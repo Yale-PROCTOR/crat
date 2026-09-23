@@ -93,6 +93,14 @@ pub(crate) fn file_key_label(key: &FileKey) -> String {
 /// corpus". It was pinned nowhere. Prose asserting a check the code does not
 /// have is this track's founding failure class, so the claim does not outlive
 /// the slice that measured it.
+/// One held class and what its hold cost, for the census table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassHeldDrop {
+    pub class: SignatureClassId,
+    pub reason: String,
+    pub dropped_edits: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unplaceable {
     pub owner_class: SignatureClassId,
@@ -914,6 +922,39 @@ pub(crate) fn link_a5_fallback_carriers(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        // **R499-1 — the raw twin discharges the A5 obligation with zero syntax.**
+        //
+        // A counted-void call routed `RawTwin` is rendered by renaming the callee and passing
+        // the input's OWN argument text, because the twin's parameters are raw. No safe view
+        // is created at that call, so there is no pair to prove disjoint: the obligation is
+        // discharged, exactly as `Clear` and `Primary` are, and it needs no carrier.
+        //
+        // R496-1 stopped the fallback PLANNING its stamps there, which removed four dead
+        // `let`s from brotli's tree and turned its census row from `instrument-error` to `ok`.
+        // It left this half undone, and batch 20's probe measured the cost: the proof site
+        // still asked for a carrier, found its own call's edit gone, and dropped
+        // `a5-fallback-unrenderable:raw=true;carriers=1;edits=0` — holding
+        // `ProcessSingleCodeLength` and `SafeReadSymbolCodeLengths` and taking seven delivered
+        // subjects with them. A site whose rendering another arm owns must be DISCHARGED, not
+        // left looking for an edit that was correctly never made.
+        //
+        // Narrow at three edges, as the planner yield is: the route must be `RawTwin`, the
+        // caller must match, and the twin's call must contain the proof's own span.
+        if table.seams.counted_void_calls.iter().any(|counted| {
+            counted.route == super::decision::counted_void::Route::RawTwin
+                && counted.caller == proof.caller
+                && counted
+                    .call_span
+                    .source_callsite()
+                    .contains(proof.span.source_callsite())
+        }) {
+            for index in sites {
+                let site = &mut plan.preclass_sites[index];
+                site.expected_form = Form::Raw.key().into();
+                site.state = ClassSiteState::ZeroSyntaxReady;
+            }
+            continue;
+        }
         for index in sites {
             let site = &plan.preclass_sites[index];
             let calls_ref = &calls;
@@ -986,6 +1027,11 @@ fn option_destination_of(
     })
 }
 
+/// **R499-1(b)** — the arms that exist to materialize what another arm may already
+/// materialize, and so may stand down at a span another class edits. Named rather than
+/// inferred: a new fallback has to be added here on purpose.
+const FALLBACK_KINDS: [&str; 1] = ["a5-site-proof-t2-fallback"];
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -1007,6 +1053,7 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
         .cloned()
         .collect::<Vec<_>>();
     let mut collisions = Vec::new();
+    let mut fallback_yields = std::collections::BTreeSet::new();
     let mut intra_class_collisions = std::collections::BTreeSet::new();
     let mut composed_dependencies = std::collections::BTreeSet::new();
     for (left_index, left) in all_sites.iter().enumerate() {
@@ -1030,6 +1077,62 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                 if left.key != right.key || left.edit_key != right.edit_key {
                     intra_class_collisions.insert(left.key.owner_class);
                 }
+                continue;
+            }
+            // **R499-1(b) — one span, one arm, across classes: a FALLBACK yields the span it
+            // strictly contains.**
+            //
+            // batch 20's brotli lost 69 subjects to six rows of one shape: a pair-arm
+            // `a5-site-proof-t2-fallback` interval strictly containing a `surface` edit of
+            // another class at `BrotliHistogramCombine{Literal,Distance,Command}`. Recorded as
+            // a collision it blocks BOTH classes, so the three `ClusterBlocks*` callers went
+            // down with them and 28 of the 97 lost subjects were the whole of
+            // `delivered-box`'s regression.
+            //
+            // A fallback exists to materialize what another arm may already materialize, so
+            // when its interval STRICTLY contains another class's edit it stands down instead
+            // — one class held rather than two, and the contained edit survives. This is the
+            // cross-class form of the yield the A5 planner already makes to the PAIR
+            // rendering, and of R496-1's yield to the raw twin.
+            //
+            // Strict containment only: a fallback that merely OVERLAPS covers bytes the other
+            // arm does not, and yielding there would drop a real edit — that case still
+            // collides. Same-class overlaps are the intra-class hold above and are untouched.
+            let yielded =
+                [(left, right), (right, left)]
+                    .into_iter()
+                    .find_map(|(fallback, inner)| {
+                        let strictly_contains = fallback.key.lo <= inner.key.lo
+                            && inner.key.hi <= fallback.key.hi
+                            && (fallback.key.lo < inner.key.lo || inner.key.hi < fallback.key.hi);
+                        // **Only a SURFACE edit, and wave-5d's controls are why.** The first
+                        // version yielded to anything contained, and the standing set caught
+                        // it: `a5_wrapper_over_unselected_argument` pins that an A5 wrapper
+                        // containing a `C`-arm `raw-cast-const` in a SELECTED argument -- or
+                        // one whose selected views are not recorded at all -- STILL collides.
+                        // That is right: a contained argument bridge is the very thing the
+                        // wrapper's raw view substitutes for, so the two are rival renderings
+                        // of one argument and `a5_wrapper_composition` decides them.
+                        //
+                        // A contained SURFACE edit is not an argument substitution at all --
+                        // it is the callee class's own signature-driven rewrite, which no raw
+                        // view can stand in for. That is brotli's shape, and the only one
+                        // yielded here.
+                        (FALLBACK_KINDS.contains(&fallback.key.bridge_kind.as_str())
+                            && inner.key.arm == super::decision::Arm::Surface.key()
+                            && strictly_contains)
+                            .then_some((fallback, inner))
+                    });
+            if let Some((fallback, inner)) = yielded {
+                fallback_yields.insert((
+                    fallback.key.owner_class,
+                    fallback.edit_key.clone(),
+                    format!(
+                        "fallback-yields-contained-edit:{}:{}",
+                        inner.key.owner_class.order_key(),
+                        inner.key.bridge_kind
+                    ),
+                ));
                 continue;
             }
             let (left, right) = if left.key.owner_class <= right.key.owner_class {
@@ -1061,6 +1164,19 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
             .push(inner);
     }
 
+    // R499-1(b): the yielded sites, marked where they are recorded rather than removed, so
+    // the receipt says which arm took the span and the class that stood down is auditable.
+    for (owner, edit_key, reason) in fallback_yields {
+        if let Some(class) = merged.get_mut(&owner) {
+            for site in class
+                .sites
+                .iter_mut()
+                .filter(|site| site.edit_key == edit_key)
+            {
+                site.state = ClassSiteState::Dropped(reason.clone());
+            }
+        }
+    }
     for class in intra_class_collisions {
         merged
             .get_mut(&class)
@@ -1791,6 +1907,13 @@ pub(crate) struct Plan {
     pub by_file: BTreeMap<FileKey, Vec<Edit>>,
     /// Decisions that produced no placed edit, with attribution.
     pub unplaceable: Vec<Unplaceable>,
+    /// **R517-8 — the class-hold receipt.** Every edit a HELD class owns is
+    /// dropped at `by_file.retain`, and until this row existed it vanished
+    /// with no `final_reverts` row, no additive-family receipt and no
+    /// diagnostic: an emitted function simply came out byte-identical
+    /// (reports 056/057 spent three windows finding one). One row per held
+    /// class that owned edits, written unconditionally.
+    pub class_held_drops: Vec<ClassHeldDrop>,
     /// **The crate ROOT file** — where a crate-level item must go, and the only
     /// place `crate::FALLBACK_SLICE_EXTENT` resolves from.
     ///
@@ -2303,6 +2426,29 @@ impl Plan {
             .filter(|class| class.is_ready())
             .map(|class| class.id)
             .collect::<std::collections::BTreeSet<_>>();
+        // **R517-8.** Count what each hold costs BEFORE dropping it, so the
+        // drop leaves a receipt instead of a byte-identical function.
+        let mut dropped: std::collections::BTreeMap<SignatureClassId, usize> =
+            std::collections::BTreeMap::new();
+        for edits in self.by_file.values() {
+            for edit in edits {
+                if let Some(class) = edit.owner_class
+                    && !ready.contains(&class)
+                {
+                    *dropped.entry(class).or_default() += 1;
+                }
+            }
+        }
+        for (class, count) in dropped {
+            let reason = self
+                .class_hold_reason(class)
+                .unwrap_or_else(|| "class-held:unknown".to_owned());
+            self.class_held_drops.push(ClassHeldDrop {
+                class,
+                reason: format!("class-held:{reason}"),
+                dropped_edits: count,
+            });
+        }
         self.by_file.retain(|_, edits| {
             edits.retain(|edit| edit.owner_class.is_none_or(|class| ready.contains(&class)));
             !edits.is_empty()
@@ -4232,28 +4378,42 @@ pub(crate) fn plan(
         }
     }
     for receipt in &option_receipt_plans {
+        let entry = table.entries.iter().find(|(subject, _)| {
+            receipt.obligation.planned.key.subject
+                == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                    owner: subject.fn_did,
+                    mir_local: subject.local.as_u32(),
+                    slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                }
+        });
+        // **R500-5(b) — a cursor-consumed subject has no option presentation to hold.**
+        //
+        // The three exempt spellings are USE-site classifications (`emitability.rs` reads the
+        // parent of each optional use). wave-6o 052 found the case they miss: when a CURSOR
+        // consumes the subject, the receipt that is held is the source's DECLARATION, whose
+        // operation is none of the three, so the presentation is pushed `option-evidence-held`
+        // — unplaceable, and therefore an owner-wide withdrawal that takes bzip2's
+        // `addFlagsFromEnvVar::p` with it.
+        //
+        // The question the exemption wants to ask is not "how is this use spelled" but "does
+        // anything still need an Option here", and a subject the cursor family has taken
+        // answers no by construction: the cursor owns the rendering and presents nothing
+        // optional. Asked of the DECISION rather than of a string, the same case the
+        // `excluded-cursor` spelling already exempts is exempt however it is reached.
+        let cursor_owns_it = matches!(
+            entry.map(|(_, decision)| decision),
+            Some(super::decision::Decision::Cursor { .. })
+        );
         if receipt.obligation.intended_terminal_state
             == super::mechanical_receipt::MechanicalState::HeldNonmechanical
             && option_receipt_requires_changed_form(table, receipt)
+            && !cursor_owns_it
             && !matches!(
                 receipt.operation.as_str(),
                 "excluded-cursor" | "handoff-return" | "handoff-use"
             )
         {
-            let subject = table
-                .entries
-                .iter()
-                .find(|(subject, _)| {
-                    receipt.obligation.planned.key.subject
-                        == super::mechanical_receipt::MechanicalSubjectKey::Local {
-                            owner: subject.fn_did,
-                            mir_local: subject.local.as_u32(),
-                            slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
-                        }
-                })
-                .expect("Option receipt retains its subject")
-                .0
-                .clone();
+            let subject = entry.expect("Option receipt retains its subject").0.clone();
             let bridge = BridgeSitePlan::local(
                 receipt.owner_class.local_def_id(),
                 receipt.owner_class.local_def_id(),
@@ -5657,6 +5817,7 @@ pub(crate) fn plan(
         callee_parameter_input_receipts,
         sibling_receipt_plans: sibling_overlap::plans(table, &span_to_loc),
         by_file,
+        class_held_drops: Vec::new(),
         unplaceable,
         // Both filled by the caller; `plan` has no `TyCtxt`, so it can ask
         // neither which file is the crate root nor the parser for an item.
@@ -5977,9 +6138,12 @@ mod tests {
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -6068,9 +6232,12 @@ mod tests {
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
             return_certificates: Default::default(),
@@ -6151,9 +6318,12 @@ mod tests {
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {
@@ -6216,6 +6386,65 @@ mod wave3_class_tests {
             out.insert(arm);
         }
         out
+    }
+
+    /// **R517-8 — a held class's dropped edits leave a receipt.**
+    ///
+    /// Every edit a held class owns is removed at `by_file.retain`. Until this
+    /// row existed the removal left NOTHING — no `final_reverts` row, no
+    /// additive-family receipt, no diagnostic — and the emitted function came
+    /// out byte-identical. heman's `kmVec4Assign` cost three windows to find
+    /// for exactly that reason (wave-6o reports 056, 057, 061).
+    #[test]
+    fn a_held_class_receipts_the_edits_it_drops() {
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let file = FileKey::Virtual("main.rs".into());
+            let input = ClassInput::new(owner, RequiredArmSet::default());
+            let edit = Edit {
+                lo: 10,
+                hi: 15,
+                replacement: "carrier".into(),
+                justification: Justification::A5RawView,
+                owner_class: Some(owner),
+                owner_path: "fixture".into(),
+                bridge: None,
+                atom_ids: Vec::new(),
+                subject_id: "fixture-subject".into(),
+                required_arms: "pair".into(),
+                edit_kind: "pair-t2-raw-view",
+            };
+            let mut plan = Plan {
+                by_file: BTreeMap::from([(file, vec![edit])]),
+                class_finalization: finalize_class_inputs(vec![input]),
+                ..Default::default()
+            };
+            assert!(plan.class_held_drops.is_empty(), "nothing held yet");
+            plan.hold_terminal_class(
+                owner,
+                crate::bo_rewriter::decision::Arm::Pair,
+                "a5-fallback-unrenderable",
+                "because the fixture says so".to_owned(),
+            );
+            assert_eq!(
+                plan.class_held_drops.len(),
+                1,
+                "{:?}",
+                plan.class_held_drops
+            );
+            let receipt = &plan.class_held_drops[0];
+            assert_eq!(receipt.class, owner);
+            assert_eq!(receipt.dropped_edits, 1);
+            assert!(
+                receipt.reason.starts_with("class-held:"),
+                "{}",
+                receipt.reason
+            );
+            assert!(
+                plan.by_file.values().flatten().count() == 0,
+                "and the edit really is gone"
+            );
+        });
     }
 
     #[test]

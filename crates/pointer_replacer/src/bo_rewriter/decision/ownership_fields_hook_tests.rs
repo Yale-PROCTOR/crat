@@ -520,6 +520,48 @@ fn synthetic_hook_a_valid_lend_does_not_cover_raw_return_or_consuming_boundary()
     }
 }
 
+/// R491-4 (relay 060): the mutable twin of the shared witness below, and the
+/// arm A9's re-offer lends through — four of its nine formals are written
+/// through, so they take `&mut`. The lend renders the caller's Box as
+/// `&mut *(owner)` and records the form on every receipt; the owner stays the
+/// caller's. Pinned here at the lend, where the shared arm was already pinned;
+/// the native side's own rendering is pinned at
+/// `ownership_fields_native.rs`'s `&mut *(name)` witness.
+#[test]
+fn r491_mutable_reference_formal_renders_a_mutable_borrow() {
+    with_fixture("fixture", |bundle, _| {
+        let call = &bundle.lends.as_ref().unwrap()[0];
+        let mut sites = call.sites.clone();
+        for site in &mut sites {
+            let mut formal = site.formal.clone().unwrap();
+            formal.form = lend::FormalForm::MutableReference;
+            site.formal = Ok(formal);
+        }
+        let plan = lend::plan_call(&call.inventory, &sites).unwrap();
+        for (argument, code) in &plan.arguments {
+            let place = &sites
+                .iter()
+                .find(|s| s.edge.argument == *argument)
+                .unwrap()
+                .place;
+            assert_eq!(code, &format!("&mut *({place})"));
+        }
+        assert!(
+            plan.receipts
+                .iter()
+                .all(|r| r.form == lend::FormalForm::MutableReference)
+        );
+        // The model kind travels beside the form, never as it (the lend
+        // module's own contract), so a reference formal still records the
+        // measured kind for custody.
+        assert!(
+            plan.receipts
+                .iter()
+                .all(|r| r.formal_model_kind == Kind::Raw)
+        );
+    });
+}
+
 #[test]
 fn r407_shared_reference_formal_renders_a_shared_borrow() {
     // era-5c 001 STOP 2: under era-5b's frame a read-only formal decides

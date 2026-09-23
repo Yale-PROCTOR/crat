@@ -936,6 +936,13 @@ fn w6v2_returned_alias_stored_globally_keeps_the_hold() {
 /// write. The subject stays held; with a clean body the confined out-param
 /// discharges the sink and it delivers. (An OPEN foreign call in the callee
 /// is the standing T2 waiver path — retention-unknown — not this arm's.)
+///
+/// **Re-premised under R481-2 (USER ruling, 2026-09-21).** The derived-global
+/// store is KNOWN retention, and known retention is now waived: the arm still
+/// needs the callee's BODY to see the store, but seeing it no longer holds the
+/// subject — it spends the tier-2 waiver and bridges. What the arm asserts is
+/// therefore the delivery and its emitted program, and the clean-body half is
+/// untouched.
 const KEEP: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
 #[repr(C)]
@@ -961,8 +968,8 @@ fn w6v2_descendant_discharge_needs_the_callee_body() {
         let input = KEEP.replace("//ESCAPE//", escape);
         let rows = by_function(&input);
         assert!(
-            !rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
-            "{name}: the body has no evidence of confinement — held: {rows:?}"
+            rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
+            "{name}: the derived-global store is waived (R481-2), so it delivers: {rows:?}"
         );
         let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
         assert!(super::verify::type_checks_str(&source));

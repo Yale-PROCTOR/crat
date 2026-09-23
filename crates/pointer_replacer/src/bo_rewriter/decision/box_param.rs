@@ -67,6 +67,32 @@ pub(crate) struct Chains {
     /// exactly as the allocation-return certificate's does, applied at the
     /// same pre-model hook.
     pub(crate) store_members: FxHashSet<(LocalDefId, HirId)>,
+    /// **W6A-A9** — the formals whose bodies PROVE a lend, so the owning arm
+    /// declines them and the borrowing arms below decide.
+    pub(crate) lends: FxHashSet<(LocalDefId, HirId)>,
+    /// One `yielded` receipt per declined ownership claim: (label, reason).
+    pub(crate) lend_receipts: Vec<(String, String)>,
+}
+
+/// **wave-6a rule W6A-A9 — a proven lend leaves the owning arm** (relay
+/// wave-6a/043 §A9). The model calls some lent formals `Owning`, and the
+/// decide ladder's owning arm claims every such subject: it asks this family
+/// for a plan, finds no consumer, and degrades. The body says the claim is
+/// wrong — the callee never frees the formal, never stores it, never moves it
+/// on, so nothing in this body releases the allocation
+/// and the caller keeps the owner.
+///
+/// This rule decides NOTHING about what the subject becomes. It declines the
+/// ownership claim its body disproves and lets the borrowing arms below decide
+/// under their own gates — exactly as they already do for a `Ref`-modeled
+/// formal of the same shape (the `w6a_a9_the_model_ref_lend_needs_no_rule`
+/// control emits `area(settings: &Settings)` / `area(&*s)` with no rule at
+/// all). It claims strictly LESS ownership than the model does, never more,
+/// which is the side of R487-3(d)'s asymmetry that evidence may move.
+pub(crate) fn lend_leaves_owning(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    ctx.box_params
+        .lends
+        .contains(&(subject.fn_did, subject.hir_id))
 }
 
 /// After the seams: a chain reverts whole (R419-3) — the consuming callee's
@@ -93,6 +119,11 @@ impl Chains {
         let mut out = String::from("parameter\tkind\tdetail\n");
         for receipt in &self.receipts {
             out.push_str(&format!("-\tadmitted\t{receipt}\n"));
+        }
+        let mut lends = self.lend_receipts.clone();
+        lends.sort();
+        for (parameter, reason) in &lends {
+            out.push_str(&format!("{parameter}\tyielded\t{reason}\n"));
         }
         let mut holds: Vec<&(String, String)> = self.holds.values().collect();
         holds.sort();
@@ -607,6 +638,47 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
     }
 }
 
+/// **W6A-A9's companion gate** (report 044). The pointee of `param` is a
+/// struct one of whose fields the model calls `Owning`: another family owns
+/// that field, its edit is an owned one, and an owned edit cannot sit inside
+/// the A5 raw view a reference formal creates at a deallocator argument.
+fn owned_field_struct<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    param: &Subject,
+) -> bool {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(param.fn_did)
+        .borrow();
+    let Some(decl) = body.local_decls.get(param.local) else {
+        return false;
+    };
+    let TyKind::RawPtr(pointee, _) = decl.ty.kind() else {
+        return false;
+    };
+    let TyKind::Adt(adt, _) = pointee.kind() else {
+        return false;
+    };
+    let Some(struct_did) = adt.did().as_local() else {
+        return false;
+    };
+    (0..adt.all_fields().count()).any(|field_index| {
+        slots
+            .field_slots
+            .slot_for_field_depth(
+                crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                    struct_did,
+                    field_index,
+                },
+                0,
+            )
+            .map(SlotRef::Field)
+            .and_then(|slot| model.get(&slot).copied())
+            == Some(SlotKind::Owning)
+    })
+}
+
 /// Derive every chain for the crate. Runs once, before the family stages; the
 /// model is read only to refuse a chain whose members are not all Owning.
 #[allow(clippy::too_many_arguments)]
@@ -719,13 +791,37 @@ pub(crate) fn derive<'tcx>(
             // Not a consumer: a lend. Only reported for an Owning-modeled formal
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
             if slot_of(param).is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Owning)) {
-                out.holds.insert(
-                    (param.fn_did, param.hir_id),
-                    (
-                        param.label.clone(),
-                        format!("box-param-callee-lends:{callee_path}"),
-                    ),
-                );
+                // **W6A-A9's companion gate**, the mirror of A1-e's (report
+                // 044): a formal whose pointee struct has a field the model
+                // calls `Owning` is NOT declined. Making such a formal a
+                // reference puts the deallocator argument behind an A5 raw
+                // view, and the owned field's edit cannot live inside one —
+                // wave-6f's field transaction declines it, and the refusal
+                // aborts the program's rewrite rather than holding one row.
+                // The owner of the hoist that would let both deliver is
+                // wave-6f; until it lands, the field keeps the subject.
+                if owned_field_struct(tcx, slots, model, param) {
+                    out.holds.insert(
+                        (param.fn_did, param.hir_id),
+                        (
+                            param.label.clone(),
+                            format!("box-param-callee-lends-owned-field:{callee_path}"),
+                        ),
+                    );
+                    continue;
+                }
+                // **W6A-A9.** The three sinks are all absent, so nothing in
+                // this body releases the allocation and the caller keeps the
+                // owner. The one act left that could carry it out — handing
+                // the formal BACK — needs no clause of its own at this frame:
+                // a lend that returns its formal is not Owning-modeled, so it
+                // never reaches here. The `..._returns_...` control measures
+                // exactly that, and a guard goes in the moment it fails.
+                out.lends.insert((param.fn_did, param.hir_id));
+                out.lend_receipts.push((
+                    param.label.clone(),
+                    format!("box-param-lend-leaves-owning:{callee_path}"),
+                ));
             }
             continue;
         }

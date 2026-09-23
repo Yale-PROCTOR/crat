@@ -156,6 +156,17 @@ pub(crate) struct ConstructionFacts {
     /// with a separately-sized trailing region. Box wave 2 holds this class;
     /// it is not an initializer failure.
     pub flexible_tail_allocations: FxHashMap<(LocalDefId, HirId), FlexibleTailEvidence>,
+    /// **R501 / dry27 link (1) — every assignment to a binding, with the
+    /// construction its right-hand side classifies as.**
+    ///
+    /// `by_binding` is keyed on the `let` INITIALIZER, and C2Rust renders a C
+    /// declaration followed by an assignment as `let mut p = 0 as *mut T;` with
+    /// the real construction on a later line — so the initializer is a null
+    /// literal and the construction table says `null-lit` for the whole class
+    /// (measured: W4B1-8). This records the assignments so the root WALK can
+    /// see through that, without reclassifying `by_binding` itself, which is
+    /// the S3.2′ measurement substrate and feeds far more than an extent.
+    pub assignments: FxHashMap<(LocalDefId, HirId), Vec<(HirId, Construction)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +190,13 @@ pub(crate) enum SliceLengthSource {
     /// R410-9 (b): each arm's literal byte length, NUL included.
     LiteralBytes {
         arms: Vec<usize>,
+    },
+    /// **R499-2 — a field root whose size is recorded in a SIBLING field.**
+    /// `(*s).storage_` beside `(*s).storage_size_`: the extent is the
+    /// sibling's value, read at the same base.
+    SiblingSize {
+        field: String,
+        sibling: String,
     },
     Fallback,
 }
@@ -212,6 +230,7 @@ impl SliceLengthSource {
                     .collect::<Vec<_>>()
                     .join(";")
             ),
+            Self::SiblingSize { field, sibling } => format!("sibling-size:{field}:{sibling}"),
             Self::Fallback => FALLBACK_EXTENT_RECEIPT.to_owned(),
         }
     }
@@ -477,6 +496,308 @@ fn associated_local_length(
     Some(inherited)
 }
 
+/// **Does this element type measure ONE BYTE?**
+///
+/// It decides whether a `_size` sibling may be read as an element count. In C
+/// a `<f>_size` beside a byte buffer is a byte count and the two coincide; for
+/// a wider element type the same name may mean bytes and the claim would
+/// over-reach by `size_of::<T>()`, so the arm refuses rather than guesses. A
+/// `_len` / `_length` / `_count` sibling names elements by its own word and is
+/// accepted for any element type.
+fn is_byte_element(element_type: &str) -> bool {
+    let last = element_type
+        .rsplit("::")
+        .next()
+        .unwrap_or(element_type)
+        .trim();
+    matches!(
+        last,
+        "u8" | "i8" | "uint8_t" | "int8_t" | "c_char" | "c_uchar" | "c_schar"
+    )
+}
+
+/// The sibling names a field root may take its extent from, in order.
+///
+/// C2Rust preserves the C spelling, and brotli's encoder state carries the
+/// Google-style trailing underscore (`storage_` / `storage_size_`), so the
+/// convention is derived from the field's own name with that suffix handled —
+/// never from a struct-level `size` field. That refusal is deliberate and
+/// measured: brotli's `RingBuffer` has TWO pointer fields (`data_`, `buffer_`)
+/// beside `size_`, `total_size_` and `cur_size_`, and `buffer_` is an interior
+/// pointer into `data_` — so a struct-level size would state the wrong extent
+/// for it. A name derived from the field itself cannot make that mistake.
+pub(crate) fn sibling_names(field: &str) -> Vec<(String, bool)> {
+    let (base, suffix) = match field.strip_suffix('_') {
+        Some(base) => (base, "_"),
+        None => (field, ""),
+    };
+    let mut names = vec![(format!("{base}_size{suffix}"), true)];
+    for word in ["len", "length", "count"] {
+        names.push((format!("{base}_{word}{suffix}"), false));
+    }
+    names
+}
+
+/// The cast-peeling [`super::sized_assignment`] needs, kept here so both halves
+/// of the rule read a right-hand side exactly the same way.
+pub(crate) fn peel_for_sized_assignment<'h>(
+    expression: &'h rustc_hir::Expr<'h>,
+) -> &'h rustc_hir::Expr<'h> {
+    Collector::peel(expression)
+}
+
+/// **R506-6 link (2)(i) — an ENSURE-CAPACITY accessor states the extent of what
+/// it returns.**
+///
+/// brotli hands every bit-writing buffer out through one shape (`lib.rs:176277`):
+///
+/// ```ignore
+/// unsafe extern "C" fn GetBrotliStorage(s: *mut BrotliEncoderState, size: size_t) -> *mut uint8_t {
+///     if (*s).storage_size_ < size { … (*s).storage_ = BrotliAllocate(m, size * 1); (*s).storage_size_ = size; }
+///     return (*s).storage_;
+/// }
+/// ```
+///
+/// At the RETURN the field has at least `(*s).storage_size_` elements, and that
+/// is the claim this arm makes — a **post-condition of the accessor read at the
+/// call**, never a global invariant of the struct. The distinction is
+/// load-bearing and measured: brotli's destructor (`lib.rs:177321-177322`) nulls
+/// `storage_` without clearing `storage_size_`, so the pair is inconsistent
+/// after it, and no read follows. A caller that constructs its slice at the call
+/// is unaffected; a rule that claimed the invariant would be wrong.
+///
+/// Recognised strictly, because it is a body proof and not a name:
+///
+/// 1. every return of the callee is the SAME field of the same parameter;
+/// 2. the body assigns that field's size SIBLING, by the same convention
+///    [`sibling_names`] uses — so the accessor and the root walk name one fact;
+/// 3. the body assigns the field itself, so the pair is maintained here rather
+///    than assumed from elsewhere.
+///
+/// The extent is then read at the CALLER, from its own argument in the position
+/// the returned field is based on: `((*s).storage_size_) as usize` where `s` is
+/// whatever the caller passed.
+fn accessor_return_field(tcx: TyCtxt<'_>, callee: LocalDefId) -> Option<(String, String, usize)> {
+    // **A foreign declaration is a LOCAL DefId with no body.** `extern "C" { fn
+    // GetBuffer() -> *mut u8; }` resolves to this crate, and asking for its body
+    // is an ICE rather than a `None` — which is exactly what the first wiring
+    // did to two of this file's own controls.
+    let body = tcx.hir_node_by_def_id(callee).body_id()?;
+    let body = tcx.hir_body(body);
+    let mut returns = Vec::new();
+    collect_returns(body.value, &mut returns);
+    let [first, rest @ ..] = returns.as_slice() else {
+        return None;
+    };
+    let (field, parameter) = returned_field_of_parameter(tcx, callee, first)?;
+    for other in rest {
+        if returned_field_of_parameter(tcx, callee, other) != Some((field.clone(), parameter)) {
+            return None;
+        }
+    }
+    let index = body
+        .params
+        .iter()
+        .position(|param| param.pat.hir_id == parameter)?;
+    let sibling = sibling_names(&field)
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| assigns_field(tcx, body.value, parameter, name))?;
+    if !assigns_field(tcx, body.value, parameter, &field) {
+        return None;
+    }
+    Some((field, sibling, index))
+}
+
+/// Every `return <e>` in a body, plus its tail expression.
+fn collect_returns<'tcx>(
+    expression: &'tcx rustc_hir::Expr<'tcx>,
+    out: &mut Vec<&'tcx rustc_hir::Expr<'tcx>>,
+) {
+    struct V<'a, 'tcx> {
+        out: &'a mut Vec<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Ret(Some(returned)) = expression.kind {
+                self.out.push(returned);
+            }
+            rustc_hir::intravisit::walk_expr(self, expression);
+        }
+    }
+    rustc_hir::intravisit::Visitor::visit_expr(&mut V { out }, expression);
+    if let rustc_hir::ExprKind::Block(block, _) = expression.kind
+        && let Some(tail) = block.expr
+        && !matches!(tail.kind, rustc_hir::ExprKind::Ret(_))
+    {
+        out.push(tail);
+    }
+}
+
+/// `(*p).field` where `p` is a binding — the field's name and that binding.
+fn returned_field_of_parameter(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &rustc_hir::Expr<'_>,
+) -> Option<(String, HirId)> {
+    let _ = tcx;
+    let _ = owner;
+    let expression = Collector::peel(expression);
+    let rustc_hir::ExprKind::Field(base, field) = expression.kind else {
+        return None;
+    };
+    let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, place) = Collector::peel(base).kind
+    else {
+        return None;
+    };
+    let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) =
+        Collector::peel(place).kind
+    else {
+        return None;
+    };
+    let rustc_hir::def::Res::Local(binding) = path.res else {
+        return None;
+    };
+    Some((field.name.as_str().to_owned(), binding))
+}
+
+/// Does the body assign `(*binding).name` anywhere?
+fn assigns_field(tcx: TyCtxt<'_>, body: &rustc_hir::Expr<'_>, binding: HirId, name: &str) -> bool {
+    struct V<'a> {
+        binding: HirId,
+        name: &'a str,
+        found: bool,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'_> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(place, _, _) = expression.kind
+                && let rustc_hir::ExprKind::Field(base, field) = place.kind
+                && field.name.as_str() == self.name
+                && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, target) = base.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = target.kind
+                && let rustc_hir::def::Res::Local(local) = path.res
+                && local == self.binding
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expression);
+        }
+    }
+    let _ = tcx;
+    let mut visitor = V {
+        binding,
+        name,
+        found: false,
+    };
+    rustc_hir::intravisit::Visitor::visit_expr(&mut visitor, body);
+    visitor.found
+}
+
+/// The caller side of [`accessor_return_field`]: this root is a call to such an
+/// accessor, so its extent is the sibling read at the caller's own argument.
+pub(crate) fn accessor_sibling_at_call(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &rustc_hir::Expr<'_>,
+) -> Option<(String, String, String)> {
+    let expression = Collector::peel(expression);
+    let rustc_hir::ExprKind::Call(callee, arguments) = expression.kind else {
+        return None;
+    };
+    let rustc_middle::ty::TyKind::FnDef(definition, _) = *tcx.typeck(owner).expr_ty(callee).kind()
+    else {
+        return None;
+    };
+    let callee = definition.as_local()?;
+    let (field, sibling, index) = accessor_return_field(tcx, callee)?;
+    let argument = arguments.get(index)?;
+    let base = tcx.sess.source_map().span_to_snippet(argument.span).ok()?;
+    Some((field, sibling, format!("*{base}")))
+}
+
+pub(crate) fn accessor_sibling_length(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    init_hir: HirId,
+) -> Option<SliceLengthPlan> {
+    let expression = tcx.hir_node(init_hir).expect_expr();
+    let (field, sibling, base) = accessor_sibling_at_call(tcx, owner, expression)?;
+    Some(SliceLengthPlan {
+        expression: format!("(({base}).{sibling}) as usize"),
+        source: SliceLengthSource::SiblingSize { field, sibling },
+        provenance: Vec::new(),
+    })
+}
+
+/// **R499-2 (B1's parameter-emission half) — the root is a FIELD whose size is
+/// recorded in a sibling field.**
+///
+/// `let mut data = (*s).ringbuffer_.buffer_;` and `(*s).storage_` are roots the
+/// walk used to call extent-less: the construction is a `PlaceRead` and nothing
+/// in the initializer states a length. The length is not absent, though — it is
+/// one field along, written by whatever grows the buffer (`GetBrotliStorage`
+/// sets `(*s).storage_size_ = size` beside the allocation it stores into
+/// `(*s).storage_`). This arm reads it there.
+///
+/// The evidence is the SIBLING's value at the same base expression, so the
+/// extent renders where the construction does and needs nothing carried: the
+/// base's own snippet with the sibling's name. Refusals, each because the claim
+/// would otherwise be wider than the evidence: a non-integer sibling, a `_size`
+/// sibling under an element type wider than a byte (it may count bytes), and
+/// any base whose snippet cannot be recovered.
+fn sibling_size_length(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    init_hir: HirId,
+    element_type: &str,
+) -> Option<SliceLengthPlan> {
+    let expression = Collector::peel(tcx.hir_node(init_hir).expect_expr());
+    let rustc_hir::ExprKind::Field(base, field) = expression.kind else {
+        return None;
+    };
+    let field = field.name.as_str().to_owned();
+    let typeck = tcx.typeck(owner);
+    let mut ty = typeck.expr_ty(base);
+    loop {
+        match ty.kind() {
+            rustc_middle::ty::TyKind::Ref(_, inner, _) => ty = *inner,
+            rustc_middle::ty::TyKind::RawPtr(inner, _) => ty = *inner,
+            _ => break,
+        }
+    }
+    let rustc_middle::ty::TyKind::Adt(def, arguments) = ty.kind() else {
+        return None;
+    };
+    if !def.is_struct() {
+        return None;
+    }
+    let variant = def.non_enum_variant();
+    let (sibling, counts_bytes) = sibling_names(&field)
+        .into_iter()
+        .find_map(|(name, bytes)| {
+            variant
+                .fields
+                .iter()
+                .find(|candidate| candidate.name.as_str() == name)
+                .map(|candidate| (candidate, bytes))
+        })?;
+    if !sibling.ty(tcx, arguments).is_integral() {
+        return None;
+    }
+    if counts_bytes && !is_byte_element(element_type) {
+        return None;
+    }
+    let base_text = tcx.sess.source_map().span_to_snippet(base.span).ok()?;
+    Some(SliceLengthPlan {
+        expression: format!("(({base_text}).{}) as usize", sibling.name.as_str()),
+        source: SliceLengthSource::SiblingSize {
+            field,
+            sibling: sibling.name.as_str().to_owned(),
+        },
+        provenance: Vec::new(),
+    })
+}
+
 fn array_decay_length(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
@@ -518,27 +839,67 @@ fn array_decay_length(
 /// states no extent, which under B1 is a HOLD and a counted residue rather
 /// than a fabricated 1024 — a checked index beyond a fabricated extent would
 /// panic where C reads on.
+/// **R501 / dry27 link (1) — the construction the ROOT WALK should read, which
+/// is not always the one the construction table records.**
+///
+/// C2Rust renders a C declaration followed by an assignment as `let mut p = 0
+/// as *mut T;` with the real construction on a later line, so `by_binding` —
+/// keyed on the initializer — says `null-lit` for that whole class (measured:
+/// W4B1-8, and brotli's `storage` tree is exactly this shape). Where the
+/// initializer is a null literal and the binding has exactly ONE assignment,
+/// the walk reads that assignment instead.
+///
+/// **Why a use before the assignment is not a hazard** (user ruling §28,
+/// 2026-08-23): the binding holds NULL until then, so a dereferencing use
+/// before it is a null dereference — a bug in the INPUT program, on which crat
+/// owes no soundness. The rule therefore needs no dominance proof; it needs the
+/// assignment to be the only one. (A binding assigned twice never reaches this
+/// walk in any case: measured, it decides `kind-raw`, the model's own verdict on
+/// overwriting a live owner.)
+///
+/// `by_binding` itself is deliberately NOT reclassified: it is the S3.2′
+/// measurement substrate and feeds Box sizing, forecasts and receipts that have
+/// nothing to do with extents.
+pub(crate) fn walked_construction<'a>(
+    facts: &'a ConstructionFacts,
+    node: (LocalDefId, HirId),
+) -> Option<(&'a Construction, HirId)> {
+    let declared = facts.by_binding.get(&node)?;
+    let init_hir = *facts.init_hirs.get(&node)?;
+    if !matches!(declared, Construction::NullLit) {
+        return Some((declared, init_hir));
+    }
+    match facts.assignments.get(&node).map(Vec::as_slice) {
+        Some([(assigned_hir, assigned)]) => Some((assigned, *assigned_hir)),
+        _ => Some((declared, init_hir)),
+    }
+}
+
 pub(crate) fn root_extent(
     tcx: TyCtxt<'_>,
     facts: &ConstructionFacts,
     subject: &Subject,
     element_type: &str,
-    init_hir: HirId,
+    declared_hir: HirId,
     known: &FxHashMap<(LocalDefId, HirId), SliceLengthPlan>,
 ) -> Option<SliceLengthPlan> {
     let node = (subject.fn_did, subject.hir_id);
-    if let Some(construction) = facts.by_binding.get(&node)
+    let (walked, init_hir) = match walked_construction(facts, node) {
+        Some(pair) => (Some(pair.0), pair.1),
+        None => (facts.by_binding.get(&node), declared_hir),
+    };
+    if let Some(construction) = walked
         && let Some(length) = allocation_length(construction, element_type)
             .or_else(|| allocation_product_length(tcx, init_hir, construction, element_type))
     {
         return Some(length);
     }
-    if matches!(facts.by_binding.get(&node), Some(Construction::ArrayDecay))
+    if matches!(walked, Some(Construction::ArrayDecay))
         && let Some(length) = array_decay_length(tcx, subject.fn_did, init_hir)
     {
         return Some(length);
     }
-    if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+    if let Some(Construction::StringLiteral { arms }) = walked {
         return Some(SliceLengthPlan {
             expression: arms
                 .iter()
@@ -550,6 +911,18 @@ pub(crate) fn root_extent(
             },
             provenance: Vec::new(),
         });
+    }
+    if matches!(walked, Some(Construction::PlaceRead))
+        && let Some(length) = sibling_size_length(tcx, subject.fn_did, init_hir, element_type)
+    {
+        return Some(length);
+    }
+    // R506-6 link (2)(i): the root is an ensure-capacity accessor's result, so
+    // the extent is the sibling it maintains, read at this caller's argument.
+    if matches!(walked, Some(Construction::CallResult))
+        && let Some(length) = accessor_sibling_length(tcx, subject.fn_did, init_hir)
+    {
+        return Some(length);
     }
     associated_local_length(facts, node, known)
 }
@@ -681,6 +1054,9 @@ fn bind_allocation_arguments(
         SliceLengthSource::AssociatedArgument { .. }
         | SliceLengthSource::SealedContract { .. }
         | SliceLengthSource::LiteralBytes { .. }
+        // A sibling size is read at the base, not bound out of an allocation
+        // argument: there is no call to hoist an argument from.
+        | SliceLengthSource::SiblingSize { .. }
         | SliceLengthSource::Fallback => {
             return Ok((
                 Vec::new(),
@@ -894,6 +1270,88 @@ fn address_of_deref_root<'h>(
     .then_some(pointer)
 }
 
+/// **A12 (relay 032) — the cursor cedes the span and the construction renders
+/// it.** slicecursor 044 §2: when a cursor's derived chain initialises a local
+/// THIS family types (`let start = data.offset(pos as isize);` with `start`
+/// decided `Slice`), the cursor's view edit and this construction claim the
+/// same interval. Two producers on one span dropped the slice-use adapter and
+/// withdrew the whole owner — a typed hold became an owner-level withdrawal.
+/// The composition is one edit: the construction takes the cursor's OWN view as
+/// its raw source (`data.offset_by(pos as isize).as_ptr()`), report 027's
+/// element-view precedent with the roles exchanged. Only `offset` is admitted —
+/// `add` takes a `usize` where `offset_by` takes an `isize`.
+fn cursor_view_root(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<String> {
+    let (base, text) = cursor_view_text(tcx, owner, initializer, mutable)?;
+    // The gate: only a DELIVERED cursor has a view to cede. Against a raw base
+    // this text would not type, which is why the rendering is inert until the
+    // cursor family delivers the root (slicecursor 044 §2, report 032).
+    table
+        .entries
+        .iter()
+        .any(|(source, decision)| {
+            source.fn_did == owner
+                && source.hir_id == base
+                && match decision {
+                    Decision::Cursor { .. } => true,
+                    Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::Box(_)
+                    | Decision::Degraded(_) => false,
+                }
+        })
+        .then_some(text)
+}
+
+/// The rendering half of [`cursor_view_root`]: `<base>.offset(<k>)` becomes the
+/// cursor's own view at that position. Only a bare path receiver and `offset`
+/// are admitted — `add` takes a `usize` where `offset_by` takes an `isize`, and
+/// a computed receiver is another producer's span.
+fn cursor_view_text(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<(HirId, String)> {
+    let rustc_hir::ExprKind::MethodCall(segment, receiver, [delta], _) =
+        Collector::peel(initializer).kind
+    else {
+        return None;
+    };
+    if segment.ident.as_str() != "offset" {
+        return None;
+    }
+    let rustc_hir::ExprKind::Path(path) = &receiver.kind else {
+        return None;
+    };
+    let Res::Local(base) = tcx.typeck(owner).qpath_res(path, receiver.hir_id) else {
+        return None;
+    };
+    let sm = tcx.sess.source_map();
+    let name = sm.span_to_snippet(receiver.span).ok()?;
+    let offset = sm.span_to_snippet(delta.span).ok()?;
+    let view = if mutable { "as_mut_ptr" } else { "as_ptr" };
+    Some((base, format!("{name}.offset_by({offset}).{view}()")))
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_view_text_for_tests(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    initializer: &rustc_hir::Expr<'_>,
+    mutable: bool,
+) -> Option<String> {
+    cursor_view_text(tcx, owner, initializer, mutable).map(|(_, text)| text)
+}
+
 pub(crate) fn compose_initializer(
     init_span: Span,
     initializer: &str,
@@ -974,6 +1432,15 @@ pub(crate) fn plan_slice_constructions(
         match subject.kind {
             SubjectKind::Local => {}
             SubjectKind::Param { .. } => continue,
+        }
+        // R491-6 route (i): a counted READ alias delivers on its own
+        // initializer edit, which types the binding by inference from the
+        // parameter's view. A constructor here would wrap that edit in
+        // `from_raw_parts` with a fabricated extent beside the count the
+        // contract already carries.
+        if let Some(plan) = super::counted_void::alias_construction(tcx, facts, subject, decision) {
+            plans.push(plan);
+            continue;
         }
         // R445-2: wave-5d2's derived-view rule renders this initializer as an
         // exact suffix of its Box owner. A constructor over the same
@@ -1061,9 +1528,17 @@ pub(crate) fn plan_slice_constructions(
         // keyed to the whole initializer span, so the peel yields to them.
         let initializer = match tcx.hir_node(init_hir) {
             rustc_hir::Node::Expr(expression) if composed_edits.is_empty() => {
-                address_of_deref_root(tcx, subject.fn_did, expression)
-                    .and_then(|root| sm.span_to_snippet(root.span).ok())
-                    .unwrap_or(initializer)
+                // wave-6k (relay 032): a cursor's derived chain is rendered
+                // through the cursor's own view, so this construction is the
+                // ONLY edit on the span (`cursor_view_root`); otherwise the
+                // root is the pointer the address-of wrapper dereferences.
+                cursor_view_root(tcx, table, subject.fn_did, expression, mutable).unwrap_or_else(
+                    || {
+                        address_of_deref_root(tcx, subject.fn_did, expression)
+                            .and_then(|root| sm.span_to_snippet(root.span).ok())
+                            .unwrap_or(initializer)
+                    },
+                )
             }
             _ => initializer,
         };
@@ -1166,7 +1641,21 @@ pub(crate) fn plan_slice_constructions(
             continue;
         }
         let rendered =
-            if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
+            // **A slice may never be built on a NULL base** (wave-4 report 053).
+            // C2Rust writes `let mut p = 0 as *mut T;` for a C declaration, and
+            // the general arm below would render
+            // `from_raw_parts_mut(0 as *mut T, FALLBACK_SLICE_EXTENT)` — which
+            // is instant UB of a kind §77 does NOT waive: that waiver is about
+            // a LENGTH claimed over a real allocation, and this has no
+            // allocation at all. The binding holds nothing until its
+            // assignment, and the empty slice is exactly that value.
+            if matches!(facts.by_binding.get(&node), Some(Construction::NullLit)) && !nullable {
+                Ok(if mutable {
+                    "&mut []".to_owned()
+                } else {
+                    "&[]".to_owned()
+                })
+            } else if let Some(Construction::StringLiteral { arms }) = facts.by_binding.get(&node) {
                 // R410-9 (b): each literal arm is its own construction with its
                 // own byte length; the outer `as *mut c_char` cast is dropped with
                 // the arms' casts kept inside `from_raw_parts` (a `*mut` operand
@@ -1589,6 +2078,11 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             && let rustc_hir::def::Res::Local(binding) = lhs_path.res
         {
             let construction = self.classify(rhs);
+            self.facts
+                .assignments
+                .entry((self.fn_did, binding))
+                .or_default()
+                .push((rhs.hir_id, construction.clone()));
             if matches!(construction, Construction::Alloc { .. }) {
                 self.facts
                     .owner_overwrites

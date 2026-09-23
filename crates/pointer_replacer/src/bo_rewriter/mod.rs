@@ -94,16 +94,30 @@ mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
 #[cfg(test)]
+mod pair_conditional_store_tests;
+#[cfg(test)]
 mod pair_disjoint_field_seam_tests;
 #[cfg(test)]
 mod pair_disjointness_tests;
 #[cfg(test)]
 mod pair_fresh_field_tests;
+#[cfg(test)]
+mod pair_projection_recovery_tests;
+#[cfg(test)]
+mod pair_read_read_tests;
+#[cfg(test)]
+mod pair_static_callers_tests;
+#[cfg(test)]
+mod pair_static_root_tests;
+#[cfg(test)]
+mod pair_view_of_formal_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 mod raw_initializer_tests;
 #[cfg(test)]
 mod raw_place_values_tests;
+#[cfg(test)]
+mod retention_waiver_tests;
 pub(crate) mod revert_closure;
 #[cfg(test)]
 mod revert_closure_tests;
@@ -123,6 +137,8 @@ pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
 mod wave5d_accumulator_tests;
+#[cfg(test)]
+mod wave5d_address_root_tests;
 #[cfg(test)]
 mod wave5d_tests;
 mod wave5r_cast;
@@ -162,6 +178,8 @@ pub(crate) mod wave6r_shared_root;
 mod a5_inner_argument_tests;
 #[cfg(test)]
 mod additive_tests;
+#[cfg(test)]
+mod address_view_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.
@@ -223,6 +241,8 @@ mod native_return_replay_tests;
 #[cfg(test)]
 mod nested_use_tests;
 #[cfg(test)]
+mod one_span_one_arm_tests;
+#[cfg(test)]
 mod option_call_dependency_tests;
 #[cfg(test)]
 mod option_carrier_tests;
@@ -250,6 +270,8 @@ mod option_suffix_tests;
 mod option_thin_extent_tests;
 #[cfg(test)]
 mod option_void_tests;
+#[cfg(test)]
+mod optional_cursor_tests;
 #[cfg(test)]
 mod ordinary_argument_permission_tests;
 #[cfg(test)]
@@ -516,6 +538,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) class_costs: String,
     pub(crate) class_collisions: String,
     pub(crate) unresolved_classes: String,
+    /// **R517-8** — one row per held class whose edits the placement layer
+    /// dropped: the reason and how many edits it cost.
+    pub(crate) class_held_drops: String,
     /// R397-6(b): contract candidates declined at the selection input.
     pub(crate) contract_candidate_declines: String,
     /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
@@ -524,6 +549,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
     /// their evidence, or HELD with what the root said and why.
     pub(crate) root_extents: String,
+    /// **main 071c (a), report 057**: the admitted sole assignments, with the
+    /// form each subject ended in.
+    pub(crate) sized_assignments: String,
     pub(crate) interface_inventory: String,
     /// R261-3 rider (addendum 264): subjects whose io-domain type walk ran out
     /// of depth budget without deciding. A nonzero count reopens the depth
@@ -1926,6 +1954,7 @@ fn verify_and_revert(
             .or_default()
             .insert(subject.owner_path.clone());
     }
+    raw_boundary_artifacts.class_held_drops = render_class_held_drops(&emission_plan, &class_paths);
     let all_ready_classes = ready_classes(&emission_plan);
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
     // introduced, not what the input already reported: brotli's frozen
@@ -2054,6 +2083,22 @@ fn verify_and_revert(
         .map(|d| d.to_path_buf());
     let mut reverted: std::collections::BTreeSet<bridge_receipt::SignatureClassId> =
         std::collections::BTreeSet::new();
+    // **wave-6f, relay 056 — test-only.** Seed the loop's revert set with the
+    // classes `CRAT_W6F_FORCE_REVERT` names (comma-separated path suffixes),
+    // so a witness can ask what the emitted tree does when a chosen class is
+    // reverted — the question report 053 STOP 1 could not answer because the
+    // lane had no way to force one. `#[cfg(test)]`: production never reads it.
+    #[cfg(test)]
+    if let Ok(names) = std::env::var("CRAT_W6F_FORCE_REVERT") {
+        for name in names.split(',').filter(|s| !s.is_empty()) {
+            if let Some(did) = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(name))
+            {
+                reverted.insert(bridge_receipt::SignatureClassId::of(did));
+            }
+        }
+    }
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut atom_reverify_count = 0usize;
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
@@ -2082,13 +2127,18 @@ fn verify_and_revert(
     // **R299-2** — the AST layer's render of every sibling-overlap call, kept
     // in step with `files` so whichever exit emits states the text of the round
     // it emitted.
+    // The two sets are EMPTY here in production — nothing has reverted before
+    // round 0 — so passing them is identical to passing fresh empty sets, which
+    // is what stood here. They are passed so that the `#[cfg(test)]` seed above
+    // reaches round 0's render; without it a forced revert moves the counters
+    // and not one byte of the text (measured, report 054).
     let (mut files, mut files_edited, mut line_maps, mut call_renders) = match round_files(
         tcx,
         capture,
         &emission_plan,
         &emission_texts,
-        &std::collections::BTreeSet::new(),
-        &std::collections::BTreeSet::new(),
+        &reverted,
+        &reverted_atoms,
         root_key.as_ref(),
         table,
     ) {
@@ -2113,6 +2163,77 @@ fn verify_and_revert(
     facts.e2_artifacts.timings.ast_placement_wall_s =
         format!("{:.6}", ast_started.elapsed().as_secs_f64());
     facts.files_touched = files_edited;
+
+    // **THE GRAFT FLOOR'S SECOND HALF (R515-1 ruling 3).**
+    //
+    // A colliding graft no longer aborts the program — it yields, and the arm
+    // records the class it was serving. That half alone would ship a
+    // HALF-COMPOSED call: the node carries the other claimant's edit, and the
+    // yielding class's remaining edits (a C-9 mark's companion temp is the
+    // sharpest case) are still in the tree without it. So the class is reverted
+    // WHOLE here and the round re-emitted, exactly as a verify-attributed
+    // revert would be, before anything is compiled.
+    //
+    // The loop terminates because each pass strictly grows `reverted` over a
+    // finite class set; the cap is a tripwire for a hold that does not clear,
+    // never the mechanism. A reverted class's grafts are not planned, so it
+    // cannot be held twice — if it is, that is the bug the cap reports.
+    const MAX_HOLD_ROUNDS: usize = 4;
+    let mut hold_rounds = 0usize;
+    let mut held_total = 0usize;
+    loop {
+        let held = ast_transform::graft_held_classes();
+        let newly = held
+            .iter()
+            .copied()
+            .filter(|class| !reverted.contains(class))
+            .collect::<Vec<_>>();
+        if newly.is_empty() {
+            break;
+        }
+        hold_rounds += 1;
+        held_total += newly.len();
+        if hold_rounds > MAX_HOLD_ROUNDS {
+            facts.files_touched = files_edited;
+            facts.reverted_count = reverted.len();
+            return facts.degraded(format!(
+                "graft-held: {held_total} class(es) held over {hold_rounds} round(s) without converging"
+            ));
+        }
+        reverted.extend(newly);
+        match round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            &reverted,
+            &reverted_atoms,
+            root_key.as_ref(),
+            table,
+        ) {
+            Ok((next_files, rollbacks, next_edited, next_maps, next_renders)) => {
+                if !rollbacks.is_empty() {
+                    facts.files_touched = files_edited;
+                    facts.reverted_count = reverted.len();
+                    return facts.degraded(format!(
+                        "graft-held re-emit produced {} rollback(s)",
+                        rollbacks.len()
+                    ));
+                }
+                files = next_files;
+                files_edited = next_edited;
+                line_maps = next_maps;
+                call_renders = next_renders;
+            }
+            Err(why) => {
+                facts.files_touched = files_edited;
+                facts.reverted_count = reverted.len();
+                return facts.degraded(format!("graft-held re-emit failed: {why}"));
+            }
+        }
+    }
+    facts.files_touched = files_edited;
+
     let mut rounds = 0usize;
     let mut previous_errors: Option<usize> = None;
     let mut probe_secs = 0.0f64;
@@ -3948,6 +4069,10 @@ impl OutcomeFacts {
         files: std::collections::BTreeMap<plan::FileKey, String>,
     ) -> RewriteOutcome {
         self.stamp_class_costs();
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
         RewriteOutcome::Emitted {
             source,
             files,
@@ -3980,6 +4105,10 @@ impl OutcomeFacts {
     }
 
     fn degraded(mut self, reason: String) -> RewriteOutcome {
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
         self.raw_boundary_artifacts.degraded_output_receipt =
             "degraded-unmodified-input".to_owned();
         for event in &mut self.raw_boundary_artifacts.bridge_events {
@@ -4363,6 +4492,26 @@ fn render_raw_boundary_final_reverts(
     for atom in atoms {
         out.push_str(&format!(
             "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\t-\n"
+        ));
+    }
+    out
+}
+
+/// **R517-8** — the class-hold receipt table.
+fn render_class_held_drops(
+    plan: &plan::Plan,
+    class_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+) -> String {
+    let mut out = bridge_receipt::class_held_drop_header();
+    for drop in &plan.class_held_drops {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            drop.class.order_key(),
+            class_paths
+                .get(&drop.class)
+                .map_or("<unknown-local-class>", String::as_str),
+            drop.reason.replace(['\t', '\r', '\n'], " "),
+            drop.dropped_edits,
         ));
     }
     out
@@ -6290,8 +6439,23 @@ fn validate_cursor_delivered_bases(
                     })
             }
             DeliveredBaseProvider::TableElement => {
+                // **R519-3 (slicecursor 067 §2).** The twin of
+                // `wrapper::table_element_base`, stated as the exact
+                // correspondence it is rather than as two conjuncts that happen
+                // to coincide: `fallback` is DEFINED as `!delivered_inner`, and
+                // `delivered_inner` is true exactly when the table is
+                // `NestedSlice`. So the table's form and the plan's `fallback`
+                // must agree, and the pair `(NestedSlice, fallback == true)` is
+                // not a case to admit — it is a fabricated
+                // `FALLBACK_SLICE_EXTENT` window over an element whose length is
+                // evidence-backed. Dropping the conjunct on the delivered side
+                // would wave that through; this re-asserts the invariant the
+                // constructor established, for the same admissions.
+                //
+                // `table_named_once` is unchanged on both sides. It keeps its
+                // force on the flat side and gains some on the delivered one: a
+                // second naming of a `&mut [&mut [T]]` table is an `E0499`.
                 cursor.wrapper
-                    && cursor.fallback
                     && (!subject.mutable
                         || decision::cursor_native::wrapper::table_named_once(
                             tcx,
@@ -6301,9 +6465,9 @@ fn validate_cursor_delivered_bases(
                     && table.entries.iter().any(|(candidate, choice)| {
                         (candidate.fn_did, candidate.hir_id) == node
                             && match choice {
-                                decision::Decision::Slice { .. } => true,
-                                decision::Decision::NestedSlice { .. }
-                                | decision::Decision::Ref { .. }
+                                decision::Decision::Slice { .. } => cursor.fallback,
+                                decision::Decision::NestedSlice { .. } => !cursor.fallback,
+                                decision::Decision::Ref { .. }
                                 | decision::Decision::InferredRef { .. }
                                 | decision::Decision::Opt { .. }
                                 | decision::Decision::Box(_)
@@ -6409,6 +6573,28 @@ fn prepare_plan_files<'tcx>(
                         .iter()
                         .any(|other| other.argument_index == view.argument_index)
                 })
+        }) {
+            continue;
+        }
+        // **R490-1(a), one layer earlier: the raw twin renders this call too.**
+        //
+        // A counted-void call routed `RawTwin` replaces the call's arguments with the
+        // input's own text -- deliberately, because the twin's parameters are raw. The A5
+        // fallback's stamps at that call are then DEAD: brotli's
+        // `ProcessSingleCodeLength` site carried four `let __crat_a5_raw_6925671_*` that
+        // nothing reads, followed by `__crat_raw_ProcessSingleCodeLength(&mut (*h).repeat,
+        // ..)` with the original arguments.
+        //
+        // Suppressing them in the LEDGER (`75ce6fedb`) was the wrong layer, and batch 20
+        // proved it: the applied receipt survived without a descriptor
+        // (`bridge-custody:missing-descriptor:..:typed-carrier-candidate-count:0`), and the
+        // stamps stayed in the tree where no receipt could ever claim them. The fallback
+        // has to yield where it is superseded, exactly as it already yields to the PAIR
+        // rendering above -- same shape, same reason, one arm further along.
+        if table.seams.counted_void_calls.iter().any(|counted| {
+            counted.route == decision::counted_void::Route::RawTwin
+                && counted.caller == call.caller
+                && counted.call_span == call.call_span
         }) {
             continue;
         }
@@ -7421,10 +7607,60 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    // **R517-11 — the cursor CANDIDATES, derived where their facts live.** The
+    // C-string exemption yields to a callee parameter the cursor family can
+    // admit, and it must do so in THIS pass: a hold lifted by a second pass is
+    // decided but never planned (wave-5c 047 §2). `cursor_native` admits from
+    // three degrade reasons — `SliceCursorUse` / `SliceUseUnsupported`, both of
+    // which are `uses.unsupported`, and `SliceNegOrUnknownOffset`, which is the
+    // sign verdict the self-advance gate reads — and every subject reaching any
+    // of them has first passed BO's kind, which is the authority on whether a
+    // reference is sound at all. A `Raw` slot degrades at `kind-raw` long
+    // before the slice arm, and the family then reaches it only through a
+    // DELIVERED base, which a bare C-string walk never has.
+    //
+    // It is deliberately a CANDIDATE set and not a prediction of the family's
+    // plan: it is read only to KEEP a hold, so over-inclusion costs yield and
+    // never soundness.
+    let cursor_candidates: decision::local_callee_extent::CursorCandidates = subjects
+        .iter()
+        .filter(|subject| {
+            decision::local_callee_extent::is_cursor_candidate(
+                slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                    .and_then(|slot| model.get(&SlotRef::Local(subject.fn_did, slot)))
+                    .copied(),
+                full_slice_uses.get(&(subject.fn_did, subject.hir_id)),
+                sign.may_be_negative(subject.fn_did, subject.local)
+                    && decision::compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                        tcx,
+                        subject.fn_did,
+                        subject.local,
+                    )
+                    .is_err(),
+            )
+        })
+        .filter_map(|subject| match subject.kind {
+            decision::SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
+            decision::SubjectKind::Local => None,
+        })
+        .collect();
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
-    let local_callee_extent_subjects =
-        decision::local_callee_extent::collect(tcx, &subjects, &facts, &full_slice_uses);
+    // First pass: no decision is settled yet, so the exemption has the use facts
+    // and the candidate set to read (R485-4(b)'s second pass supplies the
+    // decided-`Slice` exemption below).
+    let local_callee_extent_subjects = decision::local_callee_extent::collect(
+        tcx,
+        &subjects,
+        &facts,
+        &full_slice_uses,
+        &cursor_candidates,
+        None,
+        None,
+    );
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -8086,6 +8322,81 @@ fn finish_decide<'tcx>(
             ),
             &subjects,
         );
+        // **R485-4(b) — the decided-slice exemption, as a second pass.** A
+        // callee parameter this run decided `Slice` carries a checked extent,
+        // so the `held:local-callee-access-extent` hold its callers took no
+        // longer applies. The decision is not available when the map is first
+        // collected (it is one of the map's own inputs), so the pass runs once
+        // over the SETTLED table and re-decides only if a hold actually went.
+        let mut decided = decision::local_callee_extent::DecidedForms::default();
+        for (subject, decision) in &table.entries {
+            let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                continue;
+            };
+            // Exhaustive by rule (`import_denylist`): a new disposition must be
+            // classified here, not silently dropped.
+            match decision {
+                decision::Decision::Slice { .. } => {
+                    decided.slice.insert((subject.fn_did, hir_index));
+                }
+                decision::Decision::Cursor { .. }
+                | decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::Degraded(_) => {}
+            }
+        }
+        if let Some(relaxed) = decision::local_callee_extent::relaxed_by_decisions(
+            tcx,
+            &subjects,
+            &facts,
+            &full_slice_uses,
+            &cursor_candidates,
+            &fat,
+            &decided,
+            &local_callee_extent_subjects,
+        ) {
+            let ctx = decision::Ctx {
+                local_callee_extent: &relaxed,
+                ..ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                )
+            };
+            table = decision::decide(&ctx, &subjects);
+        }
+        // **After the re-decide, deliberately.** `decide` returns a fresh table,
+        // so anything recorded on the old one is gone; the seam's C-string
+        // licences are recomputed here, on whatever table the ladder settled.
+        // **R491-7** — the exact C-string extents, recorded for the seam: a
+        // callee parameter whose walk is licensed exact gives its callers
+        // `strlen(p) + 1` rather than the fallback.
+        table.nul_exact_parameters = subjects
+            .iter()
+            .filter_map(|subject| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                matches!(
+                    decision::local_callee_extent::nul_walk(tcx, subject, &facts),
+                    Some(decision::local_callee_extent::NulWalk::Exact)
+                )
+                .then_some((subject.fn_did, hir_index))
+            })
+            .collect();
+        // R491-7's caller-side clause: the subjects whose own body establishes
+        // the terminator.
+        table.nul_exact_callers = subjects
+            .iter()
+            .filter(|subject| decision::local_callee_extent::caller_establishes_nul(tcx, subject))
+            .map(|subject| (subject.fn_did, subject.hir_id))
+            .collect();
         // Surface policies are provisional until the full ladder settles. A raw
         // wrapper or entry shim exists only when at least one signature subject
         // survives every arm; blocked functions retain their seed/web evidence but
@@ -8519,7 +8830,38 @@ fn finish_decide<'tcx>(
             &model,
             &prepared.plan.class_finalization,
             &family_policy,
+            // R506-5: the flip hands the cursor family its base inside the same
+            // transaction, so `promote` needs the same `Ctx` the replan below
+            // already builds. Row (vi)'s macro is what makes that legal beside
+            // `&mut table` — `Ctx` never borrows the `DecisionTable`.
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                Some(&coconv),
+                Some(&lifetime_eligibility),
+                Some(&raw_boundary),
+                Some(&candidate_exposure),
+                Some(&return_receivers),
+            ),
         ) {
+            // **R452-6 / R475-3.** A table that just gained its inner level
+            // hands its elements as slices; a cursor built over one of those
+            // elements was planned against the flat form, so it re-plans
+            // through its OWN family here. A post-hoc rewrite of a finalised
+            // cursor plan costs the cursor entirely (nested 007's A/B), which
+            // is why this is a rebuild and not a patch. Inert when no such
+            // cursor exists. Row (vi)'s macro is what lets a `Ctx` be built
+            // after the flip at all (main 051).
+            decision::cursor_native::replan_delivered_table_elements(
+                &ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                ),
+                &mut table.entries,
+            );
             prepare_plan_files(
                 tcx,
                 &table,
@@ -8723,7 +9065,12 @@ fn finish_decide<'tcx>(
             sites: raw_boundary_sites.to_tsv(),
             retention: retention.to_tsv(),
             child_access: retention.child_access.clone(),
-            twin_placement: decision::counted_void::twin_receipt(),
+            // EMPTY here on purpose: the graft that records this runs later,
+            // inside `verify_and_revert`'s emission rounds, so the decision
+            // stage has nothing to read. Reading it here is what made every
+            // `twin-placement` table header-only through batch 27; the two
+            // outcome constructors fill it.
+            twin_placement: String::new(),
             dispositions: raw_boundary.receipts_tsv(),
             subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
             atoms: raw_boundary.atoms_tsv(),
@@ -8749,10 +9096,12 @@ fn finish_decide<'tcx>(
             class_costs: bridge_receipt::class_cost_header(),
             class_collisions: bridge_receipt::class_collision_header(),
             unresolved_classes: bridge_receipt::unresolved_class_header(),
+            class_held_drops: bridge_receipt::class_held_drop_header(),
             contract_candidate_declines: contract_extent_candidates
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
+            sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
             sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
             converted_callee_without_site_receipt: table

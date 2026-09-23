@@ -69,8 +69,28 @@ fn require_owning_formal_lend(callee_name: &str, calls: &str, expected_calls: us
             assert!(seen.insert((*block, *statement, *argument)), "duplicate native edge");
             assert_eq!(*actual, Some(bo::SlotKind::Owning), "existing caller premise remains real");
             assert_eq!(*formal, Some(bo::SlotKind::Owning), "measured formal kind, never overridden");
-            assert_eq!(emitted.emitted(), FormalForm::MutableRaw);
-            assert!(matches!(native_lend_formal(tcx, &ctx.slots, &ctx.model, callee, *argument, &emitted), Ok(Kind::Owning)), "model label is recorded while the emitted raw formal is lendable");
+            // R491-4 (relay 060): WHICH form the formal takes is the frame's,
+            // not this lane's — `resolve` reads it off the callee's terminal
+            // interface, so on this line (the callee's class is not
+            // converted) it is `MutableRaw`, and on a composition carrying
+            // wave-6a's A9 the same edge is a reference. What this test owns
+            // is the mapping and the lendability, which hold on both frames:
+            // the emitted form follows the terminal interface exactly, it is
+            // never `Box` here, and the model label is recorded beside it
+            // while the formal stays lendable.
+            let expected_form = match emitted.terminal() {
+                super::seam::Form::Raw => FormalForm::MutableRaw,
+                super::seam::Form::Ref { mutable: true } | super::seam::Form::Slice { mutable: true } => {
+                    FormalForm::MutableReference
+                }
+                super::seam::Form::Ref { mutable: false } | super::seam::Form::Slice { mutable: false } => {
+                    FormalForm::SharedReference
+                }
+                other => panic!("unexpected terminal interface {other:?}"),
+            };
+            assert_eq!(emitted.emitted(), expected_form, "the emitted form follows the callee's terminal interface");
+            assert_ne!(emitted.emitted(), FormalForm::Box, "a lent formal is never an owning one");
+            assert!(matches!(native_lend_formal(tcx, &ctx.slots, &ctx.model, callee, *argument, &emitted), Ok(Kind::Owning)), "model label is recorded while the emitted formal is lendable");
         }
         assert_eq!(observations.len(), expected_calls * 2, "complete two-buffer edge inventory");
         let call_sites: BTreeSet<_> = seen.iter().map(|(block, statement, _)| (*block, *statement)).collect();

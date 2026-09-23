@@ -267,6 +267,12 @@ pub(crate) struct Arg {
     /// Distinct field projections remain distinct even when `place_root` is
     /// the same aggregate local.
     pub place_identity: Option<String>,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path. See
+    /// [`address_root_facts`].
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer, so the root is a
+    /// pointer subject and keeps its decision path.
+    pub address_root_raw_pointer: bool,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -444,6 +450,54 @@ pub(crate) fn is_zero_literal(expr: &Expr<'_>) -> bool {
     )
 }
 
+/// **The shape of a use that has no slice image** (report 058).
+///
+/// Deliberately syntactic and coarse: the point is to say which FAMILY of use
+/// blocks the corpus's widest wall, not to describe any one site. A local
+/// callee's argument is separated from a foreign one because only the first can
+/// be answered by converting the callee, and an assignment target is separated
+/// from everything else because that is the shape main's admission already
+/// covers.
+pub(crate) fn unsupported_use_shape(tcx: TyCtxt<'_>, use_expr: &Expr<'_>) -> &'static str {
+    let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return "not-an-expression";
+    };
+    match parent.kind {
+        ExprKind::Assign(lhs, _, _) if lhs.hir_id == use_expr.hir_id => "assignment-target",
+        ExprKind::Assign(..) => "assignment-source",
+        ExprKind::Call(callee, _) => {
+            let local = match tcx
+                .typeck(callee.hir_id.owner.def_id)
+                .expr_ty(callee)
+                .kind()
+            {
+                rustc_middle::ty::TyKind::FnDef(definition, _) => definition
+                    .as_local()
+                    .is_some_and(|local| tcx.hir_node_by_def_id(local).body_id().is_some()),
+                _ => false,
+            };
+            if local {
+                "local-callee-argument"
+            } else {
+                "foreign-callee-argument"
+            }
+        }
+        ExprKind::MethodCall(_, receiver, _, _) if receiver.hir_id == use_expr.hir_id => {
+            "method-receiver"
+        }
+        ExprKind::MethodCall(..) => "method-argument",
+        ExprKind::Cast(..) => "cast",
+        ExprKind::Ret(_) => "return",
+        ExprKind::Binary(..) => "binary",
+        ExprKind::AddrOf(..) => "address-of",
+        ExprKind::Unary(rustc_hir::UnOp::Deref, _) => "deref",
+        ExprKind::Field(..) => "field-of",
+        ExprKind::Index(..) => "index",
+        ExprKind::Struct(..) => "struct-literal",
+        _ => "other",
+    }
+}
+
 /// Classify an argument expression by its **outermost** operator and resolved
 /// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
 /// complex expression only when rustc says the expression itself is a raw
@@ -563,6 +617,35 @@ fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
         return None;
     };
     Some((binding, storage.span))
+}
+
+/// R473-2: is this argument `&x` / `&mut x` over a LOCAL binding, and is that
+/// local's own type a raw pointer?
+///
+/// The address of a live local is a sound reference, so such a root needs no
+/// entry in the hypothetical decision table — a non-pointer local is not a
+/// pointer subject, and asking it for a decision asks for a fact it cannot
+/// have. The second component is the exclusion: a raw-pointer local IS a
+/// pointer subject and keeps its decision path, so the admission must not
+/// answer a decision question with a syntactic one.
+///
+/// Projections, dereferences, casts and temporaries are all absent by
+/// construction (`AddrOf` directly over a resolved local path), which is why
+/// the caller-frame claim holds: `&mut (*p).f` would be only as live as `p`.
+fn address_root_facts(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expr: &Expr<'_>,
+) -> (bool, bool) {
+    let ExprKind::AddrOf(_, _, place) = expr.kind else {
+        return (false, false);
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = place.kind else {
+        return (false, false);
+    };
+    if !matches!(path.res, Res::Local(_)) {
+        return (false, false);
+    }
+    (true, typeck.expr_ty(place).is_raw_ptr())
 }
 
 fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<u64> {
@@ -1043,6 +1126,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             adapter_operand_span,
                             adapter_operand_mutability,
                             contract_count: None,
+                            address_root_local: address_root_facts(typeck, arg).0,
+                            address_root_raw_pointer: address_root_facts(typeck, arg).1,
                             return_unused,
                             operand_pointee,
                         });
@@ -1134,6 +1219,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 .as_ref()
                                                 .map(|s| s.blind),
                                             place_identity: Self::exact_place_identity(arg),
+                                            address_root_local: address_root_facts(typeck, arg).0,
+                                            address_root_raw_pointer: address_root_facts(
+                                                typeck, arg,
+                                            )
+                                            .1,
                                         }
                                     })
                                     .collect(),
@@ -1272,6 +1362,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 adapter_operand_span,
                                 adapter_operand_mutability,
                                 contract_count,
+                                address_root_local: address_root_facts(typeck, arg).0,
+                                address_root_raw_pointer: address_root_facts(typeck, arg).1,
                                 return_unused,
                                 operand_pointee,
                             });
@@ -1532,10 +1624,30 @@ pub(crate) struct SliceUses {
     /// rest is not a partial win — it is an ill-typed crate.
     pub unsupported: Option<Span>,
     pub unsupported_is_cursor: bool,
+    /// **What the blocking use IS** (wave-4 report 058). `slice-use-unsupported`
+    /// is 85 of the corpus's 172 refusals — its widest wall by a distance — and
+    /// until now no table said what the uses behind it are. Main is being asked
+    /// whether the sole-assignment admission generalises; that is a question
+    /// about this distribution, so the distribution is measured rather than
+    /// argued.
+    pub unsupported_shape: Option<&'static str>,
     /// wave-6s: computed sub-views (`&*p.offset(e)`, `p.offset(e) as *const T`)
     /// that are themselves a raw-boundary argument. The raw use above carries
     /// the boundary; this carries the suffix the seam must render.
     pub computed_argument_views: Vec<super::slice_forms::ComputedArgumentView>,
+    /// **W6S-12 (R490-4).** How many of this subject's rewrites are W6S-8
+    /// bridges at a foreign `*const T` formal, and how many rewrites are
+    /// anything else. A subject whose ONLY uses are `*const` foreign
+    /// arguments is read through every one of them, so its slice form is the
+    /// SHARED one — whatever the declared `*mut` of the C signature says.
+    pub foreign_const_bridges: u32,
+    pub other_rewrites: u32,
+    /// **main 071c (a) — the assignment that IS the construction**, admitted
+    /// here rather than counted as an unsupported use. Condition 4's receipt:
+    /// the span and the evidence it matched, so a census can audit the
+    /// admission instead of inferring it from a subject that stopped being
+    /// held.
+    pub sized_assignments: Vec<super::sized_assignment::SizedAssignment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2333,7 +2445,23 @@ fn collect_slice_uses_with_family(
                 } else {
                     None
                 };
+                // W6S-12: is this admitted use a W6S-8 bridge at a foreign
+                // `*const T` formal? Read before the entry is taken, because
+                // the helper borrows `self`.
+                let foreign_const = classified
+                    .as_ref()
+                    .and_then(|edit| edit.as_ref())
+                    .and(self.foreign_argument_is_shared(expr, key));
+                let admitted = super::sized_assignment::admit(
+                    self.tcx,
+                    expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                );
                 let entry = self.out.entry(key).or_default();
+                if let Some(admitted) = admitted {
+                    entry.sized_assignments.push(admitted);
+                }
                 match classified {
                     // **S3.2′-2b — three outcomes, not two.** The self-advance
                     // assignment's TARGET (`p` on the left of `p = p.offset(1)`)
@@ -2341,12 +2469,19 @@ fn collect_slice_uses_with_family(
                     // keeps its name. Folding it into the reject arm would make
                     // the whole subject unsupported; folding it into the accept
                     // arm would need an edit it does not have.
-                    Some(Some(edit)) => entry.rewrites.push(edit),
+                    Some(Some(edit)) => {
+                        match foreign_const {
+                            Some(true) => entry.foreign_const_bridges += 1,
+                            _ => entry.other_rewrites += 1,
+                        }
+                        entry.rewrites.push(edit);
+                    }
                     Some(None) => {}
                     None => {
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
                             entry.unsupported_is_cursor = cursor.is_some();
+                            entry.unsupported_shape = Some(unsupported_use_shape(self.tcx, expr));
                         }
                         if let Some(cursor) = cursor {
                             entry.raw_uses.push(cursor);
@@ -2592,6 +2727,22 @@ fn collect_slice_uses_with_family(
                 return Some(Some(edit));
             }
 
+            // **W6S-11 — the array-local view root.** The right-hand side is
+            // rendered here rather than by a source subject's plan, because an
+            // array local has no subject: the array's own name IS the view.
+            if let Some((span, replacement)) = super::slice_forms::assignment_from_array_root(
+                self.tcx,
+                use_expr,
+                key,
+                self.mutable_of.contains(&key),
+            ) {
+                return Some(Some(UseEdit {
+                    span,
+                    replacement,
+                    bridge_kind: "subject-use",
+                }));
+            }
+
             // **S3.2′-2b — the PLAIN dereference.** `*p` with no arithmetic
             // under it. On `&[T]` its image is `p[0]`, and it is admitted here
             // because the census showed it never occurs alone: every subject it
@@ -2632,6 +2783,23 @@ fn collect_slice_uses_with_family(
                     || super::slice_forms::assignment_from_forward_view(self.tcx, use_expr, key)
                 {
                     return Some(None);
+                }
+                // **main 071c (a), wave-4: the assignment IS the
+                // construction.** A null-declared binding whose SOLE assignment
+                // reads the very field its extent evidence names is not writing
+                // to a slice — it is building one, and the right-hand side
+                // carries the construction so the crate stays well typed.
+                if let Some(admitted) = super::sized_assignment::admit(
+                    self.tcx,
+                    use_expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                ) {
+                    return Some(Some(UseEdit {
+                        span: admitted.value_span,
+                        replacement: admitted.value,
+                        bridge_kind: "sized-assignment",
+                    }));
                 }
                 if !self.advance_ok.contains(&key) {
                     return None;
@@ -2780,6 +2948,46 @@ fn collect_slice_uses_with_family(
                 replacement: format!("{name}.{accessor}()"),
                 bridge_kind: "subject-use",
             })
+        }
+
+        /// **W6S-12** — does this use sit at a foreign callee's `*const T`
+        /// formal? `Some(true)` for a shared foreign formal, `Some(false)` for
+        /// a mutable one, `None` when the use is not a foreign argument at
+        /// all. Only the permission is read here; the rendering is
+        /// [`Self::foreign_pointer_argument`]'s.
+        fn foreign_argument_is_shared(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<bool> {
+            use rustc_middle::ty::TyKind;
+            let rustc_hir::Node::Expr(call) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let typeck = self.tcx.typeck(key.0);
+            let TyKind::FnDef(callee_did, _) = *typeck.expr_ty(callee).kind() else {
+                return None;
+            };
+            let foreign = self.tcx.is_foreign_item(callee_did)
+                || self
+                    .tcx
+                    .hir_get_if_local(callee_did)
+                    .and_then(|node| node.body_id())
+                    .is_none();
+            if !foreign {
+                return None;
+            }
+            let signature = self.tcx.fn_sig(callee_did).skip_binder().skip_binder();
+            let TyKind::RawPtr(_, mutability) = signature.inputs().get(index)?.kind() else {
+                return None;
+            };
+            Some(matches!(mutability, Mutability::Not))
         }
 
         /// The index expression's source text, **typed as a `usize`**.

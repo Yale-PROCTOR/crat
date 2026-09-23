@@ -343,31 +343,49 @@ pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> boo
         return false;
     }
     let text = argument.trim();
-    if text.is_empty()
-        || text.contains(['{', '}', ';', '?', '|'])
-        || text.contains("=>")
-        || text.contains("&&")
-    {
+    if text.is_empty() {
         return false;
     }
-    // `=` outside `==` / `!=` / `<=` / `>=` is an assignment.
+    // **R489-3(a) — a literal is one token, and its contents are data.**
+    //
+    // Every scan below is looking for SYNTAX that would make the expression
+    // unsafe to hoist above the call. libtree's `b"\x1B[0;36m\0" as *const u8
+    // as *const c_char as *mut c_char` carries a `;` inside the byte string,
+    // and reading that as a statement separator refused a place read — the
+    // same defect R482-4(f) fixed in the C-9 renderer's delimiter scan, in the
+    // other scan of the same seam. So the three scans skip literals whole,
+    // using that fix's own scanner.
     let bytes = text.as_bytes();
-    for (index, &byte) in bytes.iter().enumerate() {
-        if byte != b'=' {
+    let mut index = 0usize;
+    let mut identifier_start = None;
+    while index < bytes.len() {
+        if let Some(end) = super::super::c9::literal_end(bytes, index) {
+            identifier_start = None;
+            index = end;
             continue;
         }
-        let previous = index.checked_sub(1).map(|i| bytes[i]);
-        let next = bytes.get(index + 1).copied();
-        if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+        let byte = bytes[index];
+        if matches!(byte, b'{' | b'}' | b';' | b'?' | b'|') {
             return false;
         }
-    }
-    // Every call is a method call from the allow-list.
-    let mut identifier_start = None;
-    let mut chars = text.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
+        if byte == b'=' {
+            // `=` outside `==` / `!=` / `<=` / `>=` is an assignment.
+            let previous = index.checked_sub(1).map(|i| bytes[i]);
+            let next = bytes.get(index + 1).copied();
+            if !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+                return false;
+            }
+        }
+        if byte == b'&' && bytes.get(index + 1) == Some(&b'&') {
+            return false;
+        }
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("byte index is a boundary");
         if ch.is_alphanumeric() || ch == '_' {
             identifier_start.get_or_insert(index);
+            index += ch.len_utf8();
             continue;
         }
         if let Some(start) = identifier_start.take() {
@@ -381,6 +399,7 @@ pub(crate) fn a5_raw_expr_view_admits(source_shape: &str, argument: &str) -> boo
                 }
             }
         }
+        index += ch.len_utf8();
     }
     // A trailing identifier is a place read, never a call.
     true
@@ -654,6 +673,10 @@ pub(crate) struct ForeignCallArgFact {
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
     pub contract_count: Option<ContractCountOperandFact>,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path.
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer.
+    pub address_root_raw_pointer: bool,
     /// Wave-4 #1b: the call's return value is discarded at the call (a `;`
     /// statement or `let _ =`), so a returned alias of an argument is never
     /// retained by the caller.
@@ -713,6 +736,12 @@ pub(crate) struct RawBoundarySiteFact {
     /// Can this callee hand a pointer back — by return or by output storage?
     /// Fails closed: an unresolved callee answers `true`.
     pub callee_may_yield_pointer: bool,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path — the address of a
+    /// live local, which needs no decision-table entry.
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer, so the root IS a
+    /// pointer subject and keeps its decision path.
+    pub address_root_raw_pointer: bool,
     /// wave-6v2 (R406-6): the sibling argument positions of this call whose
     /// operand is `&mut local` over a caller local that never leaves the
     /// caller's frame (`binn_counted::frame_confined`). A callee that retains
@@ -884,6 +913,8 @@ impl RawBoundarySiteFacts {
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
+                    address_root_local: fact.address_root_local,
+                    address_root_raw_pointer: fact.address_root_raw_pointer,
                     callee_may_yield_pointer: unique_candidate(&fact.callee, &candidates)
                         .is_none_or(|site| site.may_yield_pointer),
                     frame_confined_outputs: Vec::new(),
@@ -990,6 +1021,8 @@ impl RawBoundarySiteFacts {
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
+                            address_root_local: argument.address_root_local,
+                            address_root_raw_pointer: argument.address_root_raw_pointer,
                             callee_may_yield_pointer: unique_candidate(&callee_key, &candidates)
                                 .is_none_or(|site| site.may_yield_pointer),
                             frame_confined_outputs: frame_confined_outputs.clone(),
@@ -1134,10 +1167,16 @@ pub(crate) enum RetentionUnknownReason {
     AnalysisIncomplete,
     ReturnedAliasUsed,
     ReturnedAliasUnknown,
+    /// **R481-2 (USER ruling, 2026-09-21).** Not an unknown at all: retention
+    /// is KNOWN positive at this site and it is bridged under the confirmed
+    /// tier-2 retention waiver. It lives in this enum because the T2
+    /// disposition carries exactly one reason, and it reads in the artifacts
+    /// beside the unknown kinds it stands next to.
+    PositiveRetentionWaived,
 }
 
 impl RetentionUnknownReason {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::CalleeUnresolved,
         Self::FnPtrWeb,
         Self::OpenBoundary,
@@ -1152,6 +1191,7 @@ impl RetentionUnknownReason {
         Self::AnalysisIncomplete,
         Self::ReturnedAliasUsed,
         Self::ReturnedAliasUnknown,
+        Self::PositiveRetentionWaived,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -1170,6 +1210,7 @@ impl RetentionUnknownReason {
             Self::AnalysisIncomplete => "retention-analysis-incomplete",
             Self::ReturnedAliasUsed => "retention-returned-alias-used",
             Self::ReturnedAliasUnknown => "retention-returned-alias-unknown",
+            Self::PositiveRetentionWaived => "retention-positive-waived",
         }
     }
 }
@@ -3927,6 +3968,15 @@ impl RetentionSummaries {
     }
 }
 
+/// **R481-2 / R486-1 (USER ruling, 2026-09-21) — the tier-2 RETENTION waiver.**
+///
+/// Addendum 130 reserved the known-retention bridge for an explicit waiver
+/// confirmed by the user; the user confirmed it (Decision B, relays 049/053).
+/// Spent only after every proof has been tried, and only where retention is
+/// the site's one remaining hold.
+pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
+pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_TEXT: &str = "Tier-2 retention waiver (user ruling 2026-09-21, addendum 130). At a receipted site whose only remaining hold is a retention receipt, crat emits the bridge it would have emitted under tier 1: the subject keeps its safe form and the callee receives the raw pointer. The conditional soundness claim excludes an execution in which the callee uses that retained raw alias while the originating reference is live. It licenses only the recorded safe-to-raw view at that site, and no other hold: a site carrying a second hold stays held.";
+
 pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
     "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01";
 pub(crate) const RAW_BOUNDARY_WAIVER_TEXT: &str = "C-aliasing semantics at unsafe bridges. At a receipted T2 site, crat may expose a raw pointer derived from a safe reference to a boundary whose retention behavior is unknown, in order to preserve the source program's C calling convention. Current Rust aliasing models can invalidate a retained raw alias when the originating mutable reference remains live or is later reused. The conditional soundness claim therefore excludes an execution that retains and later uses that raw alias unless no-retention is independently established. This waiver licenses only the recorded safe-to-raw view at that call. It licenses no integer-to-pointer round trip, ownership transfer, unchecked null dereference, positive-retention site, or unreceipted reuse.";
@@ -4459,6 +4509,42 @@ pub(crate) fn outbound_reference_view(
     }
 }
 
+/// **R473-2 — the address of a value local is a trivially safe source.**
+///
+/// `&x` / `&mut x` over a LOCAL binding whose own type is not a raw pointer
+/// borrows a place in the caller's own frame. There is no pointer subject to
+/// decide, so the hypothetical table carries no entry for the root, and the
+/// `SubjectNotSafe` gate would refuse it for want of a fact it cannot have.
+/// A `Degraded` subject IS in that table and takes its own path, so absence
+/// there means "not a pointer subject", never "unsafe".
+///
+/// Three clauses, each independently load-bearing:
+///
+/// 1. the shape is exactly `addr-of` / `addr-of-mut`. A `-cast` variant is a
+///    different source expression and keeps its own path;
+/// 2. the root is a LOCAL binding path — a projection, deref or temporary is
+///    not the address of a local, and `&mut (*p).f` is only as live as `p`;
+/// 3. the local's own type is not a raw pointer — that root IS a pointer
+///    subject, and a syntactic admission must not answer its decision.
+///
+/// The callee's RETENTION of the address is the tier's question, not this
+/// rule's: the admission returns a source form into the same flow every other
+/// source takes, so a retained address is still refused by positive retention.
+pub(crate) fn address_of_value_local_source(
+    source_shape: &str,
+    address_root_local: bool,
+    address_root_raw_pointer: bool,
+) -> Option<super::Decision> {
+    if !address_root_local || address_root_raw_pointer {
+        return None;
+    }
+    match source_shape {
+        "addr-of" => Some(super::Decision::Ref { mutable: false }),
+        "addr-of-mut" => Some(super::Decision::Ref { mutable: true }),
+        _ => None,
+    }
+}
+
 /// Policy seam over an already selected expression form. The target raw
 /// pointer's mutability cannot establish permission for subsequent child uses.
 pub(crate) fn returned_child_permission(
@@ -4924,6 +5010,13 @@ pub(crate) struct RawBoundaryDispositionIndex {
     /// K18'/OAP-CHILD-ACCESS, carried per site so the terminal emission asks
     /// the same question the disposition asked.
     type_backed_child_access: BTreeMap<RawBoundarySiteKey, super::returned_child::ChildAccess>,
+    /// **R473-2.** The disposition a site rooted at the address of a VALUE
+    /// LOCAL would carry if that root needed no decision-table entry. It is
+    /// kept off `by_site` deliberately: the admission unlocks the CALLEE's
+    /// parameter input and nothing else, so no other arm's reading of this
+    /// site moves. Measured cost of publishing it instead: 18 reds over seven
+    /// lanes (report 047).
+    address_root: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
     /// **Wave-6o (relay 018 §1, R304-2).** Null-init-family locals whose
     /// boundary site would be a PENDING sibling-overlap row if delivered — a
     /// stated hold the family consults before delivering.
@@ -4968,6 +5061,15 @@ impl RawBoundaryDispositionIndex {
         self.type_backed_child_access.get(key)
     }
 
+    /// R473-2: the address-of-a-value-local disposition for this site, if the
+    /// site is one. Only `callee_parameter_input` consults it.
+    pub(crate) fn address_root_disposition(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&RawBoundaryDisposition> {
+        self.address_root.get(key)
+    }
+
     pub(crate) fn returned_child_evidence(
         &self,
         key: &RawBoundarySiteKey,
@@ -5001,6 +5103,32 @@ impl RawBoundaryDispositionIndex {
                     .insert(site.key.clone(), access.clone());
             }
             let mut mutable_binding_required = false;
+            // **R481-2.** Hoisted out of the render-site construction below so
+            // that the tier-2 retention waiver can ask it: the waiver licenses
+            // a BRIDGE, and a bridge exists only where the callee's parameter
+            // stays raw. Verbatim the computation that lived there.
+            let target_stays_raw = site.callee_local.is_none_or(|callee| {
+                hypothetical
+                    .entries
+                    .iter()
+                    .find_map(|(subject, decision)| {
+                        let super::SubjectKind::Param { hir_index } = subject.kind else {
+                            return None;
+                        };
+                        (subject.fn_did == callee && hir_index == site.key.argument_index)
+                            .then_some(match decision {
+                                super::Decision::Degraded(_) => true,
+                                super::Decision::Ref { .. }
+                                | super::Decision::InferredRef { .. }
+                                | super::Decision::Slice { .. }
+                                | super::Decision::Opt { .. }
+                                | super::Decision::Box(_)
+                                | super::Decision::NestedSlice { .. }
+                                | super::Decision::Cursor { .. } => false,
+                            })
+                    })
+                    .unwrap_or(true)
+            });
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
                     let node = site.node.ok_or_else(|| {
@@ -5015,12 +5143,24 @@ impl RawBoundaryDispositionIndex {
                             "depth-2 out-param storage is not a direct variable local".to_owned(),
                         ));
                     }
-                    let (subject, decision) = decisions.get(&node).copied().ok_or_else(|| {
-                        (
-                            RawBoundaryBlockReason::SubjectNotSafe,
-                            "hypothetical has no safe subject decision".to_owned(),
-                        )
-                    })?;
+                    // R473-2: the address of a value local carries its own
+                    // source form; it is consulted only where the table has
+                    // nothing, so a decided root is untouched.
+                    let address_root = address_of_value_local_source(
+                        site.source_shape,
+                        site.address_root_local,
+                        site.address_root_raw_pointer,
+                    );
+                    let (subject, decision) = match (decisions.get(&node).copied(), &address_root) {
+                        (Some((subject, decision)), _) => (Some(subject), decision),
+                        (None, Some(decision)) => (None, decision),
+                        (None, None) => {
+                            return Err((
+                                RawBoundaryBlockReason::SubjectNotSafe,
+                                "hypothetical has no safe subject decision".to_owned(),
+                            ));
+                        }
+                    };
                     let source_stays_raw = match decision {
                         super::Decision::Degraded(_) => true,
                         super::Decision::Ref { .. }
@@ -5354,12 +5494,12 @@ impl RawBoundaryDispositionIndex {
                             // WRITES through the subject or any alias of it.
                             && !(site.callee_local.is_some_and(|callee| {
                                 retention.returns_argument_only(callee, site.key.argument_index)
-                            }) && match subject.kind {
+                            }) && subject.is_some_and(|subject| match subject.kind {
                                 super::SubjectKind::Param { hir_index } => {
                                     retention.no_write_through(node.0, hir_index)
                                 }
                                 _ => false,
-                            })
+                            }))
                         {
                             // **R283-3 widened this arm to `*mut` positions.**
                             // It used to run only at `*const` targets, so a
@@ -5467,12 +5607,14 @@ impl RawBoundaryDispositionIndex {
                                     if site.callee_local.is_some_and(|callee| {
                                         retention
                                             .returns_argument_only(callee, site.key.argument_index)
-                                    }) && match subject.kind {
-                                        super::SubjectKind::Param { hir_index } => {
-                                            retention.no_write_through(node.0, hir_index)
+                                    }) && subject.is_some_and(|subject| {
+                                        match subject.kind {
+                                            super::SubjectKind::Param { hir_index } => {
+                                                retention.no_write_through(node.0, hir_index)
+                                            }
+                                            _ => false,
                                         }
-                                        _ => false,
-                                    } =>
+                                    }) =>
                                 {
                                     evidence = format!("{evidence};returned-alias-used");
                                     Ok(RawBoundaryDisposition::T2 {
@@ -5482,10 +5624,47 @@ impl RawBoundaryDispositionIndex {
                                         evidence,
                                     })
                                 }
-                                Some((_, RetentionVerdict::Retains { .. })) | None => Err((
-                                    RawBoundaryBlockReason::PositiveRetention,
-                                    format!("{sink:?}"),
-                                )),
+                                // **R481-2 (USER ruling) — the tier-2 retention
+                                // waiver.** Every proof has been tried before
+                                // this arm: a frame-bounded (R476-1) or
+                                // stack-storage discharge answers `NoRetain`
+                                // above and carries its own proof receipt,
+                                // never this. What is left is a site whose
+                                // ONLY remaining hold is the callee's
+                                // retention. Every other refusal in this
+                                // function is untouched.
+                                Some((_, RetentionVerdict::Retains { .. })) | None
+                                    if !target_stays_raw =>
+                                {
+                                    // No bridge exists where the callee's own
+                                    // parameter is rewritten safe: the waiver
+                                    // licenses a safe-to-raw view and there is
+                                    // no raw view here. The site holds exactly
+                                    // as it did before the waiver.
+                                    Err((
+                                        RawBoundaryBlockReason::PositiveRetention,
+                                        format!("{sink:?}"),
+                                    ))
+                                }
+                                Some((_, RetentionVerdict::Retains { .. })) | None => {
+                                    evidence = format!(
+                                        "{evidence};retention-waiver(tier-2, kind=known, subject={}, callee={}):{sink:?}",
+                                        // `subject` is an Option on lines that
+                                        // carry the address-root arm and a plain
+                                        // Subject on lines that do not; `as_ref`
+                                        // reads the label on both.
+                                        subject
+                                            .as_ref()
+                                            .map_or("-", |subject| subject.label.as_str()),
+                                        site.key.callee.path,
+                                    );
+                                    Ok(RawBoundaryDisposition::T2 {
+                                        template,
+                                        reason: RetentionUnknownReason::PositiveRetentionWaived,
+                                        waiver_id: RAW_BOUNDARY_RETENTION_WAIVER_ID,
+                                        evidence,
+                                    })
+                                }
                             }
                         }
                         RetentionVerdict::Unknown { reason, .. } => {
@@ -5498,9 +5677,43 @@ impl RawBoundaryDispositionIndex {
                         }
                     }
                 })();
-            let disposition = disposition.unwrap_or_else(|(reason, detail)| {
-                RawBoundaryDisposition::Blocked { reason, detail }
-            });
+            // R473-2: an admitted address-of-a-value-local site keeps its
+            // PUBLIC refusal and hands the computed disposition to the callee
+            // parameter input alone.
+            let disposition = match disposition {
+                Ok(admitted)
+                    if site.node.is_some_and(|node| !decisions.contains_key(&node))
+                        && address_of_value_local_source(
+                            site.source_shape,
+                            site.address_root_local,
+                            site.address_root_raw_pointer,
+                        )
+                        .is_some() =>
+                {
+                    // The closure published three per-site facts on its way to
+                    // the admission. A publicly-refused site published none of
+                    // them before R473-2 and must publish none now, or another
+                    // arm reads a fact that only exists because this input was
+                    // admitted — the ill-typed `&mut *value` reborrow wave-6o's
+                    // pin caught.
+                    out.returned_children.remove(&site.key);
+                    out.negative_write.remove(&site.key);
+                    out.return_independent.remove(&site.key);
+                    out.address_root.insert(site.key.clone(), admitted);
+                    RawBoundaryDisposition::Blocked {
+                        reason: RawBoundaryBlockReason::SubjectNotSafe,
+                        // The `reason` is a production key and does not move
+                        // (R451-2). The detail carries the receipt, so the
+                        // count of admitted sites stays auditable.
+                        detail: "hypothetical has no safe subject decision;                                 address-of-value-local-input"
+                            .to_owned(),
+                    }
+                }
+                other => other.unwrap_or_else(|(reason, detail)| RawBoundaryDisposition::Blocked {
+                    reason,
+                    detail,
+                }),
+            };
             let box_slice = site
                 .node
                 .and_then(|node| decisions.get(&node).map(|(_, decision)| *decision))
@@ -5514,28 +5727,6 @@ impl RawBoundaryDispositionIndex {
                     | super::Decision::Cursor { .. }
                     | super::Decision::Degraded(_) => false,
                 });
-            let target_stays_raw = site.callee_local.is_none_or(|callee| {
-                hypothetical
-                    .entries
-                    .iter()
-                    .find_map(|(subject, decision)| {
-                        let super::SubjectKind::Param { hir_index } = subject.kind else {
-                            return None;
-                        };
-                        (subject.fn_did == callee && hir_index == site.key.argument_index)
-                            .then_some(match decision {
-                                super::Decision::Degraded(_) => true,
-                                super::Decision::Ref { .. }
-                                | super::Decision::InferredRef { .. }
-                                | super::Decision::Slice { .. }
-                                | super::Decision::Opt { .. }
-                                | super::Decision::Box(_)
-                                | super::Decision::NestedSlice { .. }
-                                | super::Decision::Cursor { .. } => false,
-                            })
-                    })
-                    .unwrap_or(true)
-            });
             out.render_sites.insert(
                 site.key.clone(),
                 RawBoundaryRenderSite {
@@ -5678,6 +5869,31 @@ impl RawBoundaryDispositionIndex {
             }
             out.address_sites.extend(views);
         }
+        // **R515-5 (i) — one view per operand span.** A cast operand plans two
+        // views at the SAME span (the comparison's `raw-op-address-view` and
+        // the cast's `raw-op-cast-sink`), with the same template and the same
+        // replacement. Two class sites at one interval hold the whole class
+        // (`intra-class-interval-overlap`), which drops every edit the class
+        // owns and leaves the function byte-identical with no receipt. One
+        // view is the whole composition: everything outside that span — the
+        // cast included — is kept verbatim, so `pIn as *mut V4` becomes
+        // `core::ptr::from_ref(pIn) as *mut V4`. The comparison's view is the
+        // one kept, because it is what the gate refuses the subject without.
+        let mut seen: Vec<(
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            rustc_span::Span,
+        )> = Vec::new();
+        let mut kept: Vec<AddressViewSite> = Vec::new();
+        let mut ordered = std::mem::take(&mut out.address_sites);
+        ordered.sort_by_key(|site| usize::from(site.bridge_kind == "raw-op-cast-sink"));
+        for site in ordered {
+            if seen.contains(&(site.node, site.span)) {
+                continue;
+            }
+            seen.push((site.node, site.span));
+            kept.push(site);
+        }
+        out.address_sites = kept;
         out.address_sites.sort_by_key(|site| {
             (
                 site.node.0.local_def_index.as_u32(),
@@ -6098,6 +6314,86 @@ mod tests {
 
     /// A minimal cursor plan: this seam reads only the decision's mutability,
     /// so the plan's contents are deliberately empty rather than fabricated.
+    /// **R489-3(a).** libtree's `print_line` passes an ANSI colour constant at
+    /// a foreign raw formal:
+    ///
+    /// ```text
+    /// b"\x1B[0;36m\0" as *const u8 as *const libc::c_char as *mut libc::c_char
+    /// ```
+    ///
+    /// The A5 raw view hoists its argument above the call, so the argument must
+    /// be effect-free, and the gate proves that syntactically — it refuses any
+    /// text carrying `;`, `{`, `}`, `?`, `|`, `=>` or `&&`. The `;` here is
+    /// inside the BYTE STRING (`\x1B[0;36m`), which is data, not syntax: the
+    /// same defect R482-4(f) fixed in the C-9 renderer's delimiter scan, in the
+    /// other scan of the same seam. Two rows sit behind it
+    /// (`color_bold#3`, `color_regular#4`).
+    #[test]
+    fn r489_3a_a_semicolon_inside_a_literal_is_data_not_an_effect() {
+        let argument =
+            "b\"\\x1B[0;36m\\0\" as *const u8 as *const libc::c_char as *mut libc::c_char";
+        assert!(
+            a5_raw_expr_view_admits("raw-expr", argument),
+            "an ANSI byte string is a place read, not an effect: {argument}"
+        );
+    }
+
+    /// Every forbidden character, as data inside a literal. Each is a separate
+    /// reason the gate would refuse, so each is asserted rather than assumed.
+    #[test]
+    fn r489_3a_every_forbidden_character_is_data_inside_a_literal() {
+        for argument in [
+            r#"b"a;b" as *const u8"#,
+            r#"b"a{b}c" as *const u8"#,
+            r#"b"a?b" as *const u8"#,
+            r#"b"a|b" as *const u8"#,
+            r#"b"a=>b" as *const u8"#,
+            r#"b"a&&b" as *const u8"#,
+            r#"b"a=b" as *const u8"#,
+            r#"';' as u8 as *const u8"#,
+        ] {
+            assert!(
+                a5_raw_expr_view_admits("raw-expr", argument),
+                "{argument} is one token of data"
+            );
+        }
+    }
+
+    /// Controls — the gate still refuses what it exists to refuse, OUTSIDE a
+    /// literal: a statement, a block, a closure, a short-circuit, an
+    /// assignment, and any call that is not an address method.
+    #[test]
+    fn r489_3a_the_gate_still_refuses_effects_outside_a_literal() {
+        for argument in [
+            "f(); g()",
+            "{ let x = 1; x } as *const u8",
+            "p.map(|q| q) as *const u8",
+            "a && b",
+            "x = 1",
+            "compute() as *const u8",
+            // Each of these is refused by the forbidden-character clause
+            // ALONE — no call, no assignment, no short circuit — so that
+            // clause is load-bearing rather than shadowed by its neighbours.
+            "p ? q",
+            "a | b",
+            "{ x }",
+            "a => b",
+        ] {
+            assert!(
+                !a5_raw_expr_view_admits("raw-expr", argument),
+                "{argument} is not hoistable"
+            );
+        }
+    }
+
+    /// Control — the shape gate is unchanged: only `raw-expr` reaches this
+    /// predicate at all.
+    #[test]
+    fn r489_3a_only_a_raw_expression_shape_is_asked() {
+        assert!(!a5_raw_expr_view_admits("bare-local", "x"));
+        assert!(!a5_raw_expr_view_admits("addr-of", "&x"));
+    }
+
     fn cursor_decision(mutable: bool) -> super::super::Decision {
         super::super::Decision::Cursor {
             mutable,
@@ -7167,6 +7463,7 @@ mod tests {
                 "retention-analysis-incomplete",
                 "retention-returned-alias-used",
                 "retention-returned-alias-unknown",
+                "retention-positive-waived",
             ]
         );
     }

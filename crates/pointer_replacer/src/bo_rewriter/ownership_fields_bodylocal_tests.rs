@@ -2040,7 +2040,7 @@ fn r395_scalar_arithmetic_call_arguments_are_pure_but_effectful_ones_hold() {
         declarations()
     );
     let s = verify(&input, "buffer", BoxShape::Slice, false);
-    assert!(s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), (n * 2 + 1) / 3 % 4)"));
+    assert!(lends_buffer(&s, "(n * 2 + 1) / 3 % 4"), "{s}");
     let effectful = format!(
         "{} static mut COUNTER: usize = 0; unsafe fn next()->usize {{ COUNTER+=1; COUNTER }} unsafe fn read(p:*mut u32, k:usize)->u32 {{ *p.offset(k as isize) }} pub unsafe fn prepare()->u32 {{ let mut buffer=calloc(4,core::mem::size_of::<u32>()) as *mut u32; *buffer=9; let value=read(buffer, next() * 2); free(buffer as *mut core::ffi::c_void); value }}",
         declarations()
@@ -2108,10 +2108,7 @@ fn r408_argument_reading_through_the_owner_holds_no_hoist_is_owed() {
             continue;
         }
         let s = verify(&control, "buffer", BoxShape::Slice, false);
-        assert!(
-            s.contains("read(<[_]>::as_mut_ptr(&mut *(buffer)), 1)"),
-            "{s}"
-        );
+        assert!(lends_buffer(&s, "1"), "{s}");
     }
 }
 
@@ -3032,6 +3029,22 @@ fn r457_a_synthesised_struct_literal_initialises_each_field_in_its_delivered_for
 /// `Copy` — must HOLD the owner rather than initialise the field with a value
 /// of the wrong type. Fail-closed, the same way the moved-out load's
 /// non-optional shape holds.
+/// R492-4 (relay 061): the lend of a Box to a callee whose formal is raw is
+/// `<[_]>::as_mut_ptr(&mut *(owner))`; where wave-6a's A9 converts that
+/// formal to a shared slice the SAME lend is `&*(owner)` (report 048 §1's
+/// matrix — both are this producer's renderings, chosen by the callee's
+/// terminal interface). Which one appears is the frame's; the argument after
+/// it is not, and neither is the fact that the owner is lent exactly once.
+fn lends_buffer(source: &str, rest: &str) -> bool {
+    [
+        format!("read(<[_]>::as_mut_ptr(&mut *(buffer)), {rest})"),
+        format!("read(&*(buffer), {rest})"),
+        format!("read(&mut *(buffer), {rest})"),
+    ]
+    .iter()
+    .any(|text| source.contains(text))
+}
+
 /// R466-4 (relay 057): the synthesised literal must be text the AST graft
 /// ACCEPTS. `graft_expr` takes a replacement only if it round-trips through
 /// the pretty printer whitespace-insensitively, and the printer spells a
@@ -3302,6 +3315,82 @@ fn r442_an_alias_another_family_renders_keeps_the_owner_typed() {
         assert!(
             !row.contains("native-view-alias-family-owned"),
             "the alias is the deciding family's to render: {row}"
+        );
+    })
+    .unwrap();
+}
+
+/// R521-5 / relay 072 — the ONE synthesised literal now spells the two field
+/// kinds that made the return certificate refuse the L01^5 units.
+///
+/// Measured on the census's own substrate inputs (the same reconstruction the
+/// bst fixture uses). Before this commit the certificate's private
+/// `struct_initializer` refused quadtree's `quadtree_t` with
+/// `struct-field:key_free` (an `Option<unsafe extern "C" fn(..)>`) and refused
+/// ht's `ht` wholesale with `…:owned-field` (a model-`Owning` field beside a
+/// raw zero is an `E0308`). This family's literal answers both: `None` for the
+/// nullable function pointer, and the field's DELIVERED form wherever a
+/// transaction owns it (R457-4).
+#[test]
+fn r521_the_literal_spells_the_two_field_kinds_the_certificate_refused() {
+    use super::decision::ownership_fields_constructor::struct_literal;
+    const QUADTREE: &str = include_str!("ownership_fields_fixture_quadtree.rs");
+    const HT: &str = include_str!("ownership_fields_fixture_ht.rs");
+
+    fn pointee<'tcx>(
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        name: &str,
+    ) -> rustc_middle::ty::Ty<'tcx> {
+        let did = tcx
+            .hir_free_items()
+            .map(|id| id.owner_id.def_id)
+            .find(|did| {
+                tcx.opt_item_name(did.to_def_id())
+                    .is_some_and(|item| item.as_str() == name)
+                    && matches!(
+                        tcx.def_kind(did.to_def_id()),
+                        rustc_hir::def::DefKind::Struct
+                    )
+            })
+            .unwrap_or_else(|| panic!("no struct {name}"));
+        tcx.type_of(did).skip_binder()
+    }
+
+    // (a) the nullable function pointer: quadtree's `key_free`.
+    ::utils::compilation::run_compiler_on_str(QUADTREE, |tcx| {
+        let ty = pointee(tcx, "quadtree");
+        let literal = struct_literal(tcx, ty, &|_, _| None).expect("quadtree literal");
+        assert!(
+            literal.contains("key_free: None"),
+            "the nullable fn pointer zeroes to None: {literal}"
+        );
+        assert!(
+            literal.contains("root: ::core::ptr::null_mut()") && literal.contains("length: 0u32"),
+            "the other two fields keep their own zeroes: {literal}"
+        );
+    })
+    .unwrap();
+
+    // (b) the owned field: ht's `entries`, where a transaction delivers it.
+    ::utils::compilation::run_compiler_on_str(HT, |tcx| {
+        let ty = pointee(tcx, "ht");
+        let owned = |did: rustc_span::def_id::DefId, index: usize| {
+            let path = tcx.def_path_str(did);
+            (path.ends_with("::ht") && index == 0).then(|| "opt-box-slice".to_owned())
+        };
+        let raw = struct_literal(tcx, ty, &|_, _| None).expect("ht literal, no transaction");
+        assert!(
+            raw.contains("entries: ::core::ptr::null_mut()"),
+            "with no transaction the field keeps the raw zero: {raw}"
+        );
+        let delivered = struct_literal(tcx, ty, &owned).expect("ht literal, owned field");
+        assert!(
+            delivered.contains("entries: None"),
+            "an owned field takes its delivered form: {delivered}"
+        );
+        assert!(
+            !delivered.contains("entries: ::core::ptr::null_mut()"),
+            "and never both: {delivered}"
         );
     })
     .unwrap();

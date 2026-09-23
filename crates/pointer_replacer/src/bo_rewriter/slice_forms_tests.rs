@@ -1437,12 +1437,13 @@ fn wave6s_option_slice_destination_refuses_a_retyped_view() {
     assert_ne!(p.2, "<emitted>", "{rows:?}");
 }
 
-/// **CONTROL — an ARRAY LOCAL as the view's root is not admitted.** heman
-/// `kazmath::quaternion::kmQuaternionRotationMatrix`'s `pMatrix` takes its
-/// view off the function's own `[f32; 16]` (`&mut *m4x4.as_mut_ptr().offset(0)
-/// as *mut c_float`), which is not a pointer binding, so it carries no subject
-/// and no view: the row stays this family's. The boundary is pinned here so it
-/// is visible when the array-local root is built (report 021 §3).
+/// **The heman corpus row, after W6S-11.** `kmQuaternionRotationMatrix`'s
+/// `pMatrix` takes its view off the function's own `[f32; 16]`
+/// (`&mut *m4x4.as_mut_ptr().offset(0) as *mut c_float`). Report 021 pinned it
+/// as NOT admitted — an array local carries no subject, so there was no view.
+/// W6S-11 gives it one, and the row leaves this family: its reason is now the
+/// Option family's `null-init` (R217-2(a); the name is kept so the movement is
+/// traceable to the pin it replaces).
 #[test]
 fn wave6s_array_local_root_is_not_yet_a_view_root() {
     let input = include_str!("testdata/wave6s-drift/heman-quaternion-rotation-matrix.rs");
@@ -1453,7 +1454,7 @@ fn wave6s_array_local_root_is_not_yet_a_view_root() {
         .find(|(name, is_param, _)| name == "pMatrix" && !is_param)
         .map(|(_, _, reason)| reason.clone())
         .unwrap_or_else(|| panic!("{rows:?}"));
-    assert_eq!(reason, "slice-use-unsupported", "{rows:?}");
+    assert_eq!(reason, "null-init", "{rows:?}");
 }
 
 /// **The doubled view (R475-3), as a REPRODUCTION rather than a guess.**
@@ -1779,4 +1780,326 @@ fn wave6s_local_callee_argument_keeps_its_own_path() {
         !flat.contains("sum(data.as_ptr()"),
         "a local callee is not bridged here: {source}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W6S-9 — the UNCOLLECTED call position, MEASURED AND NOT BUILT (report 059)
+//
+// The premise of 058 STOPs 2 and 3 was that these positions lack an ARM. They
+// do not. Both renderings already exist and both fire in a reduction — the
+// two controls below — so what distinguishes the corpus rows is not the
+// rendering but the boundary planner's collected fact set: where the planner
+// did not collect a position, it had REFUSED it, and admitting it in the use
+// walk overrides the refusal rather than supplying anything.
+//
+// Measured: a blanket admission of a bare local-callee argument turns three
+// hold controls red — `emit_tests::slu_w1_positive_retention_stays_held`,
+// `ordinary_argument_permission_tests::
+// ordinary_argument_shared_subject_holds_with_its_typed_reason` and
+// `slice_passon_tests::wave6s2_pin_pass_on_into_a_positively_retaining_callee_stays_held`
+// — i.e. it passes a subject to a callee that STORES it (`KEEP = p`, positive
+// retention, addendum 130's one genuinely new UB channel) and promotes a
+// shared subject with a writable descendant. The arm was reverted; the
+// controls below stay as the record of what a reduction does.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — a thin `ref` formal already takes the ELEMENT in a reduction**
+/// (058 STOP 3; the corpus row is bzip2
+/// `blocksort::mainQSort3::block#2` at `mainSimpleSort(ptr, block, …)`, whose
+/// refusal this fixture does NOT reproduce).
+#[test]
+fn wave6s_bare_argument_at_a_thin_callee_takes_the_element() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sink(mut p: *mut u8, mut n: i32) -> i32 { return *p as i32 + n; }
+ pub unsafe extern "C" fn drive(mut block: *mut u8, mut n: i32) -> i32 {
+    let mut a = *block.offset(1 as i32 as isize) as i32;
+    return sink(block, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("block:&[u8]") || flat.contains("block:&mut[u8]"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("sink(&block[0],n)")
+            || flat.contains("sink(&mutblock[0],n)")
+            || flat.contains("sink(block.first().unwrap(),n)")
+            || flat.contains("sink(block.first_mut().unwrap(),n)"),
+        "the thin formal takes the element: {source}"
+    );
+}
+
+/// **CONTROL — a `slice` formal already takes the slice whole in a
+/// reduction.** The callee delivers; the argument is the delivered subject,
+/// with no adapter of its own and no extent invented. The 18 corpus rows of
+/// this shape are refused by the planner, not by the absence of this.
+#[test]
+fn wave6s_bare_argument_at_a_slice_callee_passes_the_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sum(mut p: *const u8, mut n: i32) -> i32 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n { acc += *p.offset(i as isize) as i32; i += 1; }
+    return acc;
+ }
+ pub unsafe extern "C" fn drive(mut data: *const u8, mut n: i32) -> i32 {
+    let mut a = *data.offset(1 as i32 as isize) as i32;
+    return sum(data, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("data:&[u8]"), "{source}");
+    assert!(
+        flat.contains("sum(data,n)"),
+        "the slice passes whole: {source}"
+    );
+    assert!(
+        !flat.contains("as_ptr()"),
+        "no raw bridge is needed: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6S-11 — the ARRAY-LOCAL view root (058 §2(d), 061 STOP 3)
+//
+// heman `kmQuaternionRotationMatrix` writes
+//
+//     let mut pMatrix = 0 as *mut c_float;          // null-initialised
+//     let mut m4x4: [c_float; 16] = [0.; 16];
+//     pMatrix = &mut *m4x4.as_mut_ptr().offset(0) as *mut c_float;
+//     … *pMatrix.offset(k) …
+//
+// The same shape with the view in the DECLARATION already delivers (the
+// construction family types it). By ASSIGNMENT it does not: W6S-7's walk
+// requires the view's root to be a pointer BINDING, and an array local is
+// not one — it carries no subject to hang the view on. It needs none: the
+// array's own name is the view (`&mut m4x4[e..]`), the extent is the array's,
+// and nothing is fabricated.
+// ---------------------------------------------------------------------------
+
+/// **W6S-11 — an array local is a view root, and the wall moves off this
+/// family.** The use walk admits the assignment and the row becomes the
+/// Option family's `null-init`; what it does with the value is §3 of report
+/// 062's STOP — for a BINDING root the composition works (lodepng
+/// `addChunk_IHDR::data` delivered at batch 13/14 that way), for an ARRAY root
+/// `collect_composable_edits` cannot see this arm's edit, because it reads
+/// only edits attached to OTHER delivered subjects and an array local is not
+/// one.
+#[test]
+fn wave6s_array_local_is_a_view_root() {
+    let rows = super::emit_tests::decisions_of(ARRAY_ROOT_SHAPE);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "slice-use-unsupported", "{rows:?}");
+    let source = emit(ARRAY_ROOT_SHAPE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    if reason == "<emitted>" {
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("p=Some(&mutm4x4[(0asi32)asusize..])")
+                || flat.contains("p=Some(&m4x4[(0asi32)asusize..])"),
+            "the array's own name is the view: {source}"
+        );
+    } else {
+        assert_eq!(reason, "null-init", "{rows:?}");
+    }
+}
+
+const ARRAY_ROOT_SHAPE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(0 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#;
+
+/// **CONTROL — the declaration form is untouched.** The same view in the
+/// local's initialiser is the construction family's and already delivers; this
+/// arm must not change it.
+#[test]
+fn wave6s_array_root_in_a_declaration_is_unchanged() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p: *mut f32 = &mut *m4x4.as_mut_ptr().offset(2 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("p:&[f32]") || flat.contains("p:&mut[f32]"),
+        "{source}"
+    );
+}
+
+/// **FAULT — a BACKWARD delta off an array root is refused.** The sign
+/// authority is one; a view that can move backwards is the bidirectional
+/// family's.
+#[test]
+fn wave6s_array_root_refuses_a_backward_view() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(-(1 as i32) as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize);
+ }
+"#,
+    );
+    let p = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(p.2, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a retyped view off an array root is never THIS arm's.** `[u32; 4]`
+/// read as `*mut u8` is a reinterpretation; another family may deliver the row
+/// on its own evidence, but the array's name is never handed over as a view of
+/// the wrong element type.
+#[test]
+fn wave6s_array_root_refuses_a_retyped_view() {
+    let source = emit(RETYPED_ARRAY_ROOT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("p=Some(&words["), "{source}");
+    assert!(!flat.contains("p=Some(&mutwords["), "{source}");
+    assert!(!flat.contains("p=&words["), "{source}");
+    assert!(!flat.contains("p=&mutwords["), "{source}");
+    let rows = super::emit_tests::decisions_of(RETYPED_ARRAY_ROOT);
+    let _ = &rows;
+}
+
+const RETYPED_ARRAY_ROOT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> u8 {
+    let mut words: [u32; 4] = [0; 4];
+    words[0 as usize] = 1;
+    let mut p = 0 as *mut u8;
+    p = words.as_mut_ptr() as *mut u8;
+    return *p.offset(1 as i32 as isize);
+ }
+"#;
+
+// ---------------------------------------------------------------------------
+// W6S-12 — a `*mut` formal read through every use takes the SHARED slice
+// (R490-4)
+//
+// libtree's `print_line(color_bold: *mut c_char)` is written `*mut` by C and
+// read at every use (`fputs(color_bold, stdout)`, a `*const` formal). The
+// decided form followed the declaration, so the caller-side seam asked for a
+// MUTABLE view of a value whose origin is a `b"…"` literal and was refused
+// `shared-to-mut` — the row's whole remaining block.
+//
+// The permission the program needs is the one its uses take: a subject whose
+// only rewritten uses are W6S-8 bridges at foreign `*const T` formals is read
+// through every one of them, so its slice form is the shared one. Narrowing
+// only — `&mut` → `&` never widens a permission — and exact: at least one
+// such bridge, and no other rewrite.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — in a REDUCTION the narrowing must not fire, and does not.**
+/// libtree's shape reduced: here the boundary planner COLLECTS both `fputs`
+/// positions, so they are its bridges (`as_mut_ptr().cast::<i8>().cast_const()`)
+/// and not W6S-8's — `foreign_const_bridges` stays 0 and the mutable form
+/// stands. The narrowing is keyed on this lane's own bridges precisely so it
+/// cannot reach a position another planner owns.
+///
+/// The real-crate witness is `plan::class_split::tests::
+/// wave6s_libtree_foreign_formals_leave_the_use_wall`, where the positions
+/// are NOT collected, W6S-8 renders them, and `color_bold` delivers
+/// (`placed = 1`) as a shared slice.
+#[test]
+fn wave6s_mut_formal_read_at_every_use_takes_the_shared_slice() {
+    let source = emit(LITERAL_AT_A_MUT_FORMAL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("color_bold:&mut[libc::c_char]"), "{source}");
+    assert!(
+        !flat.contains("fputs(color_bold.as_ptr(),stdout)"),
+        "{source}"
+    );
+}
+
+const LITERAL_AT_A_MUT_FORMAL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ unsafe extern "C" fn print_line(mut color_bold: *mut libc::c_char, mut on: libc::c_int) {
+    if on != 0 { fputs(color_bold, stdout); }
+    fputs(color_bold, stdout);
+ }
+ pub unsafe extern "C" fn recurse(mut excluded: libc::c_int) {
+    let mut bold_color = (if excluded != 0 { b"\x1B[0;35m\0" as *const u8 as *const libc::c_char } else { b"\x1B[1;36m\0" as *const u8 as *const libc::c_char }) as *mut libc::c_char;
+    print_line(bold_color, excluded);
+ }
+"#;
+
+/// **FAULT — a `*mut` foreign formal keeps the mutable form.** The callee may
+/// write through it, so the permission stands.
+#[test]
+fn wave6s_mut_foreign_formal_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *mut u8, mut n: libc::size_t) -> libc::c_int {
+    let mut seen = *buffer.offset(1 as i32 as isize) as libc::c_int;
+    return fill(buffer, n) + seen;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("buffer:&mut[u8]"),
+        "the mutable formal keeps it: {source}"
+    );
+}
+
+/// **FAULT — any other rewritten use keeps the mutable form.** A deref WRITE
+/// beside the foreign read is a write, and the narrowing's conjunct is
+/// "no other rewrite" precisely so this case keeps `&mut`.
+#[test]
+fn wave6s_a_write_beside_the_foreign_read_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ pub unsafe extern "C" fn touch(mut text: *mut libc::c_char, mut on: libc::c_int) {
+    *text.offset(0 as i32 as isize) = 65 as libc::c_char;
+    fputs(text, stdout);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("text:&mut[libc::c_char]"), "{source}");
 }

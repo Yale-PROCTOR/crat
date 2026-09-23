@@ -94,6 +94,7 @@ fn table_element_base(
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Result<Base, CursorHold> {
     if !model_ref(ctx, s) {
         return Err(CursorHold::RefMissing);
@@ -116,8 +117,20 @@ fn table_element_base(
     // a slice, not a pointer: the constructor is then `new(t[k])`, which takes
     // NO length, so this base fabricates nothing and is evidence-backed by
     // construction (`fallback = false`, 027 (b)).
+    // **R512-4.** The prospective flip is this table's, so read the variant it
+    // is ABOUT to have. The flip reuses the flat decision's `uses` verbatim, so
+    // the element replacement text is the same before and after and only the
+    // variant moves; an exclusive row over an element the flip leaves shared is
+    // refused rather than rendered.
+    let prospective = prospective.filter(|table| table.binding == root);
+    if let Some(table) = prospective
+        && s.mutable
+        && !table.inner_mutable
+    {
+        return Err(CursorHold::BaseMissing);
+    }
     let (uses, delivered_inner) = match decision {
-        Decision::Slice { uses, .. } => (uses, false),
+        Decision::Slice { uses, .. } => (uses, prospective.is_some()),
         Decision::NestedSlice { uses, .. } => (uses, true),
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
@@ -224,18 +237,19 @@ fn base(
     s: &Subject,
     e: &hir::Expr<'_>,
     entries: &[(Subject, Decision)],
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Result<Base, CursorHold> {
     let e = peel_reborrow_idiom(ctx.tcx, s.fn_did, e);
     if let Some(raw) = table_origin(ctx, s, e, entries, &mut rustc_hash::FxHashSet::default()) {
         if raw {
             return Err(CursorHold::BaseModelRaw);
         }
-        return table_element_base(ctx, s, e, entries);
+        return table_element_base(ctx, s, e, entries, prospective);
     }
     if let hir::ExprKind::MethodCall(_, receiver, [delta], _) = e.kind
         && emission::method(ctx.tcx, s.fn_did, e, &["offset", "add", "sub"])
     {
-        let mut b = base(ctx, s, receiver, entries)?;
+        let mut b = base(ctx, s, receiver, entries, prospective)?;
         b.expression = format!(
             "({}).offset_by({})",
             b.expression,
@@ -424,7 +438,19 @@ fn base(
             ctx.tcx.typeck(s.fn_did).expr_ty(raw_origin).kind(),
             ty::RawPtr(..)
         );
-    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) && !field_base {
+    // **R499-1.** `STATIC.as_ptr()` on an array PLACE (tulip's indicator table):
+    // the earlier `as_ptr` branch wants a reference receiver and this is the
+    // place itself. The input's own spelling is kept — which is what keeps a
+    // `static mut` receiver legal exactly where the input already made it so —
+    // and only the extent is added, receipted.
+    let array_place_as_ptr =
+        emission::method(ctx.tcx, s.fn_did, raw_origin, &["as_ptr", "as_mut_ptr"])
+            && matches!(raw_origin.kind, hir::ExprKind::MethodCall(_, receiver, [], _)
+            if matches!(
+                ctx.tcx.typeck(s.fn_did).expr_ty(receiver).kind(),
+                ty::Slice(_) | ty::Array(..)
+            ));
+    if !matches!(raw_origin.kind, hir::ExprKind::Path(_)) && !field_base && !array_place_as_ptr {
         return Err(CursorHold::BaseMissing);
     }
     let method = if s.mutable {
@@ -488,8 +514,153 @@ struct Uses<'a, 'tcx> {
     /// Ephemeral raw copies of this cursor: `let fresh = p;` whose single use
     /// is a deref read. Each carries its typed `raw-op-cursor-local` receipt.
     local_bridges: Vec<super::CursorLocalBridge>,
+    /// Chains ceded to a destination's own construction (R487-3(c)): counted so
+    /// that a subject whose ONLY handled use is a cede does not take the root.
+    ceded: usize,
+    /// **R497-3(c).** This subject is a re-seeded walker: exactly one of its
+    /// assignments comes from another value, and that assignment CONSTRUCTS a
+    /// fresh cursor rather than seeking the existing one.
+    re_seeded: bool,
+    /// Set when a re-seed construction fabricated its extent (§77): the plan
+    /// carries `fallback`, so the count is auditable.
+    re_seed_fabricated: bool,
+    /// Use edits of the RE-SEED SOURCE that this constructor's text has taken
+    /// over: the AST pass applies the constructor at its span and skips these,
+    /// exactly as a table element's outer edit is composed.
+    re_seed_composed: Vec<rustc_span::Span>,
+    prospective: Option<&'a super::ProspectiveTable>,
 }
 impl Uses<'_, '_> {
+    /// **R497-3(c) — the raw view of a re-seed value.** The re-seed source is
+    /// whatever the other families decided it is, so the construction takes a
+    /// raw pointer out of that form: a still-raw binding is its own text, a
+    /// delivered reference is bridged (addendum 130 — emit the bridge, do not
+    /// degrade the subject), and anything else holds.
+    fn re_seed_raw_view(&self, rhs: &hir::Expr<'_>) -> Option<(String, Option<rustc_span::Span>)> {
+        // **A call-rooted re-seed** (`strchr(search, ';')`, `find(key)`): the
+        // call itself is the raw value. Its own arguments keep their spans, so
+        // an argument this cursor owns is rewritten by ITS edit and spliced
+        // into this constructor by the nested-edit composition.
+        if let hir::ExprKind::Call(callee, _) = rhs.kind
+            && matches!(
+                self.ctx.tcx.typeck(self.subject.fn_did).expr_ty(rhs).kind(),
+                ty::RawPtr(..)
+            )
+        {
+            // **R513-4 — fail closed on a re-typed interface.** The
+            // construction copies the call's SOURCE TEXT, so it is only
+            // correct while that text still type-checks against the callee.
+            // If the callee is local and ANY of its parameters has been
+            // re-typed by another family, the copied text is stale: measured
+            // on tulip's `sample::main_0`, the plan was built and then
+            // SILENTLY withdrawn by `restore-family-interface-path`, because
+            // `ti_find_indicator::name` had become a `&i8`. A hold here is a
+            // receipted refusal instead; the delivering form needs the call's
+            // arguments adapted at the layer where the seam's own edits live.
+            if let ty::FnDef(did, _) = *self
+                .ctx
+                .tcx
+                .typeck(self.subject.fn_did)
+                .expr_ty(callee)
+                .kind()
+                && let Some(callee_did) = did.as_local()
+                && self.entries.iter().any(|(other, decision)| {
+                    other.fn_did == callee_did
+                        && matches!(other.kind, SubjectKind::Param { .. })
+                        && match decision {
+                            Decision::Degraded(_) => false,
+                            Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_)
+                            | Decision::NestedSlice { .. }
+                            | Decision::Cursor { .. } => true,
+                        }
+                })
+            {
+                return None;
+            }
+            return text(self.ctx, rhs).ok().map(|t| (t, None));
+        }
+        let binding = local(rhs)?;
+        let (source, decision) = self
+            .entries
+            .iter()
+            .find(|(source, _)| source.fn_did == self.subject.fn_did && source.hir_id == binding)?;
+        let name = emission::binding_name(self.ctx.tcx, source).ok()?;
+        // The source's OWN edit at this span (an option's `unwrap`, a slice's
+        // presentation) is taken over by this constructor's text.
+        let composed = match decision {
+            Decision::Opt { uses, .. } => uses
+                .iter()
+                .find(|edit| edit.span.source_callsite() == rhs.span.source_callsite())
+                .map(|edit| edit.span),
+            Decision::Slice { uses, .. } | Decision::NestedSlice { uses, .. } => uses
+                .iter()
+                .find(|edit| edit.span.source_callsite() == rhs.span.source_callsite())
+                .map(|edit| edit.span),
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => None,
+        };
+        let view = match decision {
+            // Still raw in the emitted program: the text is already a pointer.
+            Decision::Degraded(_) => Some(name),
+            // A shared reference bridges with `from_ref`. An exclusive one is
+            // NOT bridged here: taking a raw `*mut` out of a live `&mut` while
+            // the cursor walks it is the retained-alias channel, and this arm
+            // has no evidence about it.
+            Decision::Ref { mutable: false } | Decision::InferredRef { mutable: false, .. }
+                if !self.subject.mutable =>
+            {
+                Some(format!("core::ptr::from_ref({name})"))
+            }
+            // A thin optional: `None` re-seeds a null cursor, which the
+            // optional form already represents.
+            Decision::Opt {
+                mutable: false,
+                slice: false,
+                ..
+            } if !self.subject.mutable => Some(format!(
+                "{name}.map_or(core::ptr::null(), core::ptr::from_ref)"
+            )),
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Opt { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. } => None,
+        };
+        view.map(|view| (view, composed))
+    }
+
+    /// The construction a re-seed renders, with its §77 fabricated extent. The
+    /// re-seed value has no evidence-backed length here — a length recovered
+    /// from the source (json.h's `size` bound) is a later, exact form.
+    fn re_seed_construction(&mut self, rhs: &hir::Expr<'_>) -> Option<String> {
+        let (raw, composed) = self.re_seed_raw_view(rhs)?;
+        self.re_seed_composed.extend(composed);
+        self.re_seed_fabricated = true;
+        let method = if self.subject.mutable {
+            "from_raw_parts_mut"
+        } else {
+            "from_raw_parts"
+        };
+        let construction = format!(
+            "unsafe {{ {}::{method}({raw}, crate::FALLBACK_SLICE_EXTENT) }}",
+            constructor(self.subject.mutable),
+        );
+        Some(if self.optional {
+            format!("Some({construction})")
+        } else {
+            construction
+        })
+    }
+
     /// A derived pointer leaving the function through its raw return: the tail
     /// view's address under the raw-boundary T2 receipt (retained by the caller).
     /// The seam planner owns a return that is lifetime-planned; a return permit
@@ -543,6 +714,78 @@ impl Uses<'_, '_> {
                 self.hold.get_or_insert(hold);
             }
         }
+    }
+
+    /// **The `let` form of the peer relation** (R478-5). `let base_ip = input;`
+    /// binds a SECOND cursor over the same base — brotli's two-pass terminal —
+    /// and the destination is this family's own candidate, so it owns its
+    /// constructor (`base()`'s parent-cursor arm renders it as the bare name,
+    /// the shared wrapper being `Copy`) and this use needs no edit. Exactly the
+    /// assignment form (`data = start`) one statement shape over.
+    fn let_bound_peer(&self, e: &hir::Expr<'_>) -> Option<hir::HirId> {
+        if self.subject.mutable || self.optional {
+            return None;
+        }
+        let hir::Node::LetStmt(stmt) = self.ctx.tcx.parent_hir_node(e.hir_id) else {
+            return None;
+        };
+        if stmt.init.map(|init| init.hir_id) != Some(e.hir_id) {
+            return None;
+        }
+        let hir::PatKind::Binding(_, destination, _, None) = stmt.pat.kind else {
+            return None;
+        };
+        (destination != self.subject.hir_id
+            && self.entries.iter().any(|(other, decision)| {
+                other.fn_did == self.subject.fn_did
+                    && other.hir_id == destination
+                    && !other.mutable
+                    && candidate_shape(self.ctx, other, decision)
+            }))
+        .then_some(destination)
+    }
+
+    /// **The ceded chain** (R485-4(g), R487-3(c); wave-6k `7bf81651e`). A chain
+    /// rooted at this cursor that initialises a local ANOTHER family types is
+    /// rendered by that family's construction, which takes the cursor's own view
+    /// as its raw source. One edit on the span, and it is theirs — so this
+    /// family records none.
+    ///
+    /// **R487-3(c)**: the family that delivers the root WITHOUT the chain keeps
+    /// it. So the cede is admissible only for a subject that is a cursor on its
+    /// own account, which is decided at the end of the walk (`plan`): if every
+    /// handled use was a cede, the chain is what would have made this family own
+    /// the root, and it does not get to. `fill`'s `ff` is that case — its only
+    /// use is the chain, and the slice family delivers the destination today.
+    ///
+    /// The conditions otherwise mirror `construction::cursor_view_text`:
+    /// `offset` (not `add`, whose delta is a `usize`), a bare path receiver, and
+    /// a destination the slice family types at this mutability.
+    fn ceded_to_a_construction(&self, e: &hir::Expr<'_>) -> bool {
+        if self.optional {
+            return false;
+        }
+        let tcx = self.ctx.tcx;
+        let hir::ExprKind::MethodCall(segment, receiver, [_], _) = e.kind else {
+            return false;
+        };
+        if segment.ident.as_str() != "offset" || local(receiver) != Some(self.subject.hir_id) {
+            return false;
+        }
+        let hir::Node::LetStmt(stmt) = tcx.parent_hir_node(e.hir_id) else {
+            return false;
+        };
+        if stmt.init.map(|init| init.hir_id) != Some(e.hir_id) {
+            return false;
+        }
+        let hir::PatKind::Binding(_, destination, _, None) = stmt.pat.kind else {
+            return false;
+        };
+        self.entries.iter().any(|(other, decision)| {
+            other.fn_did == self.subject.fn_did
+                && other.hir_id == destination
+                && slice_mutability(decision) == Some(self.subject.mutable)
+        })
     }
 
     /// **W-CUR-LOCAL.** The bare subject initialises an unannotated local whose
@@ -1076,7 +1319,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     // family owns (a slice peer, `data = start`) or to a parent
                     // cursor: the base's own constructor, never a fallback.
                     if !self.optional && !self.subject.mutable {
-                        match base(self.ctx, self.subject, rhs, self.entries) {
+                        match base(self.ctx, self.subject, rhs, self.entries, self.prospective) {
                             Ok(b)
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
@@ -1089,13 +1332,32 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 );
                             }
                             _ => {
-                                self.hold.get_or_insert(hold);
+                                // **R497-3(c).** A RE-SEEDED walker constructs
+                                // a fresh cursor here instead of holding.
+                                match self
+                                    .re_seeded
+                                    .then(|| self.re_seed_construction(rhs))
+                                    .flatten()
+                                {
+                                    Some(construction) => self.push(
+                                        e,
+                                        format!("{} = {construction}", self.name),
+                                        // The existing constructor vocabulary:
+                                        // a re-seed IS a construction, and the
+                                        // §77 extent receipt rides `fallback`
+                                        // through the same channel.
+                                        "cursor-constructor",
+                                    ),
+                                    None => {
+                                        self.hold.get_or_insert(hold);
+                                    }
+                                }
                             }
                         }
                         return;
                     }
                     if self.optional && !self.subject.mutable {
-                        match base(self.ctx, self.subject, rhs, self.entries) {
+                        match base(self.ctx, self.subject, rhs, self.entries, self.prospective) {
                             Ok(b)
                                 if (b.delivered.is_some() || b.parent_cursor.is_some())
                                     && !b.fallback =>
@@ -1108,7 +1370,25 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                                 )
                             }
                             _ => {
-                                self.hold.get_or_insert(hold);
+                                // **R497-3(c)** — as above, with the Option.
+                                match self
+                                    .re_seeded
+                                    .then(|| self.re_seed_construction(rhs))
+                                    .flatten()
+                                {
+                                    Some(construction) => self.push(
+                                        e,
+                                        format!("{} = {construction}", self.name),
+                                        // The existing constructor vocabulary:
+                                        // a re-seed IS a construction, and the
+                                        // §77 extent receipt rides `fallback`
+                                        // through the same channel.
+                                        "cursor-constructor",
+                                    ),
+                                    None => {
+                                        self.hold.get_or_insert(hold);
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -1250,6 +1530,60 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     }
                     continue;
                 }
+                // **R513-5.** A cursor handed to an EXTERN callee's raw formal
+                // whose symbol the PINNED libc contract table models: rgba's
+                // `strstr(str, "rgb(")`, brotli's fragment compressors. The
+                // table's rows are `NoRetain`, so the callee cannot keep the
+                // pointer past the call and the bridge is unconditional under
+                // ruling 130 — no tier-2 waiver, no `opens_argument` permit to
+                // wait for. An extern the table does not model has UNKNOWN
+                // retention and keeps the hold, which is the control.
+                //
+                // The argument is the cursor's raw view at its position
+                // (`as_ptr`/`as_mut_ptr`), or at the derived index for a chain;
+                // the comparison against a returned alias stays on `.addr()`,
+                // where the ordering arm already renders it.
+                if !self.optional
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, arg)
+                        == Some(self.subject.hir_id)
+                    && let ty::FnDef(did, _) = *self
+                        .ctx
+                        .tcx
+                        .typeck(self.subject.fn_did)
+                        .expr_ty(callee)
+                        .kind()
+                    && self.ctx.tcx.is_foreign_item(did)
+                    && super::super::raw_boundary_contracts::contract_table_models_symbol(
+                        self.ctx.tcx.item_name(did).as_str(),
+                    )
+                    && let Some(callee_did) = did.as_local()
+                {
+                    let view = if self.subject.mutable {
+                        "as_mut_ptr"
+                    } else {
+                        "as_ptr"
+                    };
+                    match self.index(arg) {
+                        Ok(d) => {
+                            let text = if local(arg) == Some(self.subject.hir_id) {
+                                format!("{}.{view}()", self.view())
+                            } else {
+                                format!("{}.offset_by({d}).{view}()", self.view())
+                            };
+                            self.push(arg, text, "raw-op-cursor-t1");
+                            self.bridges.push(super::CursorBridge {
+                                call_hir: e.hir_id,
+                                callee: callee_did,
+                                argument_span: arg.span,
+                                argument_index: index,
+                            });
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                    continue;
+                }
                 if local(arg) == Some(self.subject.hir_id) {
                     let ty::FnDef(did, _) = *self
                         .ctx
@@ -1321,6 +1655,11 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             self.visit_expr(callee);
             return;
         }
+        // A chain this cursor cedes to the destination's own construction.
+        if self.ceded_to_a_construction(e) {
+            self.ceded += 1;
+            return;
+        }
         if local(e) == Some(self.subject.hir_id) {
             // The bare subject as the right-hand side of an assignment into a
             // shared peer cursor (`data = start`) is the peer's edit or no edit.
@@ -1329,7 +1668,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
             } else {
                 self.assigned_to_shared_peer(e)
             };
-            match assigned_to_peer {
+            match assigned_to_peer.or_else(|| self.let_bound_peer(e)) {
                 Some(peer) => self.peer_cursors.push(peer),
                 None => match self.ephemeral_copy(e) {
                     Some((destination, access)) => {
@@ -1404,6 +1743,91 @@ fn selected(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
     ctx.sign.may_be_negative(s.fn_did, s.local)
         || (ordering_participant(ctx, s) && ordering_degraded(decision))
 }
+/// **R485-4(c) (wave-6o, relay 052) — the ROOT case of the shape below.**
+///
+/// A subject the option family degrades `opt-use-unsupported` whose every
+/// assignment is an offset chain rooted at ITSELF: a nullable pointer that
+/// walks itself (`p = p.offset(1)`; binn `is_integer`, libtree
+/// `parse_ld_library_path::search`). [`derived_from_cursor_root`] is its
+/// sibling and explicitly declines this case ("a self-advance; not a root"),
+/// because there the root must be ANOTHER cursor; and [`selected`] declines it
+/// too, because a forward-only walker has no negative offset. The form these
+/// subjects want already exists — `CursorPlan.optional` renders
+/// `Option<SliceCursor<'_, T>>` with `is_none()`, `as_ref().expect(..)[i]` and
+/// `as_mut().expect(..).seek(..)` — so only the admission was missing.
+///
+/// Deliberately NOT gated on `null_init`: these are nullable by an `is_null`
+/// test on a parameter as often as by a null initialiser, and the option
+/// family has already settled the nullability by degrading them. The offset
+/// itself is still required by `plan`'s own `Offsets` visitor, and a subject
+/// with any assignment that is not a self-advance is refused here.
+fn self_advancing_root(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    if s.ptr_depth != 1 || !optional_degraded(decision) {
+        return false;
+    }
+    let (advances, other) = self_assignments(ctx, s);
+    advances > 0 && other == 0
+}
+
+/// `(assignments rooted at the subject, assignments from anything else)` over
+/// the subject's own body. A declaration initialiser is not an assignment.
+fn self_assignments(ctx: &Ctx<'_, '_>, s: &Subject) -> (usize, usize) {
+    struct Assigns<'a, 'tcx> {
+        ctx: &'a Ctx<'a, 'tcx>,
+        owner: rustc_hir::def_id::LocalDefId,
+        subject: hir::HirId,
+        advances: usize,
+        other: usize,
+    }
+    impl<'v> Visitor<'v> for Assigns<'_, '_> {
+        fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
+                && local(lhs) == Some(self.subject)
+            {
+                let rhs = peel_reborrow_idiom(self.ctx.tcx, self.owner, rhs);
+                if source_binding(self.ctx.tcx, self.owner, rhs) == Some(self.subject) {
+                    self.advances += 1;
+                } else {
+                    self.other += 1;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut assigns = Assigns {
+        ctx,
+        owner: s.fn_did,
+        subject: s.hir_id,
+        advances: 0,
+        other: 0,
+    };
+    assigns.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
+    (assigns.advances, assigns.other)
+}
+/// **R497-3(c) — the RE-SEEDED walker.** `self_advancing_root` wants every
+/// assignment rooted at the subject; five corpus rows advance themselves and
+/// are additionally **re-seeded once** from another value (`p = envbase`,
+/// `p = c`, `search = strchr(search, ';')`, `info = ti_find_indicator(..)`,
+/// `backptr = &*in_0.offset(..)`). Exactly one such assignment is admitted:
+/// the re-seed constructs a fresh cursor at that point (slicecursor 052 §3),
+/// which resets the position, so two of them would make the walker's own
+/// positions incomparable with no single base to name.
+fn re_seeded_walker(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool {
+    if s.ptr_depth != 1 || !optional_degraded(decision) {
+        return false;
+    }
+    // **Condition (ii), slicecursor 052 §3.** The construction at the re-seed
+    // fabricates its window FORWARD from that pointer, so the cursor cannot
+    // represent a position below it: a walker that may move backwards after
+    // the re-seed would panic where the input program was correct. The sign
+    // slot is the fact, the same one `selected` reads.
+    if ctx.sign.may_be_negative(s.fn_did, s.local) {
+        return false;
+    }
+    let (advances, other) = self_assignments(ctx, s);
+    advances > 0 && other == 1
+}
+
 /// A null-initialised local the option family degrades (`opt-use-unsupported`)
 /// whose every assignment is an offset chain (or the reborrow idiom) rooted at
 /// a cursor root of this family: the optional cursor form covers it.
@@ -1534,15 +1958,63 @@ fn derives_cursor(
     roots.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
     roots.found
 }
+/// The planner as every caller but `promote` uses it: no table is about to
+/// flip, so the family reads `entries` as it stands.
 pub(super) fn plan(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     decision: &Decision,
     entries: &[(Subject, Decision)],
 ) -> Option<Result<CursorPlan, CursorHold>> {
+    plan_with(ctx, subject, decision, entries, None)
+}
+
+/// **R512-4 / nested 018 STOP 1, answered in report 061 §4.** The same planner,
+/// told that one table is about to deliver its inner level. There is ONE base
+/// resolution in this family and this is it: `prospective` is a query parameter
+/// threaded to `table_element_base`, not a second entry point that would
+/// duplicate the resolution and drift from it.
+pub(crate) fn plan_with<'a>(
+    ctx: &Ctx<'_, '_>,
+    subject: &Subject,
+    decision: &Decision,
+    entries: &[(Subject, Decision)],
+    prospective: Option<&'a super::ProspectiveTable>,
+) -> Option<Result<CursorPlan, CursorHold>> {
+    // **R515-5(a), nested 019.** A row this family has ALREADY taken, re-planned
+    // against a base that is about to flip. The selection question is answered —
+    // this family asked it in this pass and said yes — and re-asking it gives
+    // the wrong answer rather than a conservative one, because
+    // `ordering_degraded` is defined to be false for a `Cursor`, so a row
+    // selected by ordering fails a gate it passed minutes earlier. The match
+    // below refuses an existing `Cursor` because an ordinary re-plan would be a
+    // SECOND commitment of the same row; a prospective flip is not that, it is
+    // the same commitment against a different base.
+    //
+    // So this is the one door: `build` stays `pub(super)` and nested calls
+    // `plan_with`. It also makes nested 019 (b) safe by construction — entering
+    // construction directly is sound precisely BECAUSE the subject is already a
+    // committed cursor, and this condition is what enforces that.
+    // S3.0: a `Decision` is consumed through an EXHAUSTIVE match, so a new
+    // disposition is a compile error here rather than a silent `false`.
+    let already_taken = match decision {
+        Decision::Cursor { .. } => true,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => false,
+    };
+    if prospective.is_some() && already_taken {
+        return Some(build(ctx, subject, entries, prospective));
+    }
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
-        && !derived_from_cursor_root(ctx, subject, decision, entries))
+        && !derived_from_cursor_root(ctx, subject, decision, entries)
+        && !self_advancing_root(ctx, subject, decision)
+        && !re_seeded_walker(ctx, subject, decision))
         || subject.ptr_depth != 1
     {
         return None;
@@ -1586,12 +2058,13 @@ pub(super) fn plan(
     {
         return None;
     }
-    Some(build(ctx, subject, entries))
+    Some(build(ctx, subject, entries, prospective))
 }
-fn build(
+pub(super) fn build<'a>(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     entries: &[(Subject, Decision)],
+    prospective: Option<&'a super::ProspectiveTable>,
 ) -> Result<CursorPlan, CursorHold> {
     let parameter = matches!(subject.kind, SubjectKind::Param { .. });
     // **The entry window** (R472-6, route 1). A cursor rooted at a raw parameter
@@ -1654,6 +2127,7 @@ fn build(
                 .hir_node(init.ok_or(CursorHold::BaseMissing)?)
                 .expect_expr(),
             entries,
+            prospective,
         )?
     };
     // An untyped local (`let mut q = p.offset(k)`) gets its cursor type as an
@@ -1681,6 +2155,7 @@ fn build(
         ctx,
         subject,
         entries,
+        prospective,
         name,
         init,
         base: b.binding,
@@ -1700,10 +2175,23 @@ fn build(
         peer_bases: vec![],
         peer_cursors: vec![],
         local_bridges: vec![],
+        ceded: 0,
+        re_seeded: {
+            let (advances, other) = self_assignments(ctx, subject);
+            advances > 0 && other == 1
+        },
+        re_seed_fabricated: false,
+        re_seed_composed: vec![],
     };
     v.visit_body(ctx.tcx.hir_body_owned_by(subject.fn_did));
     if let Some(hold) = v.hold {
         return Err(hold);
+    }
+    // **R487-3(c).** A subject whose only handled use was a ceded chain is not a
+    // cursor on its own account: the chain is what would make this family own
+    // the root, and the family that delivers the root without it keeps it.
+    if v.ceded > 0 && v.edits.is_empty() {
+        return Err(CursorHold::UseUnbuilt);
     }
     if let Some(init) = init {
         v.push(
@@ -1721,7 +2209,7 @@ fn build(
         wrapper: true,
         parameter,
         optional,
-        fallback: b.fallback,
+        fallback: b.fallback || v.re_seed_fabricated,
         uses: v.edits,
         use_hirs: v.hirs,
         base: b.local,
@@ -1730,7 +2218,11 @@ fn build(
         delivered_base: b.delivered,
         bridges: v.bridges,
         local_bridges: v.local_bridges,
-        composed_edit_spans: b.composed,
+        composed_edit_spans: {
+            let mut composed = b.composed;
+            composed.extend(v.re_seed_composed);
+            composed
+        },
         explicit_declaration,
         peer_bases: v.peer_bases,
         peer_cursors: v.peer_cursors,

@@ -419,6 +419,102 @@ pub(crate) fn assignment_from_forward_view<'tcx>(
     forward_delta(tcx, delta)
 }
 
+/// **W6S-11 — the same assignment with an ARRAY LOCAL as the view's root.**
+///
+/// heman `kmQuaternionRotationMatrix`:
+///
+/// ```text
+/// let mut pMatrix = 0 as *mut c_float;
+/// let mut m4x4: [c_float; 16] = [0.; 16];
+/// pMatrix = &mut *m4x4.as_mut_ptr().offset(0) as *mut c_float;
+/// ```
+///
+/// [`assignment_from_forward_view`] refuses this because the root is not a
+/// pointer BINDING — an array local carries no subject, so there is no source
+/// row to hang a view on and no name for the planner to render from. It needs
+/// none: the array IS the view (`&mut m4x4[e..]`), its own extent is the
+/// slice's, and nothing is fabricated. The SAME view in the local's
+/// initialiser already delivers (the construction family types it); this is
+/// the assignment form of it.
+///
+/// Returns the rendered view for the right-hand side, or nothing. Every
+/// refusal is another family's position: a backward delta (the bidirectional
+/// family's), an element type the destination does not share (the void-region
+/// family's evidence), a root that is not a local array.
+pub(crate) fn assignment_from_array_root<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    use_expr: &Expr<'_>,
+    key: (LocalDefId, HirId),
+    mutable: bool,
+) -> Option<(Span, String)> {
+    let rustc_hir::Node::Expr(assign) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return None;
+    };
+    let ExprKind::Assign(lhs, rhs, _) = assign.kind else {
+        return None;
+    };
+    if lhs.hir_id != use_expr.hir_id {
+        return None;
+    }
+    let typeck = tcx.typeck(key.0);
+    let rustc_middle::ty::TyKind::RawPtr(destination_pointee, _) = typeck.expr_ty(lhs).kind()
+    else {
+        return None;
+    };
+    // The C2Rust spine: identity casts and the borrow-of-deref around the
+    // arithmetic.
+    let mut value = rhs;
+    loop {
+        match value.kind {
+            ExprKind::Cast(inner, _) => value = inner,
+            ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, borrowed) => {
+                let ExprKind::Unary(rustc_hir::UnOp::Deref, place) = borrowed.kind else {
+                    return None;
+                };
+                value = place;
+            }
+            _ => break,
+        }
+    }
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = value.kind else {
+        return None;
+    };
+    if !matches!(segment.ident.name.as_str(), "offset" | "add") {
+        return None;
+    }
+    let callee = typeck.type_dependent_def_id(value.hir_id)?;
+    if tcx.crate_name(callee.krate).as_str() != "core" {
+        return None;
+    }
+    // The root: `<array local>.as_mut_ptr()` / `.as_ptr()`.
+    let ExprKind::MethodCall(root_segment, array, [], _) = receiver.kind else {
+        return None;
+    };
+    if !matches!(root_segment.ident.name.as_str(), "as_mut_ptr" | "as_ptr") {
+        return None;
+    }
+    let name = match array.kind {
+        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(binding) if binding != key.1 => tcx.hir_name(binding).to_ident_string(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // A LOCAL ARRAY, and its element is the destination's own.
+    let rustc_middle::ty::TyKind::Array(element, _) = typeck.expr_ty(array).kind() else {
+        return None;
+    };
+    if element != destination_pointee {
+        return None;
+    }
+    if !forward_delta(tcx, delta) {
+        return None;
+    }
+    let index = index_text(tcx, delta)?;
+    let amp = if mutable { "&mut " } else { "&" };
+    Some((rhs.span, format!("{amp}{name}[{index}..]")))
+}
+
 fn local(expression: &Expr<'_>) -> Option<HirId> {
     match expression.kind {
         ExprKind::Path(QPath::Resolved(_, path)) => match path.res {

@@ -359,6 +359,24 @@ fn current_alternative(
     let [(key, disposition, site)] = matches.as_slice() else {
         return Err("callee-parameter-input-raw-boundary-evidence-unavailable");
     };
+    // R473-2: a site rooted at the address of a VALUE LOCAL carries its
+    // disposition on the side channel — the admission unlocks THIS input and
+    // nothing else, so the site's public disposition stays refused.
+    //
+    // The rendering is ZERO SYNTAX, and that is the whole point: `&mut x`
+    // already coerces to `*mut T` and already IS `&mut T`, so the original
+    // argument text is correct at either formal. The bridge templates cannot
+    // render this source — they reborrow (`&mut *x`), which is ill-typed over
+    // a value place; wave-6o's pin caught exactly that.
+    if matches!(
+        disposition,
+        RawBoundaryDisposition::Blocked { .. } | RawBoundaryDisposition::OwnedByOtherArm { .. }
+    ) && matches!(
+        raw.address_root_disposition(key),
+        Some(RawBoundaryDisposition::T1 { .. } | RawBoundaryDisposition::T2 { .. })
+    ) {
+        return Ok(zero(arg, found));
+    }
     let (retention, waiver_id) = match disposition {
         RawBoundaryDisposition::T1 { .. } => (BridgeRetentionTier::T1, None),
         RawBoundaryDisposition::T2 { waiver_id, .. } => {

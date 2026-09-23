@@ -354,6 +354,11 @@ mod tests {
                 0,
             )
             .unwrap();
+            // R491-4 (relay 060): this pin does NOT move with A9. The class is
+            // deliberately `Held` two lines up, and a held class keeps its raw
+            // signature in the emitted program — that is what `raw_is_final`
+            // reads. No parameter rule can convert a formal whose class is
+            // held, so `MutableRaw` is the invariant on every frame.
             assert_eq!(recovered.emitted(), FormalForm::MutableRaw);
             assert!(recovered.require_lend().is_ok());
         })

@@ -1045,3 +1045,642 @@ fn w6a_a1_a_conditional_return_carries_the_option_on_its_arms() {
         out.source
     );
 }
+
+/// **The heman cascade's shape** (relay wave-6a/049; main 063 §3's routing
+/// table names `heman_lighting_compute_normals` as the seed of 26 of the 69
+/// cascade members). `heman_image_create` mallocs a struct, stores a SECOND
+/// allocation into one of its fields and returns it; `compute` receives that
+/// allocation, reads the field back through a CAST to a different pointee
+/// (`(*result).data as *mut Vec3`), walks it, and returns the owner.
+const HEMAN_IMAGE_CHAIN: &str = r#"
+// w6a-a1e-owned-field-frame
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Vec3 { pub x: f32, pub y: f32, pub z: f32 }
+#[repr(C)]
+pub struct Image {
+    pub width: i32,
+    pub height: i32,
+    pub nbands: i32,
+    pub data: *mut f32,
+}
+pub unsafe extern "C" fn image_create(mut width: i32, mut height: i32, mut nbands: i32) -> *mut Image {
+    let mut img = malloc(::std::mem::size_of::<Image>()) as *mut Image;
+    (*img).width = width;
+    (*img).height = height;
+    (*img).nbands = nbands;
+    (*img).data = malloc(((width * height * nbands) as usize)
+        .wrapping_mul(::std::mem::size_of::<f32>())) as *mut f32;
+    return img;
+}
+pub unsafe extern "C" fn compute(mut heightmap: *mut Image) -> *mut Image {
+    let mut width = (*heightmap).width;
+    let mut height = (*heightmap).height;
+    let mut result = image_create(width, height, 3 as i32);
+    let mut normals = (*result).data as *mut Vec3;
+    let mut y = 0 as i32;
+    while y < height {
+        let mut n = normals.offset((y * width) as isize);
+        let mut x = 0 as i32;
+        while x < width {
+            (*n).x = x as f32;
+            n = n.offset(1 as i32 as isize);
+            x += 1;
+        }
+        y += 1;
+    }
+    return result;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut base = image_create(2 as i32, 2 as i32, 1 as i32);
+    let mut out = compute(base);
+    let mut w = (*out).width;
+    free((*out).data as *mut core::ffi::c_void);
+    free(out as *mut core::ffi::c_void);
+    free((*base).data as *mut core::ffi::c_void);
+    free(base as *mut core::ffi::c_void);
+    return w;
+}
+"#;
+
+#[test]
+fn w6a_a1e_the_heman_cascade_root_is_one_lend() {
+    // **W6A-A1-e** (relay wave-6a/049). The whole shape turns on ONE hold.
+    // Bisected on this fixture: dropping the nested field allocation changes
+    // nothing, and dropping the call `compute(base)` changes both holds — so
+    // `run::base`'s `call-argument-not-a-lend` is the root, it withdraws
+    // `image_create`'s certificate, and that leaves `compute::result` with an
+    // `uncertified-source`. The callee's formal is `box-param-callee-lends`:
+    // the model calls it `Owning`, which the lend oracle refused.
+    let out = emitted("a1-heman-chain", HEMAN_IMAGE_CHAIN);
+    let text = compact(&out.source);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("call-argument-not-a-lend"),
+        "a body-proved lend must not read as a consuming argument\n{certificates}"
+    );
+    assert!(
+        text.contains("mutnbands:i32)->Box<Image>"),
+        "the producer's output type is the certificate\n{}",
+        out.source
+    );
+    // The chain continues through compute's own certificate. The FORMAL's
+    // form is not this rule's business — it is the parameter family's, and
+    // W6A-A9 moves it — so the assertion is a dichotomy over the two frames:
+    // without A9 the formal stays raw and the owner is bridged at the call,
+    // with A9 it is a reference and the owner is borrowed. Both deliver.
+    let raw_formal = text.contains("fncompute(mutheightmap:*mutImage)->Box<Image>")
+        && text.contains("compute(core::ptr::from_mut(base.as_mut()))");
+    let reference_formal = text.contains("fncompute(mutheightmap:&Image)->Box<Image>")
+        && text.contains("compute(&*base)");
+    assert!(
+        raw_formal != reference_formal,
+        "exactly one of the two frames, and the owner crosses the call either way\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("free((*out).data") && text.contains("drop(out);"),
+        "the struct's C free becomes a drop AT that site; the field's stays a C free\n{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "compute::result"),
+        None,
+        "the receiver of a certified producer is an owner\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "run::base"),
+        None,
+        "the owner lent across the call keeps its certificate\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the same chain where the lent callee COPIES its formal into a
+/// local (`let mut alias = heightmap;`). Nothing frees it and nothing stores
+/// it, so neither the transfer path nor any plan diverts the question: the
+/// LEND WALK alone must refuse it, on an `Owning`-modeled formal. This is the
+/// control that measures the walk, and the fault that skips the walk for
+/// `Owning` turns it red.
+#[test]
+fn w6a_a1e_a_copying_callee_is_not_a_lend() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut width = (*heightmap).width;",
+        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    );
+    assert!(
+        source.contains("let mut alias = heightmap;"),
+        "the control must add the copy"
+    );
+    let out = emitted("a1-heman-copying", &source);
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("call-argument-not-a-lend:compute(base)"),
+        "a formal the body copies is not a proven lend\n{}",
+        out.artifacts.return_certificate_receipts
+    );
+    // Measured, and the reason fault 1 (skipping the walk for `Owning`) is
+    // INERT: the copy also removes the model's `Owning` verdict — the whole
+    // chain reads `kind-raw` here and `compute::heightmap` has no lend hold at
+    // all. On every fixture in reach the conjunction `Owning AND !walk.ok` is
+    // empty, so no fixture can separate the walk from the kind gate.
+    //
+    // Read on the producer's own allocation, which nothing masks.
+    assert_eq!(
+        reason_of(&out.degradations, "image_create::img").as_deref(),
+        Some("kind-raw"),
+        "{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    // R497-3(b) narrows the pass-through to A1-e's companion gate alone, so
+    // `compute::result` keeps the generic model reason here; the gate's own
+    // key is witnessed by `w6a_a1e_an_owned_field_refuses_the_certificate`.
+    assert_eq!(
+        reason_of(&out.degradations, "compute::result").as_deref(),
+        Some("kind-raw"),
+        "{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the same chain where the lent callee STORES its formal into a raw
+/// place. Nothing frees it, so the transfer path does not divert the question
+/// — the LEND WALK itself must refuse, and the caller's certificate must not
+/// stand. This is the control that measures the walk on an `Owning` formal.
+#[test]
+fn w6a_a1e_a_storing_callee_is_not_a_lend() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut normals = (*result).data as *mut Vec3;",
+        "    (*result).data = heightmap as *mut f32;\n    let mut normals = (*result).data as *mut Vec3;",
+    );
+    assert!(
+        source.contains("(*result).data = heightmap"),
+        "the control must add the store"
+    );
+    let out = emitted("a1-heman-storing", &source);
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("letmutbase:Box<"),
+        "an owner the callee stores away is not the caller's to keep\n{}",
+        out.source
+    );
+    assert!(
+        reason_of(&out.degradations, "run::base").is_some(),
+        "run::base must stay degraded\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The admitted kinds, stated exactly: `Ref` (the model's own lend verdict),
+/// `Raw` (an absence the body may fill) and — W6A-A1-e — `Owning` (a claim
+/// about the FORMAL that the caller's question does not touch). A formal with
+/// no slot answers nothing.
+#[test]
+fn w6a_a1e_the_admitted_kinds_are_exactly_three() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Ref)
+    ));
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Raw)
+    ));
+    assert!(super::decision::return_certificate::model_admits_lend(
+        Some(SlotKind::Owning)
+    ));
+    assert!(!super::decision::return_certificate::model_admits_lend(
+        None
+    ));
+}
+
+/// Control: the same chain where the lent callee FREES its formal. The body
+/// walk refuses it, the argument is a consuming one again, and the caller's
+/// certificate must not stand — a Box moved into a raw free is the
+/// double-free path A1 exists to avoid.
+#[test]
+fn w6a_a1e_a_freeing_callee_is_not_a_lend_however_the_model_reads_it() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    return result;\n}",
+        "    free(heightmap as *mut core::ffi::c_void);\n    return result;\n}",
+    );
+    assert!(
+        source.contains("free(heightmap"),
+        "the control must add the free"
+    );
+    let out = emitted("a1-heman-freeing", &source);
+    let text = compact(&out.source);
+    assert!(
+        !text.contains("letmutbase:Box<") && !text.contains("letmutbase:::std::boxed::Box<"),
+        "an owner the callee frees is not the caller's to keep\n{}",
+        out.source
+    );
+    assert!(
+        reason_of(&out.degradations, "run::base").is_some(),
+        "run::base must stay degraded\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn w6a_a1e_an_owned_field_refuses_the_certificate() {
+    // **A1-e's companion gate, end to end** (report 042 §2; R496-7/R497-3(b)).
+    // A certificate CONSTRUCTS the owner and spells every field as the source
+    // spells it, so a field another family OWNS cannot be spelled that way —
+    // wave-6f promotes it to `Option<Box<T>>` and the literal raw initializer
+    // beside it is an E0308. The gate refuses the certificate; the narrow
+    // pass-through is what makes that refusal visible as the subject's reason
+    // instead of a generic model one.
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set_with_contract(
+        "w6a-a1e-owned-field-frame",
+        vec![("Image".to_owned(), 3, SlotKind::Owning)],
+        Vec::new(),
+        Vec::new(),
+    );
+    // The producer's own allocation must be model-`Raw` for the refusal to be
+    // readable: the pass-through is consulted in the ladder's `Raw` arm, and in
+    // the plain chain `image_create::img` is Owning-modeled and delivers a Box
+    // on its own, so the hold has nowhere to show. The copy that report 042's
+    // control uses is exactly what makes the model drop `Owning` here.
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut width = (*heightmap).width;",
+        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    );
+    let out = emitted("a1-owned-field", &source);
+    super::test_model_override::clear();
+    let reasons: Vec<(String, String)> = out
+        .degradations
+        .iter()
+        .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+        .collect();
+    assert_eq!(
+        reason_of(&out.degradations, "image_create::img").as_deref(),
+        Some("return-certificate-struct-field"),
+        "the gate's refusal is the subject's reason\n{reasons:?}"
+    );
+    assert!(
+        !compact(&out.source).contains("->Box<Image>"),
+        "no certificate over a struct with an owned field\n{}",
+        out.source
+    );
+}
+
+/// **W6A-A1-f — a chain-through callee does not open the chain** (relay
+/// wave-6a/068, R515-4). avl's and bst's shape, reduced: `newNode` allocates
+/// and returns; `insert` returns either its own PARAMETER or `newNode(..)` —
+/// never a third thing. `insert` cannot be certified (its returned local is a
+/// parameter, not an allocation), and until this rule that refusal
+/// (`return-certificate-return-locals:insert:not-a-subject`) withdrew
+/// `newNode`'s certificate as `chain-open` collateral, costing the allocation
+/// its Box. The callee's own return statements are the proof: it hands the
+/// value onward and originates nothing.
+const INSERT_CHAIN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    return node;
+}
+unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else {
+        (*node).right = insert((*node).right, key);
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    root = insert(root, 3 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_chain_through_callee_does_not_open_the_chain() {
+    let out = emitted("a1f-insert-chain", INSERT_CHAIN);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        certificates.contains("chain-through:insert:returns-parameter-or-certified"),
+        "the pass-over is receipted by name\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("return-certificate-chain-open"),
+        "a chain-through callee does not open the chain\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("return-locals:insert:not-a-subject"),
+        "and it is no longer a refusal\n{certificates}"
+    );
+    // What the ruling bought stops here. `newNode::node` still does not emit,
+    // and the rule is what makes the reason legible: the receiver `run::root`
+    // is passed BACK INTO the chain-through callee (`root = insert(root, 3)`),
+    // which the lend oracle refuses because `insert` returns the formal rather
+    // than only borrowing it. That is a second wall, named, not this one.
+    assert!(
+        certificates.contains("call-argument-not-a-lend:insert(root"),
+        "the next wall is the receiver's own use\n{certificates}"
+    );
+}
+
+/// The same rule where the receiver is NOT handed back to the chain-through
+/// callee: the certificate then stands and the allocation is a `Box`.
+const INSERT_CHAIN_PLAIN_RECEIVER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    return node;
+}
+unsafe extern "C" fn pick(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_the_pass_through_delivers_through_the_return_position() {
+    // **R517-9, the return-position arm.** The pass-through keeps its raw
+    // return type, so `return newNode(key)` inside it is bridged back raw —
+    // and the bridge is what makes the enclosing return the call's RECEIVER.
+    // Until that was said, the certificate refused its own bridged site as
+    // `call-site-not-a-receiver` and the constructor stopped one wall short
+    // (report 062).
+    let out = emitted("a1f-plain-receiver", INSERT_CHAIN_PLAIN_RECEIVER);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        certificates.contains("chain-through:pick:returns-parameter-or-certified"),
+        "{certificates}"
+    );
+    assert!(
+        !certificates.contains("call-site-not-a-receiver"),
+        "the enclosing return IS the receiver\n{certificates}"
+    );
+    assert!(
+        certificates.contains("return-certificate callee=newNode output=Box<Node>"),
+        "the constructor is certified\n{certificates}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "newNode::node"),
+        None,
+        "and its allocation is an owner\nRECEIPTS:\n{certificates}\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnnewNode(mutkey:i32)->Box<Node>")
+            && text.contains("Box::into_raw(newNode(key))"),
+        "{}",
+        out.source
+    );
+}
+
+/// Control (relay 068's "a third value"): the middle callee returns its
+/// parameter, a certified constructor's result AND a third local. The proof
+/// the pass-over rests on — that the callee originates nothing — does not
+/// hold, so the chain stays open.
+const THIRD_VALUE_MIDDLE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    return node;
+}
+unsafe extern "C" fn pick3(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    if key < 0 as i32 {
+        let mut other = (*node).left;
+        return other;
+    }
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_third_returned_value_keeps_the_chain_open() {
+    let out = emitted("a1f-third-value", THIRD_VALUE_MIDDLE);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("chain-through:pick3:"),
+        "a callee that returns a third value originates something\n{certificates}"
+    );
+}
+
+/// Control: the middle callee STORES its parameter away instead of handing it
+/// onward, so it is not a chain-through and the chain stays open.
+const STORING_MIDDLE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+}
+static mut STASH: *mut Node = 0 as *mut Node;
+unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    return node;
+}
+unsafe extern "C" fn keep(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() {
+        return newNode(key);
+    }
+    STASH = node;
+    return node;
+}
+pub unsafe extern "C" fn run() -> i32 {
+    let mut root = newNode(5 as i32);
+    let mut k = (*root).key;
+    free(root as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+
+#[test]
+fn w6a_a1f_a_storing_middle_is_not_a_chain_through() {
+    let out = emitted("a1f-storing-middle", STORING_MIDDLE);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("chain-through:keep:"),
+        "a callee that stores its parameter is not passed over\n{certificates}"
+    );
+}
+
+/// **W6A-A1-g — a returned block whose statements cannot touch the owner**
+/// (relay wave-6a/072 (e)). buffer's shape, reduced: c2rust hoists an argument
+/// into a `let` and returns the block —
+/// `return { let __arg_1 = strlen(str); buffer_new_with_string_length(str, __arg_1) };`
+/// — so the certificate read `return-shape:{ .. }` for the wrapper and
+/// `call-site-not-a-receiver` for the constructor inside it, and both stopped.
+///
+/// The block is descended into when every statement is a `let` binding a
+/// NON-POINTER local: such a statement cannot hold, alter or alias the owner,
+/// which does not exist until the tail call returns. A statement binding a
+/// pointer, or any other statement, keeps the old refusal — that is precisely
+/// the thing the rule would otherwise have to prove.
+const BLOCK_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn strlen(s: *const i8) -> usize;
+}
+#[repr(C)]
+pub struct buffer_t {
+    pub len: usize,
+    pub data: *mut i8,
+}
+unsafe extern "C" fn buffer_new_with_size(mut n: usize) -> *mut buffer_t {
+    let mut self_0 = malloc(::std::mem::size_of::<buffer_t>()) as *mut buffer_t;
+    (*self_0).len = n;
+    (*self_0).data = 0 as *mut i8;
+    return self_0;
+}
+unsafe extern "C" fn buffer_new_with_string_length(mut str: *mut i8, mut len: usize)
+    -> *mut buffer_t {
+    return buffer_new_with_size(len);
+}
+pub unsafe extern "C" fn buffer_new_with_string(mut str: *mut i8) -> *mut buffer_t {
+    return {
+        let __arg_1 = strlen(str);
+        buffer_new_with_string_length(str, __arg_1)
+    };
+}
+pub unsafe extern "C" fn run(mut s: *mut i8) -> usize {
+    let mut b = buffer_new_with_string(s);
+    let mut n = (*b).len;
+    free(b as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+#[test]
+fn w6a_a1g_a_returned_block_of_scalar_lets_is_descended_into() {
+    let out = emitted("a1g-block-return", BLOCK_RETURN);
+    let certificates = &out.artifacts.return_certificate_receipts;
+    assert!(
+        !certificates.contains("return-certificate-return-shape:"),
+        "the block is read through, not refused\n{certificates}"
+    );
+    assert!(
+        !certificates.contains("call-site-not-a-receiver"),
+        "and the call inside it has the enclosing return as its receiver\n{certificates}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "buffer_new_with_size::self_0"),
+        None,
+        "the allocation at the bottom of the chain is an owner\nRECEIPTS:\n{certificates}\n{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Control: the block binds a POINTER local, which this rule cannot read
+/// through — the refusal stands.
+#[test]
+fn w6a_a1g_a_block_binding_a_pointer_keeps_its_refusal() {
+    let source = BLOCK_RETURN.replace(
+        "        let __arg_1 = strlen(str);",
+        "        let __arg_1 = strlen(str);\n        let mut alias = str;",
+    );
+    assert!(
+        source.contains("let mut alias = str;"),
+        "the control must bind a pointer"
+    );
+    let out = emitted("a1g-block-pointer", &source);
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate-return-shape:"),
+        "a pointer binding keeps the block opaque\n{}",
+        out.artifacts.return_certificate_receipts
+    );
+}

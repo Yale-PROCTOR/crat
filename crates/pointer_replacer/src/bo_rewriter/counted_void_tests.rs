@@ -903,9 +903,13 @@ fn w6v_read_cursor_alias_delivers_an_optional_byte_view() {
         "null-tested read view: {source}"
     );
     assert!(c.contains("ifsrc.is_none()"), "null test moves: {source}");
+    // R492-5 route (i): the alias is a delivered subject now, so its
+    // declaration carries its own type — the custody instrument refuses a
+    // delivered declaration whose type is inferred, and the count is still the
+    // contract's (no `from_raw_parts`, no fabricated extent).
     assert!(
-        c.contains("letmutcsrc=src.unwrap_or(&[]);"),
-        "the alias is the view: {source}"
+        c.contains("letmutcsrc:&[u8]=src.unwrap_or(&[]);"),
+        "the alias is the view, typed: {source}"
     );
     assert!(
         c.contains("(csrc[0]asu8)"),
@@ -1096,7 +1100,8 @@ fn w6v_indexed_read_alias_under_a_bounded_guard_delivers() {
         c.contains("fncsv_parse(muts:Option<&[u8]>,mutlen:u64,mutskip:u64)->u64"),
         "{source}"
     );
-    assert!(c.contains("letmutus=s.unwrap_or(&[]);"), "{source}");
+    // R492-5 route (i): the alias declares its own type (see CSV_READ).
+    assert!(c.contains("letmutus:&[u8]=s.unwrap_or(&[]);"), "{source}");
     assert!(
         c.contains("c=(us[(fresh17asisize)asusize]asu8);"),
         "indexed checked read: {source}"
@@ -1770,4 +1775,235 @@ fn w6v_view_beside_the_callers_own_local_storage_is_disjoint() {
     let original = run_binary(&format!("{FILL_INTO_LOCAL}\n{main}"));
     assert_eq!(original, b"23\n".to_vec());
     assert_eq!(run_binary(&format!("{source}\n{main}")), original);
+}
+
+/// **R491-6 route (i): the counted READ alias is a delivered row of its own.**
+///
+/// The alias `csrc` is what the emitted program reads bytes through, so the
+/// ledger should say so. It cannot say so by carrying the contract's use edits
+/// — those are the contract's, and planning them twice is the duplicate K21
+/// refuses — so it says so by taking the one edit that is genuinely its own:
+/// its DECLARATION, `let mut csrc = src as *const u8` → `src.unwrap_or(&[])`.
+/// The contract keeps every use.
+#[test]
+fn w6v_counted_read_alias_is_a_delivered_row_of_its_own() {
+    let rows = super::emit_tests::decisions_of(CSV_READ);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "csrc" && !*p && r == "<emitted>"),
+        "the alias local delivers on its own declaration: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(CSV_READ).unwrap();
+    let c = compact(&source);
+    // The emitted text is unchanged by the move: one initializer, one of each use.
+    assert_eq!(
+        c.matches("letmutcsrc:&[u8]=src.unwrap_or(&[]);").count(),
+        1,
+        "the declaration is planned exactly once: {rows:?}\n{source}"
+    );
+    assert!(
+        !c.contains("csrcas*constu8") && !c.contains("*csrcasi32"),
+        "no unrewritten alias site survives: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **R492-5: the alias and its parameter withdraw together.**
+///
+/// Route (i) puts one contract's edits on two subjects, so a revert that takes
+/// one and keeps the other emits a tree that asks `unwrap_or` of a raw pointer
+/// (report 032, measured). The closure states the transaction to the revert
+/// loop; the two directions are asserted separately because a closure that
+/// only looks one way is exactly the defect that was observed.
+#[test]
+fn w6v_a_withheld_half_of_the_alias_transaction_withdraws_the_other() {
+    use rustc_hir::{
+        def_id::{DefIndex, LocalDefId},
+        hir_id::{HirId, ItemLocalId, OwnerId},
+    };
+
+    use super::decision::{
+        counted_void::{ByteElement, Contract, close_reverts},
+        emitability::UseEdit,
+    };
+
+    let owner = LocalDefId {
+        local_def_index: DefIndex::from_u32(7),
+    };
+    let hir = |id| HirId {
+        owner: OwnerId { def_id: owner },
+        local_id: ItemLocalId::from_u32(id),
+    };
+    let (param, alias) = (hir(1), hir(2));
+    let mut table = super::decision::DecisionTable::default();
+    table.counted_void.insert(
+        (owner, param),
+        Contract {
+            count_index: 1,
+            count_positional: None,
+            element: ByteElement::Read,
+            nullable: true,
+            handle: None,
+            width: None,
+            alias: Some(alias),
+            decl: Some(UseEdit {
+                span: rustc_span::DUMMY_SP,
+                replacement: "src.unwrap_or(&[])".to_owned(),
+                bridge_kind: "counted-void-read-alias",
+            }),
+            uses: Vec::new(),
+        },
+    );
+
+    let closed = |withheld: &[HirId]| {
+        let mut reverts = super::ast_transform::RevertSet::default();
+        for hir_id in withheld {
+            reverts.atom_subjects.insert((owner, *hir_id));
+        }
+        close_reverts(&table, &mut reverts);
+        reverts.fns.contains(&owner)
+    };
+
+    assert!(!closed(&[]), "a kept pair withdraws nothing");
+    assert!(closed(&[param]), "the withheld parameter takes its alias");
+    assert!(closed(&[alias]), "the withheld alias takes its parameter");
+}
+
+/// **The count must be evidence, not position (report 037).**
+///
+/// json.h's real shape, parameter for parameter: the state aggregate takes
+/// `src_size` AND `flags_bitset` from the signature, so "the sibling parameter
+/// stored beside the pointer" no longer names one thing. The rule refuses
+/// rather than pick, because picking the wrong sibling gives the view a length
+/// that is not its own — the corpus rows stand or fall on this question, not on
+/// the store shape, which the delivering witness above already proves.
+const JSON_REAL: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub type size_t = u64;
+pub struct parse_result { pub error: size_t, pub error_offset: size_t }
+pub struct parse_state {
+    pub src: *const i8,
+    pub size: size_t,
+    pub offset: size_t,
+    pub flags_bitset: size_t,
+    pub data: *mut i8,
+    pub error: size_t,
+}
+unsafe fn json_parse_ex(mut src: *const core::ffi::c_void, mut src_size: size_t,
+    mut flags_bitset: size_t,
+    mut alloc_func_ptr: Option<unsafe extern "C" fn(*mut core::ffi::c_void, size_t) -> *mut core::ffi::c_void>,
+    mut user_data: *mut core::ffi::c_void,
+    mut result: *mut parse_result) -> i32 {
+    let mut state = parse_state { src: 0 as *const i8, size: 0, offset: 0, flags_bitset: 0, data: 0 as *mut i8, error: 0 };
+    let mut allocation = 0 as *mut core::ffi::c_void;
+    if !result.is_null() { (*result).error = 0; (*result).error_offset = 0; }
+    if src.is_null() { return -(1 as i32); }
+    state.src = src as *const i8;
+    state.size = src_size;
+    state.offset = 0;
+    state.flags_bitset = flags_bitset;
+    let mut acc: i32 = 0;
+    while state.offset < state.size {
+        acc = acc.wrapping_add(*state.src.offset(state.offset as isize) as i32);
+        state.offset = state.offset.wrapping_add(1);
+    }
+    return acc;
+}
+"#;
+
+#[test]
+fn w6v_counted_store_picks_the_following_sibling_by_position() {
+    let rows = super::emit_tests::decisions_of(JSON_REAL);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "src" && *p && r == "<emitted>"),
+        "the positional clause gives the ambiguous shape its count: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(JSON_REAL).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fnjson_parse_ex(mutsrc:Option<&[u8]>,mutsrc_size:size_t,"),
+        "the view takes the sibling that follows the pointer: {source}"
+    );
+    assert!(
+        c.contains(
+            "state.src=src.map_or(0as*consti8,|__crat_cv_src|__crat_cv_src.as_ptr()as*consti8);"
+        ),
+        "the store keeps its raw form: {source}"
+    );
+    assert!(
+        c.contains("state.flags_bitset=flags_bitset;"),
+        "the other stored parameter is untouched: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **The control: a positional pick needs an integer (R500-8).**
+///
+/// The sibling following the pointer is a pointer of its own here, so there is
+/// nothing to read as a length and the rule refuses rather than guess further.
+const STORE_NON_INTEGER_SIBLING: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+pub struct holder { pub src: *const u8, pub other: *const u8, pub size: u64 }
+unsafe fn take(mut src: *const core::ffi::c_void, mut other: *const u8, mut n: u64) -> i32 {
+    let mut h = holder { src: 0 as *const u8, other: 0 as *const u8, size: 0 };
+    if src.is_null() { return -(1 as i32); }
+    h.src = src as *const u8;
+    h.other = other;
+    h.size = n;
+    return 0 as i32;
+}
+"#;
+
+#[test]
+fn w6v_counted_store_refuses_a_non_integer_following_sibling() {
+    let rows = super::emit_tests::decisions_of(STORE_NON_INTEGER_SIBLING);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "src" && *p && r != "<emitted>"),
+        "no integer follows the pointer, so there is no count to pick: {rows:?}"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(STORE_NON_INTEGER_SIBLING).unwrap();
+    assert!(
+        compact(&source).contains("mutsrc:*constcore::ffi::c_void"),
+        "the parameter stays raw: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **The receipt tells the truth (R500-8).** A positional count is emitted as
+/// the caller's own argument text and counted with §77's fabricated extents —
+/// never as evidence, because a guess is not evidence.
+#[test]
+fn w6v_positional_count_receipts_as_a_fabricated_extent() {
+    use super::decision::seam::{GlueCore, GlueSpec, SeamLen};
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.len = Some(SeamLen::PositionalSibling {
+        text: "src_size".to_owned(),
+        param: "src_size".to_owned(),
+    });
+    assert_eq!(
+        spec.extent_arm_key(),
+        "fallback-sibling-by-position@addendum-77"
+    );
+    assert!(
+        spec.len.as_ref().is_some_and(SeamLen::is_fabricated),
+        "a positional extent is counted with the fabricated ones (§77)"
+    );
+    assert_eq!(
+        spec.len.as_ref().and_then(SeamLen::positional_param),
+        Some("src_size"),
+        "and the receipt names what was guessed"
+    );
+    assert_eq!(spec.len.as_ref().map(SeamLen::text), Some("src_size"));
+    let licensed = {
+        let mut other = GlueSpec::core(GlueCore::Bare, false);
+        other.len = Some(SeamLen::Licensed("src_size".to_owned()));
+        other
+    };
+    assert_ne!(
+        spec.extent_arm_key(),
+        licensed.extent_arm_key(),
+        "the same text, and never the same receipt"
+    );
 }

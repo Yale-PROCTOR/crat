@@ -17,8 +17,9 @@ use rustc_hir::{
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::{
-    Arm, Decision, DecisionTable, SubjectKind,
+    Arm, Decision, DecisionTable, Subject, SubjectKind,
     construction::{SliceLengthPlan, SliceLengthSource},
+    cursor_native::{CursorHold, CursorPlan, ProspectiveTable},
     exposure::ExposureSurfacePlan,
 };
 use crate::{
@@ -91,6 +92,27 @@ pub(crate) struct Plan {
     pub(crate) conditional_updates: Vec<HirId>,
     pub(crate) rows: Vec<Row>,
     pub(crate) parameters: Vec<Parameter>,
+    /// **R500-6 (b).** Parameters this plan ADMITTED and then stood off. A
+    /// `Plan` is per-OWNER, so every admitted parameter shares one fate: a
+    /// clause that fails later, or an emission that does not type, takes the
+    /// whole owner with it. Report 015 measured that price — N2's cursor arm
+    /// admitting a sibling cost tulipindicators five tables N1 already
+    /// delivered. A stood-off parameter is therefore one the arm could have
+    /// taken and deliberately did not, recorded here so the decision is typed
+    /// and counted rather than a silent skip. The pair rule stands nothing off
+    /// and leaves this empty.
+    pub(crate) stood_off: Vec<HirId>,
+    /// **R506-5.** Cursor rows this flip carried with it: rows the cursor
+    /// family re-based against the PROSPECTIVE table inside the same
+    /// transaction. Each one also REMOVES a `FALLBACK_SLICE_EXTENT` site, since
+    /// `SliceCursor::new(t[k])` takes no length — a §77 reduction, counted here
+    /// so it is auditable rather than merely claimed.
+    pub(crate) rebased: Vec<HirId>,
+    /// **R506-5.** Parameters the transaction rolled back, with the cursor
+    /// family's own `CursorHold` that refused the row. Rolling back one
+    /// PARAMETER rather than the owner is what protects its siblings, which is
+    /// the job retired clause (f) used to do by proxy.
+    pub(crate) rebase_refused: Vec<(HirId, CursorHold)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
@@ -679,7 +701,38 @@ fn inspect_pair<'tcx>(
         conditional_updates,
         rows,
         parameters,
+        stood_off: Vec::new(),
+        rebased: Vec::new(),
+        rebase_refused: Vec::new(),
     })
+}
+
+/// **R506-5 / R517-6 — the flip asks the cursor family, before installing.**
+///
+/// `plan_with` is the one door, and slicecursor's `1c702270b` is what makes it
+/// the right one: a row this family has ALREADY taken, re-planned against a
+/// base about to flip, is delegated straight to construction *before* the
+/// selection gate. Re-asking selection there would give the wrong answer rather
+/// than a conservative one — `ordering_degraded` is false for a `Cursor`, so a
+/// row selected by ordering would fail a gate it passed in the same pass.
+///
+/// Report 019 reached construction by calling `build` directly and raising its
+/// visibility. That worked and was the wrong seam: it bypassed the gate rather
+/// than being admitted through it. `build` is `pub(super)` again and every row —
+/// cursor or not — goes through `plan_with(.., Some(&prospective))`.
+///
+/// `None` means the row is not in `entries` at all.
+fn rebase_row(
+    ctx: &super::Ctx<'_, '_>,
+    owner: LocalDefId,
+    row: &Row,
+    entries: &[(Subject, Decision)],
+    prospective: &ProspectiveTable,
+) -> Option<Result<CursorPlan, CursorHold>> {
+    let (subject, decision) = entries
+        .iter()
+        .find(|(s, _)| s.fn_did == owner && s.hir_id == row.local)?;
+    super::cursor_native::wrapper::plan_with(ctx, subject, decision, entries, Some(prospective))
 }
 
 pub(crate) fn promote(
@@ -689,6 +742,7 @@ pub(crate) fn promote(
     model: &FxHashMap<SlotRef, SlotKind>,
     ready: &ClassFinalization,
     policy: &FamilyPolicy,
+    ctx: &super::Ctx<'_, '_>,
 ) -> bool {
     let mut owners = table
         .entries
@@ -702,8 +756,66 @@ pub(crate) fn promote(
     owners.dedup();
     let mut changed = false;
     for owner in owners {
-        let result = inspect(tcx, owner, table, slots, model, ready);
-        if let Ok(plan) = &result {
+        let mut result = inspect(tcx, owner, table, slots, model, ready);
+        if let Ok(plan) = &mut result {
+            // **R506-5 — the per-parameter transaction.** A flip retypes the
+            // table; every row of it must still type afterwards. A slice row
+            // does, because the loop below rewrites its construction. A CURSOR
+            // row has no construction of its own — its constructor belongs to
+            // the cursor family and, until this transaction existed, was
+            // rebuilt only AFTER the flip, which is the window report 016
+            // measured as 61 lost `SliceCursor` constructions.
+            //
+            // So each parameter is decided before anything is installed: every
+            // cursor row of it is offered to the cursor family against the
+            // PROSPECTIVE table, and the parameter commits only if all of them
+            // come back constructed. A refusal costs exactly that parameter —
+            // its siblings keep the delivery they already had, which is the
+            // protection retired clause (f) used to approximate.
+            let mut committed = Vec::new();
+            for p in &plan.parameters {
+                let prospective = ProspectiveTable {
+                    binding: p.hir,
+                    inner_mutable: p.mutable,
+                };
+                let mut rebased = Vec::new();
+                let mut refusal = None;
+                for row in plan.rows.iter().filter(|r| r.parameter == p.hir) {
+                    // (g)'s own predicate is the classifier: a row with no
+                    // slice construction is exactly a cursor row.
+                    if table
+                        .slice_constructions
+                        .iter()
+                        .any(|c| c.node == (owner, row.local))
+                    {
+                        continue;
+                    }
+                    match rebase_row(ctx, owner, row, &table.entries, &prospective) {
+                        Some(Ok(rebuilt)) => rebased.push((row.local, rebuilt)),
+                        Some(Err(hold)) => {
+                            refusal = Some(hold);
+                            break;
+                        }
+                        None => {
+                            refusal = Some(CursorHold::BaseMissing);
+                            break;
+                        }
+                    }
+                }
+                match refusal {
+                    Some(hold) => plan.rebase_refused.push((p.hir, hold)),
+                    None => {
+                        plan.rebased.extend(rebased.iter().map(|(local, _)| *local));
+                        committed.push((p.clone(), rebased));
+                    }
+                }
+            }
+            // Nothing above touched `table`; from here the committed
+            // parameters are installed, and only those.
+            plan.parameters
+                .retain(|p| committed.iter().any(|(c, _)| c.hir == p.hir));
+            plan.rows
+                .retain(|r| plan.parameters.iter().any(|p| p.hir == r.parameter));
             for p in &plan.parameters {
                 let (_, d) = table
                     .entries
@@ -734,17 +846,45 @@ pub(crate) fn promote(
                         MechanicalExtent::Evidence("finite-scoped-descriptor-array".into());
                 }
             }
+            // **R519-3, the ordering condition.** The re-based plans are
+            // installed AFTER the flip, never before. `fallback` is defined as
+            // `!delivered_inner`, so a re-based plan (`fallback == false`)
+            // beside a table still `Decision::Slice` is the one pair the site
+            // check must refuse — and installing in the other order would put
+            // exactly that pair in `table.entries`. No observer runs between
+            // these two loops today, so the invariant held either way; this
+            // makes it hold by construction rather than by statement order.
+            for (_, rebased) in &committed {
+                for (local, rebuilt) in rebased {
+                    if let Some((subject, decision)) = table
+                        .entries
+                        .iter_mut()
+                        .find(|(s, _)| s.fn_did == owner && s.hir_id == *local)
+                    {
+                        *decision = Decision::Cursor {
+                            mutable: subject.mutable,
+                            plan: rebuilt.clone(),
+                        };
+                    }
+                }
+            }
             for row in &plan.rows {
                 let p = plan
                     .parameters
                     .iter()
                     .find(|p| p.hir == row.parameter)
                     .unwrap();
-                let c = table
+                // A row with no slice construction is a CURSOR row, and it was
+                // already rebased above, inside this parameter's transaction —
+                // its constructor is the cursor family's and is installed
+                // there. Nothing is left for a later repair.
+                let Some(c) = table
                     .slice_constructions
                     .iter_mut()
                     .find(|c| c.node == (owner, row.local))
-                    .unwrap();
+                else {
+                    continue;
+                };
                 c.replacement = Some(format!(
                     "{}{}[{}]",
                     if row.mutable { "&mut *" } else { "" },
@@ -798,6 +938,9 @@ pub(crate) fn observe(tcx: TyCtxt<'_>, table: &DecisionTable) {
         match &receipt.result {
             Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "arm": if plan.count_guard { "pair" } else { "per-parameter" }, "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
                 "parameters":plan.parameters.iter().map(|p|serde_json::json!({"hir":p.hir.local_id.as_u32(),"argument":p.index,"name":p.name,"inner_depth":1,"outer_mutable":p.mutable,"inner_mutable":p.mutable})).collect::<Vec<_>>(),
+                "stood_off":plan.stood_off.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
+                "rebased":plan.rebased.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
+                "rebase_refused":plan.rebase_refused.iter().map(|(h,hold)|serde_json::json!({"hir":h.local_id.as_u32(),"hold":format!("{hold:?}")})).collect::<Vec<_>>(),
                 "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after": !plan.count_guard && r.was_fallback})).collect::<Vec<_>>() }),
             Err(hold) => serde_json::json!({"owner":owner,"status":"held","hold":format!("{hold:?}")}),
         }

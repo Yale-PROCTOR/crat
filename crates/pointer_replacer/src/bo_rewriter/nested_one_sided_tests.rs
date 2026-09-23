@@ -19,6 +19,9 @@ const BOTH: &str = "indicators::ema::ti_ema";
 const LATE: &str = "indicators::ema_late_out::ti_ema_late_out";
 const LATE_IN: &str = "indicators::ema_late_in::ti_ema_late_in";
 const EXTRA: &str = "indicators::ema_extra_use::ti_ema_extra_use";
+const MIXED: &str = "indicators::sma_mixed::ti_sma_mixed";
+const CURSOR_ONLY: &str = "indicators::sma_cursor_only::ti_sma_cursor_only";
+const TWICE: &str = "indicators::sma_twice::ti_sma_twice";
 /// wave-5d's pair fixture, read (never edited) as this lane's no-shadow control.
 const PAIR_SOURCE: &str = include_str!("wave5d_ti_abs.rs");
 
@@ -423,6 +426,250 @@ fn n1_never_shadows_an_admitted_pair_plan() {
     .unwrap();
 }
 
+/// **W-N1-MIXED-FRAME** — the premises `ti_sma_mixed` exists to carry, pinned
+/// before the rule is asked anything: its INPUT row is the cursor family's
+/// market and its OUTPUT row is an ordinary slice, so this owner has exactly
+/// one slice-only table and one cursor table. If either moves, the standoff
+/// witnesses below are testing a shape that is not the corpus's.
+///
+/// The input row reading `Cursor` is itself load-bearing, and measured: with
+/// the arm admitting it, the whole owner failed and the cursor came back out
+/// as `Degraded(SliceNegOrUnknownOffset)` — a withdrawn cursor, which is how
+/// the slicecursor fixture `ti_sma_cursor` still reads. So the standoff does
+/// not only save the slice-only sibling; it leaves the cursor family holding
+/// its own row. If this assertion ever reads `Degraded` again, the standoff
+/// has stopped working and the owner is being taken down as a whole.
+#[test]
+fn n1_mixed_fixture_carries_one_cursor_row_and_one_slice_row() {
+    let rows = decisions(MIXED);
+    let input = rows
+        .iter()
+        .find(|(p, _)| p == "input")
+        .map(|(_, d)| d)
+        .expect("the input row subject");
+    let output = rows
+        .iter()
+        .find(|(p, _)| p == "output")
+        .map(|(_, d)| d)
+        .expect("the output row subject");
+    assert!(
+        matches!(input, Decision::Cursor { .. }),
+        "the input row must still be the cursor family's — a `Degraded` here is \
+         a WITHDRAWN cursor, i.e. the standoff failed: {input:?}"
+    );
+    assert!(
+        matches!(output, Decision::Slice { mutable: true, .. }),
+        "the output row must be an ordinary mutable slice: {output:?}"
+    );
+    // ... and both TABLES are the flat slices N1 consumes, so the only thing
+    // separating the two sides is which family owns the row.
+    for table in ["inputs", "outputs"] {
+        assert!(
+            matches!(
+                table_decision(MIXED, table),
+                Decision::Slice { mutable: false, .. } | Decision::NestedSlice { .. }
+            ),
+            "{table} is not the flat-slice table this rule consumes"
+        );
+    }
+}
+
+/// **W-N1-COMMIT** — R517-5. What the rollback witness measured before the
+/// hand-off worked, measured from the other side now that it does: the mixed
+/// owner commits BOTH parameters, its cursor row is re-based rather than
+/// refused, and nothing is rolled back. The per-parameter rollback itself is
+/// still the protection — it is simply not exercised here any more, because
+/// nothing fails. W3 is where a refusal is exercised, and it is owed (STOP).
+#[test]
+fn n1_the_mixed_owner_commits_both_parameters_and_rebases_its_cursor_row() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let plan = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == MIXED)
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("an admitted plan for the mixed owner");
+        let mut names = plan
+            .parameters
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["inputs".to_owned(), "outputs".to_owned()],
+            "both tables commit once the cursor row can be re-based"
+        );
+        assert_eq!(
+            plan.rebased.len(),
+            1,
+            "the cursor row is re-based, and counted: {:?}",
+            plan.rebased
+        );
+        assert!(
+            plan.rebase_refused.is_empty(),
+            "nothing was rolled back: {:?}",
+            plan.rebase_refused
+        );
+    })
+    .unwrap();
+}
+
+/// **W-N1-STANDOFF-DELIVERS** — the point of the standoff, in the tree: the
+/// slice-only sibling keeps the delivery it had before the cursor arm existed,
+/// and the cursor sibling keeps exactly its frame form.
+#[test]
+fn n1_standoff_keeps_the_slice_only_siblings_delivery() {
+    let body = region(emitted(), "__crat_safe_ti_sma_mixed");
+    assert!(
+        body.contains("outputs: &mut [&mut [std::os::raw::c_double]]"),
+        "the slice-only table still delivers its inner level:\n{body}"
+    );
+    // R517-5: the cursor sibling no longer keeps its frame form — it delivers
+    // too. Clause (f) used to forfeit it to protect this one; the transaction
+    // protects this one without the forfeit, which is the whole of the ruling.
+    assert!(
+        body.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "the cursor sibling did not deliver alongside it:\n{body}"
+    );
+}
+
+/// **W-N1-CONSTRUCTED** — R501-4 (iv), (b′). A table is flipped only when every
+/// one of its rows has a construction for `promote` to rewrite. The measured
+/// reason: a cursor row's constructor belongs to the cursor family and is
+/// rebuilt only after the flip, so in between the table's type has changed and
+/// the row's base text has not — report 016 counted that as 61 of
+/// tulipindicators' 68 `SliceCursor` constructions reverting to raw pointers,
+/// and the planner's own answer is to WITHDRAW the Return-stage transaction
+/// carrying the flip (`withdrawn=[Return]`, class-level), after which the
+/// emitting `Return` pass re-derives without it.
+///
+/// So every row that survives into a plan must name a slice construction. This
+/// is asserted over the plan rather than over the arm, deliberately: the day
+/// the cursor family constructs a row before the flip, this witness keeps
+/// passing and the arm is free again.
+#[test]
+fn n1_every_planned_row_names_a_construction() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let mut planned = 0;
+        for receipt in &table.nested_receipts {
+            let Ok(plan) = &receipt.result else { continue };
+            for row in &plan.rows {
+                // R517-5: a row is typed either by a slice construction this
+                // loop rewrites, or by the cursor plan the transaction re-based
+                // for it. Both are constructions; only the family differs.
+                assert!(
+                    table
+                        .slice_constructions
+                        .iter()
+                        .any(|c| c.node == (plan.owner, row.local))
+                        || plan.rebased.contains(&row.local),
+                    "{} row {:?} is typed by neither a slice construction nor a \
+                     re-base — the flip would change the table's type and leave \
+                     this row's base text alone",
+                    tcx.def_path_str(plan.owner.to_def_id()),
+                    row.local
+                );
+                planned += 1;
+            }
+        }
+        assert!(planned > 0, "no plan reached this witness at all");
+    })
+    .unwrap();
+}
+
+/// **W-N1-NOT-WITHDRAWN** — (b′)'s own shape, and the one that measures the
+/// difference. `ti_sma_cursor_only` has no slice-only table, so clause (f)
+/// leaves the arm free and clause (g) is the only thing between it and a flip
+/// it cannot type.
+///
+/// The assertion is that the owner has a RECEIPT AT ALL. Without (g) it has
+/// none — and the reason corrects report 016, which read that absence as "the
+/// owner is never offered". It is offered: the instrument shows a `Return` pass
+/// admitting it, and then the transaction carrying the untypeable flip is
+/// withdrawn class-level (`withdrawn=[Return]`), so the next `Return` pass —
+/// whose table is the one handed back — re-derives without it and leaves no
+/// receipt behind. With (g) the flip is never made, nothing is withdrawn, and
+/// the owner ends with a typed hold instead of a hole.
+#[test]
+fn n1_an_owner_it_cannot_type_is_held_not_withdrawn() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let receipt = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == CURSOR_ONLY)
+            .map(|r| r.result.clone());
+        assert!(
+            receipt.is_some(),
+            "no receipt for {CURSOR_ONLY}: its Return-stage transaction was \
+             withdrawn, which is what the transaction exists to prevent"
+        );
+        // R517-5: and now it DELIVERS. The guard's point is unchanged — a
+        // withdrawn transaction leaves no receipt behind — but the outcome it
+        // guards has flipped from "tree-neutral" to "delivered", because the
+        // site check no longer reads a delivered inner level as an unavailable
+        // base.
+        assert!(
+            matches!(
+                table_decision(CURSOR_ONLY, "inputs"),
+                Decision::NestedSlice { .. }
+            ),
+            "the owner survived the transaction but did not deliver"
+        );
+    })
+    .unwrap();
+}
+
+/// **W-N1-STANDOFF-SCOPED** — an owner with no cursor row at all never reaches
+/// the precondition, so `ti_ema`'s two-table plan is exactly what it was before
+/// this clause existed.
+#[test]
+fn n1_standoff_does_not_touch_an_owner_without_a_cursor_row() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let plan = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == BOTH)
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("an admitted N1 plan");
+        assert_eq!(plan.parameters.len(), 2, "both tables still deliver");
+        assert!(plan.stood_off.is_empty(), "nothing was stood off");
+    })
+    .unwrap();
+}
+
 /// The typed hold vocabulary this arm may report is the pair rule's; N1 adds
 /// no new one, so a held owner's census row cannot move because of this lane.
 #[test]
@@ -440,4 +687,104 @@ fn n1_reports_no_new_hold_vocabulary() {
         Hold::DeclarationUnbuilt,
     ];
     assert_eq!(holds.len(), 10);
+}
+
+// ============================================================================
+// R506-5 — the transaction's witnesses, RED-first and ARMED. These are the
+// outcome assertions of report 018's W1/W2/W5; they are deliberately written
+// over the emitted text and the decision frame, NOT over the hand-off's
+// internal shape, so they are identical under either option in 018's STOP 1
+// and do not prejudge slicecursor's answer.
+// ============================================================================
+
+/// **W1** — the cursor-only owner DELIVERS. Today clause (g) stands it off,
+/// because the cursor row has no construction at flip time; once the flip hands
+/// the cursor family its base inside the same transaction, the row is
+/// constructed by the flip and the table delivers.
+#[test]
+fn w1_the_cursor_only_owner_delivers_its_inner_level() {
+    let body = region(emitted(), "__crat_safe_ti_sma_cursor_only");
+    assert!(
+        body.contains("inputs: &[&[std::os::raw::c_double]]"),
+        "the cursor-only table did not deliver:\n{body}"
+    );
+    assert!(
+        body.contains("SliceCursor::new(inputs["),
+        "the row's cursor is not built from the delivered element:\n{body}"
+    );
+    assert!(
+        !body.contains("SliceCursor::from_raw_parts(inputs["),
+        "a fabricated extent survives on a delivered element:\n{body}"
+    );
+}
+
+/// **W2** — clause (f)'s retirement, made visible: with the transaction the
+/// mixed owner delivers BOTH tables, because a cursor sibling that types no
+/// longer has to be forfeited to protect the slice-only one.
+#[test]
+fn w2_the_mixed_owner_delivers_both_tables() {
+    for parameter in ["inputs", "outputs"] {
+        let decision = table_decision(MIXED, parameter);
+        assert!(
+            matches!(decision, Decision::NestedSlice { .. }),
+            "{parameter} must deliver its inner level once the flip types the \
+             cursor row: {decision:?}"
+        );
+    }
+}
+
+/// **W3 — the rollback path is NOT reachable at this frame, and this is the
+/// measurement that says so.** `ti_sma_twice` names its output table twice,
+/// which was meant to make `table_element_base` refuse an exclusive row over its
+/// element (`s.mutable && !table_named_once`) and exercise the transaction's
+/// rollback. It does not: naming the table twice degrades **the table itself**,
+/// so `outputs` never becomes a nested candidate (clause (a) wants a flat slice)
+/// and the transaction is never asked about it.
+///
+/// So the two conditions look mutually exclusive at this frame — a table named
+/// more than once cannot also be a nested candidate — and the corpus agrees:
+/// `rebase_refused` is empty across all 93 planned tulipindicators owners
+/// (report 022). What this witness pins is therefore the reachable half: the
+/// sibling delivers, and a table the arm cannot take is skipped rather than
+/// taking its sibling down. The unreachable half is a STOP, not a silent gap.
+#[test]
+fn w3_a_table_the_arm_cannot_take_is_skipped_not_rolled_back() {
+    ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let plan = table
+            .nested_receipts
+            .iter()
+            .find(|r| tcx.def_path_str(r.owner.to_def_id()) == TWICE)
+            .and_then(|r| r.result.as_ref().ok())
+            .expect("the qualifying sibling still gives this owner a plan");
+        assert_eq!(
+            plan.parameters
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["inputs".to_owned()],
+            "the sibling delivers while the twice-named table is skipped"
+        );
+        // Skipped at the CANDIDATE stage, not rolled back by the transaction:
+        // the distinction is the whole finding.
+        assert!(
+            plan.rebase_refused.is_empty(),
+            "a twice-named table reaches the transaction after all: {:?}",
+            plan.rebase_refused
+        );
+        assert!(
+            plan.rows
+                .iter()
+                .all(|r| plan.parameters.iter().any(|p| p.hir == r.parameter)),
+            "a skipped table left its rows behind"
+        );
+    })
+    .unwrap();
 }

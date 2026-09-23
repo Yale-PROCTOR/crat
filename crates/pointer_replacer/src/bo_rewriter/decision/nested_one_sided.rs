@@ -10,8 +10,10 @@
 //!   (b) EVERY use of the binding `t` in the body is the receiver of
 //!       `*t.offset(k)` at a constant `k`, and that deref is the initializer
 //!       of a `let` in the block's leading `let` run;
-//!   (c) each such `let` binds a subject whose slice construction is already
-//!       planned, not held, not nullable, and carries the FABRICATED extent —
+//!   (c) each such `let` binds a subject that is either a planned slice
+//!       construction — not held, not nullable — or (N2, the cursor seam) a
+//!       cursor whose base is this table's element; either way it carries the
+//!       FABRICATED extent —
 //!       a constant, so relocating it to the wrapper cannot change what it
 //!       means (an evidence-backed length may name a helper-local and is
 //!       therefore not relocated by this arm);
@@ -20,7 +22,25 @@
 //!       or loop, so moving the loads above them preserves both the order of
 //!       effects and the values read;
 //!   (e) the rows of `t` project 0..n at one mutability, and neither `t` nor
-//!       its rows carry a raw-boundary atom group.
+//!       its rows carry a raw-boundary atom group;
+//!   (f) (R500-6 (b)) a table admitted through (c)'s CURSOR branch stands off
+//!       any owner that has a table admissible from slice rows alone. The plan
+//!       is per-owner, so the two share one fate, and report 015 measured the
+//!       price: the cursor rows delivered nothing and cost five tables N1
+//!       already delivered. Standing off leaves exactly the plan the slice-only
+//!       arm would have made, so the seam can only ever add; the stood-off
+//!       table is named in the plan's `stood_off` and counted in the receipt;
+//!   (g) (R501-4 (iv)) a table is flipped only when EVERY row of it has a
+//!       construction for `promote` to rewrite, so where this arm cannot type
+//!       the flip it does not make one and the emitted tree is untouched. A
+//!       cursor row has no construction — its constructor belongs to the cursor
+//!       family and is rebuilt only after the flip — and report 016 measured
+//!       the gap as 61 of tulipindicators' 68 `SliceCursor` constructions
+//!       reverting to raw pointers. The planner agrees: the `Return`-stage
+//!       transaction carrying such a flip is withdrawn class-level and the next
+//!       `Return` pass re-derives without it. Phrased over constructions rather
+//!       than over cursors, so it releases itself the day a cursor row is
+//!       constructed before the flip.
 //!
 //! What it emits: `t` is re-typed `&[&[T]]` / `&mut [&mut [T]]`, each row's
 //! construction becomes a reborrow of the element (`t[k]`, `&mut *t[k]`), and
@@ -48,8 +68,9 @@ use rustc_hir::{
 use rustc_middle::ty::{TyCtxt, TyKind};
 
 use super::{
-    DecisionTable, Hold, Parameter, Plan, Prelude, Row, SubjectKind, binding, flat_slice,
-    inherited_pair, integer, named, offset, peel, prelude,
+    super::cursor_native::DeliveredBaseProvider, Decision, DecisionTable, Hold, Parameter, Plan,
+    Prelude, Row, SubjectKind, binding, flat_slice, inherited_pair, integer, named, offset, peel,
+    prelude,
 };
 use crate::{
     analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef},
@@ -188,7 +209,6 @@ pub(super) fn inspect<'tcx>(
         let Some(parameter) = binding(receiver).filter(|p| targets.contains(p)) else { continue };
         let Some(projection) = integer(argument) else { continue };
         let Some((_, decision)) = subjects.iter().find(|(s, _)| s.hir_id == id) else { continue };
-        let Some((mutable, _)) = flat_slice(decision) else { continue };
         if inherited_pair(
             table
                 .arm_requirements
@@ -200,39 +220,90 @@ pub(super) fn inspect<'tcx>(
         {
             continue;
         }
-        let Some(construction) = table
-            .slice_constructions
-            .iter()
-            .find(|c| c.node == (owner, id))
-        else {
-            continue;
-        };
-        if construction.init_hir != init.hir_id
-            || construction.mutable != mutable
-            || tcx
-                .typeck(owner)
-                .expr_ty(init)
-                .builtin_deref(true)
-                .is_none()
-            || construction.hold_reason.is_some()
-            || construction.replacement.is_none()
-            || construction.nullable
-            // Only a fabricated extent is known to be a constant, and only a
-            // constant is known to mean the same thing in the wrapper.
-            || !construction.length.is_fallback()
+        if tcx
+            .typeck(owner)
+            .expr_ty(init)
+            .builtin_deref(true)
+            .is_none()
         {
             continue;
         }
+        let (mutable, length, _from_cursor) = match decision {
+            // The row becomes a plain slice local.
+            Decision::Slice { mutable, .. } => {
+                let Some(construction) = table
+                    .slice_constructions
+                    .iter()
+                    .find(|c| c.node == (owner, id))
+                else {
+                    continue;
+                };
+                if construction.init_hir != init.hir_id
+                    || construction.mutable != *mutable
+                    || construction.hold_reason.is_some()
+                    || construction.replacement.is_none()
+                    || construction.nullable
+                    // Only a fabricated extent is known to be a constant, and
+                    // only a constant is known to mean the same thing in the
+                    // wrapper.
+                    || !construction.length.is_fallback()
+                {
+                    continue;
+                }
+                (*mutable, construction.length.expression.clone(), false)
+            }
+            // N2 (the cursor seam, relay 002 §2). The row becomes a cursor
+            // over the inner slice. The cursor VERDICT and the runtime type are
+            // the cursor family's; only the constructor at the use site is
+            // ours, and it becomes `new(t[k])` — which takes no length, so this
+            // seam fabricates NOTHING. The row's one fabricated extent is the
+            // one this arm relocates to the wrapper, and it keeps the single
+            // receipt the cursor plan already carries for it.
+            Decision::Cursor { mutable, plan } => {
+                let Some(base) = plan.delivered_base.as_ref() else { continue };
+                if !matches!(base.provider, DeliveredBaseProvider::TableElement)
+                    // `DeliveredBase::initializer` names the TABLE's own
+                    // construction, not this row's; the row correspondence is
+                    // the subject lookup above (`s.hir_id == id`).
+                    || base.binding != parameter
+                    // Only the fallback-receipted base is a bare element load;
+                    // an evidence-backed one is a different construction.
+                    || !plan.fallback
+                    // A derived or re-pointed cursor has bases that are not the
+                    // element, and this arm cannot speak for them.
+                    || plan.parent_cursor.is_some()
+                    || !plan.peer_bases.is_empty()
+                    || plan
+                        .uses
+                        .iter()
+                        .filter(|u| u.bridge_kind == "cursor-constructor")
+                        .count()
+                        != 1
+                {
+                    continue;
+                }
+                // `plan.fallback` is the cursor family's own receipt that this
+                // base took the named fabricated extent; the wrapper rebuilds
+                // the row's view with the same one.
+                (*mutable, "crate::FALLBACK_SLICE_EXTENT".to_owned(), true)
+            }
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        };
         admitted_receivers.insert(peel(receiver).hir_id);
         row_statement.push(position);
         rows.push(Row {
             parameter,
             local: id,
-            init: construction.init_hir,
+            init: init.hir_id,
             index: projection,
             mutable,
             was_fallback: true,
-            length: construction.length.expression.clone(),
+            length,
             raw_name: format!("__crat_nested_{}_raw", id.local_id.as_u32()),
             view_name: format!("__crat_nested_{}_view", id.local_id.as_u32()),
         });
@@ -263,6 +334,25 @@ pub(super) fn inspect<'tcx>(
         return Err(Hold::IntervalChanged);
     }
 
+    // **R506-5 — (f) is RETIRED and (g) moved to where its answer is knowable.**
+    // (f) stood a cursor parameter off whenever the owner had a slice-only
+    // sibling. It was a PROXY for "this flip may fail", written when failure
+    // could only be found after the fact — and left standing it refuses five of
+    // the 51 forever (`ti_crossany`, `ti_crossover`, `ti_decay`, `ti_edecay`,
+    // `ti_tr`). `promote`'s per-parameter transaction detects failure directly
+    // and rolls back exactly the parameter that failed, which is the sibling
+    // protection (f) approximated, without forfeiting a cursor row that types.
+    //
+    // (g) — every row of a flipped table must have a construction — is KEPT,
+    // and enforced in `promote`: a cursor row's construction is produced BY the
+    // flip, through the cursor family's `plan_with`, so whether the row has one
+    // is not a question `inspect` can answer. Admitting it here and deciding
+    // there is the whole point of the transaction.
+    //
+    // No flag rides along for it: (g)'s own predicate IS the classifier — a row
+    // with no slice construction is exactly a cursor row — so `promote` asks
+    // `slice_constructions` and needs nothing new on the shared `Row`.
+    let stood_off = Vec::new();
     // (d) The relocation crosses only inert declarations.
     let last = *row_statement.iter().max().expect("a row was admitted");
     for stmt in block.stmts.iter().take(last) {
@@ -337,5 +427,8 @@ pub(super) fn inspect<'tcx>(
         rows,
         parameters,
         count_guard: false,
+        stood_off,
+        rebased: Vec::new(),
+        rebase_refused: Vec::new(),
     })
 }

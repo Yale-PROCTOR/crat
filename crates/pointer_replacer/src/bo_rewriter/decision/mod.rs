@@ -56,6 +56,7 @@ pub(crate) mod counted_void;
 mod counted_void_handle;
 mod counted_void_loop;
 mod counted_void_read;
+mod counted_void_store;
 pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
@@ -119,6 +120,7 @@ pub(crate) mod seam;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod shared_weakening;
 pub(crate) mod sibling_overlap;
+pub(crate) mod sized_assignment;
 pub(crate) mod slice_carrier;
 pub(crate) mod slice_construction_values;
 pub(crate) mod slice_forms;
@@ -1071,6 +1073,13 @@ pub(crate) struct DecisionTable {
     /// lifted with its evidence, or HELD with the reason no extent was found.
     /// The held count is the seat's Decision A input.
     pub(crate) root_extents: Vec<root_extent::RootExtentRow>,
+    /// **main 071c (a), report 057** — one row per root whose sole assignment
+    /// the slice-use inventory admitted as its construction, with the form the
+    /// subject ended in. The admission is made PRE-decision (main's STOP 2), so
+    /// without this row a census can see neither how often it fires nor whether
+    /// the subjects it fires on are delivered — which is exactly what the seat
+    /// asked to read at batch 28 and what no table could answer.
+    pub(crate) sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)>,
     /// wave-6f: the finalized struct-field reference transactions.
     pub field_transactions: field_reference::FieldTransactions,
     /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
@@ -1088,6 +1097,18 @@ pub(crate) struct DecisionTable {
     /// width at that index, and the allocation, which the signature does not
     /// carry).
     pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
+    /// with the EXACT extent licensed — the walk reaches the NUL on every path,
+    /// or the pointer is handed to a libc string function whose contract
+    /// requires a terminated string. A caller constructing a slice for one of
+    /// these takes `strlen(p) + 1` instead of §77's fallback.
+    pub(crate) nul_exact_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    /// **R491-7's caller-side clause (relay 060).** Subjects whose OWN body
+    /// hands the pointer to a libc string function, so the terminator is
+    /// established at this caller even where the callee's walk licenses only
+    /// the fallback. The length is then the string's own here, and the
+    /// fallback everywhere else.
+    pub(crate) nul_exact_callers: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1311,6 +1332,19 @@ pub(crate) fn decide_with_raw_fallbacks(
                 .map(|promotion| ((subject.fn_did, subject.hir_id), promotion))
         })
         .collect();
+    // The admission's receipt, joined to the form each subject ended in.
+    let sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)> = entries
+        .iter()
+        .flat_map(|(subject, decision)| {
+            let form = seam::form_of(decision).key().to_owned();
+            ctx.slice_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .map(|uses| uses.sized_assignments.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |admitted| (subject.label.clone(), form.clone(), admitted))
+        })
+        .collect();
     let option_mut_bindings = entries
         .iter()
         .filter_map(|(subject, decision)| {
@@ -1344,6 +1378,10 @@ pub(crate) fn decide_with_raw_fallbacks(
             needed.then_some((subject.fn_did, subject.hir_id))
         })
         .collect();
+    // R523-4: the one place a COMPLETE `Certificates` exists before every
+    // consumer drops it. Recording here rather than at a use site is what makes
+    // the census table the same facts the decision layer had.
+    return_certificate::record_certificate_receipts(ctx.return_certificates);
     DecisionTable {
         counted_void: ctx.counted_void.clone(),
         flexible_tails: ctx.flexible_tails.clone(),
@@ -1396,9 +1434,12 @@ pub(crate) fn decide_with_raw_fallbacks(
         contract_extent_promotions,
         licensed_lifts,
         root_extents,
+        sized_assignments,
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
+        nul_exact_parameters: Default::default(),
+        nul_exact_callers: Default::default(),
     }
 }
 
@@ -1869,7 +1910,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 && slice_local_construction::refuses(ctx, subject)
                 // R445-2: clause (d) of that refusal is a YIELD, not a
                 // refusal — the derived-view rule below types this subject.
-                && !source_typed_local::permits(ctx, subject) =>
+                && !source_typed_local::permits(ctx, subject)
+                // relay 035 (wave-6v 028 route (a)): a counted READ alias is
+                // DECLARATION-FREE — its type comes from the initializer the
+                // parameter's contract already rewrote — so this refusal has no
+                // claim on it. The arms below still decide its form; exempting
+                // it from them instead costs six of wave-6v's witnesses.
+                && !construction_values::counted_alias_needs_no_declaration(ctx, subject) =>
         {
             degrade(
                 subject,
@@ -1992,6 +2039,31 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             }) =>
         {
             decision
+        }
+        // **R491-6 route (i): the counted READ alias delivers on its own
+        // declaration.** `counted_alias_needs_no_declaration` above lifts the
+        // receiver-form refusal, but lifting a refusal supplies no form: this
+        // subject has no receiver and no field permit either, so it fell to the
+        // residue below and degraded `copy-source-coupled` beside the very code
+        // it is the subject of (report 031, measured on the composed head).
+        // Its form is the contract's and so is every USE of it; what is its own
+        // is the initializer — `let a = P as *const B` → `P.unwrap_or(&[])` —
+        // one splice target, planned once, here instead of in the contract's
+        // `uses`, because the same span planned twice is the duplicate K21
+        // refuses. The yield belongs HERE, beneath every earlier arm: exempting
+        // the subject further up the ladder is what cost six lane witnesses in
+        // report 028.
+        Decision::Slice { mutable, .. }
+        | Decision::Opt {
+            mutable,
+            slice: true,
+            ..
+        } if counted_void::alias_declaration(ctx, subject).is_some() => {
+            let uses = counted_void::alias_declaration(ctx, subject)
+                .cloned()
+                .into_iter()
+                .collect();
+            Decision::Slice { mutable, uses }
         }
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
@@ -2121,7 +2193,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             if field_reference
                 .is_some_and(|fields| fields.array_load_lift((subject.fn_did, subject.hir_id))) => {
         }
-        Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
+        Some(SlotKind::Raw) => {
+            // **R496-7**: this arm degrades unconditionally, so a certificate's
+            // own refusal may replace the generic reason here without ever
+            // pre-empting a family that would deliver.
+            if let Some(decision) = return_certificate::held(ctx, subject, &decl_site) {
+                return decision;
+            }
+            return degrade(subject, decl_site, DegradeReason::KindRaw);
+        }
         Some(SlotKind::Owning) => {
             // Item 5 opens borrowed declaration forms. Owning alias emission
             // remains in the separately chartered Box family.
@@ -2145,10 +2225,24 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             let prior = flexible_tail::override_plan(ctx, subject, prior);
             // wave-6a W6A-C1: a Box-parameter chain supplies the plan or the typed hold.
             let prior = box_param::override_plan(ctx, subject, prior);
-            return match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
-                Ok(plan) => Decision::Box(plan),
-                Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),
-            };
+            match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
+                Ok(plan) => return Decision::Box(plan),
+                // **wave-6a W6A-A9 — a proven lend is not this family's
+                // subject** (relay wave-6a/043 §A9). Every owning producer
+                // above has had its refusal — the Box plan, the flexible-tail
+                // transaction, the parameter chain and the ownership-fields
+                // hook — and none of them owns this formal. Its body says why:
+                // the callee never frees it, never stores it and never moves
+                // it on, so nothing here releases the allocation and the
+                // caller keeps the owner. The arm declines the ownership claim
+                // rather than degrading on it, and the borrowing arms below
+                // decide under their own gates. A9 sits LAST on purpose: it
+                // must not pre-empt a producer that would deliver.
+                Err(_) if box_param::lend_leaves_owning(ctx, subject) => {}
+                Err(failure) => {
+                    return degrade(subject, decl_site, DegradeReason::BoxFailure { failure });
+                }
+            }
         }
         None => return degrade(subject, decl_site, DegradeReason::NoSlot),
     }
@@ -2835,7 +2929,20 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     Decision::Slice {
         // Composition arm (wave-4 R407-14 x wave-6b): a delivered region carries
         // its own mutability; otherwise wave-4's NUL-contract-alone narrowing.
-        mutable: region.map_or(subject.mutable && !contract_alone, |region| region.mutable),
+        // **W6S-12 (R490-4).** A subject whose only rewritten uses are W6S-8
+        // bridges at foreign `*const T` formals is READ through every one of
+        // them; the `*mut` in the C signature is the input's artifact, not a
+        // permission this program needs. Taking the shared form is what lets
+        // a caller with a literal origin supply the view at all — libtree's
+        // `print_line::color_bold`, whose seam was refused `shared-to-mut`.
+        // Narrowing only: `&mut` -> `&` never widens a permission, and the
+        // conjunct is exact (at least one such bridge, and no other rewrite).
+        mutable: region.map_or(
+            subject.mutable
+                && !contract_alone
+                && !(uses.foreign_const_bridges > 0 && uses.other_rewrites == 0),
+            |region| region.mutable,
+        ),
         uses: uses.rewrites,
     }
 }
@@ -2977,9 +3084,12 @@ mod self_consistency_tests {
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            nul_exact_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

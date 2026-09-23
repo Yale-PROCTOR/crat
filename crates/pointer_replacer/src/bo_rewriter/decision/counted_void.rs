@@ -47,7 +47,190 @@ pub(crate) struct Contract {
     /// fix (a constant, or one width per literal of a sibling discriminant);
     /// `count_index` is then the discriminant's index, or the parameter's own.
     pub(crate) width: Option<super::binn_counted::WidthTable>,
+    /// The counted READ alias this contract rewrites (`let a = P as *const B`),
+    /// when there is one: every USE of the local is the contract's edit. The
+    /// declaration family reads this to mark it declaration-free (relay
+    /// wave-6v/030 route (a); wave-6k relay 035).
+    pub(crate) alias: Option<HirId>,
+    /// **The count was picked BY POSITION (R500-8).** When no store in the body
+    /// names one sibling as the length, the sibling immediately following the
+    /// pointer in the signature is admissible — and the receipt says so: the
+    /// extent is counted with §77's fabricated ones, never as evidence. `None`
+    /// is the ordinary case, a count the body itself pairs with the pointer.
+    pub(crate) count_positional: Option<String>,
+    /// **The alias's own declaration (R491-6, route (i)).** Its initializer —
+    /// `let a = P as *const B` → `P.unwrap_or(&[])` — is the one edit that
+    /// belongs to the ALIAS and not to the parameter, so the contract plans it
+    /// here and hands it over: [`alias_declaration`] gives it to the alias
+    /// subject, which delivers on it. Planning it in `uses` as well is the
+    /// duplicate K21 refuses (report 031: the same span, twice).
+    pub(crate) decl: Option<UseEdit>,
     pub(crate) uses: Vec<UseEdit>,
+}
+
+/// The counted contract whose READ alias is this local — the parameter's,
+/// looked up in the same function. [`active`] answers for the parameter; this
+/// answers for the local it reinterprets, and is the hook the declaration
+/// family uses to classify that local as declaration-free.
+pub(crate) fn alias_contract<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a Contract> {
+    use crate::bo_rewriter::additive::FamilyStage;
+    if !matches!(s.kind, SubjectKind::Local) {
+        return None;
+    }
+    let contract = ctx
+        .counted_void
+        .iter()
+        .find(|((fn_did, _), c)| *fn_did == s.fn_did && c.alias == Some(s.hir_id))
+        .map(|(_, c)| c)?;
+    (ctx.family_policy
+        .enabled(s.fn_did, FamilyStage::Declaration)
+        && ctx.family_policy.enabled(s.fn_did, FamilyStage::SliceUse))
+    .then_some(contract)
+}
+
+/// **The declaration edit a counted READ alias delivers on (R491-6, route (i)).**
+///
+/// The contract owns every USE of the alias; what it does not own is the
+/// local's own initializer, and that is exactly one splice target — enough for
+/// the alias to be a row of its own instead of a `copy-source-coupled`
+/// degradation beside the code it is the subject of. Route (ii), a delivered
+/// row with no edits at all, was refused: the ledger may only say "emitted"
+/// where the tree independently witnesses it.
+/// **A decision that carries the alias's own initializer (R491-6, route (i)).**
+///
+/// Readable from the decision alone, because the construction planner has no
+/// `Ctx`: the edit names itself (`counted-void-read-alias`). A constructor over
+/// the same initializer would wrap this edit in `from_raw_parts` and fabricate
+/// an extent — measured, and it costs the contract its own delivery — where the
+/// edit already types the binding by inference from a view the count governs.
+pub(crate) fn declares_its_own_alias(decision: &super::Decision) -> &[UseEdit] {
+    match decision {
+        super::Decision::Slice { uses, .. }
+            if uses
+                .iter()
+                .any(|u| u.bridge_kind == "counted-void-read-alias") =>
+        {
+            uses
+        }
+        super::Decision::Slice { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => &[],
+    }
+}
+
+/// **The alias and its parameter are ONE transaction (R492-5).**
+///
+/// Route (i) splits a single contract's edits across two subjects: the
+/// parameter carries every use, the alias carries the initializer that types
+/// it. Either half alone is ill-typed — measured, report 032: the verify loop
+/// withheld the parameter, kept the alias, and the tree asked `unwrap_or` of a
+/// raw pointer — and the per-function revert loop has no way to know they
+/// belong together unless this says so. Exactly the duty
+/// `shared_read_arguments::close_reverts` discharges for its own multi-subject
+/// family, at the same call site, in the same shape: withdraw the FUNCTION, so
+/// neither half can survive the other.
+pub(crate) fn close_reverts(
+    table: &super::DecisionTable,
+    reverts: &mut crate::bo_rewriter::ast_transform::RevertSet,
+) {
+    for ((fn_did, param), contract) in table.counted_void.iter() {
+        // Only the split transaction: a contract that still plans its own
+        // initializer is one subject's, and one subject needs no closure.
+        let (Some(alias), true) = (contract.alias, contract.decl.is_some()) else {
+            continue;
+        };
+        if !reverts.keeps_subject(*fn_did, *param) || !reverts.keeps_subject(*fn_did, alias) {
+            reverts.fns.insert(*fn_did);
+        }
+    }
+}
+
+/// **The alias's initializer, carried through the CONSTRUCTION channel.**
+///
+/// The channel is not a formality: it is what the AST emission reads for an
+/// unannotated local, so an edit that only sits in the decision's `uses` is
+/// never placed and the function reverts whole (measured). What this family
+/// needs from the channel is only the text — no `from_raw_parts`, no
+/// fabricated extent — because the initializer is already a view of the
+/// parameter, whose length is the count the contract carries. Deliberately the
+/// same shape as wave-5d2's derived-suffix plan (R445-2), for the same reason.
+pub(crate) fn alias_construction<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    facts: &super::construction::ConstructionFacts,
+    subject: &Subject,
+    decision: &super::Decision,
+) -> Option<super::construction::SliceConstructionPlan> {
+    let edit = declares_its_own_alias(decision)
+        .iter()
+        .find(|u| u.bridge_kind == "counted-void-read-alias")?;
+    let node = (subject.fn_did, subject.hir_id);
+    let init_hir = *facts.init_hirs.get(&node)?;
+    let init_span = *facts.init_spans.get(&node)?;
+    // The edit IS the initializer: anything else is a shape this rule has not
+    // proved, and a construction plan over the wrong span rewrites code that
+    // was never the alias's.
+    if init_span != edit.span {
+        return None;
+    }
+    // Exhaustive, per the import denylist: a new disposition must be a compile
+    // error here, not a subject silently dropped.
+    let mutable = match decision {
+        super::Decision::Slice { mutable, .. } => *mutable,
+        super::Decision::NestedSlice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => return None,
+    };
+    let element_type = super::declaration::pointee_source(
+        tcx,
+        match tcx.typeck(subject.fn_did).node_type(subject.hir_id).kind() {
+            rustc_middle::ty::TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return None,
+        },
+    );
+    let value = edit.replacement.clone();
+    Some(super::construction::SliceConstructionPlan {
+        node,
+        init_hir,
+        init_span,
+        replacement: Some(value.clone()),
+        hold_reason: None,
+        element_type,
+        mutable,
+        nullable: false,
+        initializer_kind: "counted-void-read-alias",
+        length: super::construction::SliceLengthPlan {
+            expression: format!("{value}.len()"),
+            source: super::construction::SliceLengthSource::SealedContract {
+                contract: "counted-void-read-alias".to_owned(),
+            },
+            provenance: Vec::new(),
+        },
+        composed_edit_spans: Vec::new(),
+        unsafe_context: crate::bo_rewriter::mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn: tcx
+                .fn_sig(subject.fn_did)
+                .skip_binder()
+                .skip_binder()
+                .safety
+                .is_unsafe(),
+            wrapper_inserted: false,
+            edition: 2018,
+            requires_unsafe: false,
+        },
+    })
+}
+
+pub(crate) fn alias_declaration<'a>(ctx: &super::Ctx<'a, '_>, s: &Subject) -> Option<&'a UseEdit> {
+    alias_contract(ctx, s)?.decl.as_ref()
 }
 fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {
@@ -103,6 +286,9 @@ fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             ByteElement::Read
         },
         nullable: false,
+        alias: None,
+        decl: None,
+        count_positional: None,
         handle: None,
         width: None,
         uses: vec![UseEdit {
@@ -127,6 +313,7 @@ pub(crate) fn collect(
             prove(tcx, s)
                 .or_else(|| super::counted_void_read::prove(tcx, s))
                 .or_else(|| super::counted_void_handle::prove(tcx, s))
+                .or_else(|| super::counted_void_store::prove(tcx, s))
                 .or_else(|| super::binn_counted::prove(tcx, s))
                 .or_else(|| super::binn_counted::prove_foreign_copy(tcx, s))
                 .or_else(|| super::binn_counted::prove_header_path(tcx, s))
@@ -306,6 +493,9 @@ fn prove_forward(
                     count_index,
                     element: contract.element,
                     nullable: contract.nullable,
+                    alias: None,
+                    decl: None,
+                    count_positional: None,
                     handle: None,
                     width: contract
                         .width
@@ -564,15 +754,24 @@ pub(crate) fn owns_address(
         return false;
     }
     let Some(contract) = table.counted_void.get(&site.node) else { return false };
-    table.entries.iter().any(|(s, d)| {
-        (s.fn_did, s.hir_id) == site.node
-            && slice_edits(d).is_some_and(|uses| {
-                contract
-                    .uses
-                    .iter()
-                    .any(|owned| owned.span.contains(site.span) && uses.contains(owned))
+    let owned_by = |node: Key, owned: &UseEdit| {
+        owned.span.contains(site.span)
+            && table.entries.iter().any(|(s, d)| {
+                (s.fn_did, s.hir_id) == node
+                    && slice_edits(d).is_some_and(|uses| uses.contains(owned))
             })
-    })
+    };
+    // R492-5: the cast IS the alias's initializer, and route (i) moved that
+    // edit to the ALIAS subject. The site is no less the contract's for having
+    // changed hands — and reading only the parameter's `uses` here is what let
+    // the seam claim the span as its own address view, which retires the
+    // parameter's stage and tears the transaction in half (report 032).
+    contract.uses.iter().any(|owned| owned_by(site.node, owned))
+        || contract
+            .decl
+            .as_ref()
+            .zip(contract.alias)
+            .is_some_and(|(decl, alias)| owned_by((site.node.0, alias), decl))
 }
 
 fn find_expr<'tcx>(body: &'tcx Expr<'tcx>, span: rustc_span::Span) -> Option<&'tcx Expr<'tcx>> {

@@ -479,6 +479,45 @@ fn raw_boundary_delivery_custody(
     report
 }
 
+/// **R492-1** — the pair columns, written from the pairs receipt alone.
+///
+/// Shared by the ordinary path and the typed-failure early return, so a program that
+/// fails a custody or parser gate still reports what the pair machinery saw. These are
+/// descriptive counts, not a verdict: withholding them on a failed run makes the failure
+/// invisible in exactly the population most likely to need sizing.
+fn raw_boundary_set_pair_columns(mut row: report::Row, pairs: &str) -> report::Row {
+    let mut lines = pairs.lines();
+    let header = lines
+        .next()
+        .unwrap_or_default()
+        .split('\t')
+        .collect::<Vec<_>>();
+    let body = lines.collect::<Vec<_>>();
+    let field = |name: &str, value: &str| {
+        let Some(column) = header.iter().position(|candidate| *candidate == name) else {
+            return 0;
+        };
+        body.iter()
+            .filter(|line| line.split('\t').nth(column) == Some(value))
+            .count()
+    };
+    row.set(raw_schema::PAIR_CLEAR, field("verdict", "clear"));
+    row.set(
+        raw_schema::PAIR_OVERLAPPING,
+        field("verdict", "overlapping"),
+    );
+    row.set(
+        raw_schema::PAIR_UNDETERMINABLE,
+        field("verdict", "undeterminable"),
+    );
+    row.set(raw_schema::PAIR_PRIMARY, field("role", "primary"));
+    row.set(raw_schema::PAIR_RAW_VIEW, field("role", "raw-view"));
+    row.set(raw_schema::PAIR_T1, field("tier", "T1"));
+    row.set(raw_schema::PAIR_T2, field("tier", "T2"));
+    row.set(raw_schema::PAIR_BLOCKED, field("role", "blocked"));
+    row
+}
+
 fn raw_boundary_custody_failure(mut row: report::Row, detail: &str) -> report::Row {
     row.set(raw_schema::DATA, "false");
     row.set(raw_schema::STATUS, "instrument-error");
@@ -1676,6 +1715,31 @@ fn field_transaction_revert_status_notes(
     ) else {
         return notes;
     };
+    // **R501-4(b) — join on the WITHDRAWAL KEY, not on `owners`.**
+    //
+    // wave-6f 053 measured what `owners` is: `key_sites ∪ mentions`, where a mention is any
+    // function whose signature so much as names the struct. The withdrawal is keyed on
+    // `dependent_owners` — "a transaction survives a revert set iff none of its DEPENDENT
+    // owners is reverted" — and the two differ (their fixture: 7 owners, 1 dependent). So a
+    // reader joining a revert set against `owners` asks a question the table never answered,
+    // which is exactly the one note batches 19 and 20 carried: lodepng's
+    // `LodePNGBitReader.data` read `owner-reverted-but-reads-active` because the reverted
+    // `inflateHuffmanBlock` is a mention-only owner that never touches the field.
+    //
+    // `0b1c9324b` publishes the key as the receipt's additive twelfth column. Both directions
+    // move, not just the backward one, because both read the same `any` — and the forward
+    // check has the mirror defect: a mention-only owner in the revert set would suppress a
+    // real `withdrawn-but-no-owner-reverted`.
+    //
+    // A frame WITHOUT the column still gets its note, marked `:owners-key`, rather than
+    // silence: the imprecise join is worth reporting as long as the reader is told which set
+    // answered.
+    let dependents = column(header, "dependent_owners");
+    let key_suffix = if dependents.is_some() {
+        ""
+    } else {
+        ":owners-key"
+    };
     for line in rows {
         let cells = line.split('\t').collect::<Vec<_>>();
         let (Some(plan), Some(revert_status), Some(owner_list), Some(owning_struct), Some(field)) = (
@@ -1703,6 +1767,12 @@ fn field_transaction_revert_status_notes(
             }
             continue;
         }
+        // R501-4(b): the withdrawal key where the frame publishes it, `owners` where it does
+        // not (and the note then says which set answered).
+        let join_list = dependents
+            .and_then(|index| cells.get(index))
+            .copied()
+            .unwrap_or(owner_list);
         let mut reverted_owner = None;
         let mut any = false;
         // **R472-4 (wave-6f 047)** — the receipt joins `owners` with `,`; splitting on `;`
@@ -1711,7 +1781,7 @@ fn field_transaction_revert_status_notes(
         // of arity, and brotli's `BlockEncoder.block_types_` -- 8 of 9 owners reverted --
         // was silently missed. Both separators are tolerated rather than one swapped for
         // the other, so a producer that changes its mind cannot re-open the same hole.
-        for owner in owner_list
+        for owner in join_list
             .split([';', ','])
             .map(str::trim)
             .filter(|owner| !owner.is_empty() && *owner != "-")
@@ -1722,9 +1792,11 @@ fn field_transaction_revert_status_notes(
             }
         }
         match (*revert_status, any) {
-            ("withdrawn", false) => note("withdrawn-but-no-owner-reverted", "-"),
+            ("withdrawn", false) => {
+                note(&format!("withdrawn-but-no-owner-reverted{key_suffix}"), "-")
+            }
             ("active", true) => note(
-                "owner-reverted-but-reads-active",
+                &format!("owner-reverted-but-reads-active{key_suffix}"),
                 &reverted_owner.unwrap_or_default(),
             ),
             ("withdrawn" | "active", _) => {}
@@ -2012,6 +2084,11 @@ impl StandingCensusLaunchRecipe {
             "CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE",
             // R456-3(d): optional; absent, the cache gate is unchanged.
             "CRAT_RAW_BOUNDARY_CACHE_MANIFEST_PREDECESSOR",
+            // R519-2: optional; absent, no nested admission receipt is written.
+            // `nested_slice::observe` writes the plan's `rebased` /
+            // `stood_off` / `rebase_refused` rows, which are the only place a
+            // refusal's `CursorHold` is readable from a corpus run.
+            "CRAT_NESTED_ADMISSION_OUTPUT",
         ] {
             if let Ok(value) = std::env::var(key) {
                 env.push((key, value));
@@ -12201,6 +12278,16 @@ mod run {
         // the capture, read after, so the count belongs to THIS program and not
         // to whatever ran in the worker before it.
         crate::bo_rewriter::ast_transform::reset_graft_refusals();
+        crate::bo_rewriter::decision::cursor_native::reset_stale_replans();
+        // **R515-1 ruling 1** — same rhythm, same reason: the grafts held below
+        // are THIS program's. The RECEIPTS accumulate across the program's
+        // revert rounds (a graft held again on a later round is a second row's
+        // `emissions_held`); the class set the emission reverts from is reset
+        // per round inside `transform_with`, because only it is a question
+        // about one round.
+        crate::bo_rewriter::ast_transform::reset_graft_held();
+        // R523-4: same rhythm — the certificate receipts below are THIS program's.
+        crate::bo_rewriter::decision::return_certificate::reset_certificate_receipts();
         let capture = match super::cache_only_before_solve(
             entry_available
                 .then_some(())
@@ -12501,6 +12588,11 @@ mod run {
             // W4-B1 (R480-2, relay 056 STOP 2): the root-extent rows, whose
             // HELD count is the seat's Decision A input.
             ("root-extent", artifact.root_extents.as_str()),
+            // main 071c (a) (report 057): the assignments the use inventory
+            // admitted as constructions, with the form each subject ended in —
+            // the admission is pre-decision, so this is the only place a census
+            // can see it fire.
+            ("sized-assignments", artifact.sized_assignments.as_str()),
             ("bridge-receipts", bridge_receipts.as_str()),
             (
                 "unsafe-context-presentation",
@@ -12510,8 +12602,22 @@ mod run {
             ("class-costs", artifact.class_costs.as_str()),
             ("class-collisions", artifact.class_collisions.as_str()),
             ("unresolved-classes", artifact.unresolved_classes.as_str()),
+            // R517-8 (wave-6o): every edit a HELD class owns is dropped at the
+            // placement layer; until this row existed the drop left nothing at
+            // all -- no revert row, no receipt, no diagnostic, just a
+            // byte-identical function.
+            ("class-held-drops", artifact.class_held_drops.as_str()),
             ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
+            // **wave-6r (reports 017 / 036)** — the lane's two instrument strings
+            // reach disk. Both were BUILT on every run and written nowhere: the
+            // child-access receipt since relay 017 and the twin-placement receipt
+            // since `efb1bbbb`/`3876963c`, each produced into `RawBoundaryArtifacts`
+            // and consumed by no writer, so the census could never carry the row
+            // they exist to answer (`kmVec2Add`'s placement). Same shape of gap as
+            // R450-8's allocator contracts, two families over.
+            ("child-access", artifact.child_access.as_str()),
+            ("twin-placement", artifact.twin_placement.as_str()),
             // R450-8 (wave-6a 022 §4 GRANTED): the allocator-contract receipts
             // reach the artifact set. Without them the libc row's `kind-raw`
             // population has no reason table on disk — the facts existed in
@@ -12542,6 +12648,35 @@ mod run {
             )
             .expect("write shared-pair terminal receipts");
         }
+        // **R515-1 ruling 1 — THE GRAFT FLOOR'S RECEIPT, one table for all five
+        // visitors.**
+        //
+        // UNCONDITIONAL, unlike the table above it: a header-only file says the
+        // floor was asked and held nothing, and a missing file cannot say that.
+        // That ambiguity is the defect this channel exists for — report 069a
+        // found `composition_held` written into a field (since removed) whose one consumer
+        // destructures it and drops every field, so a held composition reached
+        // no artifact at all and "the floor held nothing" was indistinguishable
+        // from "nobody kept the line".
+        std::fs::write(
+            directory.join(format!("{name}.graft-held.tsv")),
+            stamp(&crate::bo_rewriter::ast_transform::graft_held_table()),
+        )
+        .expect("write graft-held receipts");
+        // **R523-4 (ownership-fields 056 STOP 2) — the certificate receipts.**
+        //
+        // `Certificates::receipts_tsv()` has existed since wave-6a's W6A-A1 and
+        // reached NO artifact: its only callers are unit tests, and the
+        // production emission drops the `Certificates` before anything writes a
+        // file. The census row therefore prints the generic
+        // `box-initializer-unsupported` while the receipt that says what to
+        // BUILD — `return-certificate-struct-field:key_free` — is invisible.
+        // Unconditional, like the table above it.
+        std::fs::write(
+            directory.join(format!("{name}.return-certificate-receipts.tsv")),
+            stamp(&crate::bo_rewriter::decision::return_certificate::certificate_receipts_table()),
+        )
+        .expect("write return-certificate receipts");
         // **R464-5 (wave-6f 040 STOP 1)** — the field receipt's `revert_status`
         // against the final-revert table, checked on the PUBLISHED rows rather
         // than on the predicate that wrote them.
@@ -12552,6 +12687,13 @@ mod run {
         row.set(
             raw_schema::GRAFT_REFUSED,
             crate::bo_rewriter::ast_transform::graft_refusals(),
+        );
+        // **R525-7**: the stale-replan count, the detector's exit condition made
+        // readable. 0 is the expected reading and two consecutive censuses at 0
+        // retire `replan_delivered_table_elements`.
+        row.set(
+            raw_schema::REPLAN_STALE,
+            crate::bo_rewriter::decision::cursor_native::stale_replans(),
         );
         // **R476-1 (USER)**: the frame-bounded discharges, counted per program beside the
         // box-param holds. The receipt is typed — `retention-discharged:frame-bounded(
@@ -13056,6 +13198,15 @@ mod run {
             row.set(raw_schema::SOLVER_INVOCATIONS, 0);
             // Return before the ordinary final data/status writes: a parser,
             // identity or sidecar failure cannot be overwritten as success.
+            //
+            // **R492-1 — but a typed failure must not cost the row its PAIR columns.**
+            // batch 19 read `raw_boundary_pair_raw_view` = 67 corpus-wide because
+            // brotli returned here, 450 lines before the pair columns are written, and
+            // brotli is most of the population. A sizing taken from `per-program.kv`
+            // therefore omitted the one program that mattered, silently. The columns are
+            // descriptive, not a verdict: they say what the pair machinery saw, which is
+            // exactly as true on a failed run as on a passing one.
+            row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);
             bridge_custody.issues.extend(custody.issues);
             bridge_custody.data = false;
             return super::raw_boundary_bridge_custody_gate(row, &bridge_custody);
@@ -13495,20 +13646,9 @@ mod run {
             raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
             blocked_with_applied,
         );
-        row.set(raw_schema::PAIR_CLEAR, pair_field("verdict", "clear"));
-        row.set(
-            raw_schema::PAIR_OVERLAPPING,
-            pair_field("verdict", "overlapping"),
-        );
-        row.set(
-            raw_schema::PAIR_UNDETERMINABLE,
-            pair_field("verdict", "undeterminable"),
-        );
-        row.set(raw_schema::PAIR_PRIMARY, pair_field("role", "primary"));
-        row.set(raw_schema::PAIR_RAW_VIEW, pair_field("role", "raw-view"));
-        row.set(raw_schema::PAIR_T1, pair_field("tier", "T1"));
-        row.set(raw_schema::PAIR_T2, pair_field("tier", "T2"));
-        row.set(raw_schema::PAIR_BLOCKED, pair_field("role", "blocked"));
+        // R492-1: ONE writer for the pair columns, shared with the typed-failure early
+        // return, so the two paths cannot drift into reporting different things.
+        row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);
         row.set(raw_schema::GLUE_PLACED, glue_placed);
         row.set(raw_schema::GLUE_BLOCKED, glue_blocked);
         row.set(raw_schema::ADDR_VALUE_ONLY, address_class("value-only"));
@@ -25781,17 +25921,25 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     // One owner of several reverting is enough to withdraw the transaction.
     assert!(notes(&receipt("src::a::kept;src::a::owner_reverted", "withdrawn")).is_empty());
 
-    // FORWARD: `withdrawn` must name an owner that really reverted.
+    // FORWARD: `withdrawn` must name an owner that really reverted. The `:owners-key` suffix
+    // is R501-4(b)'s: this fixture's receipt predates `dependent_owners`, so the join is the
+    // imprecise one and the note says so rather than passing itself off as the key's answer.
     let forward = notes(&receipt("src::a::kept", "withdrawn"));
     assert_eq!(forward.len(), 1);
-    assert_eq!(forward[0].kind, "withdrawn-but-no-owner-reverted");
+    assert_eq!(
+        forward[0].kind,
+        "withdrawn-but-no-owner-reverted:owners-key"
+    );
 
     // BACKWARD: `active` while an owner reverted. This is the direction that found
     // wave-6f's real defect on heman, so it is asked again -- but as a NOTE. It
     // names the reverted owner, because the row is what wave-6f has to read.
     let backward = notes(&receipt("src::a::owner_reverted", "active"));
     assert_eq!(backward.len(), 1);
-    assert_eq!(backward[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(
+        backward[0].kind,
+        "owner-reverted-but-reads-active:owners-key"
+    );
     assert_eq!(backward[0].owner, "src::a::owner_reverted");
     assert_eq!(backward[0].owning_struct, "S");
     assert_eq!(backward[0].field, "f");
@@ -25811,7 +25959,7 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
     // matched nothing. Both separators are accepted.
     let comma = notes(&receipt("src::a::kept,src::a::owner_reverted", "active"));
     assert_eq!(comma.len(), 1);
-    assert_eq!(comma[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(comma[0].kind, "owner-reverted-but-reads-active:owners-key");
     assert_eq!(comma[0].owner, "src::a::owner_reverted");
     // and the forward direction agrees across a comma-joined list, as it already did
     // across a semicolon-joined one.
@@ -25825,6 +25973,54 @@ fn r469_1_a_revert_status_disagreement_is_a_typed_note_not_a_verdict() {
         )
         .is_empty()
     );
+
+    // **R501-4(b) — the join is the WITHDRAWAL KEY where the frame publishes it.**
+    //
+    // wave-6f 053: `owners = key_sites ∪ mentions`, and a mention is any function whose
+    // signature merely names the struct, while the withdrawal is keyed on `dependent_owners`
+    // ("a transaction survives a revert set iff none of its DEPENDENT owners is reverted").
+    // Their fixture splits 7 owners / 1 dependent. Joining a revert set against `owners` asks
+    // a question the table never answered, and that is the one note batches 19 and 20 carried:
+    // lodepng's `LodePNGBitReader.data` read `owner-reverted-but-reads-active` because the
+    // reverted `inflateHuffmanBlock` is a mention-only owner that never touches the field.
+    let keyed = |owners: &str, dependents: &str, revert_status: &str| {
+        field_transaction_revert_status_notes(
+            &format!(
+                "program\tstruct\tfield\tstatus\towners\trevert_status\tdependent_owners\n\
+                 heman\tS\tf\tapplied\t{owners}\t{revert_status}\t{dependents}\n"
+            ),
+            reverts,
+        )
+    };
+    // lodepng's exact shape: the reverted owner is a MENTION, not a dependent. Silent.
+    assert!(
+        keyed(
+            "src::a::kept,src::a::owner_reverted",
+            "src::a::kept",
+            "active"
+        )
+        .is_empty(),
+        "a mention-only owner's revert is not this transaction's"
+    );
+    // The same row when the reverted owner IS a dependent: the note fires, and unsuffixed,
+    // because the key answered.
+    let by_key = keyed(
+        "src::a::kept,src::a::owner_reverted",
+        "src::a::owner_reverted",
+        "active",
+    );
+    assert_eq!(by_key.len(), 1);
+    assert_eq!(by_key[0].kind, "owner-reverted-but-reads-active");
+    assert_eq!(by_key[0].owner, "src::a::owner_reverted");
+    // And the forward direction moves with it: `withdrawn` with no DEPENDENT reverted is a
+    // disagreement even though a mention-only owner did revert.
+    let forward_by_key = keyed(
+        "src::a::kept,src::a::owner_reverted",
+        "src::a::kept",
+        "withdrawn",
+    );
+    assert_eq!(forward_by_key.len(), 1);
+    assert_eq!(forward_by_key[0].kind, "withdrawn-but-no-owner-reverted");
 
     // The published table carries struct, field, owner and BOTH values, so the
     // disagreement can be diagnosed without re-running the census.
@@ -34548,5 +34744,76 @@ fn r477_5_a_frame_absent_program_is_excluded_and_named_not_failed() {
     assert!(
         source.contains("frame-absent-excluded.txt"),
         "the excluded programs must be written where a reader can find them"
+    );
+}
+
+/// **R492-1 — a typed failure must not cost the row its pair columns.**
+///
+/// batch 19 read `raw_boundary_pair_raw_view` = 67 corpus-wide while brotli's own
+/// `pairs.tsv` carried 353 `raw-view` rows. brotli returned at the custody gate, 450
+/// lines before the pair columns are written, so its row carried none — and brotli is
+/// most of the population. Anyone sizing the pair machinery from `per-program.kv` was
+/// silently reading the corpus minus its largest program.
+///
+/// The columns are DESCRIPTIVE: they say what the pair machinery saw, which is as true on
+/// a failed run as on a passing one. Withholding them hides the failure exactly where the
+/// sizing is needed.
+#[test]
+fn r492_1_the_pair_columns_survive_a_typed_failure() {
+    let pairs = "program\tverdict\trole\ttier\n\
+                 p\toverlapping\traw-view\tT2\n\
+                 p\toverlapping\traw-view\tT2\n\
+                 p\tclear\tprimary\tT1\n";
+
+    let row = raw_boundary_set_pair_columns(report::Row(Vec::new()), pairs);
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_RAW_VIEW),
+        Some("2")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_PRIMARY),
+        Some("1")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_CLEAR),
+        Some("1")
+    );
+    assert_eq!(
+        row.get(crate::raw_boundary_census_schema::PAIR_OVERLAPPING),
+        Some("2")
+    );
+
+    // The two paths share ONE writer, so a typed-failure row and a passing row cannot
+    // drift into reporting different things. This pins that the failure path calls it.
+    // Read the PRODUCTION region only. An `include_str!` of this file also contains the
+    // assertion strings below, so a naive count counts the witness itself -- which is how
+    // the first version of this test failed, claiming four callers where there are two.
+    let source = include_str!("bo_c1.rs");
+    let production = source
+        .split("fn r492_1_the_pair_columns_survive_a_typed_failure")
+        .next()
+        .expect("the production region precedes this test");
+    // Anchor on the RETURN itself. `bridge_custody.data = false;` occurs in several
+    // functions, and splitting on its first occurrence measured a region that does not
+    // contain the census path at all -- the first version of this witness failed for that
+    // reason, not because the repair was missing.
+    let ret = production
+        .find("return super::raw_boundary_bridge_custody_gate(row, &bridge_custody);")
+        .expect("the census path's typed-failure return exists");
+    let write = production
+        .find("row = super::raw_boundary_set_pair_columns(row, &artifact.pairs);")
+        .expect("the typed-failure return writes the pair columns");
+    assert!(
+        write < ret,
+        "the pair columns must be written BEFORE the typed-failure return, or the row \
+         leaves without them"
+    );
+    // and the ordinary path uses the same call rather than its own copy.
+    assert_eq!(
+        production
+            .matches("super::raw_boundary_set_pair_columns(row, &artifact.pairs)")
+            .count(),
+        2,
+        "exactly two callers: the failure return and the ordinary path"
     );
 }

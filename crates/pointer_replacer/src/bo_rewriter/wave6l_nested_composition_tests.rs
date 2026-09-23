@@ -136,3 +136,85 @@ fn w6l_shared_reborrow_composes_over_the_weakened_argument() {
         raw_boundary_artifacts.class_collisions
     );
 }
+
+/// **W6L-FLOOR's trigger, pinned exactly (relay 032, R490-2(b)).**
+///
+/// wave-5d 055 measured the texts: the OUTER replacement carries the call with
+/// its arguments ALREADY ADAPTED, while the view carries the call as written,
+/// so the matcher — which looks for the printed node inside the outer text,
+/// ignoring whitespace — cannot locate it. Before the floor, that returned
+/// `Err` from the AST layer and aborted the WHOLE program at round 0; now it
+/// records `composition-held:caller=..:class=..:inner-text-not-found:lo..hi`
+/// and the class is held like any other. This witness pins the trigger itself
+/// with wave-5d's own strings, so a change that made the matcher accept an
+/// adapted-argument call (and splice the view into the wrong place) fails
+/// here first.
+#[test]
+fn w6l_floor_trigger_the_outer_text_with_adapted_arguments_is_unlocatable() {
+    let outer = "core::slice::from_raw_parts(heman_image_texel(texture.as_mut().unwrap(), \
+                 u as libc::c_int, v as libc::c_int), crate::FALLBACK_SLICE_EXTENT)";
+    let original = "heman_image_texel(texture, u as libc::c_int, v as libc::c_int)";
+    assert!(
+        super::ast_transform::find_ignoring_whitespace(outer, original).is_none(),
+        "the adapted-argument call must NOT be located in the outer text"
+    );
+    // The same outer text WITH the call as written is locatable: the matcher
+    // is not simply broken, it is exact about the arguments.
+    let written = outer.replace("texture.as_mut().unwrap()", "texture");
+    assert!(
+        super::ast_transform::find_ignoring_whitespace(&written, original).is_some(),
+        "the call as written must be locatable"
+    );
+}
+
+/// **The graft-held table, end to end (relay 045).**
+///
+/// main's floor witnesses drive `record_graft_held` directly; this one runs a
+/// real program through the emission and asks the table what it says. RAY
+/// composes with zero reverts, so the answer must be the HEADER — "asked and
+/// held nothing" — and not a missing file, which is the distinction the whole
+/// channel exists for. It also pins the negative direction of the fifth arm:
+/// a program whose compositions all locate records no `composition` row.
+#[test]
+fn w6l_graft_held_table_is_empty_for_a_program_that_composes() {
+    super::ast_transform::reset_graft_held();
+    let input = ray_fixture();
+    let RewriteOutcome::Emitted { reverted_count, .. } = rewrite(&input) else {
+        panic!("ray emission degraded")
+    };
+    assert_eq!(reverted_count, 0);
+    assert_eq!(
+        super::ast_transform::graft_held_table(),
+        "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n",
+        "a composing program publishes the header and nothing else"
+    );
+    assert!(super::ast_transform::graft_held_receipts().is_empty());
+    assert!(super::ast_transform::graft_held_classes().is_empty());
+}
+
+/// **The census writes the table for EVERY program, held or not.**
+///
+/// The property the artifact exists for is the unconditional write: a file that
+/// appears only when something was held reintroduces exactly the ambiguity
+/// report 039 hit, one directory further down. The write needs a census program
+/// to exercise, so what is pinned here is that it is not guarded.
+#[test]
+fn w6l_graft_held_table_is_written_for_every_census_program() {
+    let source = include_str!("../bo_c1.rs");
+    let start = source
+        .find("{name}.graft-held.tsv")
+        .expect("the census writes the graft-held table");
+    let head = &source[..start];
+    let statement = head
+        .rfind("std::fs::write(")
+        .expect("the write is an fs::write");
+    let preamble = &head[statement.saturating_sub(400)..statement];
+    assert!(
+        !preamble.contains("if !"),
+        "the graft-held table must be written even when it is empty: {preamble}"
+    );
+    assert!(
+        source.contains("ast_transform::reset_graft_held();"),
+        "the receipts are reset per program, as the graft refusals are"
+    );
+}

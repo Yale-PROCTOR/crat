@@ -610,8 +610,15 @@ impl MechanicalRetention {
     }
 
     fn validate(&self) -> Result<(), String> {
+        // **R511-2 (wave-6o).** A T2 obligation carries one of TWO waivers: the
+        // v1 bridge waiver, and — since R481-2 — the tier-2 RETENTION waiver,
+        // which has its own id because it licenses a different thing (a known
+        // retention, not an unknown one). A validator that knows only the
+        // first turns every waived site into a capture error.
         if let Self::T2 { waiver_id } = self
             && waiver_id != RAW_BOUNDARY_T2_WAIVER_ID
+            && waiver_id
+                != crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID
         {
             return Err(format!("T2 obligation has wrong waiver {waiver_id:?}"));
         }
@@ -3018,6 +3025,35 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// **R511-2 (wave-6o) — a tier-2 RETENTION waiver is a valid T2 waiver.**
+    ///
+    /// `522ef3450` gave the known-retention bridge its own waiver id; this
+    /// validator knew only the v1 bridge waiver, so every transported
+    /// obligation carrying the new id failed capture. Measured at batch 26:
+    /// binn went `issues = 0` to `issues = 4` — two
+    /// `T2 obligation has wrong waiver "retention-waiver:tier-2@2026-09-21"`
+    /// and the two `native-capture-error` rows those same two sites caused —
+    /// and its emitted tree lost a function (108 to 107).
+    #[test]
+    fn mechanical_retention_accepts_the_tier_2_retention_waiver() {
+        let waived = MechanicalRetention::T2 {
+            waiver_id: crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID
+                .to_owned(),
+        };
+        assert_eq!(waived.validate(), Ok(()), "{waived:?}");
+        let v1 = MechanicalRetention::T2 {
+            waiver_id: RAW_BOUNDARY_T2_WAIVER_ID.to_owned(),
+        };
+        assert_eq!(v1.validate(), Ok(()), "the v1 bridge waiver still passes");
+        let bogus = MechanicalRetention::T2 {
+            waiver_id: "not-a-waiver".to_owned(),
+        };
+        assert!(
+            bogus.validate().is_err(),
+            "and an unknown waiver is still refused"
+        );
+    }
+
     use std::collections::BTreeSet;
 
     use super::*;

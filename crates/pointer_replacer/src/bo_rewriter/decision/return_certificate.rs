@@ -97,6 +97,59 @@ pub(crate) struct Certificates {
     /// Refusals: binding → (label, typed reason). Keyed by the returned local
     /// for a callee hold, by the receiver for a receiver hold.
     pub(crate) holds: FxHashMap<(LocalDefId, HirId), (String, String)>,
+    /// **A1-f (R515-4)**: callees passed OVER rather than certified — their own
+    /// return statements prove they return a parameter or a certified
+    /// constructor's result, so they originate nothing and cannot break a chain
+    /// that runs through them.
+    pub(crate) chain_through: FxHashSet<LocalDefId>,
+    /// One receipt per pass-over.
+    pub(crate) chain_through_receipts: Vec<String>,
+}
+
+/// The sentinel a pass-over travels back on: `certify` has no channel for
+/// "neither certified nor refused", so it returns this as its hold text and
+/// the driver turns it into a `chain_through` entry.
+const CHAIN_THROUGH: &str = "chain-through:";
+
+/// **THE CERTIFICATE RECEIPTS, AS A CENSUS TABLE (R523-4, ownership-fields 056
+/// STOP 2).**
+///
+/// `receipts_tsv` has existed and reached NOTHING: its only callers are unit
+/// tests, and the production emission drops the `Certificates` before anything
+/// writes a file. So a census row prints the generic `box-initializer-unsupported`
+/// while the receipt that says what to BUILD —
+/// `return-certificate-struct-field:key_free` — is invisible.
+///
+/// Same shape and same reason as `GRAFT_HELD`: the fact is produced deep inside
+/// a walk whose callers all drop it, so the honest place to record is the choke
+/// point. It is an INSTRUMENT — it changes no verdict, no edit and no text.
+thread_local! {
+    static CERTIFICATE_RECEIPTS: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Per PROGRAM, beside the other census resets.
+pub(crate) fn reset_certificate_receipts() {
+    CERTIFICATE_RECEIPTS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Records THIS program's receipts. Called where the decision table is built,
+/// which is the one place a complete `Certificates` exists.
+pub(crate) fn record_certificate_receipts(certificates: &Certificates) {
+    CERTIFICATE_RECEIPTS.with(|cell| *cell.borrow_mut() = certificates.receipts_tsv());
+}
+
+/// The artifact table. **Written even when it is empty** — a header-only table
+/// says the pass ran and admitted nothing, which a missing file cannot say.
+pub(crate) fn certificate_receipts_table() -> String {
+    CERTIFICATE_RECEIPTS.with(|cell| {
+        let recorded = cell.borrow();
+        if recorded.is_empty() {
+            "callee\tkind\tdetail\n".to_owned()
+        } else {
+            recorded.clone()
+        }
+    })
 }
 
 impl Certificates {
@@ -112,6 +165,11 @@ impl Certificates {
             for receipt in &c.receipts {
                 out.push_str(&format!("{}\tadmitted\t{receipt}\n", c.callee_path));
             }
+        }
+        let mut passed = self.chain_through_receipts.clone();
+        passed.sort();
+        for receipt in &passed {
+            out.push_str(&format!("-\tpassed-over\t{receipt}\n"));
         }
         let mut holds: Vec<&(String, String)> = self.holds.values().collect();
         holds.sort();
@@ -228,12 +286,63 @@ pub(crate) fn confirm_transfers(
 
 /// Decision-phase hook, before the model's verdict is applied: a subject a
 /// certificate plans is a Box whatever kind the model gave it (relay 005).
+///
+/// **R496-7 — the hold passes through too.** A certificate's REFUSAL used to
+/// live only in `Certificates::receipts_tsv()`, which no census writes, so a
+/// subject this family examined and refused was indistinguishable from one it
+/// never saw (report 047: 0 `return-certificate` reasons in every census
+/// table). It now carries its typed reason the way `allocator_contract::planned`
+/// and `box_param::override_plan` already do — the existing
+/// `BoxPlanFailure::NativeEvidenceHeld { prior_key, detail }`, no new variant
+/// and no new census column — which is what makes A1-e's companion gate
+/// (`return-certificate-struct-field:<callee>:owned-field`) countable.
 pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Decision> {
     ctx.return_certificates
         .plans
         .get(&(subject.fn_did, subject.hir_id))
         .map(|plan| Decision::Box(plan.clone()))
 }
+
+/// **R496-7 — the hold passes through, where nothing else would deliver.**
+/// A certificate's REFUSAL used to live only in `Certificates::receipts_tsv()`,
+/// which no census writes, so a subject this family examined and refused was
+/// indistinguishable from one it never saw (report 047: 0 `return-certificate`
+/// reasons in every census table). It now carries its typed reason through the
+/// existing `BoxPlanFailure::NativeEvidenceHeld { prior_key, detail }` — no new
+/// variant and no new census column.
+///
+/// It is consulted ONLY in the ladder's `Raw` arm, which degrades
+/// unconditionally, so it can replace a generic `kind-raw` and can never
+/// pre-empt a delivery. Placing it at the pre-model hook instead cost three
+/// W6A-T1 fixtures their whole emission (measured: `tulip-stoch`, `tulip-cci`
+/// and `tulip-cci-web` degraded with two errors attributed to no rewritten
+/// function) because a hold there outranks every family below it.
+pub(crate) fn held(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
+    let (_, hold) = ctx
+        .return_certificates
+        .holds
+        .get(&(subject.fn_did, subject.hir_id))?;
+    if !hold.starts_with(PASSED_THROUGH) {
+        return None;
+    }
+    Some(Decision::Degraded(super::Degradation {
+        subject: subject.label.clone(),
+        site: site.to_owned(),
+        reason: super::DegradeReason::BoxFailure {
+            failure: BoxPlanFailure::NativeEvidenceHeld {
+                prior_key: PASSED_THROUGH,
+                detail: hold.clone(),
+            },
+        },
+    }))
+}
+
+/// **R497-3(b) — the narrow form.** Only A1-e's companion gate passes through
+/// for now: it is the one key R496-7 needs (the gate that is otherwise
+/// invisible at census), and restricting to it means no other lane's reason pin
+/// moves. The wider set of certificate keys rides a later cut together with
+/// wave-6l's re-pin.
+const PASSED_THROUGH: &str = "return-certificate-struct-field";
 
 /// After the decisions: unannotated receivers get their `Box<..>` spelled out.
 pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
@@ -385,6 +494,10 @@ struct Scan<'tcx> {
     store_calls: Vec<(DefId, Span)>,
     /// Every assignment to a bare local: (local, value span).
     assigns: Vec<(HirId, Span)>,
+    /// **A1-f**: `<non-local place> = <bare local>` — the local is stored away.
+    /// A callee that stores a parameter does not merely hand it onward, so it
+    /// is not passed over as a chain-through.
+    stores_local: Vec<HirId>,
 }
 
 fn local_callee(e: &Expr<'_>) -> Option<DefId> {
@@ -404,13 +517,37 @@ fn local_callee(e: &Expr<'_>) -> Option<DefId> {
 /// the `Some` / `None` edits land on the arms themselves. An arm with
 /// statements of its own is NOT descended into: what those statements do to
 /// the owner is exactly what this rule would have to prove.
+/// **A1-g**: every statement is a `let` binding a local whose type is not a
+/// pointer (an empty block trivially qualifies).
+fn scalar_let_statements<'tcx>(tcx: TyCtxt<'tcx>, block: &'tcx rustc_hir::Block<'tcx>) -> bool {
+    block.stmts.iter().all(|stmt| {
+        let rustc_hir::StmtKind::Let(local) = stmt.kind else {
+            return false;
+        };
+        let rustc_hir::PatKind::Binding(_, hir, _, None) = local.pat.kind else {
+            return false;
+        };
+        let typeck = tcx.typeck(local.hir_id.owner.def_id);
+        let ty = typeck.node_type(hir);
+        !ty.is_raw_ptr() && !ty.is_ref() && !ty.is_fn_ptr()
+    })
+}
+
 fn classify_returned<'tcx>(tcx: TyCtxt<'tcx>, value: &'tcx Expr<'tcx>, out: &mut Vec<Returned>) {
     match &value.kind {
         ExprKind::If(_, then, Some(otherwise)) => {
             classify_returned(tcx, then, out);
             classify_returned(tcx, otherwise, out);
         }
-        ExprKind::Block(block, _) if block.stmts.is_empty() => match block.expr {
+        // **A1-g (relay wave-6a/072 (e))** — a block is read through when its
+        // statements CANNOT touch the owner: every one a `let` binding a
+        // non-pointer local. c2rust hoists an argument that way
+        // (`{ let __arg_1 = strlen(str); ctor(str, __arg_1) }`), and such a
+        // binding can neither hold, alter nor alias the owner, which does not
+        // exist until the tail returns. A pointer binding, or any other
+        // statement, keeps the old refusal — that IS the thing this rule would
+        // otherwise have to prove.
+        ExprKind::Block(block, _) if scalar_let_statements(tcx, block) => match block.expr {
             Some(tail) => classify_returned(tcx, tail, out),
             None => out.push(Returned::Other(value.span)),
         },
@@ -445,6 +582,10 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                 let tcx = self.tcx.expect("scan tcx");
                 if let Some(hir) = bare_local(lhs) {
                     self.assigns.push((hir, rhs.span));
+                } else if let Some(hir) = bare_local(rhs) {
+                    // A1-f: the local is stored into a place that is not a
+                    // local — it does not merely travel onward.
+                    self.stores_local.push(hir);
                 }
                 let statement = match tcx.parent_hir_node(e.hir_id) {
                     rustc_hir::Node::Stmt(stmt) => stmt.span,
@@ -1214,15 +1355,13 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
                 return Some(false);
             }
             let local = rustc_middle::mir::Local::from_usize(index + 1);
-            let is_ref = self
+            let kind = self
                 .slots
                 .fn_local_slots
                 .get(&callee)
                 .and_then(|u| u.slot_for_local_depth(local, 0))
-                .is_some_and(|slot| {
-                    self.model.get(&SlotRef::Local(callee, slot)) == Some(&SlotKind::Ref)
-                });
-            if !is_ref {
+                .and_then(|slot| self.model.get(&SlotRef::Local(callee, slot)).copied());
+            if !model_admits_lend(kind) {
                 return Some(false);
             }
             let hir_body = tcx.hir_body_owned_by(callee);
@@ -1246,6 +1385,53 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
         self.memo.borrow_mut().insert((did, index), Some(answer));
         answer
     }
+}
+
+/// **R485-2 — which model kinds a body may prove a lend for.**
+///
+/// `Ref` is the model's own lend verdict and needs no help. `Raw` is the
+/// ABSENCE of a verdict — the kind a formal takes when its provenance is
+/// opaque to the model — and there the BODY is the evidence: [`LendWalk`]
+/// admits only a deref, `is_null`, an element access under a deref and an
+/// argument to a callee certified the same way, so a free, a store, a return
+/// or a copy of the formal each refuse it, and a foreign callee's position is
+/// resolved through the contract table. That is the supersession R410-5 §1
+/// allows over an absence.
+///
+/// `Owning` is the model claiming the formal owns its pointee, and this walk
+/// is not the source proof that would overturn it (report 011's licensing
+/// wall). **W6A-A1-e** (relay wave-6a/049) admits it anyway, because nothing
+/// here overturns anything: this oracle answers one question for the CALLER
+/// — may its certificate survive the call — and the formal keeps its kind,
+/// its raw form and its own family. The claim would matter if the callee
+/// could release the allocation, and [`LendWalk`] is exactly the proof that
+/// it cannot: a free, a store, a return or a copy of the formal each refuse.
+/// The precedent is already in the tree — ownership-fields emits these very
+/// formals as raw views and records the `Owning` label beside them, i.e. it
+/// has already established that an `Owning`-modeled formal emitted raw is
+/// lendable (`native_lend_formal` → `Ok(Kind::Owning)`).
+///
+/// A formal with no slot at all answers nothing and is refused.
+///
+/// The market: the 37 `contract-allocation:use:call-argument-not-a-lend` rows
+/// of batch 16 (18 `BrotliHistogramCombine{Literal,Distance,Command}`), and —
+/// the `Owning` half — the root of heman's 26-member cascade, which bisects
+/// to exactly one such argument (relay 049, report 042).
+pub(crate) fn model_admits_lend(kind: Option<SlotKind>) -> bool {
+    matches!(
+        kind,
+        Some(SlotKind::Ref) | Some(SlotKind::Raw) | Some(SlotKind::Owning)
+    )
+}
+
+/// **A1-f**: is `binding` one of `callee`'s own parameter bindings?
+fn returns_a_parameter(tcx: TyCtxt<'_>, callee: LocalDefId, binding: HirId) -> bool {
+    tcx.hir_body_owned_by(callee).params.iter().any(|p| {
+        matches!(
+            p.pat.kind,
+            rustc_hir::PatKind::Binding(_, hir, _, None) if hir == binding
+        )
+    })
 }
 
 /// Derive every certificate for the crate (fixpoint over chained returns).
@@ -1336,6 +1522,43 @@ pub(crate) fn derive<'tcx>(
     for list in receivers_of.values_mut() {
         list.sort_by_key(|s| (s.fn_did.local_def_index.as_u32(), s.local.as_u32()));
     }
+    // **A1-f (R515-4) — the pass-overs are settled BEFORE the fixpoint.**
+    // Whether a callee is a chain-through depends only on its own body, never
+    // on another certificate, and a certificate that bridges a pass-through's
+    // return must see the set already complete: settling it inside the
+    // fixpoint made the bridge depend on the order two independent callees
+    // happened to be visited in.
+    for &callee in &candidates {
+        let Some(scan) = scans.get(&callee) else { continue };
+        let mut owner: Option<HirId> = None;
+        let mut shaped = true;
+        for r in &scan.returns {
+            match r {
+                Returned::Local(hir, _) => match owner {
+                    Some(h) if h == *hir => {}
+                    Some(_) => shaped = false,
+                    None => owner = Some(*hir),
+                },
+                Returned::Call(..) | Returned::Null(_) => {}
+                Returned::Other(_) => shaped = false,
+            }
+        }
+        let Some(hir) = owner.filter(|_| shaped) else { continue };
+        if subject_of(callee, hir).is_some() {
+            continue;
+        }
+        if returns_a_parameter(tcx, callee, hir)
+            && !scan.stores_local.contains(&hir)
+            && !scan.frees.iter().any(|(h, _, _)| *h == hir)
+            && !scan.assigns.iter().any(|(h, _)| *h == hir)
+        {
+            out.chain_through.insert(callee);
+            out.chain_through_receipts.push(format!(
+                "{CHAIN_THROUGH}{}:returns-parameter-or-certified",
+                tcx.def_path_str(callee.to_def_id())
+            ));
+        }
+    }
     let mut pending: Vec<LocalDefId> = candidates;
     let mut changed = true;
     while changed {
@@ -1367,6 +1590,9 @@ pub(crate) fn derive<'tcx>(
                     changed = true;
                 }
                 Ok(None) => next.push(callee),
+                // The pass-over was settled before the fixpoint; `certify`
+                // still reports it so the two can never disagree.
+                Err((_, _, hold)) if hold.starts_with(CHAIN_THROUGH) => {}
                 Err((key, label, hold)) => {
                     out.holds.insert(key, (label, hold));
                 }
@@ -1385,10 +1611,10 @@ pub(crate) fn derive<'tcx>(
             .filter(|c| {
                 c.returned_receivers
                     .iter()
-                    .any(|(f, _)| !out.callees.contains_key(f))
+                    .any(|(f, _)| !out.callees.contains_key(f) && !out.chain_through.contains(f))
                     || c.returning_callers
                         .iter()
-                        .any(|f| !out.callees.contains_key(f))
+                        .any(|f| !out.callees.contains_key(f) && !out.chain_through.contains(f))
                     || c.chained_from
                         .iter()
                         .any(|source| !out.callees.contains_key(source))
@@ -1563,6 +1789,31 @@ fn certify<'tcx, 's>(
         Some((hir, _)) => match subject_of(callee, *hir) {
             Some(s) => Some(s),
             None => {
+                // **A1-f (R515-4) — a chain-through callee is passed over, not
+                // refused.** The returned local is not a pointer subject, so
+                // this callee can never be certified. That used to end every
+                // chain running through it: `insert` returns its own parameter
+                // or `newNode(..)`, so `newNode`'s certificate withdrew as
+                // `chain-open` collateral and the allocation lost its Box.
+                //
+                // The callee's own return statements are the proof. Where the
+                // returned local is a PARAMETER and the callee neither frees
+                // it, stores it away, nor reassigns it, the function
+                // originates nothing — it hands a value onward — and the
+                // emission-side chain is closed the way the analysis's callee
+                // summary closes it. Every other return is already a call or a
+                // null here: a second local and any other shape refused above.
+                if returns_a_parameter(tcx, callee, *hir)
+                    && !scan.stores_local.contains(hir)
+                    && !scan.frees.iter().any(|(h, _, _)| h == hir)
+                    && !scan.assigns.iter().any(|(h, _)| h == hir)
+                {
+                    return Err((
+                        (callee, *hir),
+                        callee_path.clone(),
+                        format!("{CHAIN_THROUGH}{callee_path}:returns-parameter-or-certified"),
+                    ));
+                }
                 return Err((
                     (callee, *hir),
                     callee_path.clone(),
@@ -1632,6 +1883,35 @@ fn certify<'tcx, 's>(
             }
         };
         pointee_ty = Some(ty);
+        // **W6A-A1-e's companion gate.** A certificate constructs the owner
+        // (`Box::new(Struct { field: .. })`) and spells every field as the
+        // source spells it. A field another family OWNS is not spellable that
+        // way — wave-6f promotes such a field to `Option<Box<T>>`, and the
+        // literal raw initializer beside it is an `E0308`. The model's field
+        // kind is the question, and it is asked here, at the one place the
+        // pointee is known.
+        if let TyKind::Adt(adt, _) = ty.kind()
+            && adt.is_struct()
+            && let Some(struct_did) = adt.did().as_local()
+            && (0..adt.all_fields().count()).any(|field_index| {
+                slots
+                    .field_slots
+                    .slot_for_field_depth(
+                        crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        },
+                        0,
+                    )
+                    .map(SlotRef::Field)
+                    .and_then(|slot| model.get(&slot).copied())
+                    == Some(SlotKind::Owning)
+            })
+        {
+            return Err(hold(format!(
+                "return-certificate-struct-field:{callee_path}:owned-field"
+            )));
+        }
         let pointee = pointee_source(tcx, ty);
         let frees: Vec<(Span, Span)> = scan
             .frees
@@ -2181,6 +2461,40 @@ fn certify<'tcx, 's>(
             if let Returned::Call(target, span) = r
                 && *target == callee.to_def_id()
             {
+                // **A1-f**: a caller PASSED OVER as a chain-through keeps its
+                // raw return type, so `return <certified call>` inside it is
+                // an `E0308` unless the owner is handed back raw at that exact
+                // statement — the same `Box::into_raw` the store-transfer arm
+                // emits, at the return position instead of an assignment.
+                if done.chain_through.contains(caller) {
+                    let text = tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(*span)
+                        .unwrap_or_default();
+                    let replacement = if optional_output {
+                        format!("{text}.map_or(core::ptr::null_mut(), Box::into_raw)")
+                    } else {
+                        format!("Box::into_raw({text})")
+                    };
+                    site_edits.push((
+                        *caller,
+                        BoxExprEdit {
+                            span: *span,
+                            replacement,
+                            receipt: "return-certificate-receiver:return-position",
+                        },
+                    ));
+                    // **R517-9, the return-position arm.** The call HAS a
+                    // receiver — the enclosing return — and the bridge above
+                    // is what makes it one, so the site is admitted rather
+                    // than counted as a call with nowhere to go. Without this
+                    // the certificate refused its own bridged site
+                    // (`call-site-not-a-receiver`), which is what stopped the
+                    // five constructor units at report 062.
+                    admitted_calls.push(*span);
+                    continue;
+                }
                 admitted_calls.push(*span);
                 if !returning_callers.contains(caller) {
                     returning_callers.push(*caller);

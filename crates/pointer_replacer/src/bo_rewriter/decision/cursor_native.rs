@@ -122,6 +122,147 @@ pub(crate) struct CursorReceipt {
     pub(crate) disposition: Result<(), CursorHold>,
 }
 
+/// **R452-6.** A cursor whose base is a table element (`*t.offset(k)`) is
+/// planned while `t` is still a flat slice of pointers. When `t` later delivers
+/// its inner level (nested's N1), the element becomes a slice VALUE and the
+/// constructor becomes `new(t[k])` — no length, nothing fabricated. That base
+/// is this family's, so the plan is REBUILT here through the family's own
+/// producer: a post-hoc rewrite of a finalised plan costs the cursor entirely
+/// (nested 007's A/B). The caller flips the table first and calls this after.
+///
+/// A rebuild that holds leaves its entry untouched and is reported, so the
+/// caller can withdraw the flip that made this necessary rather than emit a
+/// cursor whose base text no longer types.
+thread_local! {
+    /// **R525-7 (slicecursor 071) — the stale-replan count, PER PROGRAM.**
+    ///
+    /// The `debug_assert!` beside the increment is the loud form and a release
+    /// census compiles it out; the receipt vector counts TARGETS, which after
+    /// nested's transaction are exactly the rebased rows and so are non-zero by
+    /// design; and the call site discards that vector. So the detector's exit
+    /// condition — two consecutive censuses at zero and it goes — had nothing
+    /// to read. This is the thing it reads, on the same mechanism as
+    /// `ast_transform::graft_refusals`: a per-program cell, reset by the census
+    /// worker and published as one additive column.
+    static STALE_REPLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn reset_stale_replans() {
+    STALE_REPLANS.with(|cell| cell.set(0));
+}
+
+pub(crate) fn stale_replans() -> usize {
+    STALE_REPLANS.with(std::cell::Cell::get)
+}
+
+fn record_stale_replan() {
+    STALE_REPLANS.with(|cell| cell.set(cell.get() + 1));
+}
+
+pub(crate) fn replan_delivered_table_elements(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<CursorReceipt> {
+    let targets = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (subject, decision))| {
+            // S3.0: a `Decision` is consumed through an EXHAUSTIVE match, so a
+            // new disposition is a compile error here rather than a silent
+            // `false` that drops the row. Both arms below are spelled out for
+            // that reason and must not be collapsed to a wildcard.
+            let plan = match decision {
+                Decision::Cursor { plan, .. } => plan,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => return false,
+            };
+            let Some(base) = plan.delivered_base.as_ref() else {
+                return false;
+            };
+            matches!(base.provider, DeliveredBaseProvider::TableElement)
+                && entries.iter().any(|(table, table_decision)| {
+                    table.fn_did == subject.fn_did
+                        && table.hir_id == base.binding
+                        && match table_decision {
+                            Decision::NestedSlice { .. } => true,
+                            Decision::Cursor { .. }
+                            | Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_)
+                            | Decision::Degraded(_) => false,
+                        }
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for index in targets {
+        let subject = entries[index].0.clone();
+        // **R512-4 / slicecursor 064 §3, 068.** Since nested's transaction,
+        // `promote` asks `plan_with(.., Some(&prospective))` BEFORE it writes,
+        // so a row whose table has flipped was already built against the
+        // delivered base and this re-build is a no-op: `table_element_base`
+        // takes the `NestedSlice` arm either way and returns the same
+        // `new(t[k])` with `fallback == false`.
+        //
+        // A target still carrying a FALLBACK plan is the opposite: a plan built
+        // against the flat form whose table flipped afterwards, which is the
+        // stale-plan case this pass exists to repair and which the transaction
+        // is supposed to have made unreachable. It stays a repair rather than a
+        // deletion, because "no other producer can flip a table later" is a
+        // cross-family ordering claim and is not provable locally — but it is
+        // now loud. The auditable count is this function's own receipt vector.
+        //
+        // S3.0: the `Decision` read is exhaustive.
+        let stale = match &entries[index].1 {
+            Decision::Cursor { plan, .. } => plan.fallback,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        if stale {
+            record_stale_replan();
+        }
+        debug_assert!(
+            !stale,
+            "cursor-replan-after-flip: {:?} kept a fabricated window after its \
+             table delivered its inner level — `promote` must ask \
+             `plan_with(.., Some(..))` before it writes",
+            subject.label
+        );
+        // `None`: this consumer re-plans AFTER a flip that already happened, so
+        // there is no prospective table to tell the planner about — the flip is
+        // in `entries`. R513-5 replaces this repair with an assert; the
+        // assembler applies that patch when composing onto a frame that has
+        // this function.
+        let rebuilt = wrapper::build(ctx, &subject, entries, None);
+        receipts.push(CursorReceipt {
+            owner: subject.fn_did,
+            hir_id: subject.hir_id,
+            local: subject.local,
+            disposition: rebuilt.as_ref().map(|_| ()).map_err(|e| *e),
+        });
+        if let Ok(plan) = rebuilt {
+            entries[index].1 = Decision::Cursor {
+                mutable: subject.mutable,
+                plan,
+            };
+        }
+    }
+    receipts
+}
+
 pub(crate) fn promote(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
@@ -294,6 +435,26 @@ pub(crate) fn promote(
     }
     compose_nested_uses(ctx, entries, &committed, &mut receipts);
     receipts
+}
+
+/// **R512-4 / nested 018 STOP 1.** One bit the cursor family does not have at
+/// plan time: *this table is about to deliver its inner level*. `promote` hands
+/// it in before it writes anything, so `entries` stays pre-flip and is a single
+/// source of truth for the whole query; the family answers with a constructed
+/// `CursorPlan` or a `CursorHold`, and the caller commits the parameter only if
+/// every row came back constructed.
+///
+/// Asked, not installed: report 061 measured what installing a decision before
+/// its dependents are known good costs — a committed cursor beside a sibling
+/// that did not deliver, and `SliceCursor.offset(..)` in the emitted text
+/// (E0599). Rolling that back means unwinding the `uses` the flip wrote and
+/// everything else that read the variant in the same pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProspectiveTable {
+    /// The table being flipped.
+    pub(crate) binding: rustc_hir::HirId,
+    /// The element's mutability after the flip.
+    pub(crate) inner_mutable: bool,
 }
 
 /// Explicit declaration sites for untyped cursor locals (one hook in `mod.rs`).

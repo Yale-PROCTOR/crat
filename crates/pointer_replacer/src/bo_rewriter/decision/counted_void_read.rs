@@ -294,7 +294,9 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             return None;
         }
         let count_index = params.iter().position(|p| *p == count)?;
-        uses.push(UseEdit {
+        // R491-6 route (i): the initializer is the ALIAS's declaration, not a
+        // use of the parameter — it is handed over, not planned here.
+        let decl = Some(UseEdit {
             span: cast.span,
             replacement: if nullable {
                 format!("{name}.unwrap_or(&[])")
@@ -314,6 +316,9 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
             nullable,
             // wave-6v2 typed-width table (ec0e694a): not a width-fixed view.
             width: None,
+            alias: Some(alias),
+            decl,
+            count_positional: None,
             handle: None,
             uses,
         });
@@ -363,8 +368,8 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         return None;
     }
     let count_index = params.iter().position(|p| *p == count)?;
-    let _ = cast;
-    uses.push(UseEdit {
+    // R491-6 route (i): the initializer is the ALIAS's declaration.
+    let decl = Some(UseEdit {
         span: cast.span,
         replacement: if nullable {
             format!("{name}.unwrap_or(&[])")
@@ -379,6 +384,9 @@ pub(super) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
         count_index,
         element: ByteElement::Read,
         nullable,
+        alias: Some(alias),
+        decl,
+        count_positional: None,
         handle: None,
         uses,
     })

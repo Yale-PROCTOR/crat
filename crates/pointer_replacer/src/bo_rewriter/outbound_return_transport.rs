@@ -242,6 +242,10 @@ fn unknown(value: raw_boundary::RetentionUnknownReason) -> RetentionUnknownReaso
         Native::AnalysisIncomplete => RetentionUnknownReason::AnalysisIncomplete,
         Native::ReturnedAliasUsed => RetentionUnknownReason::ReturnedAliasUsed,
         Native::ReturnedAliasUnknown => RetentionUnknownReason::ReturnedAliasUnknown,
+        // R481-2: a waived positive retention travels as the transport's
+        // nearest unknown; the transported row's own waiver id is what names
+        // it, and this enum has no wire variant to add without a schema bump.
+        Native::PositiveRetentionWaived => RetentionUnknownReason::AnalysisIncomplete,
     }
 }
 
@@ -760,11 +764,36 @@ pub(crate) fn validate(capture: &Capture) -> Result<(), String> {
                         && row.waiver == RAW_BOUNDARY_T2_WAIVER_ID
                 }
                 "return-raw-to-ref" => {
+                    // **R494-1(b)** — W6L-1's raw-field return view rides the T2 waiver.
+                    //
+                    // This clause read `tier == "T1" && waiver == "-"` unconditionally,
+                    // which was true of every `return-raw-to-ref` row any corpus head had
+                    // ever produced. It is not true of the shape W6L-1 was written for.
+                    // `seam.rs` decides tier and waiver in ONE match on the same fact this
+                    // reads:
+                    //
+                    //     match through_raw_field {
+                    //         Some(reuse) => (T2, Some(RAW_BOUNDARY_T2_WAIVER_ID), ":through_raw_field=.."),
+                    //         None        => (T1, None, ""),
+                    //     }
+                    //
+                    // so the traversal receipt in the position IS the tier, and the ledger
+                    // asks for exactly the pairing the emission produces. heman's
+                    // `heman_image_texel` — the callee named in `return_through_raw_field`'s
+                    // own module doc — is the first corpus row to carry it.
+                    //
+                    // Both directions are asserted: a raw-field view must carry T2 and the
+                    // named waiver, and everything else must still carry T1 and none. A
+                    // clause that accepted either tier on either shape would be no clause.
+                    let raw_field_view = required.bridge.position.contains(":through_raw_field=");
                     row.target_form == required.terminal_interface
                         && !row.source_form.is_empty()
                         && row.target_form != "raw"
-                        && row.tier == "T1"
-                        && row.waiver == "-"
+                        && if raw_field_view {
+                            row.tier == "T2" && row.waiver == RAW_BOUNDARY_T2_WAIVER_ID
+                        } else {
+                            row.tier == "T1" && row.waiver == "-"
+                        }
                 }
                 "return-null-to-option" => {
                     row.target_form == required.terminal_interface
@@ -778,35 +807,50 @@ pub(crate) fn validate(capture: &Capture) -> Result<(), String> {
                 }
                 _ => false,
             };
-            if !source_contract
-                || row.state != state
-                || event.state != state
-                || bridge.state != state
-                || row.reason.is_some()
-                || event.reason.is_some()
-                || bridge.reason.is_some()
-                || row.boundary_kind != required.bridge.kind
-                || row.endpoint != required.bridge.endpoint
-                || row.position != required.bridge.position
-                || row.pair_role != "not-applicable"
-                || row.effect_carrier.is_some()
-                || row.source_form != event.source_form
-                || row.target_form != event.target_form
-                || row.negative_write != event.negative_write
-                || row.tier != event.tier
-                || row.waiver != event.waiver
-                || event.terminal_interface.as_ref() != Some(&required.terminal_interface)
-                || !event.return_adapter
-                || !event.extent_none
-                || bridge.key != required.bridge
-                || bridge.source_form != row.source_form
-                || bridge.target_form != row.target_form
-                || bridge.argument_kind != event.argument_kind
-                || bridge.tier != row.tier
-                || bridge.waiver != row.waiver
-                || !bridge.extent_none
-            {
-                return Err(fail("common-specialized-bridge-drift"));
+            // **R493-1** — name the clause that drifted.
+            //
+            // This was one 27-clause conjunction reporting a single word, so a refusal
+            // said only that the ledger and the tree disagree somewhere. Settling a
+            // drift means moving the LEDGER'S expectation to what the tree carries, and
+            // that cannot be done without knowing which expectation moved. The checks are
+            // unchanged; only their reporting is.
+            let drift: [(&str, bool); 27] = [
+                ("source-contract", !source_contract),
+                ("row-state", row.state != state),
+                ("event-state", event.state != state),
+                ("bridge-state", bridge.state != state),
+                ("row-reason", row.reason.is_some()),
+                ("event-reason", event.reason.is_some()),
+                ("bridge-reason", bridge.reason.is_some()),
+                ("boundary-kind", row.boundary_kind != required.bridge.kind),
+                ("endpoint", row.endpoint != required.bridge.endpoint),
+                ("position", row.position != required.bridge.position),
+                ("pair-role", row.pair_role != "not-applicable"),
+                ("effect-carrier", row.effect_carrier.is_some()),
+                ("row-source-form", row.source_form != event.source_form),
+                ("row-target-form", row.target_form != event.target_form),
+                ("negative-write", row.negative_write != event.negative_write),
+                ("row-tier", row.tier != event.tier),
+                ("row-waiver", row.waiver != event.waiver),
+                (
+                    "terminal-interface",
+                    event.terminal_interface.as_ref() != Some(&required.terminal_interface),
+                ),
+                ("return-adapter", !event.return_adapter),
+                ("event-extent-none", !event.extent_none),
+                ("bridge-key", bridge.key != required.bridge),
+                ("bridge-source-form", bridge.source_form != row.source_form),
+                ("bridge-target-form", bridge.target_form != row.target_form),
+                (
+                    "bridge-argument-kind",
+                    bridge.argument_kind != event.argument_kind,
+                ),
+                ("bridge-tier", bridge.tier != row.tier),
+                ("bridge-waiver", bridge.waiver != row.waiver),
+                ("bridge-extent-none", !bridge.extent_none),
+            ];
+            if let Some((clause, _)) = drift.iter().find(|(_, failed)| *failed) {
+                return Err(fail(&format!("common-specialized-bridge-drift:{clause}")));
             }
         }
         let planned = rows[&(key.clone(), "plan".into())];
@@ -960,4 +1004,131 @@ pub(crate) fn validate_sidecars(
         return Err(fail("tsv-payload-mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod drift_clause_tests {
+    /// **R493-1 — a drift refusal must name the clause that drifted.**
+    ///
+    /// This comparator held one 27-clause conjunction and reported a single word. Route
+    /// B's heman run ends `instrument-error / data=false` on it, and settling a drift
+    /// means moving the LEDGER'S expectation to what the tree carries — which cannot be
+    /// done without knowing which expectation moved. A refusal that says only "something
+    /// disagrees" is a refusal nobody can act on.
+    ///
+    /// The checks themselves are unchanged. This pins that each has a name, that the
+    /// names are distinct (two clauses sharing one label would send a reader to the wrong
+    /// expectation), and that the list still covers all 27.
+    #[test]
+    fn r493_1_every_drift_clause_is_named_and_distinct() {
+        let source = include_str!("outbound_return_transport.rs");
+        let table = source
+            .split("let drift: [(&str, bool); 27] = [")
+            .nth(1)
+            .expect("the clause table exists");
+        let table = &table[..table.find("\n            ];").expect("the table closes")];
+
+        // The names are the FIRST quoted string of each entry, and rustfmt may split an
+        // entry across lines -- the first version of this witness required `("name",` on
+        // one line and found 26 of 27 for exactly that reason, which would have read as a
+        // missing clause rather than a parser that was too strict.
+        let names = table
+            .split(',')
+            .filter_map(|piece| {
+                let piece = piece.trim();
+                piece
+                    .trim_start_matches('(')
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 27, "every clause is named: {names:?}");
+        let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            27,
+            "two clauses sharing a label would send a reader to the wrong expectation: {names:?}"
+        );
+
+        // And the refusal carries the name rather than the bare word.
+        assert!(
+            source.contains(r#"common-specialized-bridge-drift:{clause}"#),
+            "the refusal must carry the clause"
+        );
+    }
+
+    /// **R494-1(b) — the `source-contract` clause, settled on the heman shape.**
+    ///
+    /// The fixture is not hand-built: it is the ONE `return-raw-to-ref` quadruple that
+    /// refused on the Route B reproduction (`probe-routeb` = `32caeabf4`, heman, realized
+    /// 442), lifted out of that run's `heman.raw-boundary-outbound-return-custody.json`
+    /// with only the absolute worktree path normalized. Its bridge is
+    /// `heman_image_texel` — the callee `return_through_raw_field`'s own module doc names
+    /// as W6L-1's motivating example — and it carries `tier=T2` with the named waiver
+    /// because `seam.rs` derives tier, waiver and the `:through_raw_field=` receipt from
+    /// one match on one fact.
+    ///
+    /// Four cases, because a one-directional clause is not a clause: the raw-field view
+    /// must be T2-with-waiver and is refused at T1, and an ordinary return view must be
+    /// T1-without-waiver and is refused at T2. The two faults are the second and fourth.
+    #[test]
+    fn r494_1b_a_raw_field_return_view_carries_t2_and_only_it_may() {
+        use super::{Capture, render, validate};
+
+        let fixture = include_str!("testdata/r494-route-b/heman-untied-return-view.json");
+        // Flipping the receipt in the TEXT flips it everywhere it occurs -- the bridge
+        // key, the required position and the row position all embed it, and a capture
+        // where they disagree would be refused by a different clause (`bridge-key`),
+        // which would make this witness pass for the wrong reason.
+        let ordinary = fixture.replace(
+            ":through_raw_field=arg1/deref1/field:untied-return-view",
+            "",
+        );
+        assert!(
+            !ordinary.contains(":through_raw_field="),
+            "the receipt is gone"
+        );
+
+        let load = |text: &str, tier: &str, waiver: &str| {
+            let text = text
+                .replace(r#""tier": "T2""#, &format!(r#""tier": "{tier}""#))
+                .replace(
+                    r#""waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01""#,
+                    &format!(r#""waiver": "{waiver}""#),
+                );
+            let mut capture: Capture =
+                serde_json::from_str(&text).expect("the captured quadruple deserializes");
+            // The sidecar's own rendering is a separate clause; this witness is about the
+            // source contract, so the rendering is made consistent by construction.
+            capture.rendered_tsv = render(&capture.rows);
+            validate(&capture)
+        };
+
+        const WAIVER: &str = super::RAW_BOUNDARY_T2_WAIVER_ID;
+
+        assert_eq!(
+            load(fixture, "T2", WAIVER),
+            Ok(()),
+            "W6L-1's raw-field return view rides the T2 waiver -- this is the row Route B refused"
+        );
+        assert!(
+            load(fixture, "T1", "-")
+                .unwrap_err()
+                .contains("common-specialized-bridge-drift:source-contract"),
+            "a raw-field view claiming no-retention is still a drift"
+        );
+        assert_eq!(
+            load(&ordinary, "T1", "-"),
+            Ok(()),
+            "an ordinary return view is unchanged"
+        );
+        assert!(
+            load(&ordinary, "T2", WAIVER)
+                .unwrap_err()
+                .contains("common-specialized-bridge-drift:source-contract"),
+            "a waiver without the traversal receipt that licenses it is still a drift"
+        );
+    }
 }

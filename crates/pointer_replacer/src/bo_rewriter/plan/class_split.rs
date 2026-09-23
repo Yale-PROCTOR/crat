@@ -1502,6 +1502,47 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
     ///
     /// Ignored by default (~75 s, 2,656 lines); `--ignored` runs it. When
     /// these four stop being `copy-source-coupled`, this test says so.
+    /// **wave-6s, one of the 18 "callee already delivers a slice" rows, on the
+    /// real crate** (relay 037). lil is 4,621 lines — the smallest program
+    /// carrying one — and `lil_get_var_or::name#2` is passed bare to
+    /// `lil_find_var`, whose own `name#3` formal delivers `slice` and is
+    /// placed. The caller's row is this family's
+    /// `slice-use-unsupported` at `lib.rs:757:57`.
+    ///
+    /// Ignored by default (~5 min); `--ignored` runs it.
+    #[test]
+    #[ignore = "runs the real lil crate; --ignored"]
+    fn wave6s_probe_lil_name_rows() {
+        let path =
+            std::path::Path::new("/home/p51lee/dev/crat/benchmarks/rs-crown-derived/lil/lib.rs");
+        let src = std::fs::read_to_string(path).expect("derived lil");
+        let got = run(&src);
+        for line in got.subjects.lines() {
+            if line.contains("lil_get_var") || line.contains("lil_find_var") {
+                eprintln!("W6SLIL {line}");
+            }
+        }
+    }
+
+    /// wave-6s probe (relay 036): bzip2's real crate, the `block` rows.
+    #[test]
+    #[ignore = "runs the real bzip2 crate; --ignored"]
+    fn wave6s_probe_bzip2_block_rows() {
+        let path = std::path::Path::new(
+            "/home/p51lee/dev/crat/benchmarks/rs-crown-derived/bzip2/c2rust-lib.rs",
+        );
+        let src = std::fs::read_to_string(path).expect("derived bzip2");
+        let got = run(&src);
+        for line in got.subjects.lines() {
+            if line.contains("mainQSort3")
+                || line.contains("mainSimpleSort")
+                || line.contains("slice-use-unsupported")
+            {
+                eprintln!("W6SBZ {line}");
+            }
+        }
+    }
+
     /// **wave-6s W6S-8 on the real crate (relay 033).** The same 75-second
     /// run, over the rows the foreign-call bridge was built for.
     ///
@@ -1529,17 +1570,33 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
         );
         let src = std::fs::read_to_string(path).expect("derived libtree");
         let got = run(&src);
+        // **W6S-12 (R490-4).** `color_bold` now DELIVERS: its only uses are
+        // `fputs` reads at a `*const` formal, so its slice form is the shared
+        // one and the caller's literal origin can supply the view.
+        // `color_regular` left this family too, but by another door — at this
+        // frame it reads `pair-raw-view`, wave-6p's. Both spellings are
+        // named; what neither may be is this family's use wall.
         for key in [
             "src::libtree::print_line::color_bold#3",
             "src::libtree::print_line::color_regular#4",
         ] {
-            assert_eq!(
-                column(&got.subjects, key, "decision"),
-                "slice",
+            assert_ne!(
+                column(&got.subjects, key, "reason"),
+                "slice-use-unsupported",
                 "the foreign-call bridge closes the use wall:\n{}",
                 got.subjects
             );
         }
+        assert_eq!(
+            column(
+                &got.subjects,
+                "src::libtree::print_line::color_bold#3",
+                "placed"
+            ),
+            "1",
+            "the shared slice form delivers:\n{}",
+            got.subjects
+        );
         assert!(
             !got.subjects.contains("slice-use-unsupported"),
             "libtree carries no use wall of this family:\n{}",

@@ -2941,3 +2941,192 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod raw_twin_supersede_tests {
+    /// **R496-1 — the raw twin owns the span, so the A5 fallback plans NOTHING there.**
+    ///
+    /// brotli's `ProcessSingleCodeLength` is the shape: a pair T2 fallback over three
+    /// sibling-overlap-pending `&mut` field arguments of one base, at a call that is also a
+    /// counted-void site routed `RawTwin`. The emitted tree read
+    ///
+    /// ```ignore
+    /// let __crat_a5_raw_6925671_3: *mut u32 = core::ptr::from_mut(&mut *&mut (*h).space);
+    /// __crat_raw_ProcessSingleCodeLength(code_len,
+    ///     &mut (*h).symbol, &mut (*h).repeat, &mut (*h).space, …)
+    /// ```
+    ///
+    /// — four stamps bound, none read, the twin passing the ORIGINAL arguments because its
+    /// parameters are raw and `counted_void.rs` replaces `*args` wholesale on purpose.
+    ///
+    /// **`75ce6fedb` withdrew the ledger's CLAIM and that was the wrong layer.** Batch 20
+    /// measured what it cost: the applied receipt outlived its descriptor
+    /// (`bridge-custody:missing-descriptor:…:typed-carrier-candidate-count:0`), one refusal
+    /// traded for another at the same site, and the dead stamps stayed in the tree where no
+    /// receipt could claim them — `reverse_census` counts an unread generated binding as
+    /// `unclaimed-generated-declaration` whatever the ledger says, so `data` could never
+    /// have gone true by a ledger edit.
+    ///
+    /// The fallback now yields at PLANNING, one arm along from where it already yields to
+    /// the PAIR rendering for the identical reason. This pins that the yield is there, that
+    /// it is narrow at all three edges — a supersede that is too wide silently drops real
+    /// custody obligations — and that the comparator keeps its refusal for every site the
+    /// ledger does still claim.
+    ///
+    /// **What this witness does NOT catch, measured rather than assumed.** It reads source
+    /// text, so it passes against a SEMANTIC disable: pinning the condition `false && …`
+    /// leaves every string it looks for in place and the test still goes green. I tried
+    /// three times to build a fixture that reaches the shape — the cross-module twin
+    /// fixture, field siblings at a same-module callee, and the two combined — and all
+    /// three emit `stamps=0 twin=0`, so none of them exercises it; that is MAX-3 and I
+    /// stopped. **The behavioural check for this change is a brotli probe**, where the
+    /// shape actually occurs, and it is owed before the change is offered for a cut.
+    #[test]
+    fn r496_1_the_raw_twin_owns_the_span_so_the_a5_fallback_plans_nothing_there() {
+        let planner = include_str!("mod.rs");
+        let loop_body = planner
+            .split("for call in &table.seams.a5_raw_calls {")
+            .nth(1)
+            .expect("the A5 raw-view planning loop exists");
+        let body = &loop_body[..loop_body
+            .find("let (file, lo, hi) = span_to_loc(call.call_span)")
+            .expect("the loop reaches its placement step")];
+
+        let yielded = body
+            .find("counted_void::Route::RawTwin")
+            .expect("the fallback yields to the raw twin");
+        let pair_yield = body
+            .find("table.seams.pair_raw_calls")
+            .expect("the existing PAIR yield is the precedent this sits beside");
+        assert!(
+            pair_yield < yielded,
+            "the twin yield belongs after the pair yield, with which it shares its reason"
+        );
+
+        // Narrow at all three edges.
+        let arm = &body[yielded..];
+        for (needle, why) in [
+            (
+                "counted.caller == call.caller",
+                "the same span in another caller is another site",
+            ),
+            (
+                "counted.call_span == call.call_span",
+                "another call in the same caller is another site",
+            ),
+            (
+                "Route::RawTwin",
+                "only the twin route replaces arguments wholesale",
+            ),
+        ] {
+            assert!(arm.contains(needle), "{why}: {arm}");
+        }
+
+        // The LEDGER is back to claiming every A5 site it plans — the withdrawal moved to
+        // the planner, so a second withdrawal here would hide a real obligation.
+        let export = include_str!("bridge_custody_export.rs");
+        let a5 = export
+            .split(r#""a5-site-proof-t2-fallback" => {"#)
+            .nth(1)
+            .expect("the A5 arm exists");
+        let a5 = &a5[..a5.find("\"pair-copy-snapshot\"").unwrap_or(a5.len())];
+        assert!(
+            !a5.contains("superseded_by_raw_twin"),
+            "the ledger no longer second-guesses the planner: {a5}"
+        );
+
+        // And the comparator keeps its refusal for the sites the ledger does claim.
+        assert!(
+            include_str!("bridge_custody_match.rs")
+                .contains("stamped-raw-temporary-has-no-exact-bound-call-use"),
+            "the comparator is untouched"
+        );
+    }
+
+    /// **R499-1 — and the obligation is DISCHARGED there, not left looking for a carrier.**
+    ///
+    /// R496-1 stopped the A5 fallback planning its stamps at a raw-twin call. Measured on
+    /// brotli (65 min, probe `r496brotli`): four dead `let __crat_a5_raw_6925671_*` left the
+    /// tree, custody went `data=true` with 0 issues and 0 tree-only, and the census row went
+    /// `instrument-error` → `ok`. It also cost **seven subjects**, and the hold said why:
+    ///
+    /// ```text
+    /// held:dropped-site:a5-site-proof-t2-fallback:a5-fallback-unrenderable:raw=true;carriers=1;edits=0
+    /// ```
+    ///
+    /// The proof site still asked `link_a5_fallback_carriers` for a carrier and found its own
+    /// call's edit correctly gone. A site whose rendering another arm owns has to be
+    /// discharged — as `Clear` and `Primary` are — not held for an edit that was never going
+    /// to be made.
+    ///
+    /// **The limit, measured rather than assumed**: this is a source-text witness and it
+    /// passes against a semantic disable. Three attempts at a fixture reaching the shape
+    /// (cross-module twin, field siblings, both) emitted `stamps=0 twin=0`; that was MAX-3 and
+    /// I stopped. The behavioural checks are the assembler's heman probe on the re-cut (heman
+    /// carries six superseded twin sites) and batch 26's `*.a5-proof-site-fallback.tsv`, where
+    /// these sites must read a ready state rather than `a5-fallback-unrenderable`.
+    #[test]
+    fn r499_1_a_raw_twin_site_discharges_the_a5_obligation_with_zero_syntax() {
+        let planner = include_str!("plan/mod.rs");
+        let body = planner
+            .split("pub(crate) fn link_a5_fallback_carriers(")
+            .nth(1)
+            .expect("the carrier linker exists");
+        // **Comments are not code.** The first version of this anchored on
+        // `a5-fallback-unrenderable:raw=` and found it in the comment ABOVE the new arm,
+        // which put `resolve` before `discharge` and turned the ordering assertion RED on a
+        // correct tree. The same shape cost the R492-1 witness a false count and the module
+        // ratchet a commented-out `mod`; three times is a rule, so the scan drops comment
+        // lines before it looks for anything.
+        let body = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+
+        // The block starts at its `if`, NOT at the route constant: anchoring on the constant
+        // put the short-circuit check downstream of the `false &&` it was meant to catch, and
+        // the disable passed a second time. Measured both ways before this line was written.
+        let discharge = body
+            .find("if table.seams.counted_void_calls")
+            .expect("a raw-twin site discharges the obligation");
+        assert!(
+            body[discharge..].contains("counted_void::Route::RawTwin"),
+            "the discharge is keyed on the twin route"
+        );
+        let resolve = body
+            .find("a5-fallback-unrenderable:raw=")
+            .expect("the carrier resolution is still there for every other site");
+        assert!(
+            discharge < resolve,
+            "the discharge must precede the carrier resolution, or the site is dropped for \
+             missing an edit that another arm owns"
+        );
+
+        let arm = &body[discharge..resolve];
+        for (needle, why) in [
+            (
+                "counted.caller == proof.caller",
+                "another caller is another site",
+            ),
+            (
+                "contains(proof.span",
+                "the twin's call must contain the proof's own span",
+            ),
+            ("ZeroSyntaxReady", "discharged, not merely un-dropped"),
+        ] {
+            assert!(arm.contains(needle), "{why}: {arm}");
+        }
+
+        // **The one fault a source-text witness CAN close, so it does.** I disabled this arm
+        // semantically (`false && counted.route == ..`) and the test above still passed --
+        // every string it looks for was still there. That exact disable is now refused. It is
+        // a band-aid over a structural limit, not a substitute for the behavioural check in
+        // the doc comment, and I would rather name it as one than let it read as coverage.
+        assert!(
+            !arm.contains("false &&") && !arm.contains("true &&"),
+            "the discharge condition is short-circuited: {arm}"
+        );
+    }
+}

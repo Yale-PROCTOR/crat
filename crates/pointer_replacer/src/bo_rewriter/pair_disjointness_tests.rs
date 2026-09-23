@@ -1609,13 +1609,18 @@ fn w6p_probe_pair_roots() {
             &program, &mut_facts, None,
         );
         let name = |did: rustc_span::def_id::LocalDefId| tcx.def_path_str(did.to_def_id());
+        if std::env::var_os("W6P_DUMP_EDECLINE").is_some() {
+            for did in &program.functions {
+                println!("W6P_FNID\t{}\t{}", did.local_def_index.as_u32(), name(*did));
+            }
+        }
         let rows = index.probe_rows(&program);
         println!("W6P_PROBE_ROWS {}", rows.len());
         for row in rows {
             let show = |value: Option<usize>| value.map_or("-".to_owned(), |v| v.to_string());
             let flag = |value: Option<bool>| value.map_or("-", |v| if v { "free" } else { "kept" });
             println!(
-                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 name(row.caller),
                 name(row.callee),
                 row.left,
@@ -1630,7 +1635,8 @@ fn w6p_probe_pair_roots() {
                 flag(row.left_free),
                 flag(row.right_free),
                 row.left_why,
-                row.right_why
+                row.right_why,
+                u8::from(row.shared_read)
             );
         }
     })

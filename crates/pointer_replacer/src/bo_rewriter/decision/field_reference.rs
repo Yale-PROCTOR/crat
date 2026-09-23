@@ -578,7 +578,7 @@ impl FieldTransactions {
             if any { "withdrawn" } else { "active" }
         };
         let mut out = String::from(
-            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\trevert_status\n",
+            "struct\tfield\tstatus\tform\tsites\towners\timpls\tsignature_plans\tbridges\tcause\trevert_status\tdependent_owners\n",
         );
         for t in &self.applied {
             let count = |kind: &str| {
@@ -588,7 +588,7 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\t{}\n",
                 t.struct_path,
                 t.field_name,
                 t.delivered_form_key(),
@@ -622,11 +622,20 @@ impl FieldTransactions {
                     .collect::<Vec<_>>()
                     .join("|"),
                 withdrawn(t),
+                if t.dependent_owners.is_empty() {
+                    "-".to_owned()
+                } else {
+                    t.dependent_owners
+                        .iter()
+                        .map(|o| tcx.def_path_str(o.to_def_id()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
             ));
         }
         for (struct_path, field, cause) in &self.held {
             out.push_str(&format!(
-                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\t-\n"
+                "{struct_path}\t{field}\theld\t-\t-\t-\t-\t-\t-\t{cause}\t-\t-\n"
             ));
         }
         out
@@ -3255,13 +3264,37 @@ pub(crate) fn reconcile_a5_raw_views(
                     if !text.contains(original.as_str()) {
                         continue;
                     }
-                    if *wrap {
-                        return Err(format!(
-                            "field-transaction-a5-raw-view:owned-edit-inside-view:{}",
-                            sm.span_to_diagnostic_string(*span)
-                        ));
-                    }
-                    *text = text.replace(original.as_str(), replacement);
+                    // **R494-2 — the HOIST.** An owned-field edit is a WRAP:
+                    // its replacement is a template rendered around
+                    // [`WRAP_PLACEHOLDER`], which the AST pass substitutes
+                    // with the node's own (inner-edited) expression. A view
+                    // holds a SNAPSHOT of that expression's text, so the
+                    // template can be rendered against the snapshot here and
+                    // the view carries the wrapped form — the same form the
+                    // AST pass will produce at the node.
+                    //
+                    // Refusing instead (the first version) aborted the whole
+                    // rewrite rather than holding one row: on wave-6a's
+                    // A1-e + A9 line, where A9 makes such a formal a
+                    // reference and the view therefore exists, every subject
+                    // of the program delivered nothing (their report 044).
+                    //
+                    // [`WRAP_PLACE`] is the one template hole a snapshot
+                    // cannot fill — it stands for the ASSIGNED PLACE of a
+                    // raw-base store, which is not in the view's text at all.
+                    // That form keeps the refusal, and keeps it typed.
+                    let rendered = if *wrap {
+                        if replacement.contains(WRAP_PLACE) {
+                            return Err(format!(
+                                "field-transaction-a5-raw-view:place-template-inside-view:{}",
+                                sm.span_to_diagnostic_string(*span)
+                            ));
+                        }
+                        replacement.replace(WRAP_PLACEHOLDER, original.as_str())
+                    } else {
+                        replacement.clone()
+                    };
+                    *text = text.replace(original.as_str(), &rendered);
                 }
             }
         }

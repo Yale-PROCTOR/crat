@@ -609,3 +609,79 @@ pub(crate) fn dead_return_parameter(
         _ => None,
     }
 }
+
+/// **W6L-ESC (relay 039): the returned locals the escape inventory misses.**
+///
+/// The legacy inventory sees a BARE returned use — `return r;` — and nothing
+/// else. c2rust output returns through expressions constantly, and lil's own
+/// `lil_find_var` is the shape that caught it:
+///
+/// ```ignore
+/// return if !r.is_null() { r } else if env == (*lil).rootenv { 0 } else { lil_find_var(..) };
+/// ```
+///
+/// `r` escapes, and the inventory answers `escapes=false` (wave-6l report 036
+/// claim 6, measured on the corpus). Every gate of this lane that asks "does
+/// this subject escape?" inherits the answer, including R401-8's untied-view
+/// guard, where a wrong `false` admits a view that leaves its frame. This walks
+/// the owner's return sites and collects the bare locals of an `if` / `match`
+/// value, through nested arms and blocks' tail expressions, so the guards can
+/// ask a question the inventory cannot answer.
+pub(crate) fn returned_locals(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    owner: LocalDefId,
+) -> rustc_hash::FxHashSet<rustc_hir::HirId> {
+    use rustc_hir::{
+        Expr, ExprKind, QPath,
+        def::Res,
+        intravisit::{self, Visitor},
+    };
+
+    fn collect(expr: &Expr<'_>, out: &mut rustc_hash::FxHashSet<rustc_hir::HirId>) {
+        match expr.kind {
+            ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) | ExprKind::Type(inner, _) => {
+                collect(inner, out);
+            }
+            ExprKind::If(_, then, els) => {
+                collect(then, out);
+                if let Some(els) = els {
+                    collect(els, out);
+                }
+            }
+            ExprKind::Match(_, arms, _) => {
+                for arm in arms {
+                    collect(arm.body, out);
+                }
+            }
+            ExprKind::Block(block, _) => {
+                if let Some(value) = block.expr {
+                    collect(value, out);
+                }
+            }
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Local(hir) = path.res {
+                    out.insert(hir);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    struct Returns<'a>(&'a mut rustc_hash::FxHashSet<rustc_hir::HirId>);
+    impl<'tcx> Visitor<'tcx> for Returns<'_> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Ret(Some(value)) = expr.kind {
+                collect(value, self.0);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut out = rustc_hash::FxHashSet::default();
+    let Some(body_id) = tcx.hir_node_by_def_id(owner).body_id() else { return out };
+    let body = tcx.hir_body(body_id);
+    Returns(&mut out).visit_body(body);
+    // The body's own tail expression is a return site too.
+    collect(body.value, &mut out);
+    out
+}

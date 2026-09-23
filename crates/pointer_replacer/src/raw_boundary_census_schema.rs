@@ -35,6 +35,12 @@ pub(crate) const CACHE_FRAME_ADMISSION: &str = "raw_boundary_cache_frame_admissi
 /// and were dropped by their caller: correct in the plan, inert in the tree. An
 /// instrument count, per program; 0 is the expected reading.
 pub(crate) const GRAFT_REFUSED: &str = "raw_boundary_graft_refused";
+/// **R525-7 (slicecursor 071)** — targets of `replan_delivered_table_elements`
+/// that were STALE: a cursor row still carrying a fabricated window after its
+/// table delivered its inner level. Since nested's transaction asks
+/// `plan_with(.., Some(..))` before it writes, this must be 0; the detector
+/// stays only until two consecutive censuses say so. A count, per program.
+pub(crate) const REPLAN_STALE: &str = "raw_boundary_replan_stale";
 /// **R473-3** — parameters the box-parameter analysis examined and REFUSED, with their
 /// typed reasons published beside them in `box-param-receipt`. A count, per program: the
 /// market for the next owning build, and previously invisible because the whole table
@@ -217,6 +223,8 @@ pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
 pub(crate) const CLASS_COST_ROWS: &str = "raw-boundary-class-costs.tsv";
 pub(crate) const CROSS_CLASS_COLLISION_ROWS: &str = "raw-boundary-class-collisions.tsv";
 pub(crate) const UNRESOLVED_CLASS_ROWS: &str = "raw-boundary-unresolved-classes.tsv";
+/// **R517-8** — one row per held class whose edits the placement layer drops.
+pub(crate) const CLASS_HELD_DROP_ROWS: &str = "raw-boundary-class-held-drops.tsv";
 pub(crate) const MECHANICAL_OBLIGATION_ROWS: &str = "raw-boundary-mechanical-obligations.tsv";
 pub(crate) const UNSAFE_CONTEXT_PRESENTATION_ROWS: &str = "unsafe-context-presentation.tsv";
 pub(crate) const A5_PROOF_SITE_FALLBACK_ROWS: &str = "a5-proof-site-fallback.tsv";
@@ -256,6 +264,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_MANIFEST_SHA256,
     CACHE_FRAME_ADMISSION,
     GRAFT_REFUSED,
+    REPLAN_STALE,
     BOX_PARAM_HELD,
     RETENTION_FRAME_BOUNDED,
     FIELD_REVERT_STATUS_NOTES,

@@ -90,6 +90,26 @@ pub(crate) enum CertificateKind {
     /// are assumed not to alias. An assumption, never a proof — receipted at
     /// every site that rests on it, as the other waivers are.
     ExportedEntryWaiver,
+    /// R483-3(f): (e) extended to statics. One side is a `static` item, the
+    /// other a parameter's pointee, and EVERY in-crate call site of that
+    /// function passes, at that position, something whose root is known and is
+    /// not this static. The payload is how many call sites were checked, so
+    /// the evidence behind each certificate is countable in the ledger.
+    StaticVsEntry(u32),
+    /// R486-2, USER Decision C, waiver id `exported-entry-static-waiver
+    /// (2026-09-21)`: the same rule where the function is an exported
+    /// `#[no_mangle]` entry, so the callers the closed world CANNOT see are
+    /// assumed not to pass the address of a program-internal static. An
+    /// assumption, never a proof, and receipted as one. The in-crate callers
+    /// are still read, and one of them passing the static still refuses.
+    StaticVsEntryWaived(u32),
+    /// R492-3 (wave-6k 038's rule, built here under R217-2(a)): the pair needs
+    /// no disjointness at all, because both peer formals are MODEL-SHARED
+    /// READS — `*const` in the input, nothing written through them, and no
+    /// mutable reborrow anywhere in the callee. `&T` beside `&T` is the one
+    /// aliasing question Rust answers for us, so two shared borrows of one
+    /// place are legal and there is nothing to prove.
+    ReadReadShared,
 }
 
 impl CertificateKind {
@@ -103,11 +123,33 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
+            Self::StaticVsEntry(_) | Self::StaticVsEntryWaived(_) => {
+                "pair-disjoint:static-vs-entry"
+            }
+            Self::ReadReadShared => "pair-disjoint:read-read-shared",
+        }
+    }
+
+    /// The receipt with its evidence count. `key()` stays a fixed vocabulary so
+    /// the census can count it; this is what the lane's ledger records.
+    pub(crate) fn receipt(self) -> String {
+        match self {
+            Self::StaticVsEntry(callers) => format!("{}:callers={callers}", self.key()),
+            Self::StaticVsEntryWaived(callers) => format!(
+                "{}:callers={callers}:{}",
+                self.key(),
+                EXPORTED_ENTRY_STATIC_WAIVER
+            ),
+            _ => self.key().to_owned(),
         }
     }
 }
 
 pub(crate) const CERTIFICATE_FAMILY: &str = "pair-disjointness-certificate";
+
+/// R486-2 (USER Decision C, 2026-09-21). Named so every site that rests on the
+/// assumption can be counted and, if it is ever withdrawn, found.
+pub(crate) const EXPORTED_ENTRY_STATIC_WAIVER: &str = "exported-entry-static-waiver";
 
 /// Why a pair stayed unproved. One fixed vocabulary, so the census can count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +225,11 @@ enum RootClass {
     /// A parameter's VALUE, fixed at entry (never reassigned, address never
     /// taken), or a place inside its pointee: storage that existed at entry.
     EntryStorage(HirId),
+    /// R482-4(4): a `static` item — a NAMED global object. Two different
+    /// statics are two objects, and a static is neither this frame's stack nor
+    /// a block an allocator has just returned. It is NOT separable from a
+    /// parameter's pointee: a caller may pass the static itself.
+    Static(DefId),
     /// R479-4a: the value read out of a pointer field whose EVERY store in the
     /// program is a directly called named allocator. `base` is the root binding
     /// of the place the field was read from, because the sound claim is
@@ -218,7 +265,7 @@ impl RootClass {
     fn object_id(self) -> Option<HirId> {
         match self {
             Self::FreshAlloc(id, _) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
-            Self::FreshField { .. } | Self::Unknown => None,
+            Self::FreshField { .. } | Self::Static(_) | Self::Unknown => None,
         }
     }
 }
@@ -306,6 +353,10 @@ pub(crate) struct PairDisjointnessIndex {
     type_rule: FxHashMap<(u32, usize, usize), PairTypeVerdict>,
     /// `(callee, index)` formals with a non-defaulted immutable fact.
     immutable_formals: FxHashSet<(u32, usize)>,
+    /// R492-3: formals that are model-shared reads — the conjunction in
+    /// `CertificateKind::ReadReadShared`. Keyed on the CALLEE alone, so the
+    /// answer is per pair and identical at every call site.
+    shared_reads: FxHashSet<(u32, usize)>,
     /// Each function's pointer-parameter bindings, in formal order: what lets
     /// (e) map an argument's entry root back to the caller's own formal.
     param_bindings: FxHashMap<u32, Vec<HirId>>,
@@ -361,6 +412,9 @@ impl PairDisjointnessIndex {
                     tcx.def_path_str(*adt)
                 );
             }
+            for (did, index) in &allocators.views {
+                println!("W6P_VIEW\t{}\t{index}", tcx.def_path_str(*did));
+            }
             for (did, freshness) in &allocators.wrappers {
                 println!("W6P_WRAPPER\t{}\t{freshness:?}", tcx.def_path_str(*did));
             }
@@ -378,7 +432,7 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let (classes, why) = classify_locals(tcx, typeck, body, &allocators, caller);
+            let (classes, why, prefixes) = classify_locals(tcx, typeck, body, &allocators, caller);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
@@ -386,6 +440,7 @@ impl PairDisjointnessIndex {
                 classes: &classes,
                 fresh_fields: &fresh_fields,
                 why: &why,
+                prefixes: &prefixes,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -402,12 +457,23 @@ impl PairDisjointnessIndex {
 
         let mut type_verdicts = FxHashMap::default();
         let mut immutable_formals = FxHashSet::default();
+        let mut shared_reads = FxHashSet::default();
+        let mutably_reborrowed = mutably_reborrowed_formals(tcx, &program.functions);
         for &callee in &program.functions {
             let inputs = tcx.fn_sig(callee).skip_binder().skip_binder().inputs();
             for index in 0..inputs.len() {
                 let local = rustc_middle::mir::Local::from_usize(index + 1);
                 if !mut_facts.is_defaulted(callee, local) && !mut_facts.is_mutable(callee, local) {
                     immutable_formals.insert((callee.local_def_index.as_u32(), index));
+                    // R492-3, the other two conjuncts: `*const` in the INPUT,
+                    // and no mutable reborrow of this formal in the body.
+                    if matches!(
+                        inputs[index].kind(),
+                        ty::RawPtr(_, rustc_middle::mir::Mutability::Not)
+                    ) && !mutably_reborrowed.contains(&(callee, index))
+                    {
+                        shared_reads.insert((callee.local_def_index.as_u32(), index));
+                    }
                 }
             }
             let pointees: Vec<Option<Ty<'_>>> = inputs
@@ -516,6 +582,7 @@ impl PairDisjointnessIndex {
             fresh_stack,
             type_rule: type_verdicts,
             immutable_formals,
+            shared_reads,
             param_bindings,
             exported,
             parameter_pairs: RefCell::new(FxHashMap::default()),
@@ -533,6 +600,16 @@ impl PairDisjointnessIndex {
     /// with no in-program caller, an argument this read cannot map, two
     /// arguments that are the caller's SAME parameter, a same-place call, a
     /// cycle or eight levels of depth all refuse.
+    /// R492-3: why (e) declined, for the decline table. Test-only; no rule
+    /// reads it, and it is keyed on the pair so a memoised decline is counted
+    /// once.
+    #[cfg(test)]
+    fn note_decline(callee: u32, left: usize, right: usize, cause: &str) {
+        if std::env::var_os("W6P_DUMP_EDECLINE").is_some() {
+            println!("W6P_EDECLINE\t{callee}\t{left}\t{right}\t{cause}");
+        }
+    }
+
     fn parameter_pair(
         &self,
         callee: u32,
@@ -546,6 +623,8 @@ impl PairDisjointnessIndex {
             return *memo;
         }
         if depth > 8 || seen.contains(&key) {
+            #[cfg(test)]
+            Self::note_decline(callee, left, right, "recursion-or-depth");
             return None;
         }
         seen.push(key);
@@ -562,6 +641,8 @@ impl PairDisjointnessIndex {
             for record in records {
                 let find = |index: usize| record.args.iter().find(|arg| arg.index == index);
                 let (Some(a), Some(b)) = (find(left), find(right)) else {
+                    #[cfg(test)]
+                    Self::note_decline(callee, left, right, "argument-not-recorded");
                     result = None;
                     break;
                 };
@@ -571,6 +652,8 @@ impl PairDisjointnessIndex {
                 if let (Some(pa), Some(pb)) = (&a.place, &b.place)
                     && pa == pb
                 {
+                    #[cfg(test)]
+                    Self::note_decline(callee, left, right, "a-caller-passes-one-place");
                     result = None;
                     break;
                 }
@@ -586,16 +669,45 @@ impl PairDisjointnessIndex {
                     self.formal_of(*caller, a.class),
                     self.formal_of(*caller, b.class),
                 ) else {
+                    // R493-3: which SIDE failed, not just what the classes
+                    // were. Report 031's label printed the class of both sides
+                    // whichever one `formal_of` refused, which is why its
+                    // `entry-but-not-a-formal` count could not be read.
+                    #[cfg(test)]
+                    Self::note_decline(
+                        callee,
+                        left,
+                        right,
+                        &format!(
+                            "root-is-not-a-caller-formal:{}:{}@caller={}",
+                            describe_side(self.formal_of(*caller, a.class), a.class),
+                            describe_side(self.formal_of(*caller, b.class), b.class),
+                            caller
+                        ),
+                    );
                     result = None;
                     break;
                 };
                 if up_left == up_right {
+                    #[cfg(test)]
+                    Self::note_decline(
+                        callee,
+                        left,
+                        right,
+                        &format!(
+                            "a-caller-passes-one-formal-twice@caller={caller} formal={up_left} \
+                             places={:?}/{:?}",
+                            a.place, b.place
+                        ),
+                    );
                     result = None;
                     break;
                 }
                 match self.parameter_pair(*caller, up_left, up_right, depth + 1, seen) {
                     Some(up) => result = result.map(|acc| acc.join(up)),
                     None => {
+                        #[cfg(test)]
+                        Self::note_decline(callee, left, right, "declined-further-up-the-chain");
                         result = None;
                     }
                 }
@@ -605,6 +717,8 @@ impl PairDisjointnessIndex {
             }
         }
         if callers == 0 && !self.exported.contains(&callee) {
+            #[cfg(test)]
+            Self::note_decline(callee, left, right, "no-in-crate-caller-reaches-it");
             result = None;
         }
         seen.pop();
@@ -701,6 +815,10 @@ impl PairDisjointnessIndex {
         if self.immutable_formals.contains(&(callee, left))
             && self.immutable_formals.contains(&(callee, right))
         {
+            // R492-3: the FACT is derived here (`is_shared_read_pair`), but the
+            // verdict is not. `decision/shared_read_pairs.rs` owns the
+            // shared/shared case in the CONSUMER role (R396-2), and this index
+            // refuses the pair to it on purpose — report 031 STOP 1.
             return Err(Unproved::ReadReadPeers);
         }
         // The same syntactic place, however it is cast, is never disjoint from
@@ -737,6 +855,22 @@ impl PairDisjointnessIndex {
             || self.fresh_stack.contains(&(caller, callee, b.index))
         {
             return Ok(CertificateKind::FreshStackAddress);
+        }
+        // R483-3(f), before (e): a static beside a parameter's pointee, with
+        // the closed world reading every caller of the function the parameter
+        // belongs to.
+        for (statik, entry) in [(a, b), (b, a)] {
+            if let RootClass::Static(did) = statik.class
+                && let Some(formal) = self.formal_of(caller, entry.class)
+                && let Some((callers, waived)) =
+                    self.static_vs_formal(caller, formal, did, 0, &mut Vec::new())
+            {
+                return Ok(if waived {
+                    CertificateKind::StaticVsEntryWaived(callers)
+                } else {
+                    CertificateKind::StaticVsEntry(callers)
+                });
+            }
         }
         // (e) R462-1, last: the callee's two parameters may be separable even
         // where this call site's arguments are not, if every in-program call
@@ -790,6 +924,91 @@ impl PairDisjointnessIndex {
         reason = "witness surface: every certify() outcome, for the RED-first tests \
                   and the census ledger column main may add"
     )]
+    /// R483-3(f). Can the pointee of `function`'s formal `formal` be the static
+    /// `statik`? The closed world answers by reading every in-crate call site:
+    /// each must pass something whose root is known and is not that static, or
+    /// its own formal, which recurses. Returns how many sites were checked.
+    ///
+    /// Refused for an EXPORTED function — an embedder is outside the closed
+    /// world, and R462-1's waiver is about two of an entry's own parameters,
+    /// not about a program-internal static's address — and for a function no
+    /// in-crate caller reaches, where there is no evidence at all.
+    fn static_vs_formal(
+        &self,
+        function: u32,
+        formal: usize,
+        statik: DefId,
+        depth: usize,
+        seen: &mut Vec<(u32, usize)>,
+    ) -> Option<(u32, bool)> {
+        if depth > 8 || seen.contains(&(function, formal)) {
+            return None;
+        }
+        seen.push((function, formal));
+        // R486-2: an exported entry's unseen callers are assumed not to pass
+        // the static. Its IN-CRATE callers are still read below.
+        let mut waived = self.exported.contains(&function);
+        let mut callers = 0u32;
+        let mut ok = true;
+        'sites: for ((caller, target), records) in &self.sites {
+            if *target != function {
+                continue;
+            }
+            for record in records {
+                let Some(arg) = record.args.iter().find(|arg| arg.index == formal) else {
+                    ok = false;
+                    break 'sites;
+                };
+                callers += 1;
+                match arg.class {
+                    RootClass::Static(other) if other != statik => {}
+                    RootClass::StackObject(_)
+                    | RootClass::FreshAlloc(..)
+                    | RootClass::FreshField { .. } => {}
+                    RootClass::EntryStorage(_) => {
+                        let Some(up) = self.formal_of(*caller, arg.class) else {
+                            ok = false;
+                            break 'sites;
+                        };
+                        match self.static_vs_formal(*caller, up, statik, depth + 1, seen) {
+                            Some((up_callers, up_waived)) => {
+                                callers += up_callers;
+                                waived |= up_waived;
+                            }
+                            None => {
+                                ok = false;
+                                break 'sites;
+                            }
+                        }
+                    }
+                    RootClass::Static(_) | RootClass::Unknown => {
+                        ok = false;
+                        break 'sites;
+                    }
+                }
+            }
+        }
+        seen.pop();
+        // Without the waiver a function no in-crate caller reaches is no
+        // evidence at all; with it, the exported entry IS the evidence.
+        (ok && (callers > 0 || waived)).then_some((callers, waived))
+    }
+
+    /// R492-3: are both peer formals model-shared reads — `*const` in the
+    /// input, nothing written through them, and no mutable reborrow anywhere in
+    /// the callee? The fact only; `certify_inner` deliberately does not turn it
+    /// into a verdict, because the shared/shared case belongs to
+    /// `shared_read_pairs`'s consumer role (R396-2).
+    pub(crate) fn is_shared_read_pair(
+        &self,
+        callee: LocalDefId,
+        left: usize,
+        right: usize,
+    ) -> bool {
+        let callee = callee.local_def_index.as_u32();
+        self.shared_reads.contains(&(callee, left)) && self.shared_reads.contains(&(callee, right))
+    }
+
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {
         self.ledger.borrow().clone()
     }
@@ -874,6 +1093,28 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         }
         _ => {}
     }
+    // R482-4(4). A static is a named global: distinct from another static,
+    // from this frame's stack and from a block allocated inside this body. A
+    // parameter's pointee may BE the static, so that pair is refused.
+    match (a, b) {
+        (RootClass::Static(x), RootClass::Static(y)) => {
+            return (x != y).then_some(CertificateKind::DistinctRoots);
+        }
+        (RootClass::Static(_), other) | (other, RootClass::Static(_)) => {
+            return match other {
+                RootClass::StackObject(_) => Some(CertificateKind::DistinctRoots),
+                RootClass::FreshAlloc(_, Freshness::Proven) => Some(CertificateKind::DistinctRoots),
+                RootClass::FreshAlloc(_, Freshness::Contract) => {
+                    Some(CertificateKind::DistinctRootsUnderContract)
+                }
+                RootClass::EntryStorage(_)
+                | RootClass::FreshField { .. }
+                | RootClass::Static(_)
+                | RootClass::Unknown => None,
+            };
+        }
+        _ => {}
+    }
     let (fresh, other) = if a.is_fresh_object() {
         (a, b)
     } else if b.is_fresh_object() {
@@ -882,7 +1123,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         return None;
     };
     match other {
-        RootClass::Unknown | RootClass::FreshField { .. } => None,
+        RootClass::Unknown | RootClass::FreshField { .. } | RootClass::Static(_) => None,
         RootClass::FreshAlloc(..) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
             (fresh.object_id() != other.object_id()).then(|| {
                 match fresh.freshness().join(other.freshness()) {
@@ -1088,6 +1329,10 @@ struct AllocatorOracle<'a> {
     /// a known allocator (R433-6(2)). Keyed by the struct's `DefId` and the
     /// field's name.
     allocator_fields: FxHashMap<(DefId, Symbol), Freshness>,
+    /// R482-4(3): callees whose EVERY return is null or a view of one formal,
+    /// with that formal's index. A call of one is a derivation of the argument
+    /// at that index.
+    views: FxHashMap<DefId, usize>,
     indirect_calls: Option<&'a [super::lifetime::MirCallTargetSite]>,
 }
 
@@ -1175,6 +1420,11 @@ pub(crate) struct ProbeRow {
     /// R478-5: why each side's root is `Unknown` (`known` when it is not).
     pub left_why: String,
     pub right_why: String,
+    /// R500-9: is this pair a model-shared READ/READ pair — both formals
+    /// `*const`, unwritten and never mutably reborrowed? The fact
+    /// `is_shared_read_pair` exposes, so the frame's read-read set can be
+    /// stated without reusing an older pair list.
+    pub shared_read: bool,
     pub outcome: String,
 }
 
@@ -1216,6 +1466,7 @@ impl PairDisjointnessIndex {
                     Freshness::Proven => format!("fresh-field:{field}"),
                     Freshness::Contract => format!("fresh-field-contract:{field}"),
                 },
+                RootClass::Static(_) => "static".to_owned(),
                 RootClass::Unknown => "unknown".to_owned(),
             }
         };
@@ -1278,7 +1529,7 @@ impl PairDisjointnessIndex {
                                 left.span,
                                 right.span,
                             )
-                            .map_or_else(|why| why.key().to_owned(), |kind| kind.key().to_owned());
+                            .map_or_else(|why| why.key().to_owned(), CertificateKind::receipt);
                         let stack_take = |class: RootClass| match class {
                             RootClass::StackObject(id) => {
                                 takes.get(&(caller_did, id)).copied().or(Some(0))
@@ -1304,6 +1555,8 @@ impl PairDisjointnessIndex {
                             right_param: index_of(caller_did, right.class),
                             left_why: left.why.key().to_owned(),
                             right_why: right.why.key().to_owned(),
+                            shared_read: self.shared_reads.contains(&(callee, left.index))
+                                && self.shared_reads.contains(&(callee, right.index)),
                             outcome,
                         });
                     }
@@ -1360,11 +1613,17 @@ fn allocator_wrappers<'a>(
     let mut oracle = AllocatorOracle {
         wrappers: FxHashMap::default(),
         allocator_fields: FxHashMap::default(),
+        views: FxHashMap::default(),
         indirect_calls,
     };
     loop {
-        let before = (oracle.wrappers.len(), oracle.allocator_fields.len());
+        let before = (
+            oracle.wrappers.len(),
+            oracle.allocator_fields.len(),
+            oracle.views.len(),
+        );
         oracle.allocator_fields = allocator_fn_pointer_fields(tcx, functions, &oracle);
+        oracle.views = view_of_formal(tcx, functions, &oracle);
         for &function in functions {
             if oracle.wrappers.contains_key(&function.to_def_id()) {
                 continue;
@@ -1390,7 +1649,7 @@ fn allocator_wrappers<'a>(
                 continue;
             }
             let typeck = tcx.typeck(function);
-            let (classes, _why) = classify_locals(tcx, typeck, body, &oracle, function);
+            let (classes, _why, _prefixes) = classify_locals(tcx, typeck, body, &oracle, function);
             // Every returned value must be fresh; the wrapper is only as
             // strong as its weakest return, so one contract-backed return
             // makes the wrapper contract-backed.
@@ -1422,7 +1681,12 @@ fn allocator_wrappers<'a>(
                 oracle.wrappers.insert(function.to_def_id(), freshness);
             }
         }
-        if (oracle.wrappers.len(), oracle.allocator_fields.len()) == before {
+        if (
+            oracle.wrappers.len(),
+            oracle.allocator_fields.len(),
+            oracle.views.len(),
+        ) == before
+        {
             return oracle;
         }
     }
@@ -1544,6 +1808,86 @@ fn data_field_key<'tcx>(
         .find(|candidate| candidate.name == field)?
         .ty(tcx, args);
     matches!(declared.kind(), ty::RawPtr(..)).then_some((def.did(), field))
+}
+
+/// R482-4(3): the callees whose EVERY return is the null literal or a view of
+/// ONE formal — `return p` where `p` only ever walks within the storage it
+/// entered with. A call of such a callee hands back its argument's object, so
+/// the caller's local keeps that argument's root instead of going `Unknown`.
+///
+/// Computed to a fixpoint with the allocator wrappers, because a view can be
+/// built out of another: binn's `SearchForKey` is a view of its formal 0 only
+/// once `AdvanceDataPos` is known to be one. A callee still unknown on this
+/// round simply contributes no view, so the map only grows and the outer loop
+/// terminates.
+fn view_of_formal(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    oracle: &AllocatorOracle<'_>,
+) -> FxHashMap<DefId, usize> {
+    let mut views = FxHashMap::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let output = tcx.fn_sig(function).skip_binder().skip_binder().output();
+        if !matches!(output.kind(), ty::RawPtr(..)) {
+            continue;
+        }
+        let body = tcx.hir_body(body_id);
+        let mut returns = ReturnCollector {
+            returns: Vec::new(),
+        };
+        returns.visit_body(body);
+        if let ExprKind::Block(block, _) = &body.value.kind
+            && let Some(tail) = block.expr
+        {
+            returns.returns.push(tail);
+        }
+        if returns.returns.is_empty() {
+            continue;
+        }
+        let params: Vec<HirId> = body
+            .params
+            .iter()
+            .filter_map(|param| match param.pat.kind {
+                PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                _ => None,
+            })
+            .collect();
+        let typeck = tcx.typeck(function);
+        let (classes, _why, _prefixes) = classify_locals(tcx, typeck, body, oracle, function);
+        let mut index = None;
+        let mut every = true;
+        for expr in &returns.returns {
+            if is_null_literal(expr) {
+                continue;
+            }
+            // `EntryStorage(h)` is exactly "the storage this parameter entered
+            // with": a fresh allocation, a stack object or an unknown root all
+            // fail here, and so does a second formal.
+            let (class, _) = argument_provenance(tcx, typeck, &classes, expr);
+            let Some(position) = (match class {
+                RootClass::EntryStorage(h) => params.iter().position(|p| *p == h),
+                _ => None,
+            }) else {
+                every = false;
+                break;
+            };
+            match index {
+                None => index = Some(position),
+                Some(seen) if seen == position => {}
+                Some(_) => {
+                    every = false;
+                    break;
+                }
+            }
+        }
+        if let Some(position) = index.filter(|_| every) {
+            views.insert(function.to_def_id(), position);
+        }
+    }
+    views
 }
 
 /// R479-4a: the pointer fields every one of whose stores in the program is a
@@ -1861,6 +2205,11 @@ struct LocalFacts {
     /// One tag per `AssignKind::Other` source, in order: what the RHS was.
     /// Probe-only (R478-5); no rule reads it.
     other_shapes: Vec<&'static str>,
+    /// R513-3: the place this binding's `let` INITIALIZER took the address of
+    /// (`let br = &mut (*s).br` -> `(*s).br`). Only the initializer sets it, so
+    /// a binding with exactly one assignment has no window in which it holds
+    /// anything else; `prefixes` below applies the other two conjuncts.
+    view_prefix: Option<PlacePath>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1933,7 +2282,11 @@ fn classify_locals<'tcx>(
     body: &'tcx rustc_hir::Body<'tcx>,
     allocators: &AllocatorOracle<'_>,
     function: LocalDefId,
-) -> (FxHashMap<HirId, RootClass>, FxHashMap<HirId, UnknownWhy>) {
+) -> (
+    FxHashMap<HirId, RootClass>,
+    FxHashMap<HirId, UnknownWhy>,
+    FxHashMap<HirId, PlacePath>,
+) {
     let mut facts: FxHashMap<HirId, LocalFacts> = FxHashMap::default();
     for param in body.params {
         if let PatKind::Binding(_, hir_id, ..) = param.pat.kind {
@@ -1946,6 +2299,7 @@ fn classify_locals<'tcx>(
                     assignments: Vec::new(),
                     address_taken: false,
                     other_shapes: Vec::new(),
+                    view_prefix: None,
                 },
             );
         }
@@ -2056,6 +2410,29 @@ fn classify_locals<'tcx>(
     let why = facts
         .iter()
         .map(|(&hir_id, fact)| {
+            #[cfg(test)]
+            if std::env::var_os("W6P_DUMP_MIXED").is_some()
+                && classes.get(&hir_id).copied() == Some(RootClass::Unknown)
+                && fact.is_pointer
+                && !fact.address_taken
+            {
+                let kinds: Vec<&str> = fact
+                    .assignments
+                    .iter()
+                    .map(|kind| match kind {
+                        AssignKind::Null => "null",
+                        AssignKind::Allocator(_) => "alloc",
+                        AssignKind::Derived(_) => "derived",
+                        AssignKind::Other => "other",
+                    })
+                    .collect();
+                println!(
+                    "W6P_MIXED\t{}\t{}\t{}",
+                    kinds.join(","),
+                    fact.other_shapes.join(","),
+                    if fact.is_param { "param" } else { "local" }
+                );
+            }
             let why = if classes.get(&hir_id).copied() != Some(RootClass::Unknown) {
                 UnknownWhy::Known
             } else if fact.address_taken {
@@ -2076,7 +2453,44 @@ fn classify_locals<'tcx>(
             (hir_id, why)
         })
         .collect();
-    (classes, why)
+
+    // R513-3, the three conjuncts. A binding whose `let` initializer took the
+    // address of a place (1) IS that place for its whole live range provided
+    // (2) nothing else is ever assigned to it and (3) its own address is never
+    // taken, so no callee can retarget it. Then a path through its pointee is a
+    // path through the place, and folding the prefix back in restores the field
+    // projections the binding consumed. Parameters are excluded structurally:
+    // they have no `let`, so they never carry a prefix.
+    let prefixes: FxHashMap<HirId, PlacePath> = facts
+        .iter()
+        .filter(|(_, fact)| fact.assignments.len() == 1 && !fact.address_taken)
+        .filter_map(|(&hir_id, fact)| Some((hir_id, fact.view_prefix.clone()?)))
+        .collect();
+    (classes, why, prefixes)
+}
+
+/// R513-3. Replace a path rooted at a single-definition view local by the path
+/// it is a view OF: `*br` with `br = &mut (*s).br` is `(*s).br`. Only a path
+/// through the local's POINTEE folds — a path at the local's own slot names its
+/// storage, not the place it points at. Bounded, so a cycle cannot spin.
+fn fold_place_prefix(path: PlacePath, prefixes: &FxHashMap<HirId, PlacePath>) -> PlacePath {
+    let mut path = path;
+    for _ in 0..8 {
+        if !path.deref_root {
+            return path;
+        }
+        let Some(prefix) = prefixes.get(&path.root) else {
+            return path;
+        };
+        let mut projections = prefix.projections.clone();
+        projections.extend(path.projections);
+        path = PlacePath {
+            root: prefix.root,
+            deref_root: prefix.deref_root,
+            projections,
+        };
+    }
+    path
 }
 
 /// R478-5: what an unclassified RHS was, for the probe column only.
@@ -2086,6 +2500,14 @@ fn rhs_shape(rhs: &Expr<'_>) -> &'static str {
         ExprKind::MethodCall(..) => "method",
         ExprKind::Field(..) => "field",
         ExprKind::Index(..) => "index",
+        ExprKind::If(..) => "if",
+        ExprKind::Block(..) => "block",
+        ExprKind::Binary(..) => "binary",
+        ExprKind::Lit(..) => "literal",
+        ExprKind::Unary(..) => "unary",
+        ExprKind::Path(..) => "path",
+        ExprKind::AddrOf(..) => "addr-of",
+        ExprKind::Struct(..) => "struct",
         _ => "other",
     }
 }
@@ -2099,6 +2521,81 @@ struct LocalCollector<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
+    /// R513-3: the PLACE an initializer takes the address of. `&mut (*s).br`
+    /// and `&(*s).br` both give `(*s).br`; anything else gives nothing, so a
+    /// binding initialized from a call, a cast of an integer or another
+    /// pointer's VALUE records no prefix and folds nowhere.
+    fn address_of_place(&self, rhs: &Expr<'_>) -> Option<PlacePath> {
+        let ExprKind::AddrOf(BorrowKind::Ref, _, operand) = &peel_casts(rhs).kind else {
+            return None;
+        };
+        place_provenance(
+            self.tcx,
+            self.typeck,
+            &FxHashMap::default(),
+            peel_casts(operand),
+        )
+        .1
+    }
+
+    /// R482-4(3): the root binding of the argument a view-of-formal call hands
+    /// back.
+    fn view_call_base(&self, rhs: &Expr<'_>) -> Option<HirId> {
+        let ExprKind::Call(callee, args) = &peel_casts(rhs).kind else {
+            return None;
+        };
+        let did = callee_def_id(callee)?;
+        let index = *self.allocators.views.get(&did)?;
+        derivation_base(self.typeck, args.get(index)?)
+    }
+
+    /// R485-4(e): every arm of a conditional allocates or is null, and at
+    /// least one allocates. Mirrors the allocator-field admission's walk; a
+    /// conditional is only as strong as its weakest allocating arm.
+    ///
+    /// `None` refuses. `Some(None)` is an arm that allocates nothing and names
+    /// nothing — the null literal. `Some(Some(f))` is an allocation.
+    fn conditional_allocator_arm(&self, value: &Expr<'_>) -> Option<Option<Freshness>> {
+        let value = peel_casts(value);
+        match &value.kind {
+            ExprKind::If(_, then, els) => {
+                let els = (*els)?;
+                match (
+                    self.conditional_allocator_arm(then)?,
+                    self.conditional_allocator_arm(els)?,
+                ) {
+                    (Some(a), Some(b)) => Some(Some(a.join(b))),
+                    (found, None) | (None, found) => Some(found),
+                }
+            }
+            ExprKind::Block(block, _) => {
+                if !block.stmts.is_empty() {
+                    return None;
+                }
+                self.conditional_allocator_arm(block.expr?)
+            }
+            // The null check is at the LEAF, after the block descent: an arm
+            // written `else { 0 as *mut T }` is a block around a null literal,
+            // and checking it before descending refuses the whole conditional.
+            _ if is_null_literal(value) => Some(None),
+            _ => self
+                .allocators
+                .is_allocator_call(self.tcx, self.function, value)
+                .map(Some),
+        }
+    }
+
+    /// The conditional as a whole: admitted only when it is a CONDITIONAL (a
+    /// bare allocator call is already handled ahead of this) and at least one
+    /// arm allocates.
+    fn conditional_allocator(&self, value: &Expr<'_>) -> Option<Freshness> {
+        let value = peel_casts(value);
+        if !matches!(value.kind, ExprKind::If(..)) {
+            return None;
+        }
+        self.conditional_allocator_arm(value)?
+    }
+
     fn assign_kind(&self, rhs: &Expr<'_>) -> AssignKind {
         if is_null_literal(rhs) {
             AssignKind::Null
@@ -2107,11 +2604,207 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
                 .is_allocator_call(self.tcx, self.function, rhs)
         {
             AssignKind::Allocator(freshness)
+        } else if let Some(freshness) = self.conditional_allocator(rhs) {
+            // R485-4(e), the shape the corpus actually has: null or a block the
+            // allocator returned is one fresh object either way — the claim
+            // already ratified for the allocator FIELD at `f065993a2`.
+            AssignKind::Allocator(freshness)
+        } else if let Some(Some(base)) = conditional_base(self.typeck, rhs) {
+            // R485-4(e): every arm walks within one object, so the value does.
+            AssignKind::Derived(base)
+        } else if let Some(base) = self.view_call_base(rhs) {
+            // R482-4(3): the call hands back the argument's own object.
+            AssignKind::Derived(base)
         } else if let Some(base) = derivation_base(self.typeck, rhs) {
             AssignKind::Derived(base)
         } else {
             AssignKind::Other
         }
+    }
+}
+
+/// R485-4(e): the base of a CONDITIONAL store, if every arm derives from one.
+///
+/// `None` refuses the value. `Some(None)` is an arm that names no object — the
+/// null literal — which constrains nothing and lets its siblings govern, the
+/// same tolerance `classify_locals` already gives an `AssignKind::Null` beside
+/// a derivation. `Some(Some(base))` is one named object for the whole value.
+///
+/// An arm that allocates is deliberately refused: "a fresh block or a view of
+/// `base`" is two objects. That is the one place this walk differs from the
+/// allocator-field admission it is modelled on, whose claim is the weaker
+/// "null or fresh".
+fn conditional_base<'tcx>(typeck: &TypeckResults<'tcx>, value: &Expr<'_>) -> Option<Option<HirId>> {
+    let value = peel_casts(value);
+    #[cfg(test)]
+    if std::env::var_os("W6P_DUMP_COND").is_some()
+        && let ExprKind::If(_, then, els) = &value.kind
+    {
+        let arm = |e: &Expr<'_>| -> &'static str {
+            let e = peel_casts(e);
+            match &e.kind {
+                ExprKind::Block(b, _) if !b.stmts.is_empty() => "block-stmts",
+                ExprKind::Block(b, _) if b.expr.is_none() => "block-empty",
+                _ if is_null_literal(e) => "null",
+                ExprKind::Call(..) => "call",
+                ExprKind::Field(..) => "field",
+                ExprKind::Index(..) => "index",
+                ExprKind::If(..) => "if",
+                _ if derivation_base(typeck, e).is_some() => "derived",
+                _ => "other",
+            }
+        };
+        let inner = |e: &Expr<'_>| -> &'static str {
+            let e = peel_casts(e);
+            match &e.kind {
+                ExprKind::Block(b, _) if b.stmts.is_empty() => b.expr.map_or("block-empty", arm),
+                _ => arm(e),
+            }
+        };
+        println!(
+            "W6P_COND\t{}\t{}",
+            inner(then),
+            els.map_or("no-else", inner)
+        );
+    }
+    match &value.kind {
+        ExprKind::If(_, then, els) => {
+            // An `if` with no `else` leaves the local holding whatever it held
+            // before, which this walk cannot see.
+            let els = (*els)?;
+            let then = conditional_base(typeck, then)?;
+            let els = conditional_base(typeck, els)?;
+            match (then, els) {
+                (Some(a), Some(b)) if a == b => Some(Some(a)),
+                (Some(_), Some(_)) => None,
+                (found, None) | (None, found) => Some(found),
+            }
+        }
+        ExprKind::Block(block, _) => {
+            if !block.stmts.is_empty() {
+                return None;
+            }
+            conditional_base(typeck, block.expr?)
+        }
+        _ if is_null_literal(value) => Some(None),
+        _ => derivation_base(typeck, value).map(Some),
+    }
+}
+
+/// R492-3, guard (2): the formals a callee's own body takes a MUTABLE view of,
+/// however little it then does with it — `&mut *p`, `p.as_mut_ptr()`, a cast to
+/// `*mut`, or any `&mut` derivation rooted at the formal. The mutability
+/// analysis answers "is anything written through this"; this answers "does a
+/// mutable view of it exist at all", which is the question `&T` beside `&T`
+/// actually needs, and one such view anywhere kills the licence for every pair
+/// the formal is in.
+fn mutably_reborrowed_formals(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+) -> FxHashSet<(LocalDefId, usize)> {
+    let mut out = FxHashSet::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let params: Vec<HirId> = body
+            .params
+            .iter()
+            .filter_map(|param| match param.pat.kind {
+                PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                _ => None,
+            })
+            .collect();
+        let mut visitor = MutableReborrows {
+            typeck: tcx.typeck(function),
+            params: &params,
+            function,
+            out: &mut out,
+        };
+        visitor.visit_body(body);
+    }
+    out
+}
+
+struct MutableReborrows<'a, 'tcx> {
+    typeck: &'a TypeckResults<'tcx>,
+    params: &'a [HirId],
+    function: LocalDefId,
+    out: &'a mut FxHashSet<(LocalDefId, usize)>,
+}
+
+impl MutableReborrows<'_, '_> {
+    fn mark(&mut self, expr: &Expr<'_>) {
+        // Walk the derivation back to a binding: `(*p).f`, `p.offset(k)` and a
+        // cast all address the same object as `p`.
+        if let Some(base) = derivation_base(self.typeck, expr)
+            && let Some(index) = self.params.iter().position(|p| *p == base)
+        {
+            self.out.insert((self.function, index));
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for MutableReborrows<'_, 'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            ExprKind::AddrOf(_, rustc_middle::mir::Mutability::Mut, operand) => {
+                self.mark(peel_casts(operand));
+            }
+            ExprKind::MethodCall(segment, receiver, _, _)
+                if segment.ident.name.as_str() == "as_mut_ptr" =>
+            {
+                self.mark(peel_casts(receiver));
+            }
+            // A cast that turns a shared raw pointer into a mutable one is a
+            // mutable view even though nothing is written through it yet.
+            ExprKind::Cast(inner, _)
+                if matches!(
+                    self.typeck.expr_ty(expr).kind(),
+                    ty::RawPtr(_, rustc_middle::mir::Mutability::Mut)
+                ) =>
+            {
+                self.mark(peel_casts(inner));
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// R493-3: a side of a `root-is-not-a-caller-formal` decline, tagged with
+/// whether THIS side is the one `formal_of` refused.
+#[cfg(test)]
+fn describe_side(resolved: Option<usize>, class: RootClass) -> String {
+    format!(
+        "{}{}",
+        describe_class(class),
+        if resolved.is_some() { "" } else { "-FAILED" }
+    )
+}
+
+/// R492-3, for the decline table only.
+#[cfg(test)]
+fn describe_class(class: RootClass) -> &'static str {
+    match class {
+        RootClass::FreshAlloc(..) => "fresh",
+        RootClass::StackObject(_) => "stack",
+        RootClass::EntryStorage(_) => "entry-but-not-a-formal",
+        RootClass::FreshField { .. } => "fresh-field",
+        RootClass::Static(_) => "static",
+        RootClass::Unknown => "unknown",
+    }
+}
+
+/// R482-4(4): the `DefId` of a `static` item named by a path.
+fn resolved_static(expr: &Expr<'_>) -> Option<DefId> {
+    let ExprKind::Path(QPath::Resolved(_, path)) = &peel_casts(expr).kind else {
+        return None;
+    };
+    match path.res {
+        Res::Def(rustc_hir::def::DefKind::Static { .. }, did) => Some(did),
+        _ => None,
     }
 }
 
@@ -2137,6 +2830,7 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                 assignments: Vec::new(),
                 address_taken: false,
                 other_shapes: Vec::new(),
+                view_prefix: None,
             };
             if let Some(init) = local.init {
                 let kind = self.assign_kind(init);
@@ -2144,6 +2838,7 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                     fact.other_shapes.push(rhs_shape(init));
                 }
                 fact.assignments.push(kind);
+                fact.view_prefix = self.address_of_place(init);
             }
             self.facts.insert(hir_id, fact);
         }
@@ -2193,6 +2888,8 @@ struct CallCollector<'a, 'tcx> {
     classes: &'a FxHashMap<HirId, RootClass>,
     fresh_fields: &'a FxHashMap<(DefId, Symbol), Freshness>,
     why: &'a FxHashMap<HirId, UnknownWhy>,
+    /// R513-3: the place each single-definition view local is a view OF.
+    prefixes: &'a FxHashMap<HirId, PlacePath>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -2229,7 +2926,10 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                         index,
                         span: arg.span,
                         class,
-                        place,
+                        // R513-3: restore the field projections the caller's
+                        // view locals consumed, so a pair written as two locals
+                        // reads as the two places it always was.
+                        place: place.map(|path| fold_place_prefix(path, self.prefixes)),
                         is_null: is_null_literal(arg),
                         why,
                         is_pointer: matches!(
@@ -2377,6 +3077,10 @@ fn pointer_value_provenance<'tcx>(
 ) -> (RootClass, Option<PlacePath>) {
     let expr = peel_casts(expr);
     match &expr.kind {
+        ExprKind::Path(..) if resolved_local(expr).is_none() => match resolved_static(expr) {
+            Some(did) => (RootClass::Static(did), None),
+            None => (RootClass::Unknown, None),
+        },
         ExprKind::Path(..) => match resolved_local(expr) {
             Some(binding) => {
                 let class = classes.get(&binding).copied().unwrap_or(RootClass::Unknown);
@@ -2484,7 +3188,12 @@ fn place_provenance<'tcx>(
             }
             ExprKind::Path(..) => {
                 let Some(binding) = resolved_local(cur) else {
-                    return (RootClass::Unknown, None);
+                    // A `static` is a named object of its own; it carries no
+                    // `PlacePath`, whose root is a binding.
+                    return match resolved_static(cur) {
+                        Some(did) => (RootClass::Static(did), None),
+                        None => (RootClass::Unknown, None),
+                    };
                 };
                 projections.reverse();
                 let class = match classes.get(&binding).copied() {
@@ -2560,6 +3269,43 @@ mod tests {
                 RootClass::Unknown
             ),
             None
+        );
+    }
+
+    /// R513-3. `fold_place_prefix` is exercised directly because its
+    /// `deref_root` guard is unreachable from a fixture: the only way to build
+    /// a path at a local's own SLOT is `&local`, which sets `address_taken` and
+    /// so keeps that local out of `prefixes` in the first place. The guard is
+    /// the second wall, and this is what holds it up.
+    #[test]
+    fn w6p_a_prefix_folds_through_a_pointee_and_never_through_a_slot() {
+        let local = HirId::make_owner(rustc_hir::def_id::CRATE_DEF_ID);
+        let base = HirId::make_owner(rustc_hir::def_id::LocalDefId {
+            local_def_index: rustc_hir::def_id::DefIndex::from_u32(1),
+        });
+        let path = |root, deref_root: bool, projections: &[&str]| PlacePath {
+            root,
+            deref_root,
+            projections: projections.iter().map(|p| Some((*p).to_owned())).collect(),
+        };
+        let mut prefixes = FxHashMap::default();
+        prefixes.insert(local, path(base, true, &["br"]));
+
+        // `*local` with `local = &mut (*base).br` IS `(*base).br`.
+        assert_eq!(
+            fold_place_prefix(path(local, true, &["bits"]), &prefixes),
+            path(base, true, &["br", "bits"])
+        );
+        // `local` itself is the binding's own storage, which is NOT the place
+        // it points at; folding here would name another object entirely.
+        assert_eq!(
+            fold_place_prefix(path(local, false, &[]), &prefixes),
+            path(local, false, &[])
+        );
+        // A root with no recorded prefix is left exactly as it came.
+        assert_eq!(
+            fold_place_prefix(path(base, true, &["br"]), &prefixes),
+            path(base, true, &["br"])
         );
     }
 

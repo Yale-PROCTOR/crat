@@ -105,8 +105,24 @@ fn compatible(tcx: TyCtxt<'_>, subject: &Subject, value: &CopyValue, decision: &
     }
 }
 
-/// Consult the ordinary ladder for the source parameter. Restricting sources
-/// to parameters makes this query acyclic; no copying-local chain is guessed.
+/// **A12 (relay 031) — a LOCAL source, one hop.** The rule admitted only
+/// parameters, to keep the query acyclic and to guess no copying-local chain.
+/// A local source keeps both properties when it is not ITSELF this shape:
+/// `copy_value(source).is_none()` bounds the walk at one step, so `decide_one`
+/// on the source returns without re-entering this rule. Measured at batch 16:
+/// heman `heman_ops_sobel::fresh13#271` copies a local already decided `slice`;
+/// brotli's four `base*` rows copy `ip`, whose own `ptr-comparison` refusal is
+/// slicecursor's A5 and not this family's to lift (report 031).
+fn admissible_source(tcx: TyCtxt<'_>, source: &Subject) -> bool {
+    match source.kind {
+        SubjectKind::Param { .. } => true,
+        SubjectKind::Local => copy_value(tcx, source).is_none(),
+        _ => false,
+    }
+}
+
+/// Consult the ordinary ladder for the source. Sources are a parameter or a
+/// non-copying local (`admissible_source`), which keeps this query acyclic.
 pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     if !ctx
         .family_policy
@@ -120,7 +136,7 @@ pub(super) fn permits(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
         .find(|source| {
             source.fn_did == subject.fn_did
                 && source.hir_id == value.source
-                && matches!(source.kind, SubjectKind::Param { .. })
+                && admissible_source(ctx.tcx, source)
         })
         .is_some_and(|source| compatible(ctx.tcx, subject, &value, &super::decide_one(ctx, source)))
 }
@@ -171,9 +187,7 @@ pub(super) fn complete(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut seam::
         else {
             continue;
         };
-        if !compatible(tcx, subject, &value, found)
-            || !matches!(source.kind, SubjectKind::Param { .. })
-        {
+        if !compatible(tcx, subject, &value, found) || !admissible_source(tcx, source) {
             continue;
         }
         // Subject-only withdrawal could otherwise restore a raw parent under
@@ -428,4 +442,25 @@ mod tests {
             assert!(!has_declaration(&table, &destination));
         });
     }
+}
+
+/// **The counted READ alias needs no declaration (relay 035; wave-6v 028 route
+/// (a)).** `let mut csrc = src as *const libc::c_uchar;` over a `*const c_void`
+/// parameter whose counted contract is active is not a copy this family has to
+/// type: the contract already rewrote the initializer and every use, so the
+/// emitted local IS the byte view (`let mut csrc = src.unwrap_or(&[]); … csrc =
+/// &csrc[1..];`). Its type comes from that initializer, so the receiver-form
+/// refusal must not degrade it for lacking a declaration it does not need.
+///
+/// Declaration-FREE, not veto-exempt: this only removes the refusal's claim on
+/// the subject; every arm below it still decides the form. wave-6v 028 measured
+/// what the exempting form costs — six of their witnesses turn red when the
+/// subject short-circuits those arms.
+pub(super) fn counted_alias_needs_no_declaration(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    // The relation is the CONTRACT's to state, not the initializer's to imply:
+    // report 035 measured three keys derived from this side and all three miss,
+    // because the contract that rewrites the local is not the one keyed on the
+    // parameter it casts. `counted_void_read::prove` records which local it
+    // rewrote (wave-6v's `Contract::alias`), and `alias_contract` resolves it.
+    super::counted_void::alias_contract(ctx, subject).is_some()
 }

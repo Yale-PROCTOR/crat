@@ -611,7 +611,7 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
             .licensed_lifts
             .lines()
             .skip(1)
-            .all(|row| row.contains("\tfallback\t")),
+            .all(|row| !row.contains("\tevidence\t")),
         "no evidence receipt may be issued here: {}",
         raw_boundary_artifacts.licensed_lifts
     );
@@ -1091,7 +1091,7 @@ fn ce_a02_a_dereference_beside_the_nul_position_keeps_the_fatness_hold() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -1723,7 +1723,7 @@ fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -1874,7 +1874,7 @@ fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2087,7 +2087,7 @@ fn w4l04_an_untyped_void_callee_licenses_nothing() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2108,7 +2108,7 @@ fn w4l05_a_width_write_licenses_no_evidence_receipt() {
         table
             .licensed_lifts
             .iter()
-            .filter(|lift| !lift.fallback)
+            .filter(|lift| !lift.fallback && lift.declined.is_none())
             .count()
     })
     .expect("the fixture yields a table");
@@ -2169,11 +2169,58 @@ fn w4l06_an_already_fat_caller_is_untouched() {
 /// **W4L-7 (control) — a use with no slice image refuses the lift.**
 #[test]
 fn w4l07_an_unsupported_use_refuses_the_lift() {
-    let receipts = table_of(W4_LIFT_UNSUPPORTED_USE, |table| table.licensed_lifts.len())
-        .expect("the fixture yields a table");
-    assert_eq!(receipts, 0, "a subject with no slice image is not lifted");
+    let lifted = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .filter(|lift| lift.declined.is_none())
+            .count()
+    })
+    .expect("the fixture yields a table");
+    assert_eq!(lifted, 0, "a subject with no slice image is not lifted");
     let source = emitted(W4_LIFT_UNSUPPORTED_USE);
     assert!(!source.contains("data: &[uint8_t]"), "{source}");
+}
+
+/// **W4L-10 (report 056) — a refusal says whether a WIDTH was waiting behind
+/// it.**
+///
+/// At batch 27 the exact arm's thirteen refusals were `caller-is-already-fat`
+/// ten times and `slice-use-unsupported` three, and nothing in the tables could
+/// say whether those rows had a licensed width one question deeper or would
+/// have failed there too. The two are different pieces of news — the first says
+/// a gate of mine is in the way, the second says the callee states nothing —
+/// and a column that cannot tell them apart is an aim nobody can act on.
+///
+/// The unsupported-use fixture is the cheap case: its callee IS
+/// `BrotliUnalignedRead32`, so a width of 4 is licensed and only the use blocks
+/// the lift.
+#[test]
+fn w4l10_a_refusal_says_whether_a_width_was_waiting() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let unlicensed = rows
+        .iter()
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Unlicensed(_))
+            )
+        })
+        .unwrap_or_else(|| panic!("the exact arm's refusal must be receipted: {rows:?}"));
+    assert_eq!(
+        unlicensed.1,
+        Some(super::decision::licensed_lift::Refusal::Unlicensed(
+            "slice-use-unsupported-with-a-licensed-width"
+        )),
+        "the callee licenses 4 here; only the use blocks it: {rows:?}"
+    );
 }
 
 /// **W4L-8 — the lift reaches the CENSUS, not only the table.** relay 052 reads
@@ -2194,7 +2241,7 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     assert_eq!(
         lines.next(),
         Some(
-            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\treceipt"
+            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt"
         ),
         "{tsv}"
     );
@@ -2209,8 +2256,9 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
         columns[6], "evidence",
         "the exact arm, not the waiver: {tsv}"
     );
+    assert_eq!(columns[7], "-", "a lift has no blocking use: {tsv}");
     assert_eq!(
-        columns[7], "evidence(licensed-width:BrotliUnalignedRead32:0:4)",
+        columns[8], "evidence(licensed-width:BrotliUnalignedRead32:0:4)",
         "{tsv}"
     );
     assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
@@ -2287,6 +2335,238 @@ pub unsafe extern "C" fn StoreUnsized() {
 }
 "#;
 
+/// **brotli's ACTUAL root shape, minimised — the fixture report 049's C6
+/// predicts and dry27's links (1)+(2) will need.**
+///
+/// The corpus writes `let mut storage = 0 as *mut uint8_t;` and assigns the
+/// accessor's result on a later line (`lib.rs:177473` / `:177483`), because
+/// that is how C2Rust renders a C declaration followed by an assignment. The
+/// accessor itself is the ensure-capacity shape: it grows `(*s).storage_` to
+/// `size` and records the new size in `(*s).storage_size_` before returning the
+/// field.
+///
+/// Nothing here is a build. The fixture exists to make the census's shape
+/// column predictable IN PROCESS, so the claim "the walk reads the `let`
+/// initializer and never sees the call" is tested by the analysis rather than
+/// by my reading of `construction.rs`.
+const W4_B1_DECLARED_NULL_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn GetStorage(mut s: *mut EncoderState, mut size: size_t) -> *mut uint8_t {
+    if (*s).storage_size_ < size {
+        (*s).storage_ =
+            malloc(size.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64)
+                as *mut uint8_t;
+        (*s).storage_size_ = size;
+    }
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreDeclaredNull(mut s: *mut EncoderState, mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = GetStorage(s, n);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **dry27 link (1) — the corpus's declaration-then-assignment shape over an
+/// allocation the walk can already read.**
+///
+/// The same `let mut storage = 0 as *mut uint8_t;` C2Rust writes for a C
+/// declaration, with the allocation on a later line instead of the accessor.
+/// The extent is evidence the walk already knows how to recover
+/// (`allocation-byte-count`); what stops it is only that `by_binding` is keyed
+/// on the initializer, which is the null literal.
+const W4_B1_DECLARED_NULL_ALLOCATION: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreDeclaredThenAllocated(mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage =
+        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **Link (1) composed with the sibling arm.** The same declaration-then-
+/// assignment shape, with the assignment reading the field directly. The walk
+/// must follow the assignment AND then find the sibling that records its size —
+/// which is the whole point of reading the assignment rather than the
+/// declaration.
+const W4_B1_DECLARED_NULL_FIELD: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreInnerDeclared(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreDeclaredThenField(mut s: *mut EncoderState) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = (*s).storage_;
+    StoreInnerDeclared(&mut pos, storage);
+}
+"#;
+
+/// **The element-type fallback's own control.** The same declaration-then-
+/// assignment shape at a STRUCT pointee, with a `_count` sibling the byte rule
+/// would otherwise allow. rustc prints the pointee as a bare path that need not
+/// name the same type in the emitted crate, so the fallback takes primitives
+/// only and this root states nothing.
+const W4_B1_DECLARED_NULL_STRUCT_ELEMENT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Node {
+    pub weight: size_t,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Forest {
+    pub nodes_count_: size_t,
+    pub nodes_: *mut Node,
+}
+unsafe extern "C" fn TouchNode(mut pos: *mut size_t, mut nodes: *mut Node) {
+    let mut n: *mut Node = &mut *nodes.offset((*pos >> 3 as i32) as isize) as *mut Node;
+    (*n).weight = 1 as size_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn WalkForest(mut f: *mut Forest) {
+    let mut nodes = 0 as *mut Node;
+    let mut pos: size_t = 0 as size_t;
+    nodes = (*f).nodes_;
+    TouchNode(&mut pos, nodes);
+}
+"#;
+
+/// **The accessor rule's own control: a PLAIN getter states nothing.** Same
+/// struct, same field, same sibling — and the callee only reads the field back.
+/// Nothing here maintains the pair, so the extent claim has no proof and the
+/// root stays held.
+const W4_B1_PLAIN_GETTER_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn PeekStorage(mut s: *mut EncoderState) -> *mut uint8_t {
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromGetter(mut s: *mut EncoderState) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = PeekStorage(s);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **The unsound shape the sibling check exists for.** An accessor that
+/// reallocates the field and does NOT record the new size: at the return the
+/// sibling names the OLD capacity, which may be larger than the buffer. Reading
+/// it as the extent would claim memory that is not there — so the rule must
+/// refuse this even though the field is maintained and the names line up.
+const W4_B1_UNRECORDED_GROWTH_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn GrowStorage(mut s: *mut EncoderState, mut size: size_t) -> *mut uint8_t {
+    (*s).storage_ =
+        malloc(size.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64)
+            as *mut uint8_t;
+    return (*s).storage_;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromUnrecorded(mut s: *mut EncoderState, mut n: size_t) {
+    let mut storage = 0 as *mut uint8_t;
+    let mut pos: size_t = 0 as size_t;
+    storage = GrowStorage(s, n);
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **A held PARAMETER whose caller's root states nothing** — the shape the
+/// census column exists to describe, and could not until report 055.
+const W4_B1_PARAM_OVER_OPAQUE_ROOT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+extern "C" {
+    fn GetBuffer() -> *mut uint8_t;
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreMiddle(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreOpaqueOuter() {
+    let mut buffer: *mut uint8_t = GetBuffer();
+    let mut pos: size_t = 0 as size_t;
+    StoreMiddle(&mut pos, buffer);
+}
+"#;
+
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -2303,6 +2583,467 @@ fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
             .collect::<Vec<_>>()
     })
     .expect("the fixture yields a table")
+}
+
+/// **R499-2 — brotli's `storage_` shape, minimised.** The root is a FIELD read
+/// (`(*s).storage_`) and the struct records its size one field along
+/// (`storage_size_`), exactly as `GetBrotliStorage` maintains it. The caller's
+/// local takes that extent, and — the parameter half — `BrotliWriteBits`'s own
+/// parameter lifts because its one call site now hands it a root that states
+/// one.
+const W4_B1_SIBLING_SIZE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct EncoderState {
+    pub storage_size_: size_t,
+    pub storage_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+unsafe extern "C" fn StoreInner(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+pub unsafe extern "C" fn StoreFromField(mut s: *mut EncoderState) {
+    let mut storage: *mut uint8_t = (*s).storage_;
+    let mut pos: size_t = 0 as size_t;
+    StoreInner(&mut pos, storage);
+}
+"#;
+
+/// **The control the ruling names: a field root with NO size-named sibling.**
+///
+/// brotli's own `RingBuffer` is the shape — two pointer fields beside `size_`,
+/// with `buffer_` an interior pointer into `data_` — so a struct-level size
+/// states the wrong extent for it and the arm must refuse. The row stays held
+/// and keeps `none:place-read`.
+const W4_B1_NO_SIBLING_SIZE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct RingBuffer {
+    pub size_: size_t,
+    pub data_: *mut uint8_t,
+    pub buffer_: *mut uint8_t,
+}
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreFromRing(mut r: *mut RingBuffer) {
+    let mut storage: *mut uint8_t = (*r).buffer_;
+    let mut pos: size_t = 0 as size_t;
+    BrotliWriteBits(&mut pos, storage);
+}
+"#;
+
+/// **The byte-count control.** The same shape at a WIDER element type: a
+/// `<f>_size` sibling in C names bytes, and reading it as an element count
+/// would claim `size_of::<T>()` times too much. The arm refuses.
+const W4_B1_SIBLING_SIZE_WIDE_ELEMENT: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint32_t = u32;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TableState {
+    pub table_size_: size_t,
+    pub table_: *mut uint32_t,
+}
+unsafe extern "C" fn WriteWord(mut pos: *mut size_t, mut array: *mut uint32_t) {
+    let mut p: *mut uint32_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint32_t;
+    *p = 1 as uint32_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+pub unsafe extern "C" fn StoreWide(mut s: *mut TableState) {
+    let mut table: *mut uint32_t = (*s).table_;
+    let mut pos: size_t = 0 as size_t;
+    WriteWord(&mut pos, table);
+}
+"#;
+
+/// **W4B1-5 (R499-2) — a field root takes its SIBLING's size, and the
+/// parameter one hop along takes it with him.**
+///
+/// This is B1's parameter-emission half on the shape the seat expects to
+/// dominate brotli's `caller-root-states-no-extent` rows. Two claims, and the
+/// second is the half that is new: the caller's local lifts on evidence the
+/// walk could always have read but never asked for, and the CALLEE's parameter
+/// lifts because every one of its call sites now hands it a root that states an
+/// extent.
+#[test]
+fn w4b105_a_field_root_takes_its_sibling_size() {
+    let rows = b1_rows(W4_B1_SIBLING_SIZE);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromField::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromField::storage row: {rows:?}"));
+    assert_eq!(local.1, "lifted", "{rows:?}");
+    assert_eq!(
+        local.2, "sibling-size:storage_:storage_size_",
+        "the extent is the sibling's, and the receipt names both fields: {rows:?}"
+    );
+    // **The parameter half, and the wall it actually meets — measured, not
+    // assumed.** With the sibling extent in place the call site DOES state one,
+    // so the parameter clears the root test it used to fail
+    // (`caller-root-states-no-extent` becomes `every-caller-states-an-extent`).
+    // It is then held one step later, by its OWN use: `BrotliWriteBits(pos,
+    // storage)` is an argument to a local callee that is still raw, and
+    // `slice_uses` is a pre-decision fact, so nothing this pass does can make
+    // that use renderable. The chain therefore lifts bottom-up or not at all —
+    // which is a different wall from the one the build was aimed at, and is
+    // recorded here as the next question rather than asserted away.
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreInner::storage"))
+        .unwrap_or_else(|| panic!("no StoreInner::storage row: {rows:?}"));
+    assert_eq!(
+        parameter.2, "every-caller-states-an-extent",
+        "the root test now passes at the parameter: {rows:?}"
+    );
+    assert_eq!(
+        parameter.3, "slice-use-unsupported",
+        "and the remaining blocker is the use side: {rows:?}"
+    );
+}
+
+/// **W4B1-6 (control) — a field root with no size-named sibling stays held.**
+#[test]
+fn w4b106_a_field_root_without_a_sibling_size_stays_held() {
+    let rows = b1_rows(W4_B1_NO_SIBLING_SIZE);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromRing::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromRing::storage row: {rows:?}"));
+    assert_eq!(local.1, "held", "{rows:?}");
+    assert_eq!(
+        local.2, "none:place-read",
+        "a struct-level `size_` is NOT this field's extent: {rows:?}"
+    );
+}
+
+/// **W4B1-7 (control) — a `_size` sibling at a wider element type is refused.**
+#[test]
+fn w4b107_a_size_sibling_is_refused_at_a_wider_element() {
+    let rows = b1_rows(W4_B1_SIBLING_SIZE_WIDE_ELEMENT);
+    let local = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreWide::table"))
+        .unwrap_or_else(|| panic!("no StoreWide::table row: {rows:?}"));
+    assert_eq!(
+        local.1, "held",
+        "a `_size` sibling may count BYTES: {rows:?}"
+    );
+    assert_eq!(local.2, "none:place-read", "{rows:?}");
+}
+
+/// **W4B1-8 (report 051) — the walk follows the ASSIGNMENT, and brotli's shape
+/// arrives at the accessor call.**
+///
+/// This witness was written before the rule, to score report 049's C6 in
+/// process: it asserted `none:null-lit`, passed, and so established that the
+/// walk stopped at the `let` initializer — which is the whole reason dry27's
+/// link (1) exists. **Its premise is now the repair**, so it asserts where the
+/// walk arrives instead: the accessor call the corpus actually assigns.
+///
+/// **Its premise has now moved twice, each time by the rule it was written to
+/// aim.** It first asserted `none:null-lit` (the walk stopped at the `let`);
+/// link (1) made that `none:call-result` (the walk reads the assignment); link
+/// (2)(i) makes it `sibling-size:storage_:storage_size_` and a LIFT (the
+/// accessor states the extent of what it returns). A census read must keep the
+/// frames apart: batch 26 predates all of it and still shows `none:null-lit`.
+#[test]
+fn w4b108_the_accessor_states_the_extent_of_what_it_returns() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreDeclaredNull::storage"))
+        .unwrap_or_else(|| panic!("no StoreDeclaredNull::storage row: {rows:?}"));
+    assert_eq!(
+        storage.1, "lifted",
+        "link (2)(i): the accessor states the extent of what it returns: {rows:?}"
+    );
+    assert_eq!(
+        storage.2, "sibling-size:storage_:storage_size_",
+        "read at the CALLER, from its own argument: {rows:?}"
+    );
+    // **The whole shape, emitted.** This is brotli's `storage` root end to end:
+    // the binding holds nothing until its assignment, the assignment builds the
+    // slice from the accessor's result with the sibling the accessor maintains,
+    // and the callee indexes a checked slice.
+    let source = emitted(W4_B1_DECLARED_NULL_ROOT);
+    assert!(
+        source.contains("let mut storage: &mut [u8] = &mut [];"),
+        "{source}"
+    );
+    assert!(
+        source.contains("core::slice::from_raw_parts_mut(GetStorage(s, n),"),
+        "{source}"
+    );
+    assert!(source.contains("((*s).storage_size_) as usize"), "{source}");
+}
+
+/// **W4B1-9 (dry27 link (1)) — a null-declared local takes the construction of
+/// its SOLE later assignment, and the evidence arms then apply to it.**
+///
+/// C2Rust renders a C declaration followed by an assignment as `let mut p = 0
+/// as *mut T;` with the store on a later line, and `ConstructionFacts::by_binding`
+/// is keyed on the initializer — so the walk read `null-lit` and never the
+/// construction. W4B1-8 measured exactly that before the repair. The rule is
+/// confined to the root WALK: `by_binding` itself is unchanged, since it is the
+/// S3.2′ measurement substrate and feeds Box sizing, forecasts and receipts
+/// that have nothing to do with extents.
+///
+/// **Why a use before the assignment is not a hazard** (user ruling §28,
+/// 2026-08-23): the binding holds NULL until then, so a dereferencing use
+/// before it is a null dereference — a bug in the INPUT program, on which crat
+/// owes no soundness. The rule needs no dominance proof; it needs the
+/// assignment to be the only one.
+#[test]
+fn w4b109_a_null_declared_local_takes_its_sole_assignment() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_FIELD);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreDeclaredThenField::storage"))
+        .unwrap_or_else(|| panic!("no StoreDeclaredThenField::storage row: {rows:?}"));
+    // **Column one — the root.** The walk followed the assignment, the element
+    // type came from rustc because the declaration spells none, and the sibling
+    // arm answered: this root STATES an extent where it used to state nothing.
+    assert_eq!(
+        storage.2, "sibling-size:storage_:storage_size_",
+        "the walk followed the assignment and the sibling arm answered it: {rows:?}"
+    );
+    // **Column two — and the row is still held, by the USE side.** The
+    // assignment `storage = (*s).storage_;` is itself a use of the binding with
+    // no slice image, and `slice_uses` is a pre-decision fact. So this shape
+    // carries report 049's C4 wall inside it: the extent is now known and the
+    // row cannot yet take the form. Recorded, not asserted away — the residue
+    // moves from "no extent" to "an extent this build cannot carry", which is
+    // precisely the distinction B1's two columns exist to keep.
+    assert_eq!(
+        storage.1, "lifted",
+        "main 071c (a): the assignment is the construction, so the root's own \
+         initializer no longer holds it: {rows:?}"
+    );
+    // **And it must EMIT, not merely decide.** The first wiring of the
+    // admission produced two defects at once and both are pinned here: a
+    // declaration rendered `from_raw_parts_mut(0 as *mut T, 1024)` — a slice on
+    // a NULL base, instant UB of a kind §77 does not waive — and an assignment
+    // left as a raw pointer on the right of a `&mut [T]` binding, an ill-typed
+    // crate. The empty slice is what the binding holds until the assignment,
+    // and the assignment carries the construction.
+    let source = emitted(W4_B1_DECLARED_NULL_FIELD);
+    assert!(
+        source.contains("let mut storage: &mut [u8] = &mut [];"),
+        "no slice may be built on a null base: {source}"
+    );
+    assert!(
+        source.contains("storage = core::slice::from_raw_parts_mut((*s).storage_,"),
+        "the assignment carries the construction: {source}"
+    );
+    assert!(
+        !source.contains("from_raw_parts_mut(0 as *mut uint8_t"),
+        "the null-base construction must be gone: {source}"
+    );
+    // The parameter one hop along still waits on ITS use: the argument's image
+    // at a callee that is still raw is wave-6s2's pass-on question, not this
+    // rule's, and main's answer does not reach it.
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreInnerDeclared::storage"))
+        .unwrap_or_else(|| panic!("no StoreInnerDeclared::storage row: {rows:?}"));
+    assert_eq!(
+        parameter.2, "every-caller-states-an-extent",
+        "and the parameter one hop along clears the root test: {rows:?}"
+    );
+}
+
+/// **W4B1-10 (control) — an ALLOCATION assigned to a null-declared local is not
+/// this walk's at all.**
+///
+/// Measured, not assumed: `let mut p = 0 as *mut u8; p = malloc(n * 1);` decides
+/// **`kind-raw`** — the model's own verdict on storing an allocation into a live
+/// binding — so it never reaches a root walk and the rule's market is the
+/// NON-allocating assignment (brotli's accessor call, a field read). The same
+/// measurement covers the sole-assignment refusal: a binding assigned twice is
+/// `kind-raw` too, which is why that refusal is belt-and-braces rather than
+/// witnessed, and why this control says so out loud.
+#[test]
+fn w4b110_an_allocation_assignment_is_the_ownership_family() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_ALLOCATION);
+    assert!(
+        !rows
+            .iter()
+            .any(|(subject, ..)| subject.starts_with("StoreDeclaredThenAllocated::storage")),
+        "the walk must not see it: {rows:?}"
+    );
+    let decisions = super::emit_tests::decisions_of(W4_B1_DECLARED_NULL_ALLOCATION);
+    let storage = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "storage" && !*is_param)
+        .unwrap_or_else(|| panic!("no storage subject: {decisions:#?}"));
+    assert_eq!(storage.2, "kind-raw", "{decisions:#?}");
+}
+
+/// **W4B1-11 (control) — the element-type fallback is primitives only.**
+///
+/// Without a spelling from the declaration, the type name comes from rustc, and
+/// a printed struct path is not guaranteed to resolve in the emitted crate — an
+/// extent expression that does not compile is worse than no extent. So a struct
+/// pointee gets no fallback and its root states nothing, even where the sibling
+/// is there to be read.
+#[test]
+fn w4b111_the_element_type_fallback_takes_primitives_only() {
+    let rows = b1_rows(W4_B1_DECLARED_NULL_STRUCT_ELEMENT);
+    let nodes = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("WalkForest::nodes"))
+        .unwrap_or_else(|| panic!("no WalkForest::nodes row: {rows:?}"));
+    assert_eq!(nodes.1, "held", "{rows:?}");
+    assert_eq!(
+        nodes.2, "none:place-read",
+        "no element type, so no sibling is read: {rows:?}"
+    );
+}
+
+/// **W4B1-12 (control) — a plain getter is not an ensure-capacity accessor.**
+///
+/// The soundness of link (2)(i) is the accessor's POST-CONDITION: it grew the
+/// field to `size` and recorded `size` in the sibling, so at the return the two
+/// agree. A callee that only hands the field back proves nothing about the
+/// sibling — the pair could have been broken by anyone — and the rule must
+/// refuse it even though the names line up perfectly.
+#[test]
+fn w4b112_a_plain_getter_states_no_extent() {
+    let rows = b1_rows(W4_B1_PLAIN_GETTER_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromGetter::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromGetter::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(
+        storage.2, "none:call-result",
+        "nothing in the callee maintains the pair: {rows:?}"
+    );
+}
+
+/// **W4B1-13 (control) — growth the accessor does not RECORD is not an
+/// extent.** The dangerous near-miss: the field is reallocated, the sibling is
+/// not updated, so at the return it names the old capacity. Only the
+/// sibling-assignment check refuses this one, and that is why it is separate
+/// from the field check W4B1-12 exercises.
+#[test]
+fn w4b113_unrecorded_growth_states_no_extent() {
+    let rows = b1_rows(W4_B1_UNRECORDED_GROWTH_ROOT);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreFromUnrecorded::storage"))
+        .unwrap_or_else(|| panic!("no StoreFromUnrecorded::storage row: {rows:?}"));
+    assert_eq!(storage.1, "held", "{rows:?}");
+    assert_eq!(
+        storage.2, "none:call-result",
+        "the sibling names the OLD capacity: {rows:?}"
+    );
+}
+
+/// **W4B1-14 (report 055) — a parameter's row reports its CALLERS' root
+/// shapes, because it has no construction of its own.**
+///
+/// Measured at batch 26 and it is why this exists: **every**
+/// `caller-root-states-no-extent` row in the corpus is a parameter, so the
+/// column read `none:no-construction` for all of them and answered nothing.
+/// Report 049's C6 was a claim about the roots the CALL SITES hand over, and
+/// that is what the column now names — counted, so one bad caller among five is
+/// visible rather than averaged away.
+#[test]
+fn w4b114_a_parameter_row_names_its_callers_roots() {
+    let rows = b1_rows(W4_B1_PARAM_OVER_OPAQUE_ROOT);
+    let parameter = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreMiddle::storage"))
+        .unwrap_or_else(|| panic!("no StoreMiddle::storage row: {rows:?}"));
+    assert_eq!(parameter.1, "held", "{rows:?}");
+    assert_eq!(parameter.3, "caller-root-states-no-extent", "{rows:?}");
+    assert_eq!(
+        parameter.2, "callers:call-resultx1",
+        "the shape belongs to the caller's root, not to the parameter: {rows:?}"
+    );
+}
+
+/// **W4B1-15 (report 057) — the admission reaches the CENSUS.**
+///
+/// Main's STOP 2 keeps the receipt pre-decision on `SliceUses` and has the
+/// census read filter delivered subjects — which presumes a census row, and
+/// there was none: at batch 28 the seat asked what the admission did to
+/// brotli's rows and no table could answer, because the receipt never left the
+/// use inventory. One row per admitted root, carrying the form the subject
+/// ended in so "does it fire, and do those rows deliver?" is a table read.
+#[test]
+fn w4b115_the_admission_is_a_census_row() {
+    let super::RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = super::rewrite_m1(W4_B1_DECLARED_NULL_FIELD)
+    else {
+        panic!("W4B1-15 must emit");
+    };
+    let tsv = &raw_boundary_artifacts.sized_assignments;
+    let mut lines = tsv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("owner_path\tsubject\tform\tfield\tsibling\tassignment_span\treceipt"),
+        "{tsv}"
+    );
+    let row = lines.next().expect("one admitted root");
+    let columns = row.split('\t').collect::<Vec<_>>();
+    assert!(
+        columns[1].starts_with("StoreDeclaredThenField::storage"),
+        "{tsv}"
+    );
+    assert_eq!(columns[3], "storage_", "{tsv}");
+    assert_eq!(columns[4], "storage_size_", "{tsv}");
+    assert_eq!(
+        columns[6], "sized-assignment:storage_:storage_size_",
+        "{tsv}"
+    );
+}
+
+/// **W4L-11 (report 058) — a slice-use refusal says WHAT the blocking use is.**
+///
+/// `slice-use-unsupported` was 85 of the corpus's 172 refusals at batch 28 —
+/// its widest wall by a distance — and main is being asked whether the
+/// sole-assignment admission should generalise. That is a question about which
+/// SHAPES are behind the wall: an assignment target is the shape the admission
+/// already answers, an argument at a local callee is answered by converting the
+/// callee, and a cast or a return is answered by neither. The reason alone
+/// cannot tell them apart, so the receipt now carries the shape.
+///
+/// The unsupported-use fixture blocks on `data as size_t`.
+#[test]
+fn w4l11_a_slice_use_refusal_names_the_shape() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.declined, lift.use_shape, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let refused = rows
+        .iter()
+        .find(|(declined, ..)| declined.is_some())
+        .unwrap_or_else(|| panic!("a refusal must be receipted: {rows:?}"));
+    assert_eq!(refused.1, Some("cast"), "{rows:?}");
+    assert!(refused.2.contains("slice-use-unsupported"), "{rows:?}");
+    assert!(refused.2.ends_with(":cast)"), "{rows:?}");
 }
 
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**
@@ -2366,7 +3107,13 @@ fn w4b103_the_residue_is_counted_with_its_reason() {
         .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
         .unwrap_or_else(|| panic!("no StoreUnsized::storage row: {rows:?}"));
     assert_eq!(storage.1, "held", "{rows:?}");
-    assert_eq!(storage.2, "none", "no extent to propagate: {rows:?}");
+    // The column now names the SHAPE the root has instead of an extent, so the
+    // next build is chosen on the distribution rather than on a guess: here an
+    // opaque `GetBuffer()` call result.
+    assert_eq!(
+        storage.2, "none:call-result",
+        "no extent to propagate: {rows:?}"
+    );
     assert_eq!(storage.3, "root-states-no-extent", "{rows:?}");
 }
 
@@ -2397,7 +3144,7 @@ fn w4w01_a_root_with_no_extent_is_lifted_under_the_waiver() {
     .expect("the fixture yields a table");
     let storage = lifts
         .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreUnsized::storage"))
+        .find(|(subject, fallback, _)| subject.starts_with("StoreUnsized::storage") && *fallback)
         .unwrap_or_else(|| panic!("the waiver must lift it: {lifts:?}"));
     assert!(
         storage.1,
@@ -2513,4 +3260,133 @@ fn w4w05_a_shared_subject_at_a_mut_foreign_position_is_refused() {
     );
     let source = emitted(W4_W_SHARED_AT_A_MUT_POSITION);
     assert!(!source.contains(".cast_mut()"), "{source}");
+}
+
+/// A parameter with no recorded call site: `pub` and never called in the crate.
+/// Its extent cannot be proven from callers, but that is a gap in what was
+/// OBSERVED, not a root that states nothing — R489-3(b) gives it its own
+/// outcome so Decision A's residue means what it says.
+const W4_B1_NO_CALL_SITE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
+    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
+    *p = 1 as uint8_t;
+    *pos = (*pos).wrapping_add(8 as size_t);
+}
+#[no_mangle]
+pub unsafe extern "C" fn StoreExported(mut pos: *mut size_t, mut storage: *mut uint8_t) {
+    BrotliWriteBits(pos, storage);
+}
+"#;
+
+/// **W4B1-4 (R489-3(b)) — unmeasured is not evidence-absent.**
+#[test]
+fn w4b104_a_parameter_with_no_call_site_is_unmeasured_not_held() {
+    let rows = b1_rows(W4_B1_NO_CALL_SITE);
+    let storage = rows
+        .iter()
+        .find(|(subject, ..)| subject.starts_with("StoreExported::storage"))
+        .unwrap_or_else(|| panic!("no StoreExported::storage row: {rows:?}"));
+    assert_eq!(storage.1, "unmeasured", "{rows:?}");
+    assert_eq!(storage.3, "no-call-site-read", "{rows:?}");
+    // And Decision A's residue — the rows whose ROOT states nothing — leaves it out.
+    assert!(
+        !rows.iter().any(
+            |(subject, outcome, ..)| subject.starts_with("StoreExported::storage")
+                && outcome == "held"
+        ),
+        "{rows:?}"
+    );
+}
+
+/// **W4W-6 (wave-4 report 047) — a refusal is a decision and carries its
+/// reason.** Until this column existed the waiver receipted only its lifts, so
+/// a census could say how many extents were fabricated but never why a held row
+/// was passed over — which is the question C5 asked of batch 24 and the
+/// artifacts could not answer. The unsupported-use fixture is the cheapest
+/// shape that reaches a refusal.
+#[test]
+fn w4w06_a_refused_row_carries_its_reason() {
+    let rows = table_of(W4_LIFT_UNSUPPORTED_USE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    // Re-premised by report 048: BOTH arms receipt their refusals now, so the
+    // waiver's row is selected by its arm rather than by being the only one.
+    let declined = rows
+        .iter()
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Declined(_))
+            )
+        })
+        .unwrap_or_else(|| panic!("the refusal must be receipted: {rows:?}"));
+    assert_eq!(
+        declined.1,
+        Some(super::decision::licensed_lift::Refusal::Declined(
+            "slice-use-unsupported"
+        )),
+        "{rows:?}"
+    );
+    assert!(declined.2.starts_with("declined(extent-lift:"), "{rows:?}");
+}
+
+/// **W4L-9 (wave-4 report 048, relay 064) — the EXACT arm receipts its
+/// refusals too, and says which question failed.**
+///
+/// C5 is the reason this exists. Two byte-identical brotli twins, one
+/// delivered and one held: the waiver's reason for the held one was recoverable
+/// from `295cf8b6a`, and the reason no WIDTH licensed it was not — so the
+/// artifacts could say the row was refused twice and never say by what. The
+/// arm's own ladder is four distinct questions (is the caller already fat, has
+/// it a slice image, is the callee parameter a decided slice IN THIS PASS, does
+/// its region state an exact read width) and a census must be able to tell them
+/// apart: "the callee states no width" and "the callee was not decided yet when
+/// this pass ran" are a fact about the program and a fact about pass ORDER
+/// respectively, and only the second is mine to fix.
+#[test]
+fn w4l09_the_exact_arm_receipts_why_no_width_licensed_a_row() {
+    let rows = table_of(W4_LIFT_WRITE, |table| {
+        table
+            .licensed_lifts
+            .iter()
+            .map(|lift| (lift.subject.clone(), lift.declined, lift.key()))
+            .collect::<Vec<_>>()
+    })
+    .expect("the fixture yields a table");
+    let unlicensed = rows
+        .iter()
+        .find(|(_, declined, _)| {
+            matches!(
+                declined,
+                Some(super::decision::licensed_lift::Refusal::Unlicensed(_))
+            )
+        })
+        .unwrap_or_else(|| panic!("the exact arm's refusal must be receipted: {rows:?}"));
+    // **Measured, not assumed.** The first draft of this witness asserted
+    // `region-is-not-a-width-read` and came back RED with
+    // `callee-parameter-not-yet-a-slice` — which is the more basic truth about
+    // this shape and the one worth pinning: a width-WRITE parameter is
+    // `kind-raw` (report 043), so it is never a decided slice and the arm stops
+    // one question earlier than the module's prose suggests. The shape refusal
+    // below it is stated in `callee_region` and is NOT witnessed here; saying so
+    // is cheaper than shaping a fixture whose write parameter delivers.
+    assert_eq!(
+        unlicensed.1,
+        Some(super::decision::licensed_lift::Refusal::Unlicensed(
+            "callee-parameter-not-yet-a-slice"
+        )),
+        "a width-write parameter is not a decided slice at all: {rows:?}"
+    );
+    assert!(
+        unlicensed.2.starts_with("unlicensed(licensed-width:"),
+        "{rows:?}"
+    );
 }

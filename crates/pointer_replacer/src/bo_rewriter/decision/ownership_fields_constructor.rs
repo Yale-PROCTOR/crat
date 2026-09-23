@@ -726,7 +726,7 @@ fn zero_value<'tcx>(
             for (index, field) in def.non_enum_variant().fields.iter().enumerate() {
                 let zero = match field_form(def.did(), index) {
                     Some(form) => delivered_zero(&form)?,
-                    None => zero_value(tcx, field.ty(tcx, args), pointer_bits, field_form)?.0,
+                    None => field_zero(tcx, field.ty(tcx, args), pointer_bits, field_form)?.0,
                 };
                 fields.push(format!("{}: {zero}", field.name));
             }
@@ -765,6 +765,81 @@ fn zero_value<'tcx>(
             Ok((literal, layout.size.bits()))
         }
         _ => numeric_zero(element, pointer_bits),
+    }
+}
+
+/// **R521-5 — the ONE synthesised literal.**
+///
+/// The return certificate carried its own `struct_initializer`, a second
+/// spelling that knew integers, floats, bools and raw pointers and refused
+/// everything else (`struct-field:<name>`), and that knew nothing of a field's
+/// DELIVERED form — which is why it also had to refuse, wholesale, any struct
+/// with a model-`Owning` field (`…:owned-field`): a raw zero written beside an
+/// `Option<Box<T>>` field is an `E0308`.
+///
+/// Both refusals are this family's question, so this is the entry that answers
+/// it once: the literal takes each field's delivered form where a transaction
+/// owns it (R457-4) and its type's zero where none does, and it is printed in
+/// the printer's own spelling so the use graft accepts it (R466-4).
+///
+/// `field_form` is the seam (`owning_field_form`): `(struct, field) ->` the
+/// delivered form key, or `None` where no transaction owns that field.
+pub(crate) fn struct_literal<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointee: Ty<'tcx>,
+    field_form: &dyn Fn(DefId, usize) -> Option<String>,
+) -> Result<String, SourceHold> {
+    let TyKind::Adt(def, _) = pointee.kind() else {
+        return Err(SourceHold::ConstructorShape);
+    };
+    if !def.is_struct() {
+        return Err(SourceHold::ConstructorShape);
+    }
+    let (literal, _) = zero_value(
+        tcx,
+        pointee,
+        tcx.data_layout.pointer_size.bits(),
+        field_form,
+    )?;
+    Ok(graft_canonical(literal))
+}
+
+/// **R521-5 — the zero of a struct FIELD.**
+///
+/// A field position admits two kinds an element position does not, and
+/// deliberately only there: the wall this answers is the struct literal's
+/// fields (`return-certificate-struct-field:<name>`), and widening the ELEMENT
+/// vocabulary would change which boxed slices this family constructs — a
+/// different question, with its own pins (`constructor_faults_reject_wrong_size
+/// _and_non_numeric_payload` keeps a `bool` ELEMENT held).
+///
+/// * `bool` zeroes to `false` — the spelling the certificate's own private
+///   initializer already used, carried over so merging the two definitions
+///   loses no case;
+/// * a c2rust nullable function pointer is `Option<fn(..)>` and its zero is
+///   `None` — the same null-is-`None` line R395-2 draws for a data pointer,
+///   and the reason quadtree's `quadtree_t` had no spellable literal
+///   (`struct-field:key_free`). `None` is the whole value, so the payload is
+///   never consulted; the arm admits only the pointer-sized layout (the
+///   null-pointer optimisation) and holds rather than guess a width.
+fn field_zero<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    field: Ty<'tcx>,
+    pointer_bits: u64,
+    field_form: &dyn Fn(DefId, usize) -> Option<String>,
+) -> Result<(String, u64), SourceHold> {
+    match field.kind() {
+        TyKind::Bool => Ok(("false".into(), 8)),
+        TyKind::Adt(def, _) if tcx.is_diagnostic_item(rustc_span::sym::Option, def.did()) => {
+            let layout = tcx
+                .layout_of(rustc_middle::ty::TypingEnv::fully_monomorphized().as_query_input(field))
+                .map_err(|_| SourceHold::ConstructorShape)?;
+            if layout.size.bits() != pointer_bits {
+                return Err(SourceHold::ConstructorShape);
+            }
+            Ok(("None".into(), pointer_bits))
+        }
+        _ => zero_value(tcx, field, pointer_bits, field_form),
     }
 }
 
@@ -1012,10 +1087,6 @@ mod tests {
                 "Plain",
             ),
             (
-                "#[repr(C)] #[derive(Copy,Clone)] pub struct Flag { pub a: bool }",
-                "Flag",
-            ),
-            (
                 "#[repr(C)] #[derive(Copy,Clone)] pub struct Refd { pub a: &'static u8 }",
                 "Refd",
             ),
@@ -1044,6 +1115,28 @@ mod tests {
                 "{declaration}"
             );
         }
+    }
+
+    /// **R521-5 re-premise.** `Flag { a: bool }` was in the list above: a
+    /// struct whose field this family could not zero. It can now — a FIELD
+    /// `bool` zeroes to `false`, which is the spelling the return
+    /// certificate's own private initializer already used and which merging
+    /// the two definitions must not lose. The element position is untouched:
+    /// `constructor_faults_reject_wrong_size_and_non_numeric_payload` still
+    /// holds a `bool` ELEMENT, and that pin is deliberately left standing.
+    #[test]
+    fn constructor_struct_zero_spells_a_bool_field() {
+        let (count, replacement, receipt) = inspect(
+            &format!(
+                "{C_ULONG_MALLOC} #[repr(C)] #[derive(Copy,Clone)] pub struct Flag {{ pub a: bool }}"
+            ),
+            "Flag",
+            "malloc(core::mem::size_of::<Flag>() as libc::c_ulong) as *mut Flag",
+        )
+        .expect("a bool field is zeroable");
+        assert!(replacement.contains("a: false"), "{replacement}");
+        assert_eq!(count, "1");
+        assert_eq!(receipt, "native-malloc-zero-numeric");
     }
 
     #[test]
