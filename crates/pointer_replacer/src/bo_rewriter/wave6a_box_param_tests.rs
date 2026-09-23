@@ -767,7 +767,8 @@ pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
 /// account for), a struct FIELD holding one (it could be stored and released
 /// anywhere), an end that is not exported (an in-crate caller could still
 /// hand in a foreign block), and a producer with no consumer. None of them
-/// converts the CONSUMER. Restated for R517-9's callee-less extension: the
+/// converts the CONSUMER through the closure (R531-4 (vi) now delivers an
+/// exported one under its own waiver). Restated for R517-9's callee-less extension: the
 /// PRODUCER is an exported function nothing in the program receives, so it
 /// delivers `Box<ht>` at the surface under the exported-producer waiver in
 /// every shape — the closure no longer decides it.
@@ -829,10 +830,21 @@ pub struct registry { pub table: *mut ht }
             "{}\n{}",
             out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
         );
-        assert!(
-            !src.contains("table:Box<ht>"),
+        // Restated for R531-4 (vi), the consumer half: where `ht_destroy` is
+        // exported and nothing in the program calls it, it takes `Box<ht>`
+        // under the exported-consumer waiver; unexported (or absent), it
+        // keeps its raw formal.
+        let consumer_waived = matches!(name, "third-signature" | "struct-field");
+        assert_eq!(
+            src.contains("table:Box<ht>"),
+            consumer_waived,
             "{name}: {}\n{receipts}",
             out.source
+        );
+        assert_eq!(
+            receipts.contains("exported-consumer-waiver callee=ht_destroy"),
+            consumer_waived,
+            "{name}: {receipts}"
         );
         assert!(
             src.contains("fnht_create()->Box<ht>{")
@@ -1744,5 +1756,96 @@ fn w6a_r531_a_mixed_optional_chain_holds() {
             .contains("box-param-caller-retains:tree_free:optional-owner-mixed"),
         "{}",
         out.artifacts.box_param_receipts
+    );
+}
+
+/// ht's surface: an exported producer, an exported consumer, and a third
+/// exported signature that lends the pointee (the corpus's `ht_get` /
+/// `ht_set`), so R427-4's closure holds and nothing in the program calls
+/// `ht_destroy`.
+const EXPORTED_CONSUMER: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table).length; }
+#[no_mangle]
+pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
+    (*table).length = 0 as usize;
+    free(table as *mut core::ffi::c_void);
+}
+"#;
+
+/// **R531-4 (vi) — the exported-consumer waiver** (provisional; the mirror of
+/// R517-9's producer). An exported consumer nothing in the program calls,
+/// whose body consumes its formal (C1's proof: one free, no store, no move
+/// on), takes `Box<ht>`: the caller is outside the program, and under R443 its
+/// handle is a block the system allocator made, released by our drop. The
+/// control drops the export attribute and keeps `box-param-no-callers`.
+#[test]
+fn w6a_r531_an_exported_consumer_takes_the_box_under_the_waiver() {
+    let out = emitted("r531-exported-consumer", &with_prelude(EXPORTED_CONSUMER));
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("fnht_destroy(muttable:Box<ht>){(*table).length=0asusize;drop(table);}"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        receipts.contains("exported-consumer-waiver callee=ht_destroy"),
+        "{receipts}"
+    );
+    let unexported = EXPORTED_CONSUMER.replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn ht_destroy",
+        "pub unsafe extern \"C\" fn ht_destroy",
+    );
+    assert_ne!(unexported, EXPORTED_CONSUMER);
+    let out = emitted("r531-unexported-consumer", &with_prelude(&unexported));
+    assert!(
+        !compact(&out.source).contains("table:Box<ht>"),
+        "{}",
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("ht_destroy::table\theld\tbox-param-no-callers:ht_destroy"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// The waiver's `Option` form: a consumer whose body tests its formal for
+/// null accepts `NULL` from outside (`free(NULL)` is legal C), so it takes
+/// `Option<Box<ht>>` and the test reads `is_none()`.
+#[test]
+fn w6a_r531_a_null_testing_exported_consumer_takes_an_option() {
+    let source = EXPORTED_CONSUMER.replace(
+        "    (*table).length = 0 as usize;\n    free(table",
+        "    if table.is_null() { return; }\n    (*table).length = 0 as usize;\n    free(table",
+    );
+    assert_ne!(source, EXPORTED_CONSUMER);
+    let out = emitted("r531-exported-consumer-null", &with_prelude(&source));
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("fnht_destroy(muttable:Option<Box<ht>>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(src.contains("iftable.is_none(){return;}"), "{}", out.source);
+    assert!(
+        receipts.contains("exported-consumer-waiver callee=ht_destroy"),
+        "{receipts}"
     );
 }

@@ -934,8 +934,19 @@ pub(crate) fn derive<'tcx>(
         };
         // Every other use of the formal is a deref / element access the
         // slice-use collector rewrites; the sink is its one raw boundary.
-        let param_uses = match slice_uses_of(tcx, param, &[sink]) {
-            Ok(uses) => uses,
+        // R531-4 (vi): an exported function nothing in the program calls
+        // may take the consumer waiver, whose nullable form renders its
+        // formal through the certificate's owner walk instead — so a use the
+        // slice-use collector cannot rewrite (`is_null()`) is decided there.
+        let no_caller_export = super::exported_pair::exported(tcx, param.fn_did)
+            && !scans.values().any(|s| {
+                s.calls
+                    .iter()
+                    .any(|(callee, _, _)| *callee == param.fn_did.to_def_id())
+            });
+        let (param_uses, deferred_use) = match slice_uses_of(tcx, param, &[sink]) {
+            Ok(uses) => (uses, None),
+            Err(form) if no_caller_export => (Vec::new(), Some(form)),
             Err(form) => {
                 hold(
                     format!("box-param-callee-use:{callee_path}:{form}"),
@@ -1275,10 +1286,54 @@ pub(crate) fn derive<'tcx>(
             matches!(body.local_decls[param.local].ty.kind(),
                     TyKind::RawPtr(pointee, _) if exported_pairs.closes(tcx, *pointee))
         };
-        if call_count == 0 && !exported_pair {
+        // **R531-4 (vi) — the exported-consumer waiver** (ruled provisionally
+        // as the mirror of R517-9, user confirmation pending): an exported
+        // consumer nothing in the program calls, whose body consumes the
+        // formal (one free, no store, no move on), takes the owner — the
+        // caller is outside the program, and under R443 the block it hands in
+        // is one the system allocator made, released by our drop. A body that
+        // tests the formal for null accepts `NULL` from outside, so it takes
+        // `Option<Box<T>>`. Receipted per unit.
+        let consumer_waiver = call_count == 0
+            && !exported_pair
+            && no_caller_export
+            && frees.len() == 1
+            && store.is_none()
+            && moved_on.is_none();
+        if call_count == 0 && !exported_pair && !consumer_waiver {
             hold(format!("box-param-no-callers:{callee_path}"), &mut out);
             continue;
         }
+        let nullable = consumer_waiver && {
+            let lend_oracle =
+                super::return_certificate::LendOracle::new(tcx, functions, slots, model);
+            super::return_certificate::owner_uses(
+                tcx,
+                param,
+                BoxShape::Sized,
+                false,
+                false,
+                &frees,
+                &|did, index| lend_oracle.lend(did, index),
+                &|did, index| consuming.contains(&(did, index)),
+                &|_| false,
+            )
+            .is_ok_and(|uses| {
+                !uses.dead_guards.is_empty()
+                    || uses
+                        .edits
+                        .iter()
+                        .any(|edit| edit.receipt == "return-certificate-null-test")
+            })
+        };
+        if let Some(form) = deferred_use.filter(|_| !nullable) {
+            hold(
+                format!("box-param-callee-use:{callee_path}:{form}"),
+                &mut out,
+            );
+            continue;
+        }
+        let optional = optional || nullable;
         let Some(param_slot) = slot_of(param) else { continue };
         // The formal's kind: Owning admits; Raw admits when every caller
         // transfers a CERTIFIED owner (A1-c) — the same licensing wall R410-5
@@ -1313,7 +1368,7 @@ pub(crate) fn derive<'tcx>(
                 )
             })
             .collect();
-        if shapes.len() > 1 || (shapes.is_empty() && !exported_pair) {
+        if shapes.len() > 1 || (shapes.is_empty() && !(exported_pair || consumer_waiver)) {
             hold(
                 format!("box-param-shape:{callee_path}:callers-disagree"),
                 &mut out,
@@ -1326,7 +1381,7 @@ pub(crate) fn derive<'tcx>(
             // the formal's own pointee decides, and only a SIZED one — a
             // `Box<[T]>` formal would need an extent the surface does not
             // carry.
-            None if exported_pair => (false, None),
+            None if exported_pair || consumer_waiver => (false, None),
             None => {
                 hold(format!("box-param-shape:{callee_path}:no-shape"), &mut out);
                 continue;
@@ -1514,6 +1569,10 @@ pub(crate) fn derive<'tcx>(
             if exported_pair { " exported-pair-closure" } else { "" },
             members.join(",")
         ));
+        if consumer_waiver {
+            out.receipts
+                .push(format!("exported-consumer-waiver callee={callee_path}"));
+        }
         let mut chain_callers: Vec<LocalDefId> = Vec::new();
         if store.is_some() {
             out.store_members
