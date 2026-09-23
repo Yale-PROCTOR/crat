@@ -1386,6 +1386,121 @@ fn w6a_r528_a_recursion_that_copies_is_not_a_lend() {
     assert!(!receipts.contains("lend-by-recursion"), "{receipts}");
 }
 
+/// ht's `ht_create` reduced: the producer stores a second allocation into
+/// a field the model calls `Owning` (set by the override below), then returns
+/// the owner; the test frees both.
+const OWNED_FIELD_TABLE: &str = r#"
+// w6a-r528-owned-field-table
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct entry_t {
+    pub key: i32,
+}
+#[repr(C)]
+pub struct table_t {
+    pub cap: usize,
+    pub entries: *mut entry_t,
+}
+pub unsafe extern "C" fn table_new(mut cap: usize) -> *mut table_t {
+    let mut t = malloc(::std::mem::size_of::<table_t>()) as *mut table_t;
+    (*t).cap = cap;
+    (*t).entries = calloc(cap, ::std::mem::size_of::<entry_t>()) as *mut entry_t;
+    return t;
+}
+pub unsafe extern "C" fn run() -> usize {
+    let mut t = table_new(4 as usize);
+    (*(*t).entries.offset(1 as isize)).key = 3 as i32;
+    let mut n = (*t).cap;
+    free((*t).entries as *mut core::ffi::c_void);
+    free(t as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+fn owned_field_table(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set_with_contract(
+        "w6a-r528-owned-field-table",
+        vec![("table_t".to_owned(), 1, SlotKind::Owning)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+/// **R528-3 — A1-e's companion gate admits a HELD owned field** (ht's
+/// `ht_create::table`). `entries` is model-`Owning`, but it is indexed and
+/// its store carries no length, so its transaction is held and the field
+/// stays `*mut entry_t`: the raw zero the certificate spells is exactly the
+/// field's type, and the certificate stands.
+#[test]
+fn w6a_r528_a_held_owned_field_admits_the_certificate() {
+    let out = owned_field_table("r528-owned-field-held", OWNED_FIELD_TABLE);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let text = compact(&out.source);
+    assert!(!receipts.contains(":owned-field"), "{receipts}");
+    assert!(
+        text.contains("fntable_new(mutcap:usize)->Box<table_t>"),
+        "the certificate stands\n{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("pubentries:*mutentry_t"),
+        "the held field stays raw\n{}",
+        out.source
+    );
+}
+
+/// Control: the same producer where the owned field's transaction is
+/// DELIVERED (`entries` is only read through, not indexed, so no length is
+/// needed and the field becomes `Option<Box<entry_t>>`). The raw zero would be
+/// an `E0308`, so the certificate withdraws with the gate's hold. (A WRITE through the delivered field renders
+/// `.as_deref()` and does not compile — wave-6f's rendering, routed in report
+/// 077 — so the control reads.)
+#[test]
+fn w6a_r528_a_delivered_owned_field_withdraws_the_certificate() {
+    let source = OWNED_FIELD_TABLE.replace(
+        "    (*(*t).entries.offset(1 as isize)).key = 3 as i32;\n",
+        "    let mut k = (*(*t).entries).key;\n",
+    );
+    assert_ne!(source, OWNED_FIELD_TABLE, "the control must drop the index");
+    let out = owned_field_table("r528-owned-field-delivered", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("return-certificate-struct-field:table_new:owned-field"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("->Box<table_t>"),
+        "{}",
+        out.source
+    );
+    // Withdrawn, the certificate leaves the owner to the family that spells
+    // the delivered field: ownership-fields' literal writes `entries: None`
+    // and the local is a `Box` released at the return. The withdrawal is what
+    // lets that happen; the certificate's raw zero would not type.
+    let text = compact(&out.source);
+    assert!(
+        text.contains("Box::new(crate::table_t{cap:0usize,entries:None})"),
+        "{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "table_new::t"),
+        None,
+        "{receipts}"
+    );
+}
+
 /// R528-3's key table is total: every hold family `certify` writes (a
 /// `"return-certificate-<family>:` literal outside a receipt) has its own key,
 /// so no refusal collapses into the root key at census.
@@ -1495,63 +1610,6 @@ fn w6a_a1e_a_freeing_callee_is_not_a_lend_however_the_model_reads_it() {
             .iter()
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
             .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn w6a_a1e_an_owned_field_refuses_the_certificate() {
-    // R528-2: the crate-wide frame lock (wave-6f `3adb662ad`) — this test and
-    // wave-6f's lodepng witness share model-cache state, and without the one
-    // lock thread order decides which of them loses.
-    let _frame = super::test_model_override::frame_lock();
-    // **A1-e's companion gate, end to end** (report 042 §2; R496-7/R497-3(b)).
-    // A certificate CONSTRUCTS the owner and spells every field as the source
-    // spells it, so a field another family OWNS cannot be spelled that way —
-    // wave-6f promotes it to `Option<Box<T>>` and the literal raw initializer
-    // beside it is an E0308. The gate refuses the certificate; the narrow
-    // pass-through is what makes that refusal visible as the subject's reason
-    // instead of a generic model one.
-    use crate::analyses::borrow_ownership::SlotKind;
-    super::test_model_override::set_with_contract(
-        "w6a-a1e-owned-field-frame",
-        vec![("Image".to_owned(), 3, SlotKind::Owning)],
-        Vec::new(),
-        Vec::new(),
-    );
-    // The producer's own allocation must be model-`Raw` for the refusal to be
-    // readable: the pass-through is consulted in the ladder's `Raw` arm, and in
-    // the plain chain `image_create::img` is Owning-modeled and delivers a Box
-    // on its own, so the hold has nowhere to show. The copy that report 042's
-    // control uses is exactly what makes the model drop `Owning` here.
-    //
-    // The override is keyed on a marker in the fixture's source, so the
-    // marker lives in THIS test's copy only: when it sat in the shared
-    // `HEMAN_IMAGE_CHAIN`, every heman-chain test that ran while this one held
-    // the override read the owned-field model too (R528-2: measured at 8
-    // threads, `w6a_a1e_a_copying_callee_is_not_a_lend` held `…:owned-field`).
-    let source = format!(
-        "// w6a-a1e-owned-field-frame\n{}",
-        HEMAN_IMAGE_CHAIN.replace(
-            "    let mut width = (*heightmap).width;",
-            "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
-        )
-    );
-    let out = emitted("a1-owned-field", &source);
-    super::test_model_override::clear();
-    let reasons: Vec<(String, String)> = out
-        .degradations
-        .iter()
-        .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
-        .collect();
-    assert_eq!(
-        reason_of(&out.degradations, "image_create::img").as_deref(),
-        Some("return-certificate-struct-field"),
-        "the gate's refusal is the subject's reason\n{reasons:?}"
-    );
-    assert!(
-        !compact(&out.source).contains("->Box<Image>"),
-        "no certificate over a struct with an owned field\n{}",
-        out.source
     );
 }
 

@@ -8440,6 +8440,25 @@ fn finish_decide<'tcx>(
             }
             continue;
         }
+        // R528-3 (wave-6a): A1-e's companion gate, keyed on the DELIVERED
+        // field form. A certificate spells its owner's owned fields as their
+        // raw zero; if an applied transaction delivers one of them, the
+        // certificate withdraws and the stage re-derives (certificates only
+        // shrink, so this terminates).
+        if decision::return_certificate::withdraw_delivered_owned_fields(
+            &mut return_certificates,
+            &subjects,
+            &|struct_did, field_index| {
+                field_transactions.applied.iter().any(|t| {
+                    t.owning
+                        && t.array.is_none()
+                        && t.key.struct_did == struct_did
+                        && t.key.field_index == field_index
+                })
+            },
+        ) {
+            continue;
+        }
         table.field_transactions = field_transactions;
         // R425-3: the reader chain's own companion, for the seam's count
         // evidence (`count_companions`). Read from the settled table so the

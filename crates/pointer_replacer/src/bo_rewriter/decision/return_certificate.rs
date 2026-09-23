@@ -86,6 +86,10 @@ pub(crate) struct Certificate {
     /// syntactic shape; CONFIRMED against the chains after they derive — an
     /// unconfirmed transfer withdraws this certificate (`confirm_transfers`).
     pub(crate) transfers: Vec<(DefId, usize, (LocalDefId, HirId))>,
+    /// R528-3: the pointee's model-`Owning` fields, spelled as their raw zero;
+    /// the certificate stands only while no transaction delivers one
+    /// (`withdraw_delivered_owned_fields`).
+    pub(crate) owned_fields: Vec<(LocalDefId, usize)>,
     pub(crate) receipts: Vec<String>,
 }
 
@@ -209,17 +213,74 @@ pub(crate) fn confirm_transfers(
     subjects: &[Subject],
     confirmed: &dyn Fn(DefId, usize) -> bool,
 ) {
+    withdraw(certificates, subjects, &|c| {
+        let unconfirmed = c
+            .transfers
+            .iter()
+            .filter(|(d, i, _)| !confirmed(*d, *i))
+            .map(|(d, i, _)| format!("{}#{i}", tcx.def_path_str(*d)))
+            .collect::<Vec<_>>();
+        (!unconfirmed.is_empty()).then(|| {
+            format!(
+                "return-certificate-transfer-unconfirmed:{}:{}",
+                c.callee_path,
+                unconfirmed.join(",")
+            )
+        })
+    });
+}
+
+/// **R528-3 — A1-e's companion gate, keyed on the DELIVERED field form.** A
+/// certificate spells every field of the owner it constructs as that field's
+/// zero (`struct_literal`), and a raw zero is right exactly when no
+/// transaction delivers the field: ht's `entries` is model-`Owning`, but its
+/// transaction is HELD (`field-transaction-incomplete:owned-slice-store-length`),
+/// so the field stays `*mut` and the literal types. The model kind the gate
+/// used to ask at derive time is therefore the wrong predicate; the delivered
+/// form only exists once `field_reference::finalize` has run, which is after
+/// the decisions. So the certificate is admitted at derive time, and this runs
+/// on the finalized transactions: a certificate whose pointee has a field an
+/// APPLIED owning transaction delivers is withdrawn with the gate's hold, and
+/// the caller re-derives the stage. Certificates only shrink, so it
+/// terminates.
+pub(crate) fn withdraw_delivered_owned_fields(
+    certificates: &mut Certificates,
+    subjects: &[Subject],
+    delivered: &dyn Fn(LocalDefId, usize) -> bool,
+) -> bool {
+    withdraw(certificates, subjects, &|c| {
+        c.owned_fields
+            .iter()
+            .any(|(did, index)| delivered(*did, *index))
+            .then(|| {
+                format!(
+                    "return-certificate-struct-field:{}:owned-field",
+                    c.callee_path
+                )
+            })
+    })
+}
+
+/// Withdraw every certificate `refused` names (with its hold), then every
+/// certificate that chained from, returned into or was returned by one
+/// withdrawn, to a fixpoint. Returns whether anything was withdrawn.
+fn withdraw(
+    certificates: &mut Certificates,
+    subjects: &[Subject],
+    refused: &dyn Fn(&Certificate) -> Option<String>,
+) -> bool {
+    let mut any = false;
     loop {
-        let withdraw: Vec<LocalDefId> = certificates
+        let withdraw: Vec<(LocalDefId, String)> = certificates
             .callees
             .values()
-            .filter(|c| c.transfers.iter().any(|(d, i, _)| !confirmed(*d, *i)))
-            .map(|c| c.callee)
+            .filter_map(|c| refused(c).map(|hold| (c.callee, hold)))
             .collect();
         if withdraw.is_empty() {
             break;
         }
-        for callee in withdraw {
+        any = true;
+        for (callee, hold) in withdraw {
             let Some(c) = certificates.callees.remove(&callee) else { continue };
             if let Some(returned) = c.returned {
                 certificates.plans.remove(&returned);
@@ -227,29 +288,13 @@ pub(crate) fn confirm_transfers(
             for r in &c.receivers {
                 certificates.plans.remove(r);
             }
-            let unconfirmed = c
-                .transfers
-                .iter()
-                .filter(|(d, i, _)| !confirmed(*d, *i))
-                .map(|(d, i, _)| format!("{}#{i}", tcx.def_path_str(*d)))
-                .collect::<Vec<_>>()
-                .join(",");
             let key = c.returned.unwrap_or((callee, rustc_hir::CRATE_HIR_ID));
             let label = subjects
                 .iter()
                 .find(|s| s.fn_did == key.0 && s.hir_id == key.1)
                 .map(|s| s.label.clone())
                 .unwrap_or_else(|| c.callee_path.clone());
-            certificates.holds.insert(
-                key,
-                (
-                    label,
-                    format!(
-                        "return-certificate-transfer-unconfirmed:{}:{unconfirmed}",
-                        c.callee_path
-                    ),
-                ),
-            );
+            certificates.holds.insert(key, (label, hold));
         }
         // A withdrawn callee may have been another's source or receiver
         // owner: the ordinary withdrawal rule applies again.
@@ -287,6 +332,7 @@ pub(crate) fn confirm_transfers(
             );
         }
     }
+    any
 }
 
 /// Decision-phase hook, before the model's verdict is applied: a subject a
@@ -2002,6 +2048,7 @@ fn certify<'tcx, 's>(
     let mut dead_guard_receipts: Vec<String> = Vec::new();
     let mut null_returns = sources.nulls.clone();
     let mut pointee_ty: Option<rustc_middle::ty::Ty<'tcx>> = None;
+    let mut owned_fields: Vec<(LocalDefId, usize)> = Vec::new();
     if let Some(subject) = owner_subject {
         let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
         let Some(slot) = slot_of(subject) else {
@@ -2026,34 +2073,34 @@ fn certify<'tcx, 's>(
             }
         };
         pointee_ty = Some(ty);
-        // **W6A-A1-e's companion gate.** A certificate constructs the owner
-        // (`Box::new(Struct { field: .. })`) and spells every field as the
-        // source spells it. A field another family OWNS is not spellable that
-        // way — wave-6f promotes such a field to `Option<Box<T>>`, and the
-        // literal raw initializer beside it is an `E0308`. The model's field
-        // kind is the question, and it is asked here, at the one place the
-        // pointee is known.
+        // **W6A-A1-e's companion gate, recorded, not refused (R528-3).** A
+        // certificate constructs the owner (`Box::new(Struct { field: .. })`)
+        // and spells each field as its zero; a field another family OWNS and
+        // DELIVERS (`Option<Box<T>>`) makes the raw zero an `E0308`. Whether
+        // it delivers is known only after the field transactions finalize, so
+        // the model-`Owning` fields are recorded here and the certificate is
+        // withdrawn then if one is delivered.
         if let TyKind::Adt(adt, _) = ty.kind()
             && adt.is_struct()
             && let Some(struct_did) = adt.did().as_local()
-            && (0..adt.all_fields().count()).any(|field_index| {
-                slots
-                    .field_slots
-                    .slot_for_field_depth(
-                        crate::analyses::borrow_ownership::slots::StructFieldSlot {
-                            struct_did,
-                            field_index,
-                        },
-                        0,
-                    )
-                    .map(SlotRef::Field)
-                    .and_then(|slot| model.get(&slot).copied())
-                    == Some(SlotKind::Owning)
-            })
         {
-            return Err(hold(format!(
-                "return-certificate-struct-field:{callee_path}:owned-field"
-            )));
+            owned_fields = (0..adt.all_fields().count())
+                .filter(|&field_index| {
+                    slots
+                        .field_slots
+                        .slot_for_field_depth(
+                            crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                                struct_did,
+                                field_index,
+                            },
+                            0,
+                        )
+                        .map(SlotRef::Field)
+                        .and_then(|slot| model.get(&slot).copied())
+                        == Some(SlotKind::Owning)
+                })
+                .map(|field_index| (struct_did, field_index))
+                .collect();
         }
         let pointee = pointee_source(tcx, ty);
         let frees: Vec<(Span, Span)> = scan
@@ -2526,6 +2573,7 @@ fn certify<'tcx, 's>(
         chained_from: chained_from.clone(),
         site_edits: Vec::new(),
         transfers: Vec::new(),
+        owned_fields: owned_fields.clone(),
         receipts: Vec::new(),
     };
     let let_receivers = receivers_of.get(&callee).map(Vec::as_slice).unwrap_or(&[]);
