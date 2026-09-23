@@ -6433,6 +6433,19 @@ pub(crate) fn exported_waiver_counts(
     )
 }
 
+/// **R541-6** — the rows of the field-load exemption table carrying the receipt.
+pub(crate) fn field_load_exemption_count(table: &str) -> usize {
+    table
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            line.split('\t')
+                .nth(3)
+                .is_some_and(|receipt| receipt.starts_with("alias-exempt:field-load("))
+        })
+        .count()
+}
+
 /// Per-mode analysis drivers producing report rows.
 mod run {
     use std::{
@@ -12670,6 +12683,11 @@ mod run {
                 "return-certificate-receipt",
                 artifact.return_certificate_receipts.as_str(),
             ),
+            // **R541-6** — wave-6v's field-load alias exemptions, one row per site.
+            (
+                "field-load-exemption-receipt",
+                artifact.field_load_exemption_receipts.as_str(),
+            ),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(
@@ -12749,6 +12767,11 @@ mod run {
         let (producers, consumers) = super::exported_waiver_counts(artifact);
         row.set(raw_schema::EXPORTED_PRODUCER_WAIVER, producers.to_string());
         row.set(raw_schema::EXPORTED_CONSUMER_WAIVER, consumers.to_string());
+        // R541-6: the field-load exemptions, counted from the table published above.
+        row.set(
+            raw_schema::ALIAS_EXEMPT_FIELD_LOAD,
+            super::field_load_exemption_count(&artifact.field_load_exemption_receipts).to_string(),
+        );
         // R473-3: the count rides beside the table, so the market is auditable without
         // opening it. A `held` line is one refused parameter with its typed reason.
         row.set(

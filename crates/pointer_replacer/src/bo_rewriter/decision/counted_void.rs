@@ -1531,9 +1531,7 @@ pub(crate) struct FieldLoadExemption {
 }
 
 impl FieldLoadExemption {
-    /// The receipt's text. The census row that prints it is main's to add
-    /// (R538-7); until then the witness reads it from the plan.
-    #[allow(dead_code)]
+    /// The receipt's text, printed by the census (R541-6).
     pub(crate) fn key(&self) -> String {
         format!(
             "alias-exempt:field-load({}.{}->{})",

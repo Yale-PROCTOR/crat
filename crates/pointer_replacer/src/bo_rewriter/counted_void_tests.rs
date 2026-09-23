@@ -2079,6 +2079,51 @@ fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
+/// **R541-6** — the receipt reaches the census: the artifacts the census reads carry
+/// the per-site table, the column counts it, and both are registered.
+#[test]
+fn w6v_field_load_exemption_reaches_the_census_column() {
+    let artifacts = ::utils::compilation::run_compiler_on_str(QT_INSERT, |tcx| {
+        super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+    })
+    .expect("fixture compiles");
+    let table = &artifacts.field_load_exemption_receipts;
+    assert!(
+        table.lines().any(|line| line.starts_with("tree_insert\t")
+            && line.ends_with("\t1\talias-exempt:field-load(tree_t.root->node_t)")),
+        "{table}"
+    );
+    assert_eq!(
+        crate::bo_c1::field_load_exemption_count(table),
+        1,
+        "{table}"
+    );
+    // No exemption, no row: the origin control keeps the site overlapping.
+    let input = QT_INSERT.replace(
+        "    (*tree).root = node_new();\n",
+        "    (*tree).root = node_new();\n    if (*tree).length > 7 as u32 { (*tree).root = tree as *mut node_t; }\n",
+    );
+    let artifacts = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+    })
+    .expect("fixture compiles");
+    assert_eq!(
+        crate::bo_c1::field_load_exemption_count(&artifacts.field_load_exemption_receipts),
+        0
+    );
+    let census = include_str!("../bo_c1.rs");
+    for registered in [
+        concat!("\"field-load-exemption-", "receipt\","),
+        concat!("raw_schema::ALIAS_EXEMPT_", "FIELD_LOAD,"),
+    ] {
+        assert!(census.contains(registered), "{registered}");
+    }
+    assert!(
+        crate::raw_boundary_census_schema::ALL
+            .contains(&crate::raw_boundary_census_schema::ALIAS_EXEMPT_FIELD_LOAD)
+    );
+}
+
 /// The exemption is receipted per site, naming the struct, the field and the
 /// pointee it proved disjoint.
 #[test]

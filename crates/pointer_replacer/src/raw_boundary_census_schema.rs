@@ -61,6 +61,10 @@ pub(crate) const EXPORTED_PRODUCER_WAIVER: &str = "raw_boundary_exported_produce
 /// exported-consumer waiver (`exported-consumer-waiver callee=<f>`), counted per
 /// program from the published `box-param-receipt` table.
 pub(crate) const EXPORTED_CONSUMER_WAIVER: &str = "raw_boundary_exported_consumer_waiver";
+/// **R541-6 (wave-6v's R538-7 exemption)** — sites where a raw argument loaded from a
+/// field of a converted root was proved not to alias it, counted per program from the
+/// published `field-load-exemption-receipt` table (`alias-exempt:field-load(...)`).
+pub(crate) const ALIAS_EXEMPT_FIELD_LOAD: &str = "raw_boundary_alias_exempt_field_load";
 /// **R469-1** — how many rows of wave-6f's `revert_status` column disagree with the
 /// final-revert table. A NOTE, not a verdict: the count rides beside an `emitted`
 /// outcome and the rows are published in their own receipt table.
@@ -284,6 +288,7 @@ pub(crate) const ALL: &[&str] = &[
     RETENTION_FRAME_BOUNDED,
     EXPORTED_PRODUCER_WAIVER,
     EXPORTED_CONSUMER_WAIVER,
+    ALIAS_EXEMPT_FIELD_LOAD,
     FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,

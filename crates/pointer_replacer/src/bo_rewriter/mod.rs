@@ -503,6 +503,9 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) box_param_receipts: String,
     /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
     pub(crate) return_certificate_receipts: String,
+    /// **R538-7 / R541-6** — wave-6v's field-load alias exemption, one row per
+    /// exempted site: `alias-exempt:field-load(<struct>.<field>-><pointee>)`.
+    pub(crate) field_load_exemption_receipts: String,
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contract_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
@@ -9131,6 +9134,10 @@ fn finish_decide<'tcx>(
             counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
             box_param_receipts: table.box_params.receipts_tsv(),
             return_certificate_receipts: table.return_certificates.receipts_tsv(),
+            field_load_exemption_receipts: field_load_exemption_receipts_tsv(
+                tcx,
+                &table.seams.field_load_exemptions,
+            ),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
@@ -11940,6 +11947,24 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// **R541-6** — the census table of wave-6v's field-load exemptions (R538-7).
+fn field_load_exemption_receipts_tsv(
+    tcx: TyCtxt<'_>,
+    exemptions: &[decision::counted_void::FieldLoadExemption],
+) -> String {
+    let mut out = String::from("caller\tsite\targument_index\treceipt\n");
+    for exemption in exemptions {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            tcx.def_path_str(exemption.caller.to_def_id()),
+            decision::emitability::EmitabilityFacts::site(tcx, exemption.call_span),
+            exemption.index,
+            exemption.key(),
+        ));
+    }
+    out
 }
 
 /// Diagnostic-only view of the exact raw-boundary facts consumed by the final
