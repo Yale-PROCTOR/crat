@@ -1516,6 +1516,32 @@ pub(crate) fn record_call<'tcx>(
         call.bridged.sort_by_key(|b| b.index);
     }
 }
+/// **R538-7's receipt: one row per exempted site.** A raw argument loaded from
+/// a field of the converted root was proved not to alias it — the pointee type
+/// is disjoint from the root's struct, and every value the program stores into
+/// that field originates in other storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FieldLoadExemption {
+    pub(crate) caller: LocalDefId,
+    pub(crate) call_span: rustc_span::Span,
+    pub(crate) index: usize,
+    pub(crate) root_struct: String,
+    pub(crate) field: String,
+    pub(crate) pointee: String,
+}
+
+impl FieldLoadExemption {
+    /// The receipt's text. The census row that prints it is main's to add
+    /// (R538-7); until then the witness reads it from the plan.
+    #[allow(dead_code)]
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "alias-exempt:field-load({}.{}->{})",
+            self.root_struct, self.field, self.pointee
+        )
+    }
+}
+
 /// A call where a CONVERTED position's storage root (`&mut local`, a local
 /// pointer, a place rooted at a local) is also the root of an argument at a
 /// RAW callee position: the view would live beside a raw alias of the same
@@ -1551,7 +1577,11 @@ pub(crate) fn aliased_storage_twin(
     let aliased = positions.iter().any(|(i, _)| {
         let Some(root) = root_of(*i) else { return false };
         site.args.iter().any(|other| {
-            !converted.contains(&other.index) && other.shape.place_root() == Some(root)
+            !converted.contains(&other.index)
+                && other.shape.place_root() == Some(root)
+                // R538-7: a pointer LOADED from a field of the root is not the
+                // root's alias when the load provably cannot reach its storage.
+                && field_load_exemption(tcx, site, root, other).is_none()
         })
     });
     if !aliased {
@@ -1573,6 +1603,487 @@ pub(crate) fn aliased_storage_twin(
     } else {
         Err(super::seam::SeamBlock::SiteOverlap)
     })
+}
+
+/// **R538-7's receipts for one site.** Every raw argument the exemption clears
+/// beside a converted root — but only when the exemption is what leaves the
+/// site unaliased: a site that still carries another raw alias of the root gains
+/// nothing from it, and a receipt there would claim a delivery that did not
+/// happen.
+pub(crate) fn field_load_exemptions(
+    tcx: TyCtxt<'_>,
+    site: &super::emitability::CallSite,
+    positions: &[(usize, super::seam::Form, super::seam::Form)],
+) -> Vec<FieldLoadExemption> {
+    use super::seam::Form;
+    let converted: rustc_hash::FxHashSet<usize> = positions
+        .iter()
+        .filter(|(_, expected, _)| *expected != Form::Raw)
+        .map(|(i, _, _)| *i)
+        .collect();
+    let mut receipts = Vec::new();
+    for index in &converted {
+        let Some(root) = site
+            .args
+            .iter()
+            .find(|a| a.index == *index)
+            .and_then(|a| a.shape.place_root())
+        else {
+            continue;
+        };
+        for other in site.args.iter().filter(|other| {
+            !converted.contains(&other.index) && other.shape.place_root() == Some(root)
+        }) {
+            match field_load_exemption(tcx, site, root, other) {
+                Some(receipt) => receipts.push(receipt),
+                None => return Vec::new(),
+            }
+        }
+    }
+    receipts
+}
+
+/// **R538-7 — a raw argument LOADED from a field of the converted root is not
+/// that root's alias when the load provably cannot reach the root's storage.**
+///
+/// The place-root test reads `(*tree).root` as rooted at `tree`, and it is: the
+/// LOAD reads a field of `*tree`. But the argument is the loaded pointer VALUE,
+/// evaluated before the call, and what it points at is another allocation —
+/// quadtree's `insert_(tree, (*tree).root, …)` hands a node, not the tree. Both
+/// conjuncts are required, and each alone is refuted by a witness control:
+///
+/// 1. **Type disjointness.** The pointee is neither the root's struct nor a type
+///    containing it, nor contained in it, transitively through fields, arrays
+///    and tuples. A byte or `void` pointee can view any object and never
+///    qualifies.
+/// 2. **Origin.** Every value the program stores into that field is null or a
+///    fresh allocation born at the field's pointee type. A cast can make a field
+///    of a disjoint type point into the root (`(*t).root = t as *mut N`), so type
+///    alone is necessary, not sufficient; an origin the rule cannot see keeps
+///    the overlap.
+///
+/// The argument must be exactly `(*root).f` or `root.f`: one field load, no
+/// cast, no address — the shape whose value is the stored pointer itself.
+fn field_load_exemption(
+    tcx: TyCtxt<'_>,
+    site: &super::emitability::CallSite,
+    root: HirId,
+    other: &super::emitability::Arg,
+) -> Option<FieldLoadExemption> {
+    let body = tcx.hir_body_owned_by(site.caller).value;
+    let arg = find_expr(body, other.span)?;
+    let ExprKind::Field(base, field) = arg.kind else {
+        return None;
+    };
+    let local = match base.kind {
+        ExprKind::Unary(rustc_hir::UnOp::Deref, inner) => inner,
+        _ => base,
+    };
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = local.kind else {
+        return None;
+    };
+    if path.res != rustc_hir::def::Res::Local(root) {
+        return None;
+    }
+    let typeck = tcx.typeck(site.caller);
+    let root_ty = typeck.expr_ty(base);
+    let TyKind::Adt(adt, _) = root_ty.kind() else {
+        return None;
+    };
+    if !adt.is_struct() {
+        return None;
+    }
+    let loaded = typeck.expr_ty(arg);
+    let pointee = match loaded.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
+        _ => return None,
+    };
+    if super::void_pointee::has_void_pointee(tcx, loaded, 1)
+        || !types_disjoint(tcx, root_ty, pointee)
+    {
+        return None;
+    }
+    let field_index = typeck.opt_field_index(arg.hir_id)?;
+    if !field_stores_are_fresh(tcx, adt.did(), field_index, pointee) {
+        return None;
+    }
+    let name = |ty: rustc_middle::ty::Ty<'_>| match ty.kind() {
+        TyKind::Adt(def, _) => tcx.item_name(def.did()).to_string(),
+        _ => ty.to_string(),
+    };
+    Some(FieldLoadExemption {
+        caller: site.caller,
+        call_span: site.span,
+        index: other.index,
+        root_struct: name(root_ty),
+        field: field.name.to_string(),
+        pointee: name(pointee),
+    })
+}
+
+/// Conjunct (1): neither type can hold the other, reflexively and transitively.
+/// Indirection (raw pointers, references, function pointers) is not
+/// containment; a byte or opaque pointee is never disjoint from anything.
+fn types_disjoint<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    root: rustc_middle::ty::Ty<'tcx>,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+) -> bool {
+    use rustc_middle::ty::{IntTy, UintTy};
+    fn contains<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        outer: rustc_middle::ty::Ty<'tcx>,
+        inner: rustc_middle::ty::Ty<'tcx>,
+        seen: &mut rustc_hash::FxHashSet<rustc_middle::ty::Ty<'tcx>>,
+    ) -> bool {
+        if outer == inner {
+            return true;
+        }
+        if !seen.insert(outer) {
+            return false;
+        }
+        match outer.kind() {
+            TyKind::Adt(def, args) => def
+                .all_fields()
+                .any(|field| contains(tcx, field.ty(tcx, args), inner, seen)),
+            TyKind::Array(elem, _) | TyKind::Slice(elem) => contains(tcx, *elem, inner, seen),
+            TyKind::Tuple(tys) => tys.iter().any(|ty| contains(tcx, ty, inner, seen)),
+            _ => false,
+        }
+    }
+    if matches!(
+        pointee.kind(),
+        TyKind::Uint(UintTy::U8)
+            | TyKind::Int(IntTy::I8)
+            | TyKind::Foreign(_)
+            | TyKind::Param(_)
+            | TyKind::Alias(..)
+            | TyKind::Dynamic(..)
+            | TyKind::Str
+    ) {
+        return false;
+    }
+    !contains(tcx, root, pointee, &mut Default::default())
+        && !contains(tcx, pointee, root, &mut Default::default())
+}
+
+/// What a stored value can point at, as far as conjunct (2) is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreOrigin {
+    /// A fresh allocation born at the field's pointee type.
+    Fresh,
+    Null,
+    /// A definition revisited through a cycle: contributes no new origin.
+    Neutral,
+    Unresolved,
+}
+
+impl StoreOrigin {
+    fn join(self, other: Self) -> Self {
+        use StoreOrigin::*;
+        match (self, other) {
+            (Unresolved, _) | (_, Unresolved) => Unresolved,
+            (Fresh, _) | (_, Fresh) => Fresh,
+            (Null, _) | (_, Null) => Null,
+            (Neutral, Neutral) => Neutral,
+        }
+    }
+}
+
+/// Conjunct (2): every value the whole program stores into `adt.field` is null
+/// or a fresh allocation born at `pointee`. A shape that can write the field
+/// without a visible store — its address taken, a compound assignment, a
+/// functional-update literal, a byte-level writer aimed at the struct — makes
+/// the answer unknown, and unknown is no.
+fn field_stores_are_fresh<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt: rustc_hir::def_id::DefId,
+    field: rustc_abi::FieldIdx,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+) -> bool {
+    struct Stores<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        adt: rustc_hir::def_id::DefId,
+        field: rustc_abi::FieldIdx,
+        values: Vec<&'tcx Expr<'tcx>>,
+        opaque: bool,
+    }
+    impl<'tcx> Stores<'_, 'tcx> {
+        fn is_the_field(&self, e: &Expr<'_>) -> bool {
+            let ExprKind::Field(base, _) = e.kind else { return false };
+            matches!(self.typeck.expr_ty(base).kind(), TyKind::Adt(def, _) if def.did() == self.adt)
+                && self.typeck.opt_field_index(e.hir_id) == Some(self.field)
+        }
+
+        fn reaches_the_struct(&self, e: &Expr<'_>) -> bool {
+            let ty = self.typeck.expr_ty(strip_casts(e));
+            let target = match ty.kind() {
+                TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => *t,
+                _ => return false,
+            };
+            let adt_ty = self.tcx.type_of(self.adt).instantiate_identity();
+            target == adt_ty
+                || matches!(target.kind(), TyKind::Adt(def, _) if def.all_fields().any(|f| {
+                    matches!(f.ty(self.tcx, rustc_middle::ty::GenericArgs::identity_for_item(self.tcx, def.did())).kind(),
+                        TyKind::Adt(inner, _) if inner.did() == self.adt)
+                }))
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Stores<'_, 'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            match e.kind {
+                ExprKind::Assign(lhs, rhs, _) if self.is_the_field(lhs) => self.values.push(rhs),
+                ExprKind::AssignOp(_, lhs, _) if self.is_the_field(lhs) => self.opaque = true,
+                ExprKind::AddrOf(_, _, place) if self.is_the_field(place) => self.opaque = true,
+                ExprKind::Struct(_, fields, tail) if matches!(self.typeck.expr_ty(e).kind(), TyKind::Adt(def, _) if def.did() == self.adt) =>
+                {
+                    if !matches!(tail, rustc_hir::StructTailExpr::None) {
+                        self.opaque = true;
+                    }
+                    for f in fields.iter() {
+                        if self.typeck.opt_field_index(f.hir_id) == Some(self.field) {
+                            self.values.push(f.expr);
+                        }
+                    }
+                }
+                ExprKind::Call(func, args) => {
+                    if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = func.kind
+                        && let rustc_hir::def::Res::Def(_, did) = path.res
+                        && matches!(
+                            self.tcx.item_name(did).as_str(),
+                            "memcpy"
+                                | "memmove"
+                                | "memset"
+                                | "bcopy"
+                                | "bzero"
+                                | "fread"
+                                | "read"
+                                | "recv"
+                                | "strcpy"
+                                | "strncpy"
+                                | "memccpy"
+                                | "copy"
+                                | "copy_nonoverlapping"
+                                | "write"
+                                | "write_bytes"
+                        )
+                        && args.iter().any(|a| self.reaches_the_struct(a))
+                    {
+                        self.opaque = true;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut stores = 0usize;
+    for owner in tcx.hir_body_owners() {
+        let typeck = tcx.typeck(owner);
+        let body = tcx.hir_body_owned_by(owner);
+        let mut scan = Stores {
+            tcx,
+            typeck,
+            adt,
+            field,
+            values: Vec::new(),
+            opaque: false,
+        };
+        scan.visit_expr(body.value);
+        if scan.opaque {
+            return false;
+        }
+        for value in scan.values {
+            stores += 1;
+            let origin = store_origin(tcx, owner, value, pointee, 0, &mut Default::default());
+            if !matches!(origin, StoreOrigin::Fresh | StoreOrigin::Null) {
+                return false;
+            }
+        }
+    }
+    stores > 0
+}
+
+/// The origin of one stored value, followed through the local's definitions and
+/// through local callees' returns. Only two shapes are accepted: the null
+/// literal, and a libc allocation CAST to the field's pointee type — a cast of
+/// anything else is exactly how a disjoint-typed field comes to point into the
+/// root, so it is unresolved, not followed.
+fn store_origin<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    e: &'tcx Expr<'tcx>,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+    depth: u32,
+    visited: &mut rustc_hash::FxHashSet<(LocalDefId, Option<HirId>)>,
+) -> StoreOrigin {
+    const MAX_DEPTH: u32 = 6;
+    if depth > MAX_DEPTH {
+        return StoreOrigin::Unresolved;
+    }
+    let typeck = tcx.typeck(owner);
+    let callee = |func: &Expr<'_>| match func.kind {
+        ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+            rustc_hir::def::Res::Def(_, did) => Some(did),
+            _ => None,
+        },
+        _ => None,
+    };
+    match e.kind {
+        ExprKind::DropTemps(inner) => store_origin(tcx, owner, inner, pointee, depth, visited),
+        ExprKind::Cast(inner, _) => match inner.kind {
+            ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(n, _) if n.get() == 0) => {
+                StoreOrigin::Null
+            }
+            ExprKind::Call(func, _)
+                if callee(func).is_some_and(|did| {
+                    tcx.is_foreign_item(did)
+                        && matches!(tcx.item_name(did).as_str(), "malloc" | "calloc")
+                }) && matches!(typeck.expr_ty(e).kind(), TyKind::RawPtr(t, _) if *t == pointee) =>
+            {
+                StoreOrigin::Fresh
+            }
+            _ => StoreOrigin::Unresolved,
+        },
+        ExprKind::Call(func, _) => {
+            let Some(did) = callee(func) else { return StoreOrigin::Unresolved };
+            if matches!(tcx.item_name(did).as_str(), "null_mut" | "null") && !did.is_local() {
+                return StoreOrigin::Null;
+            }
+            let Some(local) = did.as_local() else { return StoreOrigin::Unresolved };
+            if tcx.hir_maybe_body_owned_by(local).is_none() {
+                return StoreOrigin::Unresolved;
+            }
+            if !visited.insert((local, None)) {
+                return StoreOrigin::Neutral;
+            }
+            let origin = returns_origin(tcx, local, pointee, depth + 1, visited);
+            visited.remove(&(local, None));
+            origin
+        }
+        ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+            let rustc_hir::def::Res::Local(hid) = path.res else { return StoreOrigin::Unresolved };
+            local_origin(tcx, owner, hid, pointee, depth, visited)
+        }
+        _ => StoreOrigin::Unresolved,
+    }
+}
+
+/// Every value a local callee can return, joined.
+fn returns_origin<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    f: LocalDefId,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+    depth: u32,
+    visited: &mut rustc_hash::FxHashSet<(LocalDefId, Option<HirId>)>,
+) -> StoreOrigin {
+    struct Returns<'tcx> {
+        values: Vec<&'tcx Expr<'tcx>>,
+        closures: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Returns<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            match e.kind {
+                ExprKind::Ret(Some(value)) => self.values.push(value),
+                ExprKind::Closure(..) => self.closures = true,
+                _ => {}
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let body = tcx.hir_body_owned_by(f);
+    let mut returns = Returns {
+        values: Vec::new(),
+        closures: false,
+    };
+    returns.visit_expr(body.value);
+    if returns.closures {
+        return StoreOrigin::Unresolved;
+    }
+    if let ExprKind::Block(block, _) = body.value.kind
+        && let Some(tail) = block.expr
+    {
+        returns.values.push(tail);
+    }
+    if returns.values.is_empty() {
+        return StoreOrigin::Unresolved;
+    }
+    returns
+        .values
+        .iter()
+        .fold(StoreOrigin::Neutral, |acc, value| {
+            acc.join(store_origin(tcx, f, value, pointee, depth, visited))
+        })
+}
+
+/// Every definition of a local in its own body, joined. A parameter, an
+/// address-taken local, or a compound assignment to it is unresolved.
+fn local_origin<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    local: HirId,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+    depth: u32,
+    visited: &mut rustc_hash::FxHashSet<(LocalDefId, Option<HirId>)>,
+) -> StoreOrigin {
+    struct Defs<'tcx> {
+        local: HirId,
+        values: Vec<&'tcx Expr<'tcx>>,
+        opaque: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Defs<'tcx> {
+        fn visit_local(&mut self, l: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if let PatKind::Binding(_, id, _, _) = l.pat.kind
+                && id == self.local
+                && let Some(init) = l.init
+            {
+                self.values.push(init);
+            }
+            intravisit::walk_local(self, l);
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            let is_local = |e: &Expr<'_>| {
+                matches!(e.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, p))
+                    if p.res == rustc_hir::def::Res::Local(self.local))
+            };
+            match e.kind {
+                ExprKind::Assign(lhs, rhs, _) if is_local(lhs) => self.values.push(rhs),
+                ExprKind::AssignOp(_, lhs, _) if is_local(lhs) => self.opaque = true,
+                ExprKind::AddrOf(_, _, place) if is_local(place) => self.opaque = true,
+                ExprKind::Closure(..) => self.opaque = true,
+                _ => {}
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let body = tcx.hir_body_owned_by(owner);
+    if body
+        .params
+        .iter()
+        .any(|p| matches!(p.pat.kind, PatKind::Binding(_, id, _, _) if id == local))
+    {
+        return StoreOrigin::Unresolved;
+    }
+    if !visited.insert((owner, Some(local))) {
+        return StoreOrigin::Neutral;
+    }
+    let mut defs = Defs {
+        local,
+        values: Vec::new(),
+        opaque: false,
+    };
+    defs.visit_expr(body.value);
+    let origin = if defs.opaque || defs.values.is_empty() {
+        StoreOrigin::Unresolved
+    } else {
+        defs.values.iter().fold(StoreOrigin::Neutral, |acc, value| {
+            acc.join(store_origin(tcx, owner, value, pointee, depth, visited))
+        })
+    };
+    visited.remove(&(owner, Some(local)));
+    origin
 }
 
 /// The plan row for an aliased-storage call: every converted position keeps

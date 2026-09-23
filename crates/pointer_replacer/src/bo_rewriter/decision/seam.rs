@@ -3144,6 +3144,9 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// reason is a yield number nobody can attribute.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    /// R538-7: the sites where a raw argument loaded from a field of a
+    /// converted root was proved not to be that root's alias.
+    pub(crate) field_load_exemptions: Vec<super::counted_void::FieldLoadExemption>,
     pub(crate) shared_read_calls: Vec<super::shared_read_pairs::SharedCall>,
     pub shared_required: Vec<super::overlapping_pairs::consumer::Permission>,
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
@@ -4758,6 +4761,22 @@ pub(crate) fn synthesize_with_raw_boundary(
                     )
                 })
                 .flatten();
+            // R538-7: receipt every raw argument the field-load exemption
+            // cleared at this site, once.
+            if !pair_owned_call {
+                for receipt in super::counted_void::field_load_exemptions(
+                    tcx,
+                    site,
+                    &positions
+                        .iter()
+                        .map(|pos| (pos.index, pos.expected, pos.found))
+                        .collect::<Vec<_>>(),
+                ) {
+                    if !plan.field_load_exemptions.contains(&receipt) {
+                        plan.field_load_exemptions.push(receipt);
+                    }
+                }
+            }
             if let Some(Ok(indices)) = &aliased_twin {
                 super::counted_void::record_alias_twin(
                     table,

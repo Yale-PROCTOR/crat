@@ -2007,3 +2007,156 @@ fn w6v_positional_count_receipts_as_a_fabricated_extent() {
         "the same text, and never the same receipt"
     );
 }
+
+// ---- report 042 (R538-7): a raw argument LOADED from a field of the converted root ----
+//
+// quadtree's `insert_(tree, (*tree).root, …)`, reduced. Position 0 converts to a
+// shared view of the tree; position 1 stays raw and shares the place root `tree`,
+// but it is a pointer loaded out of `tree` that points at a node in another
+// allocation. `insert_` is recursive, so it has no raw twin: without the
+// exemption the site is dropped with `SiteOverlap` and the tree's class holds.
+const QT_INSERT: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+    fn free(_: *mut core::ffi::c_void);
+}
+pub struct node_t {
+    pub key: *mut core::ffi::c_void,
+    pub nw: *mut node_t,
+    pub ne: *mut node_t,
+}
+pub struct tree_t {
+    pub root: *mut node_t,
+    pub length: u32,
+}
+unsafe fn node_new() -> *mut node_t {
+    let mut node = 0 as *mut node_t;
+    node = malloc(::std::mem::size_of::<node_t>() as u64) as *mut node_t;
+    if node.is_null() { return 0 as *mut node_t; }
+    (*node).nw = 0 as *mut node_t;
+    (*node).ne = 0 as *mut node_t;
+    (*node).key = 0 as *mut core::ffi::c_void;
+    return node;
+}
+unsafe fn insert_(mut tree: *mut tree_t, mut root: *mut node_t, mut depth: u32) -> i32 {
+    if (*tree).length > 100 as u32 { return 0 as i32; }
+    if depth == 0 as u32 {
+        (*root).key = 0 as *mut core::ffi::c_void;
+        (*root).ne = root;
+        return 1 as i32;
+    }
+    if ((*root).nw).is_null() { (*root).nw = node_new(); }
+    return insert_(tree, (*root).nw, depth.wrapping_sub(1));
+}
+unsafe fn tree_new() -> *mut tree_t {
+    let mut tree = 0 as *mut tree_t;
+    tree = malloc(::std::mem::size_of::<tree_t>() as u64) as *mut tree_t;
+    if tree.is_null() { return 0 as *mut tree_t; }
+    (*tree).root = node_new();
+    (*tree).length = 0 as u32;
+    return tree;
+}
+unsafe fn tree_insert(mut tree: *mut tree_t) -> i32 {
+    return insert_(tree, (*tree).root, 3 as u32);
+}
+"#;
+
+/// The positive case: the tree converts, and the call hands the node pointer it
+/// loaded from the tree as a raw argument beside the shared view.
+#[test]
+fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
+    let source = super::emit_tests::ast_emitted_source_of(QT_INSERT).unwrap();
+    let c = compact(&source);
+    assert!(
+        c.contains("fninsert_(muttree:&tree_t,mutroot:*mutnode_t,"),
+        "the tree takes its shared view; the node stays raw: {source}"
+    );
+    assert!(
+        c.contains("insert_(&*tree,(*tree).root,3asu32)"),
+        "the loaded node pointer rides raw beside the view: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// The exemption is receipted per site, naming the struct, the field and the
+/// pointee it proved disjoint.
+#[test]
+fn w6v_field_load_exemption_is_receipted_per_site() {
+    ::utils::compilation::run_compiler_on_str(QT_INSERT, |tcx| {
+        let table = super::decide_table(tcx).unwrap();
+        let keys = table
+            .seams
+            .field_load_exemptions
+            .iter()
+            .map(|e| (tcx.def_path_str(e.caller.to_def_id()), e.index, e.key()))
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter()
+                .any(|(caller, index, key)| caller == "tree_insert"
+                    && *index == 1
+                    && key == "alias-exempt:field-load(tree_t.root->node_t)"),
+            "the site's receipt: {keys:?}"
+        );
+    });
+}
+
+/// Control (2): a store into the field whose origin IS the root's storage, by a
+/// cast. The pointee type is still disjoint, which is exactly why type alone is
+/// not enough: the loaded pointer can be the tree itself.
+#[test]
+fn w6v_field_load_whose_origin_includes_the_root_still_overlaps() {
+    let input = QT_INSERT.replace(
+        "    (*tree).root = node_new();\n",
+        "    (*tree).root = node_new();\n    if (*tree).length > 7 as u32 { (*tree).root = tree as *mut node_t; }\n",
+    );
+    assert!(
+        input.contains("tree as *mut node_t"),
+        "fixture edit applied"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fninsert_(muttree:*muttree_t,"),
+        "a field that may hold the root keeps the site overlapping: {source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// Control (2'): a store whose origin is unresolved — an opaque extern's result.
+#[test]
+fn w6v_field_load_with_an_unresolved_origin_still_overlaps() {
+    let input = QT_INSERT
+        .replace(
+            "    fn free(_: *mut core::ffi::c_void);\n",
+            "    fn free(_: *mut core::ffi::c_void);\n    fn opaque_node() -> *mut node_t;\n",
+        )
+        .replace(
+            "    (*tree).root = node_new();\n",
+            "    (*tree).root = opaque_node();\n",
+        );
+    assert!(
+        input.contains("(*tree).root = opaque_node();"),
+        "fixture edit applied"
+    );
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fninsert_(muttree:*muttree_t,"),
+        "an origin the rule cannot see keeps the site overlapping: {source}"
+    );
+}
+
+/// Control (1): the pointee type CONTAINS the root's struct, so a node pointer
+/// can reach a tree embedded in a node. The origin is still a fresh allocation.
+#[test]
+fn w6v_field_load_of_a_type_containing_the_root_still_overlaps() {
+    let input = QT_INSERT.replace(
+        "    pub ne: *mut node_t,\n}",
+        "    pub ne: *mut node_t,\n    pub sub: tree_t,\n}",
+    );
+    assert!(input.contains("pub sub: tree_t"), "fixture edit applied");
+    let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(
+        compact(&source).contains("fninsert_(muttree:*muttree_t,"),
+        "a pointee that can enclose the root keeps the site overlapping: {source}"
+    );
+}
