@@ -25010,12 +25010,19 @@ fn raw_boundary_wave2_corpus_census() {
     // R346-2. The gate comparator: the previous same-lineage frame. Its decline
     // set is differenced by identity and waived by identity; era-4's rows above
     // are reported and gate nothing.
+    //
+    // **R541-5** — the verdict stays count-based, and beside it every identity the
+    // gate delivered that this frame does not is listed, for every program, whether
+    // or not its count fell: a swap that nets positive still names what it lost.
+    let mut gate_lost =
+        String::from("program\tsubject_key\tgate_realized\tcurrent_realized\tcount\n");
     for program in CORPUS {
         let gate = gate_realized.get(program.name).cloned().unwrap_or_default();
         let now = current_realized
             .get(program.name)
             .cloned()
             .unwrap_or_default();
+        gate_lost.push_str(&raw_boundary_gate_lost_rows(program.name, &gate, &now));
         if now.len() >= gate.len() {
             continue;
         }
@@ -25101,6 +25108,8 @@ fn raw_boundary_wave2_corpus_census() {
         &waiver_audit,
     )
     .expect("write regression waiver audit");
+    fs::write(artifact_dir.join("gate-lost-identities.tsv"), &gate_lost)
+        .expect("write gate lost identities");
 
     let degraded_programs = rows
         .iter()
@@ -25890,7 +25899,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\ngate_baseline_sha256={}\ngate_regressed_programs={}\ngate_waived_programs={}\nera4_reported_regressed_programs={}\npair_site_retirement_sha256={}\npair_site_retired={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\ngate_baseline_sha256={}\ngate_regressed_programs={}\ngate_waived_programs={}\nera4_reported_regressed_programs={}\npair_site_retirement_sha256={}\npair_site_retired={}\ngate_lost_identities={}\n",
             delivery.key(),
             20 - degraded_programs.len(),
             degraded_programs.len(),
@@ -25935,10 +25944,79 @@ fn raw_boundary_wave2_corpus_census() {
             era4_regressed_programs.len(),
             retirement_sha256,
             retirement_receipt.lines().count() - 1,
+            gate_lost.lines().count() - 1,
         ),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+/// **R541-5** — one program's rows of `gate-lost-identities.tsv`: every identity
+/// the gate frame realized that this frame does not. `count` says whether the
+/// program's count fell (the verdict's question) or held (a swap). A list the
+/// seat reads at every landing, never a gate.
+fn raw_boundary_gate_lost_rows(
+    program: &str,
+    gate: &std::collections::BTreeSet<String>,
+    now: &std::collections::BTreeSet<String>,
+) -> String {
+    let count = if now.len() >= gate.len() {
+        "held"
+    } else {
+        "fell"
+    };
+    gate.difference(now)
+        .map(|identity| {
+            format!(
+                "{program}\t{identity}\t{}\t{}\t{count}\n",
+                gate.len(),
+                now.len()
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn r541_5_a_swap_that_nets_positive_still_names_what_it_lost() {
+    let set = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| (*item).to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    // The count holds (2 -> 3) and `a` is lost: listed, `held`.
+    assert_eq!(
+        raw_boundary_gate_lost_rows("p", &set(&["a", "b"]), &set(&["b", "c", "d"])),
+        "p\ta\t2\t3\theld\n"
+    );
+    // The count falls: every lost identity is listed, `fell`.
+    assert_eq!(
+        raw_boundary_gate_lost_rows("p", &set(&["a", "b"]), &set(&[])),
+        "p\ta\t2\t0\tfell\np\tb\t2\t0\tfell\n"
+    );
+    // Nothing lost: no rows.
+    assert_eq!(
+        raw_boundary_gate_lost_rows("p", &set(&["a"]), &set(&["a", "b"])),
+        ""
+    );
+    // Wired for EVERY program (before the count test skips it), published, and counted.
+    let census = include_str!("bo_c1.rs");
+    let push = census
+        // Split so the needles cannot match this test's own text.
+        .find(concat!(
+            "gate_lost.push_str(&raw_boundary_",
+            "gate_lost_rows(program.name, &gate, &now));"
+        ))
+        .expect("wired");
+    let skip = census[push..]
+        .find(concat!("if now.len() >= ", "gate.len() {"))
+        .expect("the count skip follows");
+    assert!(skip < 200, "the list is built before the count skip");
+    assert!(census.contains(concat!(
+        "artifact_dir.join(\"gate-lost-",
+        "identities.tsv\"), &gate_lost)"
+    )));
+    assert!(census.contains("\\ngate_lost_identities={}\\n\","));
 }
 
 #[test]
