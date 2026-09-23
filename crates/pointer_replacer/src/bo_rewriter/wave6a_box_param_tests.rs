@@ -463,7 +463,12 @@ fn w6a_c1_qselect_lend_is_not_a_box_parameter() {
     // unchanged — the body lends and this family refuses it — but the refusal
     // is now a DECLINE that leaves the owning arm rather than a hold that
     // degrades there, so the row reads `yielded`.
-    let out = emitted("boxparam-qselect", &with_prelude(QSELECT));
+    //
+    // R528-2: its own name. `emitted` writes the fixture to a directory keyed
+    // on this name and the process id, and removes it after; sharing
+    // `boxparam-qselect` with `w6a_a9_qselect_leaves_the_owning_arm` let one
+    // test delete the file the other was reading.
+    let out = emitted("boxparam-qselect-lend", &with_prelude(QSELECT));
     let src = compact(&out.source);
     assert!(!src.contains("v:Box<"), "{}", out.source);
     assert!(

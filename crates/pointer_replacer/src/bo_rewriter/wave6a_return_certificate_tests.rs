@@ -1109,6 +1109,10 @@ pub unsafe extern "C" fn run() -> i32 {
 
 #[test]
 fn w6a_a1e_the_heman_cascade_root_is_one_lend() {
+    // R528-2: the crate-wide frame lock (wave-6f `3adb662ad`) — this test and
+    // wave-6f's lodepng witness share model-cache state, and without the one
+    // lock thread order decides which of them loses.
+    let _frame = super::test_model_override::frame_lock();
     // **W6A-A1-e** (relay wave-6a/049). The whole shape turns on ONE hold.
     // Bisected on this fixture: dropping the nested field allocation changes
     // nothing, and dropping the call `compute(base)` changes both holds — so
@@ -1306,6 +1310,10 @@ fn w6a_a1e_a_freeing_callee_is_not_a_lend_however_the_model_reads_it() {
 
 #[test]
 fn w6a_a1e_an_owned_field_refuses_the_certificate() {
+    // R528-2: the crate-wide frame lock (wave-6f `3adb662ad`) — this test and
+    // wave-6f's lodepng witness share model-cache state, and without the one
+    // lock thread order decides which of them loses.
+    let _frame = super::test_model_override::frame_lock();
     // **A1-e's companion gate, end to end** (report 042 §2; R496-7/R497-3(b)).
     // A certificate CONSTRUCTS the owner and spells every field as the source
     // spells it, so a field another family OWNS cannot be spelled that way —
