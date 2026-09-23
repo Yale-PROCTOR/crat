@@ -8853,6 +8853,9 @@ fn finish_decide<'tcx>(
         decision::return_certificate::append_interface_dependencies(&mut table);
         decision::flexible_tail::append_interface_dependencies(&mut table);
         decision::box_param::append_interface_dependencies(&mut table);
+        // R536-3: a selected native Box plan built from an owning field's form
+        // withdraws with that field's transaction (after `finalize`, before the plan).
+        native_ownership_candidates.register_seam_consumers(&mut table);
         decision::void_region::append_receiver_declarations(&mut table);
         append_literal_local_declaration_plans(tcx, &ctors, &mut table);
         decision::null_init_declaration::append_explicit_declarations(tcx, &mut table);

@@ -4,7 +4,10 @@
 use std::collections::BTreeSet;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_hir::{
+    HirId,
+    def_id::{DefId, LocalDefId},
+};
 
 use super::{
     Decision, DecisionTable, SubjectKind,
@@ -46,6 +49,10 @@ struct Bundle {
     plan: BoxPlan,
     source_elements: Option<u64>,
     formals: Vec<NativeFormal>,
+    /// R536-3: every `(struct, field)` whose delivered form this plan was
+    /// built from — recorded when the seam ANSWERS, registered only when the
+    /// plan is selected (`register_seam_consumers`), never at ask time.
+    seam_reads: Vec<(DefId, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,17 +252,27 @@ impl Candidates {
                 continue;
             }
             let node = (subject.fn_did, subject.hir_id);
+            let read = std::cell::RefCell::new(Vec::new());
             let bundle = source::derive(
                 inputs.program,
                 subject,
                 inputs.constructions,
                 &|struct_did, field_index| {
-                    owning_field_form(inputs.program.tcx, table, struct_did, field_index)
+                    let form =
+                        owning_field_form(inputs.program.tcx, table, struct_did, field_index);
+                    if form.is_some() {
+                        read.borrow_mut().push((struct_did, field_index));
+                    }
+                    form
                 },
             )
             .map_err(NativeHold::Source)
             .and_then(|source| {
                 derive_bundle(inputs, table, classes, &effects, subject, &source, false)
+            })
+            .map(|mut bundle| {
+                bundle.seam_reads.extend(read.into_inner());
+                bundle
             });
             match bundle {
                 Ok(bundle) => {
@@ -392,17 +409,27 @@ impl Candidates {
             else {
                 continue;
             };
+            let read = std::cell::RefCell::new(Vec::new());
             let bundle = source::derive(
                 inputs.program,
                 subject,
                 inputs.constructions,
                 &|struct_did, field_index| {
-                    owning_field_form(inputs.program.tcx, table, struct_did, field_index)
+                    let form =
+                        owning_field_form(inputs.program.tcx, table, struct_did, field_index);
+                    if form.is_some() {
+                        read.borrow_mut().push((struct_did, field_index));
+                    }
+                    form
                 },
             )
             .map_err(NativeHold::Source)
             .and_then(|source| {
                 derive_bundle(inputs, table, classes, &effects, subject, &source, true)
+            })
+            .map(|mut bundle| {
+                bundle.seam_reads.extend(read.into_inner());
+                bundle
             });
             self.refreshed.insert(node);
             match bundle {
@@ -420,6 +447,68 @@ impl Candidates {
             self.compose_nested_accesses(inputs.program.tcx);
         }
         (self.invalid_owners(inputs, table, classes), refreshed)
+    }
+
+    /// **R536-3 — plan-commit, not ask time.** A selected Box plan built from
+    /// an owning field's delivered form is a SEAM CONSUMER of that field's
+    /// transaction: its literal (`left: None`), its moved-out owner's
+    /// `Option<Box<T>>` type or its owned store is only well-typed while the
+    /// transaction is live. So it joins the transaction's withdrawal key
+    /// (`register_seam_consumer`, wave-6f's half), and the two revert
+    /// together.
+    ///
+    /// Only a bundle whose plan the table SELECTED registers — the same
+    /// selection test `invalid_owner_nodes` uses. A function that asked the
+    /// seam and then held never enters the key; if it did, every withheld
+    /// class of it would withdraw a field this family is not even rendering.
+    ///
+    /// Called after `field_reference::finalize` and before the plan is built,
+    /// because `finalize` recomputes the transactions from scratch and the
+    /// plan's closure reads `owner_sets()`. Returns the registrations made,
+    /// for the witness.
+    pub(crate) fn register_seam_consumers(
+        &self,
+        table: &mut DecisionTable,
+    ) -> Vec<(LocalDefId, DefId, usize)> {
+        // Order is immaterial to the key (`register_seam_consumer` keeps
+        // `dependent_owners` sorted); `made` is sorted for the witness.
+        let mut made = Vec::new();
+        for (node, bundle) in &self.bundles {
+            // Exhaustive, as `invalid_owner_nodes`' selection test is: a new
+            // disposition must be decided here, not silently not-selected.
+            let selected = table.entries.iter().any(|(s, d)| {
+                (s.fn_did, s.hir_id) == *node
+                    && match d {
+                        Decision::Box(plan) => plan == &bundle.plan,
+                        Decision::Degraded(_)
+                        | Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Slice { .. }
+                        | Decision::NestedSlice { .. }
+                        | Decision::Cursor { .. }
+                        | Decision::Opt { .. } => false,
+                    }
+            });
+            if !selected {
+                continue;
+            }
+            for &(struct_did, field_index) in &bundle.seam_reads {
+                if table
+                    .field_transactions
+                    .register_seam_consumer(struct_did, field_index, node.0)
+                {
+                    made.push((node.0, struct_did, field_index));
+                }
+            }
+        }
+        made.sort_by_key(|(owner, struct_did, field_index)| {
+            (
+                owner.local_def_index.as_u32(),
+                struct_did.index.as_u32(),
+                *field_index,
+            )
+        });
+        made
     }
 
     fn invalid_owner_nodes(
@@ -975,10 +1064,14 @@ fn derive_bundle(
     // form) an `Option<Box<T>>` one taking their `take()` (R440-4, no third
     // shape). With no transaction the local's Box would leave the container's
     // raw copy pointing into memory it closes, so the shape holds.
+    let mut seam_reads = Vec::new();
     let field_load = source.load_field();
     let field_form = field_load.and_then(|(struct_did, field_index)| {
         owning_field_form(tcx, table, struct_did, field_index)
     });
+    if let (Some(field), Some(_)) = (field_load, field_form.as_ref()) {
+        seam_reads.push(field);
+    }
     if field_load.is_some() && field_form.is_none() {
         return Err(NativeHold::Missing("native-field-load-field-not-owned"));
     }
@@ -1509,6 +1602,9 @@ fn derive_bundle(
             .is_some_and(|(struct_did, field_index)| {
                 owning_field_form(tcx, table, struct_did, field_index).is_some()
             });
+        if owned_field && let Some(field) = source.store_field() {
+            seam_reads.push(field);
+        }
         if owned_field {
             receipts.push(format!(
                 "native-box-transfer-to-owning-field span={span:?} store=field-transaction nonempty={nonempty}"
@@ -1555,6 +1651,7 @@ fn derive_bundle(
         .collect::<BTreeSet<_>>();
     receipts.push(format!("native-box-continuations calls={checked_calls:?} free_keys={required:?} transfer_keys={transfer_keys:?} scope-exit=closed-by-explicit-source-sink"));
     Ok(Bundle {
+        seam_reads,
         source_elements: source.count().parse::<u64>().ok(),
         plan: BoxPlan {
             shape: source.shape(),
@@ -1612,6 +1709,7 @@ mod audit_tests {
                             source_elements: None,
                             plan: plan.clone(),
                             formals: vec![],
+                            seam_reads: vec![],
                         },
                     );
                 }

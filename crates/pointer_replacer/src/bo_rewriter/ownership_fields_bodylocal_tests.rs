@@ -3395,3 +3395,84 @@ fn r521_the_literal_spells_the_two_field_kinds_the_certificate_refused() {
     })
     .unwrap();
 }
+
+/// **R536-3 — a selected Box plan built from an owning field's form joins that
+/// field's withdrawal key.**
+///
+/// bst at L01^6 (era-5c's corpus form; the l01p6 census's model kinds by
+/// override). `newNode` boxes its allocation with the literal
+/// `node { key: 0i32, left: None, right: None }` — both `None`s are the
+/// fields' delivered `opt-box` form — and touches the fields otherwise only
+/// through null-literal stores, so the field family does not count it as a
+/// dependent owner. Before R536-3 a withheld `insert` withdrew both
+/// transactions and left `newNode`'s literal live against a raw declaration
+/// (the l01p6 `E0308`). Registered at plan-commit, `newNode` is in both keys,
+/// so the transaction and the literal withdraw together.
+#[test]
+fn r536_a_selected_literal_joins_its_fields_withdrawal_key() {
+    use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
+    const BST: &str = include_str!("ownership_fields_fixture_bst_owned.rs");
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(
+        "R533-2 fixture: bst's node fields Owning by override",
+        vec![
+            ("node".to_owned(), 1, Owning),
+            ("node".to_owned(), 2, Owning),
+        ],
+        [
+            ("newNode::temp", Owning),
+            ("insert::node", Owning),
+            ("deleteNode::root", Owning),
+            ("deleteNode::temp", Owning),
+            ("deleteNode::temp_0", Owning),
+            ("deleteNode::temp_1", Ref),
+            ("inorder::root", Ref),
+            ("minValueNode::node", Ref),
+        ]
+        .into_iter()
+        .map(|(l, k)| (l.to_owned(), k))
+        .collect(),
+    );
+    let observed = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let literal = table.entries.iter().any(|(s, d)| {
+            s.label == "newNode::temp"
+                && matches!(d, Decision::Box(plan) if plan
+                    .expr_edits
+                    .iter()
+                    .any(|e| e.replacement.contains("left: None")))
+        });
+        let keys: Vec<(String, bool)> = table
+            .field_transactions
+            .applied
+            .iter()
+            .map(|t| {
+                (
+                    t.field_name.clone(),
+                    t.dependent_owners
+                        .iter()
+                        .any(|o| tcx.def_path_str(o.to_def_id()) == "src::bst::newNode"),
+                )
+            })
+            .collect();
+        (literal, keys)
+    })
+    .unwrap();
+    super::test_model_override::clear();
+    let (literal, keys) = observed;
+    assert!(literal, "newNode's plan is built from the delivered form");
+    assert_eq!(
+        keys,
+        vec![("left".to_owned(), true), ("right".to_owned(), true)],
+        "the literal's owner withdraws with both transactions"
+    );
+}
