@@ -104,6 +104,8 @@ pub(crate) struct Certificates {
     pub(crate) chain_through: FxHashSet<LocalDefId>,
     /// One receipt per pass-over.
     pub(crate) chain_through_receipts: Vec<String>,
+    /// R528-3: one receipt per formal admitted as a lend through recursion.
+    pub(crate) lend_by_recursion: Vec<String>,
 }
 
 /// The sentinel a pass-over travels back on: `certify` has no channel for
@@ -170,6 +172,9 @@ impl Certificates {
         passed.sort();
         for receipt in &passed {
             out.push_str(&format!("-\tpassed-over\t{receipt}\n"));
+        }
+        for receipt in &self.lend_by_recursion {
+            out.push_str(&format!("-\tlend\t{receipt}\n"));
         }
         let mut holds: Vec<&(String, String)> = self.holds.values().collect();
         holds.sort();
@@ -1300,7 +1305,7 @@ fn first_use_is(tcx: TyCtxt<'_>, subject: &Subject, statement: Span) -> Option<(
 /// accesses, null tests, lends onward to such formals): the model's Ref
 /// alone does not say the callee keeps nothing — a store of the formal
 /// through memory still emits as an escape later — so the callee's own body
-/// is read (memoized; a cycle is not a lend). A FOREIGN position is a lend
+/// is read (memoized). A FOREIGN position is a lend
 /// when the pinned libc contract table says the callee neither retains nor
 /// consumes it (`NoRetain` + `BorrowView`; `sscanf`, `strlen`, `strcmp`,
 /// `memcpy`, ..): the ordinary raw-boundary glue bridges the owner at the
@@ -1312,7 +1317,10 @@ pub(crate) struct LendOracle<'a, 'tcx> {
     functions: &'a [LocalDefId],
     slots: &'a CrateSlots,
     model: &'a FxHashMap<SlotRef, SlotKind>,
-    memo: std::cell::RefCell<FxHashMap<(DefId, usize), Option<bool>>>,
+    memo: std::cell::RefCell<FxHashMap<(DefId, usize), bool>>,
+    /// The pairs admitted only through a recursive pass-on (R528-3), one
+    /// receipt each.
+    recursive: std::cell::RefCell<FxHashSet<(DefId, usize)>>,
 }
 
 impl<'a, 'tcx> LendOracle<'a, 'tcx> {
@@ -1328,7 +1336,22 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
             slots,
             model,
             memo: std::cell::RefCell::new(FxHashMap::default()),
+            recursive: std::cell::RefCell::new(FxHashSet::default()),
         }
+    }
+
+    /// The receipts of the pairs admitted through recursion, by callee path.
+    pub(crate) fn recursive_receipts(&self) -> Vec<String> {
+        let mut out = self
+            .recursive
+            .borrow()
+            .iter()
+            .map(|(did, index)| {
+                format!("lend-by-recursion:{}#{index}", self.tcx.def_path_str(*did))
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
     }
 
     fn foreign_lend(&self, did: DefId, index: usize) -> bool {
@@ -1364,55 +1387,145 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
     }
 
     pub(crate) fn lend(&self, did: DefId, index: usize) -> bool {
-        let tcx = self.tcx;
-        if foreign_fn(tcx, did) {
+        if foreign_fn(self.tcx, did) {
             return self.foreign_lend(did, index);
         }
-        match self.memo.borrow().get(&(did, index)) {
-            Some(Some(answer)) => return *answer,
-            Some(None) => return false, // in progress: a cycle is not a lend
-            None => {}
+        if let Some(answer) = self.memo.borrow().get(&(did, index)) {
+            return *answer;
         }
-        self.memo.borrow_mut().insert((did, index), None);
-        let answer = (|| {
-            let callee = did.as_local()?;
-            if !self.functions.contains(&callee) {
-                return Some(false);
+        self.settle((did, index));
+        self.memo.borrow()[&(did, index)]
+    }
+
+    /// The callee's OWN evidence for one formal, before its pass-ons are
+    /// answered: `None` when the formal is refused on its own body (a free, a
+    /// store, a return, a copy; a model kind no body can prove; not a local
+    /// body), else the pass-ons it depends on.
+    fn own_evidence(&self, did: DefId, index: usize) -> Option<Vec<(DefId, usize)>> {
+        let tcx = self.tcx;
+        let callee = did.as_local()?;
+        if !self.functions.contains(&callee) {
+            return None;
+        }
+        let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+        if index >= body.arg_count {
+            return None;
+        }
+        let local = rustc_middle::mir::Local::from_usize(index + 1);
+        let kind = self
+            .slots
+            .fn_local_slots
+            .get(&callee)
+            .and_then(|u| u.slot_for_local_depth(local, 0))
+            .and_then(|slot| self.model.get(&SlotRef::Local(callee, slot)).copied());
+        if !model_admits_lend(kind) {
+            return None;
+        }
+        let hir_body = tcx.hir_body_owned_by(callee);
+        let param = hir_body.params.get(index)?;
+        let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
+            return None;
+        };
+        let mut walk = LendWalk {
+            tcx,
+            binding: hir,
+            ok: true,
+            nested: Vec::new(),
+        };
+        walk.visit_body(hir_body);
+        walk.ok.then_some(walk.nested)
+    }
+
+    /// **R528-3 — the receiver-use rule: a pass-on through recursion is a
+    /// lend.** The lend property is an invariant over every path through the
+    /// callee — never freed, never stored, never returned, never copied — so
+    /// it is the GREATEST fixpoint over the pass-on graph: a formal is a lend
+    /// unless some formal it reaches is refused — on its own body, or by the
+    /// contract table at a foreign position (`free`). The least
+    /// fixpoint (what "a cycle is not a lend" computed) refuses every
+    /// recursive callee whatever its body does — quadtree's `insert_` and
+    /// `split_node_` hand `tree` to each other and do nothing else with it, so
+    /// `quadtree_insert(tree, ..)` refused `test_tree::tree` (ownership-fields
+    /// 058). The closure is settled whole, so a memoized answer never rests
+    /// on an assumption still open; the pairs the greatest fixpoint admits
+    /// and the least refuses are receipted, one each.
+    fn settle(&self, root: (DefId, usize)) {
+        let mut evidence: FxHashMap<(DefId, usize), Option<Vec<(DefId, usize)>>> =
+            FxHashMap::default();
+        let mut stack = vec![root];
+        while let Some(pair) = stack.pop() {
+            if evidence.contains_key(&pair) || self.memo.borrow().contains_key(&pair) {
+                continue;
             }
-            let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
-            if index >= body.arg_count {
-                return Some(false);
+            let own = self.own_evidence(pair.0, pair.1);
+            if let Some(nested) = &own {
+                stack.extend(
+                    nested
+                        .iter()
+                        .copied()
+                        .filter(|(did, _)| !foreign_fn(self.tcx, *did)),
+                );
             }
-            let local = rustc_middle::mir::Local::from_usize(index + 1);
-            let kind = self
-                .slots
-                .fn_local_slots
-                .get(&callee)
-                .and_then(|u| u.slot_for_local_depth(local, 0))
-                .and_then(|slot| self.model.get(&SlotRef::Local(callee, slot)).copied());
-            if !model_admits_lend(kind) {
-                return Some(false);
+            evidence.insert(pair, own);
+        }
+        // A successor outside this closure is foreign or already settled.
+        let holds = |pair: &(DefId, usize), open: &FxHashSet<(DefId, usize)>, exact: bool| {
+            if foreign_fn(self.tcx, pair.0) {
+                self.foreign_lend(pair.0, pair.1)
+            } else if let Some(answer) = self.memo.borrow().get(pair) {
+                *answer && !(exact && self.recursive.borrow().contains(pair))
+            } else {
+                open.contains(pair)
             }
-            let hir_body = tcx.hir_body_owned_by(callee);
-            let param = hir_body.params.get(index)?;
-            let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
-                return Some(false);
-            };
-            let mut walk = LendWalk {
-                tcx,
-                binding: hir,
-                ok: true,
-                nested: Vec::new(),
-            };
-            walk.visit_body(hir_body);
-            if !walk.ok {
-                return Some(false);
+        };
+        let mut lend: FxHashSet<(DefId, usize)> = evidence
+            .iter()
+            .filter(|(_, own)| own.is_some())
+            .map(|(pair, _)| *pair)
+            .collect();
+        loop {
+            let refused = lend
+                .iter()
+                .filter(|pair| {
+                    !evidence[*pair]
+                        .iter()
+                        .flatten()
+                        .all(|next| holds(next, &lend, false))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if refused.is_empty() {
+                break;
             }
-            Some(walk.nested.into_iter().all(|(d, i)| self.lend(d, i)))
-        })()
-        .unwrap_or(false);
-        self.memo.borrow_mut().insert((did, index), Some(answer));
-        answer
+            for pair in refused {
+                lend.remove(&pair);
+            }
+        }
+        let mut proven: FxHashSet<(DefId, usize)> = FxHashSet::default();
+        loop {
+            let next = lend
+                .iter()
+                .filter(|pair| {
+                    !proven.contains(*pair)
+                        && evidence[*pair]
+                            .iter()
+                            .flatten()
+                            .all(|next| holds(next, &proven, true))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if next.is_empty() {
+                break;
+            }
+            proven.extend(next);
+        }
+        let mut memo = self.memo.borrow_mut();
+        for pair in evidence.keys() {
+            memo.insert(*pair, lend.contains(pair));
+            if lend.contains(pair) && !proven.contains(pair) {
+                self.recursive.borrow_mut().insert(*pair);
+            }
+        }
     }
 }
 
@@ -1719,6 +1832,7 @@ pub(crate) fn derive<'tcx>(
             ),
         );
     }
+    out.lend_by_recursion = lend_oracle.recursive_receipts();
     out
 }
 

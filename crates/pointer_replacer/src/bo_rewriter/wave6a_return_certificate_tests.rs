@@ -1261,6 +1261,131 @@ fn w6a_r528_a_certificate_refusal_is_the_subjects_reason() {
     );
 }
 
+/// quadtree's `insert_` / `split_node_` reduced: a recursive pair that hands
+/// the tree to each other and otherwise only reads and writes through it.
+const RECURSIVE_LEND: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct tree_t {
+    pub length: u32,
+    pub depth: i32,
+}
+pub unsafe extern "C" fn tree_new() -> *mut tree_t {
+    let mut tree = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;
+    (*tree).length = 0 as u32;
+    (*tree).depth = 0 as i32;
+    return tree;
+}
+unsafe extern "C" fn split_(mut tree: *mut tree_t, mut level: i32) -> i32 {
+    (*tree).depth += 1 as i32;
+    return insert_(tree, level - 1 as i32);
+}
+unsafe extern "C" fn insert_(mut tree: *mut tree_t, mut level: i32) -> i32 {
+    if level <= 0 as i32 {
+        return 1 as i32;
+    }
+    if (*tree).depth < level {
+        return split_(tree, level);
+    }
+    return insert_(tree, level - 1 as i32);
+}
+pub unsafe extern "C" fn tree_insert(mut tree: *mut tree_t, mut level: i32) -> i32 {
+    if insert_(tree, level) == 0 as i32 {
+        return 0 as i32;
+    }
+    (*tree).length = ((*tree).length).wrapping_add(1 as u32);
+    return 1 as i32;
+}
+pub unsafe extern "C" fn run() -> u32 {
+    let mut tree = tree_new();
+    tree_insert(tree, 3 as i32);
+    let mut n = (*tree).length;
+    free(tree as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+/// **R528-3 — the receiver-use rule.** `tree_insert(tree, ..)` is a lend:
+/// the formal is passed on only into a recursive pair that never frees,
+/// stores, returns or copies it. The lend oracle used to answer a cycle
+/// "not a lend", so the receiver held `call-argument-not-a-lend` and the
+/// producer's certificate withdrew (quadtree's `test_tree::tree`,
+/// ownership-fields 058). The pairs admitted through the recursion are
+/// receipted one each.
+#[test]
+fn w6a_r528_a_recursive_pass_on_is_a_lend() {
+    let out = emitted("r528-recursive-lend", RECURSIVE_LEND);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let text = compact(&out.source);
+    assert!(
+        !receipts.contains("call-argument-not-a-lend"),
+        "a recursive pass-on is a lend\n{receipts}"
+    );
+    assert!(
+        text.contains("fntree_new()->Box<tree_t>"),
+        "the producer's certificate stands\n{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "run::tree"),
+        None,
+        "the receiver owns the tree\n{receipts}"
+    );
+    assert!(
+        text.contains("drop(tree);"),
+        "the C free is the owner's drop\n{}",
+        out.source
+    );
+    for formal in ["insert_#0", "split_#0", "tree_insert#0"] {
+        assert!(
+            receipts.contains(&format!("lend\tlend-by-recursion:{formal}")),
+            "one receipt per pair admitted through the recursion: {formal}\n{receipts}"
+        );
+    }
+}
+
+/// Control: the same recursion where one member FREES the formal. The walk
+/// records `free` as a foreign pass-on and the contract table refuses it, so
+/// this measures a refused SUCCESSOR removing every member that reaches it.
+#[test]
+fn w6a_r528_a_recursion_that_frees_is_not_a_lend() {
+    let source = RECURSIVE_LEND.replace(
+        "    (*tree).depth += 1 as i32;\n",
+        "    (*tree).depth += 1 as i32;\n    if level > 9 as i32 {\n        free(tree as *mut core::ffi::c_void);\n    }\n",
+    );
+    assert_ne!(source, RECURSIVE_LEND, "the control must add the free");
+    let out = emitted("r528-recursive-free", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("call-argument-not-a-lend:tree_insert(tree, 3 as i32)"),
+        "a member that frees refuses the whole recursion\n{receipts}"
+    );
+    assert!(!receipts.contains("lend-by-recursion"), "{receipts}");
+}
+
+/// Control: the same recursion where one member COPIES the formal. That is a
+/// refusal on the member's OWN body, which the greatest fixpoint must keep:
+/// the pair starts out of the fixpoint, and its callers fall with it.
+#[test]
+fn w6a_r528_a_recursion_that_copies_is_not_a_lend() {
+    let source = RECURSIVE_LEND.replace(
+        "    (*tree).depth += 1 as i32;\n",
+        "    let mut alias = tree;\n    (*alias).depth += 1 as i32;\n",
+    );
+    assert_ne!(source, RECURSIVE_LEND, "the control must add the copy");
+    let out = emitted("r528-recursive-copy", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("call-argument-not-a-lend:tree_insert(tree, 3 as i32)"),
+        "a member whose own body copies refuses the whole recursion\n{receipts}"
+    );
+    assert!(!receipts.contains("lend-by-recursion"), "{receipts}");
+}
+
 /// R528-3's key table is total: every hold family `certify` writes (a
 /// `"return-certificate-<family>:` literal outside a receipt) has its own key,
 /// so no refusal collapses into the root key at census.
