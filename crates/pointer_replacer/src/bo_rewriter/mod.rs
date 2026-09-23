@@ -172,6 +172,8 @@ mod wave6l_local_box_exemption_tests;
 mod wave6l_nested_composition_tests;
 #[cfg(test)]
 mod wave6l_return_origin_tests;
+#[cfg(test)]
+mod wave6o_owned_field_load_tests;
 pub(crate) mod wave6r_child_access;
 mod wave6r_option_reborrow;
 pub(crate) mod wave6r_shared_root;

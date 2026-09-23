@@ -297,6 +297,28 @@ pub(crate) fn receipt(
     }
 }
 
+/// R538-3(i) (relay 081): the value is a LOAD an applied OWNED field
+/// transaction wraps at this very node (its `.as_deref()` view), in a function
+/// whose revert withdraws that transaction. The load is the transaction's: the
+/// Option family renders nothing over it, so the base's own edit applies on
+/// the base's own span and the two compose — `(*node.unwrap()).left.as_deref()`
+/// — instead of colliding at one node (the graft hold that withdrew bst's
+/// fields). Requiring a DEPENDENT owner keeps it fail-closed: if the
+/// transaction is withdrawn, this owner is reverted with it and the deferred
+/// value is never emitted without its wrap.
+fn owned_field_transaction_load(table: &DecisionTable, owner: LocalDefId, span: Span) -> bool {
+    let span = span.source_callsite();
+    table.field_transactions.applied.iter().any(|transaction| {
+        transaction.owning
+            && transaction.array.is_none()
+            && transaction.dependent_owners.contains(&owner)
+            && transaction
+                .expression_edits
+                .iter()
+                .any(|edit| edit.wrap && edit.owner == owner && edit.span.source_callsite() == span)
+    })
+}
+
 pub(crate) fn plan_values(
     tcx: TyCtxt<'_>,
     table: &mut DecisionTable,
@@ -550,6 +572,9 @@ pub(crate) fn plan_values(
                 .is_unsafe();
             let same_slice = slice && found == target;
             let replacement = if reason.is_some() {
+                None
+            } else if owned_field_transaction_load(table, subject.fn_did, span) {
+                adapter = "owned-field-transaction-load".to_owned();
                 None
             } else if initializer
                 && table
