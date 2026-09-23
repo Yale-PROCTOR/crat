@@ -595,18 +595,42 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             "{row:?}"
         );
     }
+    // **R538-3: a dichotomy on wave-6a's re-seat (`95f485540`).** `insert` and
+    // `deleteNode` consume and return their node, and the re-seat makes those
+    // formals owners (`Option<Box<node>>`). The moves then go into owned
+    // formals, not raw ones, so the receipt's raw-move / raw-store fall and two
+    // more classes deliver. The field contract below is the same on both
+    // frames; the branch is decided by `deleteNode`'s formal, one structural
+    // fact, and each branch pins its whole shape.
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reseated = flat.contains("fn deleteNode(mut root: Option<Box<node>>,");
+    assert!(
+        reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
+        "deleteNode's formal is either raw or the re-seated owner:\n{source}"
+    );
+    let bridges = |moves: usize, stores: usize| {
+        format!(
+            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion="
+        )
+    };
+    let ((left_moves, left_stores), (right_moves, right_stores)) = if reseated {
+        ((1, 1), (1, 1))
+    } else {
+        ((3, 3), (4, 4))
+    };
     assert_eq!(
         observed.bridges,
         vec![
             (
                 "node".to_owned(),
                 "left".to_owned(),
-                "raw-move=3;raw-view=1;raw-store=3;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion=".to_owned()
+                bridges(left_moves, left_stores)
             ),
             (
                 "node".to_owned(),
                 "right".to_owned(),
-                "raw-move=4;raw-view=1;raw-store=4;dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion=".to_owned()
+                bridges(right_moves, right_stores)
             ),
         ]
     );
@@ -621,54 +645,73 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         "{:?}",
         observed.seam_edits
     );
-    let (source, emitted_count, reverted) = emitted_source(&outcome);
-    assert_eq!((emitted_count, reverted), (1, 0), "{source}");
-    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    for needle in [
+    assert_eq!(
+        (emitted_count, reverted),
+        (if reseated { 3 } else { 1 }, 0),
+        "{source}"
+    );
+    let common = [
         // the declaration: null = None, ABI preserved (NPO)
         "pub left: Option<Box<node>>,",
         "pub right: Option<Box<node>>,",
         // a fresh allocation is written, never dropped through raw memory
         "core::ptr::write(&raw mut (*temp).left, None);",
-        // a Ref-frame walker views the child
+        // a Ref-frame walker views the child; R425-2: the recursive walker's
+        // two arguments are VIEWS of the children, not moves
         "inorder((*root.unwrap()).left.as_deref());",
-        // a raw owning consumer receives the moved Box (receipted raw-move)
-        "core::ptr::write(&raw mut (*node).left, core::ptr::NonNull::new(insert((*node).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)).map(|__p| Box::from_raw(__p.as_ptr())));",
-        // the null test
-        "if ((*root).left).is_none() {",
-        "while !node.is_null() && !((*node).left).is_none() {",
-        // a raw view for a raw-declared walker (receipted raw-view)
-        "node = (*node).left.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut);",
-        // a move-out into a raw owning local
-        "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
-        // the C free site is untouched
-        "free(root as *mut ::std::ffi::c_void); return temp;",
-        // R425-2: the recursive walker's two arguments are VIEWS of the
-        // children, not moves — the callee formal stays `ref`
         "inorder((*root.unwrap()).right.as_deref());",
-        // R425-2: the `minValueNode` receiver is a raw view of the child
-        "minValueNode((*root).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
+        // the null test, and a raw view for a raw-declared walker
+        "while !node.is_null() && !((*node).left).is_none() {",
+        "node = (*node).left.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut);",
         // E5C-3 (report 007): the two-children branch hoists the pure read
         // before the moving argument
         "let __crat_hoist0 = (*temp_1).key;",
-    ] {
+    ];
+    let shaped: &[&str] = if reseated {
+        &[
+            // the moved Box goes into the owned formal as itself
+            "insert((*node.as_deref_mut().unwrap()).left.take(), key)",
+            // R425-2: the `minValueNode` receiver is a raw view of the child
+            "minValueNode((*root.as_deref_mut().unwrap()).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
+            // the C free sites, now the owner's drop at exactly those sites
+            "drop(root); return temp;",
+            "drop(root); return temp_0;",
+        ]
+    } else {
+        &[
+            // a raw owning consumer receives the moved Box (receipted raw-move)
+            "core::ptr::write(&raw mut (*node).left, core::ptr::NonNull::new(insert((*node).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)).map(|__p| Box::from_raw(__p.as_ptr())));",
+            "if ((*root).left).is_none() {",
+            // a move-out into a raw owning local
+            "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
+            // the C free site is untouched
+            "free(root as *mut ::std::ffi::c_void); return temp;",
+            // R425-2: the `minValueNode` receiver is a raw view of the child
+            "minValueNode((*root).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
+        ]
+    };
+    for needle in common.iter().chain(shaped.iter()) {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
     // R425-2 (era-5c 003) — the E5C-3 emission contract's SECOND clause:
-    // the four Owning kinds at the traversal / recursive-call arguments
-    // (`deleteNode::_37`, `minValueNode::_8`, `inorder::_5/_13`) are token
+    // the Owning kinds at the traversal / recursive-call arguments are token
     // loads whose callee formals stay `ref`, so they license NO drop. bst's
-    // only deallocation sites are `deleteNode`'s two C `free`s, both
-    // RETAINED; a `Box` dropped at one of those argument sites would free a
-    // linked subtree. Emission side: no Rust drop anywhere, the two frees
-    // exactly as C wrote them (the bridges row's
-    // `waiver-drop-scope-exit=0` is the receipt side of the same clause).
-    assert_eq!(source.matches("drop(").count(), 0, "{source}");
+    // only deallocation sites are `deleteNode`'s two C `free`s; a `Box`
+    // dropped at an argument site would free a linked subtree. So: EXACTLY two
+    // deallocations, both at the C free sites — `free(root ..)` where `root` is
+    // raw, the owner's `drop(root)` where it is re-seated — and no other drop.
+    let frees = source
+        .matches("free(root as *mut ::std::ffi::c_void);")
+        .count();
+    let drops_of_root = source.matches("drop(root);").count();
     assert_eq!(
-        source
-            .matches("free(root as *mut ::std::ffi::c_void);")
-            .count(),
-        2,
+        (frees + drops_of_root, source.matches("drop(").count()),
+        (2, drops_of_root),
+        "two deallocations, both at the C free sites, and no drop elsewhere\n{source}"
+    );
+    assert_eq!(
+        (frees, drops_of_root),
+        if reseated { (0, 2) } else { (2, 0) },
         "{source}"
     );
     // A struct owning a Box is not Copy: the derives are withdrawn.
@@ -891,14 +934,42 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
         );
     }
     let (source, emitted_count, reverted) = emitted_source(&outcome);
-    assert_eq!((emitted_count, reverted), (2, 0), "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    // **R538-3: a dichotomy on wave-6a's re-seat (`95f485540`).** The pin is
+    // the HOIST — the pure `Copy` read taken before the moving argument, and a
+    // bare local never hoisted — and that holds on both frames. What the
+    // re-seat changes is `deleteNode`'s formal: raw here, `Option<Box<node>>`
+    // there (a formal consumed and returned is an owner), so the moved field
+    // goes in as the Box itself and one more class delivers. Each branch pins
+    // its whole shape; a third formal matches neither and fails.
+    let reseated = flat.contains("fn deleteNode(mut root: Option<Box<node>>,");
+    assert!(
+        reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
+        "deleteNode's formal is either raw or the re-seated owner:\n{source}"
+    );
+    assert_eq!(
+        (emitted_count, reverted),
+        (if reseated { 3 } else { 2 }, 0),
+        "{source}"
+    );
+    let moved = if reseated {
+        "(*root).right.take()"
+    } else {
+        "(*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw)"
+    };
+    let bare = if reseated {
+        "deleteNode((*root.as_deref_mut().unwrap()).left.take(), key)"
+    } else {
+        "deleteNode((*root).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)"
+    };
     for needle in [
-        "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) { let mut temp: &crate::node = (*root).right.as_deref().unwrap(); (*root).key = (*temp).key; let __crat_hoist0 = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode((*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw), __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }",
+        format!(
+            "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) {{ let mut temp: &crate::node = (*root).right.as_deref().unwrap(); (*root).key = (*temp).key; let __crat_hoist0 = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode({moved}, __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }}"
+        ),
         // a bare local read (`key`) is not hoisted — nothing a move invalidates
-        "deleteNode((*root).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)",
+        bare.to_owned(),
     ] {
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+        assert!(flat.contains(&needle), "missing {needle:?} in\n{source}");
     }
     assert_eq!(flat.matches("__crat_hoist").count(), 2, "{source}");
 }
