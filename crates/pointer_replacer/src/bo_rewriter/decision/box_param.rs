@@ -72,6 +72,12 @@ pub(crate) struct Chains {
     pub(crate) lends: FxHashSet<(LocalDefId, HirId)>,
     /// One `yielded` receipt per declined ownership claim: (label, reason).
     pub(crate) lend_receipts: Vec<(String, String)>,
+    /// **R531-4 (vii)**: the declined formals whose pointee has model-`Owning`
+    /// fields — binding → (label, callee, those fields). The decline stands
+    /// only while no transaction delivers one of them
+    /// (`withdraw_delivered_owned_field_lends`).
+    pub(crate) owned_field_lends:
+        FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
 }
 
 /// **wave-6a rule W6A-A9 — a proven lend leaves the owning arm** (relay
@@ -132,6 +138,38 @@ impl Chains {
         }
         out
     }
+}
+
+/// **R531-4 (vii) — A9's companion gate keyed on the DELIVERED field form**,
+/// the parameter-side mirror of `return_certificate::withdraw_delivered_owned_fields`:
+/// after `field_reference::finalize`, a declined formal whose pointee has a
+/// field an APPLIED owning transaction delivers loses its decline and takes
+/// the gate's hold; the caller re-derives the stage. Declines only shrink,
+/// so it terminates.
+pub(crate) fn withdraw_delivered_owned_field_lends(
+    chains: &mut Chains,
+    delivered: &dyn Fn(LocalDefId, usize) -> bool,
+) -> bool {
+    let withdrawn = chains
+        .owned_field_lends
+        .iter()
+        .filter(|(key, (_, _, fields))| {
+            chains.lends.contains(*key) && fields.iter().any(|(did, index)| delivered(*did, *index))
+        })
+        .map(|(key, (label, callee, _))| (*key, label.clone(), callee.clone()))
+        .collect::<Vec<_>>();
+    for (key, label, callee) in &withdrawn {
+        chains.lends.remove(key);
+        chains.lend_receipts.retain(|(l, _)| l != label);
+        chains.holds.insert(
+            *key,
+            (
+                label.clone(),
+                format!("box-param-callee-lends-owned-field:{callee}"),
+            ),
+        );
+    }
+    !withdrawn.is_empty()
 }
 
 /// Decision-phase hook, after the flexible-tail one: a prior parameter /
@@ -649,41 +687,44 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
 /// struct one of whose fields the model calls `Owning`: another family owns
 /// that field, its edit is an owned one, and an owned edit cannot sit inside
 /// the A5 raw view a reference formal creates at a deallocator argument.
-fn owned_field_struct<'tcx>(
+fn owned_fields_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
     param: &Subject,
-) -> bool {
+) -> Vec<(LocalDefId, usize)> {
     let body = tcx
         .mir_drops_elaborated_and_const_checked(param.fn_did)
         .borrow();
     let Some(decl) = body.local_decls.get(param.local) else {
-        return false;
+        return Vec::new();
     };
     let TyKind::RawPtr(pointee, _) = decl.ty.kind() else {
-        return false;
+        return Vec::new();
     };
     let TyKind::Adt(adt, _) = pointee.kind() else {
-        return false;
+        return Vec::new();
     };
     let Some(struct_did) = adt.did().as_local() else {
-        return false;
+        return Vec::new();
     };
-    (0..adt.all_fields().count()).any(|field_index| {
-        slots
-            .field_slots
-            .slot_for_field_depth(
-                crate::analyses::borrow_ownership::slots::StructFieldSlot {
-                    struct_did,
-                    field_index,
-                },
-                0,
-            )
-            .map(SlotRef::Field)
-            .and_then(|slot| model.get(&slot).copied())
-            == Some(SlotKind::Owning)
-    })
+    (0..adt.all_fields().count())
+        .filter(|&field_index| {
+            slots
+                .field_slots
+                .slot_for_field_depth(
+                    crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                        struct_did,
+                        field_index,
+                    },
+                    0,
+                )
+                .map(SlotRef::Field)
+                .and_then(|slot| model.get(&slot).copied())
+                == Some(SlotKind::Owning)
+        })
+        .map(|field_index| (struct_did, field_index))
+        .collect()
 }
 
 /// Derive every chain for the crate. Runs once, before the family stages; the
@@ -799,23 +840,22 @@ pub(crate) fn derive<'tcx>(
             // (the rows the Box arm holds today); a Ref/Raw formal is not (c).
             if slot_of(param).is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Owning)) {
                 // **W6A-A9's companion gate**, the mirror of A1-e's (report
-                // 044): a formal whose pointee struct has a field the model
-                // calls `Owning` is NOT declined. Making such a formal a
-                // reference puts the deallocator argument behind an A5 raw
-                // view, and the owned field's edit cannot live inside one —
-                // wave-6f's field transaction declines it, and the refusal
-                // aborts the program's rewrite rather than holding one row.
-                // The owner of the hoist that would let both deliver is
-                // wave-6f; until it lands, the field keeps the subject.
-                if owned_field_struct(tcx, slots, model, param) {
-                    out.holds.insert(
+                // 044): a formal whose pointee struct has a field another
+                // family OWNS and DELIVERS is not declined — a reference
+                // formal puts the deallocator argument behind an A5 raw view,
+                // and the owned field's edit cannot live inside one (wave-6f's
+                // transaction declines it and the refusal aborts the program's
+                // rewrite). Whether the field is delivered is known only after
+                // the transactions finalize, so the model-`Owning` fields are
+                // recorded here and the decline is withdrawn then if one is
+                // delivered (R531-4 (vii)); a HELD field has no edit to put
+                // inside a view.
+                let owned_fields = owned_fields_of(tcx, slots, model, param);
+                if !owned_fields.is_empty() {
+                    out.owned_field_lends.insert(
                         (param.fn_did, param.hir_id),
-                        (
-                            param.label.clone(),
-                            format!("box-param-callee-lends-owned-field:{callee_path}"),
-                        ),
+                        (param.label.clone(), callee_path.clone(), owned_fields),
                     );
-                    continue;
                 }
                 // **W6A-A9.** The three sinks are all absent, so nothing in
                 // this body releases the allocation and the caller keeps the

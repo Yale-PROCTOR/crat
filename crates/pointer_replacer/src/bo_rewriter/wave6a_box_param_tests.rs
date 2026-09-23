@@ -1575,6 +1575,9 @@ pub unsafe extern "C" fn drive() -> i32 {
 #[test]
 fn w6a_a9_an_owned_field_keeps_the_formal() {
     use crate::analyses::borrow_ownership::SlotKind;
+    // R528-2: the override is global state; the crate-wide lock serializes
+    // it against every other test that sets or reads one.
+    let _frame = super::test_model_override::frame_lock();
     super::test_model_override::set_with_contract(
         "w6a-a9-owned-field-frame",
         vec![("Owner".to_owned(), 1, SlotKind::Owning)],
@@ -1595,6 +1598,52 @@ fn w6a_a9_an_owned_field_keeps_the_formal() {
     assert!(
         !receipts.contains("box-param-lend-leaves-owning"),
         "no formal of an owned-field struct is declined\n{receipts}"
+    );
+}
+
+/// **R531-4 (vii) — A9's companion gate admits a HELD owned field**, the
+/// parameter-side mirror of `4ffa35319`. The gate kept the formal because a
+/// DELIVERED owned field's edit cannot live inside the A5 raw view a
+/// reference formal puts its deallocator argument behind; the control above
+/// is that case and still holds. Here `slot_` is indexed and its store has no
+/// length, so its transaction is held, the field stays `*mut i32`, there is
+/// no edit to put inside a view — and the two lends are declined as A9 says.
+#[test]
+fn w6a_r531_a9_a_held_owned_field_declines_the_lend() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    let source = OWNED_FIELD_LEND
+        .replace("// w6a-a9-owned-field-frame", "// w6a-r531-held-owned-field-frame")
+        .replace(
+            "    (*o).slot_ = malloc(::std::mem::size_of::<i32>()) as *mut i32;\n",
+            "    (*o).slot_ = calloc(4 as usize, ::std::mem::size_of::<i32>()) as *mut i32;\n    *(*o).slot_.offset(1 as isize) = 3 as i32;\n",
+        );
+    assert!(
+        source.contains("offset(1 as isize)"),
+        "the fixture must index the field"
+    );
+    super::test_model_override::set_with_contract(
+        "w6a-r531-held-owned-field-frame",
+        vec![("Owner".to_owned(), 1, SlotKind::Owning)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let out = emitted("r531-a9-held-field", &with_prelude(&source));
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.box_param_receipts;
+    for parameter in ["read_count::o", "bump::o"] {
+        assert!(
+            receipts.contains(&format!(
+                "{parameter}\tyielded\tbox-param-lend-leaves-owning:"
+            )),
+            "{parameter} is declined: its field's transaction is held\n{receipts}"
+        );
+    }
+    assert!(!receipts.contains("callee-lends-owned-field"), "{receipts}");
+    assert!(
+        compact(&out.source).contains("pubslot_:*muti32"),
+        "the held field stays raw\n{}",
+        out.source
     );
 }
 

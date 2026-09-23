@@ -7960,7 +7960,7 @@ fn finish_decide<'tcx>(
         &box_facts,
         &ctors,
     );
-    let box_params = decision::box_param::derive(
+    let mut box_params = decision::box_param::derive(
         tcx,
         &program.functions,
         &ctors,
@@ -8482,18 +8482,24 @@ fn finish_decide<'tcx>(
         // raw zero; if an applied transaction delivers one of them, the
         // certificate withdraws and the stage re-derives (certificates only
         // shrink, so this terminates).
-        if decision::return_certificate::withdraw_delivered_owned_fields(
+        // R531-4 (vii): the parameter-side mirror — A9's declines on a
+        // struct whose owned field is delivered withdraw the same way.
+        let delivered = |struct_did: rustc_hir::def_id::LocalDefId, field_index: usize| {
+            field_transactions.applied.iter().any(|t| {
+                t.owning
+                    && t.array.is_none()
+                    && t.key.struct_did == struct_did
+                    && t.key.field_index == field_index
+            })
+        };
+        let certificates_withdrawn = decision::return_certificate::withdraw_delivered_owned_fields(
             &mut return_certificates,
             &subjects,
-            &|struct_did, field_index| {
-                field_transactions.applied.iter().any(|t| {
-                    t.owning
-                        && t.array.is_none()
-                        && t.key.struct_did == struct_did
-                        && t.key.field_index == field_index
-                })
-            },
-        ) {
+            &delivered,
+        );
+        let lends_withdrawn =
+            decision::box_param::withdraw_delivered_owned_field_lends(&mut box_params, &delivered);
+        if certificates_withdrawn || lends_withdrawn {
             continue;
         }
         table.field_transactions = field_transactions;
