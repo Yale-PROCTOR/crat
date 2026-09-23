@@ -3327,3 +3327,43 @@ fn w6f_the_absorption_reads_address_taken_names_crate_wide() {
     .unwrap();
     assert_eq!(names, ["a", "x", "y"]);
 }
+
+/// **R541-2 / wave-6f 065 STOP 3 (main)** — the raw-boundary seam plans no glue
+/// over an argument an owned-field transaction renders. On the re-seat,
+/// `deleteNode`'s `minValueNode((*root).right)` drew a planned
+/// `{ let __crat_raw: *mut node = ((*root).right) as *mut node; __crat_raw }`,
+/// ill-typed against `Option<Box<node>>` and inert only because the field's wrap
+/// claimed the node first. The planner asks `owning_field_form` after `finalize`
+/// and leaves the site to the transaction, with a typed receipt.
+#[test]
+fn main_the_seam_plans_no_glue_over_an_owned_field_argument() {
+    let _frame = frame_lock();
+    bst_frame();
+    let observed = observe(BST);
+    let receipts = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        table.seams.owned_field_glue_yields.clone()
+    })
+    .unwrap();
+    super::test_model_override::clear();
+    let field_glues: Vec<&String> = observed
+        .seam_edits
+        .iter()
+        .map(|(_, replacement)| replacement)
+        .filter(|replacement| replacement.contains(".left") || replacement.contains(".right"))
+        .collect();
+    assert!(field_glues.is_empty(), "{:?}", observed.seam_edits);
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.starts_with("owned-field-renders:node.right")),
+        "{receipts:?}"
+    );
+}

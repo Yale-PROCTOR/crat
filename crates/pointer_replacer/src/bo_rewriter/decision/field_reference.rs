@@ -591,10 +591,9 @@ impl FieldTransactions {
 /// - an ARRAY transaction, whose key names the owning FUNCTION and a local's
 ///   `HirId`, not a struct and a field index.
 ///
-/// This line has no production caller: the consumer is the ownership-fields
-/// producer, which composes with this one (relay 032 / their report 035
-/// claim 1). The witnesses below are its callers here.
-#[allow(dead_code)]
+/// Its production caller is the seam's `yield_owned_field_glues` (R541-2); the
+/// ownership-fields producer composes with it too (relay 032 / their report 035
+/// claim 1).
 pub(crate) fn owning_field_form(
     tcx: TyCtxt<'_>,
     table: &DecisionTable,

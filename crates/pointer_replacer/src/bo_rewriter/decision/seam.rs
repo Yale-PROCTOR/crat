@@ -3147,6 +3147,10 @@ pub(crate) struct SeamPlan {
     /// R538-7: the sites where a raw argument loaded from a field of a
     /// converted root was proved not to be that root's alias.
     pub(crate) field_load_exemptions: Vec<super::counted_void::FieldLoadExemption>,
+    /// **R541-2 (wave-6f 065 STOP 3)** — raw-boundary glues NOT planned because an
+    /// applied owning field transaction renders the argument:
+    /// `owned-field-renders:<struct>.<field> caller=<fn> param=<i>`.
+    pub(crate) owned_field_glue_yields: Vec<String>,
     pub(crate) shared_read_calls: Vec<super::shared_read_pairs::SharedCall>,
     pub shared_required: Vec<super::overlapping_pairs::consumer::Permission>,
     pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
@@ -6838,7 +6842,77 @@ pub(crate) fn synthesize_with_raw_boundary(
     // The inventory dedups only when the fn-pointer web is available.
     plan.interface_dependencies.sort();
     plan.interface_dependencies.dedup();
+    yield_owned_field_glues(tcx, table, &mut plan);
     plan
+}
+
+/// **R541-2 (wave-6f 065 STOP 3) — the seam plans no glue over a site an owned-field
+/// transaction renders.** A raw-boundary glue over `(*p).f`, where `f` has an APPLIED
+/// owning transaction, is planned against the field's input (raw) type while the
+/// transaction renders the load in the field's delivered form (`Option<Box<T>>`):
+/// the glue is ill-typed there, and was inert only because the field's wrap claims
+/// the node first (claim order is not a contract). Asked after
+/// `field_reference::finalize`, which is the only point the delivered form exists
+/// (the seam is synthesized after it). The site is left to the transaction and
+/// receipted.
+fn yield_owned_field_glues(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut SeamPlan) {
+    if !table.field_transactions.applied.iter().any(|t| t.owning) {
+        return;
+    }
+    let mut yields = Vec::new();
+    plan.edits.retain(|edit| {
+        if edit.spec.raw_boundary.is_none() {
+            return true;
+        }
+        let Some(field) = owned_field_load_at(tcx, table, edit.span) else {
+            return true;
+        };
+        yields.push(format!(
+            "owned-field-renders:{field} caller={} param={}",
+            edit.caller_fn, edit.param_index
+        ));
+        false
+    });
+    plan.owned_field_glue_yields.extend(yields);
+}
+
+/// `Some("<struct>.<field>")` when the expression at `span` is a load of a field
+/// with an applied owning transaction (`super::field_reference::owning_field_form`).
+fn owned_field_load_at(tcx: TyCtxt<'_>, table: &DecisionTable, span: Span) -> Option<String> {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct Find<'tcx> {
+        span: Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.span {
+                self.found = Some(e);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let owner = tcx
+        .hir_body_owners()
+        .find(|owner| tcx.hir_body_owned_by(*owner).value.span.contains(span))?;
+    let mut find = Find { span, found: None };
+    find.visit_expr(tcx.hir_body_owned_by(owner).value);
+    let mut expr = find.found?;
+    while let rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) =
+        expr.kind
+    {
+        expr = inner;
+    }
+    let rustc_hir::ExprKind::Field(base, field) = expr.kind else {
+        return None;
+    };
+    let typeck = tcx.typeck(owner);
+    let rustc_middle::ty::TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else {
+        return None;
+    };
+    let index = typeck.opt_field_index(expr.hir_id)?;
+    super::field_reference::owning_field_form(tcx, table, adt.did(), index.as_usize())?;
+    Some(format!("{}.{}", tcx.item_name(adt.did()), field.name))
 }
 
 /// **Where an argument's REPLACEMENT TEXT is read from**, which is not always
