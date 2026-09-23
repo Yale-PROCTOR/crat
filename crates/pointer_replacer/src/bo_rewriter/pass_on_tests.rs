@@ -445,7 +445,6 @@ unsafe extern "C" fn HashAndClear(mut data: *mut uint8_t) -> uint32_t {
 "#;
 
 #[test]
-#[ignore = "RED at this commit: the defect is the exact arm's lift mutability, fixed by the next commit (W4-arm, R533-4)"]
 fn w6s13_wave4_shape_a_mutable_caller_is_never_lifted_shared() {
     let (lifts, _receipts, entries) = table(READ_THEN_WRITE);
     let decision = |label: &str| {
