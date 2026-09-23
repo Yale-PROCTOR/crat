@@ -500,10 +500,9 @@ struct Wraps<'a> {
     edits: &'a FxHashMap<(u32, u32), (&'a str, &'static str, &'a [LocalDefId])>,
     guard: &'a mut Composition,
     placed: FxHashSet<(u32, u32)>,
-    /// **Spans this pass YIELDED (R523-3, the floor's sixth arm).** A yielded
-    /// span is removed from `placed` and recorded here, so the `unplaced` check
-    /// below still balances — see the comment at the refusal for why BOTH halves
-    /// of that are load-bearing.
+    /// **Spans this pass YIELDED (R523-3, the floor's sixth arm).** A held span
+    /// STAYS in `placed`: `placed` means "the walk reached this span", so
+    /// `held` is a subset of it and the `unplaced` check needs no arithmetic.
     held: FxHashSet<(u32, u32)>,
     failures: Vec<String>,
 }
@@ -540,12 +539,15 @@ impl MutVisitor for Wraps<'_> {
             // edit missing -- the half-composed shape the floor exists to
             // prevent. wave-6f 058 reached the same key independently.
             //
-            // **`placed.remove` is load-bearing and is not tidying.** The
-            // `insert` above already ran, so without the removal a yielded span
-            // sits in BOTH sets and `placed.len() + held.len()` overshoots
-            // `edits.len()` -- the `unplaced` trap then degrades the program for
-            // exactly the hold just granted, which is the failure this arm
-            // exists to remove.
+            // **The held span STAYS in `placed` (R531, wave-6f 061 defect A).**
+            // An earlier version removed it and balanced `placed + held ==
+            // edits`. That broke on a key mismatch it did not see: `placed` is
+            // keyed by SPAN and `Composition::claim` by `NodeId`, so after the
+            // removal a second node with the same span passed `placed.insert`,
+            // could be granted, and left the span in both sets -- the sum then
+            // overshot and the program degraded under `unplaced` for a wrap that
+            // WAS placed. Keeping the span means a second same-span node hits
+            // `wrap-multi-matched` above, loudly, exactly as before the arm.
             // **An EMPTY withdrawal key cannot hold (R531-7, wave-6f 061).**
             // The hold works by registering `dependent_owners` so the next
             // round withdraws the transaction whole. The commonest owned-field
@@ -562,7 +564,6 @@ impl MutVisitor for Wraps<'_> {
                 return;
             }
             let holder = self.guard.holder(e.id).unwrap_or("unknown-holder");
-            self.placed.remove(&key);
             self.held.insert(key);
             for owner in dependent_owners {
                 let class = super::bridge_receipt::SignatureClassId::of(*owner);
@@ -724,11 +725,9 @@ pub(crate) fn apply_wraps(
             wraps.failures.join(";")
         ));
     }
-    // **The `unplaced` trap, as the other five arms' `unmatched` traps are.** A
-    // yielded span is in neither `placed` nor the crate's edited set, so it is
-    // indistinguishable from a span the walk never reached -- and this check
-    // would degrade the program for the hold the floor just granted.
-    if wraps.placed.len() + wraps.held.len() != edits.len() {
+    // A held span is in `placed` (it was reached; see the refusal), so this is
+    // the check the file had before the arm and needs no correction for holds.
+    if wraps.placed.len() != edits.len() {
         return Err(format!(
             "field-transaction-wrap:unplaced {}/{} (held {})",
             wraps.placed.len(),

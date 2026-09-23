@@ -10538,14 +10538,14 @@ mod graft_floor_tests {
             body.contains("self.held.insert(key)"),
             "field-wrap: a held span must be recorded held, or `unplaced` degrades the program"
         );
-        // **`placed.remove` is load-bearing, not tidying.** The `insert` ran
-        // before the claim, so without the removal a yielded span is in BOTH
-        // sets, `placed + held` overshoots `edits`, and the `unplaced` trap
-        // degrades the program for exactly the hold just granted.
+        // **The held span STAYS in `placed` (R531, defect A).** Removing it made
+        // `placed` (span-keyed) and the claim (NodeId-keyed) disagree, so a
+        // second same-span node could put the span in both sets and degrade the
+        // program under `unplaced` for a wrap that was placed.
         assert!(
-            body.contains("self.placed.remove(&key)"),
-            "field-wrap: the speculative `placed` insert must be undone, or \
-             `placed + held != edits` and the `unplaced` trap fires on the hold"
+            !body.contains("self.placed.remove(&key)"),
+            "field-wrap: a held span must stay in `placed` -- removing it lets a second \
+             same-span node land in both sets and fire `unplaced` on a correct wrap"
         );
         // **R531-7 (wave-6f 061/062): ONE failure is allowed here, and only one.**
         // A collision is the TRANSACTION's problem — except when the transaction
@@ -10589,8 +10589,8 @@ mod graft_floor_tests {
              reverted, so holding `owners` would not withdraw it"
         );
         assert!(
-            code.contains("wraps.placed.len() + wraps.held.len() != edits.len()"),
-            "field-wrap: `unplaced` does not subtract the held set"
+            code.contains("if wraps.placed.len() != edits.len() {"),
+            "field-wrap: with held spans kept in `placed`, the check is the plain one"
         );
     }
 
