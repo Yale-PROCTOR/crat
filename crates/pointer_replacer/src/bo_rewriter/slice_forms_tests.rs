@@ -2103,3 +2103,65 @@ fn wave6s_a_write_beside_the_foreign_read_keeps_the_mutable_slice() {
     let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(flat.contains("text:&mut[libc::c_char]"), "{source}");
 }
+
+/// **R533-4 (wave-4 061 C7) — the exact arm lifts with the SUBJECT's
+/// mutability.** A mutable caller held at `BrotliUnalignedRead32` (a width
+/// READ, whose region is `mutable: false`) that also hands itself to a local
+/// callee writing through it. Lifted at `subject.mutable && region.mutable` it
+/// was `&[u8]` beside a `&mut u8` formal, and the whole program came back
+/// `Degraded` (wave-6s 071 C2). Carried here without the pass-on line (R554-2).
+const W4_READ_THEN_WRITE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn Clear(mut dst: *mut uint8_t) {
+    *dst = 0;
+}
+unsafe extern "C" fn HashAndClear(mut data: *mut uint8_t) -> uint32_t {
+    let h = BrotliUnalignedRead32(data as *const core::ffi::c_void);
+    Clear(data);
+    return h;
+}
+"#;
+
+#[test]
+fn w4_arm_a_mutable_caller_is_never_lifted_shared() {
+    let entries = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(W4_READ_THEN_WRITE),
+        |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>(
+                table
+                    .entries
+                    .iter()
+                    .map(|(s, d)| (s.label.clone(), format!("{d:?}")))
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+    .expect("fixture compiles")
+    .expect("table");
+    let data = entries
+        .iter()
+        .find(|(l, _)| l == "HashAndClear::data")
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| panic!("{entries:#?}"));
+    assert!(
+        !data.starts_with("Slice { mutable: false"),
+        "a mutable caller is never lifted to a SHARED slice: {data}"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(W4_READ_THEN_WRITE)
+    else {
+        panic!("the fixture must emit (it came back Degraded before R533-4)")
+    };
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
