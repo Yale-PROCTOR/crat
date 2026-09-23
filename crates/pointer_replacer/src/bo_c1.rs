@@ -6402,6 +6402,37 @@ mod l2_red_gate {
 #[cfg(test)]
 pub(crate) use run::{CollateralMeasurement, measure_collateral};
 
+/// **R536-5 (wave-6a)** — the exported-surface waivers a program's emission applied:
+/// `(exported-producer-waiver, exported-consumer-waiver)` receipts, one per admitted
+/// unit. Only ADMITTED rows count; a held row is a refusal, not a waiver.
+pub(crate) fn exported_waiver_counts(
+    artifact: &crate::bo_rewriter::RawBoundaryArtifacts,
+) -> (usize, usize) {
+    let admitted = |table: &str, receipt: &str| {
+        table
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                let mut cells = line.split('\t');
+                cells.nth(1) == Some("admitted")
+                    && cells
+                        .next()
+                        .is_some_and(|detail| detail.starts_with(receipt))
+            })
+            .count()
+    };
+    (
+        admitted(
+            &artifact.return_certificate_receipts,
+            "exported-producer-waiver callee=",
+        ),
+        admitted(
+            &artifact.box_param_receipts,
+            "exported-consumer-waiver callee=",
+        ),
+    )
+}
+
 /// Per-mode analysis drivers producing report rows.
 mod run {
     use std::{
@@ -12631,6 +12662,14 @@ mod run {
             // in-memory carrier. Same shape of gap as R450-8's allocator contracts, one
             // family over.
             ("box-param-receipt", artifact.box_param_receipts.as_str()),
+            // **R536-5 (wave-6a)** — the allocation-return certificate receipts reach
+            // the artifact set: every certificate admitted and every refusal with its
+            // typed reason, and the exported-producer waiver's per-site receipts, which
+            // had no published table at all (report 047).
+            (
+                "return-certificate-receipt",
+                artifact.return_certificate_receipts.as_str(),
+            ),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(
@@ -12705,6 +12744,11 @@ mod run {
                 .count()
                 .to_string(),
         );
+        // R536-5: the two exported-surface waivers, counted per program (R481's
+        // discipline for every waiver), from the tables published above.
+        let (producers, consumers) = super::exported_waiver_counts(artifact);
+        row.set(raw_schema::EXPORTED_PRODUCER_WAIVER, producers.to_string());
+        row.set(raw_schema::EXPORTED_CONSUMER_WAIVER, consumers.to_string());
         // R473-3: the count rides beside the table, so the market is auditable without
         // opening it. A `held` line is one refused parameter with its typed reason.
         row.set(

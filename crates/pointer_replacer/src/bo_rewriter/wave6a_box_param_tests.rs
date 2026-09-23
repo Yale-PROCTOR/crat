@@ -1915,3 +1915,41 @@ pub unsafe extern "C" fn ht_release(mut table: *mut ht) {
         );
     }
 }
+
+/// **R536-5 — the two exported-surface waivers, counted per program.** ht's
+/// surface emits both: `ht_create` under the exported-producer waiver
+/// (R517-9, in the certificate receipts) and `ht_destroy` under the
+/// exported-consumer waiver (R534-1, in the box-parameter receipts). The
+/// census counts each from the table it publishes, ADMITTED rows only, and
+/// both tables are registered in the artifact set.
+#[test]
+fn w6a_r536_the_exported_waivers_are_counted_per_program() {
+    let out = emitted("r536-waiver-columns", &with_prelude(EXPORTED_CONSUMER));
+    assert_eq!(
+        crate::bo_c1::exported_waiver_counts(&out.artifacts),
+        (1, 1),
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.box_param_receipts
+    );
+    let unexported = EXPORTED_CONSUMER.replace("#[no_mangle]\n", "");
+    let out = emitted("r536-waiver-columns-none", &with_prelude(&unexported));
+    assert_eq!(crate::bo_c1::exported_waiver_counts(&out.artifacts), (0, 0));
+    let census = include_str!("../bo_c1.rs");
+    for registered in [
+        "(\"box-param-receipt\", artifact.box_param_receipts.as_str())",
+        "artifact.return_certificate_receipts.as_str(),",
+        "row.set(raw_schema::EXPORTED_PRODUCER_WAIVER, producers.to_string());",
+        "row.set(raw_schema::EXPORTED_CONSUMER_WAIVER, consumers.to_string());",
+    ] {
+        assert!(census.contains(registered), "{registered}");
+    }
+    // R450-9: two additive columns of their own.
+    let all = crate::raw_boundary_census_schema::ALL;
+    assert!(all.contains(&crate::raw_boundary_census_schema::EXPORTED_PRODUCER_WAIVER));
+    assert!(all.contains(&crate::raw_boundary_census_schema::EXPORTED_CONSUMER_WAIVER));
+    assert_ne!(
+        crate::raw_boundary_census_schema::EXPORTED_PRODUCER_WAIVER,
+        crate::raw_boundary_census_schema::EXPORTED_CONSUMER_WAIVER
+    );
+}

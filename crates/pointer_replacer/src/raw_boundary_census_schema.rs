@@ -52,6 +52,15 @@ pub(crate) const BOX_PARAM_HELD: &str = "raw_boundary_box_param_held";
 /// A count, per program, beside the box-param holds. It reads 0 until wave-6o's build
 /// lands, and a 0 on a frame that HAS the build is a finding, not a silence.
 pub(crate) const RETENTION_FRAME_BOUNDED: &str = "raw_boundary_retention_frame_bounded";
+/// **R536-5 (wave-6a; the waiver register R517-9 / R534-1)** — exported producers
+/// delivered under the callee-less exported-producer waiver (`exported-producer-waiver
+/// callee=<f>`), counted per program as every waiver is (R481). Read from the
+/// certificate receipts, which the census now publishes as `return-certificate-receipt`.
+pub(crate) const EXPORTED_PRODUCER_WAIVER: &str = "raw_boundary_exported_producer_waiver";
+/// **R536-5 (wave-6a; R534-1, USER)** — exported consumers delivered under the
+/// exported-consumer waiver (`exported-consumer-waiver callee=<f>`), counted per
+/// program from the published `box-param-receipt` table.
+pub(crate) const EXPORTED_CONSUMER_WAIVER: &str = "raw_boundary_exported_consumer_waiver";
 /// **R469-1** — how many rows of wave-6f's `revert_status` column disagree with the
 /// final-revert table. A NOTE, not a verdict: the count rides beside an `emitted`
 /// outcome and the rows are published in their own receipt table.
@@ -273,6 +282,8 @@ pub(crate) const ALL: &[&str] = &[
     REPLAN_STALE,
     BOX_PARAM_HELD,
     RETENTION_FRAME_BOUNDED,
+    EXPORTED_PRODUCER_WAIVER,
+    EXPORTED_CONSUMER_WAIVER,
     FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
