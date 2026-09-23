@@ -1210,18 +1210,84 @@ fn w6a_a1e_a_copying_callee_is_not_a_lend() {
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
             .collect::<Vec<_>>()
     );
-    // R497-3(b) narrows the pass-through to A1-e's companion gate alone, so
-    // `compute::result` keeps the generic model reason here; the gate's own
-    // key is witnessed by `w6a_a1e_an_owned_field_refuses_the_certificate`.
+    // Restated for R528-3: the pass-through is no longer narrowed to A1-e's
+    // companion gate (R497-3(b)), so `compute::result` carries the
+    // certificate's own refusal instead of the generic model reason — its
+    // source is the producer the receiver's refusal withdrew.
     assert_eq!(
         reason_of(&out.degradations, "compute::result").as_deref(),
-        Some("kind-raw"),
+        Some("return-certificate-return-locals"),
         "{:?}",
         out.degradations
             .iter()
             .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
             .collect::<Vec<_>>()
     );
+}
+
+/// **R528-3 — every certificate refusal is its subject's reason.** The copying
+/// control's receiver `run::base` is refused by the receiver-use rule
+/// (`call-argument-not-a-lend:compute(base)`), and until now only A1-e's
+/// companion gate reached the census, so the subject read the model's generic
+/// reason and the certificate's refusal lived only in a receipt no census
+/// writes. The key is the refusal's own family and the detail is the whole
+/// hold, so the wall can be read per subject.
+#[test]
+fn w6a_r528_a_certificate_refusal_is_the_subjects_reason() {
+    let source = HEMAN_IMAGE_CHAIN.replace(
+        "    let mut width = (*heightmap).width;",
+        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    );
+    let out = emitted("r528-refusal-is-the-reason", &source);
+    let rows: Vec<(String, String, String)> = out
+        .degradations
+        .iter()
+        .map(|d| {
+            (
+                d.subject.clone(),
+                d.reason.key().to_owned(),
+                d.reason.detail(),
+            )
+        })
+        .collect();
+    let base = rows
+        .iter()
+        .find(|(subject, ..)| subject == "run::base")
+        .unwrap_or_else(|| panic!("the refused receiver is degraded\n{rows:#?}"));
+    assert_eq!(base.1, "return-certificate-receiver-use", "{rows:#?}");
+    assert!(
+        base.2.contains("call-argument-not-a-lend:compute(base)"),
+        "the detail is the whole hold\n{rows:#?}"
+    );
+}
+
+/// R528-3's key table is total: every hold family `certify` writes (a
+/// `"return-certificate-<family>:` literal outside a receipt) has its own key,
+/// so no refusal collapses into the root key at census.
+#[test]
+fn w6a_r528_every_hold_family_has_a_key() {
+    let source = include_str!("decision/return_certificate.rs");
+    let mut families = std::collections::BTreeSet::new();
+    for line in source.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") || line.contains("receipt") {
+            continue;
+        }
+        for (at, _) in line.match_indices("\"return-certificate-") {
+            let rest = &line[at + 1..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                .unwrap_or(rest.len());
+            if rest[end..].starts_with(':') {
+                families.insert(&rest[..end]);
+            }
+        }
+    }
+    let keys = super::decision::return_certificate::HOLD_KEYS
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(families, keys);
 }
 
 /// Control: the same chain where the lent callee STORES its formal into a raw

@@ -2193,15 +2193,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             if field_reference
                 .is_some_and(|fields| fields.array_load_lift((subject.fn_did, subject.hir_id))) => {
         }
-        Some(SlotKind::Raw) => {
-            // **R496-7**: this arm degrades unconditionally, so a certificate's
-            // own refusal may replace the generic reason here without ever
-            // pre-empting a family that would deliver.
-            if let Some(decision) = return_certificate::held(ctx, subject, &decl_site) {
-                return decision;
-            }
-            return degrade(subject, decl_site, DegradeReason::KindRaw);
-        }
+        // A certificate's refusal is the reason of record for a subject it
+        // refused, but it is written on the SETTLED table
+        // (`return_certificate::relabel_refused`, R528-3), never here.
+        Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
         Some(SlotKind::Owning) => {
             // Item 5 opens borrowed declaration forms. Owning alias emission
             // remains in the separately chartered Box family.
@@ -2240,17 +2235,6 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 // must not pre-empt a producer that would deliver.
                 Err(_) if box_param::lend_leaves_owning(ctx, subject) => {}
                 Err(failure) => {
-                    // **R525-2 — the Owning arm consults the certificate too.**
-                    // The Raw arm has done this since R496-7; without the same
-                    // step here a model-`Owning` subject whose Box family fails
-                    // reports the Box arm's reason and the certificate's own
-                    // refusal never reaches the census, so no model-Owning unit
-                    // can be chased to its actual wall. Consulted only on the
-                    // failure path, so it cannot pre-empt a delivery.
-                    if let Some(decision) = return_certificate::held_final(ctx, subject, &decl_site)
-                    {
-                        return decision;
-                    }
                     return degrade(subject, decl_site, DegradeReason::BoxFailure { failure });
                 }
             }

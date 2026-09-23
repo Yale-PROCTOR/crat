@@ -9014,6 +9014,8 @@ fn finish_decide<'tcx>(
             continue;
         }
         retired.append(&mut table, &prepared.plan);
+        // R528-3: on the settled table, after every family that reads a reason.
+        decision::return_certificate::relabel_refused(&mut table);
         // output.
         if let Err(why) = table.is_self_consistent_over(&subjects) {
             return Err(format!("decision table self-consistency: {why}"));

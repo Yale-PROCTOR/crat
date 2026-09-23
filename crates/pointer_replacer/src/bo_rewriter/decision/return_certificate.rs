@@ -303,62 +303,113 @@ pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject) -> Option<Decision> 
         .map(|plan| Decision::Box(plan.clone()))
 }
 
-/// **R496-7 — the hold passes through, where nothing else would deliver.**
-/// A certificate's REFUSAL used to live only in `Certificates::receipts_tsv()`,
-/// which no census writes, so a subject this family examined and refused was
-/// indistinguishable from one it never saw (report 047: 0 `return-certificate`
-/// reasons in every census table). It now carries its typed reason through the
-/// existing `BoxPlanFailure::NativeEvidenceHeld { prior_key, detail }` — no new
-/// variant and no new census column.
+/// **R528-3 — every certificate-refused subject carries the certificate's own
+/// refusal as its reason.** A refusal used to reach the census only for A1-e's
+/// companion gate (R496-7, narrowed by R497-3(b)); every other refused subject
+/// read the model's generic `kind-raw` or the Box arm's generic failure, so a
+/// model-`Owning` unit could not be chased to its actual wall (ownership-fields
+/// 058 §3). The hold rides the existing `BoxPlanFailure::NativeEvidenceHeld` —
+/// no new variant, no new column: the key is the refusal's own family, the
+/// detail the whole hold.
 ///
-/// It is consulted ONLY in the ladder's `Raw` arm, which degrades
-/// unconditionally, so it can replace a generic `kind-raw` and can never
-/// pre-empt a delivery. Placing it at the pre-model hook instead cost three
-/// W6A-T1 fixtures their whole emission (measured: `tulip-stoch`, `tulip-cci`
-/// and `tulip-cci-web` degraded with two errors attributed to no rewritten
-/// function) because a hold there outranks every family below it.
-/// **R525-2** — the Owning arm's variant. The companion gate
-/// (`…:owned-field`) is a DERIVE-TIME refusal that `finalize` re-derives and
-/// re-admits (ownership-fields 057 §3 (a)), so it is provisional: it may not
-/// become a subject's final reason where another family would still deliver,
-/// and making it one cost ht's exported pair its surface delivery.
-pub(crate) fn held_final(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
-    let (_, hold) = ctx
-        .return_certificates
-        .holds
-        .get(&(subject.fn_did, subject.hir_id))?;
-    if hold.ends_with(":owned-field") {
-        return None;
-    }
-    held(ctx, subject, site)
-}
-
-pub(crate) fn held(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
-    let (_, hold) = ctx
-        .return_certificates
-        .holds
-        .get(&(subject.fn_did, subject.hir_id))?;
-    if !hold.starts_with(PASSED_THROUGH) {
-        return None;
-    }
-    Some(Decision::Degraded(super::Degradation {
-        subject: subject.label.clone(),
-        site: site.to_owned(),
-        reason: super::DegradeReason::BoxFailure {
+/// It runs ONCE, on the settled table, after the family stages. It must not
+/// run inside the ladder: `cursor_native` rescues a `kind-raw` subject and
+/// `ownership_fields_native` re-plans a Box failure by its key, so a reason
+/// rewritten there withdraws a subject from a family that could still deliver
+/// it — which is what the in-arm consultations it replaces risked, and what
+/// cost ht's exported pair its surface delivery (report 068 §2). Here it can
+/// only rename. And it renames only the GENERIC reasons of the two arms the
+/// ruling names — the Raw arm's `kind-raw` and the Box arm's own failure keys
+/// (`generic_box_failure`): a subject degraded for a reason another family
+/// acts on later (`pair-raw-view`, `class-blocked`, `return-not-adapted`,
+/// ...) keeps it, and so does one a family that owns it held with its own
+/// typed reason (`box-flexible-tail-held`, a `box-param-*` key, ...) — that
+/// family examined the subject as its owner and its wall is the nearer one.
+pub(crate) fn relabel_refused(table: &mut DecisionTable) {
+    let holds = &table.return_certificates.holds;
+    for (subject, decision) in &mut table.entries {
+        // Exhaustive by the import-denylist rule.
+        let record = match decision {
+            Decision::Degraded(record) => record,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => continue,
+        };
+        let generic = match &record.reason {
+            super::DegradeReason::KindRaw => true,
+            super::DegradeReason::BoxFailure { failure } => generic_box_failure(failure),
+            _ => false,
+        };
+        if !generic {
+            continue;
+        }
+        let Some((_, hold)) = holds.get(&(subject.fn_did, subject.hir_id)) else {
+            continue;
+        };
+        record.reason = super::DegradeReason::BoxFailure {
             failure: BoxPlanFailure::NativeEvidenceHeld {
-                prior_key: PASSED_THROUGH,
+                prior_key: hold_key(hold),
                 detail: hold.clone(),
             },
-        },
-    }))
+        };
+    }
 }
 
-/// **R497-3(b) — the narrow form.** Only A1-e's companion gate passes through
-/// for now: it is the one key R496-7 needs (the gate that is otherwise
-/// invisible at census), and restricting to it means no other lane's reason pin
-/// moves. The wider set of certificate keys rides a later cut together with
-/// wave-6l's re-pin.
-const PASSED_THROUGH: &str = "return-certificate-struct-field";
+/// The Box arm's own failure keys, which name no family's evidence — as
+/// themselves, or carried as the prior key of the ownership-fields hook's
+/// `NativeEvidenceHeld` (`prior=box-initializer-unsupported; Missing(..)`).
+fn generic_box_failure(failure: &BoxPlanFailure) -> bool {
+    const GENERIC: [BoxPlanFailure; 13] = [
+        BoxPlanFailure::PointerDepth,
+        BoxPlanFailure::ConstructionUnmappable,
+        BoxPlanFailure::ParameterHeld,
+        BoxPlanFailure::EndpointInactive,
+        BoxPlanFailure::EndpointUnjoined,
+        BoxPlanFailure::MoveAmbiguous,
+        BoxPlanFailure::FieldHeld,
+        BoxPlanFailure::BoundaryHeld,
+        BoxPlanFailure::InitializerUnsupported,
+        BoxPlanFailure::ReallocUnsupported,
+        BoxPlanFailure::FreeDuplicate,
+        BoxPlanFailure::StoreFormUnknown,
+        BoxPlanFailure::AstUnplaceable,
+    ];
+    let key = failure.key();
+    GENERIC.iter().any(|plain| plain.key() == key)
+}
+
+/// Every hold family `certify` writes, by its first `:`-segment.
+/// `w6a_r528_every_hold_family_has_a_key` reads this file and fails on a
+/// family missing here, so a new refusal cannot collapse into the root key.
+pub(crate) const HOLD_KEYS: [&str; 14] = [
+    "return-certificate-allocation",
+    "return-certificate-allocation-model",
+    "return-certificate-call-site-not-a-receiver",
+    "return-certificate-chain-open",
+    "return-certificate-indirect-callers",
+    "return-certificate-no-receivers",
+    "return-certificate-owner-use",
+    "return-certificate-receiver-use",
+    "return-certificate-return-locals",
+    "return-certificate-return-shape",
+    "return-certificate-shape",
+    "return-certificate-struct-field",
+    "return-certificate-struct-literal",
+    "return-certificate-transfer-unconfirmed",
+];
+
+fn hold_key(hold: &str) -> &'static str {
+    let family = hold.split(':').next().unwrap_or(hold);
+    HOLD_KEYS
+        .iter()
+        .copied()
+        .find(|key| *key == family)
+        .unwrap_or("return-certificate")
+}
 
 /// After the decisions: unannotated receivers get their `Box<..>` spelled out.
 pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
@@ -1241,44 +1292,6 @@ fn first_use_is(tcx: TyCtxt<'_>, subject: &Subject, statement: Span) -> Option<(
     };
     first.visit_body(tcx.hir_body(body_id));
     statement.contains(first.first?).then_some(())
-}
-
-/// `Box::new(crate::S { .. })` with every field zeroed (numeric, bool, raw
-/// pointer), or the field that has no zero.
-fn struct_initializer<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    pointee: rustc_middle::ty::Ty<'tcx>,
-) -> Result<String, String> {
-    let TyKind::Adt(adt, args) = pointee.kind() else {
-        return Err("not-a-struct".to_owned());
-    };
-    if !adt.is_struct() {
-        return Err("not-a-struct".to_owned());
-    }
-    let mut fields = Vec::new();
-    for field in &adt.non_enum_variant().fields {
-        let ty = field.ty(tcx, args);
-        let zero = match ty.kind() {
-            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
-                format!("0 as {}", pointee_source(tcx, ty))
-            }
-            TyKind::Bool => "false".to_owned(),
-            TyKind::RawPtr(..) => format!("0 as {}", pointee_source(tcx, ty)),
-            _ => return Err(format!("struct-field:{}", field.name)),
-        };
-        fields.push(format!("{}: {zero}", field.name));
-    }
-    // Printed once through the AST printer so the use graft's whitespace-
-    // insensitive round trip holds whatever line width the printer chooses
-    // (a short literal loses its trailing comma, a long one keeps it).
-    let text = format!(
-        "Box::new(crate::{} {{ {} }})",
-        tcx.def_path_str(adt.did()),
-        fields.join(", ")
-    );
-    Ok(rustc_ast_pretty::pprust::expr_to_string(
-        &::utils::ast::parse_expr(text),
-    ))
 }
 
 /// Is the callee's formal at `index` a LEND — a position that neither keeps
