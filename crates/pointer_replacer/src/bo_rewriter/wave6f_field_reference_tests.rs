@@ -2862,3 +2862,139 @@ fn w6f_a_write_below_an_owned_field_deref_takes_the_mutable_view() {
     assert_eq!(reverted, 0, "the tree compiles: nothing reverted\n{source}");
     assert!(emitted_count > 0, "{source}");
 }
+
+/// Claim every expression whose span is one of `spans` for an incumbent
+/// claimant, so the field-transaction wraps that follow are REFUSED — the
+/// collision the sixth arm exists for, constructed rather than waited for.
+struct IncumbentClaims<'a> {
+    spans: &'a rustc_hash::FxHashSet<(u32, u32)>,
+    guard: &'a mut super::ast_transform::Composition,
+    claimed: usize,
+}
+
+impl rustc_ast::mut_visit::MutVisitor for IncumbentClaims<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        rustc_ast::mut_visit::walk_expr(self, e);
+        if self.spans.contains(&(e.span.lo().0, e.span.hi().0))
+            && self.guard.claim(e.id, e.span, "w6f-test:incumbent")
+        {
+            self.claimed += 1;
+        }
+    }
+}
+
+/// Run `apply_wraps` on `source` with every wrap node of `(struct, field)`
+/// already claimed by an incumbent. Returns the result, how many nodes the
+/// incumbent took, and the classes the round registered as held.
+fn wraps_under_incumbent(
+    source: &str,
+    struct_name: &str,
+    field: &str,
+) -> (Result<(), String>, usize, usize) {
+    let struct_name = struct_name.to_owned();
+    let field = field.to_owned();
+    ::utils::compilation::run_compiler_on_str(source, move |tcx| {
+        // The expanded AST FIRST: deciding the table lowers the crate and
+        // steals the resolver's copy of it.
+        let mut krate = ::utils::ast::expanded_ast(tcx);
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let t = table
+            .field_transactions
+            .applied
+            .iter()
+            .find(|t| t.struct_path.ends_with(struct_name.as_str()) && t.field_name == field)
+            .unwrap_or_else(|| panic!("no applied transaction for {struct_name}.{field}"));
+        let spans: rustc_hash::FxHashSet<(u32, u32)> = t
+            .expression_edits
+            .iter()
+            .filter(|e| e.wrap)
+            .map(|e| (e.span.lo().0, e.span.hi().0))
+            .collect();
+        let mut guard = super::ast_transform::Composition::default();
+        let mut incumbent = IncumbentClaims {
+            spans: &spans,
+            guard: &mut guard,
+            claimed: 0,
+        };
+        rustc_ast::mut_visit::MutVisitor::visit_crate(&mut incumbent, &mut krate);
+        let claimed = incumbent.claimed;
+        super::ast_transform::reset_graft_held();
+        let result = super::field_reference_ast::apply_wraps(
+            &table,
+            &super::ast_transform::RevertSet::default(),
+            &mut krate,
+            &mut guard,
+        );
+        (
+            result,
+            claimed,
+            super::ast_transform::graft_held_classes().len(),
+        )
+    })
+    .unwrap()
+}
+
+/// Witness 37 (R531-7, wave-6f 061 defect B) — **a refused wrap on a
+/// transaction with NO withdrawal key fails loud; one WITH a key yields.**
+///
+/// The sixth arm holds a refused `field:wrap` by registering the transaction's
+/// `dependent_owners`, so the next round withdraws it whole. On the commonest
+/// owned-field idiom that set is EMPTY (witness 35): the loop registered
+/// nothing, wrote no receipt, still balanced `placed + held`, and `apply_wraps`
+/// returned `Ok` — the transaction shipped half-wrapped, silently. No key can
+/// withdraw it (`active` is vacuously true for an empty key), so the one sound
+/// answer is the one the file had before the arm: a failure the program sees,
+/// `wrap-claim-refused-no-key:<span>`.
+///
+/// Both halves are driven here by an incumbent that claims every wrap node
+/// first: the empty-key transaction must fail loud, and avl's `Node.left` —
+/// six dependent owners — must still YIELD, holding its classes and returning
+/// `Ok`, so the branch cannot be mistaken for undoing the arm.
+#[test]
+fn w6f_a_refused_wrap_with_no_withdrawal_key_fails_loud() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-malloc-free-field-frame",
+        vec![("holder".to_owned(), 0, SlotKind::Owning)],
+        Vec::new(),
+    );
+    let (no_key, no_key_claimed, no_key_held) =
+        wraps_under_incumbent(MALLOC_FREE_FIELD, "holder", "buf");
+    super::test_model_override::clear();
+    assert!(
+        no_key_claimed > 0,
+        "the incumbent must take a wrap node for this to test anything"
+    );
+    let why = no_key
+        .expect_err("an empty withdrawal key cannot hold: the refusal must reach the program");
+    assert!(
+        why.contains("wrap-claim-refused-no-key:"),
+        "the failure names the missing key, not a generic refusal: {why}"
+    );
+    assert_eq!(no_key_held, 0, "nothing was registered as held");
+
+    avl_frame();
+    let (keyed, keyed_claimed, keyed_held) = wraps_under_incumbent(AVL, "Node", "left");
+    super::test_model_override::clear();
+    assert!(
+        keyed_claimed > 0,
+        "the incumbent must take a wrap node on avl too"
+    );
+    assert_eq!(
+        keyed,
+        Ok(()),
+        "a transaction WITH a withdrawal key still yields — the branch is not the arm undone"
+    );
+    assert!(
+        keyed_held > 0,
+        "…and it registers its dependent owners as held"
+    );
+}

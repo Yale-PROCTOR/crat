@@ -546,6 +546,21 @@ impl MutVisitor for Wraps<'_> {
             // `edits.len()` -- the `unplaced` trap then degrades the program for
             // exactly the hold just granted, which is the failure this arm
             // exists to remove.
+            // **An EMPTY withdrawal key cannot hold (R531-7, wave-6f 061).**
+            // The hold works by registering `dependent_owners` so the next
+            // round withdraws the transaction whole. The commonest owned-field
+            // idiom -- `s->buf = malloc(n); if (!s->buf) ..; free(s->buf);` --
+            // has none: a call-result store, a NULL test and a cast into the
+            // deallocator are not dependent kinds. Registering nothing would
+            // leave the transaction ACTIVE with this site un-wrapped, with no
+            // receipt, and `active` is vacuously true for an empty key, so no
+            // revert could ever withdraw it. That is the one refusal the
+            // program must see.
+            if dependent_owners.is_empty() {
+                self.failures
+                    .push(format!("wrap-claim-refused-no-key:{key:?}"));
+                return;
+            }
             let holder = self.guard.holder(e.id).unwrap_or("unknown-holder");
             self.placed.remove(&key);
             self.held.insert(key);

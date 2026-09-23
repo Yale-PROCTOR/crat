@@ -10547,9 +10547,37 @@ mod graft_floor_tests {
             "field-wrap: the speculative `placed` insert must be undone, or \
              `placed + held != edits` and the `unplaced` trap fires on the hold"
         );
+        // **R531-7 (wave-6f 061/062): ONE failure is allowed here, and only one.**
+        // A collision is the TRANSACTION's problem — except when the transaction
+        // has NO withdrawal key: the hold registers `dependent_owners`, the
+        // commonest owned-field idiom has none, and registering nothing ships the
+        // transaction half-wrapped with no receipt. That refusal, and only that
+        // one, reaches the program as `wrap-claim-refused-no-key`.
+        //
+        // Read WHITESPACE-FREE: rustfmt splits this push as `self.failures` /
+        // `.push(..)`, and a needle with the dot attached never matched a split
+        // push — the check this replaces passed vacuously on exactly that shape.
+        let compact: String = body.split_whitespace().collect();
+        let pushes = compact.matches("self.failures.push(").count();
+        let no_key_pushes = compact
+            .matches("self.failures.push(format!(\"wrap-claim-refused-no-key:{key:?}\"))")
+            .count();
+        assert_eq!(
+            (pushes, no_key_pushes),
+            (1, 1),
+            "field-wrap: the only failure a refusal may push is the empty-key one — \
+             a collision is otherwise the TRANSACTION's problem, never the program's"
+        );
+        let guard_at = compact
+            .find("ifdependent_owners.is_empty(){")
+            .expect("field-wrap: the no-key failure is guarded by `dependent_owners.is_empty()`");
+        let push_at = compact.find("self.failures.push(").expect("counted above");
+        let hold_at = compact
+            .find("record_graft_held(")
+            .expect("counted by the assertion above");
         assert!(
-            !body.contains("self.failures.push"),
-            "field-wrap: a collision is the TRANSACTION's problem, never the program's"
+            guard_at < push_at && push_at < hold_at,
+            "field-wrap: the empty-key failure is decided BEFORE the hold, inside its guard"
         );
         // The CONSTRUCTION site, not the refusal body: `dependent_owners` there
         // is only the destructured binding's name, so a swap at the construction
