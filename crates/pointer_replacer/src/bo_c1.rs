@@ -12835,9 +12835,17 @@ mod run {
                 _ => {}
             }
         }
+        // **R526-2: `emitted_form`, appended.** `family` is the MODEL's kind; the
+        // form a realized subject was emitted in is the rewriter's `decision` — the
+        // two differ exactly where a certificate emits `Box` over a model Raw
+        // (batch 28: quadtree_node_new::node#2 = Box, split_node_'s four =
+        // Option<Box>, heman's three = &). A subject that was not realized keeps
+        // its input form, which is what `unchanged` says. Appended LAST so every
+        // reader that joins by column name is unaffected.
         let mut subject_outcomes = String::from(
-            "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\n",
+            "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\temitted_form\n",
         );
+        let mut realized_model_raw = 0usize;
         let mut tally = super::RawBoundarySubjectTally::default();
         let mut delivered_by_ledger = BTreeSet::new();
         for subject in named_tsv_rows(&capture.subject_receipt) {
@@ -12860,8 +12868,17 @@ mod run {
             // both laws live in `RawBoundarySubjectTally`, which is what the
             // unit test exercises.
             tally.observe(family, delivery);
+            let realized = delivery == super::RawBoundarySubjectDelivery::Realized;
+            if realized && family == "raw" {
+                realized_model_raw += 1;
+            }
+            let emitted_form = if realized {
+                subject.get("decision").map_or("-", String::as_str)
+            } else {
+                "unchanged"
+            };
             subject_outcomes.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 subject_key,
                 owner_fn,
                 family,
@@ -12869,6 +12886,7 @@ mod run {
                 exclusion,
                 delivery.key(),
                 delivery.revert_scope(),
+                emitted_form,
             ));
         }
         std::fs::write(
@@ -12887,6 +12905,7 @@ mod run {
             tally.reverted_program,
         );
         row.set(raw_schema::TYPED_EXCLUDED_SUBJECTS, tally.typed_excluded);
+        row.set(raw_schema::REALIZED_MODEL_RAW_FAMILY, realized_model_raw);
 
         let custody_sources = capture.emitted_files.as_ref().map(|files| {
             files
@@ -26179,6 +26198,50 @@ fn r456_3_the_frame_admission_is_its_own_column_and_never_the_cache_status() {
             .filter(|key| **key == schema::CACHE_FRAME_ADMISSION)
             .count(),
         1
+    );
+}
+
+/// **R526-2 — the two columns that reconcile the record key with `.kv`.** At batch 28
+/// the record (`delivery=realized-as-predicted`, all families) read 2,473 while
+/// `raw_boundary_realized_subjects` read 2,465; the 8 were realized subjects whose MODEL
+/// family is `raw`, emitted safe by the certificate (Box, Option<Box> x4, & x3). The
+/// first column puts that difference on the row; the second puts the emitted form beside
+/// the model's family, so "raw family, realized" is no longer a riddle.
+#[test]
+fn r526_2_the_realized_model_raw_family_and_emitted_form_columns() {
+    use crate::raw_boundary_census_schema as schema;
+    let source = include_str!("bo_c1.rs");
+    // Production only: this test's own text contains every needle below.
+    let source = &source[..source
+        .find("fn r526_2_the_realized_model_raw_family_and_emitted_form_columns")
+        .expect("this test is in the file")];
+    assert!(
+        schema::ALL.contains(&schema::REALIZED_MODEL_RAW_FAMILY),
+        "the new .kv column must be registered in the one schema authority"
+    );
+    assert!(
+        source.contains("row.set(raw_schema::REALIZED_MODEL_RAW_FAMILY, realized_model_raw);"),
+        "the census must WRITE the model-raw realized count on every program row"
+    );
+    assert!(
+        source.contains("\\trevert_scope\\temitted_form\\n"),
+        "emitted_form must be APPENDED after revert_scope, so readers that join by name are unaffected"
+    );
+    let at = source
+        .find("let emitted_form = if realized {")
+        .expect("emitted_form is chosen from the delivery");
+    let body = &source[at..at + 220];
+    assert!(
+        body.contains("subject.get(\"decision\")"),
+        "a realized row's form is the rewriter's DECISION, not the model's family"
+    );
+    assert!(
+        body.contains("\"unchanged\""),
+        "a non-realized row keeps its input form and must say so"
+    );
+    assert!(
+        source.contains("if realized && family == \"raw\""),
+        "the count is realized rows whose MODEL family is raw -- not whose decision is"
     );
 }
 

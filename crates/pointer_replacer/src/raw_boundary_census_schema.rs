@@ -81,6 +81,12 @@ pub(crate) const DEGRADED_SUBJECTS: &str = "raw_boundary_degraded_subjects";
 pub(crate) const REVERTED_FUNCTION_SUBJECTS: &str = "raw_boundary_reverted_function_subjects";
 pub(crate) const REVERTED_PROGRAM_SUBJECTS: &str = "raw_boundary_reverted_program_subjects";
 pub(crate) const TYPED_EXCLUDED_SUBJECTS: &str = "raw_boundary_typed_excluded_subjects";
+/// **R526-2** — realized subjects whose MODEL family is `raw` (the certificate or
+/// another arm emitted them in a safe form over the model's Raw). They are in
+/// `delivery=realized-as-predicted` and NOT in `REALIZED_SUBJECTS`, which counts
+/// the safe families only; this column is the difference, so the two keys can be
+/// reconciled from the row instead of re-derived from the tables (batch 28: 8).
+pub(crate) const REALIZED_MODEL_RAW_FAMILY: &str = "raw_boundary_realized_model_raw_family";
 pub(crate) const EMITTED_TREE_STATUS: &str = "raw_boundary_emitted_tree_status";
 pub(crate) const INPUT_TREE_SHA256: &str = "raw_boundary_input_tree_sha256";
 pub(crate) const EMITTED_TREE_SHA256: &str = "raw_boundary_emitted_tree_sha256";
@@ -293,6 +299,7 @@ pub(crate) const ALL: &[&str] = &[
     REVERTED_FUNCTION_SUBJECTS,
     REVERTED_PROGRAM_SUBJECTS,
     TYPED_EXCLUDED_SUBJECTS,
+    REALIZED_MODEL_RAW_FAMILY,
     EMITTED_TREE_STATUS,
     INPUT_TREE_SHA256,
     EMITTED_TREE_SHA256,
