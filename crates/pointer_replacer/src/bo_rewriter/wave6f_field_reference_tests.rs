@@ -1317,6 +1317,7 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
 const AVL: &str = include_str!("wave6f_fixture_avl.rs");
 const QUADTREE_ROOT: &str = include_str!("wave6f_fixture_quadtree_root.rs");
 const MALLOC_FREE_FIELD: &str = include_str!("wave6f_fixture_malloc_free_field.rs");
+const OWNED_SUBFIELD_WRITE: &str = include_str!("wave6f_fixture_owned_subfield_write.rs");
 
 /// era-5c-shaped frame for avl (the rotation family, relay 003 §2): both
 /// `Node` pointer fields Owning, the rotation's owners Owning, the readers
@@ -2804,4 +2805,60 @@ fn w6f_malloc_free_field_has_an_empty_withdrawal_key() {
         ],
         "every edit it owns is a WRAP — each one a site the sixth arm can hold"
     );
+}
+
+/// Witness 36 (R531-7, wave-6a 077 §1) — **a write one projection below an
+/// owned field's deref takes the MUTABLE view.**
+///
+/// `(*(*t).entries).key = 3` rendered `(*(*t).entries.as_deref().unwrap()).key
+/// = 3` — E0594, assignment through `&` — and the program failed to emit
+/// ("2 errors attributed to no rewritten function"). The deref site's
+/// `written` flag asked only whether the DEREF was an assignment's left side;
+/// here its parent is the `.key` projection. A place is written when it is the
+/// left side of `=` or of a compound assignment, or the operand of `&mut`,
+/// after climbing any field / index projections. The read in `table_get` keeps
+/// the shared view — that is the control that the fix is not "always mut".
+#[test]
+fn w6f_a_write_below_an_owned_field_deref_takes_the_mutable_view() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    let set = || {
+        super::test_model_override::set(
+            "w6f-owned-subfield-write-frame",
+            vec![("table".to_owned(), 0, SlotKind::Owning)],
+            Vec::new(),
+        )
+    };
+    set();
+    let observed = observe(OWNED_SUBFIELD_WRITE);
+    let row = field_row(&observed, "table", "entries");
+    assert_eq!(
+        (row.2.as_str(), row.3.as_str()),
+        ("applied", "opt-box"),
+        "the owned field delivers: {row:?}"
+    );
+    let outcome = emitted("owned-subfield-write", OWNED_SUBFIELD_WRITE);
+    super::test_model_override::clear();
+    let (source, emitted_count, reverted) = emitted_source(&outcome);
+    // CODE only: the fixture's doc comment quotes the E0594 rendering verbatim,
+    // and a check that reads comments passes or fails on prose.
+    let flat: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "(*(*t).entries.as_deref_mut().unwrap()).key = 3",
+        "(*(*t).entries.as_deref_mut().unwrap()).value += 1",
+        "return (*(*t).entries.as_deref().unwrap()).key;",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    assert!(
+        !flat.contains("(*(*t).entries.as_deref().unwrap()).key = 3"),
+        "the E0594 rendering is gone"
+    );
+    assert_eq!(reverted, 0, "the tree compiles: nothing reverted\n{source}");
+    assert!(emitted_count > 0, "{source}");
 }

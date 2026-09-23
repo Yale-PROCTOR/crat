@@ -680,6 +680,30 @@ impl FieldTransactions {
     }
 }
 
+/// Whether the place `place` is WRITTEN, after climbing the field and index
+/// projections built on it: it is the left side of `=` or of a compound
+/// assignment, or the operand of `&mut`. `*PLACE.f = v`, `(*PLACE.f).x = v`,
+/// `(*PLACE.f).x += v` and `&mut (*PLACE.f).a[i]` are all writes through the
+/// field; anything else reads it (R531-7).
+fn place_is_written(tcx: TyCtxt<'_>, mut place: HirId) -> bool {
+    loop {
+        let Node::Expr(parent) = tcx.parent_hir_node(place) else {
+            return false;
+        };
+        match parent.kind {
+            ExprKind::Field(base, _) if base.hir_id == place => place = parent.hir_id,
+            ExprKind::Index(base, _, _) if base.hir_id == place => place = parent.hir_id,
+            ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
+                return lhs.hir_id == place;
+            }
+            ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, operand) => {
+                return operand.hir_id == place;
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn wants_slice_of(sites: &[Site]) -> bool {
     sites
         .iter()
@@ -1060,13 +1084,11 @@ impl<'tcx> Collector<'_, 'tcx> {
             },
             ExprKind::Unary(UnOp::Deref, _) => {
                 let mut deref = site(SiteKind::Deref, field.span, None, None, None);
-                // `*PLACE.f = v` writes through the field; a read takes the
-                // shared view.
-                deref.written = matches!(
-                    tcx.parent_hir_node(parent.hir_id),
-                    Node::Expr(assign)
-                        if matches!(assign.kind, ExprKind::Assign(lhs, _, _) if lhs.hir_id == parent.hir_id)
-                );
+                // `*PLACE.f = v` writes through the field, and so does
+                // `(*PLACE.f).x = v` one projection below it (wave-6a 077 §1:
+                // that shape took the shared view and was E0594); a read
+                // takes the shared view.
+                deref.written = place_is_written(tcx, parent.hir_id);
                 self.push(key, deref);
             }
             ExprKind::MethodCall(segment, receiver, args, _) if receiver.hir_id == field.hir_id => {
