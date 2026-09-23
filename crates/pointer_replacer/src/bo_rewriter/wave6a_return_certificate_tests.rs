@@ -1053,7 +1053,6 @@ fn w6a_a1_a_conditional_return_carries_the_option_on_its_arms() {
 /// allocation, reads the field back through a CAST to a different pointee
 /// (`(*result).data as *mut Vec3`), walks it, and returns the owner.
 const HEMAN_IMAGE_CHAIN: &str = r#"
-// w6a-a1e-owned-field-frame
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
 extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -1333,9 +1332,18 @@ fn w6a_a1e_an_owned_field_refuses_the_certificate() {
     // the plain chain `image_create::img` is Owning-modeled and delivers a Box
     // on its own, so the hold has nowhere to show. The copy that report 042's
     // control uses is exactly what makes the model drop `Owning` here.
-    let source = HEMAN_IMAGE_CHAIN.replace(
-        "    let mut width = (*heightmap).width;",
-        "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+    //
+    // The override is keyed on a marker in the fixture's source, so the
+    // marker lives in THIS test's copy only: when it sat in the shared
+    // `HEMAN_IMAGE_CHAIN`, every heman-chain test that ran while this one held
+    // the override read the owned-field model too (R528-2: measured at 8
+    // threads, `w6a_a1e_a_copying_callee_is_not_a_lend` held `…:owned-field`).
+    let source = format!(
+        "// w6a-a1e-owned-field-frame\n{}",
+        HEMAN_IMAGE_CHAIN.replace(
+            "    let mut width = (*heightmap).width;",
+            "    let mut alias = heightmap;\n    let mut width = (*alias).width;",
+        )
     );
     let out = emitted("a1-owned-field", &source);
     super::test_model_override::clear();
