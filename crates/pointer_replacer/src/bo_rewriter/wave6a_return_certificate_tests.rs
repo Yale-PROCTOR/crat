@@ -1501,6 +1501,85 @@ fn w6a_r528_a_delivered_owned_field_withdraws_the_certificate() {
     );
 }
 
+/// **R531-4 (i), main's guard (a).** The widening is reason-only because it
+/// never runs where a family could still deliver: no in-ladder consultation
+/// (`held` / `held_final`) exists any more, and the one rename runs exactly
+/// once, on the settled table right after `retired.append`, with no decision
+/// made after it in `finish_decide`. Its body rewrites only a degraded
+/// record's reason — never a decision. A later edit that adds a call site in
+/// the ladder, moves the call ahead of a decide, or lets the rename touch a
+/// decision turns this red.
+#[test]
+fn w6a_r531_the_rename_runs_once_on_the_settled_table() {
+    let pipeline = include_str!("mod.rs");
+    let ladder = include_str!("decision/mod.rs");
+    let certificate = include_str!("decision/return_certificate.rs");
+    let code = |text: &'static str| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect::<Vec<_>>()
+    };
+    for (name, text) in [
+        ("mod.rs", pipeline),
+        ("decision/mod.rs", ladder),
+        ("return_certificate.rs", certificate),
+    ] {
+        for line in code(text) {
+            assert!(
+                !line.contains("return_certificate::held(")
+                    && !line.contains("return_certificate::held_final(")
+                    && !line.contains("fn held(")
+                    && !line.contains("fn held_final("),
+                "{name}: an in-ladder consultation is back: {line}"
+            );
+        }
+    }
+    let lines = code(pipeline);
+    let calls = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("relabel_refused("))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "exactly one rename");
+    assert!(
+        code(ladder)
+            .iter()
+            .all(|line| !line.contains("relabel_refused(")),
+        "never inside the ladder"
+    );
+    let at = calls[0];
+    assert_eq!(
+        lines[at - 1],
+        "retired.append(&mut table, &prepared.plan);",
+        "the rename sits on the settled table, after the stage loop's last stage"
+    );
+    let rest = lines[at..]
+        .iter()
+        .take_while(|line| !line.starts_with("return Ok((table, context));"))
+        .collect::<Vec<_>>();
+    assert!(
+        rest.iter().all(|line| !line.contains("decision::decide(")),
+        "no decision is made after the rename"
+    );
+    let body = certificate
+        .split("pub(crate) fn relabel_refused(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("the rename's body");
+    let writes = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && line.contains(" = ") && !line.starts_with("let "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        writes,
+        ["record.reason = super::DegradeReason::BoxFailure {"],
+        "{body}"
+    );
+}
+
 /// R528-3's key table is total: every hold family `certify` writes (a
 /// `"return-certificate-<family>:` literal outside a receipt) has its own key,
 /// so no refusal collapses into the root key at census.
