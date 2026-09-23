@@ -1938,7 +1938,7 @@ fn w6a_r536_the_exported_waivers_are_counted_per_program() {
     let census = include_str!("../bo_c1.rs");
     for registered in [
         "(\"box-param-receipt\", artifact.box_param_receipts.as_str())",
-        "artifact.return_certificate_receipts.as_str(),",
+        "stamp(&artifact.return_certificate_receipts),",
         "row.set(raw_schema::EXPORTED_PRODUCER_WAIVER, producers.to_string());",
         "row.set(raw_schema::EXPORTED_CONSUMER_WAIVER, consumers.to_string());",
     ] {

@@ -12675,14 +12675,6 @@ mod run {
             // in-memory carrier. Same shape of gap as R450-8's allocator contracts, one
             // family over.
             ("box-param-receipt", artifact.box_param_receipts.as_str()),
-            // **R536-5 (wave-6a)** — the allocation-return certificate receipts reach
-            // the artifact set: every certificate admitted and every refusal with its
-            // typed reason, and the exported-producer waiver's per-site receipts, which
-            // had no published table at all (report 047).
-            (
-                "return-certificate-receipt",
-                artifact.return_certificate_receipts.as_str(),
-            ),
             // **R541-6** — wave-6v's field-load alias exemptions, one row per site.
             (
                 "field-load-exemption-receipt",

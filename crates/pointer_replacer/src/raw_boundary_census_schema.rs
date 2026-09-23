@@ -53,11 +53,12 @@ pub(crate) const BOX_PARAM_HELD: &str = "raw_boundary_box_param_held";
 /// lands, and a 0 on a frame that HAS the build is a finding, not a silence.
 pub(crate) const RETENTION_FRAME_BOUNDED: &str = "raw_boundary_retention_frame_bounded";
 /// **R536-5 (wave-6a; the waiver register R517-9 / R534-1)** — exported producers
-/// delivered under the callee-less exported-producer waiver (`exported-producer-waiver
+/// admitted under the callee-less exported-producer waiver (`exported-producer-waiver
 /// callee=<f>`), counted per program as every waiver is (R481). Read from the
-/// certificate receipts, which the census now publishes as `return-certificate-receipt`.
+/// certificate receipts, which the census publishes as `return-certificate-receipts`
+/// (R523-4). A certificate admitted and then reverted by verify still counts.
 pub(crate) const EXPORTED_PRODUCER_WAIVER: &str = "raw_boundary_exported_producer_waiver";
-/// **R536-5 (wave-6a; R534-1, USER)** — exported consumers delivered under the
+/// **R536-5 (wave-6a; R534-1, USER)** — exported consumers admitted under the
 /// exported-consumer waiver (`exported-consumer-waiver callee=<f>`), counted per
 /// program from the published `box-param-receipt` table.
 pub(crate) const EXPORTED_CONSUMER_WAIVER: &str = "raw_boundary_exported_consumer_waiver";
