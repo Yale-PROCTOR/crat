@@ -11,7 +11,10 @@
 //!   although union members overlap (W1);
 //! - `(*(p as *mut U)).b` beside `(*p).a` certified on the differing names,
 //!   although `U.b` and `T.a` sit at the same offset (W2);
-//! - the same through a folded view binding whose initializer casts (W3).
+//! - the same through a folded view binding whose initializer casts (W3);
+//! - two fields of ONE structure each widened by a cast on the argument, so
+//!   the callee's wider accesses overlap (W4). The parent key alone refuses
+//!   W2 and W3; W4 is the shape only the retyping mark refuses.
 //!
 //! Every fixture's callee takes two formals of ONE pointee type, so the type
 //! rule refuses `same-type` and the pair reaches (c) — otherwise the type
@@ -69,6 +72,11 @@ pub unsafe fn take2(mut p: *mut u32, mut q: *mut u32) {
     *p = 1;
     *q = 2;
 }
+
+pub unsafe fn take2_wide(mut p: *mut u64, mut q: *mut u64) {
+    *p = 1;
+    *q = 2;
+}
 "#;
 
 fn source(body: &str) -> String {
@@ -95,6 +103,19 @@ const CAST_IN_VIEW: &str = r#"
 pub unsafe fn CastInView(mut h: *mut Holder) {
     let mut br: *mut U = &mut (*h).t as *mut T as *mut U;
     take2(&mut (*br).b, &mut (*h).t.a);
+}
+"#;
+
+/// W4: the cast is on the ARGUMENT, after the spine. Both spines are fields of
+/// one `T` — the parent key cannot object — but each argument is widened to
+/// `*mut u64`, so the callee's eight-byte store through `&(*h).a` covers
+/// `(*h).b`. Only the retyping mark refuses this shape.
+const WIDENED_ARGUMENTS: &str = r#"
+pub unsafe fn WidenedArguments(mut h: *mut T) {
+    take2_wide(
+        &mut (*h).a as *mut u32 as *mut u64,
+        &mut (*h).b as *mut u32 as *mut u64,
+    );
 }
 "#;
 
@@ -154,6 +175,21 @@ fn w6p_a_cast_inside_a_folded_view_forms_no_spine() {
     assert!(
         verdict.is_err(),
         "the view retypes `(*h).t` as `U`, so `.b` overlaps `(*h).t.a`: got {verdict:?}"
+    );
+}
+
+#[test]
+fn w6p_a_type_changing_argument_cast_forms_no_spine() {
+    let verdict = verdict_of(
+        &source(WIDENED_ARGUMENTS),
+        "WidenedArguments",
+        "take2_wide",
+        0,
+        1,
+    );
+    assert!(
+        verdict.is_err(),
+        "an eight-byte store through `&(*h).a` covers `(*h).b`: got {verdict:?}"
     );
 }
 
