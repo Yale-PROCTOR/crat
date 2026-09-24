@@ -164,3 +164,93 @@ fn r499_1b_a_fallback_containing_an_argument_bridge_still_collides() {
         finalization.collisions
     );
 }
+
+/// **R554-5 (ii) — a fallback yields only to an edit that will apply.** brotli at batch 31:
+/// the fallback in `BrotliHistogramCombine*` (1834–1836) yields to the caller's
+/// `box-expression` for `clusters#19` (1849–1851) — but every `box-expression` in those caller
+/// classes ends `dropped: intra-class-interval-overlap`. The edit the yield protects is never
+/// applied, so the yield held 18 subjects for nothing. Here the contained class is
+/// intra-held (two of its own edits overlap); the fallback's class must stay ready, and the
+/// pair must not turn into a cross-class collision either.
+#[test]
+fn r554_5_a_fallback_does_not_yield_to_an_edit_whose_class_is_intra_held() {
+    let (fallback, caller) = (class(1835), class(1849));
+    let mut held = ClassInput::new(caller, Default::default());
+    // Two of the caller's own edits overlap partially, so neither composes: intra-class hold.
+    held.sites.push(ClassSite::edit(
+        caller,
+        caller,
+        Arm::Surface,
+        FILE,
+        8_180_398,
+        8_180_437,
+        "box-expression",
+    ));
+    held.sites.push(ClassSite::edit(
+        caller,
+        caller,
+        Arm::Surface,
+        FILE,
+        8_180_430,
+        8_180_450,
+        "subject-use",
+    ));
+    let finalization = finalize_class_inputs(vec![
+        input(
+            fallback,
+            Arm::Pair,
+            8_180_243,
+            8_180_565,
+            "a5-site-proof-t2-fallback",
+        ),
+        held,
+    ]);
+    assert!(
+        finalization.classes[&caller]
+            .hold_reasons()
+            .iter()
+            .any(|reason| reason == "intra-class-interval-overlap"),
+        "AUTHORING PREMISE: the contained edit's class is intra-held: {:#?}",
+        finalization.classes[&caller]
+    );
+    assert!(
+        finalization.classes[&fallback].is_ready(),
+        "the fallback must not stand down for an edit that will not be applied: {:#?}",
+        finalization.classes[&fallback]
+    );
+    assert!(
+        finalization.collisions.is_empty(),
+        "and the pair is not a cross-class collision either — that would hold both: {:#?}",
+        finalization.collisions
+    );
+}
+
+/// **R554-5 control — R499-1(b) intact: a contained edit that WILL apply still takes the
+/// span.** The same geometry with the caller class unheld: the fallback stands down, its site
+/// is dropped with the yield receipt, and its class is held. `r499_1b_a_fallback_yields_…`
+/// checks the survivor; this checks the one that stood down, so a rule that skipped every
+/// yield could not pass both.
+#[test]
+fn r554_5_a_contained_edit_that_applies_still_takes_the_span() {
+    let (fallback, surface) = (class(1835), class(1849));
+    let finalization = finalize_class_inputs(vec![
+        input(
+            fallback,
+            Arm::Pair,
+            8_180_243,
+            8_180_565,
+            "a5-site-proof-t2-fallback",
+        ),
+        input(surface, Arm::Surface, 8_180_398, 8_180_420, "surface"),
+    ]);
+    assert!(
+        finalization.classes[&surface].is_ready(),
+        "{:#?}",
+        finalization.classes[&surface]
+    );
+    assert!(
+        !finalization.classes[&fallback].is_ready(),
+        "the fallback still stands down for an edit that applies: {:#?}",
+        finalization.classes[&fallback]
+    );
+}

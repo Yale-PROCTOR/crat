@@ -1032,6 +1032,30 @@ fn option_destination_of(
 /// inferred: a new fallback has to be added here on purpose.
 const FALLBACK_KINDS: [&str; 1] = ["a5-site-proof-t2-fallback"];
 
+/// **R554-5 (ii).** The classes `finalize_class_inputs` will hold for an intra-class interval
+/// overlap: a same-class pair that overlaps, does not compose, and is not an exact duplicate.
+/// It is the main loop's same-class branch, evaluated ahead of it, so the two cannot disagree.
+fn intra_class_held(all_sites: &[ClassSite]) -> std::collections::BTreeSet<SignatureClassId> {
+    let mut held = std::collections::BTreeSet::new();
+    for (left_index, left) in all_sites.iter().enumerate() {
+        for right in &all_sites[left_index + 1..] {
+            if left.key.owner_class != right.key.owner_class || !intervals_overlap(left, right) {
+                continue;
+            }
+            if nested_ast_composition(left, right)
+                .or_else(|| a5_wrapper_composition(left, right, all_sites))
+                .is_some()
+            {
+                continue;
+            }
+            if left.key != right.key || left.edit_key != right.edit_key {
+                held.insert(left.key.owner_class);
+            }
+        }
+    }
+    held
+}
+
 pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
     let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
     for input in inputs {
@@ -1056,6 +1080,11 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
     let mut fallback_yields = std::collections::BTreeSet::new();
     let mut intra_class_collisions = std::collections::BTreeSet::new();
     let mut composed_dependencies = std::collections::BTreeSet::new();
+    // **R554-5 (ii) — which classes the plan itself will hold, before any yield is decided.**
+    // A same-class pair that overlaps and does not compose holds its whole class below
+    // (`intra-class-interval-overlap`), so every edit of that class is dropped. Knowing the set
+    // up front lets a fallback decline to yield to an edit that will never be applied.
+    let intra_held = intra_class_held(&all_sites);
     for (left_index, left) in all_sites.iter().enumerate() {
         for right in &all_sites[left_index + 1..] {
             if !intervals_overlap(left, right) {
@@ -1123,6 +1152,20 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                             && strictly_contains)
                             .then_some((fallback, inner))
                     });
+            // **R554-5 (ii) — a fallback yields only to an edit that will apply.** R499-1(b)
+            // yields so that "the contained edit survives". When the contained edit's class is
+            // already held by an intra-class overlap, that edit is dropped with its class and
+            // nothing survives: the yield would hold the fallback's class for nothing (brotli
+            // batch 31: 18 `BrotliHistogramCombine*` subjects, yielding to `clusters#19`'s
+            // `box-expression` in the intra-held `BrotliClusterHistograms*`). The emitted text
+            // then carries the ORIGINAL argument there, so the fallback renders over it as it
+            // does at any raw caller -- and the pair is no conflict at all, so it is skipped
+            // rather than recorded as a cross-class collision (which would hold both classes).
+            if let Some((_, inner)) = yielded
+                && intra_held.contains(&inner.key.owner_class)
+            {
+                continue;
+            }
             if let Some((fallback, inner)) = yielded {
                 fallback_yields.insert((
                     fallback.key.owner_class,
