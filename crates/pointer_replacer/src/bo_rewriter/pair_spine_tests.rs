@@ -143,6 +143,15 @@ pub unsafe fn SamePlaceTwoCasts(mut h: *mut T) {
 }
 "#;
 
+/// C5: the same field NAME reached through a cast that changes its parent is
+/// still one place written two ways — refused `same-place` before any rule,
+/// exactly as before the parent key existed.
+const SAME_PLACE_TWO_PARENTS: &str = r#"
+pub unsafe fn SamePlaceTwoParents(mut h: *mut T) {
+    take2(&mut (*(h as *mut U)).a, &mut (*h).a);
+}
+"#;
+
 /// C4: a union EARLIER on the shared prefix is not the divergence; the two
 /// fields diverge inside one structure member of it and are disjoint there.
 const UNION_ON_THE_PREFIX: &str = r#"
@@ -215,6 +224,20 @@ fn w6p_the_same_place_cast_two_ways_is_still_the_same_place() {
         verdict_of(
             &source(SAME_PLACE_TWO_CASTS),
             "SamePlaceTwoCasts",
+            "take2",
+            0,
+            1
+        ),
+        Err(Unproved::SamePlace)
+    );
+}
+
+#[test]
+fn w6p_one_name_under_two_parents_is_still_the_same_place() {
+    assert_eq!(
+        verdict_of(
+            &source(SAME_PLACE_TWO_PARENTS),
+            "SamePlaceTwoParents",
             "take2",
             0,
             1

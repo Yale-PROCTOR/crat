@@ -1620,7 +1620,7 @@ fn w6p_probe_pair_roots() {
             let show = |value: Option<usize>| value.map_or("-".to_owned(), |v| v.to_string());
             let flag = |value: Option<bool>| value.map_or("-", |v| if v { "free" } else { "kept" });
             println!(
-                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "W6P_PROBE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 name(row.caller),
                 name(row.callee),
                 row.left,
@@ -1636,7 +1636,10 @@ fn w6p_probe_pair_roots() {
                 flag(row.right_free),
                 row.left_why,
                 row.right_why,
-                u8::from(row.shared_read)
+                u8::from(row.shared_read),
+                row.site,
+                row.left_place,
+                row.right_place
             );
         }
     })

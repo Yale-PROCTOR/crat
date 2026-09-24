@@ -302,11 +302,23 @@ enum Projection {
 
 impl PlacePath {
     /// The same syntactic place, however either side was cast: the same-place
-    /// refusal must survive a cast that `retyped` records.
+    /// refusal must survive a cast that `retyped` records, and a cast that
+    /// changes a field's PARENT (`(*(h as *mut U)).a` beside `(*h).a`) — that
+    /// is still one place written two ways, so it compares field NAMES, as the
+    /// refusal always did, never the parents rule (c) reads.
     fn same_place(&self, other: &PlacePath) -> bool {
+        let syntactic = |projection: &Projection| match projection {
+            Projection::Field { name, .. } => Some(name.clone()),
+            Projection::Index => None,
+        };
         self.root == other.root
             && self.deref_root == other.deref_root
-            && self.projections == other.projections
+            && self.projections.len() == other.projections.len()
+            && self
+                .projections
+                .iter()
+                .zip(&other.projections)
+                .all(|(x, y)| syntactic(x) == syntactic(y))
     }
 }
 
@@ -1555,6 +1567,12 @@ pub(crate) struct ProbeRow {
     /// stated without reusing an older pair list.
     pub shared_read: bool,
     pub outcome: String,
+    /// R550-2 audit: the call's source line and each side's place spine,
+    /// every field with its parent (`.name@Parent`, `U` marks a union parent),
+    /// `!` when a cast retyped it, `-` when no place was formed.
+    pub site: String,
+    pub left_place: String,
+    pub right_place: String,
 }
 
 #[cfg(test)]
@@ -1649,6 +1667,38 @@ impl PairDisjointnessIndex {
                         if !right.is_pointer {
                             continue;
                         }
+                        let spine = |place: &Option<PlacePath>| -> String {
+                            let Some(path) = place else {
+                                return "-".to_owned();
+                            };
+                            let mut out = format!(
+                                "{}{}",
+                                if path.deref_root { "*" } else { "" },
+                                tcx.hir_name(path.root)
+                            );
+                            for projection in &path.projections {
+                                match projection {
+                                    Projection::Field {
+                                        parent,
+                                        union,
+                                        name,
+                                    } => {
+                                        let parent = parent.map_or("?".to_owned(), |did| {
+                                            tcx.item_name(did).to_string()
+                                        });
+                                        out += &format!(
+                                            ".{name}@{parent}{}",
+                                            if *union { "U" } else { "" }
+                                        );
+                                    }
+                                    Projection::Index => out += "[]",
+                                }
+                            }
+                            if path.retyped {
+                                out += "!";
+                            }
+                            out
+                        };
                         let outcome = self
                             .certify(
                                 caller,
@@ -1687,6 +1737,13 @@ impl PairDisjointnessIndex {
                             shared_read: self.shared_reads.contains(&(callee, left.index))
                                 && self.shared_reads.contains(&(callee, right.index)),
                             outcome,
+                            site: {
+                                let at =
+                                    tcx.sess.source_map().lookup_char_pos(record.call_span.lo());
+                                format!("{}:{}", at.line, at.col.0 + 1)
+                            },
+                            left_place: spine(&left.place),
+                            right_place: spine(&right.place),
                         });
                     }
                 }
