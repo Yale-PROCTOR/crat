@@ -51,23 +51,21 @@ pub(crate) struct Receipt {
 }
 
 /// Does every refused use of `node` hand the slice on to a callee parameter
-/// that receives it in `entries`? The pairs when it does.
-///
-/// **`lift_mutable` is the mutability the ASKING arm will give the lifted
-/// slice** (R533-4, wave-4 061 C7) — not the subject's: the exact arm lifts
-/// `subject.mutable && region.mutable`, the waiver and B1 `subject.mutable`. A
-/// lift that will be `&[T]` must not be admitted into a formal that writes.
+/// that delivers the slice form in `entries`? The pairs when it does.
 pub(crate) fn supported(
     ctx: &Ctx<'_, '_>,
     entries: &[(Subject, Decision)],
     node: (LocalDefId, HirId),
-    lift_mutable: bool,
 ) -> Option<Vec<(LocalDefId, usize)>> {
     let uses = ctx.slice_uses.get(&node)?;
     if uses.unsupported.is_none() || uses.other_unsupported != 0 || uses.pass_on.is_empty() {
         return None;
     }
-    let caller_mutable = lift_mutable;
+    let caller_mutable = entries
+        .iter()
+        .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)?
+        .0
+        .mutable;
     uses.pass_on
         .iter()
         .all(|&(callee, index)| formal(entries, callee, index, caller_mutable) == Receive::Yes)
@@ -176,13 +174,7 @@ pub(crate) fn close(
         // Only a held row some pass-on now reaches can move; otherwise stop.
         let movable = entries.iter().any(|(subject, decision)| {
             super::licensed_lift::held_at_a_local_callee(decision).is_some()
-                && supported(
-                    ctx,
-                    entries,
-                    (subject.fn_did, subject.hir_id),
-                    subject.mutable,
-                )
-                .is_some()
+                && supported(ctx, entries, (subject.fn_did, subject.hir_id)).is_some()
         });
         if !movable {
             return;
@@ -238,23 +230,10 @@ pub(crate) fn receipts(
         }
     }
     for (subject, decision) in entries {
-        // The lifted slice's own mutability, whichever arm gave it.
-        let lifted_mutable = match decision {
-            Decision::Slice { mutable, .. } => *mutable,
-            Decision::Ref { .. }
-            | Decision::InferredRef { .. }
-            | Decision::NestedSlice { .. }
-            | Decision::Opt { .. }
-            | Decision::Box(_)
-            | Decision::Cursor { .. }
-            | Decision::Degraded(_) => continue,
-        };
-        let Some(pairs) = supported(
-            ctx,
-            entries,
-            (subject.fn_did, subject.hir_id),
-            lifted_mutable,
-        ) else {
+        if !super::licensed_lift::delivers_slice(decision) {
+            continue;
+        }
+        let Some(pairs) = supported(ctx, entries, (subject.fn_did, subject.hir_id)) else {
             continue;
         };
         let mut lifted = false;
