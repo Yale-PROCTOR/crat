@@ -4457,6 +4457,7 @@ fn render_raw_boundary_final_reverts(
         .copied()
         .filter(|function| !interface_dependency_rooted(partition_reasons, *function))
         .collect::<std::collections::BTreeSet<_>>();
+    let graft_held = ast_transform::graft_held_attributions();
     for &function in functions {
         // **R430-1 — one row per OWNER PATH of the withheld class.** The census
         // marks a subject reverted by its owner path; a class-mate this
@@ -4473,7 +4474,10 @@ fn render_raw_boundary_final_reverts(
                         .unwrap_or_else(|| "<unknown-local-class>".to_owned()),
                 ]
             });
-        let attribution = if verify_reverted.contains(&function) {
+        let attribution = if let Some(held) = graft_held.get(&function.order_key()) {
+            // R547-6: the floor's revert names the arm that yielded, not the verify loop.
+            held.clone()
+        } else if verify_reverted.contains(&function) {
             "verify-reverted".to_owned()
         } else if let Some(reason) = emission_plan.and_then(|plan| {
             plan.class_finalization

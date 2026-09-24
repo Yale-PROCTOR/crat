@@ -90,3 +90,77 @@ fn wave6k_a_class_held_before_any_edit_renders_its_own_path() {
     )
     .expect("the fixture compiles");
 }
+
+/// **R547-6 (wave-6l 051 STOP 1) — the floor's revert names the arm.** A class
+/// the graft floor held is reverted by the hold loop exactly as the verify loop
+/// would revert it, and it sits in the same `reverted` set. Its final-reverts row
+/// read `verify-reverted` while `graft-held.tsv` named the C-9 arm (brotli's
+/// `ProcessRepeatedCodeLength`, class 557, at `l01p7`). The row now reads
+/// `graft-held:c9`; a class only the verify loop reverted keeps `verify-reverted`.
+#[test]
+fn r547_6_a_floor_revert_is_attributed_to_the_arm_that_yielded() {
+    ::utils::compilation::run_compiler_on_str(
+        "pub unsafe fn held(p: *mut i32) -> i32 { *p }\npub unsafe fn verified(p: *mut i32) -> i32 { *p }",
+        |tcx| {
+            let class_of = |name: &str| {
+                SignatureClassId::of(
+                    tcx.hir_crate_items(())
+                        .free_items()
+                        .map(|id| id.owner_id.def_id)
+                        .find(|did| {
+                            tcx.opt_item_name(did.to_def_id())
+                                .is_some_and(|item| item.as_str() == name)
+                        })
+                        .expect("the fixture's function"),
+                )
+            };
+            let (held, verified) = (class_of("held"), class_of("verified"));
+            super::ast_transform::reset_graft_held();
+            super::ast_transform::record_graft_held(
+                super::ast_transform::GraftHeldReceipt {
+                    visitor: super::ast_transform::GraftVisitor::C9,
+                    caller: held.local_def_id().local_def_index.as_u32(),
+                    class: held.order_key(),
+                    reason: "counted-void-twin",
+                    lo: 10,
+                    hi: 20,
+                },
+                held,
+            );
+            let both = BTreeSet::from([held, verified]);
+            let receipt = super::render_raw_boundary_final_reverts(
+                &both,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &both,
+                None,
+            );
+            super::ast_transform::reset_graft_held();
+            let header = receipt.lines().next().expect("a header").split('\t').collect::<Vec<_>>();
+            let column = |name: &str| header.iter().position(|h| *h == name).expect(name);
+            let attribution_of = |class: SignatureClassId| {
+                receipt
+                    .lines()
+                    .skip(1)
+                    .map(|line| line.split('\t').collect::<Vec<_>>())
+                    .find(|cells| cells[column("class_id")] == format!("local-def-index:{}", class.order_key()))
+                    .map(|cells| (cells[column("attribution")].to_owned(), cells[column("reason_head")].to_owned()))
+                    .unwrap_or_else(|| panic!("no row for {class:?} in\n{receipt}"))
+            };
+            assert_eq!(
+                attribution_of(held),
+                ("graft-held:c9".to_owned(), "graft-held".to_owned()),
+                "{receipt}"
+            );
+            assert_eq!(
+                attribution_of(verified).0,
+                "verify-reverted",
+                "{receipt}"
+            );
+        },
+    )
+    .expect("fixture compiles");
+}

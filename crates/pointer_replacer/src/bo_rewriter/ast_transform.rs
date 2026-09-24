@@ -7398,6 +7398,37 @@ pub(crate) fn graft_held_receipts() -> Vec<GraftHeldReceipt> {
     GRAFT_HELD.with(|cell| cell.borrow().clone())
 }
 
+/// **R547-6 (wave-6l 051 STOP 1)** — the final-reverts attribution of every class
+/// the floor held this program, keyed by the class's order key:
+/// `graft-held:<visitor>` (`graft-held:c9` for brotli's `ProcessRepeatedCodeLength`),
+/// `+`-joined in key order when more than one arm held the same class. The
+/// floor reverts a held class exactly as the verify loop would, and without this
+/// the revert table credited the verify loop while `graft-held.tsv` named the
+/// arm: the two tables now agree. Read on the emission thread, where the receipts
+/// are recorded.
+pub(crate) fn graft_held_attributions() -> std::collections::BTreeMap<u32, String> {
+    let mut visitors =
+        std::collections::BTreeMap::<u32, std::collections::BTreeSet<&'static str>>::new();
+    for receipt in graft_held_receipts() {
+        visitors
+            .entry(receipt.class)
+            .or_default()
+            .insert(receipt.visitor.key());
+    }
+    visitors
+        .into_iter()
+        .map(|(class, keys)| {
+            (
+                class,
+                format!(
+                    "graft-held:{}",
+                    keys.into_iter().collect::<Vec<_>>().join("+")
+                ),
+            )
+        })
+        .collect()
+}
+
 /// The artifact table. **Written even when it is empty** — a header-only table
 /// says the floor was asked and held nothing, which is exactly the reading a
 /// missing file cannot carry.
