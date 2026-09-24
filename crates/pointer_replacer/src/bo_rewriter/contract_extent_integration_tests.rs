@@ -2241,7 +2241,7 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     assert_eq!(
         lines.next(),
         Some(
-            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt\tsubject_key"
+            "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt"
         ),
         "{tsv}"
     );
@@ -3044,90 +3044,6 @@ fn w4l11_a_slice_use_refusal_names_the_shape() {
     assert_eq!(refused.1, Some("cast"), "{rows:?}");
     assert!(refused.2.contains("slice-use-unsupported"), "{rows:?}");
     assert!(refused.2.ends_with(":cast)"), "{rows:?}");
-}
-
-/// **R536-6 (report 062 R1) — two modules, one label.** C2Rust duplicates a
-/// static function into every module that uses it, so `Hash::p` names two
-/// different subjects in brotli (`compress_fragment` and
-/// `compress_fragment_two_pass`) — one held, one delivered, at batch 29. The
-/// fixture reproduces the collision with two inline modules.
-const W4_TWO_MODULES_ONE_LABEL: &str = r#"
-#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
-pub mod first {
-    pub type uint8_t = u8;
-    pub type size_t = usize;
-    extern "C" {
-        fn GetBuffer() -> *mut uint8_t;
-    }
-    unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
-        let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
-        *p = 1 as uint8_t;
-        *pos = (*pos).wrapping_add(8 as size_t);
-    }
-    pub unsafe extern "C" fn Store() {
-        let mut storage: *mut uint8_t = GetBuffer();
-        let mut pos: size_t = 0 as size_t;
-        BrotliWriteBits(&mut pos, storage);
-    }
-}
-pub mod second {
-    pub type uint8_t = u8;
-    pub type size_t = usize;
-    extern "C" {
-        fn GetBuffer() -> *mut uint8_t;
-    }
-    unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
-        let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
-        *p = 1 as uint8_t;
-        *pos = (*pos).wrapping_add(8 as size_t);
-    }
-    pub unsafe extern "C" fn Store() {
-        let mut storage: *mut uint8_t = GetBuffer();
-        let mut pos: size_t = 0 as size_t;
-        BrotliWriteBits(&mut pos, storage);
-    }
-}
-"#;
-
-/// **W4R-1 (R536-6) — a receipt's key tells same-label twins apart.** Both
-/// modules' `Store::storage` share the label; their census `subject_key`s must
-/// not, or a join or deduplication over receipts silently merges a held
-/// subject with a different one — which is what the chain round's bookkeeping
-/// did with the label (report 062 R1).
-#[test]
-fn w4r01_the_receipt_key_separates_same_label_twins() {
-    let (labels, keys) = table_of(W4_TWO_MODULES_ONE_LABEL, |table| {
-        let rows = table
-            .licensed_lifts
-            .iter()
-            .filter(|lift| lift.subject.starts_with("Store::storage"))
-            .map(|lift| (lift.subject.clone(), lift.subject_key.clone()))
-            .collect::<Vec<_>>();
-        let labels = rows
-            .iter()
-            .map(|(label, _)| label.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let keys = rows
-            .iter()
-            .map(|(_, key)| key.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        (labels, keys)
-    })
-    .expect("the fixture yields a table");
-    assert_eq!(
-        labels.len(),
-        1,
-        "the fixture must collide on the label: {labels:?}"
-    );
-    assert_eq!(keys.len(), 2, "one key per subject: {keys:?}");
-    assert!(
-        keys.iter()
-            .any(|key| key.contains("first::Store::storage#"))
-            && keys
-                .iter()
-                .any(|key| key.contains("second::Store::storage#")),
-        "the key carries the owner's module path: {keys:?}"
-    );
 }
 
 /// **W4B1-1 (control) — a root that states nothing stays the fallback's.**

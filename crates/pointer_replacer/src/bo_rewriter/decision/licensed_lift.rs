@@ -56,13 +56,6 @@ use super::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiftReceipt {
     pub(crate) subject: String,
-    /// **The census `subject_key`** (R536-6, wave-4 report 062 R1): the owner's
-    /// full path, the name and the MIR local — `src::enc::compress_fragment::Hash::p#1`.
-    /// `subject` is the label, and C2Rust duplicates static functions per module,
-    /// so one label can name a held subject and a delivered one (brotli's
-    /// `Hash::p` at batch 29). Anything that joins or deduplicates receipts must
-    /// key on this, never on the label.
-    pub(crate) subject_key: String,
     pub(crate) callee: String,
     pub(crate) parameter_index: Option<usize>,
     /// The exact licensed width in bytes, from wave-6b's export. `None` is the
@@ -149,12 +142,6 @@ impl LiftReceipt {
             None => format!("fallback(extent-lift@addendum-77:{}:{index})", self.callee),
         }
     }
-}
-
-/// The census `subject_key` for a subject — the key the census's own subjects
-/// table uses, so a receipt row joins to its subject exactly.
-pub(crate) fn subject_key(ctx: &Ctx<'_, '_>, subject: &Subject) -> String {
-    subject.identity_key(&ctx.tcx.def_path_str(subject.fn_did.to_def_id()))
 }
 
 /// The callee parameter's region, looked up over `entries` rather than over a
@@ -300,7 +287,6 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
         let mut refuse = |why: &'static str| {
             unlicensed.push(LiftReceipt {
                 subject: subject.label.clone(),
-                subject_key: subject_key(ctx, subject),
                 callee: access.callee.clone(),
                 parameter_index: Some(access.parameter_index),
                 width_bytes: None,
@@ -388,7 +374,6 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
         };
         receipts.push(LiftReceipt {
             subject: subject.label.clone(),
-            subject_key: subject_key(ctx, subject),
             callee: callee.clone(),
             parameter_index: Some(*parameter_index),
             width_bytes: Some(*width),
@@ -412,7 +397,7 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
         .iter()
         .map(|lift| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 lift.subject.split("::").next().unwrap_or(&lift.subject),
                 lift.subject,
                 lift.callee,
@@ -428,13 +413,12 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
                 },
                 lift.use_shape.unwrap_or("-"),
                 lift.key(),
-                lift.subject_key,
             )
         })
         .collect::<Vec<_>>();
     rows.sort();
     let mut out = String::from(
-        "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt\tsubject_key\n",
+        "owner_path\tsubject\tlicensing_callee\tparameter_index\twidth_bytes\tform\textent_class\tuse_shape\treceipt\n",
     );
     out.extend(rows);
     out
@@ -556,7 +540,6 @@ pub(crate) fn promote_fallback(
         |subject: &Subject, callee: String, index: Option<usize>, why: &'static str| {
             declines.push(LiftReceipt {
                 subject: subject.label.clone(),
-                subject_key: subject_key(ctx, subject),
                 callee,
                 parameter_index: index,
                 width_bytes: None,
@@ -661,7 +644,6 @@ pub(crate) fn promote_fallback(
         };
         receipts.push(LiftReceipt {
             subject: subject.label.clone(),
-            subject_key: subject_key(ctx, subject),
             callee: callee.clone(),
             parameter_index: *parameter_index,
             width_bytes: None,
