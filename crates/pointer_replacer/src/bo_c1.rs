@@ -656,7 +656,11 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
 
     use crate::bo_rewriter::bridge_custody_export::{self, ReplayFrame, RetainedReplay};
 
-    if raw_boundary_typed_failure(&row) {
+    // R547-5(i): a frame-absent program has no sidecars to replay -- it was
+    // excluded before any load -- so its row passes through as it was written.
+    if raw_boundary_typed_failure(&row)
+        || row.get(raw_schema::STATUS) == Some("frame-absent-excluded")
+    {
         return row;
     }
     let checked = (|| -> Result<(), String> {
@@ -24149,6 +24153,269 @@ fn raw_boundary_rows_have_data(rows: &[report::Row]) -> bool {
     rows.iter().all(|row| !raw_boundary_typed_failure(row))
 }
 
+/// The per-program columns the census aggregate SUMS. One list for the full
+/// aggregate and the frame-absent one (R547-5(i)), so the two can never sum
+/// different things under the same key.
+const RAW_BOUNDARY_AGGREGATE_SUM_KEYS: &[&str] = &[
+    raw_schema::SITE_ROWS,
+    raw_schema::SUBJECT_ROWS,
+    raw_schema::T1_CANDIDATE_SITES,
+    raw_schema::T2_CANDIDATE_SITES,
+    raw_schema::T2_WAIVER_SITES,
+    raw_schema::BLOCKED_SITES,
+    raw_schema::OWNED_BY_OTHER_ARM_SITES,
+    raw_schema::ZERO_SYNTAX_SITES,
+    raw_schema::EXPLICIT_BRIDGE_SITES,
+    raw_schema::LIFECYCLE_SITES,
+    raw_schema::T1_COMPILER_SURVIVING,
+    raw_schema::T2_COMPILER_SURVIVING,
+    raw_schema::T1_REALIZED_SUBJECTS,
+    raw_schema::T2_REALIZED_SUBJECTS,
+    raw_schema::REALIZED_SUBJECTS,
+    raw_schema::DEGRADED_SUBJECTS,
+    raw_schema::REVERTED_FUNCTION_SUBJECTS,
+    raw_schema::REVERTED_PROGRAM_SUBJECTS,
+    raw_schema::TYPED_EXCLUDED_SUBJECTS,
+    raw_schema::MASKED_SECONDARY,
+    raw_schema::ADDRESS_OBSERVATION_EDITS,
+    raw_schema::ATOM_ATTEMPTS,
+    raw_schema::ATOM_SUCCESSES,
+    raw_schema::ATOM_AMBIGUOUS,
+    raw_schema::ATOM_SECOND_VERIFY,
+    raw_schema::ATOM_FUNCTION_FALLBACK,
+    raw_schema::EXPOSURE_CONFIGURED_MATCHES,
+    raw_schema::EXPOSURE_ADDRESS_ROOTS,
+    raw_schema::EXPOSURE_BOTH,
+    raw_schema::EXPOSURE_SEED_UNION,
+    raw_schema::SURFACE_ENTRY_SHIMS,
+    raw_schema::SURFACE_WEB_WRAPPERS,
+    raw_schema::SURFACE_CLOSED_DIRECT,
+    raw_schema::SURFACE_NOT_APPLICABLE,
+    raw_schema::UNIFIED_CONTROL_ROWS,
+    raw_schema::UNIFIED_PRODUCTION_MATCHED,
+    raw_schema::UNIFIED_CONTROL_UNMATCHED,
+    raw_schema::UNIFIED_PRODUCTION_UNMATCHED,
+    raw_schema::ARM_OUTCOME_ROWS,
+    raw_schema::ARM_SURFACE_REQUIRED,
+    raw_schema::ARM_D4_REQUIRED,
+    raw_schema::ARM_C_REQUIRED,
+    raw_schema::ARM_PAIR_REQUIRED,
+    raw_schema::ARM_GLUE_REQUIRED,
+    raw_schema::ARM_ADDR_REQUIRED,
+    raw_schema::ARM_PLANNED_UNIQUE,
+    raw_schema::ARM_BLOCKED_UNIQUE,
+    raw_schema::PAIR_CLEAR,
+    raw_schema::PAIR_OVERLAPPING,
+    raw_schema::PAIR_UNDETERMINABLE,
+    raw_schema::PAIR_PRIMARY,
+    raw_schema::PAIR_RAW_VIEW,
+    raw_schema::PAIR_T1,
+    raw_schema::PAIR_T2,
+    raw_schema::PAIR_BLOCKED,
+    raw_schema::GLUE_PLACED,
+    raw_schema::GLUE_BLOCKED,
+    raw_schema::ADDR_VALUE_ONLY,
+    raw_schema::ADDR_ACCESS_ONLY,
+    raw_schema::ADDR_BOTH,
+    raw_schema::ADDR_NEITHER,
+    raw_schema::ATOM_KEYED_EDITS,
+    raw_schema::ATOM_BISECT_ATTEMPTS,
+    raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
+    raw_schema::R1_CLASS_BLOCKED,
+    raw_schema::R1_ARG_STAYS_RAW,
+    raw_schema::R1_DUPLICATE_PLACE_ROOT,
+    raw_schema::R1_FLOWS_INTO_RAW_PARAM,
+    raw_schema::R1_FLOWS_INTO_OTHER_FORM,
+    raw_schema::R1_BORROWED_INTO_RAW_PARAM,
+    raw_schema::R1_PTR_COMPARISON,
+    raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
+    raw_schema::R1_OTHER,
+    raw_schema::BRIDGE_RECEIPT_ROWS,
+    raw_schema::BRIDGE_REQUIRED_SITES,
+    raw_schema::BRIDGE_PLANNED_EVENTS,
+    raw_schema::BRIDGE_APPLIED_EVENTS,
+    raw_schema::BRIDGE_DROPPED_EVENTS,
+    raw_schema::MECHANICAL_OBLIGATION_COUNT,
+    raw_schema::MECHANICAL_APPLIED_COUNT,
+    raw_schema::MECHANICAL_DROPPED_COUNT,
+    raw_schema::MECHANICAL_HELD_COUNT,
+    raw_schema::MECHANICAL_RECLASSIFIED_COUNT,
+    raw_schema::SIGNATURE_CLASS_COUNT,
+    raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
+    raw_schema::ATTRIBUTION_HITS_EXACT_SEAM,
+    raw_schema::ATTRIBUTION_HITS_RELATED_SPAN,
+    raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION,
+    raw_schema::ATTRIBUTION_HITS_UNRESOLVED,
+    raw_schema::CLASS_BISECT_PROBES,
+    raw_schema::CROSS_CLASS_COLLISION_COUNT,
+    raw_schema::UNRESOLVED_CLASS_COUNT,
+    raw_schema::SURFACE_APPLIED_REQUIRED_C_MISSING,
+    raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
+    raw_schema::INTERFACE_INVENTORY_SITES,
+    raw_schema::SITES_FROM_NON_SUBJECT_ARGUMENTS,
+    raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
+];
+
+/// **R547-5(i) — the aggregate of a frame with a declared-absent program.**
+///
+/// `l01p7` (2026-09-24) excluded lil by declaration (R477-5 route (A)) and the
+/// census then panicked in the full aggregate, whose every check is pinned to the
+/// twenty-program corpus (the 7,011 subjects, the 1,291 unified-control rows, the
+/// external controls' populations …) — so a frame with an absent program wrote no
+/// `aggregate.kv` at all. This is the aggregate such a frame CAN state:
+///
+/// - the per-program rows of the present programs, row-local checks kept (a
+///   converted callee without its call-site receipt, attribution drift);
+/// - the summed columns ([`RAW_BOUNDARY_AGGREGATE_SUM_KEYS`]) over the present rows;
+/// - the number of record (`delivery=realized-as-predicted`, all families, R470-3)
+///   counted from the present programs' subject-outcomes tables;
+/// - the gate comparison (count verdict) and the mandatory lost-identity list
+///   (R541-5) over the present programs, against the gate baseline;
+/// - the absent programs NAMED, on the aggregate row and in the receipt.
+///
+/// The corpus-pinned reconciliations (subject population, promote exclusions,
+/// external controls, diagnostic and PAIR-site controls, regression waivers) are
+/// NOT evaluated and the receipt says so: they are twenty-program instruments, and
+/// restricting them silently would claim a check that did not run. `data=partial`.
+/// Returns `(aggregate, receipt, regression_rows, lost_identities)`.
+fn raw_boundary_frame_absent_aggregate(
+    rows: &[report::Row],
+    absent: &[String],
+    ledger_dir: &std::path::Path,
+    gate_dir: &std::path::Path,
+    code_frame: &str,
+) -> (report::Row, String, String, String) {
+    let present = rows
+        .iter()
+        .filter(|row| row.get(raw_schema::STATUS) != Some("frame-absent-excluded"))
+        .collect::<Vec<_>>();
+    for row in &present {
+        assert_eq!(
+            row.get(raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT),
+            Some("0"),
+            "converted callee lacks a required call-site receipt: {row:?}"
+        );
+        let count = |key: &str| {
+            row.get(key)
+                .unwrap_or_else(|| panic!("missing {key}: {row:?}"))
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("parse {key}: {error}"))
+        };
+        assert!(
+            raw_boundary_attribution_control(
+                count(raw_schema::ATTRIBUTION_HITS_UNRESOLVED),
+                count(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM),
+            ),
+            "unresolved attribution has no exact-seam attribution: {row:?}"
+        );
+    }
+    use std::collections::{BTreeMap, BTreeSet};
+    let named_tsv_rows = |text: &str| -> Vec<BTreeMap<String, String>> {
+        let mut lines = text.lines();
+        let header = lines
+            .next()
+            .unwrap_or_default()
+            .split('\t')
+            .collect::<Vec<_>>();
+        lines
+            .map(|line| {
+                header
+                    .iter()
+                    .zip(line.split('\t'))
+                    .map(|(name, value)| ((*name).to_owned(), value.to_owned()))
+                    .collect()
+            })
+            .collect()
+    };
+    let read_outcomes = |dir: &std::path::Path, program: &str| {
+        let path = dir.join(format!("{program}.raw-boundary-subject-outcomes.tsv"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    };
+    let mut record = 0usize;
+    let mut regressed = Vec::new();
+    let mut regression_rows = String::from(
+        "comparator\tcorpus\tcode_frame\tprogram\tgate_realized\tcurrent_realized\tdelta\tverdict\n",
+    );
+    let mut lost = String::from("program\tsubject_key\tgate_realized\tcurrent_realized\tcount\n");
+    let mut lost_count = 0usize;
+    for row in &present {
+        let program = row.get("program").expect("program row");
+        let current = read_outcomes(ledger_dir, program);
+        let gate = read_outcomes(gate_dir, program);
+        let safe_realized = |text: &str| {
+            named_tsv_rows(text)
+                .into_iter()
+                .filter(|r| {
+                    r.get("delivery").map(String::as_str) == Some("realized-as-predicted")
+                        && r.get("family").is_some_and(|f| raw_boundary_safe_family(f))
+                })
+                .filter_map(|r| r.get("subject_key").cloned())
+                .collect::<BTreeSet<String>>()
+        };
+        record += named_tsv_rows(&current)
+            .iter()
+            .filter(|r| r.get("delivery").map(String::as_str) == Some("realized-as-predicted"))
+            .count();
+        let (gate_set, now_set) = (safe_realized(&gate), safe_realized(&current));
+        let fell = now_set.len() < gate_set.len();
+        if fell {
+            regressed.push(program.to_owned());
+        }
+        regression_rows.push_str(&format!(
+            "gate\trs-crown\t{code_frame}\t{program}\t{}\t{}\t{}\t{}\n",
+            gate_set.len(),
+            now_set.len(),
+            now_set.len() as isize - gate_set.len() as isize,
+            if fell { "fell" } else { "held" },
+        ));
+        let rows = raw_boundary_gate_lost_rows(program, &gate_set, &now_set);
+        lost_count += rows.lines().count();
+        lost.push_str(&rows);
+    }
+    let mut aggregate = report::Row::default();
+    aggregate.set(raw_schema::CORPUS, "rs-crown");
+    aggregate.set(
+        raw_schema::ANALYSIS_FRAME,
+        crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+    );
+    aggregate.set(raw_schema::CODE_FRAME, code_frame);
+    aggregate.set(raw_schema::WAVE, "wave2");
+    aggregate.set(raw_schema::DATA, "partial");
+    let delivery = if regressed.is_empty() {
+        "clean"
+    } else {
+        "regressed"
+    };
+    aggregate.set(raw_schema::DELIVERY, delivery);
+    for &key in RAW_BOUNDARY_AGGREGATE_SUM_KEYS {
+        aggregate.set(
+            key,
+            present
+                .iter()
+                .map(|row| {
+                    row.get(key)
+                        .unwrap_or_else(|| panic!("missing {key}: {row:?}"))
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| panic!("parse {key}: {error}"))
+                })
+                .sum::<usize>(),
+        );
+    }
+    aggregate.set("raw_boundary_realized_record", record);
+    aggregate.set("raw_boundary_frame_absent_programs", absent.join(","));
+    aggregate.set(raw_schema::STATUS, "complete-frame-absent");
+    let receipt = format!(
+        "status=complete-frame-absent\ndata=partial\ndelivery={delivery}\nprograms={}/{}\nframe_absent={}\nrealized_record={record}\ngate_regressed_programs={}\ngate_regressed={}\ngate_lost_identities={lost_count}\ncontrols=not-evaluated:frame-absent\nregression_waivers=not-evaluated:frame-absent\n",
+        present.len(),
+        rows.len(),
+        absent.join(","),
+        regressed.len(),
+        regressed.join(","),
+    );
+    (aggregate, receipt, regression_rows, lost)
+}
+
 fn raw_boundary_census_rows_have_data(
     rows: &[report::Row],
     diagnostic_run: bool,
@@ -24595,6 +24862,42 @@ fn raw_boundary_wave2_corpus_census() {
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
+        return;
+    }
+    // **R547-5(i)** — a frame with a declared-absent program takes the aggregate it
+    // can state; every check below is pinned to the twenty-program corpus.
+    if !frame_absent.is_empty() {
+        let gate_dir = PathBuf::from(
+            std::env::var_os("CRAT_RAW_BOUNDARY_GATE_BASELINE_DIR")
+                .expect("raw-boundary census requires the R346-2 gate baseline"),
+        );
+        let (aggregate, receipt, regression_rows, lost) = raw_boundary_frame_absent_aggregate(
+            &rows,
+            &frame_absent,
+            &ledger_dir,
+            &gate_dir,
+            &code_frame,
+        );
+        let per_program = rows
+            .iter()
+            .map(report::to_kv_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(artifact_dir.join("per-program.kv"), per_program)
+            .expect("write frame-absent per-program rows");
+        fs::write(artifact_dir.join("regression-rows.tsv"), regression_rows)
+            .expect("write frame-absent regression rows");
+        fs::write(artifact_dir.join("gate-lost-identities.tsv"), lost)
+            .expect("write frame-absent gate lost identities");
+        fs::write(
+            artifact_dir.join("aggregate.kv"),
+            format!("{}\n", report::to_kv_line(&aggregate)),
+        )
+        .expect("write frame-absent aggregate");
+        fs::write(artifact_dir.join("census-receipt.txt"), receipt)
+            .expect("write frame-absent census receipt");
+        raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
         return;
     }
     let mut corpus_unresolved = 0usize;
@@ -25696,105 +25999,7 @@ fn raw_boundary_wave2_corpus_census() {
         raw_schema::LAUNCH_ENV_SHA256,
         unique_value(raw_schema::LAUNCH_ENV_SHA256),
     );
-    for key in [
-        raw_schema::SITE_ROWS,
-        raw_schema::SUBJECT_ROWS,
-        raw_schema::T1_CANDIDATE_SITES,
-        raw_schema::T2_CANDIDATE_SITES,
-        raw_schema::T2_WAIVER_SITES,
-        raw_schema::BLOCKED_SITES,
-        raw_schema::OWNED_BY_OTHER_ARM_SITES,
-        raw_schema::ZERO_SYNTAX_SITES,
-        raw_schema::EXPLICIT_BRIDGE_SITES,
-        raw_schema::LIFECYCLE_SITES,
-        raw_schema::T1_COMPILER_SURVIVING,
-        raw_schema::T2_COMPILER_SURVIVING,
-        raw_schema::T1_REALIZED_SUBJECTS,
-        raw_schema::T2_REALIZED_SUBJECTS,
-        raw_schema::REALIZED_SUBJECTS,
-        raw_schema::DEGRADED_SUBJECTS,
-        raw_schema::REVERTED_FUNCTION_SUBJECTS,
-        raw_schema::REVERTED_PROGRAM_SUBJECTS,
-        raw_schema::TYPED_EXCLUDED_SUBJECTS,
-        raw_schema::MASKED_SECONDARY,
-        raw_schema::ADDRESS_OBSERVATION_EDITS,
-        raw_schema::ATOM_ATTEMPTS,
-        raw_schema::ATOM_SUCCESSES,
-        raw_schema::ATOM_AMBIGUOUS,
-        raw_schema::ATOM_SECOND_VERIFY,
-        raw_schema::ATOM_FUNCTION_FALLBACK,
-        raw_schema::EXPOSURE_CONFIGURED_MATCHES,
-        raw_schema::EXPOSURE_ADDRESS_ROOTS,
-        raw_schema::EXPOSURE_BOTH,
-        raw_schema::EXPOSURE_SEED_UNION,
-        raw_schema::SURFACE_ENTRY_SHIMS,
-        raw_schema::SURFACE_WEB_WRAPPERS,
-        raw_schema::SURFACE_CLOSED_DIRECT,
-        raw_schema::SURFACE_NOT_APPLICABLE,
-        raw_schema::UNIFIED_CONTROL_ROWS,
-        raw_schema::UNIFIED_PRODUCTION_MATCHED,
-        raw_schema::UNIFIED_CONTROL_UNMATCHED,
-        raw_schema::UNIFIED_PRODUCTION_UNMATCHED,
-        raw_schema::ARM_OUTCOME_ROWS,
-        raw_schema::ARM_SURFACE_REQUIRED,
-        raw_schema::ARM_D4_REQUIRED,
-        raw_schema::ARM_C_REQUIRED,
-        raw_schema::ARM_PAIR_REQUIRED,
-        raw_schema::ARM_GLUE_REQUIRED,
-        raw_schema::ARM_ADDR_REQUIRED,
-        raw_schema::ARM_PLANNED_UNIQUE,
-        raw_schema::ARM_BLOCKED_UNIQUE,
-        raw_schema::PAIR_CLEAR,
-        raw_schema::PAIR_OVERLAPPING,
-        raw_schema::PAIR_UNDETERMINABLE,
-        raw_schema::PAIR_PRIMARY,
-        raw_schema::PAIR_RAW_VIEW,
-        raw_schema::PAIR_T1,
-        raw_schema::PAIR_T2,
-        raw_schema::PAIR_BLOCKED,
-        raw_schema::GLUE_PLACED,
-        raw_schema::GLUE_BLOCKED,
-        raw_schema::ADDR_VALUE_ONLY,
-        raw_schema::ADDR_ACCESS_ONLY,
-        raw_schema::ADDR_BOTH,
-        raw_schema::ADDR_NEITHER,
-        raw_schema::ATOM_KEYED_EDITS,
-        raw_schema::ATOM_BISECT_ATTEMPTS,
-        raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
-        raw_schema::R1_CLASS_BLOCKED,
-        raw_schema::R1_ARG_STAYS_RAW,
-        raw_schema::R1_DUPLICATE_PLACE_ROOT,
-        raw_schema::R1_FLOWS_INTO_RAW_PARAM,
-        raw_schema::R1_FLOWS_INTO_OTHER_FORM,
-        raw_schema::R1_BORROWED_INTO_RAW_PARAM,
-        raw_schema::R1_PTR_COMPARISON,
-        raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
-        raw_schema::R1_OTHER,
-        raw_schema::BRIDGE_RECEIPT_ROWS,
-        raw_schema::BRIDGE_REQUIRED_SITES,
-        raw_schema::BRIDGE_PLANNED_EVENTS,
-        raw_schema::BRIDGE_APPLIED_EVENTS,
-        raw_schema::BRIDGE_DROPPED_EVENTS,
-        raw_schema::MECHANICAL_OBLIGATION_COUNT,
-        raw_schema::MECHANICAL_APPLIED_COUNT,
-        raw_schema::MECHANICAL_DROPPED_COUNT,
-        raw_schema::MECHANICAL_HELD_COUNT,
-        raw_schema::MECHANICAL_RECLASSIFIED_COUNT,
-        raw_schema::SIGNATURE_CLASS_COUNT,
-        raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
-        raw_schema::ATTRIBUTION_HITS_EXACT_SEAM,
-        raw_schema::ATTRIBUTION_HITS_RELATED_SPAN,
-        raw_schema::ATTRIBUTION_HITS_ENCLOSING_REGION,
-        raw_schema::ATTRIBUTION_HITS_UNRESOLVED,
-        raw_schema::CLASS_BISECT_PROBES,
-        raw_schema::CROSS_CLASS_COLLISION_COUNT,
-        raw_schema::UNRESOLVED_CLASS_COUNT,
-        raw_schema::SURFACE_APPLIED_REQUIRED_C_MISSING,
-        raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
-        raw_schema::INTERFACE_INVENTORY_SITES,
-        raw_schema::SITES_FROM_NON_SUBJECT_ARGUMENTS,
-        raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT,
-    ] {
+    for &key in RAW_BOUNDARY_AGGREGATE_SUM_KEYS {
         aggregate.set(key, total(key));
     }
     assert_eq!(total(raw_schema::UNIFIED_CONTROL_ROWS), 1_291);
@@ -25966,6 +26171,116 @@ fn raw_boundary_gate_lost_rows(
             )
         })
         .collect()
+}
+
+/// **R547-5(i)** — a frame with a declared-absent program writes the aggregate it
+/// can state: the absent program named, the present programs summed and counted,
+/// the gate comparison and lost identities over the present programs only, and
+/// the corpus-pinned reconciliations declared not evaluated. `l01p7`'s shape:
+/// nineteen present, lil absent -- here two present and one absent.
+#[test]
+fn r547_5_a_frame_absent_program_is_named_and_the_rest_aggregated() {
+    let dir = std::env::temp_dir().join(format!("r547-5-frame-absent-{}", std::process::id()));
+    let (ledger, gate) = (dir.join("ledger"), dir.join("gate"));
+    std::fs::create_dir_all(&ledger).unwrap();
+    std::fs::create_dir_all(&gate).unwrap();
+    let outcomes = |rows: &[(&str, &str, &str)]| {
+        let mut text = String::from("program\tsubject_key\tfamily\tdelivery\n");
+        for (key, family, delivery) in rows {
+            text.push_str(&format!("p\t{key}\t{family}\t{delivery}\n"));
+        }
+        text
+    };
+    let write = |dir: &std::path::Path, program: &str, text: String| {
+        std::fs::write(
+            dir.join(format!("{program}.raw-boundary-subject-outcomes.tsv")),
+            text,
+        )
+        .unwrap();
+    };
+    // `alpha` swaps: gate {a, b}, now {b, c} -- the count holds, `a` is lost.
+    write(
+        &gate,
+        "alpha",
+        outcomes(&[
+            ("a", "ref", "realized-as-predicted"),
+            ("b", "ref", "realized-as-predicted"),
+        ]),
+    );
+    write(
+        &ledger,
+        "alpha",
+        outcomes(&[
+            ("b", "ref", "realized-as-predicted"),
+            ("c", "slice", "realized-as-predicted"),
+            ("d", "raw", "realized-as-predicted"),
+        ]),
+    );
+    // `beta` falls: gate {x}, now {}.
+    write(
+        &gate,
+        "beta",
+        outcomes(&[("x", "box", "realized-as-predicted")]),
+    );
+    write(&ledger, "beta", outcomes(&[("x", "box", "degraded")]));
+    let present = |program: &str, realized: usize| {
+        let mut row = report::Row::default();
+        row.set("program", program);
+        row.set(raw_schema::STATUS, "ok");
+        row.set(raw_schema::CONVERTED_CALLEE_WITHOUT_SITE_RECEIPT, "0");
+        for &key in RAW_BOUNDARY_AGGREGATE_SUM_KEYS {
+            row.set(key, 0);
+        }
+        row.set(raw_schema::REALIZED_SUBJECTS, realized);
+        row
+    };
+    let mut absent_row = report::Row::default();
+    absent_row.set("program", "gamma");
+    absent_row.set(raw_schema::STATUS, "frame-absent-excluded");
+    let rows = vec![present("alpha", 3), present("beta", 0), absent_row];
+    let (aggregate, receipt, regression, lost) =
+        raw_boundary_frame_absent_aggregate(&rows, &["gamma".to_owned()], &ledger, &gate, "cf");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        aggregate.get("raw_boundary_frame_absent_programs"),
+        Some("gamma")
+    );
+    assert_eq!(aggregate.get(raw_schema::REALIZED_SUBJECTS), Some("3"));
+    // The record key counts every family (`d` is raw-family and realized).
+    assert_eq!(aggregate.get("raw_boundary_realized_record"), Some("3"));
+    assert_eq!(aggregate.get(raw_schema::DATA), Some("partial"));
+    assert_eq!(aggregate.get(raw_schema::DELIVERY), Some("regressed"));
+    for line in [
+        "programs=2/3",
+        "frame_absent=gamma",
+        "realized_record=3",
+        "gate_regressed=beta",
+        "gate_lost_identities=2",
+        "controls=not-evaluated:frame-absent",
+    ] {
+        assert!(receipt.lines().any(|l| l == line), "{line}\n{receipt}");
+    }
+    assert!(
+        regression.contains("\talpha\t2\t2\t0\theld\n"),
+        "{regression}"
+    );
+    assert!(
+        regression.contains("\tbeta\t1\t0\t-1\tfell\n"),
+        "{regression}"
+    );
+    assert!(!regression.contains("gamma") && !lost.contains("gamma"));
+    assert!(lost.contains("alpha\ta\t2\t2\theld\n"), "{lost}");
+    assert!(lost.contains("beta\tx\t1\t0\tfell\n"), "{lost}");
+    // Wired where the full aggregate would have panicked, and replay passes the row.
+    let census = include_str!("bo_c1.rs");
+    assert!(census.contains(concat!(
+        "let (aggregate, receipt, regression_rows, lost) = ",
+        "raw_boundary_frame_absent_aggregate("
+    )));
+    assert!(census.contains(concat!(
+        "|| row.get(raw_schema::STATUS) == Some(\"frame-absent-",
+        "excluded\")"
+    )));
 }
 
 #[test]
