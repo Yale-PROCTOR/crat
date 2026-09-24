@@ -344,9 +344,7 @@ pub(crate) fn promote(
         // slice image would yield an ill-typed crate, so the row is held — but
         // its extent is recorded above, which is what separates "no extent to
         // propagate" from "an extent this build cannot yet carry".
-        if !super::licensed_lift::slice_uses_supported(ctx, node)
-            && super::pass_on::supported(ctx, entries, node).is_none()
-        {
+        if !super::licensed_lift::slice_uses_supported(ctx, node) {
             rows.push(held(subject, position, extent, "slice-use-unsupported"));
             continue;
         }

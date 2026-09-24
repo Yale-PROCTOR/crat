@@ -8079,8 +8079,6 @@ fn finish_decide<'tcx>(
             &mut ctors,
             &mut subjects,
         );
-        #[cfg(test)]
-        test_model_override::seed_mutability(tcx, &mut subjects);
         retained_c9_plans = original_c9_plans.clone();
         facts.body_adapters = original_body_adapters.clone();
         let current_slice_uses = additive::select_uses(
@@ -10102,35 +10100,6 @@ pub(crate) mod test_model_override {
                         .withdrawn
                         .insert((stage, super::bridge_receipt::SignatureClassId::of(function)));
                 }
-            }
-        }
-    }
-
-    /// **W6S-13 (R531-5(d))** — a subject a fixture marks MUTABLE with a
-    /// `// crat-test-mutable: <label>` line. Foster mutability makes a caller
-    /// mutable whenever its callee writes through the argument, so a shared
-    /// caller at a mutable formal cannot be written as C; the witness for the
-    /// pass-on's mutability refusal seeds the disagreement instead.
-    pub(crate) fn seed_mutability(
-        tcx: rustc_middle::ty::TyCtxt<'_>,
-        subjects: &mut [super::decision::Subject],
-    ) {
-        let marked = tcx
-            .sess
-            .source_map()
-            .files()
-            .iter()
-            .filter_map(|file| file.src.as_ref().map(|src| src.to_string()))
-            .flat_map(|src| {
-                src.lines()
-                    .filter_map(|line| line.trim().strip_prefix("// crat-test-mutable:"))
-                    .map(|rest| rest.trim().to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        for subject in subjects.iter_mut() {
-            if marked.contains(&subject.label) {
-                subject.mutable = true;
             }
         }
     }
