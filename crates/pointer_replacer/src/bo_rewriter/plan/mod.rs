@@ -629,6 +629,16 @@ fn nested_ast_composition(
                     // `("c-raw-reborrow-shared", "raw-cast-const")` and
                     // `("c-raw-slice-shared", "raw-cast-const")` rows above.
                     | ("c-raw-option-slice", "c-raw-option-mut")
+                    // R555-1 (wave-6a 089, joint (d)): brotli's
+                    // `ContextBlockSplitterFinishBlock` — `BitsEntropy(&mut
+                    // *((*combined_histo.offset(jx)).data_).as_mut_ptr()
+                    // .offset(0), ..)`: the array-start slice seam (W-C6) over
+                    // `A.as_mut_ptr()` strictly contains the Box owner's own
+                    // element edit of `(*combined_histo.offset(jx))`. The seam
+                    // builds its adapter around the operand node after the use
+                    // pass has grafted the element into it — the same argument
+                    // as the `("box-borrow-view-to-raw", "box-expression")` row.
+                    | ("c-raw-slice-shared", "box-expression")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),

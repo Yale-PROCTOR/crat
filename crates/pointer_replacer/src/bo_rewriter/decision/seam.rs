@@ -3464,6 +3464,21 @@ fn shared_candidate(
 /// (`as_deref`) and declines. No raw boundary is crossed, so no retention
 /// tier. A non-optional SIZED owner keeps the matrix's `&*x` (A1's receivers).
 /// Keyed on the argument's decision, not a new `Form` variant.
+/// The binding whose own view the R422-5 owner-view glue renders: the owner
+/// passed bare, never a place derived from it.
+fn owner_argument(shape: ArgShape) -> Option<HirId> {
+    match shape {
+        ArgShape::BareLocal(root) => Some(root),
+        ArgShape::AddrOf { .. }
+        | ArgShape::AddrOfCast { .. }
+        | ArgShape::CastOfLocal { .. }
+        | ArgShape::RawExpr { .. }
+        | ArgShape::NullLit
+        | ArgShape::Cast { .. }
+        | ArgShape::Other => None,
+    }
+}
+
 fn owner_view_candidate(
     decision: Option<&Decision>,
     expected: Form,
@@ -4699,10 +4714,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // wave-6a (R422-5): a Box-decided argument the owner-view glue
                 // renders IS the expected form at the call (`&*x`,
                 // `x.as_deref().unwrap()`, ..): the position is a glue-arm
-                // seam of the callee's, not a C-arm crossing.
-                let found = if arg
-                    .shape
-                    .place_root()
+                // seam of the callee's, not a C-arm crossing. The view is the
+                // OWNER's: only the owner passed bare takes it. An element
+                // address (`&mut *owner.offset(i)`) is `&mut T` once the Box
+                // plan renders the element, and keeps its own form (R555-1).
+                let found = if owner_argument(arg.shape)
                     .and_then(|root| decision_of.get(&(site.caller, root)).copied())
                     .and_then(|decision| owner_view_candidate(Some(decision), expected, "x"))
                     .is_some()
@@ -5090,6 +5106,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 };
                 let owner_view = pos
                     .root
+                    .filter(|_| pos.source_shape == "bare-local")
                     .and_then(|root| decision_of.get(&(site.caller, root)).copied())
                     .and_then(|decision| owner_view_candidate(Some(decision), pos.expected, text));
                 let len_text = super::slice_return_evidence::companion_for_tail(

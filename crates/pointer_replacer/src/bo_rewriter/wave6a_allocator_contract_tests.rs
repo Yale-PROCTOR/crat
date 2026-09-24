@@ -1446,6 +1446,67 @@ pub unsafe extern "C" fn entropy(mut m: *mut MemoryManager, n: usize, mut out: *
 }
 "#;
 
+/// **R555-1 joint (d).** An element address of a Box owner —
+/// `&mut *histograms.offset(j)` at a `&mut Hist` formal — is `&mut T` once the
+/// Box plan renders the element (`histograms.as_deref_mut().unwrap()[j]`).
+/// The owner-view glue (R422-5) is the OWNER's view and applies to the owner
+/// passed bare; keyed on the place root it also wrapped this element as
+/// `&mut (&mut ..[j]).as_mut().unwrap()[0]` (E0599 — brotli `ClusterBlocks*`'s
+/// fifteen, `ContextBlockSplitterFinishBlock`).
+#[test]
+fn w6a_r555_an_element_address_of_a_box_owner_passes_as_written() {
+    let out = emitted("r555-element", &format!("{PRELUDE}{ELEMENTS}"));
+    let text = compact(&out.source);
+    for subject in [
+        "adding::histograms",
+        "HistogramAdd::self_0",
+        "entropy::combined",
+        "BitsEntropy::population",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{:#?}\n{}",
+            out.degradations,
+            out.source
+        );
+    }
+    assert!(!text.contains(".as_mut().unwrap()[0]"), "{}", out.source);
+    assert!(
+        text.contains("HistogramAdd(&muthistograms.as_deref_mut().unwrap()[(j)asusize],"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnHistogramAdd(mutself_0:&mutHist,"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnBitsEntropy(mutpopulation:&[u32],"),
+        "{}",
+        out.source
+    );
+    // A write through the element's projection opens the owner mutably.
+    assert!(
+        text.contains("histograms.as_deref_mut().unwrap()[(j)asusize].total_count_=0asusize;"),
+        "{}",
+        out.source
+    );
+    // The array start of an element's array field is the array-start seam's
+    // own rendering (W-C6: `from_raw_parts(A.as_mut_ptr(), LEN)`, here at the
+    // receipted §77 fallback extent — no companion is licensed), not a
+    // one-element slice; the `&mut self` `as_mut_ptr` opens the owner mutably.
+    assert!(
+        text.contains(
+            "BitsEntropy(core::slice::from_raw_parts((combined.as_deref_mut().unwrap()[(0)asusize].data_).as_mut_ptr(),crate::FALLBACK_SLICE_EXTENT),4asusize);"
+        ),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+}
+
 /// Joint (a)'s owner view is likewise the owner's: an element address of a Box
 /// owner at a callee formal that falls back to raw keeps the refusal (it is a
 /// reference to one element, not the owner, and has no raw-view rendering of

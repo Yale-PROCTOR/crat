@@ -887,6 +887,24 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     lhs.hir_id == deref.hir_id
                 }
                 ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, _) => true,
+                // A `&mut self` method on the place (`(*p.offset(j)).data_
+                // .as_mut_ptr()`) borrows it mutably through its autoref
+                // (R555-1).
+                ExprKind::MethodCall(_, receiver, _, _) if receiver.hir_id == deref.hir_id => self
+                    .tcx
+                    .typeck(deref.hir_id.owner.def_id)
+                    .expr_adjustments(receiver)
+                    .iter()
+                    .any(|adjustment| {
+                        matches!(
+                            adjustment.kind,
+                            rustc_middle::ty::adjustment::Adjust::Borrow(
+                                rustc_middle::ty::adjustment::AutoBorrow::Ref(
+                                    rustc_middle::ty::adjustment::AutoBorrowMutability::Mut { .. }
+                                )
+                            )
+                        )
+                    }),
                 _ => false,
             },
             _ => false,
@@ -1021,10 +1039,12 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                         let index_text = self.snippet(index.span);
                         // An optional slice owner (the contract consumer's
                         // conditional allocation) is read through
-                        // `as_deref()` and written through `as_deref_mut()`.
+                        // `as_deref()` and written through `as_deref_mut()` —
+                        // a write seen THROUGH the element's projection too
+                        // (`(*p.offset(j)).f = v`), as the deref arm sees it.
                         let owner = if !self.optional {
                             name.clone()
-                        } else if self.written(grand) {
+                        } else if self.written_through_places(grand) {
                             format!("{name}.as_deref_mut().unwrap()")
                         } else {
                             format!("{name}.as_deref().unwrap()")
