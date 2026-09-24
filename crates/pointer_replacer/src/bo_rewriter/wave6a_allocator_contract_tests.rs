@@ -1235,3 +1235,174 @@ fn w6a_a_body_proves_a_lend_for_every_slotted_formal() {
     // A formal the model never slotted answers nothing, in every reading.
     assert!(!model_admits_lend(None));
 }
+
+/// **R551-5 joint (a) (relay wave-6a/083–084).** A Box owner lent to a local
+/// callee whose converted formal falls back to its raw input form. brotli's
+/// `ClusterBlocks*` pass `histogram_symbols` to `BrotliHistogramCombine*`, a
+/// class the A5 site proof holds; the caller's partition reverted because
+/// `callee_parameter_input` refused any source decided `Box`. The owner now
+/// supplies its raw view, tiered by the raw boundary's own disposition of
+/// the site, through the template every raw-boundary Box site renders.
+///
+/// Returns the emitted tree with the CALLEE's class reverted, and the
+/// callee-parameter input plan's current source for `callee`'s argument
+/// from `caller`: its bridge kind and tier, or its refusal key.
+fn box_source_at_reverted_callee(
+    name: &str,
+    src: &str,
+    caller: &str,
+    callee: &str,
+) -> (
+    String,
+    Result<(String, super::bridge_receipt::BridgeRetentionTier), &'static str>,
+) {
+    let (source, input) = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("one original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("one decision pipeline");
+        let function = |name: &str| {
+            table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject.fn_did)
+                .find(|did| {
+                    tcx.def_path_str(did.to_def_id())
+                        .ends_with(&format!("::{name}"))
+                        || tcx.def_path_str(did.to_def_id()) == name
+                })
+                .unwrap_or_else(|| panic!("function {name} has subjects"))
+        };
+        let (caller, callee) = (function(caller), function(callee));
+        let emission = super::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("one terminal plan");
+        let inputs = emission
+            .plan
+            .terminal_call_plans
+            .callee_parameter_inputs
+            .values()
+            .filter(|input| input.caller == caller && input.node.0 == callee)
+            .collect::<Vec<_>>();
+        let [input] = inputs.as_slice() else {
+            panic!("{name}: one callee-parameter input for {callee:?}: {inputs:#?}")
+        };
+        let input = input
+            .current_source
+            .as_ref()
+            .map_err(|reason| *reason)
+            .map(|alternative| {
+                let bridge = alternative
+                    .bridge
+                    .as_ref()
+                    .expect("an adapter carries its bridge");
+                (bridge.bridge_kind.clone(), bridge.retention)
+            });
+        let mut reverted = emission.plan.held_classes();
+        reverted.insert(super::bridge_receipt::SignatureClassId::of(callee));
+        let (files, rollbacks, ..) = super::round_files(
+            tcx,
+            &capture,
+            &emission.plan,
+            &emission.texts,
+            &reverted,
+            &std::collections::BTreeSet::new(),
+            emission.plan.root_file.as_ref(),
+            &table,
+        )
+        .expect("the reverted-callee emission");
+        assert!(
+            rollbacks.is_empty(),
+            "{name}: no structural rollback: {rollbacks:#?}"
+        );
+        (files.into_values().next().expect("one file"), input)
+    })
+    .expect("the fixture compiles");
+    (source, input)
+}
+
+const LENT_TO_A_REVERTED_CALLEE: &str = r#"
+pub unsafe extern "C" fn lending(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {
+    let mut lent = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    *lent.offset(0 as isize) = 1 as u32;
+    *split = ReindexSymbols(lent, n);
+    BrotliFree(m, lent as *mut std::os::raw::c_void);
+}
+"#;
+
+/// The owner's raw view at the fallen-back formal: `lent.as_mut_ptr()`,
+/// `box-borrow-view-to-raw` at tier 1 (`ReindexSymbols` only reads), and the
+/// tree type-checks with the callee raw and the owner still `Box<[u32]>`.
+#[test]
+fn w6a_r551_a_box_owner_lends_its_raw_view_to_a_reverted_callee() {
+    let (source, input) = box_source_at_reverted_callee(
+        "r551-box-source",
+        &format!("{PRELUDE}{LENT_TO_A_REVERTED_CALLEE}"),
+        "lending",
+        "ReindexSymbols",
+    );
+    assert_eq!(
+        input,
+        Ok((
+            "box-borrow-view-to-raw".to_owned(),
+            super::bridge_receipt::BridgeRetentionTier::T1
+        )),
+        "{source}"
+    );
+    let text = compact(&source);
+    assert!(text.contains("letmutlent:Box<[u32]>="), "{source}");
+    assert!(
+        text.contains("*split=ReindexSymbols(lent.as_mut_ptr(),n);"),
+        "{source}"
+    );
+    assert!(
+        text.contains("fnReindexSymbols(mutsymbols:*mutu32,"),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// Control: an OPTIONAL owner (the conditional allocation) lends the R130
+/// optional view — `None` is the null the raw formal already accepts.
+#[test]
+fn w6a_r551_an_optional_owner_lends_the_optional_raw_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{\n\
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32\n\
+    }} else {{ 0 as *mut u32 }};\n\
+    if n > 0 as usize {{ *syms.offset(0 as isize) = 1 as u32; }}\n\
+    *split = ReindexSymbols(syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let (source, input) =
+        box_source_at_reverted_callee("r551-optional-source", &src, "optional", "ReindexSymbols");
+    assert_eq!(
+        input,
+        Ok((
+            "optional-box-borrow-view-to-raw".to_owned(),
+            super::bridge_receipt::BridgeRetentionTier::T1
+        )),
+        "{source}"
+    );
+    let text = compact(&source);
+    assert!(text.contains("letmutsyms:Option<Box<[u32]>>="), "{source}");
+    assert!(
+        text.contains(
+            "ReindexSymbols(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()),n)"
+        ),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}

@@ -325,25 +325,33 @@ fn current_alternative(
     if matches!(arg.shape, ArgShape::Other | ArgShape::Cast { .. }) {
         return Err("callee-parameter-input-source-shape-unbuilt");
     }
-    if let Some(root) = arg.shape.place_root()
-        && table.entries.iter().any(|(subject, decision)| {
-            subject.fn_did == caller
-                && subject.hir_id == root
-                && match decision {
-                    Decision::Box(_)
-                    | Decision::NestedSlice { .. }
-                    | Decision::Cursor { .. }
-                    | Decision::InferredRef { .. } => true,
-                    Decision::Ref { .. }
-                    | Decision::Slice { .. }
-                    | Decision::Opt { .. }
-                    | Decision::Degraded(_) => false,
-                }
-        })
-    {
-        return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
-    }
-    if found == Form::Raw {
+    let root_decision = arg.shape.place_root().and_then(|root| {
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == caller && subject.hir_id == root)
+            .map(|(_, decision)| decision)
+    });
+    // R551-5 joint (a): a `Box` owner is NOT refused. `form_of(Box)` is
+    // `Raw`, so it must also skip the zero-syntax shortcut below — a Box
+    // owner's text is never a raw pointer — and supply its raw view, tiered
+    // by the raw boundary's own disposition of this site.
+    let owner = match root_decision {
+        Some(
+            Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::InferredRef { .. },
+        ) => {
+            return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
+        }
+        Some(owner @ Decision::Box(_)) => Some(owner),
+        Some(
+            Decision::Ref { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Degraded(_),
+        )
+        | None => None,
+    };
+    if owner.is_none() && found == Form::Raw {
         return Ok(zero(arg, found));
     }
     let matches = raw
@@ -386,6 +394,22 @@ fn current_alternative(
             return Err("callee-parameter-input-raw-boundary-held");
         }
     };
+    if let Some(owner) = owner {
+        // The owner's view through the template every raw-boundary Box site
+        // renders (`x.as_mut_ptr()`, `core::ptr::from_mut(x.as_mut())`, the
+        // R130 optional form), the slice/value choice read from the site.
+        let template = raw_boundary::template_for(
+            owner,
+            &site.target,
+            None,
+            raw.negative_write_evidence(key).is_some(),
+        )
+        .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+        let spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, true);
+        return adapter(
+            tcx, caller, callee, arg, site, template, spec, found, input_form, retention, waiver_id,
+        );
+    }
     let found = crate::bo_rewriter::wave6r_shared_root::input_found(
         table,
         caller,
@@ -426,6 +450,25 @@ fn current_alternative(
         template = selected.template;
     }
     let spec = GlueSpec::raw_boundary_target(template, &site.target, false, true);
+    adapter(
+        tcx, caller, callee, arg, site, template, spec, found, input_form, retention, waiver_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adapter(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    arg: &Arg,
+    site: &raw_boundary::RawBoundaryRenderSite,
+    template: raw_boundary::BridgeTemplate,
+    spec: GlueSpec,
+    found: Form,
+    input_form: Form,
+    retention: BridgeRetentionTier,
+    waiver_id: Option<String>,
+) -> Result<SeamAlternative, &'static str> {
     let arg_span = site
         .direct_storage_span
         .unwrap_or(site.adapter_operand_span);
