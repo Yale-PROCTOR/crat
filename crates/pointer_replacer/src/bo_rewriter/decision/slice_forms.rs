@@ -138,6 +138,11 @@ pub(crate) struct ComputedArgumentView {
     pub(crate) argument_span: Span,
     /// The suffix start, already typed `usize`.
     pub(crate) index: String,
+    /// **W6S-14.** The source span [`Self::index`] was copied from, and
+    /// whether it is wrapped `(…) as usize` — so [`composed_index`] can render
+    /// it with another subject's edits inside it applied.
+    pub(crate) index_span: Span,
+    pub(crate) index_wrap: bool,
     /// The spine borrowed the element (`&*` / `&mut *`) rather than passing
     /// the arithmetic itself.
     pub(crate) borrowed: bool,
@@ -221,6 +226,8 @@ pub(crate) fn computed_body_copy_view<'tcx>(
             use_span: expr.span,
             argument_span: operand.span,
             index: index_text(tcx, delta)?,
+            index_span: super::emitability::index_parts(tcx, delta).0,
+            index_wrap: super::emitability::index_parts(tcx, delta).1,
             borrowed: borrowed.is_some(),
             borrow_span: borrowed.map(|(_, span)| span),
             mutable: borrowed.is_some_and(|(mutable, _)| mutable),
@@ -331,6 +338,8 @@ pub(crate) fn computed_argument_view<'tcx>(
             use_span: expr.span,
             argument_span: operand.span,
             index,
+            index_span: super::emitability::index_parts(tcx, delta).0,
+            index_wrap: super::emitability::index_parts(tcx, delta).1,
             borrowed: borrowed.is_some(),
             borrow_span: borrowed.map(|(_, span)| span),
             mutable: borrowed.is_some_and(|(mutable, _)| mutable),
@@ -631,6 +640,90 @@ pub(crate) fn lower(
     lower_computed_argument_views(tcx, table, slice_uses)
 }
 
+/// **W6S-14 (R554-3, wave-6s 075 N1) — the view's index, rendered with the
+/// other subjects' edits inside it.** A view's index is the delta's SOURCE
+/// text, captured by the collector before any decision exists. When the delta
+/// itself reads another subject that delivers (`*block_ids.offset(i)` with
+/// `block_ids: &[u8]`), that subject's own use edit lies INSIDE the span the
+/// view replaces: copied raw, the view is ill-typed (`method not found in
+/// &[u8]`); kept beside the view's edit, the two overlap and the family site
+/// fails. So the index is rendered here, from the decided table: every other
+/// subject's use edit contained in the index span is spliced in, and returned
+/// so the caller can retire it once the view is admitted (the view's edit now
+/// carries it). An edit that only partly overlaps, or a seam inside the index,
+/// refuses the view — `None`.
+fn composed_index(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    view: &ComputedArgumentView,
+    own: (LocalDefId, HirId),
+) -> Option<(String, Vec<(usize, Span)>)> {
+    let within = |span: Span| view.index_span.contains(span);
+    let overlaps =
+        |span: Span| span.lo() < view.index_span.hi() && view.index_span.lo() < span.hi();
+    if table
+        .seams
+        .edits
+        .iter()
+        .any(|edit| overlaps(edit.span) && !edit.span.contains(view.index_span))
+    {
+        return None;
+    }
+    let mut inner: Vec<(usize, Span, String)> = Vec::new();
+    for (entry, (subject, decision)) in table.entries.iter().enumerate() {
+        if (subject.fn_did, subject.hir_id) == own {
+            continue;
+        }
+        let uses = match decision {
+            Decision::Slice { uses, .. }
+            | Decision::NestedSlice { uses, .. }
+            | Decision::Opt { uses, .. } => uses,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => continue,
+        };
+        for edit in uses {
+            if within(edit.span) {
+                inner.push((entry, edit.span, edit.replacement.clone()));
+            } else if overlaps(edit.span) && !edit.span.contains(view.index_span) {
+                return None;
+            }
+        }
+    }
+    let mut text = tcx
+        .sess
+        .source_map()
+        .span_to_snippet(view.index_span)
+        .ok()?;
+    let base = view.index_span.lo().0;
+    inner.sort_by_key(|(_, span, _)| std::cmp::Reverse(span.lo().0));
+    let mut last_lo = u32::MAX;
+    for (_, span, replacement) in &inner {
+        // Nested inner edits are one subject's business; two that overlap each
+        // other are not composable here.
+        if span.hi().0 > last_lo {
+            return None;
+        }
+        last_lo = span.lo().0;
+        let (lo, hi) = ((span.lo().0 - base) as usize, (span.hi().0 - base) as usize);
+        text.replace_range(lo..hi, replacement);
+    }
+    let text = if view.index_wrap {
+        format!("({text}) as usize")
+    } else {
+        text
+    };
+    Some((
+        text,
+        inner
+            .into_iter()
+            .map(|(entry, span, _)| (entry, span))
+            .collect(),
+    ))
+}
+
 /// Render every admitted computed sub-view argument of a Slice subject on its
 /// own raw-boundary seam: the seam's operand becomes the base binding, the
 /// carried view supplies `[e..]`, and the existing bridge template adds the
@@ -715,8 +808,15 @@ fn lower_computed_argument_views(
             .is_unsafe();
         let mut seams = Vec::new();
         let mut element_uses = Vec::new();
+        let mut retired: Vec<(usize, Span)> = Vec::new();
         let mut hold = None;
         for view in views {
+            // W6S-14: the index with the other subjects' edits inside it.
+            let Some((index_text, subsumed)) = composed_index(tcx, table, view, node) else {
+                hold = Some(view.use_span);
+                break;
+            };
+            retired.extend(subsumed);
             let carriers = table
                 .seams
                 .edits
@@ -740,7 +840,7 @@ fn lower_computed_argument_views(
                 }
             };
             let forward = |view_mutable: bool| ForwardView {
-                index_name: view.index.clone(),
+                index_name: index_text.clone(),
                 mutable: view_mutable,
                 root: Some(view.use_span),
             };
@@ -752,7 +852,7 @@ fn lower_computed_argument_views(
                     let amp = if view.mutable { "&mut " } else { "&" };
                     element_uses.push(UseEdit {
                         span: view.argument_span,
-                        replacement: format!("{amp}({name})[{}]", view.index),
+                        replacement: format!("{amp}({name})[{index_text}]"),
                         bridge_kind: "subject-use",
                     });
                     continue;
@@ -899,6 +999,20 @@ fn lower_computed_argument_views(
         }
         for (index, edit) in seams {
             table.seams.edits[index] = edit;
+        }
+        // W6S-14: an inner subject's edit the view now carries is retired from
+        // that subject, so the two never overlap.
+        for (inner, span) in retired {
+            match &mut table.entries[inner].1 {
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses.retain(|edit| edit.span != span),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. }
+                | Decision::Degraded(_) => {}
+            }
         }
         match &mut table.entries[entry].1 {
             Decision::Slice { uses, .. } => uses.extend(element_uses),

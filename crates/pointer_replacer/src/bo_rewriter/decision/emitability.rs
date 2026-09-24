@@ -1705,6 +1705,35 @@ fn self_advance_lhs(expr: &Expr<'_>, key: (LocalDefId, HirId)) -> bool {
 /// **S3.2′-3: lifted out of the slice collector unchanged**, so the optional
 /// slice twin renders indices by the same rule rather than by a second copy of
 /// it. One canonicalizer, the standing rule.
+/// **W6S-14 (R554-3).** Where [`index_text`]'s text comes from, and whether it
+/// is wrapped `(…) as usize`: the SPAN of the expression whose source is the
+/// index, so a view can render it later with another subject's edits inside
+/// it applied (`*block_ids.offset(i)` → `block_ids[i]`). Same rule, same
+/// order as [`index_text`].
+pub(crate) fn index_parts(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> (Span, bool) {
+    let usize_or_literal = |expr: &Expr<'_>| {
+        matches!(&expr.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+            || tcx
+                .typeck(expr.hir_id.owner.def_id)
+                .expr_ty_adjusted_opt(expr)
+                .is_some_and(|t| {
+                    matches!(
+                        t.kind(),
+                        rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)
+                    )
+                })
+    };
+    if let ExprKind::Cast(inner, ty) = &arg.kind
+        && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
+        && p.segments
+            .last()
+            .is_some_and(|s| s.ident.name.as_str() == "isize")
+    {
+        return (inner.span, !usize_or_literal(inner));
+    }
+    (arg.span, !usize_or_literal(arg))
+}
+
 pub(crate) fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
     /// Is this expression already a `usize`?
     ///

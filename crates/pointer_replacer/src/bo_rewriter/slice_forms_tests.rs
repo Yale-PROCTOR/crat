@@ -2165,3 +2165,89 @@ fn w4_arm_a_mutable_caller_is_never_lifted_shared() {
     };
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+/// **W6S-14 (R554-3, wave-6s 075 N1) — a computed view whose index holds
+/// ANOTHER subject's rewrite.** brotli `BuildBlockHistograms*::histograms#5`:
+/// `HistogramAdd*(&mut *histograms.offset(*block_ids.offset(i) as isize), …)`
+/// with `block_ids` itself a delivered slice. The view's index is the delta's
+/// source text; it must be rendered with `block_ids`' own edit spliced in, or
+/// the element borrow is refused and its bare-offset twin is emitted ill-typed
+/// (`method not found in &[u8]`).
+fn nested_index_fixture(call: &str) -> String {
+    format!(
+        r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct HistogramLiteral {{ pub total_count_: size_t }}
+unsafe extern "C" fn HistogramAddLiteral(mut self_0: *mut HistogramLiteral, mut val: size_t) {{
+    (*self_0).total_count_ = ((*self_0).total_count_).wrapping_add(val);
+}}
+unsafe extern "C" fn BuildBlockHistogramsLiteral(length: size_t, mut block_ids: *const uint8_t,
+        mut histograms: *mut HistogramLiteral) {{
+    let mut i: size_t = 0;
+    while i < length {{
+        {call}
+        i = i.wrapping_add(1);
+    }}
+}}
+"#
+    )
+}
+
+fn delivered_and_emitted(input: &str) -> (String, String) {
+    let decision = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>(
+                table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.label == "BuildBlockHistogramsLiteral::histograms")
+                    .map(|(_, d)| format!("{d:?}"))
+                    .unwrap_or_default(),
+            )
+        },
+    )
+    .expect("fixture compiles")
+    .expect("table");
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(input) else {
+        panic!("the fixture must emit")
+    };
+    (decision, source)
+}
+
+#[test]
+fn w6s14_the_element_borrow_renders_its_index_from_the_inner_rewrite() {
+    let (decision, source) = delivered_and_emitted(&nested_index_fixture(
+        "HistogramAddLiteral(&mut *histograms.offset(*block_ids.offset(i as isize) as isize), i);",
+    ));
+    assert!(decision.starts_with("Slice { mutable: true"), "{decision}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("HistogramAddLiteral(&mut (histograms)[(block_ids[i]) as usize], i)"),
+        "the index carries block_ids' own rewrite: {source}"
+    );
+}
+
+#[test]
+fn w6s14_the_bare_offset_view_renders_its_index_from_the_inner_rewrite() {
+    let (decision, source) = delivered_and_emitted(&nested_index_fixture(
+        "HistogramAddLiteral(histograms.offset(*block_ids.offset(i as isize) as isize), i);",
+    ));
+    assert!(decision.starts_with("Slice { mutable: true"), "{decision}");
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the bare-offset twin must be well typed: {source}"
+    );
+    assert!(!source.contains("block_ids.offset"), "{source}");
+}
