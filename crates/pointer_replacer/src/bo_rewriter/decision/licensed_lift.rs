@@ -318,8 +318,8 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
-        // R533-4: ask with the mutability THIS arm lifts with (below).
-        let lift_mutable = subject.mutable;
+        // R533-4: ask with the mutability THIS arm lifts with.
+        let lift_mutable = subject.mutable && width.as_ref().is_ok_and(|region| region.mutable);
         if !slice_uses_supported(ctx, node)
             && super::pass_on::supported(ctx, entries, node, lift_mutable).is_none()
         {
@@ -354,20 +354,12 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
     }
     let mut receipts = unlicensed;
     for (subject, decision) in entries.iter_mut() {
-        let Some((width, _region_mutable, callee, parameter_index)) =
+        let Some((width, region_mutable, callee, parameter_index)) =
             widths.get(&(subject.fn_did, subject.hir_id))
         else {
             continue;
         };
-        // **R533-4 (wave-4 061 C7) — the SUBJECT's mutability.** A width-read
-        // region is `mutable: false` (`void_region.rs`), so the old
-        // `subject.mutable && region.mutable` lifted every exact-arm caller
-        // SHARED — including one that writes through another of its uses,
-        // which then hands `&[T]` to a writing formal and degrades the whole
-        // program. A width read is rendered from a mutable slice as well
-        // (`&s[..N]` auto-reborrows), so the lifted form keeps the subject's
-        // own permission; the region's is the callee's, not the caller's.
-        let mutable = subject.mutable;
+        let mutable = subject.mutable && *region_mutable;
         *decision = Decision::Slice {
             mutable,
             uses: slice_rewrites(ctx, (subject.fn_did, subject.hir_id)),
