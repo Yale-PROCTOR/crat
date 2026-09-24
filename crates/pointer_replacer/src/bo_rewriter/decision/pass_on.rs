@@ -37,6 +37,7 @@
 //! a candidate again and the set of receiving formals only grows), bounded by
 //! the held rows, and measured cycle-free (068).
 
+use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 
 use super::{Ctx, Decision, Subject, SubjectKind};
@@ -170,10 +171,12 @@ fn receives(decision: &Decision, caller_mutable: bool) -> Receive {
 /// - B1 writes one row per held subject per round, so its held rows are the
 ///   last round's and its lifted rows every round's.
 ///
-/// Within one round a refusal is paired with its lift by the census
-/// `subject_key` both receipts carry (wave-4 `2cd00befc`, R536-6): the owner's
-/// full path, so C2Rust's per-module duplicates — which share a LABEL (R1) —
-/// never meet.
+/// Within one round a refusal is paired with its lift by the identity the
+/// census row itself carries — subject label, licensing callee path,
+/// parameter index. C2Rust's per-module duplicates share a LABEL (R1) but
+/// license from their own module's callee, so that identity separates them;
+/// where even it collides, the two rows are indistinguishable in the census
+/// schema too, and wave-4's `subject_key` (relay 078) makes it exact.
 pub(crate) fn close(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
@@ -190,11 +193,18 @@ pub(crate) fn close(
             .filter(|(_, decision)| held_at_a_local_callee(decision).is_some())
             .count()
     };
-    let identity = |lift: &LiftReceipt| lift.subject_key.clone();
+    let identity = |lift: &LiftReceipt| {
+        (
+            lift.subject.clone(),
+            lift.callee.clone(),
+            lift.parameter_index,
+        )
+    };
     // Split one round's receipts into what is final now (its lifts, and the
     // refusals it wrote for subjects it lifted) and what only the LAST round
     // may keep (refusals of rows still held).
-    let settle = |round: Vec<LiftReceipt>,
+    let settle = |entries: &[(Subject, Decision)],
+                  round: Vec<LiftReceipt>,
                   round_roots: &[RootExtentRow]|
      -> (Vec<LiftReceipt>, Vec<LiftReceipt>) {
         let lifted = round
@@ -202,15 +212,20 @@ pub(crate) fn close(
             .filter(|lift| lift.declined.is_none())
             .map(identity)
             .collect::<rustc_hash::FxHashSet<_>>();
+        let still_held = entries
+            .iter()
+            .filter(|(_, decision)| held_at_a_local_callee(decision).is_some())
+            .map(|(subject, _)| subject.label.clone())
+            .collect::<rustc_hash::FxHashSet<_>>();
         let lifted_by_b1 = round_roots
             .iter()
-            .filter(|row| row.outcome == "lifted")
-            .map(|row| row.subject_key.clone())
+            .filter(|row| row.outcome == "lifted" && !still_held.contains(&row.subject))
+            .map(|row| row.subject.clone())
             .collect::<rustc_hash::FxHashSet<_>>();
         round.into_iter().partition(|lift| {
             lift.declined.is_none()
                 || lifted.contains(&identity(lift))
-                || lifted_by_b1.contains(&lift.subject_key)
+                || lifted_by_b1.contains(&lift.subject)
         })
     };
     let movable = |entries: &[(Subject, Decision)]| {
@@ -229,7 +244,7 @@ pub(crate) fn close(
     if !movable(entries) {
         return;
     }
-    let (mut kept, mut pending) = settle(std::mem::take(lifts), roots);
+    let (mut kept, mut pending) = settle(entries, std::mem::take(lifts), roots);
     let mut kept_roots = roots
         .iter()
         .filter(|row| row.outcome == "lifted")
@@ -251,7 +266,7 @@ pub(crate) fn close(
         round.extend(super::licensed_lift::promote_fallback(ctx, entries));
         let progressed = held_count(entries) != before;
         // This round is now the latest view of every row still held.
-        let (final_now, still_held) = settle(round, &round_roots);
+        let (final_now, still_held) = settle(entries, round, &round_roots);
         kept.extend(final_now);
         pending = still_held;
         kept_roots.extend(
@@ -268,6 +283,13 @@ pub(crate) fn close(
             break;
         }
     }
+    // Where even the census identity collides (twins licensed by ONE callee),
+    // a paired refusal that a still-held row also carries is that row's.
+    let held_identities = pending
+        .iter()
+        .map(identity)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    kept.retain(|lift| lift.declined.is_none() || !held_identities.contains(&identity(lift)));
     kept.extend(pending);
     kept_roots.extend(pending_roots);
     *lifts = kept;
@@ -283,11 +305,15 @@ pub(crate) fn receipts(
     entries: &[(Subject, Decision)],
     lifts: &mut [super::licensed_lift::LiftReceipt],
 ) -> Vec<Receipt> {
-    // **R536-6 R1 — the marks are keyed on the census `subject_key`**, which
-    // the lift rows carry (wave-4 `2cd00befc`), so a per-module duplicate —
-    // same LABEL — is never marked for its twin. A candidate is a subject
-    // whose own uses the collector refused: only a lift can have taken such a
-    // subject to `Slice`, and only such a subject is declined at the use gate.
+    // **R536-6 R1 — the marks are keyed on a LABEL, so they are set only when
+    // every candidate carrying that label agrees.** The lift rows name their
+    // subject by label, and C2Rust's per-module duplicates share one. A
+    // candidate here is a subject whose own uses the collector refused
+    // (`unsupported` is set): only a lift can have taken such a subject to
+    // `Slice`, and only such a subject can be declined at the use gate. A twin
+    // the ladder delivered directly has no refused use and takes no part. Where
+    // two candidates with one label disagree, no mark is written — the row is
+    // left unmarked rather than marked for its twin.
     let refused_use = |subject: &Subject| {
         ctx.slice_uses
             .get(&(subject.fn_did, subject.hir_id))
@@ -303,30 +329,32 @@ pub(crate) fn receipts(
         | Decision::Cursor { .. }
         | Decision::Degraded(_) => None,
     };
-    let mut pass_on_keys = rustc_hash::FxHashSet::default();
-    let mut refused_keys = rustc_hash::FxHashSet::default();
+    let mut refused_votes: FxHashMap<&str, Vec<bool>> = FxHashMap::default();
+    let mut pass_on_votes: FxHashMap<&str, Vec<bool>> = FxHashMap::default();
     for (subject, decision) in entries {
         if !refused_use(subject) {
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
-        let key = super::licensed_lift::subject_key(ctx, subject);
         match lifted_mutable(decision) {
-            Some(mutable) if supported(ctx, entries, node, mutable).is_some() => {
-                pass_on_keys.insert(key);
-            }
-            Some(_) => {}
-            None if refused_by_mutability(ctx, entries, node) => {
-                refused_keys.insert(key);
-            }
-            None => {}
+            Some(mutable) => pass_on_votes
+                .entry(subject.label.as_str())
+                .or_default()
+                .push(supported(ctx, entries, node, mutable).is_some()),
+            None => refused_votes
+                .entry(subject.label.as_str())
+                .or_default()
+                .push(refused_by_mutability(ctx, entries, node)),
         }
     }
+    let unanimous = |votes: &FxHashMap<&str, Vec<bool>>, label: &str| {
+        votes.get(label).is_some_and(|v| v.iter().all(|&yes| yes))
+    };
     for lift in lifts.iter_mut() {
-        if lift.declined.is_some() && refused_keys.contains(&lift.subject_key) {
+        if lift.declined.is_some() && unanimous(&refused_votes, &lift.subject) {
             lift.use_shape = Some("pass-on-refused:shared-into-mut");
         }
-        if lift.declined.is_none() && pass_on_keys.contains(&lift.subject_key) {
+        if lift.declined.is_none() && unanimous(&pass_on_votes, &lift.subject) {
             lift.use_shape = Some("pass-on");
         }
     }
