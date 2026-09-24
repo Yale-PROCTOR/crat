@@ -37,7 +37,6 @@
 //! a candidate again and the set of receiving formals only grows), bounded by
 //! the held rows, and measured cycle-free (068).
 
-use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 
 use super::{Ctx, Decision, Subject, SubjectKind};
@@ -305,70 +304,49 @@ pub(crate) fn receipts(
     entries: &[(Subject, Decision)],
     lifts: &mut [super::licensed_lift::LiftReceipt],
 ) -> Vec<Receipt> {
-    // **R536-6 R1 — the marks are keyed on a LABEL, so they are set only when
-    // every candidate carrying that label agrees.** The lift rows name their
-    // subject by label, and C2Rust's per-module duplicates share one. A
-    // candidate here is a subject whose own uses the collector refused
-    // (`unsupported` is set): only a lift can have taken such a subject to
-    // `Slice`, and only such a subject can be declined at the use gate. A twin
-    // the ladder delivered directly has no refused use and takes no part. Where
-    // two candidates with one label disagree, no mark is written — the row is
-    // left unmarked rather than marked for its twin.
-    let refused_use = |subject: &Subject| {
-        ctx.slice_uses
-            .get(&(subject.fn_did, subject.hir_id))
-            .is_some_and(|uses| uses.unsupported.is_some())
-    };
-    let lifted_mutable = |decision: &Decision| match decision {
-        Decision::Slice { mutable, .. } => Some(*mutable),
-        Decision::Ref { .. }
-        | Decision::InferredRef { .. }
-        | Decision::NestedSlice { .. }
-        | Decision::Opt { .. }
-        | Decision::Box(_)
-        | Decision::Cursor { .. }
-        | Decision::Degraded(_) => None,
-    };
-    let mut refused_votes: FxHashMap<&str, Vec<bool>> = FxHashMap::default();
-    let mut pass_on_votes: FxHashMap<&str, Vec<bool>> = FxHashMap::default();
-    for (subject, decision) in entries {
-        if !refused_use(subject) {
+    let mut out = Vec::new();
+    for (subject, _) in entries {
+        if !refused_by_mutability(ctx, entries, (subject.fn_did, subject.hir_id)) {
             continue;
         }
-        let node = (subject.fn_did, subject.hir_id);
-        match lifted_mutable(decision) {
-            Some(mutable) => pass_on_votes
-                .entry(subject.label.as_str())
-                .or_default()
-                .push(supported(ctx, entries, node, mutable).is_some()),
-            None => refused_votes
-                .entry(subject.label.as_str())
-                .or_default()
-                .push(refused_by_mutability(ctx, entries, node)),
-        }
-    }
-    let unanimous = |votes: &FxHashMap<&str, Vec<bool>>, label: &str| {
-        votes.get(label).is_some_and(|v| v.iter().all(|&yes| yes))
-    };
-    for lift in lifts.iter_mut() {
-        if lift.declined.is_some() && unanimous(&refused_votes, &lift.subject) {
+        for lift in lifts
+            .iter_mut()
+            .filter(|lift| lift.declined.is_some() && lift.subject == subject.label)
+        {
             lift.use_shape = Some("pass-on-refused:shared-into-mut");
         }
-        if lift.declined.is_none() && unanimous(&pass_on_votes, &lift.subject) {
-            lift.use_shape = Some("pass-on");
-        }
     }
-    let mut out = Vec::new();
     for (subject, decision) in entries {
-        let Some(mutable) = lifted_mutable(decision) else {
+        // The lifted slice's own mutability, whichever arm gave it.
+        let lifted_mutable = match decision {
+            Decision::Slice { mutable, .. } => *mutable,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => continue,
+        };
+        let Some(pairs) = supported(
+            ctx,
+            entries,
+            (subject.fn_did, subject.hir_id),
+            lifted_mutable,
+        ) else {
             continue;
         };
-        if !refused_use(subject) {
+        let mut lifted = false;
+        for lift in lifts
+            .iter_mut()
+            .filter(|lift| lift.declined.is_none() && lift.subject == subject.label)
+        {
+            lift.use_shape = Some("pass-on");
+            lifted = true;
+        }
+        if !lifted {
             continue;
         }
-        let Some(pairs) = supported(ctx, entries, (subject.fn_did, subject.hir_id), mutable) else {
-            continue;
-        };
         let mut pairs = pairs
             .into_iter()
             .map(|(callee, parameter_index)| {
