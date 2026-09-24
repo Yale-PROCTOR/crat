@@ -1406,3 +1406,61 @@ pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut spl
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
+
+const ELEMENTS: &str = r#"
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Hist { pub data_: [u32; 4], pub total_count_: usize }
+pub unsafe extern "C" fn HistogramAdd(mut self_0: *mut Hist, mut val: usize) {
+    (*self_0).data_[val] = ((*self_0).data_[val]).wrapping_add(1 as u32);
+    (*self_0).total_count_ = ((*self_0).total_count_).wrapping_add(1 as usize);
+}
+pub unsafe extern "C" fn BitsEntropy(mut population: *const u32, mut size: usize) -> u32 {
+    let mut sum = 0 as u32;
+    let mut i = 0 as usize;
+    while i < size { sum = sum.wrapping_add(*population.offset(i as isize)); i = i.wrapping_add(1); }
+    return sum;
+}
+pub unsafe extern "C" fn adding(mut m: *mut MemoryManager, n: usize, mut out: *mut usize) {
+    let mut histograms = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<Hist>())) as *mut Hist
+    } else { 0 as *mut Hist };
+    let mut j = 0 as usize;
+    while j < n {
+        (*histograms.offset(j as isize)).total_count_ = 0 as usize;
+        HistogramAdd(&mut *histograms.offset(j as isize), j & 3 as usize);
+        j = j.wrapping_add(1);
+    }
+    if n > 0 as usize { *out = (*histograms.offset(0 as isize)).total_count_; }
+    BrotliFree(m, histograms as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn entropy(mut m: *mut MemoryManager, n: usize, mut out: *mut u32) {
+    let mut combined = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<Hist>())) as *mut Hist
+    } else { 0 as *mut Hist };
+    if n > 0 as usize {
+    (*combined.offset(0 as isize)).total_count_ = 0 as usize;
+    *out = BitsEntropy(&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize), 4 as usize);
+    }
+    BrotliFree(m, combined as *mut std::os::raw::c_void);
+}
+"#;
+
+/// Joint (a)'s owner view is likewise the owner's: an element address of a Box
+/// owner at a callee formal that falls back to raw keeps the refusal (it is a
+/// reference to one element, not the owner, and has no raw-view rendering of
+/// the owner's).
+#[test]
+fn w6a_r555_an_element_address_does_not_take_the_owner_raw_view() {
+    let (source, input) = box_source_at_reverted_callee(
+        "r555-element-reverted",
+        &format!("{PRELUDE}{ELEMENTS}"),
+        "adding",
+        "HistogramAdd",
+    );
+    assert_eq!(
+        input,
+        Err("callee-parameter-input-owned-or-inferred-source-unbuilt"),
+        "{source}"
+    );
+}

@@ -336,13 +336,20 @@ fn current_alternative(
     // `Raw`, so it must also skip the zero-syntax shortcut below — a Box
     // owner's text is never a raw pointer — and supply its raw view, tiered
     // by the raw boundary's own disposition of this site.
+    // The owner's view is the OWNER's: only the owner passed bare takes it.
+    // An element address (`&mut *owner.offset(i)`) roots at the owner but is
+    // a reference to one element, and keeps the refusal (R555-1).
+    let bare = matches!(arg.shape, ArgShape::BareLocal(_));
     let owner = match root_decision {
         Some(
             Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::InferredRef { .. },
         ) => {
             return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
         }
-        Some(owner @ Decision::Box(_)) => Some(owner),
+        Some(owner @ Decision::Box(_)) if bare => Some(owner),
+        Some(Decision::Box(_)) => {
+            return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
+        }
         Some(
             Decision::Ref { .. }
             | Decision::Slice { .. }
