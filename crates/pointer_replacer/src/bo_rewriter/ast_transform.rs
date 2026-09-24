@@ -4711,6 +4711,18 @@ fn transform_with<'tcx>(
         })
         .map(|edit| (edit.span.lo().0, edit.span.hi().0))
         .collect();
+    // R556-4 (i): a base-view bridge sits strictly inside its argument; the
+    // wrapper takes the whole argument's grafted text, so key it by the argument.
+    let a5_inner_arguments = {
+        let mut arguments = a5_inner_arguments;
+        for retirement in &table.seams.box_base_view_retirements {
+            let base = (retirement.base.lo().0, retirement.base.hi().0);
+            if arguments.contains(&base) {
+                arguments.insert((retirement.argument.lo().0, retirement.argument.hi().0));
+            }
+        }
+        arguments
+    };
     let mut a5_raw = A5RawGraftVisitor {
         calls: &a5_raw_calls,
         reverts,

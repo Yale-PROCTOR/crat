@@ -296,3 +296,70 @@ fn r556_4_a_whole_argument_box_view_over_its_element_edit_holds() {
         );
     }
 }
+
+/// **R556-4 (i) — (α) over containment, and only there.** The callee's A5 T2 fallback wraps
+/// the call (`args=` over `100..400`) and selects `arg1` (`200..240`); the caller's Box view at
+/// the BASE of that argument (`206..214`) sits strictly inside. It composes. Two controls keep
+/// the arm narrow: a non-Box `c` edit strictly inside the view (a conversion the wrapper would
+/// re-render) and a Box view at a DIFFERENT argument's position both still collide.
+#[test]
+fn r556_4_i_a_base_view_inside_the_selected_view_of_its_argument_composes() {
+    let (callee, caller) = (class(1834), class(1851));
+    let finalize = |inner_kind: &str, inner_position: &str| {
+        let mut wrapper = ClassInput::new(callee, Default::default());
+        let mut whole = ClassSite::edit(
+            callee,
+            caller,
+            Arm::Pair,
+            FILE,
+            100,
+            400,
+            "a5-site-proof-t2-fallback",
+        );
+        whole.key.position = "args=caller=1851:arg=1".to_owned();
+        let mut view = ClassSite::edit(
+            callee,
+            caller,
+            Arm::Pair,
+            FILE,
+            200,
+            240,
+            "a5-site-proof-t2-fallback",
+        );
+        view.key.position = "arg1".to_owned();
+        view.expected_form = "raw".to_owned();
+        // One wrapper, one physical edit: the view is a logical receipt of the whole-call
+        // edit and shares its key, as in the plan (`intervals_overlap`'s exemption).
+        view.edit_key = whole.edit_key.clone();
+        wrapper.sites.extend([whole, view]);
+        let mut bridging = ClassInput::new(caller, Default::default());
+        let mut inner = ClassSite::edit(caller, caller, Arm::C, FILE, 206, 214, inner_kind);
+        inner.key.position = inner_position.to_owned();
+        inner.expected_form = "raw".to_owned();
+        bridging.sites.push(inner);
+        finalize_class_inputs(vec![wrapper, bridging])
+    };
+    let composed = finalize("optional-box-borrow-view-to-raw", "arg1");
+    assert!(composed.collisions.is_empty(), "{:#?}", composed.collisions);
+    assert!(
+        composed.classes[&callee].is_ready(),
+        "{:#?}",
+        composed.classes[&callee]
+    );
+    assert!(
+        composed.classes[&caller].is_ready(),
+        "{:#?}",
+        composed.classes[&caller]
+    );
+    for (kind, position) in [
+        ("ref-mut-to-raw-mut", "arg1"),
+        ("optional-box-borrow-view-to-raw", "arg0"),
+    ] {
+        let held = finalize(kind, position);
+        assert!(
+            !held.collisions.is_empty() && !held.classes[&caller].is_ready(),
+            "{kind} at {position}: {:#?}",
+            held.collisions
+        );
+    }
+}

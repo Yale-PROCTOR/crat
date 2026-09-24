@@ -326,3 +326,69 @@ pub unsafe extern "C" fn Peek(mut clusters: *const u32, n: usize) -> usize {
     );
     assert_eq!(out.reverted, 0, "{}", out.source);
 }
+
+/// **(i) — the composed geometry at brotli's `BrotliHistogramCombine*` calls.** The callee
+/// writes a range through `clusters` beside a `symbols` formal of the same pointee type; their
+/// disjointness is not provable (the caller's `symbols` and an opaque allocation), so the
+/// callee's A5 T2 fallback selects the element address's argument as a raw view — exactly the
+/// argument the caller's base-view bridge sits INSIDE. Before (i) the two were a cross-class
+/// collision holding both classes; (α) over containment lets the wrapper take the argument's
+/// grafted text, `&mut *clusters.as_deref_mut()….offset(k)`, as its raw value.
+const COMPOSED: &str = r#"
+pub unsafe extern "C" fn CombineCounted(mut symbols: *mut u32, mut clusters: *mut u32, n: usize) -> usize {
+    *symbols.offset(0 as isize) = 7 as u32;
+    let mut i = 0 as usize;
+    while i < n {
+        *clusters.offset(i as isize) = *symbols.offset(0 as isize);
+        i = i.wrapping_add(1);
+    }
+    return n;
+}
+pub unsafe extern "C" fn ClusterCounted(mut m: *mut MemoryManager, mut symbols: *mut u32, n: usize, k: usize) -> usize {
+    let mut clusters = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    if n > 0 as usize { *clusters.offset(0 as isize) = 1 as u32; }
+    let _raw_symbols = symbols as usize;
+    let r = CombineCounted(symbols, &mut *clusters.offset(k as isize), n.wrapping_sub(k));
+    BrotliFree(m, clusters as *mut std::os::raw::c_void);
+    return r;
+}
+"#;
+
+/// **Witness (i).** The wrapper and the base view compose: no class collides, the wrapper's
+/// raw value for the element address is the argument's grafted text, and the tree type-checks.
+#[test]
+fn r556_4_i_the_a5_wrapper_takes_the_base_view_argument() {
+    let out = emitted("r556-composed", &format!("{PRELUDE}{COMPOSED}"));
+    let text = compact(&out.source);
+    let events = &out.artifacts.bridge_events;
+    assert!(
+        !events.iter().any(|event| event
+            .drop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cross-class-interval-collision"))),
+        "{events:#?}\n{}",
+        out.source
+    );
+    assert!(
+        events.iter().any(
+            |event| event.site.bridge_kind == "a5-site-proof-t2-fallback"
+                && event.state == super::bridge_receipt::BridgeReceiptState::Applied
+        ),
+        "the fallback is the composed geometry's premise: {events:#?}"
+    );
+    assert!(
+        text.contains(
+            ":*mutu32=&mut*clusters.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()).offset(kasisize);"
+        ),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+    assert!(
+        super::verify::type_checks_str(&out.source),
+        "{}",
+        out.source
+    );
+}

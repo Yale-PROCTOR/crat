@@ -787,7 +787,28 @@ fn a5_wrapper_composition(
                 let inner_product = same_interval
                     && inner.state == ClassSiteState::EditReady
                     && view.expected_form == "raw";
-                duplicate_rendering || inner_product
+                // **R556-4 (i) — (α) over containment.** A Box owner's view at the
+                // BASE of an element address (`&mut *RAWVIEW(X).offset(k)`, joint
+                // (c)) sits strictly inside the selected view of the same argument.
+                // The seam grafts it before the A5 pass, so the argument's current
+                // text is the whole raw-convertible address; the wrapper takes that
+                // text as its raw value (`a5_inner_arguments` carries the argument
+                // span) and the outer depends on the inner. A Box-view `c` edit
+                // strictly inside its own argument is only ever that base view — a
+                // bare owner's view spans the whole argument.
+                let base_view_inner = inner.key.arm == "c"
+                    && matches!(
+                        inner.key.bridge_kind.as_str(),
+                        "box-borrow-view-to-raw" | "optional-box-borrow-view-to-raw"
+                    )
+                    && inner.key.caller == view.key.caller
+                    && inner.key.position == view.key.position
+                    && view.key.lo <= inner.key.lo
+                    && inner.key.hi <= view.key.hi
+                    && (view.key.lo, view.key.hi) != (inner.key.lo, inner.key.hi)
+                    && inner.state == ClassSiteState::EditReady
+                    && view.expected_form == "raw";
+                duplicate_rendering || inner_product || base_view_inner
             }
         }
     };
