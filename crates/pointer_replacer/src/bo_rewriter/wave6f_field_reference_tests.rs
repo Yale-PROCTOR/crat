@@ -634,31 +634,22 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             ),
         ]
     );
-    // The seam sees an owned argument in its consumer's form, so no glue may
-    // stack on the field's wrap. Unseated, no glue is even planned over a field
-    // site. **Re-seated, one IS planned** — `deleteNode`'s
-    // `((*root).right) as *mut crate::node` for `minValueNode`'s argument, which
-    // would be ill-typed against `Option<Box<node>>` — and it is inert only
-    // because the field's wrap claims the node first (report 065, routed). So
-    // the re-seated branch pins the hazard itself: no planned field glue
-    // reaches the emitted tree.
-    let field_glues: Vec<&String> = observed
-        .seam_edits
-        .iter()
-        .map(|(_, replacement)| replacement)
-        .filter(|replacement| replacement.contains(".left") || replacement.contains(".right"))
-        .collect();
-    if reseated {
-        for glue in &field_glues {
-            let glue: String = glue.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(
-                !flat.contains(&glue),
-                "a glue planned over an owned field reached the tree: {glue}\n{source}"
-            );
-        }
-    } else {
-        assert!(field_glues.is_empty(), "{:?}", observed.seam_edits);
-    }
+    // The seam sees an owned argument in its consumer's form: no glue is
+    // planned over a field site, on either branch (a planned glue would stack
+    // on the wrap). Re-seated, the seam once planned `deleteNode`'s
+    // `((*root).right) as *mut crate::node` for `minValueNode`'s argument —
+    // ill-typed against `Option<Box<node>>`, inert only by claim order
+    // (report 065); since main's `cf0a16d66` the seam yields a site an
+    // owned-field transaction renders, so the strict form holds on both.
+    assert!(
+        observed
+            .seam_edits
+            .iter()
+            .all(|(_, replacement)| !replacement.contains(".left")
+                && !replacement.contains(".right")),
+        "{:?}",
+        observed.seam_edits
+    );
     assert_eq!(
         (emitted_count, reverted),
         (if reseated { 3 } else { 1 }, 0),
