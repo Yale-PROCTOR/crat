@@ -271,13 +271,43 @@ impl RootClass {
 }
 
 /// A place path: the root binding, whether the path passes through one deref
-/// of that root, and the projections after it. `None` in a projection slot is
-/// an `Index`; `Some(name)` a `Field`.
+/// of that root, and the projections after it (Erratum 9d (i)'s place spine).
+///
+/// R550-2: `retyped` records that a cast changed the pointee type somewhere
+/// on the way to the root — at the root dereference base, the argument itself,
+/// an `as_mut_ptr()` receiver, or a folded view binding's initializer. The path
+/// still names the PLACE, so the same-place refusal keeps reading it; it is
+/// not a SPINE, so rule (c) does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PlacePath {
     root: HirId,
     deref_root: bool,
-    projections: Vec<Option<String>>,
+    projections: Vec<Projection>,
+    retyped: bool,
+}
+
+/// R550-2: one projection of a place spine. A field carries its PARENT — the
+/// ADT it is a field of, and whether that ADT is a union — because two fields
+/// are disjoint only as fields of one structure (Erratum 9d (ii)); a name alone
+/// cannot say that. `parent` is `None` when the base is not an ADT (a tuple).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Projection {
+    Field {
+        parent: Option<DefId>,
+        union: bool,
+        name: String,
+    },
+    Index,
+}
+
+impl PlacePath {
+    /// The same syntactic place, however either side was cast: the same-place
+    /// refusal must survive a cast that `retyped` records.
+    fn same_place(&self, other: &PlacePath) -> bool {
+        self.root == other.root
+            && self.deref_root == other.deref_root
+            && self.projections == other.projections
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -674,7 +704,7 @@ impl PairDisjointnessIndex {
                 // R462-1 (2): an in-crate caller that hands the callee the
                 // same place refuses the pair, waiver or not.
                 if let (Some(pa), Some(pb)) = (&a.place, &b.place)
-                    && pa == pb
+                    && pa.same_place(pb)
                 {
                     #[cfg(test)]
                     Self::note_decline(callee, left, right, "a-caller-passes-one-place");
@@ -848,7 +878,7 @@ impl PairDisjointnessIndex {
         // The same syntactic place, however it is cast, is never disjoint from
         // itself; refused before any rule is consulted.
         if let (Some(pa), Some(pb)) = (&a.place, &b.place)
-            && pa == pb
+            && pa.same_place(pb)
         {
             return Err(Unproved::SamePlace);
         }
@@ -868,10 +898,15 @@ impl PairDisjointnessIndex {
         if type_verdict.is_ok() {
             return Ok(CertificateKind::TypeRule);
         }
-        if let (Some(pa), Some(pb)) = (&a.place, &b.place)
-            && disjoint_fields(pa, pb)
-        {
-            return Ok(CertificateKind::DisjointFields);
+        // R550-2: a divergence at two members of one union is remembered, so the
+        // pair is held for the reason it has rather than whatever came before.
+        let mut union_members = false;
+        if let (Some(pa), Some(pb)) = (&a.place, &b.place) {
+            match divergence(pa, pb) {
+                Divergence::StructFields => return Ok(CertificateKind::DisjointFields),
+                Divergence::UnionMembers => union_members = true,
+                Divergence::NotAField => {}
+            }
         }
         // R466-5, before (e): a fresh stack address at this call cannot be
         // aliased by a pointer value that existed before it.
@@ -906,6 +941,9 @@ impl PairDisjointnessIndex {
         }
         // Report the type rule's reason when it was consulted, the roots
         // otherwise: whichever is the most specific thing the input lacked.
+        if union_members {
+            return Err(Unproved::UnionSibling);
+        }
         Err(match type_verdict {
             Err(Unproved::TypeUnresolved) => Unproved::RootsUnknown,
             Err(why) => why,
@@ -1159,18 +1197,57 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     }
 }
 
-/// (c): same root, same deref status, and the first differing projection is a
-/// `Field` on both sides.
-fn disjoint_fields(a: &PlacePath, b: &PlacePath) -> bool {
-    if a.root != b.root || a.deref_root != b.deref_root {
-        return false;
+/// Where two place spines first differ, for rule (c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Divergence {
+    /// Two fields of ONE structure: disjoint byte ranges by layout.
+    StructFields,
+    /// Two members of one union: they overlap.
+    UnionMembers,
+    /// No common base, no divergence, an index divergence, or a spine a cast
+    /// retyped: rule (c) says nothing.
+    NotAField,
+}
+
+/// (c), Erratum 9d (ii): the same root, the same deref status, the same
+/// projection at every position before the first differing one, and that
+/// first difference a field projection on both sides OF THE SAME PARENT
+/// STRUCTURE. Index projections before it may agree or differ (9c (iii)): an
+/// `Index` carries no payload, so two indices compare equal and the walk goes
+/// on. A spine a cast retyped is not a base (R550-2).
+fn divergence(a: &PlacePath, b: &PlacePath) -> Divergence {
+    if a.retyped || b.retyped || a.root != b.root || a.deref_root != b.deref_root {
+        return Divergence::NotAField;
     }
     for (x, y) in a.projections.iter().zip(&b.projections) {
-        if x != y {
-            return x.is_some() && y.is_some();
+        if x == y {
+            continue;
         }
+        return match (x, y) {
+            (
+                Projection::Field {
+                    parent: Some(pa),
+                    union: ua,
+                    ..
+                },
+                Projection::Field {
+                    parent: Some(pb), ..
+                },
+            ) if pa == pb => {
+                if *ua {
+                    Divergence::UnionMembers
+                } else {
+                    Divergence::StructFields
+                }
+            }
+            _ => Divergence::NotAField,
+        };
     }
-    false
+    Divergence::NotAField
+}
+
+fn disjoint_fields(a: &PlacePath, b: &PlacePath) -> bool {
+    divergence(a, b) == Divergence::StructFields
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1391,34 @@ fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
         expr = inner;
     }
     expr
+}
+
+/// R550-2: `peel_casts`, also reporting whether any peeled cast changed the
+/// POINTEE type (`*mut T as *mut U`, an integer cast to a pointer). A cast that
+/// only changes mutability or turns a reference into a raw pointer keeps it.
+fn peel_casts_retyping<'e, 'tcx>(
+    typeck: &TypeckResults<'tcx>,
+    mut expr: &'e Expr<'e>,
+) -> (&'e Expr<'e>, bool) {
+    let mut retyped = false;
+    while let ExprKind::Cast(inner, _) = &expr.kind {
+        let from = typeck.expr_ty(inner).builtin_deref(true);
+        let to = typeck.expr_ty(expr).builtin_deref(true);
+        retyped |= match (from, to) {
+            (Some(from), Some(to)) => from != to,
+            _ => true,
+        };
+        expr = inner;
+    }
+    (expr, retyped)
+}
+
+/// R550-2: mark a place a cast retyped on the way to it.
+fn retyped_by(place: Option<PlacePath>, retyped: bool) -> Option<PlacePath> {
+    place.map(|mut path| {
+        path.retyped |= retyped;
+        path
+    })
 }
 
 fn callee_def_id(expr: &Expr<'_>) -> Option<DefId> {
@@ -2512,6 +2617,7 @@ fn fold_place_prefix(path: PlacePath, prefixes: &FxHashMap<HirId, PlacePath>) ->
             root: prefix.root,
             deref_root: prefix.deref_root,
             projections,
+            retyped: path.retyped || prefix.retyped,
         };
     }
     path
@@ -2550,16 +2656,14 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
     /// binding initialized from a call, a cast of an integer or another
     /// pointer's VALUE records no prefix and folds nowhere.
     fn address_of_place(&self, rhs: &Expr<'_>) -> Option<PlacePath> {
-        let ExprKind::AddrOf(BorrowKind::Ref, _, operand) = &peel_casts(rhs).kind else {
+        let (rhs, outer) = peel_casts_retyping(self.typeck, rhs);
+        let ExprKind::AddrOf(BorrowKind::Ref, _, operand) = &rhs.kind else {
             return None;
         };
-        place_provenance(
-            self.tcx,
-            self.typeck,
-            &FxHashMap::default(),
-            peel_casts(operand),
-        )
-        .1
+        let (operand, inner) = peel_casts_retyping(self.typeck, operand);
+        let (_, place) = place_provenance(self.tcx, self.typeck, &FxHashMap::default(), operand);
+        // R550-2: `let br = &mut (*s).x as *mut U` views `(*s).x` as a `U`.
+        retyped_by(place, outer || inner)
     }
 
     /// R482-4(3): the root binding of the argument a view-of-formal call hands
@@ -2989,27 +3093,40 @@ fn argument_provenance<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     arg: &Expr<'_>,
 ) -> (RootClass, Option<PlacePath>) {
-    let expr = peel_casts(arg);
+    let (expr, outer) = peel_casts_retyping(typeck, arg);
+    let (class, place) = argument_provenance_peeled(tcx, typeck, classes, expr);
+    (class, retyped_by(place, outer))
+}
+
+fn argument_provenance_peeled<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    expr: &Expr<'_>,
+) -> (RootClass, Option<PlacePath>) {
     match &expr.kind {
         // `&mut place` / `&place`: a view into the place's object.
         ExprKind::AddrOf(BorrowKind::Ref, _, operand) => {
-            let operand = peel_casts(operand);
+            let (operand, cast) = peel_casts_retyping(typeck, operand);
             // `&mut *e` — a reborrow of whatever `e` addresses.
             if let ExprKind::Unary(UnOp::Deref, inner) = &operand.kind
                 && matches!(typeck.expr_ty(inner).kind(), ty::RawPtr(..))
             {
-                return pointer_value_provenance(tcx, typeck, classes, inner);
+                let (class, place) = pointer_value_provenance(tcx, typeck, classes, inner);
+                return (class, retyped_by(place, cast));
             }
-            place_provenance(tcx, typeck, classes, operand)
+            let (class, place) = place_provenance(tcx, typeck, classes, operand);
+            (class, retyped_by(place, cast))
         }
         // `place.as_mut_ptr()` / `place.as_ptr()`: a view into the array
         // object. `e.offset(k)` / `e.add(k)`: the pointer's own object.
         ExprKind::MethodCall(segment, receiver, method_args, _) => {
             match segment.ident.name.as_str() {
                 "as_mut_ptr" | "as_ptr" if method_args.is_empty() => {
-                    let receiver = peel_casts(receiver);
+                    let (receiver, cast) = peel_casts_retyping(typeck, receiver);
                     if matches!(typeck.expr_ty(receiver).kind(), ty::Array(..)) {
-                        place_provenance(tcx, typeck, classes, receiver)
+                        let (class, place) = place_provenance(tcx, typeck, classes, receiver);
+                        (class, retyped_by(place, cast))
                     } else {
                         (RootClass::Unknown, None)
                     }
@@ -3099,7 +3216,17 @@ fn pointer_value_provenance<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     expr: &Expr<'_>,
 ) -> (RootClass, Option<PlacePath>) {
-    let expr = peel_casts(expr);
+    let (expr, cast) = peel_casts_retyping(typeck, expr);
+    let (class, place) = pointer_value_provenance_peeled(tcx, typeck, classes, expr);
+    (class, retyped_by(place, cast))
+}
+
+fn pointer_value_provenance_peeled<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    expr: &Expr<'_>,
+) -> (RootClass, Option<PlacePath>) {
     match &expr.kind {
         ExprKind::Path(..) if resolved_local(expr).is_none() => match resolved_static(expr) {
             Some(did) => (RootClass::Static(did), None),
@@ -3114,13 +3241,14 @@ fn pointer_value_provenance<'tcx>(
                     root: binding,
                     deref_root: true,
                     projections: Vec::new(),
+                    retyped: false,
                 };
                 (class, Some(place))
             }
             None => (RootClass::Unknown, None),
         },
         ExprKind::MethodCall(..) | ExprKind::AddrOf(..) => {
-            argument_provenance(tcx, typeck, classes, expr)
+            argument_provenance_peeled(tcx, typeck, classes, expr)
         }
         _ => (RootClass::Unknown, None),
     }
@@ -3176,23 +3304,34 @@ fn place_provenance<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     place: &Expr<'_>,
 ) -> (RootClass, Option<PlacePath>) {
-    let mut projections: Vec<Option<String>> = Vec::new();
+    let mut projections: Vec<Projection> = Vec::new();
     let mut cur = place;
     loop {
         match &cur.kind {
             ExprKind::Field(base, ident) => {
-                projections.push(Some(ident.name.to_string()));
+                // R550-2: the field's parent is the type of the base it is
+                // projected from, after the base's own adjustments.
+                let (parent, union) = match typeck.expr_ty_adjusted(base).peel_refs().kind() {
+                    ty::Adt(def, _) => (Some(def.did()), def.is_union()),
+                    _ => (None, false),
+                };
+                projections.push(Projection::Field {
+                    parent,
+                    union,
+                    name: ident.name.to_string(),
+                });
                 cur = base;
             }
             ExprKind::Index(base, _, _) => {
-                projections.push(None);
+                projections.push(Projection::Index);
                 cur = base;
             }
             ExprKind::DropTemps(base) => cur = base,
             ExprKind::Unary(UnOp::Deref, base) => {
                 // One deref, at the root, of a pointer local: a place inside
-                // its pointee.
-                let base = peel_casts(base);
+                // its pointee. R550-2: a cast here changes what the
+                // projections below are projections OF.
+                let (base, cast) = peel_casts_retyping(typeck, base);
                 let Some(binding) = resolved_local(base) else {
                     return (RootClass::Unknown, None);
                 };
@@ -3207,6 +3346,7 @@ fn place_provenance<'tcx>(
                         root: binding,
                         deref_root: true,
                         projections,
+                        retyped: cast,
                     }),
                 );
             }
@@ -3232,6 +3372,7 @@ fn place_provenance<'tcx>(
                         root: binding,
                         deref_root: false,
                         projections,
+                        retyped: false,
                     }),
                 );
             }
@@ -3307,10 +3448,19 @@ mod tests {
         let base = HirId::make_owner(rustc_hir::def_id::LocalDefId {
             local_def_index: rustc_hir::def_id::DefIndex::from_u32(1),
         });
+        let parent = Some(rustc_hir::def_id::CRATE_DEF_ID.to_def_id());
         let path = |root, deref_root: bool, projections: &[&str]| PlacePath {
             root,
             deref_root,
-            projections: projections.iter().map(|p| Some((*p).to_owned())).collect(),
+            projections: projections
+                .iter()
+                .map(|p| Projection::Field {
+                    parent,
+                    union: false,
+                    name: (*p).to_owned(),
+                })
+                .collect(),
+            retyped: false,
         };
         let mut prefixes = FxHashMap::default();
         prefixes.insert(local, path(base, true, &["br"]));
@@ -3331,15 +3481,32 @@ mod tests {
             fold_place_prefix(path(base, true, &["br"]), &prefixes),
             path(base, true, &["br"])
         );
+        // R550-2: a view whose initializer was retyped retypes the fold.
+        let mut retyped = path(base, true, &["br"]);
+        retyped.retyped = true;
+        prefixes.insert(local, retyped);
+        assert!(fold_place_prefix(path(local, true, &["bits"]), &prefixes).retyped);
     }
 
     #[test]
     fn w6p_disjoint_fields_diverge_only_at_a_field() {
         let root = HirId::make_owner(rustc_hir::def_id::CRATE_DEF_ID);
+        let parent = Some(rustc_hir::def_id::CRATE_DEF_ID.to_def_id());
         let path = |deref_root: bool, projections: &[Option<&str>]| PlacePath {
             root,
             deref_root,
-            projections: projections.iter().map(|p| p.map(str::to_owned)).collect(),
+            projections: projections
+                .iter()
+                .map(|p| match p {
+                    Some(name) => Projection::Field {
+                        parent,
+                        union: false,
+                        name: (*name).to_owned(),
+                    },
+                    None => Projection::Index,
+                })
+                .collect(),
+            retyped: false,
         };
         assert!(disjoint_fields(
             &path(true, &[Some("a")]),
@@ -3378,6 +3545,59 @@ mod tests {
         assert!(
             !disjoint_fields(&path(true, &[Some("a")]), &path(false, &[Some("b")])),
             "the pointee and the pointer slot are different objects, not fields of one"
+        );
+
+        // R550-2, Erratum 9d (ii): the divergence must be at fields OF ONE
+        // STRUCTURE — not of a union, not of two different parents, not on a
+        // spine a cast retyped.
+        let field = |parent, union: bool, name: &str| Projection::Field {
+            parent,
+            union,
+            name: name.to_owned(),
+        };
+        let spine = |projections: Vec<Projection>| PlacePath {
+            root,
+            deref_root: true,
+            projections,
+            retyped: false,
+        };
+        let other = Some(
+            rustc_hir::def_id::LocalDefId {
+                local_def_index: rustc_hir::def_id::DefIndex::from_u32(1),
+            }
+            .to_def_id(),
+        );
+        assert_eq!(
+            divergence(
+                &spine(vec![field(parent, true, "x")]),
+                &spine(vec![field(parent, true, "y")])
+            ),
+            Divergence::UnionMembers,
+            "two members of one union overlap"
+        );
+        assert!(
+            !disjoint_fields(
+                &spine(vec![field(parent, false, "a")]),
+                &spine(vec![field(other, false, "b")])
+            ),
+            "fields of two different parents at one position are not fields of one structure"
+        );
+        assert!(
+            !disjoint_fields(
+                &spine(vec![field(None, false, "0")]),
+                &spine(vec![field(None, false, "1")])
+            ),
+            "a field whose parent is not known is not a structure field"
+        );
+        let mut retyped = spine(vec![field(parent, false, "a")]);
+        retyped.retyped = true;
+        assert!(
+            !disjoint_fields(&retyped, &spine(vec![field(parent, false, "b")])),
+            "a retyped spine is not a base"
+        );
+        assert!(
+            retyped.same_place(&spine(vec![field(parent, false, "a")])),
+            "but it still names the same place"
         );
     }
 }

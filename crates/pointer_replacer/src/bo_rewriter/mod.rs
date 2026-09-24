@@ -106,6 +106,8 @@ mod pair_projection_recovery_tests;
 #[cfg(test)]
 mod pair_read_read_tests;
 #[cfg(test)]
+mod pair_spine_tests;
+#[cfg(test)]
 mod pair_static_callers_tests;
 #[cfg(test)]
 mod pair_static_root_tests;
