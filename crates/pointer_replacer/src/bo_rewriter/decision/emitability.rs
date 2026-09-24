@@ -502,6 +502,82 @@ pub(crate) fn unsupported_use_shape(tcx: TyCtxt<'_>, use_expr: &Expr<'_>) -> &'s
     }
 }
 
+/// **R556-4 — an owner's element address**, `&mut *X.offset(k)` / `&*X.offset(k)`,
+/// with the two spans joint (c)'s seam anchors on. The shape itself is
+/// [`super::box_facts::box_element_address`]'s (R557-4: one classifier, wave-6a's);
+/// this only locates, inside the address it accepted, the element place and the
+/// owner's own path node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerElementAddress {
+    /// The binding `X` whose element is addressed.
+    pub(crate) root: HirId,
+    /// `&mut` rather than `&`.
+    pub(crate) mutable: bool,
+    /// The base path `X` inside the argument.
+    pub(crate) base: rustc_span::Span,
+    /// The element place `*X.offset(k)`.
+    pub(crate) element: rustc_span::Span,
+}
+
+/// [`super::box_facts::box_element_address`] with the spans joint (c) needs: the
+/// `AddrOf`'s operand, and the first path to the owner inside it (the receiver —
+/// a method call walks its receiver before its index).
+pub(crate) fn owner_element_address<'tcx>(expr: &'tcx Expr<'tcx>) -> Option<OwnerElementAddress> {
+    let (root, _index, mutable) = super::box_facts::box_element_address(expr)?;
+    let ExprKind::AddrOf(_, _, element) = &expr.kind else {
+        return None;
+    };
+    struct FirstPath {
+        root: HirId,
+        found: Option<rustc_span::Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for FirstPath {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.found.is_some() {
+                return;
+            }
+            if let ExprKind::Path(QPath::Resolved(None, path)) = &expr.kind
+                && path.res == Res::Local(self.root)
+            {
+                self.found = Some(expr.span);
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut first = FirstPath { root, found: None };
+    first.visit_expr(element);
+    Some(OwnerElementAddress {
+        root,
+        mutable,
+        base: first.found?,
+        element: element.span,
+    })
+}
+
+/// [`owner_element_address`] of the argument expression at `span` in `owner`'s body.
+pub(crate) fn owner_element_address_at(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    span: rustc_span::Span,
+) -> Option<OwnerElementAddress> {
+    struct V {
+        span: rustc_span::Span,
+        found: Option<OwnerElementAddress>,
+    }
+    impl<'tcx> Visitor<'tcx> for V {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.found.is_none() && expr.span == self.span {
+                self.found = owner_element_address(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut v = V { span, found: None };
+    v.visit_body(tcx.hir_body_owned_by(owner));
+    v.found
+}
+
 /// Classify an argument expression by its **outermost** operator and resolved
 /// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
 /// complex expression only when rustc says the expression itself is a raw

@@ -239,6 +239,8 @@ mod import_denylist;
 #[cfg(test)]
 mod io_domain_tests;
 #[cfg(test)]
+mod joint_c_base_view_tests;
+#[cfg(test)]
 mod native_return_receipt_tests;
 #[cfg(test)]
 mod native_return_replay_tests;
@@ -8603,6 +8605,7 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
             &mut_facts,
         );
+        retire_box_edits_under_base_views(&mut table);
         let mut arm_requirements =
             derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
         table.seams.d4_pair_discharges = discharge_d4_by_pair_certificates(
@@ -8656,6 +8659,7 @@ fn finish_decide<'tcx>(
                 &lifetime_eligibility,
                 &mut_facts,
             );
+            retire_box_edits_under_base_views(&mut table);
         }
         // C-9 filtering can reveal a fallback only after co-conversion ran.
         // Learn all exact raw roles together, then rebuild this profile's
@@ -13155,6 +13159,37 @@ mod session_receipts_tests {
                 !census.contains(&format!("crate::bo_rewriter::{cell}")),
                 "the census reads `{cell}` across the session boundary -- it can only be zero"
             );
+        }
+    }
+}
+
+/// **R556-4 joint (c).** Retire each Box owner's element edit whose argument took
+/// the owner's raw view at its base (`SeamPlan::box_base_view_retirements`): the
+/// element stays raw arithmetic over that view. Applied to the decision table
+/// itself, which both the planner and the AST pass read, so the two cannot
+/// disagree; idempotent across re-syntheses.
+fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
+    let retirements = table.seams.box_base_view_retirements.clone();
+    for decision::seam::BoxBaseViewRetirement {
+        node: (owner, root),
+        element,
+        ..
+    } in retirements
+    {
+        for (subject, decision) in &mut table.entries {
+            let decision::Decision::Box(plan) = decision else {
+                continue;
+            };
+            if subject.fn_did != owner || subject.hir_id != root {
+                continue;
+            }
+            let before = plan.expr_edits.len();
+            plan.expr_edits
+                .retain(|edit| edit.span.source_callsite() != element.source_callsite());
+            if plan.expr_edits.len() != before {
+                plan.receipts
+                    .push("box-expression:retired-under-base-view".to_owned());
+            }
         }
     }
 }

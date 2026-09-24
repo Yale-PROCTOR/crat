@@ -254,3 +254,45 @@ fn r554_5_a_contained_edit_that_applies_still_takes_the_span() {
         finalization.classes[&fallback]
     );
 }
+
+/// **R556-4 control (075 §4, 4) — the relay-042 row withdrawn.** A Box view over the WHOLE
+/// argument strictly containing the owner's own element edit is the ill-typed composition
+/// (`(&mut X[..][k]).as_deref_mut()..`, E0599); joint (c) renders the view at the base instead
+/// and retires the element edit, so the pair never reaches the planner from that shape. When
+/// it does reach it, it holds — in BOTH kinds: `optional-box-borrow-view-to-raw` never had a
+/// row, and `box-borrow-view-to-raw`'s (relay 042, admitted on a reading, never witnessed) is
+/// withdrawn.
+#[test]
+fn r556_4_a_whole_argument_box_view_over_its_element_edit_holds() {
+    for outer in ["optional-box-borrow-view-to-raw", "box-borrow-view-to-raw"] {
+        let owner = class(1850);
+        let mut only = ClassInput::new(owner, Default::default());
+        only.sites.push(ClassSite::edit(
+            owner,
+            owner,
+            Arm::C,
+            FILE,
+            8_187_809,
+            8_187_853,
+            outer,
+        ));
+        only.sites.push(ClassSite::edit(
+            owner,
+            owner,
+            Arm::Surface,
+            FILE,
+            8_187_814,
+            8_187_853,
+            "box-expression",
+        ));
+        let finalization = finalize_class_inputs(vec![only]);
+        assert!(
+            finalization.classes[&owner]
+                .hold_reasons()
+                .iter()
+                .any(|reason| reason == "intra-class-interval-overlap"),
+            "{outer}: {:#?}",
+            finalization.classes[&owner]
+        );
+    }
+}

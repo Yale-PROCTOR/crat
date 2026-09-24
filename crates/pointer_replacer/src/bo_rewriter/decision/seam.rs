@@ -3142,6 +3142,22 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 /// **Blocked positions are carried, not dropped.** The ledger rule this module
 /// exists under: an unadapted position becomes a revert, and a revert with no
 /// reason is a yield number nobody can attribute.
+/// **R556-4 joint (c)** — one argument whose Box owner's raw view went to its
+/// base path: the owner's element edit there is retired, and the whole argument
+/// is what an A5 wrapper selecting it takes as its raw value (`(α)` over
+/// containment).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxBaseViewRetirement {
+    /// The Box owner, `(caller, binding)`.
+    pub(crate) node: (LocalDefId, HirId),
+    /// The retired element edit's span, `*X.offset(k)`.
+    pub(crate) element: Span,
+    /// The base path `X`, where the view's edit sits.
+    pub(crate) base: Span,
+    /// The whole argument, `&mut *X.offset(k)`.
+    pub(crate) argument: Span,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
     /// **R544-3** — degraded partners whose blocked-class D4 was paid by a pair
@@ -3214,6 +3230,12 @@ pub(crate) struct SeamPlan {
     /// disposition of that collision: the existing use edit remains the sole
     /// owner and the raw arm emits no competing edit.
     pub raw_boundary_edit_region_owned: Vec<(String, String)>,
+    /// **R556-4 joint (c).** A Box owner's element edits (`*X.offset(k)`) whose
+    /// argument now takes the owner's raw view at its base: the element stays raw
+    /// arithmetic over that view, so the owner's own edit there is retired
+    /// (`box-expression:retired-under-base-view`) — applied to the table after
+    /// every synthesis, which is what both the planner and the AST read.
+    pub box_base_view_retirements: Vec<BoxBaseViewRetirement>,
     /// Typed PAIR sites, including zero-syntax and blocked roles, retained for
     /// signature-class completeness rather than reconstructed from TSV.
     pub pair_sites: Vec<super::co_conversion::PairSiteDecision>,
@@ -5888,9 +5910,37 @@ pub(crate) fn synthesize_with_raw_boundary(
             }
             continue;
         };
-        let argument_span = site
-            .direct_storage_span
-            .unwrap_or(site.adapter_operand_span);
+        // **R556-4 joint (c) — the owner's raw view at the BASE.** A Box view's
+        // template is written for the owner itself. At an element address of that
+        // owner (`&mut *X.offset(k)`, brotli's `BrotliClusterHistograms*` /
+        // `Quality10` / HqZopfli) it would wrap one element as if it were the owner
+        // (E0599). The view goes over the base path `X` instead and the input's
+        // `&mut *….offset(k)` stays around it; the owner's own element edit is
+        // retired (`box_base_view_retirements`), since its product — a one-element
+        // place — is what must not reach a formal that walks a range. Mutability
+        // must agree: `&mut *` over a `*const` view does not type.
+        let base_view = matches!(
+            template,
+            super::raw_boundary::BridgeTemplate::BoxBorrowViewToRaw
+                | super::raw_boundary::BridgeTemplate::OptionalBoxBorrowViewToRaw
+        )
+        .then(|| {
+            let (owner, root) = site.node?;
+            super::emitability::owner_element_address_at(tcx, owner, site.span).filter(|address| {
+                address.root == root
+                    && address.mutable
+                        == (site.target.mutability == super::raw_boundary::RawMutability::Mut)
+            })
+        })
+        .flatten();
+        let edit_span = base_view.map_or(site.span, |address| address.base);
+        let argument_span = base_view.map_or_else(
+            || {
+                site.direct_storage_span
+                    .unwrap_or(site.adapter_operand_span)
+            },
+            |address| address.base,
+        );
         let Ok(mut argument) = sm.span_to_snippet(argument_span) else {
             continue;
         };
@@ -5995,8 +6045,16 @@ pub(crate) fn synthesize_with_raw_boundary(
         .ok()
         .map(|contract| contract.ownership);
         let original_expression = sm
-            .span_to_snippet(site.span)
+            .span_to_snippet(edit_span)
             .expect("located outbound argument has original source");
+        if let Some(address) = base_view {
+            plan.box_base_view_retirements.push(BoxBaseViewRetirement {
+                node: (owner_did, address.root),
+                element: address.element,
+                base: address.base,
+                argument: site.span,
+            });
+        }
         plan.edits.push(SeamEdit {
             raw_outbound: Some(RawOutboundEndpoint {
                 return_independent: raw_boundary.return_independent(key).cloned(),
@@ -6013,7 +6071,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 child_access: raw_boundary.type_backed_child_access_for(key).cloned(),
             }),
             zero_syntax,
-            span: site.span,
+            span: edit_span,
             call_span: site.call_span,
             replacement,
             owner_class: SignatureClassId::of(owner_did),
