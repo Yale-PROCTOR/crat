@@ -222,14 +222,18 @@ pub unsafe fn run(mut src: *const u8, mut size: usize) -> i32 {
 }
 "#;
 
+/// **Re-premised by R573-3 (relay 086).** R477-4b admitted this callee on the
+/// ADDRESS half: the retained address is reachable only through the container.
+/// Clause (3)'s FIELDS half now also asks whether the pointer in the written
+/// field (`st.src`) can leave, and storing the container's address into the
+/// block opens a path back to it (`(*(*st).state).strm->src`) that the fields
+/// walk does not follow. So the hold stands, fail-closed. No census receipt
+/// rests on R477-4b (batch 37: heman 4 with no container callees, json.h 1
+/// keyed and discharged); reopening it needs a fields walk through the block.
 #[test]
-fn wave6o_a_container_callee_retaining_into_a_fresh_block_is_admissible() {
+fn wave6o_a_container_callee_retaining_into_a_fresh_block_is_held_by_the_fields_half() {
     let (verdict, reason) = retention_row(INIT_RETAINS_INTO_A_FRESH_BLOCK, "run", 0);
-    assert_eq!(verdict, "no-retain", "reason={reason}");
-    assert!(
-        reason.contains("retention-discharged:frame-bounded"),
-        "the discharge is receipted: {reason}"
-    );
+    assert_ne!(verdict, "no-retain", "reason={reason}");
 }
 
 /// **Control 6 (R477-4b) — the callee also stores the fresh block into a
@@ -305,4 +309,76 @@ fn wave6o_an_open_residual_keeps_the_r476_hold() {
     assert!(input.contains("keep_src(src);"), "fixture edit applied");
     let (verdict, reason) = retention_row(&input, "parse", 0);
     assert_ne!(verdict, "no-retain", "reason={reason}");
+}
+
+/// **R573-3 (relay 086) — clause (3)'s FIELDS half, keyed to the written
+/// field.** A container callee copies the pointer the bounded store wrote
+/// (`st.src`) into a static. Its row at the container's position certifies the
+/// ADDRESS and reads `no-retain`, so before this rule the arm discharged.
+#[test]
+fn wave6o_a_container_callee_copying_the_written_field_keeps_the_hold() {
+    let input = READER
+        .replace(
+            "unsafe fn read_one(mut st: *mut State) -> i32 {",
+            "static mut KEPT: *const u8 = 0 as *const u8;\nunsafe fn read_one(mut st: *mut State) -> i32 {\n    KEPT = (*st).src;",
+        );
+    assert!(input.contains("KEPT = (*st).src;"), "fixture edit applied");
+    let (verdict, reason) = retention_row(&input, "parse", 0);
+    assert_ne!(verdict, "no-retain", "reason={reason}");
+}
+
+/// **R573-3 — json.h's real shape still discharges.** `json_parse_value`
+/// stores derivations of OTHER container fields (`state.dom`, the parser's
+/// output buffer) into its `value` formal and hands them to a local callee,
+/// and only reads through the written field. The key makes those fields
+/// irrelevant; the strict (field-blind) check would refuse them.
+#[test]
+fn wave6o_other_fields_handed_on_by_a_container_callee_still_discharge() {
+    const PARSER: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+#[repr(C)]
+pub struct State { pub src: *const u8, pub dom: *mut u8, pub offset: usize }
+unsafe fn put_byte(mut p: *mut u8, mut b: u8) { *p = b; }
+unsafe fn parse_value(mut st: *mut State, mut value: *mut *mut u8) -> i32 {
+    *value = (*st).dom;
+    put_byte((*st).dom, *((*st).src).offset((*st).offset as isize));
+    (*st).dom = ((*st).dom).offset(1 as isize);
+    (*st).offset = ((*st).offset).wrapping_add(1);
+    return 1;
+}
+pub unsafe fn parse(mut src: *const u8, mut dom: *mut u8, mut value: *mut *mut u8) -> i32 {
+    let mut state = State { src: 0 as *const u8, dom: 0 as *mut u8, offset: 0 };
+    if src.is_null() { return 0; }
+    state.src = src;
+    state.dom = dom;
+    return parse_value(&mut state, value);
+}
+"#;
+    let (verdict, reason) = retention_row(PARSER, "parse", 0);
+    assert_eq!(verdict, "no-retain", "reason={reason}");
+    assert!(
+        reason.starts_with("retention-discharged:frame-bounded(subject=arg0,"),
+        "{reason}"
+    );
+    // The written field's pointer handed to a local callee that only uses
+    // it (json.h's `json_get_string_size` → `json_hexadecimal_value`): that
+    // callee's own row is no-retain, so the hold does not stand.
+    let used = PARSER.replace(
+        "    put_byte((*st).dom, *((*st).src).offset((*st).offset as isize));",
+        "    put_byte((*st).src as *mut u8, 0 as u8);",
+    );
+    assert!(
+        used.contains("put_byte((*st).src as *mut u8"),
+        "fixture edit applied"
+    );
+    assert_eq!(retention_row(&used, "parse", 0).0, "no-retain");
+    // ...and to one that KEEPS it: the hand-off is asked of that callee's row,
+    // which retains, so the hold stands — the key narrows the check to the
+    // written field, it does not relax it there.
+    let kept = used.replace(
+        "unsafe fn put_byte(mut p: *mut u8, mut b: u8) { *p = b; }",
+        "static mut KEPT: *mut u8 = 0 as *mut u8;\nunsafe fn put_byte(mut p: *mut u8, mut b: u8) { KEPT = p; }",
+    );
+    assert!(kept.contains("KEPT = p;"), "fixture edit applied");
+    assert_ne!(retention_row(&kept, "parse", 0).0, "no-retain");
 }

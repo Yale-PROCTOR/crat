@@ -1279,6 +1279,17 @@ struct FrameBoundedStore {
     step: RetentionStep,
     container: Local,
     callees: Vec<(LocalDefId, usize)>,
+    /// **R573-3 (relay 086).** Clause (3)'s FIELDS half for R476-1's own
+    /// arm, decided where the store is seen: every container callee leaves
+    /// the pointer it can load from the written field confined
+    /// ([`field_contents_confined`]). `None` for the callee-side arm, whose
+    /// store's field is inside the storing callee and which asks the strict
+    /// (field-blind) contents set instead.
+    field_contents: Option<bool>,
+    /// R573-3: the local callee positions the written field's pointer is
+    /// handed to inside those callees; each must itself be certified
+    /// no-retain, which `frame_bounded_discharge` asks of the rows.
+    field_handed: Vec<(LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1805,6 +1816,32 @@ fn container_pointer_field_reads<'tcx>(
     reads.ok.then_some(reads.reads)
 }
 
+/// R573-3: does this read through a container address concern the field the
+/// bounded store wrote? Without a key, or through an address that no longer
+/// has the container's type (a cast, a derived element), every read does.
+/// Otherwise the read's field path after its `Deref` concerns the key when
+/// either is a prefix of the other; any non-field step before they diverge
+/// (an index, a downcast) is answered conservatively: it does.
+fn field_relevant(
+    place: &rustc_middle::mir::Place<'_>,
+    field: Option<&[u32]>,
+    exact: &FxHashSet<Local>,
+) -> bool {
+    let Some(field) = field else { return true };
+    if !exact.contains(&place.local) {
+        return true;
+    }
+    for (depth, element) in place.projection.iter().skip(1).enumerate() {
+        let Some(&want) = field.get(depth) else { return true };
+        match element {
+            ProjectionElem::Field(index, _) if index.as_u32() != want => return false,
+            ProjectionElem::Field(..) => {}
+            _ => return true,
+        }
+    }
+    true
+}
+
 /// R572-3: a `core` integer method (`wrapping_add`, `checked_sub`, ..) — pure on
 /// its integer operands, so a tracked operand only taints its result.
 fn core_numeric(tcx: TyCtxt<'_>, callee: DefId) -> bool {
@@ -1842,7 +1879,8 @@ fn container_contents_facts<'tcx>(
     program: &RustProgram<'tcx>,
     body: &Body<'tcx>,
     param: Local,
-) -> (bool, Vec<(LocalDefId, usize)>) {
+    field: Option<&[u32]>,
+) -> (bool, Vec<(LocalDefId, usize)>, Vec<(LocalDefId, usize)>) {
     use rustc_middle::mir::{
         Place,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
@@ -1863,9 +1901,13 @@ fn container_contents_facts<'tcx>(
         _ => None,
     };
     let mut addresses = FxHashSet::from_iter([param]);
+    // R573-3: the addresses that still point at the container AS ITS TYPE —
+    // the only ones a field key can be read against.
+    let pointee = |local: Local| body.local_decls[local].ty.builtin_deref(true);
+    let mut exact = FxHashSet::from_iter([param]);
     let mut contents = FxHashSet::default();
     loop {
-        let before = addresses.len() + contents.len();
+        let before = addresses.len() + contents.len() + exact.len();
         for data in body.basic_blocks.iter() {
             for statement in &data.statements {
                 let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
@@ -1874,11 +1916,18 @@ fn container_contents_facts<'tcx>(
                     if q.projection.is_empty() {
                         if addresses.contains(&q.local) {
                             addresses.insert(defined);
+                            if exact.contains(&q.local) && pointee(defined) == pointee(param) {
+                                exact.insert(defined);
+                            }
                         }
                         if contents.contains(&q.local) {
                             contents.insert(defined);
                         }
-                    } else if addresses.contains(&q.local) && one_deref(&q) && carries(&q) {
+                    } else if addresses.contains(&q.local)
+                        && one_deref(&q)
+                        && carries(&q)
+                        && field_relevant(&q, field, &exact)
+                    {
                         contents.insert(defined);
                     } else if contents.contains(&q.local)
                         && !q
@@ -1896,6 +1945,9 @@ fn container_contents_facts<'tcx>(
                 {
                     if addresses.contains(&q.local) {
                         addresses.insert(defined);
+                        if exact.contains(&q.local) && pointee(defined) == pointee(param) {
+                            exact.insert(defined);
+                        }
                     }
                     if contents.contains(&q.local) {
                         contents.insert(defined);
@@ -1961,7 +2013,7 @@ fn container_contents_facts<'tcx>(
                 }
             }
         }
-        if addresses.len() + contents.len() == before {
+        if addresses.len() + contents.len() + exact.len() == before {
             break;
         }
     }
@@ -1969,6 +2021,8 @@ fn container_contents_facts<'tcx>(
         body: &'a Body<'tcx>,
         tcx: TyCtxt<'tcx>,
         addresses: &'a FxHashSet<Local>,
+        exact: &'a FxHashSet<Local>,
+        field: Option<&'a [u32]>,
         contents: &'a FxHashSet<Local>,
         current: Option<(Place<'tcx>, Rvalue<'tcx>)>,
         in_branch: bool,
@@ -2077,12 +2131,22 @@ fn container_contents_facts<'tcx>(
                 .iter()
                 .skip(1)
                 .any(|p| matches!(p, ProjectionElem::Deref));
+            // R573-3: with a field key, a read or borrow of ANOTHER field of
+            // the container, through an address that is still the container's
+            // type, is not about the stored pointer.
+            let relevant = !self.addresses.contains(&place.local)
+                || field_relevant(place, self.field, self.exact);
             let fine = if leading_deref {
                 if borrow {
                     // Only a plain reborrow `&(*p)`; a borrow of a field
                     // through either would hand out an address into it.
-                    place.projection.len() == 1 && defines_local(&self.current)
-                } else if read && carries && !further_deref && self.addresses.contains(&place.local)
+                    (place.projection.len() == 1 && defines_local(&self.current))
+                        || (!further_deref && !relevant)
+                } else if read
+                    && carries
+                    && !further_deref
+                    && self.addresses.contains(&place.local)
+                    && relevant
                 {
                     // A pointer-carrying field of the container: only into a
                     // local, which the contents set follows.
@@ -2113,6 +2177,8 @@ fn container_contents_facts<'tcx>(
         body,
         tcx,
         addresses: &addresses,
+        exact: &exact,
+        field,
         contents: &contents,
         current: None,
         in_branch: false,
@@ -2121,6 +2187,10 @@ fn container_contents_facts<'tcx>(
     check.visit_body(body);
     let mut ok = check.ok;
     let mut passes = Vec::new();
+    // R573-3: the stored pointer (or a pointer derived from it) handed to a
+    // LOCAL callee — admissible exactly when that callee's own retention row
+    // at the position is no-retain, which only the fixpoint knows.
+    let mut value_passes = Vec::new();
     for data in body.basic_blocks.iter() {
         let Some(terminator) = &data.terminator else { continue };
         let (func, args) = match &terminator.kind {
@@ -2139,8 +2209,11 @@ fn container_contents_facts<'tcx>(
                 continue;
             }
             let value = place.projection.is_empty();
-            let content_read =
-                !value && addresses.contains(&place.local) && one_deref(&place) && carries(&place);
+            let content_read = !value
+                && addresses.contains(&place.local)
+                && one_deref(&place)
+                && carries(&place)
+                && field_relevant(&place, field, &exact);
             let admitted = if matches!(
                 method,
                 Some(CorePointerMethod::Derive | CorePointerMethod::Observe)
@@ -2156,9 +2229,16 @@ fn container_contents_facts<'tcx>(
                     }
                     None => false,
                 }
+            } else if value && contents.contains(&place.local) {
+                match local_callee {
+                    Some(callee) => {
+                        value_passes.push((callee, index));
+                        true
+                    }
+                    None => false,
+                }
             } else {
-                // The stored pointer (or a copy of it) handed to a callee, or
-                // a callee reading a field value it could keep: not certified.
+                // A callee reading a field value it could keep: not certified.
                 !value && !content_read
             };
             ok &= admitted;
@@ -2166,7 +2246,64 @@ fn container_contents_facts<'tcx>(
     }
     passes.sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
     passes.dedup();
-    (ok, passes)
+    value_passes.sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
+    value_passes.dedup();
+    (ok, passes, value_passes)
+}
+
+/// **R573-3 (relay 086): R476-1 clause (3), the fields half, keyed.** Does this
+/// container callee — and every local callee it passes the container on to —
+/// leave the pointer loaded from the WRITTEN field confined
+/// ([`container_contents_facts`] with the key)? The key follows the container
+/// into a callee whose parameter points at the same type, and is dropped (the
+/// strict check) into one that does not. A position already on the path is a
+/// cycle of readers and retains nothing; past the depth bound, it is refused.
+fn field_contents_confined(
+    program: &RustProgram<'_>,
+    callee: LocalDefId,
+    argument: usize,
+    field: Option<&[u32]>,
+    visiting: &mut FxHashSet<(LocalDefId, usize)>,
+    handed: &mut Vec<(LocalDefId, usize)>,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    if !visiting.insert((callee, argument)) {
+        return true;
+    }
+    let tcx = program.tcx;
+    let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+    let param = Local::from_usize(argument + 1);
+    if argument >= body.arg_count {
+        return false;
+    }
+    let (ok, passes, value_passes) = container_contents_facts(program, &body, param, field);
+    if !ok {
+        return false;
+    }
+    handed.extend(value_passes);
+    let pointee = body.local_decls[param].ty.builtin_deref(true);
+    passes.into_iter().all(|(next, index)| {
+        let same_type = {
+            let next_body = tcx.mir_drops_elaborated_and_const_checked(next).borrow();
+            index < next_body.arg_count
+                && next_body.local_decls[Local::from_usize(index + 1)]
+                    .ty
+                    .builtin_deref(true)
+                    == pointee
+        };
+        field_contents_confined(
+            program,
+            next,
+            index,
+            if same_type { field } else { None },
+            visiting,
+            handed,
+            depth + 1,
+        )
+    })
 }
 
 /// R572-3: the positions whose container CONTENTS the walk certifies: local
@@ -3015,8 +3152,10 @@ fn collect_retention_facts<'tcx>(
     };
     // R572-3: only a parameter root is ever a container callee's position.
     if argument_index.is_some() {
-        (facts.contents_local, facts.contents_passes) =
-            container_contents_facts(program, body, root);
+        let (local, passes, value_passes) = container_contents_facts(program, body, root, None);
+        // The strict set has no rows to ask: a hand-off is refused there.
+        facts.contents_local = local && value_passes.is_empty();
+        facts.contents_passes = passes;
     }
     for record in children {
         let child = &record.evidence;
@@ -3233,10 +3372,35 @@ fn collect_retention_facts<'tcx>(
                         .into_iter()
                         .all(|ancestor| !live_after(location, ancestor))
                 {
+                    // R573-3: the written field's key — a pure field path, else
+                    // none and the check is the strict one.
+                    let field = lhs
+                        .projection
+                        .iter()
+                        .map(|element| match element {
+                            ProjectionElem::Field(index, _) => Some(index.as_u32()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<u32>>>();
+                    let mut visiting = FxHashSet::default();
+                    let mut handed = Vec::new();
+                    let field_contents = callees.iter().all(|&(callee, argument)| {
+                        field_contents_confined(
+                            program,
+                            callee,
+                            argument,
+                            field.as_deref(),
+                            &mut visiting,
+                            &mut handed,
+                            0,
+                        )
+                    });
                     facts.frame_bounded.push(FrameBoundedStore {
                         step: step.clone(),
                         container: storage_root,
                         callees,
+                        field_contents: Some(field_contents),
+                        field_handed: handed,
                     });
                 }
                 // R477-4b: the callee-side half — this store puts the
@@ -3482,6 +3646,8 @@ fn collect_retention_facts<'tcx>(
                             step: step.clone(),
                             container,
                             callees: bounded.callees.clone(),
+                            field_contents: None,
+                            field_handed: Vec::new(),
                         });
                     }
                 }
@@ -3764,6 +3930,17 @@ fn frame_bounded_discharge(
     let mut containers = Vec::new();
     let mut callees = Vec::new();
     for bounded in &facts.frame_bounded {
+        // R573-3: R476-1's own arm, clause (3)'s fields half.
+        if bounded.field_contents == Some(false) {
+            return None;
+        }
+        if !bounded
+            .field_handed
+            .iter()
+            .all(|key| matches!(rows.get(key), Some(RetentionVerdict::NoRetain { .. })))
+        {
+            return None;
+        }
         containers.push(format!("_{}", bounded.container.as_u32()));
         for &(callee, argument) in &bounded.callees {
             // R572-3: clause (3) asked of the CONTENTS too — the callee may not
