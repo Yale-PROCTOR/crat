@@ -119,18 +119,19 @@ fn r556_4_an_element_address_at_a_raw_formal_takes_the_base_view() {
     );
 }
 
-/// `(argument, base, element)` byte intervals of `argument` (spelled
-/// `&mut *X.offset(..)`) in `{PRELUDE}{program}`.
+/// `(argument, base, element)` byte intervals of `argument` (spelled `&mut *X.offset(..)` or
+/// `&*X.offset(..)`) in `{PRELUDE}{program}`.
 fn spans(program: &str, argument: &str) -> ((u32, u32), (u32, u32), (u32, u32)) {
     let source = format!("{PRELUDE}{program}");
     let lo = u32::try_from(source.find(argument).expect("argument spelled")).unwrap();
     let hi = lo + u32::try_from(argument.len()).unwrap();
-    let name = argument["&mut *".len()..].split('.').next().unwrap();
-    let base_lo = lo + u32::try_from("&mut *".len()).unwrap();
+    let star = u32::try_from(argument.find('*').expect("a deref")).unwrap();
+    let name = argument[star as usize + 1..].split('.').next().unwrap();
+    let base_lo = lo + star + 1;
     (
         (lo, hi),
         (base_lo, base_lo + u32::try_from(name.len()).unwrap()),
-        (lo + u32::try_from("&mut ".len()).unwrap(), hi),
+        (lo + star, hi),
     )
 }
 
@@ -281,14 +282,16 @@ fn r556_4_the_non_optional_twin_takes_the_base_view() {
     );
 }
 
-/// **Control — mutability must agree.** `&mut *X.offset(k)` at a `*const` formal: the view
-/// would be `*const` and `&mut *` over it does not type, so the base view declines and the
-/// argument keeps its pre-R556-4 path (the class holds; the tree is the input's there).
-#[test]
-fn r556_4_a_mutable_element_address_at_a_const_formal_declines_the_base_view() {
-    let program = format!(
+/// Quality10's shape (`BrotliZopfliCreateCommands(.., &mut *nodes.offset(0), ..)` into a
+/// `nodes: *const ZopfliNode` formal): the element address `address` of the optional owner at a
+/// `*const` range reader.
+fn at_const_formal(address: &str) -> String {
+    format!(
         "{}{}",
-        ELEMENT_AT_RAW.replace("Combine(&mut *clusters", "Peek(&mut *clusters"),
+        ELEMENT_AT_RAW.replace(
+            "Combine(&mut *clusters.offset(k as isize)",
+            &format!("Peek({address}")
+        ),
         r#"
 pub unsafe extern "C" fn Peek(mut clusters: *const u32, n: usize) -> usize {
     let mut i = 0 as usize;
@@ -300,31 +303,90 @@ pub unsafe extern "C" fn Peek(mut clusters: *const u32, n: usize) -> usize {
     return total.wrapping_add(clusters as usize);
 }
 "#
+    )
+}
+
+/// The base-anchored view applied and the element edit retired, read on the PLAN (an
+/// ill-typed view would be reverted by the per-function gate and leave the input's text).
+fn assert_base_view_planned(
+    out: &super::wave6a_allocation_tests::Emitted,
+    program: &str,
+    address: &str,
+) {
+    let (argument, base, element) = spans(program, address);
+    let events = &out.artifacts.bridge_events;
+    assert!(
+        events.iter().any(
+            |event| event.site.bridge_kind == "optional-box-borrow-view-to-raw"
+                && event.state == super::bridge_receipt::BridgeReceiptState::Applied
+                && (event.site.lo, event.site.hi) == base
+        ),
+        "the view is anchored at the base path {base:?} of {argument:?}: {events:#?}"
     );
-    let out = emitted("r556-const", &format!("{PRELUDE}{program}"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.site.bridge_kind == "box-expression"
+                && (event.site.lo, event.site.hi) == element),
+        "the element edit {element:?} is retired: {events:#?}"
+    );
+}
+
+/// **R568-3 witness (076's control, flipped) — the view takes the ADDRESS's mutability.**
+/// `&mut *X.offset(k)` at a `*const` formal: the base view bridges `X`, the raw pointer the
+/// input's arithmetic runs on, so it is `*mut` (`as_deref_mut` / `as_mut_ptr`); the `&mut T`
+/// around it coerces to the formal's `*const T` exactly as the input's `&mut *nodes.offset(0)`
+/// did. R-A's clause asked the address to equal the formal and declined — brotli's Quality10.
+#[test]
+fn r568_3_a_mutable_element_address_at_a_const_formal_takes_the_mutable_base_view() {
+    let address = "&mut *clusters.offset(k as isize)";
+    let program = at_const_formal(address);
+    let out = emitted("r568-mut-at-const", &format!("{PRELUDE}{program}"));
     let text = compact(&out.source);
-    assert!(!text.contains("&mut*clusters.as_deref"), "{}", out.source);
+    assert!(
+        text.contains(
+            "Peek(&mut*clusters.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()).offset(kasisize),"
+        ),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnPeek(mutclusters:*constu32,"),
+        "{}",
+        out.source
+    );
+    assert_base_view_planned(&out, &program, address);
+    assert_eq!(out.reverted, 0, "{}", out.source);
     assert!(
         super::verify::type_checks_str(&out.source),
         "{}",
         out.source
     );
-    // Read on the PLAN, not the verified text: an ill-typed base view would be caught by the
-    // per-function gate and reverted, leaving the same final text. The view stays on the whole
-    // argument (the pre-R556-4 path) and nothing reverts.
-    let (argument, _, _) = spans(&program, "&mut *clusters.offset(k as isize)");
+}
+
+/// **R568-3 control — a SHARED address keeps the shared view.** `&*X.offset(k)` at a `*const`
+/// formal renders `as_deref` / `as_ptr`: the rule follows the address, not a blanket `*mut`.
+/// (`&*X.offset(k)` at a `*mut` formal cannot occur — the input would not type.)
+#[test]
+fn r568_3_a_shared_element_address_at_a_const_formal_takes_the_shared_base_view() {
+    let address = "&*clusters.offset(k as isize)";
+    let program = at_const_formal(address);
+    let out = emitted("r568-shared-at-const", &format!("{PRELUDE}{program}"));
+    let text = compact(&out.source);
     assert!(
-        out.artifacts
-            .bridge_events
-            .iter()
-            .any(
-                |event| event.site.bridge_kind == "optional-box-borrow-view-to-raw"
-                    && (event.site.lo, event.site.hi) == argument
-            ),
-        "{:#?}",
-        out.artifacts.bridge_events
+        text.contains(
+            "Peek(&*clusters.as_deref().map_or(core::ptr::null(),|s|s.as_ptr()).offset(kasisize),"
+        ),
+        "{}",
+        out.source
     );
+    assert_base_view_planned(&out, &program, address);
     assert_eq!(out.reverted, 0, "{}", out.source);
+    assert!(
+        super::verify::type_checks_str(&out.source),
+        "{}",
+        out.source
+    );
 }
 
 /// **(i) — the composed geometry at brotli's `BrotliHistogramCombine*` calls.** The callee

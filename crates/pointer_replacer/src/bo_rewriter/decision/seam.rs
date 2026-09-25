@@ -5943,8 +5943,14 @@ pub(crate) fn synthesize_with_raw_boundary(
         // (E0599). The view goes over the base path `X` instead and the input's
         // `&mut *….offset(k)` stays around it; the owner's own element edit is
         // retired (`box_base_view_retirements`), since its product — a one-element
-        // place — is what must not reach a formal that walks a range. Mutability
-        // must agree: `&mut *` over a `*const` view does not type.
+        // place — is what must not reach a formal that walks a range.
+        //
+        // **R568-3 — the view takes the ADDRESS's mutability.** The view bridges
+        // `X`, the raw pointer the input's arithmetic runs on, not the formal:
+        // `&mut *X.offset(k)` needs a `*mut` view whatever the formal, and the
+        // `&mut T` around it coerces to a `*const T` formal exactly as the
+        // input's did (brotli's Quality10, `nodes: *const ZopfliNode`). A shared
+        // address at a `*mut` formal cannot type in the input; it declines.
         let base_view = matches!(
             template,
             super::raw_boundary::BridgeTemplate::BoxBorrowViewToRaw
@@ -5954,11 +5960,22 @@ pub(crate) fn synthesize_with_raw_boundary(
             let (owner, root) = site.node?;
             super::emitability::owner_element_address_at(tcx, owner, site.span).filter(|address| {
                 address.root == root
-                    && address.mutable
-                        == (site.target.mutability == super::raw_boundary::RawMutability::Mut)
+                    && (address.mutable
+                        || site.target.mutability == super::raw_boundary::RawMutability::Const)
             })
         })
         .flatten();
+        let view_target = base_view
+            .filter(|address| {
+                address.mutable
+                    && site.target.mutability == super::raw_boundary::RawMutability::Const
+            })
+            .map(|_| super::raw_boundary::RawTargetType {
+                rendered: format!("*mut {}", site.target.pointee),
+                mutability: super::raw_boundary::RawMutability::Mut,
+                ..site.target.clone()
+            });
+        let target = view_target.as_ref().unwrap_or(&site.target);
         let edit_span = base_view.map_or(site.span, |address| address.base);
         let argument_span = base_view.map_or_else(
             || {
@@ -5970,7 +5987,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         let Ok(mut argument) = sm.span_to_snippet(argument_span) else {
             continue;
         };
-        let mut spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
+        let mut spec = GlueSpec::raw_boundary_target(template, target, site.box_slice, false);
         let exact_subject_use = site
             .node
             .and_then(|node| decision_of.get(&node).copied())
@@ -6015,7 +6032,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         };
         let zero_syntax = match template.render(
             &argument,
-            site.target.mutability,
+            target.mutability,
             site.box_slice,
             spec.raw_boundary
                 .as_ref()
@@ -6086,7 +6103,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 return_independent: raw_boundary.return_independent(key).cloned(),
                 returned_child: raw_boundary.returned_child_evidence(key).cloned(),
                 mutable_binding_required: site.mutable_binding_required,
-                target: site.target.clone(),
+                target: target.clone(),
                 original_expression,
                 operand_expression: argument.clone(),
                 ownership,
