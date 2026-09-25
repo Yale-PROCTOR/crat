@@ -1297,6 +1297,12 @@ struct RetentionDependency {
     /// returned-alias continuation) — the callee's `return` sink is this
     /// body's to account for; only the callee's residual travels.
     continued_returned_alias: bool,
+    /// **R572-3 (relay 085).** The callee stores this argument only through
+    /// output parameters, and at this call those operands borrow containers
+    /// that THIS frame bounds (clauses (1)+(2) decided in the walk). The step
+    /// is a [`FrameBoundedStore`]; clause (3) — every callee receiving a
+    /// container's address certified — is decided in `evaluate_retention`.
+    frame_bounded_container: bool,
 }
 
 /// wave-6v2 (R407-11): what the previous derivation pass learned about every
@@ -1676,6 +1682,524 @@ fn output_discharge<'tcx>(
     out
 }
 
+/// **R572-3 (relay 085): R476-1 with the store one call deeper.** An
+/// output-storage-only callee writes the argument into containers this body
+/// borrows at the call; each container is a stack local of this frame that
+/// does not escape it ([`container_frame_confinement`], which also names every
+/// callee that receives its address), and every pointer-carrying field read of
+/// it is copied into a local, so the walk continues from that local.
+#[derive(Clone, Debug, Default)]
+struct FrameBoundedOutput {
+    containers: Vec<Local>,
+    callees: Vec<(LocalDefId, usize)>,
+    field_reads: Vec<(Local, Location)>,
+}
+
+fn frame_bounded_output<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    args: &[rustc_middle::mir::Operand<'tcx>],
+    outputs: &[usize],
+    call: Location,
+) -> Option<FrameBoundedOutput> {
+    let mut out = FrameBoundedOutput::default();
+    for &output in outputs {
+        let operand = args.get(output)?.place()?.as_local()?;
+        let Some(OutputOperand::Borrowed(container, _)) = output_operand(body, operand, call)
+        else {
+            return None;
+        };
+        out.callees
+            .extend(container_frame_confinement(body, container)?);
+        out.field_reads
+            .extend(container_pointer_field_reads(tcx, body, container)?);
+        out.containers.push(container);
+    }
+    out.containers.sort();
+    out.containers.dedup();
+    out.callees
+        .sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
+    out.callees.dedup();
+    (!out.containers.is_empty()).then_some(out)
+}
+
+/// R572-3: every read of a pointer-carrying projection of `container` (a field
+/// of the struct, not a read THROUGH a pointer it holds) is `_d = copy/move
+/// container.f..`, and each `_d` is returned so the walk follows it; `None`
+/// when such a projection is read any other way. Whole-value reads are
+/// [`container_frame_confinement`]'s escapes.
+fn container_pointer_field_reads<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    container: Local,
+) -> Option<Vec<(Local, Location)>> {
+    use rustc_middle::mir::visit::{NonMutatingUseContext, PlaceContext, Visitor};
+    struct Reads<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        container: Local,
+        allowed: Option<Location>,
+        reads: Vec<(Local, Location)>,
+        ok: bool,
+    }
+    impl<'tcx> Reads<'_, 'tcx> {
+        fn carried(&self, place: &rustc_middle::mir::Place<'tcx>) -> bool {
+            place.local == self.container
+                && !place.projection.is_empty()
+                && !place
+                    .projection
+                    .iter()
+                    .any(|p| matches!(p, ProjectionElem::Deref))
+                && may_carry_pointer(
+                    self.tcx,
+                    place.ty(self.body, self.tcx).ty,
+                    CARRIER_WALK_DEPTH,
+                )
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Reads<'_, 'tcx> {
+        fn visit_assign(
+            &mut self,
+            place: &rustc_middle::mir::Place<'tcx>,
+            rvalue: &Rvalue<'tcx>,
+            location: Location,
+        ) {
+            if let Rvalue::Use(Operand::Copy(source) | Operand::Move(source)) = rvalue
+                && self.carried(source)
+                && let Some(destination) = place.as_local()
+            {
+                self.reads.push((destination, location));
+                self.allowed = Some(location);
+            }
+            self.super_assign(place, rvalue, location);
+            self.allowed = None;
+        }
+
+        fn visit_place(
+            &mut self,
+            place: &rustc_middle::mir::Place<'tcx>,
+            context: PlaceContext,
+            location: Location,
+        ) {
+            if matches!(
+                context,
+                PlaceContext::NonMutatingUse(
+                    NonMutatingUseContext::Copy | NonMutatingUseContext::Move
+                )
+            ) && self.carried(place)
+                && self.allowed != Some(location)
+            {
+                self.ok = false;
+            }
+        }
+    }
+    let mut reads = Reads {
+        tcx,
+        body,
+        container,
+        allowed: None,
+        reads: Vec::new(),
+        ok: true,
+    };
+    reads.visit_body(body);
+    reads.ok.then_some(reads.reads)
+}
+
+/// R572-3: a `core` integer method (`wrapping_add`, `checked_sub`, ..) — pure on
+/// its integer operands, so a tracked operand only taints its result.
+fn core_numeric(tcx: TyCtxt<'_>, callee: DefId) -> bool {
+    let path = tcx.def_path_str(callee);
+    (path.starts_with("core::num::") || path.starts_with("std::num::"))
+        && tcx
+            .fn_sig(callee)
+            .skip_binder()
+            .skip_binder()
+            .inputs_and_output
+            .iter()
+            .all(|ty| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool))
+}
+
+/// **R572-3 (relay 085): clause (3)'s CONTENTS half.** R476-1 asks every callee
+/// that receives the container's address for a certificate "for the
+/// container's pointer-typed fields". The row at that position certifies the
+/// ADDRESS only: a load `(*p).f` is not an alias of `p`, so a callee copying the
+/// stored pointer into a static still reads `no-retain`. This is the fields
+/// half, strictly, for parameter `param`:
+///
+/// - every pointer-carrying read of `*p` (one leading `Deref`, no further one)
+///   is copied into a local, which joins the CONTENTS set;
+/// - a contents local — and every copy, cast, reborrow or core-derived pointer
+///   of it — is only dereferenced (a plain read or write through it),
+///   compared, or given to a core pointer method;
+/// - `p` and its aliases are likewise only dereferenced, compared, given to a
+///   core pointer method, or passed to a LOCAL callee, whose position is
+///   returned so the caller's fixpoint asks it the same question.
+///
+/// Anything else fails: a store of either into a place, an aggregate, a
+/// return, a borrow of a field through either, or a foreign or indirect callee.
+/// Returns `(local conditions hold, positions p is passed to)`.
+fn container_contents_facts<'tcx>(
+    program: &RustProgram<'tcx>,
+    body: &Body<'tcx>,
+    param: Local,
+) -> (bool, Vec<(LocalDefId, usize)>) {
+    use rustc_middle::mir::{
+        Place,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+    };
+    let tcx = program.tcx;
+    let carries =
+        |place: &Place<'tcx>| may_carry_pointer(tcx, place.ty(body, tcx).ty, CARRIER_WALK_DEPTH);
+    let one_deref = |place: &Place<'tcx>| {
+        matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && !place.projection[1..]
+                .iter()
+                .any(|p| matches!(p, ProjectionElem::Deref))
+    };
+    let copied = |rvalue: &Rvalue<'tcx>| match rvalue {
+        Rvalue::Use(Operand::Copy(q) | Operand::Move(q))
+        | Rvalue::Cast(_, Operand::Copy(q) | Operand::Move(q), _)
+        | Rvalue::CopyForDeref(q) => Some(*q),
+        _ => None,
+    };
+    let mut addresses = FxHashSet::from_iter([param]);
+    let mut contents = FxHashSet::default();
+    loop {
+        let before = addresses.len() + contents.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+                let Some(defined) = lhs.as_local() else { continue };
+                if let Some(q) = copied(rhs) {
+                    if q.projection.is_empty() {
+                        if addresses.contains(&q.local) {
+                            addresses.insert(defined);
+                        }
+                        if contents.contains(&q.local) {
+                            contents.insert(defined);
+                        }
+                    } else if addresses.contains(&q.local) && one_deref(&q) && carries(&q) {
+                        contents.insert(defined);
+                    } else if contents.contains(&q.local)
+                        && !q
+                            .projection
+                            .iter()
+                            .any(|p| matches!(p, ProjectionElem::Deref))
+                        && carries(&q)
+                    {
+                        contents.insert(defined);
+                    }
+                }
+                if let Rvalue::Ref(_, _, q) | Rvalue::RawPtr(_, q) = rhs
+                    && q.projection.len() == 1
+                    && matches!(q.projection[0], ProjectionElem::Deref)
+                {
+                    if addresses.contains(&q.local) {
+                        addresses.insert(defined);
+                    }
+                    if contents.contains(&q.local) {
+                        contents.insert(defined);
+                    }
+                }
+                // Addendum 256(2): a pointer-width integer carries an address,
+                // so arithmetic on a tracked value is tracked in turn.
+                if let Rvalue::BinaryOp(_, box (a, b)) = rhs
+                    && [a, b].into_iter().any(|operand| {
+                        operand.place().is_some_and(|q| {
+                            addresses.contains(&q.local) || contents.contains(&q.local)
+                        })
+                    })
+                {
+                    contents.insert(defined);
+                }
+                if let Rvalue::UnaryOp(_, operand) = rhs
+                    && operand.place().is_some_and(|q| {
+                        addresses.contains(&q.local) || contents.contains(&q.local)
+                    })
+                {
+                    contents.insert(defined);
+                }
+            }
+            if let Some(terminator) = &data.terminator
+                && let TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } = &terminator.kind
+                && let Some(callee) = operand_callee(func)
+                && core_numeric(tcx, callee)
+                && let Some(defined) = destination.as_local()
+                && args.iter().any(|argument| {
+                    argument.node.place().is_some_and(|q| {
+                        addresses.contains(&q.local) || contents.contains(&q.local)
+                    })
+                })
+            {
+                contents.insert(defined);
+            }
+            if let Some(terminator) = &data.terminator
+                && let TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } = &terminator.kind
+                && let Some(callee) = operand_callee(func)
+                && core_pointer_method(tcx, callee) == Some(CorePointerMethod::Derive)
+                && let Some(receiver) = args
+                    .first()
+                    .and_then(|receiver| receiver.node.place())
+                    .and_then(|place| place.as_local())
+                && let Some(defined) = destination.as_local()
+            {
+                if addresses.contains(&receiver) {
+                    addresses.insert(defined);
+                }
+                if contents.contains(&receiver) {
+                    contents.insert(defined);
+                }
+            }
+        }
+        if addresses.len() + contents.len() == before {
+            break;
+        }
+    }
+    struct Check<'a, 'tcx> {
+        body: &'a Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        addresses: &'a FxHashSet<Local>,
+        contents: &'a FxHashSet<Local>,
+        current: Option<(Place<'tcx>, Rvalue<'tcx>)>,
+        in_branch: bool,
+        ok: bool,
+    }
+    impl<'tcx> Check<'_, 'tcx> {
+        fn tracked(&self, local: Local) -> bool {
+            self.addresses.contains(&local) || self.contents.contains(&local)
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Check<'_, 'tcx> {
+        fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
+            self.current = Some((*place, rvalue.clone()));
+            self.super_assign(place, rvalue, location);
+            self.current = None;
+        }
+
+        fn visit_terminator(
+            &mut self,
+            terminator: &rustc_middle::mir::Terminator<'tcx>,
+            location: Location,
+        ) {
+            match &terminator.kind {
+                // Call operands are judged in `container_contents_facts`'s
+                // caller-side pass below; the destination is a redefinition.
+                TerminatorKind::Call { .. } | TerminatorKind::TailCall { .. } => {}
+                TerminatorKind::Return => {
+                    if self.tracked(RETURN_PLACE) {
+                        self.ok = false;
+                    }
+                }
+                TerminatorKind::SwitchInt { .. } | TerminatorKind::Assert { .. } => {
+                    // A branch reads its discriminant and keeps nothing.
+                    self.in_branch = true;
+                    self.super_terminator(terminator, location);
+                    self.in_branch = false;
+                }
+                _ => self.super_terminator(terminator, location),
+            }
+        }
+
+        fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _: Location) {
+            if !self.tracked(place.local) {
+                return;
+            }
+            let read = matches!(
+                context,
+                PlaceContext::NonMutatingUse(
+                    NonMutatingUseContext::Copy | NonMutatingUseContext::Move
+                )
+            );
+            let borrow = matches!(
+                context,
+                PlaceContext::MutatingUse(
+                    MutatingUseContext::Borrow | MutatingUseContext::RawBorrow
+                ) | PlaceContext::NonMutatingUse(
+                    NonMutatingUseContext::SharedBorrow
+                        | NonMutatingUseContext::FakeBorrow
+                        | NonMutatingUseContext::RawBorrow
+                )
+            );
+            let carries = may_carry_pointer(
+                self.tcx,
+                place.ty(self.body, self.tcx).ty,
+                CARRIER_WALK_DEPTH,
+            );
+            let defines_local = |current: &Option<(Place<'tcx>, Rvalue<'tcx>)>| {
+                current.as_ref().is_some_and(|(lhs, rvalue)| {
+                    lhs.projection.is_empty()
+                        && match rvalue {
+                            Rvalue::Use(Operand::Copy(q) | Operand::Move(q))
+                            | Rvalue::Cast(_, Operand::Copy(q) | Operand::Move(q), _)
+                            | Rvalue::CopyForDeref(q) => q == place,
+                            Rvalue::Ref(_, _, q) | Rvalue::RawPtr(_, q) => q == place,
+                            _ => false,
+                        }
+                })
+            };
+            // A computed value (comparison, arithmetic) lands in a local the
+            // contents set follows, or back in a field of the container.
+            let kept_local_or_container = self.current.as_ref().is_some_and(|(lhs, _)| {
+                lhs.projection.is_empty()
+                    || (self.addresses.contains(&lhs.local)
+                        && matches!(lhs.projection.first(), Some(ProjectionElem::Deref))
+                        && !lhs.projection[1..]
+                            .iter()
+                            .any(|p| matches!(p, ProjectionElem::Deref)))
+            });
+            let compared = kept_local_or_container
+                && self.current.as_ref().is_some_and(|(_, rvalue)| {
+                    matches!(rvalue, Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..))
+                });
+            // A value stored back into a field of the container stays in it.
+            let stays_in_container = self.current.as_ref().is_some_and(|(lhs, rvalue)| {
+                !lhs.projection.is_empty()
+                    && kept_local_or_container
+                    && matches!(
+                        rvalue,
+                        Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) if q == place
+                    )
+            });
+
+            let leading_deref = matches!(place.projection.first(), Some(ProjectionElem::Deref));
+            let further_deref = place
+                .projection
+                .iter()
+                .skip(1)
+                .any(|p| matches!(p, ProjectionElem::Deref));
+            let fine = if leading_deref {
+                if borrow {
+                    // Only a plain reborrow `&(*p)`; a borrow of a field
+                    // through either would hand out an address into it.
+                    place.projection.len() == 1 && defines_local(&self.current)
+                } else if read && carries && !further_deref && self.addresses.contains(&place.local)
+                {
+                    // A pointer-carrying field of the container: only into a
+                    // local, which the contents set follows.
+                    defines_local(&self.current)
+                } else {
+                    true
+                }
+            } else if place.projection.is_empty() {
+                match context {
+                    PlaceContext::NonUse(_)
+                    | PlaceContext::MutatingUse(MutatingUseContext::Store) => true,
+                    _ if read => {
+                        defines_local(&self.current)
+                            || compared
+                            || stays_in_container
+                            || self.in_branch
+                    }
+                    _ => false,
+                }
+            } else {
+                // A field of a contents struct held by value.
+                !(read || borrow) || !carries || defines_local(&self.current)
+            };
+            self.ok &= fine;
+        }
+    }
+    let mut check = Check {
+        body,
+        tcx,
+        addresses: &addresses,
+        contents: &contents,
+        current: None,
+        in_branch: false,
+        ok: true,
+    };
+    check.visit_body(body);
+    let mut ok = check.ok;
+    let mut passes = Vec::new();
+    for data in body.basic_blocks.iter() {
+        let Some(terminator) = &data.terminator else { continue };
+        let (func, args) = match &terminator.kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        let callee = operand_callee(func);
+        let method = callee.and_then(|callee| core_pointer_method(tcx, callee));
+        let local_callee = callee
+            .and_then(|callee| callee.as_local())
+            .filter(|callee| program.functions.contains(callee));
+        for (index, argument) in args.iter().enumerate() {
+            let Some(place) = argument.node.place() else { continue };
+            if !(addresses.contains(&place.local) || contents.contains(&place.local)) {
+                continue;
+            }
+            let value = place.projection.is_empty();
+            let content_read =
+                !value && addresses.contains(&place.local) && one_deref(&place) && carries(&place);
+            let admitted = if matches!(
+                method,
+                Some(CorePointerMethod::Derive | CorePointerMethod::Observe)
+            ) || callee.is_some_and(|callee| core_numeric(tcx, callee))
+            {
+                !content_read
+            } else if value && addresses.contains(&place.local) && !contents.contains(&place.local)
+            {
+                match local_callee {
+                    Some(callee) => {
+                        passes.push((callee, index));
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                // The stored pointer (or a copy of it) handed to a callee, or
+                // a callee reading a field value it could keep: not certified.
+                !value && !content_read
+            };
+            ok &= admitted;
+        }
+    }
+    passes.sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
+    passes.dedup();
+    (ok, passes)
+}
+
+/// R572-3: the positions whose container CONTENTS the walk certifies: local
+/// conditions hold, and every local callee the container is passed on to is
+/// certified in turn (greatest fixpoint — a cycle of readers retains nothing).
+fn contents_confined(
+    facts: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
+) -> FxHashSet<(LocalDefId, usize)> {
+    let mut confined = facts
+        .iter()
+        .filter(|(_, facts)| facts.contents_local)
+        .map(|(key, _)| *key)
+        .collect::<FxHashSet<_>>();
+    loop {
+        let dropped = confined
+            .iter()
+            .filter(|key| {
+                !facts[*key]
+                    .contents_passes
+                    .iter()
+                    .all(|pass| confined.contains(pass))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if dropped.is_empty() {
+            return confined;
+        }
+        for key in dropped {
+            confined.remove(&key);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RetentionBodyFacts {
     function: LocalDefId,
@@ -1693,6 +2217,10 @@ struct RetentionBodyFacts {
     /// a FRESH ALLOCATION which escapes only back into the parameter's own
     /// subgraph, so a caller whose frame bounds the parameter bounds them too.
     retains_into_fresh_allocation: Vec<RetentionStep>,
+    /// R572-3: [`container_contents_facts`] for a parameter root — the local
+    /// conditions, and the local callees the pointee is passed on to.
+    contents_local: bool,
+    contents_passes: Vec<(LocalDefId, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2199,6 +2727,8 @@ fn collect_retention_facts<'tcx>(
     // parameters) is discharged here, its confined field reads continuing the
     // walk and its parameter stores transposing to this body's.
     let mut discharges = FxHashMap::<(Location, usize), OutputDischarge>::default();
+    // R572-3: the calls whose output operands borrow frame-bounded containers.
+    let mut bounded_outputs = FxHashMap::<(Location, usize), FrameBoundedOutput>::default();
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::Call {
             func,
@@ -2275,6 +2805,27 @@ fn collect_retention_facts<'tcx>(
                             ),
                         ));
                     }
+                }
+                if !discharge.ok
+                    && let Some(bounded) = frame_bounded_output(tcx, body, &operands, outputs, call)
+                {
+                    for &(destination, at) in &bounded.field_reads {
+                        aliases.push((
+                            source,
+                            destination,
+                            retention_step(
+                                at,
+                                RetentionEventKind::ReturnedAlias,
+                                format!(
+                                    "{} arg{index} frame-bounded-field-read _{}->_{}",
+                                    tcx.def_path_str(callee.to_def_id()),
+                                    source.as_u32(),
+                                    destination.as_u32()
+                                ),
+                            ),
+                        ));
+                    }
+                    bounded_outputs.insert((call, index), bounded);
                 }
                 discharges.insert((call, index), discharge);
             }
@@ -2459,7 +3010,14 @@ fn collect_retention_facts<'tcx>(
         frame_bounded: Vec::new(),
         retains_into_fresh_allocation: Vec::new(),
         dependencies: Vec::new(),
+        contents_local: false,
+        contents_passes: Vec::new(),
     };
+    // R572-3: only a parameter root is ever a container callee's position.
+    if argument_index.is_some() {
+        (facts.contents_local, facts.contents_passes) =
+            container_contents_facts(program, body, root);
+    }
     for record in children {
         let child = &record.evidence;
         let parent = match &child.parent {
@@ -2865,6 +3423,17 @@ fn collect_retention_facts<'tcx>(
                 // body's output-storage sinks.
                 let discharge = discharges.get(&(location, index));
                 let discharged_by_stack_storage = discharge.is_some_and(|d| d.ok);
+                // R572-3 clause (1), asked as R477-4a asks it: every ancestor
+                // whose provenance the stored argument carries is dead after
+                // the call.
+                let bounded = bounded_outputs
+                    .get(&(location, index))
+                    .filter(|_| !discharged_by_stack_storage)
+                    .filter(|_| {
+                        provenance_ancestors(&aliases, root, local)
+                            .into_iter()
+                            .all(|ancestor| !live_after(location, ancestor))
+                    });
                 if let Some(discharge) = discharge.filter(|d| d.ok) {
                     for &(source, parameter) in &discharge.transposed {
                         let step = retention_step(
@@ -2907,12 +3476,22 @@ fn collect_retention_facts<'tcx>(
                         }
                     ),
                 );
+                if let Some(bounded) = bounded {
+                    for &container in &bounded.containers {
+                        facts.frame_bounded.push(FrameBoundedStore {
+                            step: step.clone(),
+                            container,
+                            callees: bounded.callees.clone(),
+                        });
+                    }
+                }
                 facts.dependencies.push(RetentionDependency {
                     callee: local_callee,
                     argument_index: index,
                     step: step.clone(),
                     discharged_by_stack_storage,
                     continued_returned_alias,
+                    frame_bounded_container: bounded.is_some(),
                 });
                 facts.steps.push(step);
                 continue;
@@ -3148,8 +3727,28 @@ fn frame_bounded_discharge(
     facts: &RetentionBodyFacts,
     rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
     all: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
+    residual_clean: bool,
+    contents: &FxHashSet<(LocalDefId, usize)>,
 ) -> Option<String> {
-    if facts.retains.is_empty() || facts.argument_index.is_none() {
+    // R572-3: a store one call deeper, into a container this frame bounds.
+    let via = facts
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.frame_bounded_container)
+        .map(|dependency| {
+            format!(
+                "{}:arg{}",
+                dependency.callee.local_def_index.as_u32(),
+                dependency.argument_index
+            )
+        })
+        .collect::<Vec<_>>();
+    if (facts.retains.is_empty() && via.is_empty()) || facts.argument_index.is_none() {
+        return None;
+    }
+    // R572-3: with the store in a callee, nothing else may retain — every
+    // other dependency certified, every open step one of the bounded stores.
+    if !via.is_empty() && !residual_clean {
         return None;
     }
     if !facts.retains.iter().all(|step| {
@@ -3165,6 +3764,11 @@ fn frame_bounded_discharge(
     for bounded in &facts.frame_bounded {
         containers.push(format!("_{}", bounded.container.as_u32()));
         for &(callee, argument) in &bounded.callees {
+            // R572-3: clause (3) asked of the CONTENTS too — the callee may not
+            // copy the stored pointer out of the container.
+            if !via.is_empty() && !contents.contains(&(callee, argument)) {
+                return None;
+            }
             match rows.get(&(callee, argument)) {
                 Some(RetentionVerdict::NoRetain { .. }) => {}
                 // **R477-4b.** A retaining container callee is admissible when
@@ -3187,13 +3791,18 @@ fn frame_bounded_discharge(
     callees.sort();
     callees.dedup();
     Some(format!(
-        "retention-discharged:frame-bounded(subject=arg{}, container={}, callees={})",
+        "retention-discharged:frame-bounded(subject=arg{}, container={}, callees={}{})",
         facts.argument_index?,
         containers.join("+"),
         if callees.is_empty() {
             "none".to_owned()
         } else {
             callees.join("+")
+        },
+        if via.is_empty() {
+            String::new()
+        } else {
+            format!(", via={}, callee-local", via.join("+"))
         }
     ))
 }
@@ -3208,6 +3817,7 @@ fn evaluate_retention(
         .collect::<FxHashMap<_, _>>();
     let mut keys = facts.keys().copied().collect::<Vec<_>>();
     keys.sort_by_key(|(function, argument)| (function.local_def_index.as_u32(), *argument));
+    let contents = contents_confined(facts);
     for _ in 0..=keys.len() {
         let previous = rows.clone();
         for key in &keys {
@@ -3233,7 +3843,27 @@ fn evaluate_retention(
             // address is certified no-retain at that position (clause (3),
             // decided here because it needs the other rows). Unknown or
             // retaining callee ⇒ no discharge and the hold stands.
-            let frame_bounded = frame_bounded_discharge(fact, &previous, facts);
+            // R572-3: the residual a callee-side bounded store must leave clean
+            // — attested, every open step one of the bounded stores, and every
+            // other dependency certified no-retain.
+            let residual_clean = attested
+                && fact.unknowns.values().flatten().all(|step| {
+                    fact.frame_bounded
+                        .iter()
+                        .any(|bounded| &bounded.step == step)
+                })
+                && fact
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| !dependency.frame_bounded_container)
+                    .all(|dependency| {
+                        matches!(
+                            dependency_verdict(dependency),
+                            Some(RetentionVerdict::NoRetain { .. })
+                        )
+                    });
+            let frame_bounded =
+                frame_bounded_discharge(fact, &previous, facts, residual_clean, &contents);
             let next = if let Some(receipt) = frame_bounded {
                 RetentionVerdict::NoRetain {
                     certificate: RetentionCertificate {
