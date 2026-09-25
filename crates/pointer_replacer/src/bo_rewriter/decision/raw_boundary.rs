@@ -3746,9 +3746,11 @@ fn frame_bounded_discharge(
     if (facts.retains.is_empty() && via.is_empty()) || facts.argument_index.is_none() {
         return None;
     }
-    // R572-3: with the store in a callee, nothing else may retain — every
-    // other dependency certified, every open step one of the bounded stores.
-    if !via.is_empty() && !residual_clean {
+    // R572-3: nothing else may retain — every other dependency certified,
+    // every open step one of the bounded stores. This holds for R476-1's own
+    // arm as much as for the callee-side one: a frame-bounded store discharges
+    // THAT store, not a retention on another path of the same parameter.
+    if !residual_clean {
         return None;
     }
     if !facts.retains.iter().all(|step| {

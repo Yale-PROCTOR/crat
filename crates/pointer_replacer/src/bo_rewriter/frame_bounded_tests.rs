@@ -286,3 +286,23 @@ pub unsafe fn run(mut src: *const u8, mut size: usize) -> i32 {
     let (verdict, _) = retention_row(INDIRECT, "run", 0);
     assert_eq!(verdict, "retains");
 }
+
+/// **Control 6 (R572-3, wave-6o 072) — an open residual.** The subject is ALSO
+/// handed to a foreign callee the walk cannot see into. The frame-bounded store
+/// discharges that store, not the other path, so the row stays open. Before the
+/// fix the arm returned `no-retain` here, ahead of every other step.
+#[test]
+fn wave6o_an_open_residual_keeps_the_r476_hold() {
+    let input = READER
+        .replace(
+            "unsafe fn read_one",
+            "extern \"C\" { fn keep_src(_: *const u8); }\nunsafe fn read_one",
+        )
+        .replace(
+            "    state.src = src;",
+            "    keep_src(src);\n    state.src = src;",
+        );
+    assert!(input.contains("keep_src(src);"), "fixture edit applied");
+    let (verdict, reason) = retention_row(&input, "parse", 0);
+    assert_ne!(verdict, "no-retain", "reason={reason}");
+}
