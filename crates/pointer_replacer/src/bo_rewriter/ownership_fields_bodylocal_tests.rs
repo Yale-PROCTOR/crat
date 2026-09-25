@@ -3476,3 +3476,167 @@ fn r536_a_selected_literal_joins_its_fields_withdrawal_key() {
         "the literal's owner withdraws with both transactions"
     );
 }
+
+/// **R560-2 — the moved-out owning-field take, when the container dies.**
+///
+/// bst's `deleteNode`, in both free branches:
+/// `let mut temp = (*root).right; free(root as *mut c_void); return temp;`.
+/// The input never overwrites `(*root).right`, so R425-2's move-out evidence
+/// (a later overwrite of the same field) does not fire — but it frees the
+/// CONTAINER in the same block, before any exit and with no other mention of
+/// `root` in between, so the field is never read again and the loaded pointer
+/// is the subtree's only owner. With `node.right` delivered `opt-box`, the
+/// local is `Option<Box<node>>` taken out of the field, and the container's
+/// drop at C's `free` site frees the node alone (the rotation design's
+/// take-before-free ordering). Decision level, on era-5c's corpus form of
+/// bst with the l01p7 census's kinds (the override); emission is measured on
+/// the era-5c frame, where this delivers.
+#[test]
+fn r560_a_moved_out_owner_whose_container_is_freed_is_an_optional_box() {
+    use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
+    const BST: &str = include_str!("ownership_fields_fixture_bst_owned.rs");
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(
+        "R533-2 fixture: bst's node fields Owning by override",
+        vec![
+            ("node".to_owned(), 1, Owning),
+            ("node".to_owned(), 2, Owning),
+        ],
+        [
+            ("newNode::temp", Owning),
+            ("insert::node", Owning),
+            ("deleteNode::root", Owning),
+            ("deleteNode::temp", Owning),
+            ("deleteNode::temp_0", Owning),
+            ("deleteNode::temp_1", Ref),
+            ("inorder::root", Ref),
+            ("minValueNode::node", Ref),
+        ]
+        .into_iter()
+        .map(|(l, k)| (l.to_owned(), k))
+        .collect(),
+    );
+    let decided = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        ["deleteNode::temp", "deleteNode::temp_0"].map(|label| {
+            table
+                .entries
+                .iter()
+                .find(|(s, _)| s.label == label)
+                .map(|(_, d)| match d {
+                    Decision::Box(plan) => (
+                        plan.optional,
+                        plan.receipts
+                            .iter()
+                            .find(|r| r.starts_with("native-box-declaration-type "))
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                    other => (false, format!("{other:?}")),
+                })
+                .expect(label)
+        })
+    })
+    .unwrap();
+    super::test_model_override::clear();
+    for (optional, declaration) in &decided {
+        assert!(
+            *optional,
+            "the field is opt-box, so the owner is optional: {declaration}"
+        );
+        assert_eq!(
+            declaration,
+            "native-box-declaration-type ::std::option::Option<::std::boxed::Box<crate::src::bst::node>>"
+        );
+    }
+}
+
+/// **R560-2, the guard.** The container-freed move-out holds only while
+/// nothing between the load and the free mentions the container: a second
+/// read of the field would COPY the owner. A dichotomy on one fixture — the
+/// same body with and without that read — so the refusal is never vacuous
+/// (the positive half proves the transaction and the Box path are live).
+#[test]
+fn r560_a_container_read_between_the_load_and_its_free_keeps_the_load_raw() {
+    use crate::analyses::borrow_ownership::SlotKind::Owning;
+    let body = |between: &str| {
+        format!(
+            r#"// R560-2 guard fixture
+extern "C" {{ fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); }}
+#[repr(C)]
+pub struct node {{ pub key: i32, pub left: *mut node, pub right: *mut node }}
+pub unsafe fn leaf() -> *mut node {{
+    let mut n = malloc(::std::mem::size_of::<node>()) as *mut node;
+    (*n).key = 0;
+    (*n).left = 0 as *mut node;
+    (*n).right = 0 as *mut node;
+    return n;
+}}
+pub unsafe fn cut(mut root: *mut node) -> *mut node {{
+    let mut temp = (*root).right;
+    {between}
+    free(root as *mut core::ffi::c_void);
+    return temp;
+}}
+"#
+        )
+    };
+    let decide = |source: String| {
+        let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        super::test_model_override::set(
+            "R560-2 guard fixture",
+            vec![
+                ("node".to_owned(), 1, Owning),
+                ("node".to_owned(), 2, Owning),
+            ],
+            [
+                ("leaf::n", Owning),
+                ("cut::root", Owning),
+                ("cut::temp", Owning),
+            ]
+            .into_iter()
+            .map(|(l, k)| (l.to_owned(), k))
+            .collect(),
+        );
+        let boxed = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            table
+                .entries
+                .iter()
+                .find(|(s, _)| s.label == "cut::temp")
+                .map(|(_, d)| format!("{d:?}"))
+                .unwrap_or_default()
+        })
+        .unwrap();
+        super::test_model_override::clear();
+        boxed
+    };
+    let clean = decide(body(""));
+    assert!(
+        clean.starts_with("Box("),
+        "positive half: with nothing between, the container-freed load is a Box: {clean}"
+    );
+    let copied = decide(body("let mut peek = (*root).right;"));
+    assert!(
+        !copied.starts_with("Box("),
+        "a second read of the field between the load and the free keeps it raw: {copied}"
+    );
+}

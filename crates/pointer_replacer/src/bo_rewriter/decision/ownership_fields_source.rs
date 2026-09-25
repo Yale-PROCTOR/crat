@@ -432,6 +432,15 @@ fn view_alias_of(
 }
 /// The raw-pointer locals reachable from `seeds` through plain copies and
 /// pointer-to-pointer casts (both directions), a must-alias set.
+///
+/// **R560-2 — the return place is a sink, never a bridge.** Every `return e`
+/// of a function writes `_0`, so walking copies through `_0` in both
+/// directions merges every value any path returns into one "alias" set: in
+/// bst's `deleteNode` the moved-out `temp`, `temp_0` and the parameter `root`
+/// all became aliases of one another, and `root`'s first read counted as a
+/// read of `temp` before it was acquired. `_0` is not a must-alias of anything
+/// — different paths put different values there — so it is left out; a move
+/// INTO it is the return transfer, recognised by the exit walk on its own.
 fn copy_closure(body: &rustc_middle::mir::Body<'_>, seeds: BTreeSet<u32>) -> BTreeSet<u32> {
     let mut aliases = seeds;
     loop {
@@ -442,6 +451,9 @@ fn copy_closure(body: &rustc_middle::mir::Body<'_>, seeds: BTreeSet<u32>) -> BTr
                     continue;
                 };
                 let Some(destination) = destination.as_local() else { continue };
+                if destination == rustc_middle::mir::RETURN_PLACE {
+                    continue;
+                }
                 let operand = match rvalue {
                     Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => operand,
                     _ => continue,
@@ -488,6 +500,24 @@ fn is_field_load_acquisition(
 /// `(*base).field = <alias of the owner>` in MIR: the destination is a
 /// projected place whose base is not the owner, the value a plain alias
 /// local (a copy, a move, or a pointer-to-pointer cast of one).
+/// `_0 = x` / `_0 = x as *mut T` for an alias `x` of the owner: the owner
+/// moves into the return place (R560-2).
+fn is_return_transfer(
+    statement: &rustc_middle::mir::Statement<'_>,
+    aliases: &BTreeSet<u32>,
+) -> bool {
+    let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+        return false;
+    };
+    destination.as_local() == Some(rustc_middle::mir::RETURN_PLACE)
+        && match rvalue {
+            Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => {
+                plain_local(operand).is_some_and(|local| aliases.contains(&local.as_u32()))
+            }
+            _ => false,
+        }
+}
+
 fn is_store_transfer(
     statement: &rustc_middle::mir::Statement<'_>,
     aliases: &BTreeSet<u32>,
@@ -1440,6 +1470,23 @@ pub(crate) fn derive<'tcx>(
                 state = State::Freed;
                 continue;
             }
+            // **R560-2 — the return transfer, across blocks.** Where the close
+            // IS the return, the owner moves into the return place at the
+            // assignment `_0 = x`, which MIR often writes in the branch block
+            // and returns from a SHARED block (bst's `deleteNode`: three
+            // `return`s, one `Return` terminator). The owner is handed over at
+            // the assignment: no later statement or terminator of the path
+            // may read it, and the shared `Return` is then covered — the same
+            // obligation the same-block arm below checks, carried by state.
+            if close_key.is_none()
+                && stores.is_empty()
+                && !returns.is_empty()
+                && state == State::Live
+                && is_return_transfer(statement, &aliases)
+            {
+                state = State::Freed;
+                continue;
+            }
             reads.found = false;
             reads.visit_statement(
                 statement,
@@ -1942,11 +1989,17 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
             let program = bo::collect_program(tcx);
             // Every token load of the traversal — whatever the model says —
             // is refused by the permit: it owns no allocation of its own.
-            for (owner, name) in [
-                ("minValueNode", "current"),
-                ("deleteNode", "temp"),
-                ("deleteNode", "temp_0"),
-            ] {
+            //
+            // **R560-2 re-premise.** `deleteNode::temp` was in this list:
+            // `let mut temp = (*root).right;` with no later overwrite of the
+            // field. But the next statement frees the CONTAINER, before any
+            // exit and with nothing between mentioning it, so the field dies
+            // unread and the load is the subtree's only owner — a moved-out
+            // owner, no longer a token (`r560_a_moved_out_owner_whose_container_
+            // is_freed_is_an_optional_box`). `current` walks the tree, and this
+            // fixture's `temp_0` is `minValueNode(..)`'s result: neither's
+            // container is freed, and both stay tokens.
+            for (owner, name) in [("minValueNode", "current"), ("deleteNode", "temp_0")] {
                 let (subject, _) = table
                     .entries
                     .iter()
@@ -1961,6 +2014,20 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
                         Err(SourceHold::ConstructorIdentity | SourceHold::ConstructorShape)
                     ),
                     "{owner}::{name} must own no allocation"
+                );
+            }
+            for name in ["temp"] {
+                let (subject, _) = table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        subject.param_name.as_deref() == Some(name)
+                            && tcx.def_path_str(subject.fn_did.to_def_id()) == "deleteNode"
+                    })
+                    .unwrap_or_else(|| panic!("deleteNode::{name}"));
+                assert!(
+                    derive(&program, subject, &ctx.constructions, &|_, _| None).is_ok(),
+                    "deleteNode::{name}: its container is freed next, so the load moves the owner out"
                 );
             }
             // `newNode`'s own allocation IS an owner — closed by its return

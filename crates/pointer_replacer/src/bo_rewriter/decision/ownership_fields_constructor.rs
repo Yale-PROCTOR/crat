@@ -45,8 +45,75 @@ fn base_local(expr: &Expr<'_>) -> Option<HirId> {
     }
 }
 
-/// Does a later statement of the load's own block overwrite the same field of
-/// the same object, with no exit in between? (R431's move-out evidence.)
+/// Does this statement / expression name the local `root` anywhere?
+fn mentions(statement: &rustc_hir::Stmt<'_>, root: HirId) -> bool {
+    let mut found = Mentions(root, false);
+    found.visit_stmt(statement);
+    found.1
+}
+
+fn mentions_expr(expression: &Expr<'_>, root: HirId) -> bool {
+    let mut found = Mentions(root, false);
+    found.visit_expr(expression);
+    found.1
+}
+
+struct Mentions(HirId, bool);
+impl<'tcx> Visitor<'tcx> for Mentions {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if base_local(expr) == Some(self.0) {
+            self.1 = true;
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// `free(root)` / `free(root as *mut c_void)` — libc's `free`, a foreign
+/// item, applied to the local `root` through pointer casts only.
+fn frees_local<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expression: &Expr<'_>,
+    root: HirId,
+) -> bool {
+    let ExprKind::Call(callee, [argument]) = expression.kind else { return false };
+    let Some(did) = definition(callee) else { return false };
+    let is_free = did
+        .as_local()
+        .is_some_and(|local| matches!(tcx.hir_node_by_def_id(local), Node::ForeignItem(_)))
+        && tcx
+            .codegen_fn_attrs(did)
+            .link_name
+            .unwrap_or_else(|| tcx.item_name(did))
+            .as_str()
+            == "free";
+    if !is_free {
+        return false;
+    }
+    let mut value = argument;
+    while let ExprKind::Cast(inner, _) = value.kind {
+        if !typeck.expr_ty(inner).is_raw_ptr() {
+            return false;
+        }
+        value = inner;
+    }
+    base_local(value) == Some(root)
+}
+
+/// Does the load's own block MOVE the owner out of the field? Two shapes, each
+/// with no exit between the load and the evidence:
+///
+/// * a later statement overwrites the same field of the same object (R431,
+///   avl's rotations: `let mut x = (*y).left; … (*y).left = T2;`);
+/// * **R560-2** — a later statement frees the CONTAINER itself, and nothing
+///   between the load and that free mentions it (bst's `deleteNode`:
+///   `let mut temp = (*root).right; free(root as *mut c_void); return temp;`).
+///   The field dies with its object, unread, so the loaded pointer is the
+///   subtree's only owner. The field family renders the load as `take()`,
+///   which is what makes the container's drop at C's `free` site free the
+///   node alone (the rotation design's take-before-free ordering). A mention
+///   of the container in between — a second read of the field would copy the
+///   owner — refuses the free arm; the overwrite arm keeps its own reading.
 fn moved_out<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
@@ -87,6 +154,7 @@ fn moved_out<'tcx>(
         }) else {
             continue;
         };
+        let mut container_mentioned = false;
         for statement in &block.stmts[index + 1..] {
             let mut exits = Exits(false);
             exits.visit_stmt(statement);
@@ -96,8 +164,12 @@ fn moved_out<'tcx>(
             let (rustc_hir::StmtKind::Semi(expression) | rustc_hir::StmtKind::Expr(expression)) =
                 statement.kind
             else {
+                container_mentioned |= mentions(statement, root);
                 continue;
             };
+            if frees_local(tcx, typeck, expression, root) {
+                return Ok(!container_mentioned);
+            }
             if let ExprKind::Assign(destination, _, _) = expression.kind
                 && let ExprKind::Field(base, _) = destination.kind
                 && let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind
@@ -106,6 +178,7 @@ fn moved_out<'tcx>(
             {
                 return Ok(true);
             }
+            container_mentioned |= mentions_expr(expression, root);
         }
         return Ok(false);
     }
