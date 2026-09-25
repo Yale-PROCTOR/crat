@@ -1042,9 +1042,22 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                         // `as_deref()` and written through `as_deref_mut()` —
                         // a write seen THROUGH the element's projection too
                         // (`(*p.offset(j)).f = v`), as the deref arm sees it.
+                        // An element ADDRESS (`&mut *p.offset(j)`) is written
+                        // exactly when its borrow is mutable: the classifier
+                        // every element-address consumer shares (R557-4).
+                        let element = match self.tcx.parent_hir_node(grand.hir_id) {
+                            rustc_hir::Node::Expr(address) => {
+                                super::box_facts::box_element_address(address)
+                            }
+                            _ => None,
+                        };
+                        let written = match element {
+                            Some((_, _, mutable)) => mutable,
+                            None => self.written_through_places(grand),
+                        };
                         let owner = if !self.optional {
                             name.clone()
-                        } else if self.written_through_places(grand) {
+                        } else if written {
                             format!("{name}.as_deref_mut().unwrap()")
                         } else {
                             format!("{name}.as_deref().unwrap()")

@@ -3466,8 +3466,13 @@ fn shared_candidate(
 /// Keyed on the argument's decision, not a new `Form` variant.
 /// The binding whose own view the R422-5 owner-view glue renders: the owner
 /// passed bare, never a place derived from it.
-fn owner_argument(shape: ArgShape) -> Option<HirId> {
-    match shape {
+fn owner_argument(arg: &super::emitability::Arg) -> Option<HirId> {
+    // An element address of a Box owner (`box_facts::box_element_address`,
+    // R557-4) is one element, not the owner: it keeps its own form (R555-1).
+    if arg.element_of.is_some() {
+        return None;
+    }
+    match arg.shape {
         ArgShape::BareLocal(root) => Some(root),
         ArgShape::AddrOf { .. }
         | ArgShape::AddrOfCast { .. }
@@ -4718,7 +4723,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // OWNER's: only the owner passed bare takes it. An element
                 // address (`&mut *owner.offset(i)`) is `&mut T` once the Box
                 // plan renders the element, and keeps its own form (R555-1).
-                let found = if owner_argument(arg.shape)
+                let found = if owner_argument(arg)
                     .and_then(|root| decision_of.get(&(site.caller, root)).copied())
                     .and_then(|decision| owner_view_candidate(Some(decision), expected, "x"))
                     .is_some()

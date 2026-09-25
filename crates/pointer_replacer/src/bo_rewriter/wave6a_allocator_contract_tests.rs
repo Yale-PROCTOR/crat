@@ -1525,3 +1525,67 @@ fn w6a_r555_an_element_address_does_not_take_the_owner_raw_view() {
         "{source}"
     );
 }
+
+/// **R557-4: the element-address classifier's home.** `&mut *X.offset(i)` /
+/// `&*X.offset(i)` over a bare local `X` is the address of one element of
+/// `X`: `box_facts::box_element_address` names the owner, the index and the
+/// mutability — the owner walk's offset arm, the 089 seam restriction and
+/// wave-5d's joint (c) call this one function. A bare owner, a field place and
+/// an offset that is not dereferenced are not element addresses.
+#[test]
+fn w6a_r557_the_element_address_classifier_names_owner_index_and_mutability() {
+    let src = format!("{PRELUDE}{ELEMENTS}");
+    let rows = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        struct V<'tcx> {
+            tcx: rustc_middle::ty::TyCtxt<'tcx>,
+            rows: Vec<String>,
+        }
+        impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+                if matches!(
+                    expr.kind,
+                    rustc_hir::ExprKind::AddrOf(..) | rustc_hir::ExprKind::Path(..)
+                ) {
+                    let sm = self.tcx.sess.source_map();
+                    let text = sm.span_to_snippet(expr.span).unwrap_or_default();
+                    let got = super::decision::box_facts::box_element_address(expr).map(
+                        |(owner, index, mutable)| {
+                            format!(
+                                "{}|{}|{mutable}",
+                                self.tcx.hir_name(owner),
+                                sm.span_to_snippet(index.span).unwrap_or_default()
+                            )
+                        },
+                    );
+                    self.rows.push(format!("{text} => {got:?}"));
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut v = V {
+            tcx,
+            rows: Vec::new(),
+        };
+        for owner in tcx.hir_body_owners() {
+            rustc_hir::intravisit::Visitor::visit_body(&mut v, tcx.hir_body_owned_by(owner));
+        }
+        v.rows
+    })
+    .expect("the fixture compiles");
+    let find = |text: &str| {
+        rows.iter()
+            .find(|row| row.starts_with(&format!("{text} => ")))
+            .unwrap_or_else(|| panic!("{text}\n{rows:#?}"))
+            .clone()
+    };
+    assert_eq!(
+        find("&mut *histograms.offset(j as isize)"),
+        "&mut *histograms.offset(j as isize) => Some(\"histograms|j as isize|true\")"
+    );
+    assert_eq!(
+        find("&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize)"),
+        "&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize) => None",
+        "the element's field array is not an element address of `combined`"
+    );
+    assert_eq!(find("histograms"), "histograms => None");
+}

@@ -273,6 +273,10 @@ pub(crate) struct Arg {
     /// R473-2: that local's own type is a raw pointer, so the root is a
     /// pointer subject and keeps its decision path.
     pub address_root_raw_pointer: bool,
+    /// R557-4: `&mut *X.offset(i)` / `&*X.offset(i)` over a local `X` — the
+    /// owner binding (`box_facts::box_element_address`). An element of `X`,
+    /// never `X` itself.
+    pub element_of: Option<HirId>,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -1224,6 +1228,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 typeck, arg,
                                             )
                                             .1,
+                                            element_of: super::box_facts::box_element_address(arg)
+                                                .map(|(owner, _, _)| owner),
                                         }
                                     })
                                     .collect(),

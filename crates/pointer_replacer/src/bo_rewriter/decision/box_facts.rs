@@ -38,6 +38,37 @@ pub(crate) enum BoxScopeFailure {
     ParameterHeld,
 }
 
+/// **R557-4: the element address of a Box subject.** `&mut *X.offset(i)` /
+/// `&*X.offset(i)` (also `.add` / `.wrapping_add`, casts on `X` peeled) over a
+/// bare local `X` is the address of ONE element of `X`: the owner binding, the
+/// index expression and the borrow's mutability. It is not the owner — the
+/// owner's views (R422-5, joint (a)) never apply to it (R555-1). One function
+/// for every consumer: the owner walk's offset arm, the seam's owner-view
+/// restriction, wave-5d's joint (c). The caller asks whether `X` is a Box.
+pub(crate) fn box_element_address<'tcx>(
+    expr: &'tcx rustc_hir::Expr<'tcx>,
+) -> Option<(rustc_hir::HirId, &'tcx rustc_hir::Expr<'tcx>, bool)> {
+    use rustc_hir::{ExprKind, QPath, UnOp, def::Res};
+    let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, mutability, place) = expr.kind else {
+        return None;
+    };
+    let ExprKind::Unary(UnOp::Deref, pointer) = place.kind else { return None };
+    let ExprKind::MethodCall(segment, receiver, [index], _) = pointer.kind else { return None };
+    if !matches!(
+        segment.ident.name.as_str(),
+        "offset" | "add" | "wrapping_add"
+    ) {
+        return None;
+    }
+    let mut receiver = receiver;
+    while let ExprKind::Cast(inner, _) = receiver.kind {
+        receiver = inner;
+    }
+    let ExprKind::Path(QPath::Resolved(None, path)) = receiver.kind else { return None };
+    let Res::Local(owner) = path.res else { return None };
+    Some((owner, index, mutability == rustc_hir::Mutability::Mut))
+}
+
 pub(crate) fn box_scope(is_parameter: bool, pointer_depth: u8) -> Result<(), BoxScopeFailure> {
     if pointer_depth != 1 {
         return Err(BoxScopeFailure::PointerDepth);
