@@ -390,8 +390,62 @@ fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr
             ast::ExprKind::Unary(ast::UnOp::Deref, left),
             ast::ExprKind::Unary(ast::UnOp::Deref, right),
         ) => initializer_matches_modulo_adapters(left, right),
+        // **R568-1 (a) -- a struct literal whose delivered field starts as `None`.**
+        //
+        // brotli's `let mut literal_enc = BlockEncoder { .., block_types_: 0 as *const
+        // uint8_t, .. };` is emitted with `block_types_: None` once the field
+        // transaction delivers `block_types_` as an optional slice: the null the input
+        // wrote, spelled as the `Option`'s `None` (R29), in a tree the census has
+        // already type-checked, so the field IS an `Option` there. Additive: a literal
+        // that already printed the same still corresponds through the key.
+        (ast::ExprKind::Struct(left), ast::ExprKind::Struct(right)) => {
+            struct_literals_correspond(left, right)
+                || expression_key(original) == expression_key(emitted)
+        }
         _ => expression_key(original) == expression_key(emitted),
     }
+}
+
+/// Field by field, in the input's order: the same path, the same field names, the
+/// same functional-update base, and each value either corresponding by
+/// [`initializer_matches_modulo_adapters`] or a zero literal the emitted side
+/// spells `None`. A field added, dropped, renamed or reordered refuses, and so
+/// does any other value that moved.
+fn struct_literals_correspond(original: &ast::StructExpr, emitted: &ast::StructExpr) -> bool {
+    let same_rest = match (&original.rest, &emitted.rest) {
+        (ast::StructRest::None, ast::StructRest::None) => true,
+        (ast::StructRest::Base(left), ast::StructRest::Base(right)) => {
+            expression_key(left) == expression_key(right)
+        }
+        _ => false,
+    };
+    original.qself.is_none()
+        && emitted.qself.is_none()
+        && pprust::path_to_string(&original.path) == pprust::path_to_string(&emitted.path)
+        && same_rest
+        && original.fields.len() == emitted.fields.len()
+        && original
+            .fields
+            .iter()
+            .zip(emitted.fields.iter())
+            .all(|(left, right)| {
+                left.ident.name == right.ident.name
+                    && (initializer_matches_modulo_adapters(&left.expr, &right.expr)
+                        || null_literal_starts_as_none(&left.expr, &right.expr))
+            })
+}
+
+/// The zero literal under any casts, against the path `None`.
+fn null_literal_starts_as_none(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    if path(emitted).as_deref() != Some("None") {
+        return false;
+    }
+    let mut view = unparen(original);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
 }
 
 /// Parse both sides and apply [`initializer_matches_modulo_adapters`].
@@ -740,12 +794,58 @@ fn borrows_the_same_place(initializer: &ast::Expr, original: &ast::Expr) -> bool
     }
 }
 
+/// **R568-1 (b) -- an element address through the owner's view is the original
+/// element.** joint (c) passes a Box owner's element at a raw formal through the
+/// owner's raw view at its base: brotli's `BrotliHistogramCombine*` calls read
+/// `&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())
+/// .offset(num_clusters as isize)` where the input wrote
+/// `&mut *clusters.offset(num_clusters as isize)`. Exact: both sides borrow a
+/// dereferenced one-argument `offset` with the same mutability, the index is the
+/// same expression, and the emitted receiver is a raw view of the original
+/// receiver by the relations already in force. `add`, another index, another owner
+/// or another borrow all refuse.
+fn element_address_through_view(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    let (
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, emitted_mutability, emitted_place),
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, original_mutability, original_place),
+    ) = (&unparen(initializer).kind, &unparen(original).kind)
+    else {
+        return false;
+    };
+    let (
+        ast::ExprKind::Unary(ast::UnOp::Deref, emitted_pointer),
+        ast::ExprKind::Unary(ast::UnOp::Deref, original_pointer),
+    ) = (&unparen(emitted_place).kind, &unparen(original_place).kind)
+    else {
+        return false;
+    };
+    let (ast::ExprKind::MethodCall(emitted_offset), ast::ExprKind::MethodCall(original_offset)) = (
+        &unparen(emitted_pointer).kind,
+        &unparen(original_pointer).kind,
+    ) else {
+        return false;
+    };
+    let one_offset = |offset: &ast::MethodCall| {
+        offset.seg.ident.name.as_str() == "offset"
+            && offset.seg.args.is_none()
+            && offset.args.len() == 1
+    };
+    emitted_mutability == original_mutability
+        && one_offset(emitted_offset)
+        && one_offset(original_offset)
+        && expression_key(&emitted_offset.args[0]) == expression_key(&original_offset.args[0])
+        && raw_initializer_matches(&emitted_offset.receiver, &original_offset.receiver)
+}
+
 fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> bool {
     let initializer = unparen(initializer);
     if expression_key(initializer) == expression_key(original) {
         return true;
     }
     if borrows_the_same_place(initializer, original) {
+        return true;
+    }
+    if element_address_through_view(initializer, original) {
         return true;
     }
     match &initializer.kind {

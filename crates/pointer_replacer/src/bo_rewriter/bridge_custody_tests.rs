@@ -2679,3 +2679,172 @@ fn r568_1_a_retained_replay_recompared_under_this_matcher() {
         std::fs::write(summary, &out).expect("retained replay summary");
     }
 }
+
+/// **R568-1 (a) — a struct literal whose delivered field starts as `None` is its
+/// original.** brotli's `BrotliStoreMetaBlock` declares `literal_enc` /
+/// `command_enc` / `distance_enc` with no annotation and a `BlockEncoder { .. }`
+/// literal; the field transaction delivers `block_types_` as an optional slice, so
+/// the emitted literal reads `block_types_: None` where the input wrote
+/// `block_types_: 0 as *const uint8_t`. Every other field is the same text. With no
+/// field-wise relation the three bindings failed to correspond and six A5 rows at
+/// the `InitBlockEncoder` calls read `initializer-original-binding-correspondence-
+/// unresolved` (batch 34′).
+#[test]
+fn r568_1_a_struct_literal_whose_delivered_field_starts_as_none_is_its_original() {
+    use crate::bo_rewriter::bridge_custody_match::initializer_adapter_correspondence_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+    let literal = |types: &str, depths: &str| {
+        format!(
+            "BlockEncoder {{ histogram_length_: 0, num_block_types_: 0, block_types_: {types}, \
+             block_lengths_: 0 as *const uint32_t, num_blocks_: 0, \
+             block_split_code_: BlockSplitCode {{ type_code_calculator: \
+             BlockTypeCodeCalculator {{ last_type: 0, second_last_type: 0 }}, \
+             type_depths: {depths}, }}, }}"
+        )
+    };
+    let original = literal("0 as *const uint8_t", "[0; 258]");
+    // The corpus shape.
+    assert!(under(&original, &literal("None", "[0; 258]")));
+    // Nested literals relate field by field too.
+    assert!(under(
+        "Outer { inner: Inner { p: 0 as *mut u8, n: 1 }, m: 2 }",
+        "Outer { inner: Inner { p: None, n: 1 }, m: 2 }"
+    ));
+    // Identical literals, and a functional-update base, still correspond as before.
+    assert!(under(&original, &original));
+    assert!(under("S { a: 1, ..base }", "S { a: 1, ..base }"));
+
+    // Faults: only a null literal may start as `None`, and nothing else may move.
+    assert!(
+        !under(&original, &literal("types", "[0; 258]")),
+        "a non-null field is not None"
+    );
+    assert!(
+        !under(&literal("types", "[0; 258]"), &literal("None", "[0; 258]")),
+        "a value the input wrote cannot become None"
+    );
+    assert!(
+        !under(
+            &literal("1 as *const uint8_t", "[0; 258]"),
+            &literal("None", "[0; 258]")
+        ),
+        "only the zero literal is null"
+    );
+    assert!(
+        !under(&original, &literal("Some(x)", "[0; 258]")),
+        "a null field is not Some"
+    );
+    assert!(
+        !under(&original, &literal("None", "[1; 258]")),
+        "another field that moved still refuses"
+    );
+    assert!(
+        !under("S { p: 0 as *mut u8, n: 1 }", "T { p: None, n: 1 }"),
+        "another struct is another value"
+    );
+    assert!(
+        !under("S { p: 0 as *mut u8, n: 1 }", "S { q: None, n: 1 }"),
+        "another field name"
+    );
+    assert!(
+        !under("S { p: 0 as *mut u8, n: 1 }", "S { n: 1, p: None }"),
+        "the fields in the input's order"
+    );
+    assert!(
+        !under("S { p: 0 as *mut u8, n: 1 }", "S { p: None, n: 1, m: 2 }"),
+        "no field added"
+    );
+    assert!(
+        !under("S { p: 0 as *mut u8, ..base }", "S { p: None, ..other }"),
+        "the same functional-update base"
+    );
+}
+
+/// **R568-1 (b) — an element address through the owner's view is the original
+/// element.** joint (c) passes a Box owner's element at a raw formal through the
+/// owner's raw view at its base: brotli's `BrotliHistogramCombine*` calls read
+/// `&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())
+/// .offset(num_clusters as isize)` where the input wrote
+/// `&mut *clusters.offset(num_clusters as isize)`. The view is one the comparator
+/// already knows (`clusters` ≡ its `map_or` view); the `offset` over it was not, so
+/// six A5 rows read `raw-initializer-source-relation-unbuilt` (batch 34′).
+#[test]
+fn r568_1_b_an_element_address_through_the_owner_view_is_the_original_element() {
+    use crate::bo_rewriter::bridge_custody_match::raw_initializer_matches_for_test as matches;
+    let under = |emitted: &str, original: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || matches(emitted, original),
+        )
+    };
+    let original = "&mut *clusters.offset(num_clusters as isize)";
+    // The corpus shape.
+    assert!(under(
+        "&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())\
+         .offset(num_clusters as isize)",
+        original
+    ));
+    // The shared spelling of the same relation.
+    assert!(under(
+        "&*v.as_deref().map_or(core::ptr::null(), |s| s.as_ptr()).offset(i as isize)",
+        "&*v.offset(i as isize)"
+    ));
+
+    // Faults: the same element of the same owner, borrowed the same way, only.
+    assert!(
+        !under(
+            "&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())\
+             .offset(other as isize)",
+            original
+        ),
+        "another index is another element"
+    );
+    assert!(
+        !under(
+            "&mut *others.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())\
+             .offset(num_clusters as isize)",
+            original
+        ),
+        "another owner is another container"
+    );
+    assert!(
+        !under(
+            "&*clusters.as_deref().map_or(core::ptr::null(), |s| s.as_ptr())\
+             .offset(num_clusters as isize)",
+            original
+        ),
+        "a shared borrow is not the mutable one"
+    );
+    assert!(
+        !under(
+            "&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())\
+             .add(num_clusters as usize)",
+            original
+        ),
+        "only `offset` against `offset`"
+    );
+    assert!(
+        !under(
+            "&mut *clusters.clone().offset(num_clusters as isize)",
+            original
+        ),
+        "the receiver must be a view the comparator knows"
+    );
+    assert!(
+        !under(
+            "&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())\
+             .offset(num_clusters as isize, 1)",
+            original
+        ),
+        "one argument"
+    );
+}
