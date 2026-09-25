@@ -2028,3 +2028,102 @@ fn w6a_a1g_a_block_binding_a_pointer_keeps_its_refusal() {
         out.artifacts.return_certificate_receipts
     );
 }
+
+/// **R561-4 W1 — a re-seated `let` receiver.** buffer's `test_buffer_trim`:
+/// `let mut buf = f(..); …; <consume buf>; buf = f(..); …` — each re-seat by
+/// the same callee after the previous generation was consumed is one more
+/// generation of the same Box local (`buf = f(..)` after the move is plain
+/// Rust). The certificate admitted only `let` receivers and null-initialised
+/// assignment receivers, so the re-seat was a call with nowhere to go
+/// (`call-site-not-a-receiver`), and every certificate chained through the
+/// callee closed with it (buffer: the three constructors and the 22 locals).
+fn reseat_fixture(driver: &str) -> String {
+    let head = &BUFFER_CHAIN[..BUFFER_CHAIN
+        .find("pub unsafe extern \"C\" fn buffer_slice")
+        .expect("the fixture's head")];
+    format!("{head}{driver}")
+}
+
+const RESEAT_AFTER_FREE: &str = r#"
+pub unsafe extern "C" fn test_buffer_trim() -> usize {
+    let mut buf = buffer_new_with_size(3);
+    let mut n = (*buf).len;
+    free((*buf).alloc as *mut core::ffi::c_void);
+    free(buf as *mut core::ffi::c_void);
+    buf = buffer_new_with_size(4);
+    n = n.wrapping_add((*buf).len);
+    free((*buf).alloc as *mut core::ffi::c_void);
+    free(buf as *mut core::ffi::c_void);
+    buf = buffer_new_with_size(5);
+    n = n.wrapping_add((*buf).len);
+    free((*buf).alloc as *mut core::ffi::c_void);
+    free(buf as *mut core::ffi::c_void);
+    return n;
+}
+"#;
+
+#[test]
+fn w6a_r561_a_let_receiver_reseated_after_its_free_is_one_box_local() {
+    let out = emitted("r561-reseat", &reseat_fixture(RESEAT_AFTER_FREE));
+    let src = compact(&out.source);
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{}",
+        out.source, out.degradations, out.artifacts.return_certificate_receipts
+    );
+    for subject in ["buffer_new_with_size::self_0", "test_buffer_trim::buf"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{:#?}\n{}\n{}",
+            out.degradations,
+            out.artifacts.return_certificate_receipts,
+            out.source
+        );
+    }
+    assert!(
+        src.contains("letmutbuf:Box<crate::buffer_t>=buffer_new_with_size(3);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("drop(buf);buf=buffer_new_with_size(4);"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("drop(buf);buf=buffer_new_with_size(5);"),
+        "{}",
+        out.source
+    );
+}
+
+/// Control: a re-seat over a LIVE owner (the first generation never freed) is
+/// an overwrite, the leak-parity line — it stays refused.
+#[test]
+fn w6a_r561_a_reseat_over_a_live_owner_stays_refused() {
+    let live = RESEAT_AFTER_FREE.replacen(
+        "    free(buf as *mut core::ffi::c_void);\n    buf = buffer_new_with_size(4);",
+        "    buf = buffer_new_with_size(4);",
+        1,
+    );
+    assert_ne!(
+        live, RESEAT_AFTER_FREE,
+        "the control removes the first generation's free"
+    );
+    let out = emitted("r561-reseat-live", &reseat_fixture(&live));
+    assert!(
+        out.artifacts.return_certificate_receipts.contains(
+            "return-certificate-receiver-use:reseat-over-live-owner:test_buffer_trim::buf"
+        ),
+        "{}\n{:#?}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.degradations,
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("letmutbuf:Box<crate::buffer_t>="),
+        "{}",
+        out.source
+    );
+}

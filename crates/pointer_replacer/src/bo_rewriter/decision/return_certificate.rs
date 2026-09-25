@@ -2611,10 +2611,44 @@ fn certify<'tcx, 's>(
         }
         assignment_receivers.push((s, values));
     }
-    let mut all_receivers: Vec<(&Subject, Vec<(Span, Span)>)> =
-        let_receivers.iter().map(|s| (*s, Vec::new())).collect();
-    all_receivers.extend(assignment_receivers);
-    for (receiver, assignments) in &all_receivers {
+    // **R561-4 W1** — a `let` receiver re-seated by the same callee
+    // (`buf = f(..)` after `buffer_free(buf)`, buffer's `test_buffer_trim`)
+    // carries its re-seats: one Box local, one generation per call. Admitted
+    // only where EVERY overwrite of the local is such a call; the generation
+    // check below refuses a re-seat over a live owner.
+    let mut all_receivers: Vec<(&Subject, Vec<(Span, Span)>, Vec<(Span, Span)>)> = let_receivers
+        .iter()
+        .map(|s| {
+            let reseats: Vec<(Span, Span)> = scans
+                .get(&s.fn_did)
+                .map(|rscan| {
+                    let values: Vec<(Span, Span)> = rscan
+                        .assign_calls
+                        .iter()
+                        .filter(|(hir, did, _, _)| *hir == s.hir_id && *did == callee.to_def_id())
+                        .map(|(_, _, span, stmt)| (*span, *stmt))
+                        .collect();
+                    let overwrites = rscan
+                        .assigns
+                        .iter()
+                        .filter(|(hir, _)| *hir == s.hir_id)
+                        .count();
+                    if overwrites == values.len() {
+                        values
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default();
+            (*s, Vec::new(), reseats)
+        })
+        .collect();
+    all_receivers.extend(
+        assignment_receivers
+            .into_iter()
+            .map(|(s, a)| (s, a, Vec::new())),
+    );
+    for (receiver, assignments, reseats) in &all_receivers {
         let rkey = (receiver.fn_did, receiver.hir_id);
         let rscan = scans.get(&receiver.fn_did).expect("scanned");
         let rfrees: Vec<(Span, Span)> = rscan
@@ -2632,7 +2666,7 @@ fn certify<'tcx, 's>(
             returned_receivers.push(rkey);
             continue;
         }
-        let (rplan, rtransfers) = receiver_plan(
+        let (mut rplan, rtransfers) = receiver_plan(
             tcx,
             receiver,
             &certificate_stub,
@@ -2644,6 +2678,24 @@ fn certify<'tcx, 's>(
             &format!("return-certificate-receiver callee={callee_path} model={rkind:?}"),
         )
         .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
+        if !reseats.is_empty() {
+            let consumes: Vec<Span> = rfrees
+                .iter()
+                .map(|(call, _)| *call)
+                .chain(rtransfers.iter().map(|(_, _, span)| *span))
+                .collect();
+            reseat_generations_consumed(
+                tcx,
+                receiver,
+                reseats,
+                constructions.init_spans.get(&rkey).copied(),
+                &consumes,
+            )
+            .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
+            rplan
+                .receipts
+                .push(format!("reseat-receiver generations={}", reseats.len() + 1));
+        }
         transfers.extend(rtransfers.into_iter().map(|(d, i, _)| (d, i, rkey)));
         plans.push((rkey, rplan));
         planned_receivers.push(rkey);
@@ -2660,7 +2712,7 @@ fn certify<'tcx, 's>(
     admitted_calls.extend(
         all_receivers
             .iter()
-            .flat_map(|(_, a)| a.iter().map(|(v, _)| *v)),
+            .flat_map(|(_, a, r)| a.iter().chain(r).map(|(v, _)| *v)),
     );
     let mut returning_callers: Vec<LocalDefId> = Vec::new();
     for (caller, caller_scan) in scans {
@@ -2828,6 +2880,51 @@ fn certify<'tcx, 's>(
 /// each assignment wrapped `Some(..)` when the callee's output is not
 /// optional. A `let` receiver of a non-optional callee can never be null: its
 /// null guard is dead (folded like the allocation's, receipted).
+/// **R561-4 W1** — every re-seat of a `let` receiver must follow the
+/// CONSUMPTION of the previous generation (a C free of it, or its move into a
+/// consuming formal) in the same block, after that generation began: then
+/// `buf = f(..)` assigns a moved-from local. A re-seat with no such consume in
+/// straight-line code before it would overwrite a live owner — the
+/// leak-parity line (addendum 101) — and is refused; a consume inside a branch
+/// does not count, since the other path would drop the live owner.
+fn reseat_generations_consumed(
+    tcx: TyCtxt<'_>,
+    receiver: &Subject,
+    reseats: &[(Span, Span)],
+    init: Option<Span>,
+    consumes: &[Span],
+) -> Result<(), String> {
+    struct Blocks<'tcx>(Vec<&'tcx rustc_hir::Block<'tcx>>);
+    impl<'tcx> Visitor<'tcx> for Blocks<'tcx> {
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            self.0.push(block);
+            intravisit::walk_block(self, block);
+        }
+    }
+    let mut blocks = Blocks(Vec::new());
+    blocks.visit_body(tcx.hir_body_owned_by(receiver.fn_did));
+    let mut previous = init;
+    for (_, statement) in reseats {
+        let consumed = blocks.0.iter().any(|block| {
+            let Some(at) = block.stmts.iter().position(|stmt| stmt.span == *statement) else {
+                return false;
+            };
+            block.stmts[..at].iter().any(|stmt| {
+                previous.is_none_or(|p| stmt.span.lo() >= p.hi())
+                    && consumes.iter().any(|consume| stmt.span.contains(*consume))
+            })
+        });
+        if !consumed {
+            return Err(format!(
+                "return-certificate-receiver-use:reseat-over-live-owner:{}",
+                receiver.label
+            ));
+        }
+        previous = Some(*statement);
+    }
+    Ok(())
+}
+
 fn receiver_plan(
     tcx: TyCtxt<'_>,
     receiver: &Subject,
