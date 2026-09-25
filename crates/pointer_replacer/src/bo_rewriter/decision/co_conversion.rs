@@ -363,6 +363,15 @@ impl PairSiteDecision {
 pub(crate) fn resolve_pair_roles(
     entries: &[(usize, usize, A5SiteProofVerdict, bool)],
 ) -> BTreeMap<usize, PairRole> {
+    resolve_pair_roles_with_rule(entries).0
+}
+
+/// [`resolve_pair_roles`], plus the positions whose role the **forced cover** (R573-4) chose,
+/// so their receipts can name it (`pair-forced-cover`).
+pub(crate) fn resolve_pair_roles_with_rule(
+    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+) -> (BTreeMap<usize, PairRole>, BTreeSet<usize>) {
+    let mut rule = BTreeSet::new();
     let mut vertices = BTreeSet::new();
     let mut overlap = BTreeMap::<usize, BTreeSet<usize>>::new();
     let mut positive = BTreeSet::new();
@@ -410,8 +419,48 @@ pub(crate) fn resolve_pair_roles(
                 .all(|index| index == candidate || !positive.contains(index))
         });
         let Some(primary) = primary else {
-            for index in component {
-                roles.insert(index, PairRole::Blocked);
+            // **R573-4 — the forced cover.** One primary with every other member raw is one
+            // admissible assignment, not the only one. The invariants are: every overlapping
+            // pair has a raw side, no raw side retains, and the primaries are pairwise clear
+            // (which the first gives). A retaining vertex can never be the raw side, so its
+            // non-retaining neighbours are FORCED raw. If they cover every edge of the
+            // component, they are the raw views and the rest keep their safe forms; if not,
+            // there is no admissible assignment and the component stays blocked. Reached only
+            // where the single-primary rule found none (brotli's `InitOrStitchToPreviousBlock`,
+            // a star around a `*const u8` with two retaining leaves).
+            let forced = component
+                .iter()
+                .copied()
+                .filter(|index| {
+                    !positive.contains(index)
+                        && overlap
+                            .get(index)
+                            .into_iter()
+                            .flatten()
+                            .any(|neighbour| positive.contains(neighbour))
+                })
+                .collect::<BTreeSet<_>>();
+            let covers = component.iter().all(|index| {
+                overlap
+                    .get(index)
+                    .into_iter()
+                    .flatten()
+                    .all(|neighbour| forced.contains(index) || forced.contains(neighbour))
+            });
+            for &index in &component {
+                roles.insert(
+                    index,
+                    if !covers || forced.is_empty() {
+                        PairRole::Blocked
+                    } else if forced.contains(&index) {
+                        PairRole::RawView
+                    } else {
+                        PairRole::Primary
+                    },
+                );
+            }
+            if covers && !forced.is_empty() {
+                rule.extend(component.iter().copied());
             }
             continue;
         };
@@ -426,7 +475,7 @@ pub(crate) fn resolve_pair_roles(
             );
         }
     }
-    roles
+    (roles, rule)
 }
 
 /// The finished class structure. **Measurement at task 2; the gate at task 3.**
@@ -1052,7 +1101,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                         ]
                     })
                     .collect::<Vec<_>>();
-                let roles = resolve_pair_roles(&role_entries);
+                let (roles, forced_cover) = resolve_pair_roles_with_rule(&role_entries);
                 for position in &node_positions {
                     let Some(&initial_role) = roles.get(&position.argument_index) else {
                         continue;
@@ -1150,6 +1199,8 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     };
                     if tier == PairTier::Blocked {
                         role = PairRole::Blocked;
+                    } else if forced_cover.contains(&position.argument_index) {
+                        reason.push_str(";pair-forced-cover");
                     }
                     if role == PairRole::RawView {
                         let source_decision = position
@@ -1898,6 +1949,93 @@ mod pair_plan_tests {
             ]),
             ["primary", "raw-view"]
         );
+    }
+
+    /// Both directions of each overlap edge, with each endpoint's own retention.
+    fn star_entries(
+        edges: &[(usize, usize)],
+        retaining: &[usize],
+    ) -> Vec<(usize, usize, A5SiteProofVerdict, bool)> {
+        edges
+            .iter()
+            .flat_map(|&(left, right)| {
+                [
+                    (
+                        left,
+                        right,
+                        A5SiteProofVerdict::Overlapping,
+                        retaining.contains(&left),
+                    ),
+                    (
+                        right,
+                        left,
+                        A5SiteProofVerdict::Overlapping,
+                        retaining.contains(&right),
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// **R573-4 witness — the forced cover.** brotli's `EncodeData` →
+    /// `InitOrStitchToPreviousBlock(m, hasher, data, _, params)` (class 2337): `data` (2, a
+    /// `*const u8`) overlaps `m` (0), `hasher` (1) and `params` (4), which are pairwise clear;
+    /// `hasher` and `params` retain. No single primary leaves every raw view non-retaining, so the
+    /// single-primary rule blocked the call. `data` alone covers every edge and retains nothing:
+    /// it is the raw view, and the other three keep their safe forms, marked as the rule's.
+    #[test]
+    fn r573_4_a_star_with_two_retaining_leaves_takes_its_centre_as_the_raw_view() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4)], &[1, 4]));
+        assert_eq!(
+            roles
+                .into_iter()
+                .map(|(index, role)| (index, role.key()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "primary"),
+                (1, "primary"),
+                (2, "raw-view"),
+                (4, "primary")
+            ]
+        );
+        assert_eq!(rule.into_iter().collect::<Vec<_>>(), [0, 1, 2, 4]);
+    }
+
+    /// **R573-4 control — a forced set that does not cover every edge stays blocked.** The same
+    /// star plus an overlap between the two retaining leaves: neither may be the raw side of
+    /// that edge, so no admissible assignment exists.
+    #[test]
+    fn r573_4_an_edge_between_two_retaining_vertices_stays_blocked() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4), (1, 4)], &[1, 4]));
+        assert!(
+            roles.values().all(|role| *role == PairRole::Blocked),
+            "{roles:?}"
+        );
+        assert!(rule.is_empty(), "{rule:?}");
+    }
+
+    /// **R573-4 control — a component with a single primary is untouched.** The rule runs only
+    /// where the single-primary rule found none: one retaining vertex keeps its canonical
+    /// primary, and nothing is marked as the rule's.
+    #[test]
+    fn r573_4_a_component_with_a_single_primary_is_untouched() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4)], &[1]));
+        assert_eq!(
+            roles
+                .into_iter()
+                .map(|(index, role)| (index, role.key()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "raw-view"),
+                (1, "primary"),
+                (2, "raw-view"),
+                (4, "raw-view")
+            ]
+        );
+        assert!(rule.is_empty(), "{rule:?}");
     }
 
     #[test]

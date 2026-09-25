@@ -5358,7 +5358,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                     ]
                 })
                 .collect::<Vec<_>>();
-            let mut a5_roles = super::co_conversion::resolve_pair_roles(&role_entries);
+            let (mut a5_roles, forced_cover) =
+                super::co_conversion::resolve_pair_roles_with_rule(&role_entries);
             if shared_pairs.at(*callee, site).is_some() {
                 a5_roles.insert(0, super::co_conversion::PairRole::Primary);
                 a5_roles.insert(1, super::co_conversion::PairRole::Primary);
@@ -5496,8 +5497,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 if shared_read_positions.contains(&pos.index) {
                                     proof.reason.push_str(";native-shared-read-peers");
                                 }
+                                if forced_cover.contains(&pos.index) {
+                                    proof.reason.push_str(";pair-forced-cover");
+                                }
                             }
                             super::co_conversion::PairRole::RawView => {
+                                if forced_cover.contains(&pos.index) {
+                                    proof.reason.push_str(";pair-forced-cover");
+                                }
                                 if let (Some(proof_site_key), Some(argument)) =
                                     (proof.proof_site_key, pos.text.as_deref())
                                 {
