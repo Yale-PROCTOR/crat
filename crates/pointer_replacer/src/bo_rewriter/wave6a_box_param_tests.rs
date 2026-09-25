@@ -2270,3 +2270,93 @@ fn w6a_r564_a_box_owner_field_crosses_at_the_c_arm_around_the_owner_edit() {
         );
     }
 }
+
+/// R561-5 (report 094): brotli's `metablock` E0499. `&mut place` twice at a
+/// callee whose formals are shared: wave-6p's weakening renders `&(place)`
+/// when the caller is converted, and must do the same when the caller is
+/// emitted in its INPUT form beside the converted callee.
+const SAME_PLACE_TWICE: &str = r#"
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DistParams { pub postfix: u32, pub ndirect: u32 }
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Params { pub quality: i32, pub dist: DistParams }
+pub unsafe extern "C" fn ComputeDistanceCost(mut orig_params: *const DistParams, mut new_params: *const DistParams, mut cost: *mut f64) -> i32 {
+    if (*orig_params).postfix == (*new_params).postfix { *cost = 1.0f64; return 1 as i32; }
+    *cost = ((*orig_params).ndirect + (*new_params).ndirect) as f64;
+    return 0 as i32;
+}
+pub unsafe extern "C" fn BuildMetaBlock(mut params: *mut Params) {
+    let mut orig_params = *params;
+    let mut new_params = *params;
+    let mut dist_cost: f64 = 0.;
+    ComputeDistanceCost(&mut orig_params.dist, &mut new_params.dist, &mut dist_cost);
+    let mut dist_cost_0: f64 = 0.;
+    ComputeDistanceCost(&mut orig_params.dist, &mut orig_params.dist, &mut dist_cost_0);
+    if dist_cost_0 < dist_cost { (*params).dist = orig_params.dist; }
+}
+"#;
+
+#[test]
+fn w6a_r561_5_input_form_caller_weakens_the_same_place_twice() {
+    let src = with_prelude(SAME_PLACE_TWICE);
+    let (source, callee_converted) = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("ast");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decide");
+        let caller = table
+            .entries
+            .iter()
+            .map(|(s, _)| s.fn_did)
+            .find(|d| tcx.def_path_str(d.to_def_id()).ends_with("BuildMetaBlock"))
+            .expect("caller");
+        let emission = super::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("emit");
+        // The caller in its input form, the callee kept: brotli's tree.
+        let mut reverted = emission.plan.held_classes();
+        reverted.insert(super::bridge_receipt::SignatureClassId::of(caller));
+        let (files, ..) = super::round_files(
+            tcx,
+            &capture,
+            &emission.plan,
+            &emission.texts,
+            &reverted,
+            &std::collections::BTreeSet::new(),
+            emission.plan.root_file.as_ref(),
+            &table,
+        )
+        .expect("round");
+        let source = files.into_values().next().expect("file");
+        let callee_converted = source.contains("orig_params: &DistParams");
+        (source, callee_converted)
+    })
+    .expect("compiles");
+    let flat: String = source.split_whitespace().collect();
+    assert!(callee_converted, "the callee is kept converted:\n{source}");
+    assert!(
+        flat.contains("fnBuildMetaBlock(mutparams:*mutParams)"),
+        "the caller is in its input form:\n{source}"
+    );
+    assert!(
+        flat.contains(
+            "ComputeDistanceCost(&(orig_params.dist),&(orig_params.dist),&mutdist_cost_0)"
+        ),
+        "the input-form call carries the shared weakening at both positions:\n{source}"
+    );
+    assert!(
+        super::verify::type_checks_str(&source),
+        "no E0499 at the input-form call:\n{source}"
+    );
+}

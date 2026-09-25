@@ -5195,7 +5195,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 let input = if pos.root.is_some() {
                     let input_found = a5_argument_expression_form(pos.source_shape, Form::Raw)
                         .unwrap_or(Form::Raw);
-                    (if let Some(address) = shared_pairs
+                    let input_candidate = if let Some(address) = shared_pairs
                         .at(*callee, site)
                         .and_then(|call| call.addresses.get(&pos.index))
                     {
@@ -5219,8 +5219,27 @@ pub(crate) fn synthesize_with_raw_boundary(
                             field_tied_params.contains(&pos.index),
                             region,
                         )
-                    })
-                    .map(|candidate| {
+                    };
+                    // R561-5: the same weakening when the CALLER is emitted in
+                    // its input form beside a converted callee — `&mut place`
+                    // twice at shared formals is E0499 there too (brotli's
+                    // `metablock`). Same conditions as the current candidate.
+                    let input_candidate = if pos.source_shape == "addr-of-mut"
+                        && !pos.through_deref
+                        && shared_pairs.at(*callee, site).is_none()
+                        && let Some(weakened) = shared_weakening_candidate(
+                            tcx,
+                            &shared_weakenings,
+                            pos.expected,
+                            pos.span,
+                            text,
+                            &input_candidate,
+                        ) {
+                        Ok(Some(weakened))
+                    } else {
+                        input_candidate
+                    };
+                    input_candidate.map(|candidate| {
                         Some(candidate.map_or(
                             SeamInputRendering::ZeroSyntax { found: input_found },
                             |candidate| candidate.into_input_rendering(input_found),
