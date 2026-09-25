@@ -614,8 +614,11 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion="
         )
     };
+    // R561-6: ownership-fields' `67df47077` types the moved-out owner of a
+    // freed container (`deleteNode`'s `temp` / `temp_0`) as `Option<Box<node>>`,
+    // so the take is no longer a raw move: re-seated, raw-move is 0.
     let ((left_moves, left_stores), (right_moves, right_stores)) = if reseated {
-        ((1, 1), (1, 1))
+        ((0, 1), (0, 1))
     } else {
         ((3, 3), (4, 4))
     };
@@ -650,9 +653,11 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         "{:?}",
         observed.seam_edits
     );
+    // R561-6: re-seated, the two moved-out owners `temp` / `temp_0` deliver as
+    // `Option<Box<node>>` locals (ownership-fields' `67df47077`): 3 -> 5.
     assert_eq!(
         (emitted_count, reverted),
-        (if reseated { 3 } else { 1 }, 0),
+        (if reseated { 5 } else { 1 }, 0),
         "{source}"
     );
     let common = [
@@ -678,9 +683,11 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             "insert((*node.as_deref_mut().unwrap()).left.take(), key)",
             // R425-2: the `minValueNode` receiver is a raw view of the child
             "minValueNode((*root.as_deref_mut().unwrap()).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
-            // the C free sites, now the owner's drop at exactly those sites
-            "drop(root); return temp;",
-            "drop(root); return temp_0;",
+            // the moved-out owners are Box locals; the C free sites are the
+            // owner's drop at exactly those sites, and each local leaves as raw
+            // only at its return (R561-6)
+            "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).right.take(); drop(root); return temp.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);",
+            "let mut temp_0: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp_0.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);",
         ]
     } else {
         &[
@@ -952,11 +959,20 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
         reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
         "deleteNode's formal is either raw or the re-seated owner:\n{source}"
     );
+    // R561-6: re-seated, `deleteNode`'s moved-out `temp` is an
+    // `Option<Box<node>>` local too (ownership-fields' `67df47077`), so one
+    // more subject delivers: 3 -> 4.
     assert_eq!(
         (emitted_count, reverted),
-        (if reseated { 3 } else { 2 }, 0),
+        (if reseated { 4 } else { 2 }, 0),
         "{source}"
     );
+    if reseated {
+        // the moved-out owner is the Box local; the C free site is the owner's
+        // drop, and the local leaves as raw only at the return
+        let needle = "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);";
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
     let moved = if reseated {
         "(*root).right.take()"
     } else {
