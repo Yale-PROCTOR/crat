@@ -1777,6 +1777,64 @@ fn w6a_r561_a_mixed_optional_chain_takes_the_option_formal() {
     );
 }
 
+/// **R561-4 W1 at the chain.** buffer's `test_buffer_trim` re-seats one
+/// certified receiver through the consuming callee: `buffer_free(buf); buf =
+/// buffer_new_with_copy(..); .. buffer_free(buf);` ×3. Each call moves one
+/// generation, and a use after the call belongs to the next generation once a
+/// re-seat stands between them, so the chain must not read the re-seat as a
+/// use of the moved owner (`used-after-transfer`). With an optional member in
+/// the same chain (W2), every call of the re-seated member takes `Some(..)`,
+/// not only the first.
+#[test]
+fn w6a_r561_a_reseated_member_moves_one_generation_per_call() {
+    let source = OPTIONAL_OWNER_CHAIN.replace(
+        "    return n;\n}\n",
+        "    return n;\n}\npub unsafe extern \"C\" fn tree_make(mut n: u32) -> *mut tree_t {\n    let mut t = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;\n    if t.is_null() { return 0 as *mut tree_t; }\n    (*t).length = n;\n    (*t).depth = 0 as i32;\n    (*t).root = malloc(::std::mem::size_of::<i32>()) as *mut i32;\n    return t;\n}\npub unsafe extern \"C\" fn run_trim() -> u32 {\n    let mut t = tree_make(1 as u32);\n    let mut n = (*t).length;\n    tree_free(t);\n    t = tree_make(2 as u32);\n    n = n.wrapping_add((*t).length);\n    tree_free(t);\n    t = tree_make(3 as u32);\n    n = n.wrapping_add((*t).length);\n    tree_free(t);\n    return n;\n}\n",
+    );
+    assert_ne!(source, OPTIONAL_OWNER_CHAIN);
+    let out = emitted("r561-reseat-chain", &with_prelude(&source));
+    let src = compact(&out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(!receipts.contains("used-after-transfer"), "{receipts}");
+    assert!(
+        src.contains("fntree_free(muttree:Option<Box<tree_t>>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("letmutt:Box<crate::tree_t>=tree_make(1asu32);"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("tree_free(Some(t));t=tree_make(2asu32);"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("tree_free(Some(t));t=tree_make(3asu32);"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert_eq!(
+        src.matches("tree_free(Some(t));").count(),
+        3,
+        "every generation's call is wrapped:\n{}",
+        out.source
+    );
+    assert!(src.contains("tree_free(tree);"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "run_trim::t"),
+        None,
+        "{:#?}\n{receipts}",
+        out.degradations
+    );
+}
+
 /// ht's surface: an exported producer, an exported consumer, and a third
 /// exported signature that lends the pointee (the corpus's `ht_get` /
 /// `ht_set`), so R427-4's closure holds and nothing in the program calls

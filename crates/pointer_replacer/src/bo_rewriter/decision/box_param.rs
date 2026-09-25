@@ -565,6 +565,8 @@ struct Scan<'tcx> {
     freed_fields: FxHashSet<DefId>,
     /// Local functions whose address is taken (a value, not a callee).
     fn_values: FxHashSet<DefId>,
+    /// R561-4 W1: `x = ..` with `x` a bare local: (local, the assignment's span).
+    assigns: Vec<(HirId, Span)>,
 }
 
 impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
@@ -584,6 +586,9 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                 _ => {}
             },
             ExprKind::Assign(lhs, rhs, _) => {
+                if let Some(hir) = bare_local(lhs) {
+                    self.assigns.push((hir, e.span));
+                }
                 if bare_local(lhs).is_none()
                     && let Some(hir) = bare_local(rhs)
                 {
@@ -1285,11 +1290,25 @@ pub(crate) fn derive<'tcx>(
                     if plan.optional {
                         optional_members += 1;
                     }
-                    if caller_scan
-                        .local_uses
+                    // R561-4 W1: a receiver the certificate re-seats is one
+                    // local over several generations, and every overwrite of
+                    // it is a certified re-seat. A use behind a re-seat that
+                    // follows this call belongs to the next generation.
+                    let reseated = plan
+                        .receipts
                         .iter()
-                        .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
-                    {
+                        .any(|r| r.starts_with(super::return_certificate::RESEAT_RECEIPT));
+                    let next_generation = |use_span: &Span| {
+                        reseated
+                            && caller_scan.assigns.iter().any(|(hir, assign)| {
+                                *hir == *arg
+                                    && assign.lo() > call_span.hi()
+                                    && assign.lo() <= use_span.lo()
+                            })
+                    };
+                    if caller_scan.local_uses.iter().any(|(hir, span)| {
+                        *hir == *arg && span.lo() > call_span.hi() && !next_generation(span)
+                    }) {
                         failure = Some(format!(
                             "box-param-caller-retains:{caller_path}:used-after-transfer"
                         ));
@@ -1515,19 +1534,21 @@ pub(crate) fn derive<'tcx>(
         let mut optional_wraps: Vec<BoxExprEdit> = Vec::new();
         let mut mixed_refusal = None;
         if optional && optional_members != member_plans.len() {
-            for (key, plan, _, _) in &member_plans {
-                if plan.optional {
+            // Per CALL, not per member: a re-seated member (W1) passes one
+            // generation at each of its calls.
+            for (key, span) in &member_args {
+                if member_plans
+                    .iter()
+                    .any(|(k, plan, _, _)| k == key && plan.optional)
+                {
                     continue;
                 }
-                let span = member_args
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, span)| *span);
-                let Some(span) = span.filter(|_| !moved_on_members.contains(key)) else {
+                if moved_on_members.contains(key) {
                     mixed_refusal =
                         Some("box-param-caller-retains:{callee_path}:optional-owner-mixed");
                     break;
-                };
+                }
+                let span = *span;
                 let text = tcx
                     .sess
                     .source_map()

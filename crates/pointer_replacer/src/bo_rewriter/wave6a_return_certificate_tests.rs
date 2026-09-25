@@ -2098,6 +2098,29 @@ fn w6a_r561_a_let_receiver_reseated_after_its_free_is_one_box_local() {
     );
 }
 
+/// Control: a first generation freed only inside a branch is still live on
+/// the other path when the re-seat overwrites it — refused like the plain
+/// overwrite. The consume must be a statement of the re-seat's own block.
+#[test]
+fn w6a_r561_a_reseat_after_a_branch_free_stays_refused() {
+    let branch = RESEAT_AFTER_FREE.replacen(
+        "    free(buf as *mut core::ffi::c_void);\n    buf = buffer_new_with_size(4);",
+        "    if n > 0 {\n        free(buf as *mut core::ffi::c_void);\n    }\n    buf = buffer_new_with_size(4);",
+        1,
+    );
+    assert_ne!(
+        branch, RESEAT_AFTER_FREE,
+        "the control moves the first generation's free into a branch"
+    );
+    let out = emitted("r561-reseat-branch", &reseat_fixture(&branch));
+    assert!(
+        !compact(&out.source).contains("letmutbuf:Box<crate::buffer_t>="),
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.source
+    );
+}
+
 /// Control: a re-seat over a LIVE owner (the first generation never freed) is
 /// an overwrite, the leak-parity line — it stays refused.
 #[test]

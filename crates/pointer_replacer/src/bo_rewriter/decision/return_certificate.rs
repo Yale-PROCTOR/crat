@@ -112,6 +112,10 @@ pub(crate) struct Certificates {
     pub(crate) lend_by_recursion: Vec<String>,
 }
 
+/// R561-4 W1: the receipt a re-seated receiver's plan carries; the C1 chain
+/// reads it to tell a re-seat from a use of the moved owner.
+pub(crate) const RESEAT_RECEIPT: &str = "reseat-receiver generations=";
+
 /// The sentinel a pass-over travels back on: `certify` has no channel for
 /// "neither certified nor refused", so it returns this as its hold text and
 /// the driver turns it into a `chain_through` entry.
@@ -2694,7 +2698,7 @@ fn certify<'tcx, 's>(
             .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
             rplan
                 .receipts
-                .push(format!("reseat-receiver generations={}", reseats.len() + 1));
+                .push(format!("{RESEAT_RECEIPT}{}", reseats.len() + 1));
         }
         transfers.extend(rtransfers.into_iter().map(|(d, i, _)| (d, i, rkey)));
         plans.push((rkey, rplan));
@@ -2909,9 +2913,15 @@ fn reseat_generations_consumed(
             let Some(at) = block.stmts.iter().position(|stmt| stmt.span == *statement) else {
                 return false;
             };
+            // The consume IS the statement (`free(buf);`, `buffer_free(buf);`),
+            // not a call nested in a branch of it.
             block.stmts[..at].iter().any(|stmt| {
+                let (rustc_hir::StmtKind::Semi(expr) | rustc_hir::StmtKind::Expr(expr)) = stmt.kind
+                else {
+                    return false;
+                };
                 previous.is_none_or(|p| stmt.span.lo() >= p.hi())
-                    && consumes.iter().any(|consume| stmt.span.contains(*consume))
+                    && consumes.iter().any(|consume| expr.span == *consume)
             })
         });
         if !consumed {
