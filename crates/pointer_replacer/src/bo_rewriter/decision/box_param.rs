@@ -1220,6 +1220,9 @@ pub(crate) fn derive<'tcx>(
         let mut moved_on_members: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
         // R531-4 (iii): members whose owner is an `Option<Box<T>>`.
         let mut optional_members = 0usize;
+        // R561-4 W2: each member's argument at its call, for the `Some(..)`
+        // a non-optional member needs at an optional formal.
+        let mut member_args: Vec<((LocalDefId, HirId), Span)> = Vec::new();
         let mut failure: Option<String> = None;
         let mut callers: Vec<(&LocalDefId, &Scan<'tcx>)> = scans.iter().collect();
         callers.sort_by_key(|(f, _)| f.local_def_index.as_u32());
@@ -1237,6 +1240,7 @@ pub(crate) fn derive<'tcx>(
                     break 'callers;
                 };
                 let key = (*caller, *arg);
+                member_args.push((key, *arg_span));
                 let Some(local) = subjects.iter().find(|s| {
                     s.fn_did == *caller && s.hir_id == *arg && s.kind == SubjectKind::Local
                 }) else {
@@ -1501,9 +1505,44 @@ pub(crate) fn derive<'tcx>(
         // else needs an edit: every member optional, the sink a free, a sized
         // owner, and no raw exposure wrapper to re-enter ownership.
         let optional = optional_members > 0;
+        // **R561-4 W2 — a MIXED chain.** One member optional (buffer's
+        // `buffer_slice` returns null on a range error) and the rest not: the
+        // formal is `Option<Box<T>>` for all of them and each non-optional
+        // member passes `Some(x)` at its call — `drop(Some(b))` frees as
+        // `free(b)`, `drop(None)` is `free(NULL)`. A member that is the
+        // caller's own parameter (rung 2) belongs to another chain, which
+        // makes no such edit, so the mix still holds there.
+        let mut optional_wraps: Vec<BoxExprEdit> = Vec::new();
+        let mut mixed_refusal = None;
+        if optional && optional_members != member_plans.len() {
+            for (key, plan, _, _) in &member_plans {
+                if plan.optional {
+                    continue;
+                }
+                let span = member_args
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, span)| *span);
+                let Some(span) = span.filter(|_| !moved_on_members.contains(key)) else {
+                    mixed_refusal =
+                        Some("box-param-caller-retains:{callee_path}:optional-owner-mixed");
+                    break;
+                };
+                let text = tcx
+                    .sess
+                    .source_map()
+                    .span_to_snippet(span)
+                    .unwrap_or_default();
+                optional_wraps.push(BoxExprEdit {
+                    span,
+                    replacement: format!("Some({text})"),
+                    receipt: "box-param-optional-formal-some",
+                });
+            }
+        }
         if optional {
-            let refusal = if optional_members != member_plans.len() {
-                Some("box-param-caller-retains:{callee_path}:optional-owner-mixed")
+            let refusal = if mixed_refusal.is_some() {
+                mixed_refusal
             } else if frees.len() != 1 || store.is_some() || moved_on.is_some() {
                 Some("box-param-shape:{callee_path}:optional-owner-sink")
             } else if member_plans
@@ -1775,6 +1814,9 @@ pub(crate) fn derive<'tcx>(
         } else {
             param_edits
         };
+        let wrapped_members = optional_wraps.len();
+        let mut param_edits = param_edits;
+        param_edits.extend(optional_wraps);
         let pointee = {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(param.fn_did)
@@ -1830,8 +1872,13 @@ pub(crate) fn derive<'tcx>(
                 expr_edits: param_edits,
                 delete_statements: Vec::new(),
                 receipts: vec![format!(
-                    "box-param-owning-formal callee={callee_path} index={hir_index} callers={call_count}{}",
-                    if optional { " optional-owner" } else { "" }
+                    "box-param-owning-formal callee={callee_path} index={hir_index} callers={call_count}{}{}",
+                    if optional { " optional-owner" } else { "" },
+                    if wrapped_members > 0 {
+                        format!(" some-wrapped-members={wrapped_members}")
+                    } else {
+                        String::new()
+                    }
                 )],
                 fabricated_extent: false,
                 pointee_override: None,

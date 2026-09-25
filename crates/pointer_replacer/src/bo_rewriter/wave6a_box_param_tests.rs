@@ -1737,25 +1737,43 @@ fn w6a_r531_an_optional_owner_moves_into_a_consuming_formal() {
     );
 }
 
-/// Control: a second caller hands the same formal a NON-optional owner. One
-/// formal cannot be both `Box<T>` and `Option<Box<T>>` without an edit at
-/// the call the chain does not make, so the mixed chain holds.
+/// **R561-4 W2 — a mixed chain** (restates R531-4 (iii)'s control, which pinned
+/// the hold this rule lifts). A second caller hands the same formal a
+/// NON-optional owner: the formal is `Option<Box<T>>` for the whole chain and
+/// that caller passes `Some(t)`; `drop(Some(b))` is `free(b)`. buffer's
+/// `buffer_free` is this shape — five `buffer_slice` receivers optional,
+/// nineteen constructor receivers not (report 095).
 #[test]
-fn w6a_r531_a_mixed_optional_chain_holds() {
+fn w6a_r561_a_mixed_optional_chain_takes_the_option_formal() {
     let source = OPTIONAL_OWNER_CHAIN.replace(
         "    return n;\n}\n",
         "    return n;\n}\npub unsafe extern \"C\" fn run_sized() {\n    let mut t = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;\n    (*t).length = 1 as u32;\n    (*t).depth = 1 as i32;\n    (*t).root = 0 as *mut i32;\n    tree_free(t);\n}\n",
     );
     assert_ne!(source, OPTIONAL_OWNER_CHAIN);
-    let out = emitted("r531-optional-mixed", &with_prelude(&source));
+    let out = emitted("r561-optional-mixed", &with_prelude(&source));
     let src = compact(&out.source);
-    assert!(!src.contains("tree:Option<Box<tree_t>>"), "{}", out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
     assert!(
-        out.artifacts
-            .box_param_receipts
-            .contains("box-param-caller-retains:tree_free:optional-owner-mixed"),
-        "{}",
-        out.artifacts.box_param_receipts
+        src.contains("fntree_free(muttree:Option<Box<tree_t>>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("tree_free(Some(t));"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(src.contains("tree_free(tree);"), "{}", out.source);
+    assert!(!receipts.contains("optional-owner-mixed"), "{receipts}");
+    assert_eq!(
+        reason_of(&out.degradations, "run_sized::t"),
+        None,
+        "{:#?}",
+        out.degradations
     );
 }
 
