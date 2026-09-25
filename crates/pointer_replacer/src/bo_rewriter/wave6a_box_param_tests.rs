@@ -2178,3 +2178,95 @@ fn w6a_r536_a_reseat_over_raw_fields_is_withdrawn() {
     );
     assert_eq!(out.reverted, 0, "{}", out.source);
 }
+
+/// quadtree's `test_tree`, reduced: an optional Box owner (`tree_new` may
+/// return null) whose raw field `root` is passed to a callee that decides
+/// `&mut`. Since joint (d) (R555-1) the owner view is the OWNER's, so
+/// `(*tree).root` is no longer read as the owner's view: it crosses at the C
+/// arm (`c-raw-reborrow-mut`), whose interval strictly contains the owner's
+/// own `box-expression` edit of `(*tree)`. That is a composition the seam pass
+/// renders around the grafted operand, like the `("c-raw-slice-shared",
+/// "box-expression")` row. Held, it cost quadtree 23 → 12 at batch 34′
+/// (`cross-class-interval-collision`, then `dependency-class-held`).
+const QUADTREE_WALK_OF_BOX_FIELD: &str = r#"
+#[repr(C)]
+pub struct node_t { pub nw: *mut node_t, pub count: i32 }
+#[repr(C)]
+pub struct tree_t { pub root: *mut node_t, pub length: u32 }
+pub unsafe extern "C" fn node_new() -> *mut node_t {
+    let mut node = 0 as *mut node_t;
+    node = malloc(::std::mem::size_of::<node_t>()) as *mut node_t;
+    if node.is_null() { return 0 as *mut node_t; }
+    (*node).nw = 0 as *mut node_t;
+    (*node).count = 0 as i32;
+    return node;
+}
+pub unsafe extern "C" fn tree_new() -> *mut tree_t {
+    let mut tree = 0 as *mut tree_t;
+    tree = malloc(::std::mem::size_of::<tree_t>()) as *mut tree_t;
+    if tree.is_null() { return 0 as *mut tree_t; }
+    (*tree).root = node_new();
+    if ((*tree).root).is_null() {
+        free(tree as *mut core::ffi::c_void);
+        return 0 as *mut tree_t;
+    }
+    (*tree).length = 0 as u32;
+    return tree;
+}
+pub unsafe extern "C" fn tree_free(mut tree: *mut tree_t) {
+    free((*tree).root as *mut core::ffi::c_void);
+    free(tree as *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn walk(mut root: *mut node_t) {
+    (*root).count += 1 as i32;
+    if !((*root).nw).is_null() {
+        walk((*root).nw);
+    }
+}
+pub unsafe extern "C" fn test_tree() {
+    let mut tree = tree_new();
+    (*tree).length = 1 as u32;
+    walk((*tree).root);
+    tree_free(tree);
+}
+"#;
+
+#[test]
+fn w6a_r564_a_box_owner_field_crosses_at_the_c_arm_around_the_owner_edit() {
+    let out = emitted(
+        "r564-quadtree-walk",
+        &with_prelude(QUADTREE_WALK_OF_BOX_FIELD),
+    );
+    let src = compact(&out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("fnwalk(mutroot:&mutnode_t)"),
+        "{}\n{receipts}\n{:#?}\n{}",
+        out.source,
+        out.degradations,
+        out.artifacts.class_collisions
+    );
+    assert!(
+        src.contains("letmuttree:Option<Box<crate::tree_t>>=tree_new();"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("walk(&mut*(*tree.as_deref_mut().unwrap()).root);"),
+        "{}\n{receipts}",
+        out.source
+    );
+    for subject in ["test_tree::tree", "walk::root"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{:#?}\n{receipts}\n{}",
+            out.degradations,
+            out.source
+        );
+    }
+}

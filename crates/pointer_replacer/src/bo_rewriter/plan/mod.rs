@@ -632,6 +632,15 @@ fn nested_ast_composition(
                     // pass has grafted the element into it — the same argument
                     // as the `("box-borrow-view-to-raw", "box-expression")` row.
                     | ("c-raw-slice-shared", "box-expression")
+                    // R564-2 (wave-6a 098): quadtree's `test_tree` —
+                    // `quadtree_walk((*tree).root, ..)`. Since joint (d) the
+                    // owner view is the OWNER's, so a raw field read through
+                    // the Box owner crosses at the C arm (`&mut *(..).root`),
+                    // whose interval strictly contains the owner's own
+                    // `box-expression` edit of `(*tree)`. The seam builds its
+                    // reborrow around the operand after the use pass grafted
+                    // the owner's edit — the argument of the row above.
+                    | ("c-raw-reborrow-mut", "box-expression")
             );
         let raw_receiver_over_argument = matches!(
             outer.key.bridge_kind.as_str(),
