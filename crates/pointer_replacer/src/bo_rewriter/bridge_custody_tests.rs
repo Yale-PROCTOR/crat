@@ -2592,3 +2592,90 @@ fn r494_1b_an_offset_deref_corresponds_to_the_index_of_the_delivered_container()
         "a bare deref of another value is unrelated"
     );
 }
+
+/// **R568-1 (main 100b) — a retained census's custody, re-compared under THIS
+/// matcher.** Batch 34′'s brotli failed custody on twelve A5 T2-fallback rows; the
+/// census retains its export and emitted sources in
+/// `<program>.raw-boundary-bridge-replay.json`, so the whole comparison — not one
+/// relation at a time — can be re-run offline, with no worker and no slot. At the
+/// census's own code the re-comparison must equal the retained one; under a matcher
+/// change, only the rows the change names may move.
+///
+/// Set `CRAT_BRIDGE_RETAINED_REPLAY` to the sidecar (and optionally
+/// `CRAT_BRIDGE_RETAINED_REPLAY_OUT` to a summary path); unset, the test is inert.
+#[test]
+fn r568_1_a_retained_replay_recompared_under_this_matcher() {
+    use crate::bo_rewriter::{
+        bridge_custody_export::{RetainedReplay, recompare_retained_for_test},
+        bridge_custody_match::ReceiptStatus,
+    };
+    let Some(path) = std::env::var_os("CRAT_BRIDGE_RETAINED_REPLAY") else { return };
+    let packet: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("retained replay sidecar"))
+            .expect("retained replay JSON");
+    let retained: RetainedReplay =
+        serde_json::from_value(packet["replay"].clone()).expect("retained replay packet");
+    // The comparison installs its own session globals, as in the census.
+    let replay = recompare_retained_for_test(&retained);
+    let matched = |status: ReceiptStatus| {
+        matches!(
+            status,
+            ReceiptStatus::MatchedRaw | ReceiptStatus::MatchedC9 | ReceiptStatus::WaivedPending
+        )
+    };
+    let mut out = format!(
+        "program={} data={} (retained {}) issues={} equal-to-retained={}\n",
+        retained.frame.program,
+        replay.data,
+        retained.comparison.data,
+        replay.issues.len(),
+        replay == retained.comparison
+    );
+    for (file, report) in &replay.files {
+        let mut by_status = std::collections::BTreeMap::<String, usize>::new();
+        for row in &report.rows {
+            *by_status.entry(format!("{:?}", row.status)).or_default() += 1;
+        }
+        out += &format!(
+            "file={file} data={} rows={} {by_status:?} tree_only={}\n",
+            report.data,
+            report.rows.len(),
+            report.tree_only.len()
+        );
+        for row in report.rows.iter().filter(|row| !matched(row.status)) {
+            out += &format!(
+                "  unmatched {:?} {} {}\n",
+                row.status, row.identity, row.reason
+            );
+        }
+        let before = retained
+            .comparison
+            .files
+            .get(file)
+            .map(|report| {
+                report
+                    .rows
+                    .iter()
+                    .map(|row| (row.identity.clone(), row.status))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for row in &report.rows {
+            if before.get(&row.identity) != Some(&row.status) {
+                out += &format!(
+                    "  moved {} {:?} -> {:?}\n",
+                    row.identity,
+                    before.get(&row.identity),
+                    row.status
+                );
+            }
+        }
+    }
+    for issue in &replay.issues {
+        out += &format!("issue {issue}\n");
+    }
+    print!("{out}");
+    if let Some(summary) = std::env::var_os("CRAT_BRIDGE_RETAINED_REPLAY_OUT") {
+        std::fs::write(summary, &out).expect("retained replay summary");
+    }
+}

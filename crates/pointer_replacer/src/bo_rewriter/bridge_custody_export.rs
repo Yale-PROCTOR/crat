@@ -1400,6 +1400,24 @@ fn native_sibling_source_issues(export: &Export) -> Vec<String> {
     issues
 }
 
+/// **R568-1 (main 100b) — a retained census's custody, re-compared under the
+/// matcher of THIS build.** `compare_retained` refuses a retained comparison that
+/// already failed; this is its core alone, so a matcher change can be measured
+/// against the census's own export and emitted sources with no worker and no slot.
+#[cfg(test)]
+pub(crate) fn recompare_retained_for_test(retained: &RetainedReplay) -> CheckpointReport {
+    compare_applied(
+        &retained.export,
+        &retained.applied,
+        retained.emitted_sources.as_ref(),
+        if retained.emitted_outcome {
+            CensusOutcomeKind::Emitted
+        } else {
+            CensusOutcomeKind::Degraded
+        },
+    )
+}
+
 fn compare_applied(
     export: &Export,
     applied: &[AppliedReceipt],
