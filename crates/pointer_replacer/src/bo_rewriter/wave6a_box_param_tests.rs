@@ -2095,11 +2095,14 @@ fn bst_reseat(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitt
 
 /// **R536-3 — the re-seat.** `insert::node` is not a lend (A9's gate asked it
 /// the wrong question): the body consumes the formal and hands it back. It
-/// takes `Option<Box<node>>`, its null test reads `is_none()`, `return node`
-/// hands the owner out through `Box::into_raw` (the return stays the raw
-/// pointer the source declares, so `return newNode(key)` is untouched), and
-/// the recursive calls move each owned child out with `.take()` and store the
-/// result back through wave-6f's `from_raw` bridge.
+/// takes `Option<Box<node>>`, its null test reads `is_none()`, and the
+/// recursive calls move each owned child out with `.take()`.
+///
+/// Restated for R579-4: the re-seated formal is the owner `insert`'s return
+/// certificate reads (R2), so the return is certified — `-> Option<Box<node>>`,
+/// `return node` (C1), `return Some(newNode(key))` — and the result goes back
+/// into the field as a plain move (C2) where it went through `Box::into_raw`
+/// and wave-6f's `from_raw` bridge.
 #[test]
 fn w6a_r536_a_consumed_and_returned_formal_is_reseated() {
     let out = bst_reseat("r536-bst-reseat", BST_RESEAT);
@@ -2111,17 +2114,19 @@ fn w6a_r536_a_consumed_and_returned_formal_is_reseated() {
         "{receipts}"
     );
     assert!(
-        src.contains("fninsert(mutnode:Option<Box<node>>,mutkey:i32)->*mutnode"),
+        src.contains("fninsert(mutnode:Option<Box<node>>,mutkey:i32)->Option<Box<node>>"),
         "{}",
         out.source
     );
     assert!(src.contains("ifnode.is_none(){"), "{}", out.source);
+    assert!(src.contains("returnnode;"), "{}", out.source);
+    assert!(src.contains("returnSome(newNode(key));"), "{}", out.source);
+    assert!(src.contains(".left.take()"), "{}", out.source);
     assert!(
-        src.contains("returnnode.map_or(core::ptr::null_mut(),Box::into_raw);"),
+        !src.contains("into_raw") && !src.contains("from_raw"),
         "{}",
         out.source
     );
-    assert!(src.contains(".left.take()"), "{}", out.source);
     assert_eq!(
         reason_of(&out.degradations, "insert::node"),
         None,

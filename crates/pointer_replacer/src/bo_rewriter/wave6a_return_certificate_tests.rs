@@ -1459,14 +1459,20 @@ fn w6a_r528_a_held_owned_field_admits_the_certificate() {
     );
 }
 
-/// Control: the same producer where the owned field's transaction is
-/// DELIVERED (`entries` is only read through, not indexed, so no length is
-/// needed and the field becomes `Option<Box<entry_t>>`). The raw zero would be
-/// an `E0308`, so the certificate withdraws with the gate's hold. (A WRITE through the delivered field renders
+/// The same producer where the owned field's transaction is DELIVERED
+/// (`entries` is only read through, not indexed, so no length is needed and
+/// the field becomes `Option<Box<entry_t>>`). R528-3 withdrew the certificate
+/// here, because its raw zero would be an `E0308`.
+///
+/// **Restated for R579-4 R1 — the gate re-renders.** The certificate spells
+/// its literal again with the delivered form (`entries: None`, ownership-
+/// fields' own spelling) and stands: `table_new` returns `Box<table_t>`, its
+/// receiver is a `Box`, and the delivered field's store and C free are the
+/// field transaction's. (A WRITE through the delivered field renders
 /// `.as_deref()` and does not compile — wave-6f's rendering, routed in report
-/// 077 — so the control reads.)
+/// 077 — so the fixture reads.)
 #[test]
-fn w6a_r528_a_delivered_owned_field_withdraws_the_certificate() {
+fn w6a_r579_a_delivered_owned_field_re_renders_the_certificate() {
     let source = OWNED_FIELD_TABLE.replace(
         "    (*(*t).entries.offset(1 as isize)).key = 3 as i32;\n",
         "    let mut k = (*(*t).entries).key;\n",
@@ -1474,23 +1480,25 @@ fn w6a_r528_a_delivered_owned_field_withdraws_the_certificate() {
     assert_ne!(source, OWNED_FIELD_TABLE, "the control must drop the index");
     let out = owned_field_table("r528-owned-field-delivered", &source);
     let receipts = &out.artifacts.return_certificate_receipts;
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
     assert!(
-        receipts.contains("return-certificate-struct-field:table_new:owned-field"),
+        !receipts.contains(":owned-field"),
         "{receipts}\n{}",
         out.source
     );
     assert!(
-        !compact(&out.source).contains("->Box<table_t>"),
+        text.contains("fntable_new(mutcap:usize)->Box<table_t>"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        text.contains("Box::new(crate::table_t{cap:0usize,entries:None})"),
         "{}",
         out.source
     );
-    // Withdrawn, the certificate leaves the owner to the family that spells
-    // the delivered field: ownership-fields' literal writes `entries: None`
-    // and the local is a `Box` released at the return. The withdrawal is what
-    // lets that happen; the certificate's raw zero would not type.
-    let text = compact(&out.source);
     assert!(
-        text.contains("Box::new(crate::table_t{cap:0usize,entries:None})"),
+        text.contains("letmutt:Box<crate::table_t>=table_new(4asusize);"),
         "{}",
         out.source
     );
@@ -2148,5 +2156,319 @@ fn w6a_r561_a_reseat_over_a_live_owner_stays_refused() {
         !compact(&out.source).contains("letmutbuf:Box<crate::buffer_t>="),
         "{}",
         out.source
+    );
+}
+
+/// bst, reduced from the corpus: `newNode` mallocs and fills a node,
+/// `insert` / `deleteNode` recurse and store the recursive result into the
+/// node's own `left` / `right`.
+const BST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+// w6a-r578-bst-frame
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct node {
+    pub key: i32,
+    pub left: *mut node,
+    pub right: *mut node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn newNode(mut item: i32) -> *mut node {
+    let mut temp = malloc(::std::mem::size_of::<node>()) as *mut node;
+    (*temp).key = item;
+    (*temp).left = 0 as *mut node;
+    (*temp).right = 0 as *mut node;
+    return temp;
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: *mut node, mut key: i32) -> *mut node {
+    if node.is_null() { return newNode(key); }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else { (*node).right = insert((*node).right, key); }
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn minValueNode(mut node: *mut node) -> *mut node {
+    while !node.is_null() && !((*node).left).is_null() {
+        node = (*node).left;
+    }
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: i32) -> *mut node {
+    if root.is_null() { return root; }
+    if key < (*root).key {
+        (*root).left = deleteNode((*root).left, key);
+    } else if key > (*root).key {
+        (*root).right = deleteNode((*root).right, key);
+    } else {
+        if ((*root).left).is_null() {
+            let mut temp = (*root).right;
+            free(root as *mut core::ffi::c_void);
+            return temp;
+        } else {
+            if ((*root).right).is_null() {
+                let mut temp_0 = (*root).left;
+                free(root as *mut core::ffi::c_void);
+                return temp_0;
+            }
+        }
+        let mut temp_1 = minValueNode((*root).right);
+        (*root).key = (*temp_1).key;
+        (*root).right = deleteNode((*root).right, (*temp_1).key);
+    }
+    return root;
+}
+"#;
+
+/// era-5c's bst frame (the solve's 0 raw / 13 ref / 31 owning), as wave-6f
+/// states it for its own witnesses: both `node` fields and every node owner
+/// Owning, the traversal subjects Ref.
+fn bst_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6a-r578-bst-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp_0".to_owned(), SlotKind::Owning),
+            ("minValueNode::node".to_owned(), SlotKind::Ref),
+            ("deleteNode::temp_1".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// Both frame locks, in one order: the crate-wide one every frame-state test
+/// holds, then ownership-fields' (three of whose tests set the same global
+/// model override under it alone).
+fn frame_locks() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let frame = super::test_model_override::frame_lock();
+    let fields = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (frame, fields)
+}
+
+fn bst_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    let _frame = frame_locks();
+    bst_frame();
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+/// The degradations of a run, by subject and reason key, sorted.
+fn degraded(out: &super::wave6a_allocation_tests::Emitted) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = out
+        .degradations
+        .iter()
+        .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// **R579-4 — the recursive return certificate, six edits in one
+/// transaction** (relay wave-6a/106). Under era-5c's frame bst's recursive
+/// returns certify: `newNode` re-renders its literal with the delivered field
+/// forms (R1), `insert` / `deleteNode` return their own re-seated formal
+/// (R2, C1) and `deleteNode` the owners it moves out of a field (R3, C3), and
+/// every store of a recursive result into the owned field is a plain move
+/// (C2) — no `from_raw` and no `into_raw` left anywhere.
+#[test]
+fn w6a_r579_the_recursive_certificate_moves_bst_whole() {
+    let out = bst_emitted("r579-bst", BST);
+    record(
+        "r579-bst",
+        &format!(
+            "{}\n{}",
+            out.artifacts.return_certificate_receipts, out.source
+        ),
+    );
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let context = format!("{receipts}\n{}", out.source);
+    assert_eq!(out.reverted, 0, "{context}");
+    // R1: the producer stands, its literal spelling the delivered fields.
+    assert!(
+        text.contains("fnnewNode(mutitem:i32)->Box<node>") && text.contains("left:None,right:None"),
+        "{context}"
+    );
+    // R2 + C1: the re-seated formal is the owner the callee hands back.
+    assert!(
+        text.contains("fninsert(mutnode:Option<Box<node>>,mutkey:i32)->Option<Box<node>>"),
+        "{context}"
+    );
+    assert!(text.contains("returnSome(newNode(key));"), "{context}");
+    assert!(text.contains("returnnode;"), "{context}");
+    // R2 + R3 + C3: the formal on two paths, the moved-out owners on two.
+    assert!(
+        text.contains("fndeleteNode(mutroot:Option<Box<node>>,mutkey:i32)->Option<Box<node>>"),
+        "{context}"
+    );
+    assert!(
+        text.contains("returnroot;")
+            && text.contains("returntemp;")
+            && text.contains("returntemp_0;"),
+        "{context}"
+    );
+    // C2: the five stores are plain moves.
+    assert_eq!(
+        text.matches("=insert(").count() + text.matches("=deleteNode(").count(),
+        5,
+        "{context}"
+    );
+    assert!(
+        !text.contains("from_raw") && !text.contains("into_raw"),
+        "{context}"
+    );
+    // The control: the borrowed-child return stays uncertified and held.
+    assert!(
+        text.contains("fnminValueNode(mutnode:*mutnode)->*mutnode"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains(
+            "minValueNode\theld\treturn-certificate-return-locals:minValueNode:not-a-subject"
+        ),
+        "{context}"
+    );
+    // Nothing else moves: the two rows batch 39 holds stay held.
+    assert_eq!(
+        degraded(&out),
+        vec![
+            (
+                "deleteNode::temp_1".to_owned(),
+                "return-not-adapted".to_owned()
+            ),
+            (
+                "minValueNode::node".to_owned(),
+                "opt-use-unsupported".to_owned()
+            ),
+        ],
+        "{context}"
+    );
+}
+
+/// Control (R579-4, `fn_values` unchanged): `insert`'s address is taken, so
+/// the re-seat refuses its formal (`box-param-indirect-callers`) and R2 has
+/// no owner to read — `insert` keeps its raw return and its stores their
+/// `from_raw`, exactly as before; `deleteNode` still certifies.
+#[test]
+fn w6a_r579_an_address_taken_recursion_is_not_certified() {
+    let source = BST.replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
+        "pub unsafe fn pick() -> unsafe extern \"C\" fn(*mut node, i32) -> *mut node { insert }\n#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
+    );
+    assert_ne!(source, BST, "the control must take insert's address");
+    let out = bst_emitted("r579-bst-fn-value", &source);
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let context = format!("{receipts}\n{}", out.source);
+    assert!(!receipts.contains("callee=insert output"), "{context}");
+    assert!(
+        text.contains("fninsert(mutnode:*mutnode,mutkey:i32)->*mutnode")
+            || text.contains("fninsert(mutnode:Option<Box<node>>,mutkey:i32)->*mutnode"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate callee=deleteNode output=Option<Box<node>>"),
+        "{context}"
+    );
+}
+
+/// Control (R579-4 R2's fallback): the same program with the fields NOT
+/// owned. The re-seat plans the formals at derive time, but no transaction
+/// delivers `left` / `right`, so the re-seats withdraw after the fields
+/// finalize; the certificates re-derive without them and `insert` is passed
+/// over, `deleteNode` held, exactly as before R2.
+#[test]
+fn w6a_r579_an_undelivered_field_unseats_the_owner_parameter() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r578-bst-frame",
+        Vec::new(),
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted("r579-bst-fields-raw", BST);
+    super::test_model_override::clear();
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let context = format!("{receipts}\n{}", out.source);
+    assert!(!receipts.contains("source=owner-parameter"), "{context}");
+    assert!(
+        receipts.contains("chain-through:insert:returns-parameter-or-certified"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate-return-locals:deleteNode:2"),
+        "{context}"
+    );
+    assert!(!text.contains("->Option<Box<node>>"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// Control (R579-4 R3's scope): R3 lifts `return-locals:2` for owner locals
+/// BESIDE a primary owner. A callee whose one returned local is a load moved
+/// out of an owned field, with no owner of its own (`detachLeft`, the shape
+/// of avl's rotations), keeps exactly the reading it had before R3.
+#[test]
+fn w6a_r579_a_lone_field_load_return_keeps_its_hold() {
+    let source = BST.replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
+        "#[no_mangle]\npub unsafe extern \"C\" fn detachLeft(mut root: *mut node) -> *mut node {\n    let mut t = (*root).left;\n    (*root).left = 0 as *mut node;\n    return t;\n}\n#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
+    );
+    assert_ne!(source, BST, "the control must add the detaching callee");
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r578-bst-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp_0".to_owned(), SlotKind::Owning),
+            ("minValueNode::node".to_owned(), SlotKind::Ref),
+            ("deleteNode::temp_1".to_owned(), SlotKind::Ref),
+            ("detachLeft::t".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted("r579-bst-detach", &source);
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let context = format!("{receipts}\n{}", out.source);
+    assert!(
+        receipts
+            .contains("detachLeft::t\theld\treturn-certificate-allocation:detachLeft:construction"),
+        "{context}"
+    );
+    assert!(!receipts.contains("owners=detachLeft::t"), "{context}");
+    // The rest of the transaction is unmoved by the extra callee.
+    assert!(
+        receipts.contains("return-certificate callee=deleteNode output=Option<Box<node>>"),
+        "{context}"
     );
 }

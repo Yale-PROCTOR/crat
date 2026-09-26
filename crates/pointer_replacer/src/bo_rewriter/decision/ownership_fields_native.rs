@@ -866,6 +866,10 @@ pub(crate) mod field_form_override {
     }
 }
 
+/// **R579-4 C3** — the receipt of a moved-out owner returned as the enclosing
+/// function's certified output; the certificate confirms its adopted owners
+/// by it (`return_certificate::confirm_adopted`).
+pub(crate) const CERTIFIED_RETURN_RECEIPT: &str = "native-box-transfer-at-return-certified";
 const DECLARATION_TYPE_RECEIPT: &str = "native-box-declaration-type";
 const VIEW_ALIAS_TYPE_RECEIPT: &str = "native-box-view-alias-type";
 
@@ -1552,17 +1556,43 @@ fn derive_bundle(
         if !c_free_allocator_compatible(tcx) {
             return Err(NativeHold::Missing("native-transfer-allocator-contract"));
         }
-        receipts.push(format!("native-box-transfer-at-return span={span:?} allocator=linux-System;global-allocators=none;nonempty=numeric-layout caller-free=unchanged"));
-        edits.push(BoxExprEdit {
-            span,
-            replacement: if optional_owner {
-                // R395-2's null rule: the empty option IS the null pointer.
-                format!("{name}.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw)")
-            } else {
-                format!("::std::boxed::Box::into_raw({name})")
-            },
-            receipt: "native-box-transfer-at-return",
-        });
+        // **R579-4 C3** — where the enclosing function's return certificate
+        // adopted this owner, the return type IS the owner's
+        // (`Option<Box<T>>`): it leaves as itself, wrapped `Some` only when a
+        // sized owner meets an optional output. Every other return keeps the
+        // raw transfer.
+        let certified = table
+            .return_certificates
+            .callees
+            .get(&subject.fn_did)
+            .filter(|c| c.adopted.contains(&(subject.fn_did, subject.hir_id)));
+        if let Some(certificate) = certified {
+            receipts.push(format!(
+                "{CERTIFIED_RETURN_RECEIPT} span={span:?} output={}",
+                certificate.output_type
+            ));
+            edits.push(BoxExprEdit {
+                span,
+                replacement: if certificate.optional && !optional_owner {
+                    format!("Some({name})")
+                } else {
+                    name.clone()
+                },
+                receipt: CERTIFIED_RETURN_RECEIPT,
+            });
+        } else {
+            receipts.push(format!("native-box-transfer-at-return span={span:?} allocator=linux-System;global-allocators=none;nonempty=numeric-layout caller-free=unchanged"));
+            edits.push(BoxExprEdit {
+                span,
+                replacement: if optional_owner {
+                    // R395-2's null rule: the empty option IS the null pointer.
+                    format!("{name}.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw)")
+                } else {
+                    format!("::std::boxed::Box::into_raw({name})")
+                },
+                receipt: "native-box-transfer-at-return",
+            });
+        }
     }
     if let Some(span) = source.store_transfer() {
         // The owner leaves into another object's field as a raw pointer,

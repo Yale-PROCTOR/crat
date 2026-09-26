@@ -7956,6 +7956,12 @@ fn finish_decide<'tcx>(
     // the chains read it to admit a pair the crate itself never calls.
     let exported_pairs =
         decision::exported_pair::derive(tcx, &program.functions, &raw_surface, &consuming_formals);
+    // R579-4 R2: formals whose re-seat a later stage withdrew; the
+    // certificates re-derive without them (grows only).
+    let mut excluded_reseats: rustc_hash::FxHashSet<(
+        rustc_hir::def_id::LocalDefId,
+        rustc_hir::HirId,
+    )> = rustc_hash::FxHashSet::default();
     let mut return_certificates = decision::return_certificate::derive(
         tcx,
         &program.functions,
@@ -7967,6 +7973,7 @@ fn finish_decide<'tcx>(
         &consuming_formals,
         &raw_surface,
         &exported_pairs,
+        &excluded_reseats,
     );
     // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
     let allocator_contracts = decision::allocator_contract::derive(
@@ -8023,6 +8030,11 @@ fn finish_decide<'tcx>(
             })
         },
     );
+    // R579-4 R2: the certificates' own inputs, for a re-derivation inside the
+    // loop (which shadows `ctors` / `subjects` with the stage's augmented
+    // copies).
+    let certificate_ctors = ctors.clone();
+    let certificate_subjects = subjects.clone();
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
@@ -8509,16 +8521,71 @@ fn finish_decide<'tcx>(
                     && t.key.field_index == field_index
             })
         };
+        // R579-4 R1: a synthesised literal re-renders with the delivered
+        // forms instead of withdrawing; C2: a certified call stored into a
+        // delivered owned field is the transaction's move.
+        let delivered_form = |struct_did: rustc_span::def_id::DefId, field_index: usize| {
+            let struct_did = struct_did.as_local()?;
+            field_transactions
+                .applied
+                .iter()
+                .find(|t| {
+                    t.owning
+                        && t.array.is_none()
+                        && t.key.struct_did == struct_did
+                        && t.key.field_index == field_index
+                })
+                .map(|t| t.delivered_form_key().to_owned())
+        };
         let certificates_withdrawn = decision::return_certificate::withdraw_delivered_owned_fields(
             &mut return_certificates,
+            tcx,
             &subjects,
             &delivered,
+            &delivered_form,
         );
         let lends_withdrawn =
             decision::box_param::withdraw_delivered_owned_field_lends(&mut box_params, &delivered);
         // R536-3: a re-seat whose moved-out field is not delivered withdraws.
         let reseats_withdrawn =
             decision::box_param::withdraw_undelivered_reseats(&mut box_params, &delivered);
+        // R579-4 R2: a certificate whose owner is a withdrawn re-seat's formal
+        // re-derives without it, then re-confirms its transfers.
+        let unseated = decision::return_certificate::unseated_owner_parameters(
+            &return_certificates,
+            &|f, h| box_params.plans.contains_key(&(f, h)),
+        );
+        if !unseated.is_empty() {
+            excluded_reseats.extend(unseated);
+            return_certificates = decision::return_certificate::derive(
+                tcx,
+                &program.functions,
+                &certificate_ctors,
+                &certificate_subjects,
+                &box_facts,
+                &slots,
+                &model,
+                &consuming_formals,
+                &raw_surface,
+                &exported_pairs,
+                &excluded_reseats,
+            );
+            decision::return_certificate::confirm_transfers(
+                &mut return_certificates,
+                tcx,
+                &certificate_subjects,
+                &|did, index| {
+                    did.as_local().is_some_and(|callee| {
+                        certificate_subjects.iter().any(|s| {
+                            s.fn_did == callee
+                                && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                                && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+                        })
+                    })
+                },
+            );
+            continue;
+        }
         if certificates_withdrawn || lends_withdrawn || reseats_withdrawn {
             continue;
         }
@@ -8880,6 +8947,8 @@ fn finish_decide<'tcx>(
         // R536-3: a selected native Box plan built from an owning field's form
         // withdraws with that field's transaction (after `finalize`, before the plan).
         native_ownership_candidates.register_seam_consumers(&mut table);
+        // R579-4 R1: a certificate's re-rendered literal likewise.
+        decision::return_certificate::register_seam_consumers(&mut table);
         decision::void_region::append_receiver_declarations(&mut table);
         append_literal_local_declaration_plans(tcx, &ctors, &mut table);
         decision::null_init_declaration::append_explicit_declarations(tcx, &mut table);
@@ -9119,6 +9188,31 @@ fn finish_decide<'tcx>(
         {
             predecessor = Some(candidate);
             family_policy.stage = next;
+            continue;
+        }
+        // R579-4 R3: the owners a certificate adopted are planned by their
+        // own family, which has now settled; one that is not withdraws the
+        // certificate and the stage re-derives (certificates only shrink).
+        if decision::return_certificate::confirm_adopted(
+            &mut return_certificates,
+            &subjects,
+            &|f, h| {
+                table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.fn_did == f && s.hir_id == h)
+                    .and_then(|(_, decision)| match decision {
+                        decision::Decision::Box(plan) => Some(plan.clone()),
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Slice { .. }
+                        | decision::Decision::NestedSlice { .. }
+                        | decision::Decision::Cursor { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Degraded(_) => None,
+                    })
+            },
+        ) {
             continue;
         }
         retired.append(&mut table, &prepared.plan);

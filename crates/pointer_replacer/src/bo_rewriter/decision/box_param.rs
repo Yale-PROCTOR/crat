@@ -211,6 +211,70 @@ pub(crate) fn withdraw_undelivered_reseats(
     !withdrawn.is_empty()
 }
 
+/// **R579-4 R2** — the re-seats `derive` plans, computed from the same inputs
+/// ahead of it. The allocation-return certificate reads a re-seated formal as
+/// the owner its callee hands back, and the certificates derive before the
+/// chains; `reseat_plan` reads no certificate, so the two agree plan for plan.
+pub(crate) fn reseats(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    subjects: &[Subject],
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    consuming: &FxHashSet<(DefId, usize)>,
+) -> FxHashMap<(LocalDefId, HirId), BoxPlan> {
+    let mut scans: FxHashMap<LocalDefId, Scan<'_>> = FxHashMap::default();
+    for &function in functions {
+        let mut scan = Scan {
+            tcx: Some(tcx),
+            ..Scan::default()
+        };
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else { continue };
+        scan.visit_body(tcx.hir_body(body_id));
+        scans.insert(function, scan);
+    }
+    let fn_values: FxHashSet<DefId> = scans
+        .values()
+        .flat_map(|s| s.fn_values.iter().copied())
+        .collect();
+    let mut out = FxHashMap::default();
+    for param in subjects
+        .iter()
+        .filter(|s| matches!(s.kind, SubjectKind::Param { .. }) && s.ptr_depth == 1)
+    {
+        let Some(scan) = scans.get(&param.fn_did) else { continue };
+        let frees: Vec<(Span, Span)> = scan
+            .frees
+            .iter()
+            .filter(|(hir, _, _)| *hir == param.hir_id)
+            .map(|(_, call, arg)| (*call, *arg))
+            .collect();
+        // `derive`'s own order: a store or a move-on sink is asked first.
+        if store_sink(tcx, scan, param).is_some()
+            || (frees.is_empty() && move_on_sink(scan, param, consuming).is_some())
+        {
+            continue;
+        }
+        if let Reseat::Planned(plan, _) = reseat_plan(
+            tcx, functions, slots, model, consuming, &fn_values, param, &frees,
+        ) {
+            out.insert((param.fn_did, param.hir_id), plan);
+        }
+    }
+    out
+}
+
+/// **R579-4 C1** — a re-seat whose callee's return is certified hands the
+/// formal back AS the owner: `return node` against the certified output,
+/// where the raw return type took `node.map_or(null_mut(), Box::into_raw)`.
+pub(crate) fn certified_reseat(mut plan: BoxPlan) -> BoxPlan {
+    plan.expr_edits
+        .retain(|edit| edit.receipt != "box-param-reseat-return");
+    plan.receipts
+        .push("box-param-reseat-return-certified".to_owned());
+    plan
+}
+
 enum Reseat {
     /// The body does not return the formal: A9's lend question applies.
     NotReturned,

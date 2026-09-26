@@ -113,6 +113,10 @@ pub(crate) enum Rhs {
     /// OWNED field takes it through the `from_raw` bridge, a reference field
     /// holds.
     RawExpression,
+    /// **R579-4 C2** — a call of a local function, into an OWNED field. A
+    /// callee whose return a certificate certifies hands back an owner, moved
+    /// in as `Subject(Box)` is; any other call is `RawExpression`'s.
+    Call(LocalDefId),
     /// An allocation whose element count its own size argument proves (G
     /// build 3): a fat owned place reclaims it as a boxed slice of that
     /// length — no fabricated extent.
@@ -892,6 +896,14 @@ impl<'tcx> Collector<'_, 'tcx> {
             };
         }
         if self.owning.contains(&key) {
+            if let ExprKind::Call(callee, _) = &expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                && let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res
+                && let Some(callee) = did.as_local()
+                && !matches!(self.tcx.hir_node_by_def_id(callee), Node::ForeignItem(_))
+            {
+                return Ok(Rhs::Call(callee));
+            }
             return Ok(Rhs::RawExpression);
         }
         Err("store-source-raw-expression")
@@ -3657,7 +3669,7 @@ pub(crate) fn finalize(
                             }
                         }
                     }
-                    Some(Rhs::RawExpression) | None => {
+                    Some(Rhs::RawExpression | Rhs::Call(_)) | None => {
                         cause.get_or_insert_with(|| "store-source-unknown".to_owned());
                     }
                 },
@@ -3842,6 +3854,11 @@ pub(crate) fn finalize(
                         site.kind,
                         SiteKind::Load | SiteKind::CallArgument | SiteKind::Assignment
                     ) || matches!(site.rhs, Some(Rhs::Subject(_)))
+                        // R579-4 C2: a certified call's move holds only while
+                        // the certificate does; its class and the storing
+                        // function's revert together (`Certificates::owners`).
+                        || matches!(site.rhs, Some(Rhs::Call(callee))
+                            if table.return_certificates.callees.contains_key(&callee))
                 })
                 .map(|site| site.owner)
                 .chain(
@@ -4173,11 +4190,42 @@ fn owned_sites<'t>(
                         continue;
                     }
                     Some(Rhs::RawExpression) => from_raw(),
+                    // **R579-4 C2** — a certified callee's result IS an owner
+                    // of the certificate's shape: moved in as `Subject(Box)`'s
+                    // is, `inner` from an optional output, `Some(inner)` from
+                    // a sized one. An uncertified call is a raw expression.
+                    Some(Rhs::Call(callee)) => {
+                        match table.return_certificates.callees.get(&callee) {
+                            Some(certificate) => {
+                                if (certificate.shape == super::box_facts::BoxShape::Slice) != fat {
+                                    cause.get_or_insert_with(|| {
+                                        "field-transaction-incomplete:owned-store-shape".to_owned()
+                                    });
+                                    continue;
+                                }
+                                if certificate.optional {
+                                    inner.to_owned()
+                                } else {
+                                    format!("Some({inner})")
+                                }
+                            }
+                            None if fat => {
+                                cause.get_or_insert_with(|| {
+                                    "field-transaction-incomplete:owned-slice-store-length"
+                                        .to_owned()
+                                });
+                                continue;
+                            }
+                            None => from_raw(),
+                        }
+                    }
                     None => {
                         cause.get_or_insert_with(|| "store-source-unknown".to_owned());
                         continue;
                     }
                 };
+                let certified_move = matches!(site.rhs, Some(Rhs::Call(callee))
+                    if table.return_certificates.callees.contains_key(&callee));
                 // Through a raw base the place may be uninitialized memory (a
                 // fresh allocation), so the store never drops: `ptr::write`
                 // keeps C's overwrite semantics (the old value, if any, leaks
@@ -4203,7 +4251,11 @@ fn owned_sites<'t>(
                         owner: site.owner,
                         span: site.span,
                         replacement,
-                        kind: "owned-field-store",
+                        kind: if certified_move {
+                            "owned-field-store-certified-move"
+                        } else {
+                            "owned-field-store"
+                        },
                         wrap: true,
                     }),
                 }

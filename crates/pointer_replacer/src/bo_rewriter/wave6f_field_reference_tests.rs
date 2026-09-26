@@ -684,10 +684,11 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
             // R425-2: the `minValueNode` receiver is a raw view of the child
             "minValueNode((*root.as_deref_mut().unwrap()).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
             // the moved-out owners are Box locals; the C free sites are the
-            // owner's drop at exactly those sites, and each local leaves as raw
-            // only at its return (R561-6)
-            "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).right.take(); drop(root); return temp.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);",
-            "let mut temp_0: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp_0.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);",
+            // owner's drop at exactly those sites (R561-6), and each local is
+            // returned as itself: `deleteNode`'s return is certified
+            // `Option<Box<node>>` (wave-6a R579-4, R3 / C3)
+            "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).right.take(); drop(root); return temp;",
+            "let mut temp_0: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp_0;",
         ]
     } else {
         &[
@@ -969,8 +970,9 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
     );
     if reseated {
         // the moved-out owner is the Box local; the C free site is the owner's
-        // drop, and the local leaves as raw only at the return
-        let needle = "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw);";
+        // drop, and the local is returned as itself: `deleteNode`'s return is
+        // certified `Option<Box<node>>` (wave-6a R579-4, R3 / C3)
+        let needle = "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp;";
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
     let moved = if reseated {
@@ -983,13 +985,23 @@ fn w6f_hoist_pure_read_before_a_moving_argument() {
     } else {
         "deleteNode((*root).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)"
     };
+    // Re-seated, `deleteNode`'s return is certified `Option<Box<node>>`
+    // (wave-6a R579-4), so its result goes back into the owned field as a
+    // plain move (C2) instead of through the `from_raw` bridge.
+    let stored = if reseated {
+        format!("deleteNode({moved}, __crat_hoist0)")
+    } else {
+        format!(
+            "core::ptr::NonNull::new(deleteNode({moved}, __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr()))"
+        )
+    };
     for needle in [
         format!(
             // R538-3: the hoisted read ABSORBS the preceding assignment of the
             // same read — the binding moves above `(*root).key = (*temp).key;`,
             // so `temp`'s last use precedes the write through the owner (the
             // E0499 wave-6a measured once the owner is a re-seated Box).
-            "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) {{ let mut temp: &crate::node = (*root).right.as_deref().unwrap(); let __crat_hoist0 = (*temp).key; (*root).key = (*temp).key; (*root).right = core::ptr::NonNull::new(deleteNode({moved}, __crat_hoist0)).map(|__p| Box::from_raw(__p.as_ptr())); }}"
+            "pub unsafe extern \"C\" fn removeMin(mut root: &mut node) {{ let mut temp: &crate::node = (*root).right.as_deref().unwrap(); let __crat_hoist0 = (*temp).key; (*root).key = (*temp).key; (*root).right = {stored}; }}"
         ),
         // a bare local read (`key`) is not hoisted — nothing a move invalidates
         bare.to_owned(),
