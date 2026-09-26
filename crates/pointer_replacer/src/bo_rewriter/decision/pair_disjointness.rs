@@ -2231,7 +2231,43 @@ const STRUCT_BYTE_WRITERS: &[&str] = &[
     "copy_to",
     "copy_from_nonoverlapping",
     "copy_to_nonoverlapping",
+    // R583-5 G2: whole-value movers of `core::mem` / `core::ptr`.
+    "swap",
+    "replace",
+    "take",
+    "swap_nonoverlapping",
+    "write_volatile",
 ];
+
+/// R583-5 G1: is `callee` a deallocator, and if so which argument does it
+/// release? The allocator contracts' free functions by name (`free`,
+/// `BrotliFree`), and a call through a `free_func` function-pointer field —
+/// `((*m).free_func).expect(..)(opaque, p)` or a local copy of that field —
+/// which releases its second argument.
+fn deallocator_pointer_index(tcx: TyCtxt<'_>, callee: &Expr<'_>) -> Option<usize> {
+    if let Some(did) = callee_def_id(callee) {
+        let name = tcx.item_name(did);
+        return super::allocator_contract::CONTRACTS
+            .iter()
+            .find(|contract| contract.free == name.as_str())
+            .map(|contract| contract.pointer_index);
+    }
+    let ExprKind::MethodCall(segment, receiver, _, _) = &peel_casts(callee).kind else {
+        return None;
+    };
+    if !matches!(segment.ident.name.as_str(), "expect" | "unwrap") {
+        return None;
+    }
+    let named_free_func = match &peel_casts(receiver).kind {
+        ExprKind::Field(_, field) => field.name.as_str() == "free_func",
+        ExprKind::Path(QPath::Resolved(_, path)) => path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.name.as_str() == "free_func"),
+        _ => false,
+    };
+    named_free_func.then_some(1)
+}
 
 /// R579-3 refusals (3) and (4): the structs among `structs` that the program
 /// writes other than through a field store — so a pointer field of one may
@@ -2245,7 +2281,11 @@ const STRUCT_BYTE_WRITERS: &[&str] = &[
 ///   a type holding the struct (R538-7);
 /// * a pointer reaching the struct cast to another pointee that is neither a
 ///   byte nor `void` (R544-4's pun: `*(rb as *mut *mut u8) = p` writes the
-///   first field).
+///   first field);
+/// * R583-5 G1: the same cast to a byte or `void` pointee, too — the bytes go
+///   to code this scan cannot read — UNLESS the cast's value goes straight to
+///   a deallocator ([`deallocator_pointer_index`]), which only releases the
+///   object.
 fn struct_writes_outside_field_stores<'tcx>(
     tcx: TyCtxt<'tcx>,
     structs: &FxHashSet<DefId>,
@@ -2255,6 +2295,10 @@ fn struct_writes_outside_field_stores<'tcx>(
         typeck: &'a TypeckResults<'tcx>,
         structs: &'a [(DefId, Ty<'tcx>)],
         written: &'a mut FxHashSet<DefId>,
+        /// G1: the casts that are a deallocator's released argument (every
+        /// cast of the chain), recorded when the call is visited — before its
+        /// arguments are.
+        released: FxHashSet<HirId>,
     }
     impl<'tcx> Writes<'_, 'tcx> {
         /// Every struct `ty` holds by value, at any depth.
@@ -2296,16 +2340,20 @@ fn struct_writes_outside_field_stores<'tcx>(
                     if let (Some(from_pointee), Some(to_pointee)) =
                         (from.builtin_deref(true), to.builtin_deref(true))
                         && from_pointee != to_pointee
-                        && !matches!(
-                            to_pointee.kind(),
-                            ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8)
-                        )
-                        && !super::void_pointee::has_void_pointee(self.tcx, to, 1)
+                        && !self.released.contains(&expr.hir_id)
                     {
                         self.held_by(from_pointee);
                     }
                 }
                 ExprKind::Call(callee, args) => {
+                    if let Some(index) = deallocator_pointer_index(self.tcx, callee)
+                        && let Some(mut arg) = args.get(index)
+                    {
+                        while let ExprKind::Cast(inner, _) = &arg.kind {
+                            self.released.insert(arg.hir_id);
+                            arg = inner;
+                        }
+                    }
                     if let Some(did) = callee_def_id(callee)
                         && STRUCT_BYTE_WRITERS.contains(&self.tcx.item_name(did).as_str())
                     {
@@ -2338,6 +2386,7 @@ fn struct_writes_outside_field_stores<'tcx>(
             typeck: tcx.typeck(owner),
             structs: &structs,
             written: &mut written,
+            released: FxHashSet::default(),
         };
         writes.visit_body(tcx.hir_body_owned_by(owner));
     }

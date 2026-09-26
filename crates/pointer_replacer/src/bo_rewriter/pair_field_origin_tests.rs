@@ -348,3 +348,102 @@ fn w6v_control_a_parameter_is_not_carried() {
         "a parameter d",
     );
 }
+
+// ------------------------------------------------- R583-5: G1 and G2
+
+/// G1: a byte or `void` cast of a pointer that reaches the struct hands its
+/// bytes to code the store scan cannot read, so it counts as a writer. Fault
+/// G1-F1: byte and `void` targets exempt again (the pre-G1 rule).
+#[test]
+fn w6v_control_a_byte_or_void_cast_of_the_struct_refuses_it() {
+    for (name, body) in [
+        (
+            "byte",
+            "unsafe fn Bytes(rb: *mut RingBuffer) { let p = rb as *mut u8; *p.offset(8) = 0; }",
+        ),
+        (
+            "void",
+            "unsafe fn Bytes(rb: *mut RingBuffer) { let p = rb as *mut c_void; *(p as *mut u64) = 0; }",
+        ),
+    ] {
+        let src = variant(body, "Bytes(&mut (*s).ringbuffer_);");
+        assert_unproved(
+            &outcomes(&src, "EncodeData", "InitOrStitch", 1, 2),
+            &format!("a {name} cast of *mut RingBuffer"),
+        );
+    }
+}
+
+/// G1's exemption: a `void` cast whose value goes STRAIGHT to a deallocator —
+/// libc `free`, a contract's free function, or a `free_func` field call — only
+/// releases the object. Fault G1-F2: the exemption dropped.
+#[test]
+fn w6v_a_cast_straight_to_a_deallocator_is_not_a_writer() {
+    for (name, body, call) in [
+        (
+            "free",
+            "unsafe fn Release(s: *mut State) { free(s as *mut c_void); }",
+            "Release(s);",
+        ),
+        (
+            "free_func field",
+            "#[repr(C)] pub struct Freer { pub free_func: Option<unsafe extern \"C\" fn(*mut c_void, *mut c_void)>, pub opaque: *mut c_void }
+             unsafe fn Release(f: *mut Freer, s: *mut State) { ((*f).free_func).expect(\"non-null function pointer\")((*f).opaque, s as *mut c_void); }",
+            "Release(0 as *mut Freer, s);",
+        ),
+        (
+            "free_func local",
+            "#[repr(C)] pub struct Freer { pub free_func: Option<unsafe extern \"C\" fn(*mut c_void, *mut c_void)>, pub opaque: *mut c_void }
+             unsafe fn Release(f: *mut Freer, s: *mut State) { let mut free_func = (*f).free_func; free_func.expect(\"non-null function pointer\")((*f).opaque, s as *mut c_void); }",
+            "Release(0 as *mut Freer, s);",
+        ),
+    ] {
+        let src = variant(body, call);
+        let rows = outcomes(&src, "EncodeData", "InitOrStitch", 1, 2);
+        assert!(certified(&rows), "{name}: {rows:?}");
+    }
+}
+
+/// G2: whole-value movers of `core::mem` / `core::ptr` write every field
+/// without a field store. Fault G2-F1: the five names dropped.
+#[test]
+fn w6v_control_a_whole_value_mover_refuses_the_struct() {
+    const DEFAULT: &str = "impl Default for RingBuffer { fn default() -> Self { RingBuffer { size_: 0, data_: 0 as *mut u8, buffer_: 0 as *mut u8 } } }";
+    for (name, body) in [
+        (
+            "mem::swap",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { core::mem::swap(&mut *a, &mut *b); }",
+        ),
+        (
+            "mem::replace",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { let _ = core::mem::replace(&mut *a, *b); }",
+        ),
+        (
+            "mem::take",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { let _ = core::mem::take(&mut *a); }",
+        ),
+        (
+            "ptr::swap",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { core::ptr::swap(a, b); }",
+        ),
+        (
+            "ptr::swap_nonoverlapping",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { core::ptr::swap_nonoverlapping(a, b, 1); }",
+        ),
+        (
+            "ptr::write_volatile",
+            "unsafe fn Mv(a: *mut RingBuffer, b: *mut RingBuffer) { core::ptr::write_volatile(a, *b); }",
+        ),
+    ] {
+        let extra = if name == "mem::take" {
+            format!("{DEFAULT}\n{body}")
+        } else {
+            body.to_owned()
+        };
+        let src = variant(&extra, "Mv(&mut (*s).ringbuffer_, &mut (*s).ringbuffer_);");
+        assert_unproved(
+            &outcomes(&src, "EncodeData", "InitOrStitch", 1, 2),
+            &format!("{name} on a RingBuffer"),
+        );
+    }
+}
