@@ -62,6 +62,12 @@ pub(crate) struct Candidates {
     /// Owners whose bundle was re-derived once at the ownership stage after
     /// a callee's interface class was restored beneath the return-stage proof.
     refreshed: FxHashSet<Node>,
+    /// **R579-4 C3, the reverse direction.** Owners re-derived because their
+    /// bundle rendered a certified return (`return temp`) that the enclosing
+    /// function's certificate no longer adopts — `confirm_adopted` withdraws a
+    /// certificate after the bundles were built. Adoption only shrinks, so each
+    /// node is decertified at most once.
+    decertified: FxHashSet<Node>,
     /// Observation only: the primary diagnosis before the native stage.
     /// Kept apart from native holds and final decisions, including on success.
     primary: FxHashMap<Node, (String, String)>,
@@ -396,11 +402,16 @@ impl Candidates {
     ) -> (FxHashSet<LocalDefId>, bool) {
         let effects = NativeEffects::derive(inputs.program);
         let mut refreshed = false;
-        let stale: Vec<Node> = self
+        let mut stale: Vec<Node> = self
             .invalid_owner_nodes(inputs, table, classes)
             .into_iter()
             .filter(|node| !self.refreshed.contains(node))
             .collect();
+        for node in self.decertified_returns(table) {
+            if self.decertified.insert(node) && !stale.contains(&node) {
+                stale.push(node);
+            }
+        }
         for node in stale {
             let Some((subject, _)) = table
                 .entries
@@ -509,6 +520,32 @@ impl Candidates {
             )
         });
         made
+    }
+
+    /// Bundles that render C3's certified return while the enclosing
+    /// function's certificate no longer adopts the owner. Left alone, the
+    /// plan returns `Option<Box<T>>` into a raw return type (E0308), and the
+    /// class verify-reverts with every class it closes over.
+    fn decertified_returns(&self, table: &DecisionTable) -> Vec<Node> {
+        let mut nodes: Vec<Node> = self
+            .bundles
+            .iter()
+            .filter(|(node, bundle)| {
+                bundle
+                    .plan
+                    .expr_edits
+                    .iter()
+                    .any(|edit| edit.receipt == CERTIFIED_RETURN_RECEIPT)
+                    && !table
+                        .return_certificates
+                        .callees
+                        .get(&node.0)
+                        .is_some_and(|c| c.adopted.contains(node))
+            })
+            .map(|(node, _)| *node)
+            .collect();
+        nodes.sort_by_key(|(f, h)| (f.local_def_index.as_u32(), h.local_id.as_u32()));
+        nodes
     }
 
     fn invalid_owner_nodes(

@@ -3649,3 +3649,124 @@ pub unsafe fn cut(mut root: *mut node) -> *mut node {{
         "a second read of the field between the load and the free keeps it raw: {copied}"
     );
 }
+
+/// **R579-4 C3, the reverse direction (report 073a).** A certificate that
+/// adopted two moved-out owners withdraws when one of them is not planned
+/// (`confirm_adopted`: here `temp_0`, held by R560-2's container-read guard).
+/// The other owner's bundle was built while the certificate still adopted it,
+/// so it rendered the certified `return temp`; left alone, that returns an
+/// `Option<Box<node>>` into the raw return type (E0308) and `deleteNode`'s
+/// class verify-reverts with every class it closes over (4 at `4ff73addb`).
+/// The decertified owner re-derives once: it returns through the bridge.
+#[test]
+fn r579_a_decertified_moved_out_owner_returns_through_the_bridge() {
+    use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
+    const BST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+// r579 decertified-return fixture
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct node {
+    pub key: i32,
+    pub left: *mut node,
+    pub right: *mut node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn newNode(mut item: i32) -> *mut node {
+    let mut temp = malloc(::std::mem::size_of::<node>()) as *mut node;
+    (*temp).key = item;
+    (*temp).left = 0 as *mut node;
+    (*temp).right = 0 as *mut node;
+    return temp;
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: *mut node, mut key: i32) -> *mut node {
+    if node.is_null() { return newNode(key); }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else { (*node).right = insert((*node).right, key); }
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn minValueNode(mut node: *mut node) -> *mut node {
+    while !node.is_null() && !((*node).left).is_null() {
+        node = (*node).left;
+    }
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: i32) -> *mut node {
+    if root.is_null() { return root; }
+    if key < (*root).key {
+        (*root).left = deleteNode((*root).left, key);
+    } else if key > (*root).key {
+        (*root).right = deleteNode((*root).right, key);
+    } else {
+        if ((*root).left).is_null() {
+            let mut temp = (*root).right;
+            free(root as *mut core::ffi::c_void);
+            return temp;
+        } else {
+            if ((*root).right).is_null() {
+                let mut temp_0 = (*root).left;
+                let mut k = (*root).key;
+                free(root as *mut core::ffi::c_void);
+                return temp_0;
+            }
+        }
+        let mut temp_1 = minValueNode((*root).right);
+        (*root).key = (*temp_1).key;
+        (*root).right = deleteNode((*root).right, (*temp_1).key);
+    }
+    return root;
+}
+"#;
+    let _frame = super::test_model_override::frame_lock();
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(
+        "r579 decertified-return fixture",
+        vec![
+            ("node".to_owned(), 1, Owning),
+            ("node".to_owned(), 2, Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), Owning),
+            ("deleteNode::root".to_owned(), Owning),
+            ("newNode::temp".to_owned(), Owning),
+            ("deleteNode::temp".to_owned(), Owning),
+            ("deleteNode::temp_0".to_owned(), Owning),
+            ("minValueNode::node".to_owned(), Ref),
+            ("deleteNode::temp_1".to_owned(), Ref),
+        ],
+    );
+    let out = super::wave6a_allocation_tests::emitted("r579-decertified", BST);
+    super::test_model_override::clear();
+    let text: String = out.source.split_whitespace().collect();
+    let context = format!(
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts, out.source
+    );
+    // The forward direction: the unplanned owner withdraws the certificate.
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("adopted-unplanned:deleteNode::temp_0"),
+        "{context}"
+    );
+    // The reverse direction: the planned owner leaves through the bridge, the
+    // raw return type stands, and nothing reverts.
+    assert_eq!(out.reverted, 0, "{context}");
+    assert!(
+        text.contains("fndeleteNode(mutroot:Option<Box<node>>,mutkey:i32)->*mutnode"),
+        "{context}"
+    );
+    // `deleteNode`'s own `temp` (newNode's `return temp;` is its certified
+    // producer and stays).
+    assert!(text.contains("drop(root);returntemp.map_or("), "{context}");
+    assert!(!text.contains("drop(root);returntemp;"), "{context}");
+}
