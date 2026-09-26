@@ -272,6 +272,77 @@ fn return_dependencies<'tcx>(
     visitor.owners
 }
 
+/// **R583-4** — the receipt of a raw-rooted input at a held callee, carried
+/// in the zero-syntax receipt's `found_form` column (counted per program).
+pub(crate) const HELD_CALLEE_RAW_ROOTED: &str = "held-callee-input:raw-rooted";
+
+/// **R583-4** — `&mut <place>` whose place is rooted in a `kind-raw` FORMAL of
+/// the caller, through a deref, and projects only fields no transaction
+/// delivers (a deref of an undelivered pointer field stays raw as well). An
+/// argument whose path crosses a delivered field is not raw-rooted.
+fn raw_rooted(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    caller: LocalDefId,
+    arg: &Arg,
+    expression: Option<&Expr<'_>>,
+) -> bool {
+    let ArgShape::AddrOf {
+        base: Some(root),
+        through_deref: true,
+        ..
+    } = arg.shape
+    else {
+        return false;
+    };
+    let kind_raw_formal = table.entries.iter().any(|(subject, decision)| {
+        subject.fn_did == caller
+            && subject.hir_id == root
+            && matches!(subject.kind, SubjectKind::Param { .. })
+            && match decision {
+                Decision::Degraded(record) => {
+                    matches!(record.reason, super::DegradeReason::KindRaw)
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_) => false,
+            }
+    });
+    let Some(ExprKind::AddrOf(_, _, place)) = expression.map(|e| e.kind) else {
+        return false;
+    };
+    let mut place = place;
+    if !kind_raw_formal {
+        return false;
+    }
+    let typeck = tcx.typeck(caller);
+    loop {
+        match place.kind {
+            ExprKind::Field(base, _) => {
+                let Some(index) = typeck.opt_field_index(place.hir_id) else { return false };
+                let TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else { return false };
+                if adt.did().as_local().is_some_and(|struct_did| {
+                    table.field_transactions.applied.iter().any(|t| {
+                        t.key.struct_did == struct_did && t.key.field_index == index.as_usize()
+                    })
+                }) {
+                    return false;
+                }
+                place = base;
+            }
+            ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) => place = pointer,
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                return matches!(path.res, Res::Local(id) if id == root);
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn zero(arg: &Arg, found: Form) -> SeamAlternative {
     SeamAlternative {
         rendering: SeamInputRendering::ZeroSyntax { found },
@@ -489,6 +560,38 @@ fn current_alternative(
                 extent: BridgeExtentKind::None,
                 retention: BridgeRetentionTier::T2,
                 waiver_id: Some((*waiver_id).to_owned()),
+                unsafe_context: None,
+            }),
+        });
+    }
+    // **R583-4 — the raw-rooted arm.** An address rooted in a `kind-raw`
+    // formal through undelivered fields (`&mut (*s).hasher_` at
+    // `EncodeData → HasherReset`) is raw on both sides: the caller's root keeps
+    // its declared raw type, and the held callee's formal is its raw input
+    // form. No safe subject stands on either side, so there is no bridge to
+    // render and no retention to read (§130's channel — Rust noalias against a
+    // retained alias — is absent). Admitted as written; the receipt is the
+    // zero-syntax row, its `found_form` naming the arm.
+    // The refusal it replaces is the site's `Blocked` (a raw root's is
+    // `raw-boundary-subject-not-safe`).
+    if matches!(disposition, RawBoundaryDisposition::Blocked { .. })
+        && raw_rooted(tcx, table, caller, arg, expression)
+    {
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::ZeroSyntax { found },
+            arg_span: arg.span,
+            bridge: Some(BridgeSitePlan {
+                caller,
+                callee: BridgeCalleeId::Local(callee),
+                arm: "c".into(),
+                position: format!("arg{}", arg.index),
+                bridge_kind: "interface-call-zero-syntax".into(),
+                expected_form: input_form.key().into(),
+                found_form: HELD_CALLEE_RAW_ROOTED.into(),
+                argument_kind: arg.shape.key().into(),
+                extent: BridgeExtentKind::None,
+                retention: BridgeRetentionTier::None,
+                waiver_id: None,
                 unsafe_context: None,
             }),
         });

@@ -222,3 +222,268 @@ fn w6a_r575_an_unknown_retention_takes_no_held_callee_receipt() {
         rows(&run.dispositions, "pass").join("\n")
     );
 }
+
+/// brotli's `EncodeData` → `HasherReset(&mut (*s).hasher_)`, reduced (R583-4):
+/// the caller's `s` is `kind-raw` (batch 42: model `raw`, `degraded kind-raw`;
+/// stated here by the frame override), and the argument is the address of a
+/// field reached through that raw formal. The callee is held, so its formal
+/// is its raw input form.
+const RAW_ROOTED: &str = "#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]\n\
+    // w6a-r583-raw-rooted-frame\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)]\n\
+    pub struct Hasher { pub n: u32 }\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)]\n\
+    pub struct State { pub k: u32, pub hasher_: Hasher }\n\
+    unsafe fn hasher_reset(hasher: *mut Hasher) { (*hasher).n = 0; }\n\
+    pub unsafe fn encode_data(s: *mut State, out: *mut u32) {\n\
+        hasher_reset(&mut (*s).hasher_);\n\
+        *out = (*s).k;\n\
+    }\n";
+
+/// The frame: `encode_data::s` is `Raw`, as the model has it on the corpus.
+fn raw_rooted(input: &str) -> Run {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set(
+        "w6a-r583-raw-rooted-frame",
+        Vec::new(),
+        vec![("encode_data::s".to_owned(), SlotKind::Raw)],
+    );
+    let out = run(input, "encode_data", "hasher_reset");
+    super::test_model_override::clear();
+    out
+}
+
+/// **R583-4 — the raw-rooted arm.** An address rooted in a raw formal through
+/// undelivered fields, into a held callee's raw formal, crosses no boundary:
+/// admitted as written, no bridge and no retention reading, receipted
+/// `held-callee-input:raw-rooted`.
+#[test]
+fn w6a_r583_a_raw_rooted_address_at_a_held_callee_is_admitted_as_written() {
+    let run = raw_rooted(RAW_ROOTED);
+    assert_eq!(
+        run.inputs,
+        vec![(
+            "zero-syntax".to_owned(),
+            Some((BridgeRetentionTier::None, None))
+        )],
+        "{}\n{}",
+        rows(&run.dispositions, "hasher_reset").join("\n"),
+        run.held_source
+    );
+    let src = compact(&run.held_source);
+    assert!(
+        src.contains("fnhasher_reset(hasher:*mutHasher)"),
+        "the callee is held:\n{}",
+        run.held_source
+    );
+    assert!(
+        src.contains("fnencode_data(s:*mutState,out:&mutu32)"),
+        "the caller stays converted beside the held callee:\n{}",
+        run.held_source
+    );
+    assert!(
+        src.contains("hasher_reset(&mut(*s).hasher_);"),
+        "the argument is rendered as written:\n{}",
+        run.held_source
+    );
+}
+
+/// The `found_form` of every held-callee input's receipt (`-` for none).
+fn receipts(run: &Run) -> Vec<String> {
+    run.inputs
+        .iter()
+        .map(|(rendering, _)| rendering.clone())
+        .collect()
+}
+
+/// Control (R583-4): a raw LOCAL root is not the ruled shape — the arm reads
+/// a formal only, so `let t = s; hasher_reset(&mut (*t).hasher_)` keeps the
+/// existing refusal.
+#[test]
+fn w6a_r583_a_raw_local_root_is_not_the_raw_rooted_arm() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let input = RAW_ROOTED.replace(
+        "hasher_reset(&mut (*s).hasher_);",
+        "let mut t = s; hasher_reset(&mut (*t).hasher_);",
+    );
+    assert_ne!(input, RAW_ROOTED);
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set(
+        "w6a-r583-raw-rooted-frame",
+        Vec::new(),
+        vec![
+            ("encode_data::s".to_owned(), SlotKind::Raw),
+            ("encode_data::t".to_owned(), SlotKind::Raw),
+        ],
+    );
+    let run = run(&input, "encode_data", "hasher_reset");
+    super::test_model_override::clear();
+    assert_eq!(
+        receipts(&run),
+        vec!["callee-parameter-input-raw-boundary-held".to_owned()],
+        "{}\n{}",
+        rows(&run.dispositions, "hasher_reset").join("\n"),
+        run.held_source
+    );
+}
+
+/// Control (R583-4): the address of the raw formal's own slot (`&mut s`) is
+/// not rooted THROUGH it — that is R473-2's value-local question — so it is
+/// not the raw-rooted arm.
+#[test]
+fn w6a_r583_the_formals_own_slot_is_not_raw_rooted() {
+    let input = RAW_ROOTED
+        .replace(
+            "unsafe fn hasher_reset(hasher: *mut Hasher) { (*hasher).n = 0; }",
+            "unsafe fn hasher_reset(slot: *mut *mut State) { (**slot).k = 0; }",
+        )
+        .replace("hasher_reset(&mut (*s).hasher_);", "hasher_reset(&mut s);")
+        .replace("encode_data(s: *mut State", "encode_data(mut s: *mut State");
+    assert_ne!(input, RAW_ROOTED);
+    let run = raw_rooted(&input);
+    assert!(
+        !run.inputs
+            .iter()
+            .any(|(_, bridge)| bridge == &Some((BridgeRetentionTier::None, None))),
+        "{:?}\n{}\n{}",
+        run.inputs,
+        rows(&run.dispositions, "hasher_reset").join("\n"),
+        run.held_source
+    );
+}
+
+/// bst's `node` with its two children delivered as owned fields (era-5c's
+/// frame), and a caller whose raw formal reaches a key THROUGH a delivered
+/// child: `&mut (*(*s).left).key` crosses the field transaction, so it is not
+/// raw-rooted.
+const THROUGH_DELIVERED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+// w6a-r583-through-delivered-frame
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct node {
+    pub key: i32,
+    pub left: *mut node,
+    pub right: *mut node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn newNode(mut item: i32) -> *mut node {
+    let mut temp = malloc(::std::mem::size_of::<node>()) as *mut node;
+    (*temp).key = item;
+    (*temp).left = 0 as *mut node;
+    (*temp).right = 0 as *mut node;
+    return temp;
+}
+#[no_mangle]
+pub unsafe extern "C" fn freeTree(mut root: *mut node) {
+    if root.is_null() { return; }
+    freeTree((*root).left);
+    freeTree((*root).right);
+    free(root as *mut core::ffi::c_void);
+}
+unsafe fn reset_key(k: *mut i32) { *k = 0; }
+pub unsafe fn touch(s: *mut node, out: *mut i32) {
+    reset_key(&mut (*(*s).left).key);
+    *out = (*s).key;
+}
+"#;
+
+/// Control (R583-4): an argument whose path crosses a DELIVERED field
+/// transaction is not raw-rooted; the existing rules decide it.
+#[test]
+fn w6a_r583_a_path_through_a_delivered_field_is_not_raw_rooted() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set(
+        "w6a-r583-through-delivered-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+            ("freeTree::root".to_owned(), SlotKind::Owning),
+            ("touch::s".to_owned(), SlotKind::Raw),
+        ],
+    );
+    let run = run(THROUGH_DELIVERED, "touch", "reset_key");
+    super::test_model_override::clear();
+    println!(
+        "R583 delivered control: {:?}\n{}\n{}",
+        run.inputs,
+        rows(&run.dispositions, "reset_key").join("\n"),
+        run.held_source
+    );
+    assert!(
+        run.held_source.contains("pub left: Option<Box<node>>"),
+        "the field is delivered:\n{}",
+        run.held_source
+    );
+    assert!(
+        !run.inputs
+            .iter()
+            .any(|(_, bridge)| bridge == &Some((BridgeRetentionTier::None, None))),
+        "{:?}\n{}",
+        run.inputs,
+        run.held_source
+    );
+}
+
+/// Control (R583-4, the arm's premise): the same address shape rooted in a
+/// SAFE formal. `quality(p, ..)` passes `&mut (*p).hasher` to the held
+/// `init_or_stitch`, which retains `&mut (*hasher).common` inside the hasher
+/// itself — §130's channel IS present (the caller's `p` is a reference), so
+/// the retention reading is owed and the raw-rooted arm must not admit it.
+#[test]
+fn w6a_r583_a_safe_root_is_not_raw_rooted() {
+    let cut = QUALITY10
+        .find("pub unsafe fn quality10")
+        .expect("the Quality10 caller");
+    let input = format!(
+        "{}{}",
+        &QUALITY10[..cut],
+        "#[derive(Copy, Clone)]\n\
+        #[repr(C)]\n\
+        pub struct Outer { pub hasher: Hasher }\n\
+        pub unsafe fn quality(p: *mut Outer, out: *mut u32, x: u32) {\n\
+            init_or_stitch(&mut (*p).hasher, x);\n\
+            *out = (*(*p).hasher.h2.common).n + (*p).hasher.h2.k;\n\
+        }\n"
+    );
+    assert_ne!(
+        input, QUALITY10,
+        "the control must root the address in a formal"
+    );
+    let run = run(&input, "quality", "init_or_stitch");
+    println!(
+        "R583 safe-root control: {:?}\n{}\n{}",
+        run.inputs,
+        rows(&run.dispositions, "init_or_stitch").join("\n"),
+        run.held_source
+    );
+    // The premise: the root is a SAFE subject whose address the callee
+    // retains — the raw boundary reads a positive retention, not
+    // `raw-boundary-subject-not-safe`.
+    let init = rows(&run.dispositions, "init_or_stitch");
+    assert!(
+        init.iter()
+            .any(|row| row.contains("quality::p#1")
+                && row.contains("raw-boundary-positive-retention")),
+        "{}",
+        init.join("\n")
+    );
+    assert!(
+        !run.inputs
+            .iter()
+            .any(|(_, bridge)| bridge == &Some((BridgeRetentionTier::None, None))),
+        "{:?}\n{}",
+        run.inputs,
+        run.held_source
+    );
+}
