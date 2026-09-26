@@ -5826,6 +5826,13 @@ pub(crate) struct RawBoundaryDispositionIndex {
     /// site moves. Measured cost of publishing it instead: 18 reds over seven
     /// lanes (report 047).
     address_root: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
+    /// **R575-5 — the held-callee disposition.** `address_root`'s sibling for
+    /// the HELD callee: the R481-2 tier-2 retention waiver computed with the
+    /// target raw, because a held callee's emitted formal IS its raw input
+    /// form. The kept disposition answers the kept world (`target_stays_raw`
+    /// is the decided formal, where the waiver declines) and stays the site's
+    /// public one; this answers only the callee parameter input's question.
+    held_address_root: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
     /// **Wave-6o (relay 018 §1, R304-2).** Null-init-family locals whose
     /// boundary site would be a PENDING sibling-overlap row if delivered — a
     /// stated hold the family consults before delivering.
@@ -5877,6 +5884,16 @@ impl RawBoundaryDispositionIndex {
         key: &RawBoundarySiteKey,
     ) -> Option<&RawBoundaryDisposition> {
         self.address_root.get(key)
+    }
+
+    /// R575-5: the held-callee disposition of an address-of-a-value-local
+    /// site. Only `callee_parameter_input`'s held-callee alternative consults
+    /// it.
+    pub(crate) fn held_address_root_disposition(
+        &self,
+        key: &RawBoundarySiteKey,
+    ) -> Option<&RawBoundaryDisposition> {
+        self.held_address_root.get(key)
     }
 
     pub(crate) fn returned_child_evidence(
@@ -5938,6 +5955,8 @@ impl RawBoundaryDispositionIndex {
                     })
                     .unwrap_or(true)
             });
+            // R575-5: what the R481-2 arm would grant with the target raw.
+            let mut held_callee: Option<RawBoundaryDisposition> = None;
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
                     let node = site.node.ok_or_else(|| {
@@ -6450,6 +6469,22 @@ impl RawBoundaryDispositionIndex {
                                     // licenses a safe-to-raw view and there is
                                     // no raw view here. The site holds exactly
                                     // as it did before the waiver.
+                                    //
+                                    // R575-5: a HELD callee's formal is raw, so
+                                    // there the waiver applies; recorded for
+                                    // that world only (published below).
+                                    held_callee = Some(RawBoundaryDisposition::T2 {
+                                        template,
+                                        reason: RetentionUnknownReason::PositiveRetentionWaived,
+                                        waiver_id: RAW_BOUNDARY_RETENTION_WAIVER_ID,
+                                        evidence: format!(
+                                            "{evidence};retention-waiver(tier-2, kind=known, held-callee, subject={}, callee={}):{sink:?}",
+                                            subject
+                                                .as_ref()
+                                                .map_or("-", |subject| subject.label.as_str()),
+                                            site.key.callee.path,
+                                        ),
+                                    });
                                     Err((
                                         RawBoundaryBlockReason::PositiveRetention,
                                         format!("{sink:?}"),
@@ -6523,6 +6558,18 @@ impl RawBoundaryDispositionIndex {
                     detail,
                 }),
             };
+            // R575-5: the held world, for the same R473-2 sites only.
+            if let Some(held) = held_callee
+                && site.node.is_some_and(|node| !decisions.contains_key(&node))
+                && address_of_value_local_source(
+                    site.source_shape,
+                    site.address_root_local,
+                    site.address_root_raw_pointer,
+                )
+                .is_some()
+            {
+                out.held_address_root.insert(site.key.clone(), held);
+            }
             let box_slice = site
                 .node
                 .and_then(|node| decisions.get(&node).map(|(_, decision)| *decision))

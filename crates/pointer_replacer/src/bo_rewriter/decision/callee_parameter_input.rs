@@ -392,6 +392,35 @@ fn current_alternative(
     ) {
         return Ok(zero(arg, found));
     }
+    // R575-5: this alternative exists only for a HELD callee, whose emitted
+    // formal is its raw input form. There R481-2's tier-2 retention waiver
+    // applies although the kept disposition (the formal decided safe)
+    // declines, so the raw boundary publishes the held-world answer beside
+    // R473-2's. The same zero syntax, receipted: the waiver spent is counted
+    // per site.
+    if matches!(disposition, RawBoundaryDisposition::Blocked { .. })
+        && let Some(RawBoundaryDisposition::T2 { waiver_id, .. }) =
+            raw.held_address_root_disposition(key)
+    {
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::ZeroSyntax { found },
+            arg_span: arg.span,
+            bridge: Some(BridgeSitePlan {
+                caller,
+                callee: BridgeCalleeId::Local(callee),
+                arm: "c".into(),
+                position: format!("arg{}", arg.index),
+                bridge_kind: "interface-call-zero-syntax".into(),
+                expected_form: input_form.key().into(),
+                found_form: found.key().into(),
+                argument_kind: arg.shape.key().into(),
+                extent: BridgeExtentKind::None,
+                retention: BridgeRetentionTier::T2,
+                waiver_id: Some((*waiver_id).to_owned()),
+                unsafe_context: None,
+            }),
+        });
+    }
     let (retention, waiver_id) = match disposition {
         RawBoundaryDisposition::T1 { .. } => (BridgeRetentionTier::T1, None),
         RawBoundaryDisposition::T2 { waiver_id, .. } => {

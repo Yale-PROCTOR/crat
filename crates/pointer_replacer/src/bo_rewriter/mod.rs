@@ -157,6 +157,8 @@ mod wave6a_box_param_tests;
 #[cfg(test)]
 mod wave6a_fixture_tulip;
 #[cfg(test)]
+mod wave6a_held_callee_tests;
+#[cfg(test)]
 mod wave6a_return_certificate_tests;
 #[cfg(test)]
 mod wave6f_field_reference_tests;
