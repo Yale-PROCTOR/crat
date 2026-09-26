@@ -3412,6 +3412,9 @@ fn r521_the_literal_spells_the_two_field_kinds_the_certificate_refused() {
 fn r536_a_selected_literal_joins_its_fields_withdrawal_key() {
     use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
     const BST: &str = include_str!("ownership_fields_fixture_bst_owned.rs");
+    // R583-7: the model override is one global slot, and every frame test in
+    // the crate holds `frame_lock()`; take it first, in `frame_locks()`'s order.
+    let _frame = super::test_model_override::frame_lock();
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -3495,6 +3498,9 @@ fn r536_a_selected_literal_joins_its_fields_withdrawal_key() {
 fn r560_a_moved_out_owner_whose_container_is_freed_is_an_optional_box() {
     use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
     const BST: &str = include_str!("ownership_fields_fixture_bst_owned.rs");
+    // R583-7: the model override is one global slot, and every frame test in
+    // the crate holds `frame_lock()`; take it first, in `frame_locks()`'s order.
+    let _frame = super::test_model_override::frame_lock();
     let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -3591,6 +3597,9 @@ pub unsafe fn cut(mut root: *mut node) -> *mut node {{
         )
     };
     let decide = |source: String| {
+        // R583-7: the model override is one global slot, and every frame test in
+        // the crate holds `frame_lock()`; take it first, in `frame_locks()`'s order.
+        let _frame = super::test_model_override::frame_lock();
         let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
