@@ -345,17 +345,29 @@ mod tests {
                         no_borrow_origin: vec![], occurrences: vec![],
                         ownership: OwnershipCorrespondence {
                             versions: OriginAvailability::Missing(OriginMissing::OwnershipVersionsNotSupplied),
-                            equations: OriginMissing::OwnershipEquationsNotExported,
+                            equations: OriginAvailability::Missing(OriginMissing::OwnershipEquationsNotExported),
+                            consumes: OriginAvailability::Missing(OriginMissing::OwnershipConsumesNotRecorded),
+                            terminals: OriginAvailability::Missing(OriginMissing::OwnershipTerminalsNotRecorded),
+                            boundary_substitutions: OriginAvailability::Missing(OriginMissing::OwnershipBoundarySubstitutionsNotRecorded),
+                            call_arg_registrations: OriginAvailability::Missing(OriginMissing::CallArgRegistrationsNotRecorded),
+                            equation_valuation_join: OriginMissing::EquationValuationJoinNotRecorded,
+                            origin_closure: OriginMissing::OriginClosureNotComputed,
+                            boundary_terminal_roster: OriginMissing::IndependentSlotOwnershipJoinNotRecorded,
                             dynamic_epochs: OriginMissing::DynamicEpochNotRepresented,
                             partner_free: OriginMissing::PartnerFreeCorrespondenceNotExported,
                             conservation: OriginMissing::ConservationNotProved,
                         },
                     }).collect(),
+                    licensing: None,
+                    reader_replay: None,
+                    stack_entry_final: None,
                 };
                 let metadata = Metadata {
                     schema: cache_contract::SCHEMA.into(), key: key.clone(), inputs: actual.clone(),
                     functions, universe: rows.keys().cloned().collect(), baseline: rows.clone(), model: rows,
-                    receipt: "status=ok\ndata=true".into(), origin: serde_json::to_value(origin).unwrap(),
+                    receipt: "status=ok\ndata=true".into(), origin: cache_contract::stream::OriginSource::Evidence {
+                        evidence: Box::new(origin), present: Default::default(),
+                    },
                 };
                 metadata.validate_meta().unwrap();
                 let payload_digest = Sha256::digest(serde_json::to_vec(
