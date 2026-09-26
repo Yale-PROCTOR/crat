@@ -2043,6 +2043,10 @@ pub(crate) struct Plan {
     /// wave-6f: the owner classes of each applied field transaction — one
     /// edit region across functions, reverted together.
     pub field_transaction_owners: Vec<BTreeSet<SignatureClassId>>,
+    /// **R584-4 (wave-6a)**: the owner classes of each allocation-return
+    /// certificate (`Certificates::owners`) — a certificate applies only while
+    /// none is reverted, so they revert together, in the same round.
+    pub certificate_owners: Vec<BTreeSet<SignatureClassId>>,
 }
 
 /// wave-6f: does a field transaction plan this local's explicit declaration?
@@ -5916,6 +5920,19 @@ pub(crate) fn plan(
             .owner_sets()
             .into_iter()
             .map(|owners| owners.into_iter().map(SignatureClassId::of).collect())
+            .collect(),
+        certificate_owners: table
+            .return_certificates
+            .callees
+            .keys()
+            .map(|callee| {
+                table
+                    .return_certificates
+                    .owners(*callee)
+                    .into_iter()
+                    .map(SignatureClassId::of)
+                    .collect()
+            })
             .collect(),
     }
 }

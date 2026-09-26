@@ -1741,9 +1741,15 @@ pub(crate) fn effective_withheld_classes(
     let mut effective = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
     // wave-6f: a field transaction is one edit region across its owners — a
     // reverted owner withdraws the field, and the field's other owners with it.
+    // R584-4: an allocation-return certificate likewise — its signature is
+    // withheld once any owner reverts, so its local plans go in the same round.
     loop {
         let before = effective.len();
-        for owners in &emission_plan.field_transaction_owners {
+        for owners in emission_plan
+            .field_transaction_owners
+            .iter()
+            .chain(&emission_plan.certificate_owners)
+        {
             if owners.iter().any(|owner| effective.contains(owner)) {
                 effective.extend(owners.iter().copied());
             }

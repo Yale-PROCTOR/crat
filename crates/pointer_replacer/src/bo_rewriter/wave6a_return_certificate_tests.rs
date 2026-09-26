@@ -2523,3 +2523,85 @@ fn w6a_r583_field_moves_follow_the_current_delivery() {
     super::test_model_override::clear();
     assert_eq!(observed, ((2, 0), true, (0, 2)));
 }
+
+/// wave-6f 072's shape (their `wave6f_fixture_certified_store.rs`, my copy):
+/// `make_item` certifies `Box<item>`, `attach`'s ONLY site of the owned field
+/// `holder.item` is the certified-call store, and `make_item` owns no site
+/// of the field.
+const CERTIFIED_STORE: &str = r#"// w6a-r584-certified-store-frame
+#![allow(dead_code, unused_mut, unused_unsafe, non_camel_case_types, unused_variables, unused_assignments)]
+extern "C" {
+    fn malloc(_: u64) -> *mut ::std::ffi::c_void;
+    fn free(_: *mut ::std::ffi::c_void);
+}
+#[repr(C)]
+pub struct item {
+    pub v: i32,
+}
+#[repr(C)]
+pub struct holder {
+    pub item: *mut item,
+}
+pub unsafe extern "C" fn make_item(mut v: i32) -> *mut item {
+    let mut p: *mut item = malloc(::std::mem::size_of::<item>() as u64) as *mut item;
+    (*p).v = v;
+    return p;
+}
+pub unsafe extern "C" fn attach(mut h: *mut holder, mut v: i32) {
+    (*h).item = make_item(v);
+}
+pub unsafe extern "C" fn value(mut h: *mut holder) -> i32 {
+    return (*(*h).item).v;
+}
+pub unsafe extern "C" fn release(mut h: *mut holder) {
+    free((*h).item as *mut ::std::ffi::c_void);
+    (*h).item = 0 as *mut item;
+}
+"#;
+
+/// **R584-4 (wave-6f 072 §4)** — a certificate reverts WHOLE in the round
+/// one of its owners reverts. `attach` (the certified storer) is reverted for
+/// a reason of its own; `Certificates::owners` then withholds the
+/// certificate's signature, and its callee's LOCAL plan (`make_item::p` →
+/// `Box::new(..)`) must go in the same round — the certificate's owner set is
+/// closed in the round's withheld set, as a field transaction's is. Before,
+/// round 1 shipped `return p;` as a `Box<item>` against the withheld
+/// `*mut item` (E0308) and the loop converged one revert later.
+#[test]
+fn w6a_r584_a_certificate_reverts_whole_in_its_owners_round() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r584-certified-store-frame",
+        vec![("holder".to_owned(), 0, SlotKind::Owning)],
+        Vec::new(),
+    );
+    let dir = std::env::temp_dir().join(format!("w6a-r584-first-failing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // SAFETY: the frame locks serialize the witnesses that set these.
+    unsafe {
+        std::env::set_var("CRAT_W6F_FORCE_REVERT", "attach");
+        std::env::set_var("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE", &dir);
+    }
+    let out = emitted("r584-certified-store", CERTIFIED_STORE);
+    unsafe {
+        std::env::remove_var("CRAT_W6F_FORCE_REVERT");
+        std::env::remove_var("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE");
+    }
+    super::test_model_override::clear();
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = compact(&out.source);
+    assert_eq!(
+        out.artifacts.first_failing_verify_tree, "",
+        "no verify round fails: the callee reverts with its storer in round 1\n{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 2, "attach and make_item\n{}", out.source);
+    assert!(
+        text.contains("pubitem:*mutitem,")
+            && text.contains("fnmake_item(mutv:i32)->*mutitem{")
+            && text.contains("(*h).item=make_item(v);"),
+        "{}",
+        out.source
+    );
+}
