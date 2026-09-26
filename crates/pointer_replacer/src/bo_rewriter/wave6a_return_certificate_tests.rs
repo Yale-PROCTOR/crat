@@ -2426,12 +2426,15 @@ fn w6a_r579_an_undelivered_field_unseats_the_owner_parameter() {
     assert_eq!(out.reverted, 0, "{context}");
 }
 
-/// Control (R579-4 R3's scope): R3 lifts `return-locals:2` for owner locals
-/// BESIDE a primary owner. A callee whose one returned local is a load moved
-/// out of an owned field, with no owner of its own (`detachLeft`, the shape
-/// of avl's rotations), keeps exactly the reading it had before R3.
+/// **R583-8 wall 3 — a moved-out owner alone.** R579-4's R3 lifted
+/// `return-locals:2` only beside a primary owner, and this fixture was its
+/// scope control (`detachLeft` kept `return-certificate-allocation:…:
+/// construction`). Wall 3 admits the lone owner — the shape of avl's
+/// rotations: `detachLeft`'s one returned local is a load moved out of an
+/// owned field, adopted and confirmed by ownership-fields' certified return,
+/// so the callee certifies `Option<Box<node>>` and returns the owner as itself.
 #[test]
-fn w6a_r579_a_lone_field_load_return_keeps_its_hold() {
+fn w6a_r583_a_lone_moved_out_owner_is_certified() {
     let source = BST.replace(
         "#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
         "#[no_mangle]\npub unsafe extern \"C\" fn detachLeft(mut root: *mut node) -> *mut node {\n    let mut t = (*root).left;\n    (*root).left = 0 as *mut node;\n    return t;\n}\n#[no_mangle]\npub unsafe extern \"C\" fn minValueNode",
@@ -2460,12 +2463,18 @@ fn w6a_r579_a_lone_field_load_return_keeps_its_hold() {
     super::test_model_override::clear();
     let receipts = &out.artifacts.return_certificate_receipts;
     let context = format!("{receipts}\n{}", out.source);
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{context}");
     assert!(
-        receipts
-            .contains("detachLeft::t\theld\treturn-certificate-allocation:detachLeft:construction"),
+        receipts.contains("return-certificate-adopted owners=detachLeft::t"),
         "{context}"
     );
-    assert!(!receipts.contains("owners=detachLeft::t"), "{context}");
+    assert!(
+        text.contains("fndetachLeft(mutroot:&mutnode)->Option<Box<node>>")
+            && text.contains("(*root).left.take();")
+            && text.contains("returnt;"),
+        "{context}"
+    );
     // The rest of the transaction is unmoved by the extra callee.
     assert!(
         receipts.contains("return-certificate callee=deleteNode output=Option<Box<node>>"),
@@ -2603,5 +2612,343 @@ fn w6a_r584_a_certificate_reverts_whole_in_its_owners_round() {
             && text.contains("(*h).item=make_item(v);"),
         "{}",
         out.source
+    );
+}
+
+/// avl, reduced from the corpus in its substrate form (the `ref mut fresh`
+/// stores already plain): `newNode`, the two rotations, `insert`.
+const AVL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+// w6a-r579-avl-frame
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+    pub height: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn height(mut N: *mut Node) -> i32 {
+    if N.is_null() { return 0 as i32; }
+    return (*N).height;
+}
+#[no_mangle]
+pub unsafe extern "C" fn max(mut a: i32, mut b: i32) -> i32 {
+    return if a > b { a } else { b };
+}
+#[no_mangle]
+pub unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    (*node).height = 1 as i32;
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn rightRotate(mut y: *mut Node) -> *mut Node {
+    let mut x = (*y).left;
+    let mut T2 = (*x).right;
+    (*y).left = T2;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    (*x).right = y;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    return x;
+}
+#[no_mangle]
+pub unsafe extern "C" fn leftRotate(mut x: *mut Node) -> *mut Node {
+    let mut y = (*x).right;
+    let mut T2 = (*y).left;
+    (*x).right = T2;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    (*y).left = x;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    return y;
+}
+#[no_mangle]
+pub unsafe extern "C" fn getBalance(mut N: *mut Node) -> i32 {
+    if N.is_null() { return 0 as i32; }
+    return height((*N).left) - height((*N).right);
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() { return newNode(key); }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else if key > (*node).key {
+        (*node).right = insert((*node).right, key);
+    } else { return node }
+    (*node).height = 1 as i32 + max(height((*node).left), height((*node).right));
+    let mut balance = getBalance(node);
+    if balance > 1 as i32 && key < (*(*node).left).key {
+        return rightRotate(node);
+    }
+    if balance < -(1 as i32) && key > (*(*node).right).key {
+        return leftRotate(node);
+    }
+    if balance > 1 as i32 && key > (*(*node).left).key {
+        (*node).left = leftRotate((*node).left);
+        return rightRotate(node);
+    }
+    if balance < -(1 as i32) && key < (*(*node).right).key {
+        (*node).right = rightRotate((*node).right);
+        return leftRotate(node);
+    }
+    return node;
+}
+"#;
+
+/// era-5c's L01⁹ avl frame (report 067: avl's ten CROWN units Owning —
+/// `Node::field1` / `field2`, `insert::node`, `newNode::node`, the rotations'
+/// `x` / `y` / `T2`), the readers Ref.
+fn avl_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    let _frame = frame_locks();
+    avl_frame();
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+/// report 067's ten Owning units, the readers `Ref`. The caller holds the
+/// frame locks.
+fn avl_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6a-r579-avl-frame",
+        vec![
+            ("Node".to_owned(), 1, SlotKind::Owning),
+            ("Node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("newNode::node".to_owned(), SlotKind::Owning),
+            ("rightRotate::y".to_owned(), SlotKind::Owning),
+            ("rightRotate::x".to_owned(), SlotKind::Owning),
+            ("rightRotate::T2".to_owned(), SlotKind::Owning),
+            ("leftRotate::x".to_owned(), SlotKind::Owning),
+            ("leftRotate::y".to_owned(), SlotKind::Owning),
+            ("leftRotate::T2".to_owned(), SlotKind::Owning),
+            ("height::N".to_owned(), SlotKind::Ref),
+            ("getBalance::N".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// avl's round-1 tree: the first failing verify tree when a round fails,
+/// else the emitted tree (no round failed). Every planned rendering is in it
+/// either way, whatever a later round reverts.
+fn avl_round1(name: &str, source: &str) -> (super::wave6a_allocation_tests::Emitted, String) {
+    let dir = std::env::temp_dir().join(format!("w6a-r583-avl-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The locks FIRST: another frame witness brackets the same variable, and
+    // setting it while waiting for them lets that witness's removal land
+    // inside this emission (measured at 4 threads: no capture).
+    let _frame = frame_locks();
+    avl_frame();
+    // SAFETY: the frame locks serialize every writer of this variable.
+    unsafe { std::env::set_var("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE", &dir) };
+    let out = emitted(name, source);
+    unsafe { std::env::remove_var("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE") };
+    super::test_model_override::clear();
+    let _ = std::fs::remove_dir_all(&dir);
+    let round1 = if out.artifacts.first_failing_verify_tree.is_empty() {
+        out.source.clone()
+    } else {
+        out.artifacts.first_failing_verify_tree.clone()
+    };
+    (out, round1)
+}
+
+/// **R583-8 — avl on L01⁹, walls 1–3.** Under report 067's ten Owning units
+/// the recursive certificate reaches avl: `insert` hands its re-seated formal
+/// back or ON (`return rightRotate(node)`, wall 1), the rotations consume a
+/// formal from `insert` (the re-seated `node`, wall 2(a)) or an owned child
+/// (`leftRotate((*node).left)`, 2(b)), store it into an owned field (2(c)),
+/// and return the owner they move out of a field alone (wall 3). The round-1
+/// tree carries it whole: every signature certified, every store a plain
+/// move, the lend of the optional owner its own view, no `from_raw` /
+/// `into_raw`. Where no round fails (ownership-fields' moved-load
+/// projection, report 112 §1, in place) it is also the emitted tree.
+#[test]
+fn w6a_r583_the_recursive_certificate_moves_avl_whole() {
+    let (out, round1) = avl_round1("r583-avl", AVL);
+    record(
+        "r583-avl",
+        &format!("{}\n{}", out.artifacts.return_certificate_receipts, round1),
+    );
+    let text = compact(&round1);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let chains = &out.artifacts.box_param_receipts;
+    let context = format!("{receipts}\n{chains}\n{round1}");
+    assert!(
+        receipts.contains(
+            "return-certificate callee=insert output=Option<Box<Node>> source=owner-parameter"
+        ) && receipts.contains("return-certificate-adopted owners=rightRotate::x")
+            && receipts.contains("return-certificate-adopted owners=leftRotate::y"),
+        "{context}"
+    );
+    assert!(
+        chains.contains("box-param-reseat callee=insert index=0 fields=2 transfers-at-return=4")
+            && chains.contains("box-param-chain callee=rightRotate index=0 sink=store")
+            && chains.contains("box-param-chain callee=leftRotate index=0 sink=store"),
+        "{context}"
+    );
+    assert!(
+        text.contains("fnnewNode(mutkey:i32)->Box<Node>"),
+        "{context}"
+    );
+    assert!(
+        text.contains("fnrightRotate(muty:Option<Box<Node>>)->Option<Box<Node>>")
+            && text.contains("fnleftRotate(mutx:Option<Box<Node>>)->Option<Box<Node>>"),
+        "{context}"
+    );
+    assert!(
+        text.contains("fninsert(mutnode:Option<Box<Node>>,mutkey:i32)->Option<Box<Node>>"),
+        "{context}"
+    );
+    assert!(
+        text.contains("returnrightRotate(node);")
+            && text.contains("returnleftRotate(node);")
+            && text.contains("returnSome(newNode(key));")
+            && text.contains("getBalance(node.as_deref())")
+            && text.contains("=leftRotate((*node.as_deref_mut().unwrap()).left.take());")
+            && text.contains("(*x.as_deref_mut().unwrap()).right=y;")
+            && text.contains("(*y.as_deref_mut().unwrap()).left=x;"),
+        "{context}"
+    );
+    assert!(
+        !text.contains("from_raw") && !text.contains("into_raw"),
+        "{context}"
+    );
+    if out.artifacts.first_failing_verify_tree.is_empty() {
+        assert_eq!(out.reverted, 0, "{context}");
+    }
+}
+
+/// The avl frame's holds on the Box-parameter family, one line per hold.
+fn chain_holds(out: &super::wave6a_allocation_tests::Emitted) -> Vec<String> {
+    out.artifacts
+        .box_param_receipts
+        .lines()
+        .filter(|line| line.contains("\theld\t"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Control (R583-8 walls 1 / 2(b)): a rotation whose owned child is handed
+/// in and the result DISCARDED (`rightRotate((*node).right);`) would leave
+/// the field `None` where C left it intact, so the chain refuses that
+/// caller; the re-seat that hands `node` on at `return rightRotate(node)` then
+/// has no chain to hand into and withdraws, and the chain that took the
+/// re-seated `node` as its member withdraws with it.
+#[test]
+fn w6a_r583_a_discarded_child_hand_on_holds_the_hand_ons() {
+    let source = AVL.replace(
+        "    let mut balance = getBalance(node);\n",
+        "    let mut balance = getBalance(node);\n    rightRotate((*node).right);\n",
+    );
+    assert_ne!(source, AVL, "the control must discard a rotation's result");
+    let (out, _) = avl_round1("r583-avl-discarded", &source);
+    let holds = chain_holds(&out);
+    let context = format!("{holds:#?}\n{}", out.artifacts.box_param_receipts);
+    assert!(
+        holds.iter().any(|h| h.starts_with("rightRotate::y")
+            && h.contains("box-param-caller-retains:insert:not-a-local")),
+        "{context}"
+    );
+    assert!(
+        holds.iter().any(|h| h.starts_with("insert::node")
+            && h.contains("box-param-reseat-transfer-unplanned:insert")),
+        "{context}"
+    );
+    assert!(
+        holds.iter().any(|h| h.starts_with("leftRotate::x")
+            && h.contains("box-param-chain-member-withdrawn:leftRotate")),
+        "{context}"
+    );
+}
+
+/// Control (R583-8 wall 1): a hand-on that is NOT the `return` operand
+/// (`let r = rightRotate(node); return r;`) leaves a path on which the owner
+/// has moved, so the re-seat still refuses it (`box-param-reseat-escapes`).
+#[test]
+fn w6a_r583_a_hand_on_off_the_return_is_not_a_reseat() {
+    let source = AVL.replacen(
+        "        return rightRotate(node);\n    }\n    if balance < -(1 as i32) && key > (*(*node).right).key {",
+        "        let mut r = rightRotate(node);\n        return r;\n    }\n    if balance < -(1 as i32) && key > (*(*node).right).key {",
+        1,
+    );
+    assert_ne!(source, AVL, "the control must bind the rotation's result");
+    let (out, _) = avl_round1("r583-avl-bound", &source);
+    let holds = chain_holds(&out);
+    assert!(
+        holds.iter().any(|h| h.starts_with("insert::node")
+            && h.contains("box-param-reseat-escapes:insert")),
+        "{holds:#?}\n{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// Control (R583-8 wall 2(c)): an optional formal whose store goes into a
+/// field the model does NOT own (`Node.right` not `Owning` here) is a raw
+/// transfer, not the field's move, so the optional chain refuses its sink.
+/// `rightRotate`'s only member is the re-seated `node` (optional).
+#[test]
+fn w6a_r583_an_optional_formal_stored_into_a_raw_field_holds() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r579-avl-frame",
+        vec![("Node".to_owned(), 1, SlotKind::Owning)],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("newNode::node".to_owned(), SlotKind::Owning),
+            ("rightRotate::y".to_owned(), SlotKind::Owning),
+            ("rightRotate::x".to_owned(), SlotKind::Owning),
+            ("rightRotate::T2".to_owned(), SlotKind::Owning),
+            ("leftRotate::x".to_owned(), SlotKind::Owning),
+            ("leftRotate::y".to_owned(), SlotKind::Owning),
+            ("leftRotate::T2".to_owned(), SlotKind::Owning),
+            ("height::N".to_owned(), SlotKind::Ref),
+            ("getBalance::N".to_owned(), SlotKind::Ref),
+        ],
+    );
+    // Only the re-seated `node` is a member (the double rotations, whose
+    // owned-child members would refuse first, are cut).
+    let start = AVL
+        .find("    if balance > 1 as i32 && key > (*(*node).left).key {")
+        .expect("double rotations");
+    let end = AVL[start..].find("    return node;\n}").expect("the tail") + start;
+    let source = format!("{}{}", &AVL[..start], &AVL[end..]);
+    let out = emitted("r583-avl-raw-right", &source);
+    super::test_model_override::clear();
+    let holds = chain_holds(&out);
+    assert!(
+        holds.iter().any(|h| h.starts_with("rightRotate::y")
+            && h.contains("box-param-shape:rightRotate:optional-owner-sink")),
+        "{holds:#?}\n{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// Control (R583-8 wall 2): a chain's owned field that no transaction
+/// delivers (`Node.left` is indexed below, so its transaction holds) withdraws
+/// the chain after the fields finalize, with its own hold.
+#[test]
+fn w6a_r583_an_undelivered_chain_field_withdraws_the_chain() {
+    let source = format!(
+        "{AVL}#[no_mangle]\npub unsafe extern \"C\" fn peekSecond(mut n: *mut Node) -> i32 {{\n    return (*(*n).left.offset(1 as isize)).key;\n}}\n"
+    );
+    let (out, _) = avl_round1("r583-avl-left-held", &source);
+    let holds = chain_holds(&out);
+    assert!(
+        holds.iter().any(|h| h.starts_with("leftRotate::x")
+            && h.contains("box-param-chain-field-not-delivered:leftRotate")),
+        "{holds:#?}\n{}",
+        out.artifacts.box_param_receipts
     );
 }

@@ -2278,6 +2278,26 @@ impl<'a> SeamGraftVisitor<'a> {
         if let Some(weakening) = &spec.shared_weakening {
             return super::decision::shared_weakening::build(e, weakening);
         }
+        // R583-8 wall 1 (wave-6a): an optional owner's own view.
+        if let Some(mutable) = spec.option_view {
+            let argument = if target.arg_span == e.span {
+                e.clone()
+            } else {
+                find_by_span(e, target.arg_span)?.clone()
+            };
+            return Some(rustc_ast::ExprKind::MethodCall(Box::new(
+                rustc_ast::MethodCall {
+                    seg: rustc_ast::PathSegment::from_ident(Ident::from_str(if mutable {
+                        "as_deref_mut"
+                    } else {
+                        "as_deref"
+                    })),
+                    receiver: P(argument),
+                    args: ThinVec::new(),
+                    span: e.span,
+                },
+            )));
+        }
         if let Some(raw) = spec.raw_boundary.as_ref() {
             let argument = if target.arg_span == e.span {
                 e.clone()

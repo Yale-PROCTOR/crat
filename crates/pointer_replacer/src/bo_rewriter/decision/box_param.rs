@@ -84,6 +84,76 @@ pub(crate) struct Chains {
     /// (`withdraw_undelivered_reseats`).
     pub(crate) reseat_fields:
         FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
+    /// **R583-8 wall 1** — a re-seated formal handed on at a `return`: the
+    /// consuming formals it moves into, each a chain's `Box` formal or the
+    /// re-seat withdraws (`confirm_reseat_transfers`).
+    pub(crate) reseat_transfers: FxHashMap<(LocalDefId, HirId), Vec<(LocalDefId, HirId)>>,
+    /// **R583-8 wall 2** — a chain's formal → the re-seated formals that are
+    /// its members at a `return` (their plans are the re-seat's), and the
+    /// owned fields its members move out of or its store moves into; the
+    /// chain stands only while those members are planned and those fields
+    /// delivered.
+    pub(crate) chain_moved_on: FxHashMap<(LocalDefId, HirId), Vec<(LocalDefId, HirId)>>,
+    pub(crate) chain_fields:
+        FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
+    /// The member plans a chain inserted, withdrawn with it.
+    pub(crate) chain_members: FxHashMap<(LocalDefId, HirId), Vec<(LocalDefId, HirId)>>,
+    /// A planned formal's (label, callee path, index), for its withdrawal.
+    pub(crate) formal_labels: FxHashMap<(LocalDefId, HirId), (String, String, usize)>,
+}
+
+/// Withdraw a formal's plan (and the member plans its chain inserted) with a
+/// typed hold and without its admission receipt.
+fn withdraw_formal(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) {
+    chains.plans.remove(&key);
+    for member in chains.chain_members.remove(&key).unwrap_or_default() {
+        chains.plans.remove(&member);
+        chains.store_members.remove(&member);
+    }
+    if let Some((label, callee, index)) = chains.formal_labels.get(&key).cloned() {
+        chains.receipts.retain(|r| {
+            !r.starts_with(&format!("box-param-reseat callee={callee} index={index} "))
+                && !r.starts_with(&format!("box-param-chain callee={callee} index={index} "))
+        });
+        chains
+            .holds
+            .insert(key, (label, format!("{reason}:{callee}")));
+    }
+}
+
+/// **R583-8 walls 1 / 2 — a hand-on stands with the chain it hands into.** A
+/// re-seated formal handed on at a `return` is sound only where the
+/// transferee formal is a chain's `Box` formal; that chain in turn takes the
+/// re-seated formal as its member. So both are confirmed together, to a
+/// fixpoint: a re-seat whose transferee is not planned withdraws, and a chain
+/// whose moved-on member is not planned withdraws with the members it planned.
+/// Plans only shrink, so it terminates.
+fn confirm_hand_ons(chains: &mut Chains) -> bool {
+    let mut any = false;
+    loop {
+        let mut withdrawn: Vec<((LocalDefId, HirId), &'static str)> = Vec::new();
+        for (reseat, formals) in &chains.reseat_transfers {
+            if chains.plans.contains_key(reseat)
+                && formals.iter().any(|f| !chains.plans.contains_key(f))
+            {
+                withdrawn.push((*reseat, "box-param-reseat-transfer-unplanned"));
+            }
+        }
+        for (formal, members) in &chains.chain_moved_on {
+            if chains.plans.contains_key(formal)
+                && members.iter().any(|m| !chains.plans.contains_key(m))
+            {
+                withdrawn.push((*formal, "box-param-chain-member-withdrawn"));
+            }
+        }
+        if withdrawn.is_empty() {
+            return any;
+        }
+        any = true;
+        for (key, reason) in withdrawn {
+            withdraw_formal(chains, key, reason);
+        }
+    }
 }
 
 /// **wave-6a rule W6A-A9 — a proven lend leaves the owning arm** (relay
@@ -208,7 +278,22 @@ pub(crate) fn withdraw_undelivered_reseats(
             ),
         );
     }
-    !withdrawn.is_empty()
+    // R583-8 wall 2: a chain whose owned child or store field is not
+    // delivered withdraws the same way, and the hand-ons re-confirm.
+    let chain_withdrawn = chains
+        .chain_fields
+        .iter()
+        .filter(|(key, (_, _, fields))| {
+            chains.plans.contains_key(*key)
+                && fields.iter().any(|(did, index)| !delivered(*did, *index))
+        })
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>();
+    for key in &chain_withdrawn {
+        withdraw_formal(chains, *key, "box-param-chain-field-not-delivered");
+    }
+    let confirmed = confirm_hand_ons(chains);
+    !withdrawn.is_empty() || !chain_withdrawn.is_empty() || confirmed
 }
 
 /// **R579-4 R2** — the re-seats `derive` plans, computed from the same inputs
@@ -255,8 +340,16 @@ pub(crate) fn reseats(
         {
             continue;
         }
-        if let Reseat::Planned(plan, _) = reseat_plan(
-            tcx, functions, slots, model, consuming, &fn_values, param, &frees,
+        if let Reseat::Planned(plan, _, _) = reseat_plan(
+            tcx,
+            functions,
+            slots,
+            model,
+            consuming,
+            &fn_values,
+            param,
+            &frees,
+            &scan.return_calls,
         ) {
             out.insert((param.fn_did, param.hir_id), plan);
         }
@@ -279,7 +372,9 @@ enum Reseat {
     /// The body does not return the formal: A9's lend question applies.
     NotReturned,
     Held(String),
-    Planned(BoxPlan, Vec<(LocalDefId, usize)>),
+    /// The plan, the owned fields its call sites move out of, and (R583-8
+    /// wall 1) the consuming formals it is handed to at a `return`.
+    Planned(BoxPlan, Vec<(LocalDefId, usize)>, Vec<(DefId, usize)>),
 }
 
 /// **R536-3 — a formal consumed AND returned** (`root = insert(root, key)`,
@@ -307,6 +402,7 @@ fn reseat_plan<'tcx>(
     fn_values: &FxHashSet<DefId>,
     param: &Subject,
     frees: &[(Span, Span)],
+    return_calls: &[Span],
 ) -> Reseat {
     let SubjectKind::Param { hir_index } = param.kind else { return Reseat::NotReturned };
     let slot = slots
@@ -335,9 +431,24 @@ fn reseat_plan<'tcx>(
         return Reseat::NotReturned;
     }
     let callee_path = tcx.def_path_str(param.fn_did.to_def_id());
-    if !uses.stores.is_empty() || !uses.transfers.is_empty() {
+    // **R583-8 wall 1** — a transfer into a consuming formal is admitted
+    // where the call IS the `return` operand (avl's `return rightRotate(node)`):
+    // the owner is handed on and what comes back is that callee's result, and
+    // no path continues after it. The transferee formal must be a chain's
+    // `Box` formal (`confirm_reseat_transfers`), or the re-seat withdraws.
+    if !uses.stores.is_empty()
+        || uses
+            .transfers
+            .iter()
+            .any(|(_, _, call)| !return_calls.contains(call))
+    {
         return Reseat::Held(format!("box-param-reseat-escapes:{callee_path}"));
     }
+    let transfers: Vec<(DefId, usize)> = uses
+        .transfers
+        .iter()
+        .map(|(did, index, _)| (*did, *index))
+        .collect();
     if fn_values.contains(&param.fn_did.to_def_id()) {
         return Reseat::Held(format!("box-param-indirect-callers:{callee_path}"));
     }
@@ -392,6 +503,7 @@ fn reseat_plan<'tcx>(
             implicit_scope_close: false,
         },
         fields,
+        transfers,
     )
 }
 
@@ -631,6 +743,46 @@ struct Scan<'tcx> {
     fn_values: FxHashSet<DefId>,
     /// R561-4 W1: `x = ..` with `x` a bare local: (local, the assignment's span).
     assigns: Vec<(HirId, Span)>,
+    /// **R583-8 walls 1 / 2(a)**: the local calls that are a `return`
+    /// operand (`return rightRotate(node)`) — no path continues after them.
+    return_calls: Vec<Span>,
+    /// **R583-8 wall 2(b)**: a local call's argument that is a struct field
+    /// place `(*p).f`: (call span, index, the field, the argument's span,
+    /// whether the call's result is stored back into that same place).
+    field_args: Vec<(Span, usize, (LocalDefId, usize), Span, bool)>,
+}
+
+/// The local struct field a place projects (`(*p).f`), as (struct, index).
+fn field_key(tcx: TyCtxt<'_>, place: &Expr<'_>) -> Option<(LocalDefId, usize)> {
+    let ExprKind::Field(base, _) = place.kind else { return None };
+    let typeck = tcx.typeck(place.hir_id.owner.def_id);
+    let TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else { return None };
+    if !adt.is_struct() {
+        return None;
+    }
+    Some((
+        adt.did().as_local()?,
+        typeck.opt_field_index(place.hir_id)?.as_usize(),
+    ))
+}
+
+/// A field's model kind at depth 0.
+fn field_kind(
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    (struct_did, field_index): (LocalDefId, usize),
+) -> Option<SlotKind> {
+    slots
+        .field_slots
+        .slot_for_field_depth(
+            crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                struct_did,
+                field_index,
+            },
+            0,
+        )
+        .map(SlotRef::Field)
+        .and_then(|slot| model.get(&slot).copied())
 }
 
 impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
@@ -693,6 +845,36 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                         }
                     }
                     Some(did) if did.is_local() => {
+                        let tcx = self.tcx.expect("scan tcx");
+                        if matches!(
+                            tcx.parent_hir_node(e.hir_id),
+                            rustc_hir::Node::Expr(parent) if matches!(parent.kind, ExprKind::Ret(Some(value)) if value.hir_id == e.hir_id)
+                        ) {
+                            self.return_calls.push(e.span);
+                        }
+                        let stored_back_into = match tcx.parent_hir_node(e.hir_id) {
+                            rustc_hir::Node::Expr(parent) => match parent.kind {
+                                ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == e.hir_id => {
+                                    tcx.sess.source_map().span_to_snippet(lhs.span).ok()
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        for (index, arg) in args.iter().enumerate() {
+                            if let Some(field) = field_key(tcx, arg) {
+                                let stored_back = stored_back_into.as_deref().is_some_and(|lhs| {
+                                    tcx.sess
+                                        .source_map()
+                                        .span_to_snippet(arg.span)
+                                        .ok()
+                                        .as_deref()
+                                        == Some(lhs)
+                                });
+                                self.field_args
+                                    .push((e.span, index, field, arg.span, stored_back));
+                            }
+                        }
                         self.calls.push((
                             did,
                             e.span,
@@ -1129,7 +1311,15 @@ pub(crate) fn derive<'tcx>(
         // second-free count applies to it.
         if store.is_none() && moved_on.is_none() {
             match reseat_plan(
-                tcx, functions, slots, model, consuming, &fn_values, param, &frees,
+                tcx,
+                functions,
+                slots,
+                model,
+                consuming,
+                &fn_values,
+                param,
+                &frees,
+                &scan.return_calls,
             ) {
                 Reseat::NotReturned => {}
                 Reseat::Held(reason) => {
@@ -1137,14 +1327,39 @@ pub(crate) fn derive<'tcx>(
                         .insert((param.fn_did, param.hir_id), (param.label.clone(), reason));
                     continue;
                 }
-                Reseat::Planned(plan, fields) => {
+                Reseat::Planned(plan, fields, transfers) => {
                     out.receipts.push(format!(
-                        "box-param-reseat callee={callee_path} index={hir_index} fields={}",
-                        fields.len()
+                        "box-param-reseat callee={callee_path} index={hir_index} fields={}{}",
+                        fields.len(),
+                        if transfers.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" transfers-at-return={}", transfers.len())
+                        }
                     ));
+                    if !transfers.is_empty() {
+                        let formals = transfers
+                            .iter()
+                            .filter_map(|(did, index)| {
+                                subjects
+                                    .iter()
+                                    .find(|s| {
+                                        Some(s.fn_did) == did.as_local()
+                                            && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == *index)
+                                    })
+                                    .map(|s| (s.fn_did, s.hir_id))
+                            })
+                            .collect::<Vec<_>>();
+                        out.reseat_transfers
+                            .insert((param.fn_did, param.hir_id), formals);
+                    }
                     out.reseat_fields.insert(
                         (param.fn_did, param.hir_id),
                         (param.label.clone(), callee_path.clone(), fields),
+                    );
+                    out.formal_labels.insert(
+                        (param.fn_did, param.hir_id),
+                        (param.label.clone(), callee_path.clone(), hir_index),
                     );
                     out.plans.insert((param.fn_did, param.hir_id), plan);
                     continue;
@@ -1289,6 +1504,8 @@ pub(crate) fn derive<'tcx>(
         let mut moved_on_members: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
         // R531-4 (iii): members whose owner is an `Option<Box<T>>`.
         let mut optional_members = 0usize;
+        // R583-8 wall 2(b): owned children moved out at the call.
+        let mut field_members: Vec<(LocalDefId, usize)> = Vec::new();
         // R561-4 W2: each member's argument at its call, for the `Some(..)`
         // a non-optional member needs at an optional formal.
         let mut member_args: Vec<((LocalDefId, HirId), Span)> = Vec::new();
@@ -1303,6 +1520,24 @@ pub(crate) fn derive<'tcx>(
                 }
                 call_count += 1;
                 let Some(Some((arg, arg_span))) = args.get(hir_index) else {
+                    // **R583-8 wall 2(b) — an owned child moved out.** The
+                    // argument is an owned field `(*p).f` (model `Owning`) and
+                    // the call's result goes back into that same place
+                    // (`(*node).left = leftRotate((*node).left)`), the re-seat's
+                    // own condition: the field transaction moves the child
+                    // out with `.take()` (an `Option<Box<T>>` member) and the
+                    // result in again, so C's field is never left `None`. The
+                    // field must be delivered (`chain_fields`).
+                    if let Some((_, _, field, _, true)) = caller_scan
+                        .field_args
+                        .iter()
+                        .find(|(call, index, _, _, _)| call == call_span && *index == hir_index)
+                        && field_kind(slots, model, *field) == Some(SlotKind::Owning)
+                    {
+                        optional_members += 1;
+                        field_members.push(*field);
+                        continue;
+                    }
                     failure = Some(format!(
                         "box-param-caller-retains:{caller_path}:not-a-local"
                     ));
@@ -1326,15 +1561,25 @@ pub(crate) fn derive<'tcx>(
                             && matches!(s.kind, SubjectKind::Param { .. })
                     }) && let Some(plan) = out.plans.get(&(*caller, *arg)).cloned()
                     {
-                        if caller_scan
-                            .local_uses
-                            .iter()
-                            .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
+                        // **R583-8 wall 2(a)**: a hand-on that IS the caller's
+                        // `return` operand ends its path — a later use in the
+                        // text is on another path, where the owner never moved.
+                        let at_return = caller_scan.return_calls.contains(call_span);
+                        if !at_return
+                            && caller_scan
+                                .local_uses
+                                .iter()
+                                .any(|(hir, span)| *hir == *arg && span.lo() > call_span.hi())
                         {
                             failure = Some(format!(
                                 "box-param-caller-retains:{caller_path}:used-after-transfer"
                             ));
                             break 'callers;
+                        }
+                        // An optional owner (a re-seated formal) moves in as
+                        // written; the formal takes its type (R531-4 (iii)).
+                        if plan.optional {
+                            optional_members += 1;
                         }
                         moved_on_members.insert(key);
                         member_plans.push((key, plan, member.label.clone(), Vec::new()));
@@ -1588,6 +1833,25 @@ pub(crate) fn derive<'tcx>(
         // else needs an edit: every member optional, the sink a free, a sized
         // owner, and no raw exposure wrapper to re-enter ownership.
         let optional = optional_members > 0;
+        // R583-8 wall 2(c): the store sink's field, when it is model-`Owning`.
+        let owned_store_field: Option<(LocalDefId, usize)> = store
+            .and_then(|_| {
+                scan.store_fields
+                    .iter()
+                    .find(|(hir, _)| *hir == param.hir_id)
+                    .map(|(_, field)| *field)
+            })
+            .and_then(|field| {
+                let struct_did = tcx.parent(field);
+                let index = tcx
+                    .adt_def(struct_did)
+                    .non_enum_variant()
+                    .fields
+                    .iter()
+                    .position(|f| f.did == field)?;
+                Some((struct_did.as_local()?, index))
+            })
+            .filter(|field| field_kind(slots, model, *field) == Some(SlotKind::Owning));
         // **R561-4 W2 — a MIXED chain.** One member optional (buffer's
         // `buffer_slice` returns null on a range error) and the rest not: the
         // formal is `Option<Box<T>>` for all of them and each non-optional
@@ -1626,9 +1890,15 @@ pub(crate) fn derive<'tcx>(
             }
         }
         if optional {
+            // The sink: one free, or (R583-8 wall 2(c)) one store into an
+            // OWNED field — the field transaction renders it as the move of
+            // the optional owner (C2's `Rhs::Subject(Box)`), not a raw transfer.
+            let sink_ok = moved_on.is_none()
+                && ((frees.len() == 1 && store.is_none())
+                    || (frees.is_empty() && owned_store_field.is_some()));
             let refusal = if mixed_refusal.is_some() {
                 mixed_refusal
-            } else if frees.len() != 1 || store.is_some() || moved_on.is_some() {
+            } else if !sink_ok {
                 Some("box-param-shape:{callee_path}:optional-owner-sink")
             } else if member_plans
                 .iter()
@@ -1870,7 +2140,9 @@ pub(crate) fn derive<'tcx>(
                 &|_| false,
             ) {
                 Ok(uses)
-                    if uses.stores.is_empty()
+                    if (uses.stores.is_empty()
+                        || (owned_store_field.is_some()
+                            && store.is_some_and(|(value, _)| uses.stores == [value])))
                         && uses.transfers.is_empty()
                         && uses.returns.is_empty() =>
                 {
@@ -1878,7 +2150,11 @@ pub(crate) fn derive<'tcx>(
                         .into_iter()
                         .filter(|edit| edit.receipt == "box-param-c-free-site-drop")
                         .collect::<Vec<_>>();
-                    edits.extend(uses.edits);
+                    // The owned-field store is the field transaction's move.
+                    edits.extend(uses.edits.into_iter().filter(|edit| {
+                        !(owned_store_field.is_some()
+                            && store.is_some_and(|(value, _)| edit.span == value))
+                    }));
                     edits
                 }
                 Ok(_) => {
@@ -1938,6 +2214,8 @@ pub(crate) fn derive<'tcx>(
             out.store_members
                 .extend(member_plans.iter().map(|(key, _, _, _)| *key));
         }
+        let formal = (param.fn_did, param.hir_id);
+        let mut inserted = Vec::new();
         for (key, mut plan, _, uses) in member_plans {
             plan.expr_edits.extend(member_edits.drain(..uses.len()));
             if !chain_callers.contains(&key.0) {
@@ -1947,6 +2225,23 @@ pub(crate) fn derive<'tcx>(
                 continue;
             }
             out.plans.insert(key, plan);
+            inserted.push(key);
+        }
+        // R583-8 wall 2: what this chain stands on.
+        out.chain_members.insert(formal, inserted);
+        out.formal_labels.insert(
+            formal,
+            (param.label.clone(), callee_path.clone(), hir_index),
+        );
+        out.chain_moved_on
+            .insert(formal, moved_on_members.iter().copied().collect());
+        let mut fields = field_members.clone();
+        fields.extend(owned_store_field);
+        if !fields.is_empty() {
+            fields.sort_by_key(|(did, index)| (did.local_def_index.as_u32(), *index));
+            fields.dedup();
+            out.chain_fields
+                .insert(formal, (param.label.clone(), callee_path.clone(), fields));
         }
         out.chains.push((param.fn_did, chain_callers));
         out.plans.insert(
@@ -1974,5 +2269,6 @@ pub(crate) fn derive<'tcx>(
             },
         );
     }
+    confirm_hand_ons(&mut out);
     out
 }

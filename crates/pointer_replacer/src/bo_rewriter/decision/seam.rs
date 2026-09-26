@@ -1185,6 +1185,11 @@ pub(crate) struct GlueSpec {
     /// Exact source type for the one-evaluation local introduced by a checked
     /// nullable bridge. `None` means this spec introduces no local.
     pub checked_binding_type: Option<String>,
+    /// **R583-8 wall 1 (wave-6a)**: an OPTIONAL `Box` owner at an optional
+    /// reference formal — `X.as_deref_mut()` (`Some(true)`) / `X.as_deref()`
+    /// — the owner's own view, `None` for `None`: the panic-free spelling the
+    /// R422-5 owner-view glue lacked.
+    pub(crate) option_view: Option<bool>,
 }
 
 impl GlueSpec {
@@ -1220,6 +1225,7 @@ impl GlueSpec {
             raw_boundary: None,
             nonempty_evidence: false,
             checked_binding_type: None,
+            option_view: None,
         }
     }
 
@@ -1286,6 +1292,7 @@ impl GlueSpec {
             raw_boundary: None,
             nonempty_evidence: false,
             checked_binding_type: None,
+            option_view: None,
         }
     }
 
@@ -1316,6 +1323,7 @@ impl GlueSpec {
             }),
             nonempty_evidence: false,
             checked_binding_type: None,
+            option_view: None,
         }
     }
 
@@ -1546,6 +1554,12 @@ impl GlueSpec {
         }
         if let Some(address) = &self.shared_address {
             return address.render(text);
+        }
+        if let Some(mutable) = self.option_view {
+            return Some(format!(
+                "{text}.{}()",
+                if mutable { "as_deref_mut" } else { "as_deref" }
+            ));
         }
         // R465-5: an `Option` has no index, so when a spec carries BOTH the
         // unwrap and a forward view the unwrap opens the base first —
@@ -3482,9 +3496,11 @@ fn shared_candidate(
 /// an optional owner through `x.as_mut().unwrap()` first (`&*x.as_mut()
 /// .unwrap()` is `&Box<[T]>`, which deref-coerces to `&[T]` at the call);
 /// `Some(..)` at an optional formal from a non-optional owner. An optional
-/// owner at an optional formal has no panic-free spelling in the algebra
-/// (`as_deref`) and declines. No raw boundary is crossed, so no retention
-/// tier. A non-optional SIZED owner keeps the matrix's `&*x` (A1's receivers).
+/// owner at an optional formal of its own shape takes its own view,
+/// `x.as_deref()` / `x.as_deref_mut()` (R583-8 wall 1: avl's re-seated
+/// `insert::node` lent to `getBalance(N: Option<&Node>)`). No raw boundary is
+/// crossed, so no retention tier. A non-optional SIZED owner keeps the
+/// matrix's `&*x` (A1's receivers).
 /// Keyed on the argument's decision, not a new `Form` variant.
 /// The binding whose own view the R422-5 owner-view glue renders: the owner
 /// passed bare, never a place derived from it.
@@ -3515,6 +3531,25 @@ fn owner_view_candidate(
     let slice = plan.shape == super::box_facts::BoxShape::Slice;
     if !slice && !plan.optional {
         return None;
+    }
+    if let Form::Opt {
+        mutable,
+        slice: formal_slice,
+    } = expected
+        && formal_slice == slice
+        && plan.optional
+    {
+        let mut spec = GlueSpec::core(GlueCore::Bare, mutable);
+        spec.option_view = Some(mutable);
+        let replacement = spec.render(text)?;
+        return Some(Candidate {
+            spec,
+            family: SeamFamily::Safe,
+            replacement,
+            len_arm: None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        });
     }
     let (mutable, core, wrapped) = match expected {
         Form::Slice { mutable } if slice => (mutable, GlueCore::Reborrow, false),

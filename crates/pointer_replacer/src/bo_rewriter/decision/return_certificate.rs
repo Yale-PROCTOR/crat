@@ -2228,10 +2228,11 @@ fn certify<'tcx, 's>(
                 == Some(SlotKind::Owning)
         })
     };
-    // R3 lifts `return-locals:2` only BESIDE a primary owner (`deleteNode`'s
-    // re-seated `root`); a callee whose every returned local is a field load,
-    // or whose returns R3's reading refuses, keeps exactly the reading it had
-    // without R3 (`classify(false)`).
+    // R3 lifts `return-locals:2` beside a primary owner (`deleteNode`'s
+    // re-seated `root`), and **R583-8 wall 3** admits a moved-out owner ALONE
+    // (avl's rotations: `let x = (*y).left; ..; return x;`). A callee whose
+    // returns R3's reading refuses keeps exactly the reading it had without
+    // R3 (`classify(false)`).
     let classify = |adopt: bool| -> Result<Sources, Hold> {
         let mut sources = Sources {
             owner: None,
@@ -2297,8 +2298,8 @@ fn certify<'tcx, 's>(
         Ok(sources)
     };
     let sources = match classify(true) {
-        Ok(sources) if sources.owner.is_some() || sources.adopted.is_empty() => sources,
-        _ => classify(false)?,
+        Ok(sources) => sources,
+        Err(_) => classify(false)?,
     };
     // **R579-4 R2** — the returned local is the callee's own formal, which
     // the re-seat plans as an owner handed back (`insert`'s `node`,
