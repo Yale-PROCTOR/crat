@@ -22703,6 +22703,71 @@ fn raw_boundary_knock_on_hold_class(
     (dropped && peer_held).then_some("knock-on:held:local-callee-access-extent")
 }
 
+/// R346-2 / R342-3. The class a gate-lost identity OBSERVABLY carries: its row of
+/// this frame's `raw-boundary-subjects.tsv` (`cause`: family, reason, exclusion,
+/// owner) and its row of the gate frame's outcomes (`gate`: family, analysis frame).
+/// A libc contract hold, else the knock-on of a directly held peer, else a model
+/// family move. The waiver may only name what this returns.
+fn raw_boundary_gate_observed_class(
+    program: &str,
+    cause: Option<&(String, String, String, String)>,
+    gate: Option<&(String, String)>,
+    current_frame: &str,
+    directly_held_owners: &std::collections::BTreeSet<(String, String)>,
+) -> Option<&'static str> {
+    let (family, reason, exclusion, owner_fn) = cause?;
+    raw_boundary_libc_hold_class(family, reason, exclusion)
+        .or_else(|| {
+            raw_boundary_knock_on_hold_class(program, owner_fn, exclusion, directly_held_owners)
+        })
+        .or_else(|| raw_boundary_model_family_move_class(family, exclusion, gate, current_frame))
+}
+
+/// **R578-1 (c)** — `model-family-move`: the analysis frame changed between the gate
+/// and this census, the identity's family changed with it, and no rewriter gate took
+/// the subject (exclusion `-`). All three are read from the two ledgers, so a waiver
+/// naming the class cannot be spent on a rewriter-stage loss: within one frame a
+/// family move is the rewriter's (batch 40's `BrotliSplitBlock::data#4`), and an
+/// excluded subject is a gate's.
+fn raw_boundary_model_family_move_class(
+    family: &str,
+    exclusion: &str,
+    gate: Option<&(String, String)>,
+    current_frame: &str,
+) -> Option<&'static str> {
+    let (gate_family, gate_frame) = gate?;
+    (gate_frame != current_frame && gate_family != family && matches!(exclusion, "" | "-"))
+        .then_some("model-family-move")
+}
+
+/// R342-3. A gate-lost identity is waived only when the waiver lists it with the
+/// class production observes, and that class is one the gate accepts. `Ok` is the
+/// waived class, `Err` the unwaived verdict the audit records.
+fn raw_boundary_gate_waiver_verdict(
+    listed: Option<&str>,
+    observed: Option<&str>,
+) -> Result<String, String> {
+    match (listed, observed) {
+        (Some(listed), Some(observed))
+            if listed == observed
+                && matches!(
+                    listed,
+                    "analysis-frame-decline"
+                        | "thin-extent"
+                        | "knock-on:held:local-callee-access-extent"
+                        | "model-family-move"
+                ) =>
+        {
+            Ok(listed.to_owned())
+        }
+        (Some(listed), Some(observed)) => {
+            Err(format!("unwaived:listed={listed}:observed={observed}"))
+        }
+        (Some(listed), None) => Err(format!("unwaived:listed={listed}:observed=none")),
+        (None, _) => Err("unwaived:unlisted".to_owned()),
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn control_keys_unused(
     control: &std::collections::BTreeMap<(String, String, String, usize, usize), String>,
@@ -25047,11 +25112,24 @@ fn raw_boundary_wave2_corpus_census() {
         raw_boundary_program_artifacts(&gate_dir, "raw-boundary-subject-outcomes.tsv")
             .expect("read gate baseline outcomes");
     let mut gate_realized = BTreeMap::<String, BTreeSet<String>>::new();
+    // R578-1 (c): each gate identity's family and analysis frame, for the
+    // family-move class the waiver audit observes.
+    let mut gate_rows = BTreeMap::<(String, String), (String, String)>::new();
     let mut gate_digest = Sha256::new();
     for (program, text) in &gate_artifacts {
         gate_digest.update(program.as_bytes());
         gate_digest.update(text.as_bytes());
         for row in named_tsv_rows(text) {
+            gate_rows.insert(
+                (
+                    program.clone(),
+                    row.get("subject_key").cloned().unwrap_or_default(),
+                ),
+                (
+                    row.get("family").cloned().unwrap_or_default(),
+                    row.get("analysis_frame").cloned().unwrap_or_default(),
+                ),
+            );
             if row.get("delivery").map(String::as_str) == Some("realized-as-predicted")
                 && row
                     .get("family")
@@ -25329,43 +25407,19 @@ fn raw_boundary_wave2_corpus_census() {
                 identity.clone(),
             );
             let listed = waiver_rows.get(&key).map(String::as_str);
-            let observed = hold_causes.get(&(key.1.clone(), key.2.clone())).and_then(
-                |(family, reason, exclusion, owner_fn)| {
-                    raw_boundary_libc_hold_class(family, reason, exclusion).or_else(|| {
-                        raw_boundary_knock_on_hold_class(
-                            &key.1,
-                            owner_fn,
-                            exclusion,
-                            &directly_held_owners,
-                        )
-                    })
-                },
+            let identity_key = (key.1.clone(), key.2.clone());
+            let observed = raw_boundary_gate_observed_class(
+                &key.1,
+                hold_causes.get(&identity_key),
+                gate_rows.get(&identity_key),
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                &directly_held_owners,
             );
-            let verdict = match (listed, observed) {
-                (Some(listed), Some(observed))
-                    if listed == observed
-                        && matches!(
-                            listed,
-                            "analysis-frame-decline"
-                                | "thin-extent"
-                                | "knock-on:held:local-callee-access-extent"
-                        ) =>
-                {
-                    listed.to_owned()
-                }
-                (Some(listed), Some(observed)) => {
+            let verdict =
+                raw_boundary_gate_waiver_verdict(listed, observed).unwrap_or_else(|unwaived| {
                     waived = false;
-                    format!("unwaived:listed={listed}:observed={observed}")
-                }
-                (Some(listed), None) => {
-                    waived = false;
-                    format!("unwaived:listed={listed}:observed=none")
-                }
-                (None, _) => {
-                    waived = false;
-                    "unwaived:unlisted".to_owned()
-                }
-            };
+                    unwaived
+                });
             waiver_audit.push_str(&format!(
                 "gate-27bb3b3a\trs-crown\t{}\t{}\t{identity}\t{verdict}\n",
                 code_frame, program.name
@@ -27067,6 +27121,156 @@ fn r346_1_a_retired_pair_site_names_why_from_the_parameter_row() {
             "terminal-not-applied:blocked-subject:slice-use-unsupported"
         ),
         ("held", "slice-use-unsupported".to_owned())
+    );
+}
+
+fn r578_1_cause(family: &str, reason: &str, exclusion: &str) -> (String, String, String, String) {
+    (
+        family.to_owned(),
+        reason.to_owned(),
+        exclusion.to_owned(),
+        "src::f".to_owned(),
+    )
+}
+
+fn r578_1_gate(family: &str, frame: &str) -> (String, String) {
+    (family.to_owned(), frame.to_owned())
+}
+
+/// **R578-1 (c)** — the census gate observes a MODEL family move: an identity the
+/// gate frame realized, whose family differs in this frame across an analysis-frame
+/// change, and which no rewriter gate took (exclusion `-`). The rows are batch 39's
+/// (L01⁸'s frame over batch 38's gate), whose twelve the gate could not waive (main 107).
+#[test]
+fn r578_1_c_a_model_family_move_across_a_frame_change_is_observed_and_waivable() {
+    let held = std::collections::BTreeSet::new();
+    let (old, new) = ("era5a-r258-local-coverage-v1", "era5c-l01p8-v1");
+    // lil `ateol::lil#1`: ref -> box, degraded `unsupported-decl-shape`
+    let lil = raw_boundary_gate_observed_class(
+        "lil",
+        Some(&r578_1_cause("box", "unsupported-decl-shape", "-")),
+        Some(&r578_1_gate("ref", old)),
+        new,
+        &held,
+    );
+    assert_eq!(lil, Some("model-family-move"));
+    // bzip2 `mkCell::c#2`: optional -> raw, degraded `return-certificate-return-locals`
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "bzip2",
+            Some(&r578_1_cause(
+                "raw",
+                "return-certificate-return-locals",
+                "-"
+            )),
+            Some(&r578_1_gate("optional", old)),
+            new,
+            &held,
+        ),
+        Some("model-family-move")
+    );
+    // buffer `range_error::a#7`: box -> raw, still emitted through the certificate
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "buffer",
+            Some(&r578_1_cause("raw", "-", "-")),
+            Some(&r578_1_gate("box", old)),
+            new,
+            &held,
+        ),
+        Some("model-family-move")
+    );
+    // listed with the class it shows: waived
+    assert_eq!(
+        raw_boundary_gate_waiver_verdict(Some("model-family-move"), lil),
+        Ok("model-family-move".to_owned())
+    );
+    // unlisted: still unwaived -- the class is observed, never assumed
+    assert_eq!(
+        raw_boundary_gate_waiver_verdict(None, lil),
+        Err("unwaived:unlisted".to_owned())
+    );
+}
+
+/// R578-1 (c) controls: a family move is a MODEL move only across a frame change and
+/// only where no rewriter gate took the subject; otherwise the loss stays unwaivable.
+#[test]
+fn r578_1_c_a_rewriter_move_is_not_a_model_family_move() {
+    let held = std::collections::BTreeSet::new();
+    let (old, new) = ("era5a-r258-local-coverage-v1", "era5c-l01p8-v1");
+    // the same frame: batch 40's `BrotliSplitBlock::data#4` went slice -> ref under
+    // L01⁸ on both sides -- the rewriter's move
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "brotli",
+            Some(&r578_1_cause("ref", "held:local-callee-access-extent", "-")),
+            Some(&r578_1_gate("slice", new)),
+            new,
+            &held,
+        ),
+        None
+    );
+    // a rewriter gate took it
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "lil",
+            Some(&r578_1_cause(
+                "box",
+                "-",
+                "terminal-not-applied:intra-class-interval-overlap"
+            )),
+            Some(&r578_1_gate("ref", old)),
+            new,
+            &held,
+        ),
+        None
+    );
+    // the family did not move: a rewriter hold across the frame change
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "brotli",
+            Some(&r578_1_cause(
+                "slice",
+                "held:local-callee-access-extent",
+                "-"
+            )),
+            Some(&r578_1_gate("slice", old)),
+            new,
+            &held,
+        ),
+        None
+    );
+    // no gate row, no current row
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "lil",
+            Some(&r578_1_cause("box", "-", "-")),
+            None,
+            new,
+            &held
+        ),
+        None
+    );
+    assert_eq!(
+        raw_boundary_gate_observed_class("lil", None, Some(&r578_1_gate("ref", old)), new, &held),
+        None
+    );
+    // the existing classes keep precedence: the kind narrowing across a frame change
+    // is still an analysis-frame decline
+    assert_eq!(
+        raw_boundary_gate_observed_class(
+            "lil",
+            Some(&r578_1_cause("raw", "kind-raw", "-")),
+            Some(&r578_1_gate("ref", old)),
+            new,
+            &held,
+        ),
+        Some("analysis-frame-decline")
+    );
+    // a class the gate does not accept stays unwaived even when listed and observed
+    assert_eq!(
+        raw_boundary_gate_waiver_verdict(Some("io-domain-type"), Some("io-domain-type")),
+        Err("unwaived:listed=io-domain-type:observed=io-domain-type".to_owned())
     );
 }
 
