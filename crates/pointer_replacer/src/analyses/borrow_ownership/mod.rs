@@ -9,6 +9,7 @@ use std::ops::Range;
 pub(crate) mod a5_overlap;
 pub(crate) mod a5_producer;
 pub(crate) mod a5_snapshot_effects;
+pub(crate) mod allocator_contract;
 pub(crate) mod array_fields;
 mod assoc;
 pub(crate) mod borrow_engine;
@@ -32,14 +33,25 @@ pub(crate) mod esc_minimal;
 pub(crate) mod execution_guard;
 pub(crate) mod export;
 mod infer;
+// era-5c report 040: the A1 spare-set, for the MIR-walk market count.
+pub(crate) use infer::reseat_destinations;
 pub(crate) mod l2;
+pub(crate) mod licensing;
 pub(crate) mod model_cache;
 pub(crate) mod mutability_facts;
+pub(crate) mod field_moves;
+pub(crate) mod null_paths;
+#[cfg(test)]
+mod null_paths_tests;
 pub(crate) mod nullability;
 pub(crate) mod origin_evidence;
 pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
+pub(crate) mod ownership_access;
+pub(crate) mod ownership_boundary;
+pub(crate) mod ownership_evidence;
+pub(crate) mod ownership_occurrence;
 pub(crate) mod portable_export;
 pub(crate) mod proof_evidence;
 pub(crate) mod protected_entry;
@@ -297,7 +309,100 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     let mut var_gen = Gen::new();
     // §NB-R: hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
+    allocator_contract::prepare(
+        crate_ctxt.tcx,
+        &crate_ctxt
+            .fns()
+            .iter()
+            .map(|did| did.expect_local())
+            .collect::<Vec<_>>(),
+    );
     let mut database = BoOwnDatabase::new(kind_solver.optimize(), kind_solver.tracker());
+    let facts_scope = database.activate_facts();
+    let transfer_scope = ownership_occurrence::reset();
+    let boundary_scope = ownership_boundary::call_arguments(None);
+    let ownership_scope = ownership_evidence::construction();
+    licensing::facts::record(|facts| {
+        let program = RustProgram {
+            tcx: crate_ctxt.tcx,
+            functions: crate_ctxt
+                .fns()
+                .iter()
+                .map(|did| did.expect_local())
+                .collect(),
+            structs: Vec::new(),
+        };
+        for &function in &program.functions {
+            facts.source_occurrences.insert(
+                program.tcx.def_path_str(function),
+                origin_evidence::occurrences(&program, slots, function),
+            );
+        }
+        facts.reader_inputs = licensing::readers::Inputs::collect(&program, slots);
+        facts.reader_plan = licensing::readers::Plan::build(&facts.reader_inputs);
+        facts.traversal_native = Some(licensing::traversal_native::collect(
+            &program,
+            slots,
+            origins,
+            &facts.reader_plan,
+        ));
+        facts.field_support_inputs = licensing::field_support::Inputs::collect(&program, slots);
+        facts.fold_types = Some(licensing::fold_types::Inputs::collect(&program));
+        facts.fold_declarations = Some(Vec::new());
+        facts.caller_coverage = Some(licensing::caller_coverage::Coverage::collect(&program));
+        facts.frame_attested = licensing::stack_entry::current_world()
+            == licensing::stack_entry::CallWorld::ClosedProgram;
+        for (&function, universe) in &slots.fn_local_slots {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            facts.unit_locals.extend(
+                body.local_decls
+                    .iter_enumerated()
+                    .filter(|(_, declaration)| declaration.ty.is_unit())
+                    .map(|(local, _)| (program.tcx.def_path_str(function), local.as_u32())),
+            );
+            for index in 0..universe.len() {
+                let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
+                let slot = universe.slot(id);
+                let slots::SlotOwner::Local(local) = slot.owner else { unreachable!() };
+                let key = slot_key::local_key(program.tcx, function, local.as_usize(), slot.depth);
+                if slot.depth == 0
+                    && matches!(
+                        body.local_decls[local].ty.kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    )
+                {
+                    facts
+                        .raw_pointer_heads
+                        .push(licensing::value_origins::RawHead {
+                            function: program.tcx.def_path_str(function),
+                            local: local.as_u32(),
+                            slot_key: key.clone(),
+                        });
+                }
+                assert!(
+                    facts
+                        .slot_refs
+                        .insert(key, SlotRef::Local(function, id))
+                        .is_none()
+                );
+            }
+        }
+        facts.unit_locals.sort();
+        facts
+            .raw_pointer_heads
+            .sort_by(|a, b| a.slot_key.cmp(&b.slot_key));
+        for index in 0..slots.field_slots.len() {
+            let id = slots::SlotId::from_u32(index.try_into().expect("field slot index"));
+            let slot = slots.field_slots.slot(id);
+            let slots::SlotOwner::Field(field) = slot.owner else { unreachable!() };
+            let key =
+                slot_key::field_key(program.tcx, field.struct_did, field.field_index, slot.depth);
+            assert!(facts.slot_refs.insert(key, SlotRef::Field(id)).is_none());
+        }
+    });
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("global-assumptions");
     }
@@ -378,6 +483,9 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     let nullability = nullability::analyze(crate_ctxt.tcx, &fns, slots);
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
         if !nullability.contains(&slot) {
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!("E5C may-supply-exclusion slot={slot:?}");
+            }
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
             comparison::record_guard(
                 crate_ctxt.tcx,
@@ -389,6 +497,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     }
 
     // E-R2: snapshot the Var -> Bool map before the database is dropped.
+    database.emit_reference_effect_obligations()?;
     database.snapshot_version_asts();
 
     let selectors = Selectors::new_with_keys(
@@ -397,10 +506,228 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         database.sink_selectors().to_vec(),
         database.sink_keys().to_vec(),
     );
+    // L01^5 (i): a program with no sink can never be forced to own (W18). Under
+    // the leak-parity waiver, prefer Box for its field slots. Pin-gated and
+    // objective-only: no hard constraint changes, so nothing legal becomes illegal.
+    if super::borrow_ownership::field_moves::leak_parity_admission()
+        && selectors.sinks().is_empty()
+    {
+        kind_solver.prefer_owning_for_unsinked_fields(slots);
+    }
     let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
         source_sink_emissions: database.source_sink_emissions(),
     };
+    drop(ownership_scope);
+    drop(boundary_scope);
+    drop(transfer_scope);
+    drop(facts_scope);
+    let facts = database.freeze_facts();
+    if let Some(tracker) = kind_solver.tracker() {
+        tracker.set_context("licensing-origin-admissibility");
+    }
+    // R351-3 pass 1: the facts are still carried — the construction downstream
+    // is built from them — but not one of era-5b's constraints is emitted and
+    // nothing is recorded into the entry. The gate sits at each emission site
+    // rather than before them, because the facts themselves are structure, not
+    // constraint.
+    // R377-1: the return-port rule. It is emitted here rather than beside the
+    // `¬ref` at the `AllocationSource` loop because its premise is read from the
+    // licensing facts, which exist only after `freeze_facts`. Emission order is
+    // irrelevant (the bodies share the InterCtxt signature vars), so the loop
+    // above is left untouched and this adds rows rather than changing any.
+    if licensing::facts::return_port()
+        && let Some(frozen) = facts.licensing.as_ref()
+    {
+        let _ = frozen;
+        if let Some(tracker) = kind_solver.tracker() {
+            tracker.set_context("r377-return-port");
+        }
+        let origins = licensing::value_origins::ValueOrigins::build(&facts);
+        let (admitted, _holds) = licensing::fold_caller::return_port_owning(&facts, &origins);
+        for slot_key in admitted {
+            if let Some(&slot) = facts.slot_refs.get(&slot_key) {
+                // The refusal machinery stays authoritative: a slot some other
+                // rule refuses ownership for yields and keeps the pin's kind.
+                kind_solver.require_own(&slot_key, slot);
+            }
+        }
+    }
+    let joint = licensing::facts::Pass::current() == licensing::facts::Pass::Joint;
+    let mut preferred_own = 0usize;
+    for carrier in &facts
+        .licensing
+        .as_ref()
+        .expect("frozen licensing facts")
+        .no_ref_carriers
+    {
+        let slot = facts.slot_refs[&carrier.slot_key];
+        // O-ORIGIN is independent of endpoint/grant selection. A refused
+        // fresh responsibility cannot acquire an invented borrow lifetime.
+        // R371-2: the repair arm withdraws this exclusion and leaves every
+        // grant constraint below on.
+        if joint
+            && !licensing::facts::repair()
+            && !std::env::var("CRAT_ERA5C_SKIP_FAMILY")
+                .unwrap_or_default()
+                .split(',')
+                .any(|s| s.trim() == "no_ref_carriers")
+        {
+            kind_solver.add_borrow_exclusion(Some(slot), &[]);
+            // L01⁶ (b) / R517-12: this slot's reference has just been refused,
+            // so `raw ∨ own` is all that remains and only `raw` carries weight.
+            // Prefer `own` where it is legal. Objective-only; report 034b §3
+            // measured the market at 77 of 462 before the rule was written.
+            if field_moves::own_prefer_local() {
+                preferred_own += kind_solver.prefer_owning_for_refused_reference(slot) as usize;
+            }
+        }
+    }
+    // L01⁶ arm 3 half two (R518-2): with the finalization blanket gone, prefer
+    // the NAMED locals as owners so the token is not smeared onto temporaries.
+    if field_moves::finalize_soft() {
+        let mut named = 0usize;
+        for did in crate_ctxt.fns() {
+            let fn_did = did.expect_local();
+            let body = crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(fn_did)
+                .borrow();
+            let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+                continue;
+            };
+            let mut seen = rustc_data_structures::fx::FxHashSet::default();
+            for info in &body.var_debug_info {
+                let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value else {
+                    continue;
+                };
+                if !place.projection.is_empty() || !seen.insert(place.local) {
+                    continue;
+                }
+                if let Some(slot) = universe.slot_for_local_depth(place.local, 0)
+                    && kind_solver.prefer_owning_for_named_local(SlotRef::Local(fn_did, slot))
+                {
+                    named += 1;
+                }
+            }
+        }
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!("E5C l016-arm3: preferred own on {named} NAMED local slots");
+        }
+    }
+    if field_moves::own_prefer_local() {
+        // L01⁷ lever (b), report 043 / R536-4. L01⁶ preferred `own` on every
+        // local slot and over-reached on CALLER-DERIVED values: tulip's 78
+        // indicator-table formals (reached only through the `ti_indicators`
+        // function-pointer table) and heman's seven exported write-then-return
+        // formals with no caller settled Owning -- dragged there through local
+        // copies (`_19 = copy _4`), returns (`_0 = copy pOut`) and pointers
+        // loaded through them (`outputs[k]`). A formal with no allocation site
+        // and no free is a LEND. So the preference skips every local whose
+        // value derives from a formal; call RESULTS are not caller values, so a
+        // caller receiving a constructor's allocation keeps the preference.
+        let mut preferred_locals = 0usize;
+        for did in crate_ctxt.fns() {
+            let fn_did = did.expect_local();
+            let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+                continue;
+            };
+            let body = crate_ctxt.tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+            let caller = caller_derived_locals(&body, crate_ctxt.tcx);
+            for index in 0..universe.len() {
+                let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
+                if let slots::SlotOwner::Local(local) = universe.slot(id).owner
+                    && !caller.contains(&local)
+                {
+                    preferred_locals +=
+                        kind_solver.prefer_owning_for_refused_reference(SlotRef::Local(fn_did, id))
+                            as usize;
+                }
+            }
+        }
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!(
+                "E5C l016-b: preferred own on {preferred_own} refused-reference + {preferred_locals} non-caller local slots"
+            );
+        }
+    }
+    if field_moves::lend_formal() {
+        // L01⁸, R545-2: a formal whose every closed-world actual is the address
+        // of a stack or interior place is a LEND -- never `Owning`.
+        let fns: Vec<_> = crate_ctxt
+            .fns()
+            .iter()
+            .map(|did| did.expect_local())
+            .collect();
+        let mut forbidden = 0usize;
+        for (fn_did, formal) in lend_formals(crate_ctxt.tcx, &fns) {
+            let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+                continue;
+            };
+            if let Some(id) = universe.slot_for_local_depth(formal, 0) {
+                forbidden +=
+                    kind_solver.forbid_lend_formal_own(SlotRef::Local(fn_did, id)) as usize;
+            }
+        }
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!("E5C lend-formal: forbade own on {forbidden} formal slots");
+        }
+    }
+    if joint {
+        // R467-2 (019 profile): per-family RSS, so libzahl says which joint-gated
+        // family retains. Diagnosis only, behind CRAT_ERA5C_PROFILE.
+        let profile = std::env::var_os("CRAT_ERA5C_PROFILE").is_some();
+        let rss = || -> f64 {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<f64>().ok()))
+                .map(|pages| pages * 4096.0 / 1073741824.0)
+                .unwrap_or(0.0)
+        };
+        let mut mark = rss();
+        macro_rules! step {
+            ($name:literal, $e:expr) => {{
+                let value = $e;
+                if profile {
+                    let now = rss();
+                    eprintln!("E5C_PROFILE {:<34} rss={:7.2} GiB  delta={:+7.2}", $name, now, now - mark);
+                    mark = now;
+                }
+                value
+            }};
+        }
+        // R467-2 diagnosis: CRAT_ERA5C_SKIP_FAMILY=<comma list> omits joint-gated
+        // families so the one that drives the solver's blow-up can be named. Never
+        // set in a measurement run; the verdicts are not valid with it on.
+        let skipped = std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default();
+        let skip = |name: &str| skipped.split(',').any(|s| s.trim() == name);
+        step!("start", ());
+        if !skip("grants") {
+            step!("apply_licensing_grants", kind_solver.apply_licensing_grants(&facts)?);
+        }
+        if !skip("transfers") {
+            step!("block_incomplete_transfers", licensing::readers::block_incomplete_transfers(&facts, kind_solver));
+        }
+        if !skip("reader_field_support") {
+            step!("constrain_reader_field_support", kind_solver.constrain_reader_field_support(&facts)?);
+        }
+        if !skip("reference_field_effects") {
+            step!("constrain_reference_field_effects", kind_solver.constrain_reference_field_effects(&facts)?);
+        }
+        if !skip("first_permissions") {
+            step!("constrain_first_permissions", kind_solver.constrain_first_permissions(&facts)?);
+        }
+        if !skip("traversal_calls") {
+            step!("constrain_traversal_calls", kind_solver.constrain_traversal_calls(&facts)?);
+        }
+        if !skip("fold_callers") {
+            step!("constrain_fold_callers", kind_solver.constrain_fold_callers(&facts)?);
+        }
+        // era-5c (R409-1): an allocation is released by its own allocator.
+        step!("allocator_contract_pairing", kind_solver.constrain_allocator_contract_pairing(&facts));
+        step!("record_ownership_facts", export::record_ownership_facts(&facts));
+    }
+    kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))
 }
 
@@ -420,6 +747,7 @@ fn emit_fn_body_into<'tcx>(
     copy_lends: Option<&FxHashSet<coherence::CopyLendPair>>,
 ) -> anyhow::Result<()> {
     const B1_PRECISION: Precision = BO_PRECISION;
+    let _ownership_function = ownership_evidence::function(|| crate_ctxt.tcx.def_path_str(fn_did));
 
     let body_ref = crate_ctxt
         .tcx
@@ -436,6 +764,10 @@ fn emit_fn_body_into<'tcx>(
     let copy_lend_guards = copy_lends
         .map(|pairs| coherence::copy_lend_guards_for_body(kind_solver, slots, fn_did, body, pairs))
         .unwrap_or_default();
+    let field_reader_guards = licensing::facts::read(|facts| {
+        licensing::readers::guards_for_body(facts, kind_solver, fn_did, body)
+    })
+    .unwrap_or_default();
 
     let summary = {
         let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx)
@@ -450,11 +782,22 @@ fn emit_fn_body_into<'tcx>(
             global_assumptions,
             &copy_lend_guards,
         )
-        .with_realloc_plans(realloc_plans);
+        .with_realloc_plans(realloc_plans)
+        .with_field_reader_guards(field_reader_guards);
 
         rn.go::<BoOwnershipProbe>(&mut infer_cx);
         FnSummary::new(rn, infer_cx)
     };
+
+    licensing::coverage::record_body(
+        body,
+        &summary,
+        ptr::Measurable::measure(
+            &crate_ctxt.struct_ctxt.with_max_precision(B1_PRECISION),
+            body.local_decls[rustc_middle::mir::RETURN_PLACE].ty,
+            0,
+        ) as usize,
+    );
 
     // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
     link_versions_to_slots(slots, fn_did, body, &summary, database, kind_solver);
@@ -646,3 +989,263 @@ impl<'tcx> CrateCtxt<'tcx> {
 
 #[cfg(test)]
 pub(crate) mod wrapper_fault_tests;
+
+/// L01⁷ lever (b), report 043: the locals whose value derives from a FORMAL --
+/// the formals themselves, then anything assigned from them by `Use`/`Cast`
+/// (including loads THROUGH a caller pointer, `x = copy (*p).f`), and the
+/// result of a non-local call (`ptr::offset` and friends) taking one. These hold
+/// the caller's storage; they are lends, never Box candidates.
+/// era-5c R545-2: the closed-world LEND formals `(callee, formal)`. A formal
+/// qualifies when its function is not `#[no_mangle]`, is never address-taken
+/// (no fn-item constant outside a call's callee, in any fn body or static), is never reassigned, has at least one call site, and EVERY actual
+/// traces back -- through single-definition copies and casts -- to the address
+/// of a stack place or of an interior place: a field with index > 0 or a
+/// constant index > 0 after the last `Deref`. `&*p`, a first field and a
+/// runtime index are excluded: they may carry the allocation's own address,
+/// which C may legally `free`.
+pub(crate) fn lend_formals<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    fns: &[rustc_span::def_id::LocalDefId],
+) -> Vec<(rustc_span::def_id::LocalDefId, rustc_middle::mir::Local)> {
+    use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+    use rustc_hir::def::DefKind;
+    use rustc_middle::{
+        middle::codegen_fn_attrs::CodegenFnAttrFlags,
+        mir::{
+            Body, ConstOperand, Location, Operand, Place, ProjectionElem, Rvalue, StatementKind,
+            Terminator, TerminatorKind, visit::Visitor,
+        },
+        ty::TyKind,
+    };
+    use rustc_span::def_id::{DefId, LocalDefId};
+
+    struct AddressTaken<'a> {
+        out: &'a mut FxHashSet<DefId>,
+    }
+    impl<'tcx> Visitor<'tcx> for AddressTaken<'_> {
+        fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _: Location) {
+            if let TyKind::FnDef(def, _) = constant.const_.ty().kind() {
+                self.out.insert(*def);
+            }
+        }
+
+        fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+            if let TerminatorKind::Call { args, .. } = &terminator.kind {
+                // the callee operand is a call, not an escape
+                for arg in args.iter() {
+                    self.visit_operand(&arg.node, location);
+                }
+            } else {
+                self.super_terminator(terminator, location);
+            }
+        }
+    }
+    let mut address_taken = FxHashSet::default();
+    for &f in fns {
+        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        AddressTaken {
+            out: &mut address_taken,
+        }
+        .visit_body(&body);
+    }
+    // Function-pointer tables are statics. Read their initializers from HIR:
+    // building a static's CTFE MIR (`mir_for_ctfe`) STEALS its body, which later
+    // passes read. Foreign statics have no initializer.
+    struct FnPaths<'tcx, 'a> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        out: &'a mut FxHashSet<DefId>,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for FnPaths<'tcx, '_> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Path(qpath) = &expr.kind
+                && let rustc_hir::def::Res::Def(DefKind::Fn, def) =
+                    self.typeck.qpath_res(qpath, expr.hir_id)
+            {
+                self.out.insert(def);
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    for def in tcx.hir_crate_items(()).definitions() {
+        if matches!(tcx.def_kind(def), DefKind::Static { .. })
+            && !tcx.is_foreign_item(def)
+            && let Some(body_id) = tcx.hir_node_by_def_id(def).body_id()
+        {
+            let body = tcx.hir_body(body_id);
+            let mut visitor = FnPaths {
+                typeck: tcx.typeck(def),
+                out: &mut address_taken,
+            };
+            rustc_hir::intravisit::Visitor::visit_expr(&mut visitor, body.value);
+        }
+    }
+
+    fn assigned_once<'b, 'tcx>(
+        body: &'b Body<'tcx>,
+        local: rustc_middle::mir::Local,
+    ) -> Option<&'b Rvalue<'tcx>> {
+        let mut found = None;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                if let StatementKind::Assign(assign) = &statement.kind
+                    && assign.0.local == local
+                    && assign.0.projection.is_empty()
+                {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(&assign.1);
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+                && destination.local == local
+            {
+                return None;
+            }
+        }
+        found
+    }
+    fn lend_place(place: &Place<'_>) -> bool {
+        let last_deref = place
+            .projection
+            .iter()
+            .rposition(|e| matches!(e, ProjectionElem::Deref));
+        let Some(last_deref) = last_deref else {
+            return true; // a stack place
+        };
+        // W49 fault (test builds only): the first-field exclusion dropped.
+        #[cfg(test)]
+        let first_field_counts =
+            std::env::var("CRAT_E5C_W49_FAULT").as_deref() == Ok("first-field");
+        #[cfg(not(test))]
+        let first_field_counts = false;
+        place.projection[last_deref + 1..].iter().any(|e| match e {
+            ProjectionElem::Field(field, _) => field.index() > 0 || first_field_counts,
+            ProjectionElem::ConstantIndex {
+                offset, from_end, ..
+            } => !from_end && *offset > 0,
+            _ => false,
+        })
+    }
+    fn actual_is_lend(body: &Body<'_>, actual: &Operand<'_>) -> bool {
+        let (Operand::Copy(place) | Operand::Move(place)) = actual else {
+            return false;
+        };
+        if !place.projection.is_empty() {
+            return false;
+        }
+        let mut local = place.local;
+        for _ in 0..16 {
+            match assigned_once(body, local) {
+                // `&raw mut *q` of a reference temporary `q = &mut (*h).f` (the
+                // `&mut x as *mut` coercion): the address is q's -- follow it.
+                Some(Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place))
+                    if matches!(place.projection.as_slice(), [ProjectionElem::Deref])
+                        && matches!(
+                            assigned_once(body, place.local),
+                            Some(Rvalue::RawPtr(..) | Rvalue::Ref(..))
+                        ) =>
+                {
+                    local = place.local;
+                }
+                Some(Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place)) => {
+                    return lend_place(place);
+                }
+                Some(
+                    Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                    | Rvalue::Use(Operand::Copy(p) | Operand::Move(p)),
+                ) if p.projection.is_empty() => local = p.local,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    let local_fns: FxHashSet<LocalDefId> = fns.iter().copied().collect();
+    let mut verdict: FxHashMap<(LocalDefId, usize), bool> = FxHashMap::default();
+    for &caller in fns {
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        for data in body.basic_blocks.iter() {
+            if let TerminatorKind::Call { func, args, .. } = &data.terminator().kind
+                && let Some((def, _)) = func.const_fn_def()
+                && let Some(callee) = def.as_local()
+                && local_fns.contains(&callee)
+            {
+                for (index, arg) in args.iter().enumerate() {
+                    let lend = actual_is_lend(&body, &arg.node);
+                    *verdict.entry((callee, index)).or_insert(true) &= lend;
+                }
+            }
+        }
+    }
+    let mut out: Vec<_> = verdict
+        .into_iter()
+        .filter(|&(_, lend)| lend)
+        .filter_map(|((callee, index), _)| {
+            if address_taken.contains(&callee.to_def_id())
+                || tcx
+                    .codegen_fn_attrs(callee)
+                    .flags
+                    .contains(CodegenFnAttrFlags::NO_MANGLE)
+            {
+                return None;
+            }
+            let body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+            let formal = rustc_middle::mir::Local::from_usize(index + 1);
+            let decl = body.local_decls.get(formal)?;
+            if !decl.ty.is_raw_ptr() {
+                return None;
+            }
+            let reassigned = body.basic_blocks.iter().any(|data| {
+                data.statements.iter().any(|s| {
+                    matches!(&s.kind, StatementKind::Assign(a)
+                        if a.0.local == formal && a.0.projection.is_empty())
+                }) || matches!(&data.terminator().kind,
+                    TerminatorKind::Call { destination, .. } if destination.local == formal)
+            });
+            (!reassigned).then_some((callee, formal))
+        })
+        .collect();
+    out.sort_by_key(|&(callee, formal)| (callee.local_def_index, formal));
+    out
+}
+
+fn caller_derived_locals<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+) -> rustc_data_structures::fx::FxHashSet<rustc_middle::mir::Local> {
+    use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind};
+    let mut caller: rustc_data_structures::fx::FxHashSet<rustc_middle::mir::Local> =
+        (1..=body.arg_count).map(rustc_middle::mir::Local::from_usize).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(assign) = &statement.kind else { continue };
+                let (target, rvalue) = &**assign;
+                let operand = match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand,
+                    _ => continue,
+                };
+                if let Some(source) = operand.place()
+                    && target.projection.is_empty()
+                    && caller.contains(&source.local)
+                    && caller.insert(target.local)
+                {
+                    changed = true;
+                }
+            }
+            if let TerminatorKind::Call { func, args, destination, .. } = &data.terminator().kind
+                && destination.projection.is_empty()
+                && func.const_fn_def().is_some_and(|(callee, _)| !callee.is_local())
+                && args.iter().any(|arg| arg.node.place().is_some_and(|p| caller.contains(&p.local)))
+                && caller.insert(destination.local)
+            {
+                changed = true;
+            }
+        }
+    }
+    let _ = tcx;
+    caller
+}

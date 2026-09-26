@@ -289,6 +289,16 @@ fn extract_conflict_edges(
             if !loans.contains(loan) {
                 continue;
             }
+            // era-5c: name the invalidation point of an invalid loan when asked.
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!(
+                    "E5C invalid-loan loan={loan:?} borrowed={:?} reserved={:?} assigned={:?} error-at={:?}",
+                    borrow_data.borrowed,
+                    borrow_data.location(),
+                    borrow_data.assigned,
+                    inference.facts.location_map.to_location(row)
+                );
+            }
             let Some(live) = provenance_liveness.row(row) else {
                 continue;
             };

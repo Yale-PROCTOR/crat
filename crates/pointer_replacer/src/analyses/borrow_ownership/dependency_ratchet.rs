@@ -138,6 +138,7 @@ mod tests {
         ("src/bo_c1.rs", "nb5m_native_round_stats_contract::stats_of"),
         ("src/bo_c1.rs", "nb5f2_field_conflict_restores::run"),
         ("src/bo_c1.rs", "s23_owning_blocker_probe"),
+        ("src/bo_c1.rs", "r385_forced_assignment_probe"),
         ("src/bo_c1.rs", "nbf_sink_retractable_delete_node"),
         (
             "src/bo_c1.rs",

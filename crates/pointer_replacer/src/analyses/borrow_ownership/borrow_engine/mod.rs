@@ -38,6 +38,7 @@ mod invalidates;
 mod loan_liveness;
 mod origin_replay;
 mod places_conflict;
+mod traversal_targets;
 
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).

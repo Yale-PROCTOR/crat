@@ -295,7 +295,56 @@ pub trait Database {
     ) {
         panic!("guarded CopyForDeref constraints require the BO Optimize database")
     }
+
+    /// era-5c (R409-1): a contract producer's return port. `guard ⇒ dest = ret`
+    /// (the caller takes the token), `¬guard ⇒ dest ≤ ret` (the caller receives
+    /// a raw view; the token is dropped at the port). The guard is closed by the
+    /// pairing check for a caller that releases the allocation through the
+    /// wrong allocator.
+    fn push_guarded_contract_port(&mut self, _guard: &z3::ast::Bool, _dest: Var, _ret: Var) {
+        panic!("guarded contract-port constraints require the BO Optimize database")
+    }
+    fn push_guarded_field_reader(
+        &mut self,
+        _reader: &z3::ast::Bool,
+        _destination_def: Var,
+        _source_def: Var,
+        _source_use: Var,
+        _ensure_move: bool,
+    ) {
+        panic!("field-reader constraints require the BO Optimize database")
+    }
+    fn push_guarded_field_reader_tail(
+        &mut self,
+        _reader: &z3::ast::Bool,
+        _post: Var,
+        _pre: Var,
+        _source: bool,
+    ) {
+        panic!("field-reader precision obligations require the BO Optimize database")
+    }
     fn push_assume_impl(&mut self, x: Var, sign: bool);
+    fn try_reference_field_effect(
+        &mut self,
+        _reference: &super::consume::Consume<Range<Var>>,
+        _cell: &super::consume::Consume<Range<Var>>,
+    ) -> bool {
+        false
+    }
+    fn try_original_cell_argument(
+        &mut self,
+        _boundary: &crate::analyses::borrow_ownership::ownership_boundary::Substitution,
+    ) -> bool {
+        false
+    }
+
+    fn try_original_cell_frame(
+        &mut self,
+        _reference: &super::consume::Consume<Range<Var>>,
+        _cell: &super::consume::Consume<Range<Var>>,
+    ) -> bool {
+        false
+    }
     fn push_assume<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, sign: bool) {
         self.push_assume_impl(x, sign);
         Infer::store_assumption(store, x, sign);
@@ -308,6 +357,18 @@ pub trait Database {
     fn push_less_equal_impl(&mut self, x: Var, y: Var);
     fn push_less_equal<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, y: Var) {
         self.push_less_equal_impl(x, y);
+        Infer::store_less_equal(store, x, y);
+    }
+
+    /// era-5c (R404-3): a phi edge on which the incoming component is known
+    /// null. The join may drop the vacuous token (`lhs <= rhs`) but never
+    /// create one. Backends that label constraints override the `_impl` to name
+    /// the row; the stored constraint is the `less-equal` it is.
+    fn push_null_join_impl(&mut self, x: Var, y: Var) {
+        self.push_less_equal_impl(x, y);
+    }
+    fn push_null_join<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, y: Var) {
+        self.push_null_join_impl(x, y);
         Infer::store_less_equal(store, x, y);
     }
 

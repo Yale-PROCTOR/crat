@@ -116,11 +116,24 @@ fn present<T>(value: &OriginAvailability<T>) -> &T {
     }
 }
 
-fn gaps(row: &FunctionEvidence) {
+fn gaps(row: &FunctionEvidence, equations_recorded: bool) {
     assert_eq!(
-        row.ownership.equations,
-        OriginMissing::OwnershipEquationsNotExported
+        row.ownership.equation_valuation_join,
+        OriginMissing::EquationValuationJoinNotRecorded
     );
+    if equations_recorded {
+        let equations = present(&row.ownership.equations);
+        assert!(
+            !equations.is_empty(),
+            "real construction records equations, not proofs"
+        );
+        assert!(equations.iter().all(|equation| equation.validate().is_ok()));
+    } else {
+        assert_eq!(
+            row.ownership.equations,
+            OriginAvailability::Missing(OriginMissing::OwnershipEquationsNotExported)
+        );
+    }
     assert_eq!(
         row.ownership.dynamic_epochs,
         OriginMissing::DynamicEpochNotRepresented
@@ -202,7 +215,7 @@ fn e5_l_origin_native_value_and_storage_relations_stay_separate() {
                     .iter()
                     .any(|edge| edge.source.depth == 1 && edge.target.depth == 1)
             );
-            gaps(row);
+            gaps(row, false);
             // This existing API deliberately retains summaries without native matrices.
             let without_native: OriginSummaries = origins
                 .iter()
@@ -285,7 +298,7 @@ pub unsafe fn mixed(p: *mut i32, choose: bool) -> *mut i32 { if choose { p } els
                         "modeled flow and no-borrow-origin must coexist"
                     );
                 }
-                gaps(row);
+                gaps(row, false);
             }
         },
     );
@@ -422,7 +435,7 @@ pub unsafe fn occurrences(p: *mut i32) -> *mut i32 { let q = p; let r = identity
                     &expected,
                     "same-capture occurrence transport, not a cross-run Var join"
                 );
-                gaps(row);
+                gaps(row, true);
             }
         },
     );

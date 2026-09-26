@@ -105,7 +105,16 @@ fn r281_cache_stream_metadata_and_field_order_match_old_validator() {
     assert_eq!(actual.model, expected.model);
     assert_eq!(actual.baseline, expected.baseline);
     assert_eq!(actual.receipt, expected.receipt);
-    assert_eq!(actual.origin, expected.origin);
+    {
+        // R473-4: `origin` is no longer a comparable `Value`; compare the
+        // canonical bytes, which is the property the contract rests on.
+        // `expected` is a CompleteEntry (origin still a Value); `actual` is
+        // the streamed Metadata. Compare their canonical bytes.
+        let mut a = Vec::new();
+        actual.write_origin(&mut a).unwrap();
+        let b = serde_json::to_vec(&expected.origin).unwrap();
+        assert_eq!(a, b);
+    }
     let reversed = reverse_objects(&value);
     assert!(validate_reader(reversed.as_bytes()).is_ok());
     assert!(crate::analyses::borrow_ownership::cache_contract::decode(reversed.as_bytes()).is_ok());

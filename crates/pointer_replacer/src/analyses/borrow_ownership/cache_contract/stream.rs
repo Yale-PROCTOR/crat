@@ -19,6 +19,121 @@ use crate::analyses::borrow_ownership::{
     strict_json::{Discard, UniqueValue},
 };
 
+/// R473-4 design (A): where an entry's origin evidence lives.
+///
+/// The whole-`Value` form cost 31 GiB on libzahl (report 022). Neither variant
+/// materializes one: the writer hands over canonical bytes already on disk, and
+/// the reader validates per element and retains only these aggregate facts.
+#[derive(Clone, Debug)]
+pub(crate) enum OriginSource {
+    /// Writer side: canonical origin bytes streamed to this file.
+    File(std::path::PathBuf),
+    /// Reader side: the TYPED evidence, deserialized straight from the stream.
+    /// Never a `serde_json::Value` -- that expansion was the 31 GiB.
+    ///
+    /// `present` records which optional keys the source actually carried, because
+    /// JSON distinguishes an ABSENT key from an explicit `null` while `Option`
+    /// does not. Without it a foreign entry that omits a key would be re-emitted
+    /// with `null` and fail its own hash; production always writes all four.
+    Evidence {
+        evidence: Box<OriginEvidence>,
+        present: OriginKeys,
+    },
+}
+
+/// Which optional origin keys were present in the source bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OriginKeys {
+    pub(crate) licensing: bool,
+    pub(crate) reader_replay: bool,
+    pub(crate) stack_entry_final: bool,
+}
+
+impl Default for OriginKeys {
+    fn default() -> Self {
+        Self {
+            licensing: true,
+            reader_replay: true,
+            stack_entry_final: true,
+        }
+    }
+}
+
+impl Metadata {
+    /// The canonical origin bytes, from whichever side holds them. Both forms
+    /// emit exactly what whole-`Value` serialization emitted (report 023 §2).
+    pub(crate) fn write_origin(&self, w: &mut impl std::io::Write) -> Result<(), String> {
+        match &self.origin {
+            OriginSource::File(path) => {
+                let mut file =
+                    std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+                std::io::copy(&mut file, w).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            OriginSource::Evidence { evidence, present } => evidence.write_json(w, *present),
+        }
+    }
+
+    /// The aggregate facts `validate_meta` cross-checks, without ever holding a
+    /// `Value`: from the typed evidence directly, or by reading the staged file
+    /// back as ONE typed value.
+    fn origin_facts(&self) -> Result<OriginFacts, String> {
+        match &self.origin {
+            OriginSource::Evidence { evidence, .. } => OriginFacts::of(evidence),
+            OriginSource::File(path) => {
+                let file = std::fs::File::open(path)
+                    .map_err(|error| format!("required origin evidence: {error}"))?;
+                let origin: OriginEvidence = serde_json::from_reader(std::io::BufReader::new(file))
+                    .map_err(|error| format!("required origin evidence: {error}"))?;
+                OriginFacts::of(&origin)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OriginFacts {
+    pub(crate) function_names: BTreeSet<String>,
+    pub(crate) functions_len: usize,
+    pub(crate) equations_present: usize,
+    pub(crate) kind_slot_keys: BTreeSet<String>,
+    pub(crate) has_licensing: bool,
+    pub(crate) has_reader_replay: bool,
+    pub(crate) has_stack_entry_final: bool,
+}
+
+impl OriginFacts {
+    /// The aggregate half of `declares_ownership_family`.
+    pub(crate) fn declares_ownership_family(&self) -> Result<bool, String> {
+        if self.equations_present != 0 && self.equations_present != self.functions_len {
+            return Err("ownership family declared for some functions and not others".into());
+        }
+        Ok(self.equations_present != 0
+            || self.has_licensing
+            || self.has_reader_replay
+            || self.has_stack_entry_final)
+    }
+
+    /// Collect the same facts from a whole evidence value (the `File` path).
+    pub(crate) fn of(origin: &OriginEvidence) -> Result<Self, String> {
+        let mut facts = OriginFacts {
+            functions_len: origin.functions.len(),
+            has_licensing: origin.licensing.is_some(),
+            has_reader_replay: origin.reader_replay.is_some(),
+            has_stack_entry_final: origin.stack_entry_final.is_some(),
+            ..Default::default()
+        };
+        for function in &origin.functions {
+            facts.function_names.insert(function.function.clone());
+            if OriginEvidence::equations_present(function)? {
+                facts.equations_present += 1;
+            }
+            OriginEvidence::check_function(function, &mut facts.kind_slot_keys)?;
+        }
+        Ok(facts)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Metadata {
     pub(crate) schema: String,
@@ -29,7 +144,7 @@ pub(crate) struct Metadata {
     pub(crate) model: BTreeMap<String, String>,
     pub(crate) baseline: BTreeMap<String, String>,
     pub(crate) receipt: String,
-    pub(crate) origin: Value,
+    pub(crate) origin: OriginSource,
 }
 
 impl Metadata {
@@ -55,41 +170,21 @@ impl Metadata {
         {
             return Err("cache requires a complete accepted receipt".into());
         }
-        let origin: OriginEvidence = serde_json::from_value(self.origin.clone())
-            .map_err(|error| format!("required origin evidence: {error}"))?;
+        // R473-4 design (A): the same checks, sited on aggregates gathered per
+        // element. `File` re-reads the staged bytes as ONE typed value (never a
+        // `Value`); `Streamed` already ran the per-element half while reading.
+        let facts = self.origin_facts()?;
         let functions: BTreeSet<_> = self.functions.iter().cloned().collect();
         if functions.len() != self.functions.len()
             || functions.iter().any(String::is_empty)
-            || origin.functions.len() != functions.len()
-            || origin
-                .functions
-                .iter()
-                .map(|function| function.function.clone())
-                .collect::<BTreeSet<_>>()
-                != functions
+            || facts.functions_len != functions.len()
+            || facts.function_names != functions
         {
             return Err("incomplete origin function universe".into());
         }
-        for function in &origin.functions {
-            let gaps = &function.ownership;
-            if gaps.equations != OriginMissing::OwnershipEquationsNotExported
-                || gaps.dynamic_epochs != OriginMissing::DynamicEpochNotRepresented
-                || gaps.partner_free != OriginMissing::PartnerFreeCorrespondenceNotExported
-                || gaps.conservation != OriginMissing::ConservationNotProved
-            {
-                return Err("ownership proof availability changed".into());
-            }
-            let mut signatures = BTreeSet::new();
-            for slot in &function.signature_slots {
-                if !signatures.insert(slot) {
-                    return Err("duplicate signature evidence".into());
-                }
-                if let OriginAvailability::Present(key) = &slot.kind_slot
-                    && !universe.contains(key)
-                {
-                    return Err("unresolved signature kind slot".into());
-                }
-            }
+        facts.declares_ownership_family()?;
+        if !facts.kind_slot_keys.is_subset(&universe) {
+            return Err("unresolved signature kind slot".into());
         }
         Ok(())
     }
@@ -176,7 +271,7 @@ impl Metadata {
         suffix
             .write_all(b",\"origin\":")
             .map_err(|e| e.to_string())?;
-        serde_json::to_writer(&mut suffix, &self.origin).map_err(|e| e.to_string())?;
+        self.write_origin(&mut suffix)?;
         suffix.write_all(b"}").map_err(|e| e.to_string())?;
         let exported = length
             .checked_sub(prefix_length)
@@ -194,7 +289,7 @@ impl Metadata {
             return Err("truncated exports".into());
         }
         exports.write_all(b",").map_err(|e| e.to_string())?;
-        serde_json::to_writer(&mut exports, &self.origin).map_err(|e| e.to_string())?;
+        self.write_origin(&mut exports)?;
         exports.write_all(b"]").map_err(|e| e.to_string())?;
         {
             let mut output = Match {
@@ -204,7 +299,7 @@ impl Metadata {
             output
                 .write_all(b",\"origin\":")
                 .map_err(|e| e.to_string())?;
-            serde_json::to_writer(&mut output, &self.origin).map_err(|e| e.to_string())?;
+            self.write_origin(&mut output)?;
             output.write_all(b"}").map_err(|e| e.to_string())?;
         }
         if input.read(&mut [0u8; 1]).map_err(|e| e.to_string())? != 0 {
@@ -218,9 +313,11 @@ impl Metadata {
     }
 }
 
-impl From<CompleteEntry> for Metadata {
-    fn from(entry: CompleteEntry) -> Self {
-        Self {
+impl TryFrom<CompleteEntry> for Metadata {
+    type Error = String;
+
+    fn try_from(entry: CompleteEntry) -> Result<Self, String> {
+        Ok(Self {
             schema: entry.schema,
             key: entry.key,
             inputs: entry.inputs,
@@ -229,8 +326,23 @@ impl From<CompleteEntry> for Metadata {
             model: entry.model,
             baseline: entry.baseline,
             receipt: entry.receipt,
-            origin: entry.origin,
-        }
+            // R473-4: a CompleteEntry still carries a Value; convert ONCE here
+            // into the typed form the rest of the contract now uses.
+            origin: {
+                let present = OriginKeys {
+                    licensing: entry.origin.get("licensing").is_some(),
+                    reader_replay: entry.origin.get("reader_replay").is_some(),
+                    stack_entry_final: entry.origin.get("stack_entry_final").is_some(),
+                };
+                OriginSource::Evidence {
+                    evidence: Box::new(
+                        serde_json::from_value(entry.origin)
+                            .map_err(|error| format!("required origin evidence: {error}"))?,
+                    ),
+                    present,
+                }
+            },
+        })
     }
 }
 
@@ -265,6 +377,60 @@ fn next<'de, T: DeserializeOwned, A: MapAccess<'de>>(map: &mut A) -> Result<T, A
     serde_json::from_value(value.0).map_err(de::Error::custom)
 }
 
+/// R473-4: deserialize the origin evidence TYPED (never a `Value`) while
+/// recording which optional keys the bytes carried. Unknown keys are rejected
+/// and duplicates refused here, exactly as the strict `Value` reader did.
+struct OriginWithKeys {
+    evidence: OriginEvidence,
+    present: OriginKeys,
+}
+
+impl<'de> de::Deserialize<'de> for OriginWithKeys {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OriginWithKeys;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("origin evidence")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OriginWithKeys, A::Error> {
+                let mut evidence = OriginEvidence::default();
+                let mut present = OriginKeys {
+                    licensing: false,
+                    reader_replay: false,
+                    stack_entry_final: false,
+                };
+                let mut seen = BTreeSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    unique(&mut seen, &name)?;
+                    match name.as_str() {
+                        "functions" => evidence.functions = map.next_value()?,
+                        "licensing" => {
+                            evidence.licensing = map.next_value()?;
+                            present.licensing = true;
+                        }
+                        "reader_replay" => {
+                            evidence.reader_replay = map.next_value()?;
+                            present.reader_replay = true;
+                        }
+                        "stack_entry_final" => {
+                            evidence.stack_entry_final = map.next_value()?;
+                            present.stack_entry_final = true;
+                        }
+                        _ => {
+                            return Err(de::Error::custom(format!("unknown origin field: {name}")));
+                        }
+                    }
+                }
+                Ok(OriginWithKeys { evidence, present })
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
 struct MetadataVisitor;
 impl<'de> Visitor<'de> for MetadataVisitor {
     type Value = Metadata;
@@ -290,7 +456,13 @@ impl<'de> Visitor<'de> for MetadataVisitor {
                 "model" => model = Some(next(&mut map)?),
                 "baseline" => baseline = Some(next(&mut map)?),
                 "receipt" => receipt = Some(next(&mut map)?),
-                "origin" => origin = Some(next(&mut map)?),
+                "origin" => {
+                    let parsed = map.next_value::<OriginWithKeys>()?;
+                    origin = Some(OriginSource::Evidence {
+                        evidence: Box::new(parsed.evidence),
+                        present: parsed.present,
+                    })
+                }
                 "exports" => exports = Some(map.next_value_seed(Exports)?),
                 _ => return Err(de::Error::custom(format!("unknown cache field: {name}"))),
             }

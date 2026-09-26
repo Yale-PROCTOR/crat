@@ -76,7 +76,7 @@ class MemoryRuntime:
             else:
                 inputs = {"program": job["program"], "files": {"main.rs": job["input"]["sha256"]}, **job["semantic"]}
                 key = s.semantic_key(inputs)
-                entry = {"schema": "era5a-model-cache-v1", "key": key, "inputs": inputs,
+                entry = {"schema": "era5b-model-cache-v1", "key": key, "inputs": inputs,
                     "functions": ["crate::f"], "universe": ["crate::f::_1@0"],
                     "model": {"crate::f::_1@0": "ref"}, "baseline": {"crate::f::_1@0": "raw"},
                     "receipt": "status=ok\ndata=true\n", "exports": {"synthetic": "transport-only"},

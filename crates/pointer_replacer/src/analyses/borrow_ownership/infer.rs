@@ -4,8 +4,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, PlaceElem,
-        ProjectionElem,
+        AggregateKind, BasicBlock, Body, ClearCrossCrate, Local, LocalInfo, Location, Operand,
+        Place, PlaceElem, ProjectionElem,
     },
     ty::{AdtDef, Ty, TyCtxt, TyKind},
 };
@@ -35,6 +35,7 @@ use crate::analyses::borrow_ownership::{
     struct_ctxt::{RestrictedStructCtxt, StructCtxt},
 };
 
+mod aggregate;
 mod boundary;
 mod realloc_transition;
 
@@ -145,13 +146,25 @@ where
     fn_body_sig: FnBodySig<LocalSig>,
     deref_copy: Option<Consume<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
     call_args: Vec<CallArg<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
+    call_arg_records: FxHashMap<Local, Option<usize>>,
     global_assumptions: &'infercx GlobalAssumptions,
     copy_lend_guards: &'infercx FxHashMap<Location, Bool>,
+    field_reader_guards: FxHashMap<Location, Bool>,
     realloc_plans: Vec<super::realloc_ssa::ReallocSsaPlan>,
     realloc_inputs:
         std::collections::BTreeMap<super::l2::MirLocationKey, realloc_transition::ReallocInput>,
     realloc_versions: Vec<super::export::ReallocVersionSite>,
     realloc_ghosts: FxHashSet<Var>,
+    /// era-5c: the function whose body this context infers.
+    function: rustc_hir::def_id::DefId,
+    /// era-5c: must-null facts per CFG edge; `Some` only under the arm.
+    null_paths: Option<super::null_paths::NullPaths>,
+    /// era-5c: per (join block, local, incoming version) the window components
+    /// known null on EVERY edge that carries that version into the join.
+    null_joins: FxHashMap<(BasicBlock, Local, SSAIdx), Vec<bool>>,
+    /// L01^5 (ii): the proven strong-update field moves of this body. Empty
+    /// unless `CRAT_ERA5C_FIELD_MOVE` is on.
+    field_moves: super::field_moves::FieldMoves,
 }
 
 type CallArg<LocalSig> = (Local, (Consume<LocalSig>, bool));
@@ -204,17 +217,33 @@ where
             fn_body_sig,
             deref_copy: None,
             call_args: Vec::new(),
+            call_arg_records: FxHashMap::default(),
             global_assumptions,
             copy_lend_guards,
+            field_reader_guards: FxHashMap::default(),
             realloc_plans: Vec::new(),
             realloc_inputs: std::collections::BTreeMap::new(),
             realloc_versions: Vec::new(),
             realloc_ghosts: FxHashSet::default(),
+            function: body.source.def_id(),
+            null_paths: super::null_paths::move_tracking()
+                .then(|| super::null_paths::NullPaths::compute(crate_ctxt.tcx, body)),
+            null_joins: FxHashMap::default(),
+            field_moves: super::field_moves::compute(body),
         }
+    }
+
+    pub(crate) fn function(&self) -> rustc_hir::def_id::DefId {
+        self.function
     }
 
     fn copy_lend_guard(&self, location: Location) -> Option<Bool> {
         self.copy_lend_guards.get(&location).cloned()
+    }
+
+    pub(crate) fn with_field_reader_guards(mut self, guards: FxHashMap<Location, Bool>) -> Self {
+        self.field_reader_guards = guards;
+        self
     }
 
     /// Dominance property
@@ -459,6 +488,10 @@ where
         arg: Consume<Self::LocalSig>,
         is_ref: bool,
     ) {
+        let registration = super::ownership_boundary::register_proxy(temp.as_u32(), &arg, is_ref);
+        if super::licensing::facts::active() {
+            infer_cx.call_arg_records.insert(temp, registration);
+        }
         if let Some(existing) = infer_cx.call_args.get_by_key_mut(&temp) {
             *existing = (arg, is_ref);
         } else {
@@ -495,8 +528,47 @@ where
         }
     }
 
+    fn phi_edge(
+        infer_cx: &mut InferCtxt<'infercx, 'db, 'tcx, Analysis>,
+        pred: BasicBlock,
+        succ: BasicBlock,
+        local: Local,
+        ty: Ty<'tcx>,
+        rhs: SSAIdx,
+    ) {
+        let Some(null_paths) = infer_cx.null_paths.as_ref() else {
+            return;
+        };
+        let facts = null_paths.local_facts_on_edge(pred, succ, local);
+        let window = infer_cx
+            .fn_body_sig
+            .get(local)
+            .and_then(|versions| versions.get(rhs))
+            .map(|sigs| sigs.end.as_u32() - sigs.start.as_u32())
+            .unwrap_or_else(|| infer_cx.struct_ctxt.measure(ty, 0));
+        let vacuous = super::null_paths::vacuous_components_with(
+            infer_cx.tcx,
+            &infer_cx.struct_ctxt,
+            ty,
+            window,
+            &facts,
+        );
+        // Every edge carrying this version must agree: intersect.
+        infer_cx
+            .null_joins
+            .entry((succ, local, rhs))
+            .and_modify(|known| {
+                for (known, now) in known.iter_mut().zip(vacuous.iter()) {
+                    *known = *known && *now;
+                }
+                known.truncate(vacuous.len().min(known.len()));
+            })
+            .or_insert(vacuous);
+    }
+
     fn join_phi_nodes<'a>(
         infer_cx: &'a mut InferCtxt<'infercx, 'db, 'tcx, Analysis>,
+        bb: BasicBlock,
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
     ) {
         for (local, phi_node) in phi_nodes {
@@ -524,7 +596,20 @@ where
                     );
                     continue;
                 };
-                for (lhs_sig, rhs_sig) in lhs_sigs.zip(rhs_sigs) {
+                let vacuous = infer_cx.null_joins.get(&(bb, local, rhs)).cloned();
+                for (index, (lhs_sig, rhs_sig)) in lhs_sigs.zip(rhs_sigs).enumerate() {
+                    if vacuous
+                        .as_ref()
+                        .is_some_and(|vacuous| vacuous.get(index).copied().unwrap_or(false))
+                    {
+                        // era-5c: the incoming pointer is null on every edge
+                        // that carries this version here — its token guards
+                        // nothing and may be dropped at the join.
+                        infer_cx.database.push_null_join::<
+                            crate::analyses::borrow_ownership::ssa::constraint::Debug,
+                        >((), lhs_sig, rhs_sig);
+                        continue;
+                    }
                     infer_cx
                         .database
                         .push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
@@ -543,6 +628,7 @@ where
         place: &Place<'tcx>,
         consume: Option<Consume<SSAIdx>>,
     ) -> Option<Consume<Self::LocalSig>> {
+        let occurrence_ssa = consume.clone();
         let base = place.local;
         let base_ty = body.local_decls[base].ty;
 
@@ -594,12 +680,47 @@ where
             body.local_decls[base].local_info.as_ref(),
             ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
         ) {
-            infer_cx.deref_copy.take()?
+            let Some(base) = infer_cx.deref_copy.take() else {
+                super::ownership_occurrence::record_consume(
+                    infer_cx.tcx,
+                    body,
+                    *place,
+                    occurrence_ssa.as_ref(),
+                    None,
+                    None,
+                    &infer_cx.struct_ctxt,
+                    "deref-copy provider unavailable",
+                );
+                return None;
+            };
+            base
         } else {
+            super::ownership_occurrence::record_consume(
+                infer_cx.tcx,
+                body,
+                *place,
+                occurrence_ssa.as_ref(),
+                None,
+                None,
+                &infer_cx.struct_ctxt,
+                "no SSA consume",
+            );
             return None;
         };
 
-        InferCtxt::project_deeper(base, base_ty, place.projection, infer_cx)
+        let observed_base = base.clone();
+        let projected = InferCtxt::project_deeper(base, base_ty, place.projection, infer_cx);
+        super::ownership_occurrence::record_consume(
+            infer_cx.tcx,
+            body,
+            *place,
+            occurrence_ssa.as_ref(),
+            Some(&observed_base),
+            projected.as_ref(),
+            &infer_cx.struct_ctxt,
+            "projection outside represented ownership window",
+        );
+        projected
     }
 
     fn copy_for_deref(
@@ -622,6 +743,17 @@ where
         infer_cx.deref_copy = consume
     }
 
+    fn aggregate(
+        infer_cx: &mut Self::Ctxt,
+        body: &Body<'tcx>,
+        place: Place<'tcx>,
+        kind: &AggregateKind<'tcx>,
+        destination: Option<Consume<Self::LocalSig>>,
+        operands: &[(&Operand<'tcx>, Option<Consume<Self::LocalSig>>)],
+    ) {
+        infer_cx.aggregate(body, place, kind, destination, operands);
+    }
+
     fn transfer<const ENSURE_MOVE: bool>(
         infer_cx: &mut InferCtxt<'infercx, 'db, 'tcx, Analysis>,
         ty: Ty<'tcx>,
@@ -640,8 +772,21 @@ where
         }
 
         let copy_lend_guard = location.and_then(|location| infer_cx.copy_lend_guard(location));
+        let field_reader_guard =
+            location.and_then(|location| infer_cx.field_reader_guards.get(&location).cloned());
+        let reader_windows = field_reader_guard
+            .as_ref()
+            .map(|_| (lhs_result.clone(), rhs_result.clone()));
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
+            // L01^5 (ii): a proven strong-update field load MOVES the token —
+            // the destination takes it and the source component goes vacuous —
+            // instead of the split a copy would get. `field_moves` is empty
+            // unless CRAT_ERA5C_FIELD_MOVE is on.
+            let ensure_move = ENSURE_MOVE
+                || location.is_some_and(|location| infer_cx.field_moves.is_move(location));
             let mut matched_depth = 0usize;
+            let mut reader_destinations = std::collections::BTreeSet::new();
+            let mut reader_sources = std::collections::BTreeSet::new();
             matcher(
                 ty,
                 lhs_result.transpose(),
@@ -649,17 +794,28 @@ where
                 infer_cx.struct_ctxt,
                 infer_cx.database,
                 |lhs, rhs, database| {
+                    let _transfer = super::ownership_occurrence::transfer(&lhs, &rhs, ensure_move);
                     database
                         .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
                             (),
                             lhs.r#use,
                             false,
                         );
-                    if matched_depth == 0
+                    if let Some(reader) = field_reader_guard.as_ref() {
+                        reader_destinations.insert(lhs.def);
+                        reader_sources.insert(rhs.def);
+                        database.push_guarded_field_reader(
+                            reader,
+                            lhs.def,
+                            rhs.def,
+                            rhs.r#use,
+                            ENSURE_MOVE,
+                        );
+                    } else if matched_depth == 0
                         && let Some(lend) = copy_lend_guard.as_ref()
                     {
                         database.push_guarded_copy(lend, lhs.def, rhs.def, rhs.r#use, ENSURE_MOVE);
-                    } else if ENSURE_MOVE {
+                    } else if ensure_move {
                         database.push_equal::<
                             crate::analyses::borrow_ownership::ssa::constraint::Debug,
                         >((), lhs.def, rhs.r#use);
@@ -673,7 +829,30 @@ where
                     }
                     matched_depth += 1;
                 },
-            )
+            );
+            if let (Some(reader), Some((destination, source))) =
+                (field_reader_guard.as_ref(), reader_windows)
+            {
+                // Structural matching can omit deeper components at a precision
+                // boundary. The certified view still owns no represented part,
+                // and the source keeps every represented responsibility. The
+                // ordinary transfer arm retains its existing precision behavior.
+                for (window, matched, source_tail) in [
+                    (destination, reader_destinations, false),
+                    (source, reader_sources, true),
+                ] {
+                    for component in window.transpose() {
+                        if !matched.contains(&component.def) {
+                            infer_cx.database.push_guarded_field_reader_tail(
+                                reader,
+                                component.def,
+                                component.r#use,
+                                source_tail,
+                            );
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -719,6 +898,31 @@ where
                     r#use,
                     def,
                 )
+        }
+    }
+
+    fn mutable_reference(
+        infer_cx: &mut Self::Ctxt,
+        destination: Consume<Self::LocalSig>,
+        source: Option<Consume<Self::LocalSig>>,
+    ) {
+        if let Some(source) = source.as_ref()
+            && infer_cx
+                .database
+                .try_original_cell_frame(&destination, source)
+        {
+            return;
+        }
+        if let Some(source) = source.as_ref()
+            && infer_cx
+                .database
+                .try_reference_field_effect(&destination, source)
+        {
+            return;
+        }
+        Self::borrow(infer_cx, destination);
+        if let Some(source) = source {
+            Self::lend(infer_cx, source);
         }
     }
 
@@ -768,18 +972,28 @@ where
         destination: Option<Consume<Self::LocalSig>>,
         args: &[Spanned<Operand<'tcx>>],
         callee: &Operand<'tcx>,
+        body: &Body<'tcx>,
+        location: Location,
     ) {
+        let mut registrations = super::licensing::facts::active().then(Vec::new);
         let args = args
             .iter()
             .map(|operand| {
-                operand
-                    .node
-                    .place()
-                    .and_then(|operand| operand.as_local())
-                    .and_then(|operand| infer_cx.call_args.get_by_key(&operand))
-                    .cloned()
+                let proxy = operand.node.place().and_then(|operand| operand.as_local());
+                let arg = proxy.and_then(|proxy| infer_cx.call_args.get_by_key(&proxy));
+                if let Some(registrations) = &mut registrations {
+                    registrations.push(arg.and_then(|(_, by_reference)| {
+                        proxy.map(|proxy| super::ownership_boundary::SelectedProxy {
+                            proxy_local: proxy.as_u32(),
+                            registration: infer_cx.call_arg_records.get(&proxy).copied().flatten(),
+                            by_reference: *by_reference,
+                        })
+                    }));
+                }
+                arg.cloned()
             })
             .collect::<SmallVec<_>>();
+        let _boundary_arguments = super::ownership_boundary::call_arguments(registrations);
 
         if let Some(func) = callee.constant() {
             let ty = func.ty();
@@ -821,7 +1035,47 @@ where
             }
         } else {
             // closure or fn ptr
-            // TODO
+            // TODO (default arm: nothing is emitted and the result floats —
+            // the objective then settles it Owning with no evidence).
+            //
+            // era-5c (R409-1, R412-12): under the frame an indirect call's
+            // result is OPAQUE — an unknown call: destination borrowed,
+            // arguments lent — and the named allocator contract is the only
+            // route to Owning for such a result: a call through `alloc_func`
+            // is a receipted source, through `free_func` a sink.
+            if super::null_paths::move_tracking() || super::allocator_contract::enabled() {
+                let class = super::allocator_contract::classify(infer_cx.tcx, body, location);
+                if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                    eprintln!(
+                        "E5C contract-call {:?} at {location:?}: {class:?} callee-ty={:?}",
+                        infer_cx.tcx.def_path_str(body.source.def_id()),
+                        callee.ty(body, infer_cx.tcx)
+                    );
+                }
+                match class {
+                    Some(super::allocator_contract::ContractCall::Alloc) => {
+                        super::allocator_contract::note_producer(body.source.def_id());
+                        with_own_assume_site(OwnAssumeSite::LibcRule, || {
+                            super::export::with_callee(super::allocator_contract::CONTRACT, || {
+                                if let Some(destination) = destination {
+                                    Self::source(infer_cx, destination);
+                                }
+                            })
+                        })
+                    }
+                    Some(super::allocator_contract::ContractCall::Free) => {
+                        with_own_assume_site(OwnAssumeSite::LibcRule, || {
+                            super::export::with_callee(super::allocator_contract::CONTRACT, || {
+                                if let Some(Some((arg, is_ref))) = args.get(1) {
+                                    assert!(!is_ref);
+                                    Self::sink(infer_cx, arg.clone());
+                                }
+                            })
+                        })
+                    }
+                    None => infer_cx.unknown_call(destination, &args),
+                }
+            }
         }
     }
 
@@ -842,10 +1096,59 @@ where
             } else {
                 None
             };
-            locals_collected.push(sigs);
+            super::ownership_occurrence::record_terminal(
+                infer_cx.tcx,
+                body,
+                local,
+                ssa_idx,
+                sigs.as_ref(),
+                &infer_cx.struct_ctxt,
+            );
+            locals_collected.push((local, sigs));
         }
 
-        let mut locals = locals_collected.into_iter();
+        // L01⁷-A1 (R525-5). The loop below is commented "finalize temporaries",
+        // but it walks EVERY non-parameter local -- named ones included. Report
+        // 037 §3 measured `main_0::root` sitting in that set directly, which is
+        // why bst's driver collapses: the blanket asserts `own = false` on the
+        // very local the source named as the owner.
+        //
+        // A1 spares exactly those. Uniqueness is preserved by construction and
+        // the argument is direct: every ANONYMOUS temporary stays pinned to
+        // non-owning, so within each `own-equal` class at most the named local
+        // can hold the token -- which is the conclusion the blanket exists to
+        // support. On bst that is 5 named locals spared out of 159.
+        //
+        // R526-3 narrows this from "every named local" to the CALL-RESULT
+        // RE-SEAT destination only. The wide form took the analyses suite from
+        // 1,112/6 to 1,005/113 -- the fold/custody/gate certificates rely on the
+        // final zero of a live local as an inference device, and
+        // `ol19_return_transfers_but_live_local_finalization_is_not_relaxed` is
+        // a purpose-named counter-witness that is NOT re-pinned. So the spare
+        // set is exactly `x = f(x)`: a named local that is both an argument of a
+        // call and the destination of that call's result, directly
+        // (`x = f(x)`) or through the result temporary (`t = f(x); x = t`).
+        let named_locals: rustc_data_structures::fx::FxHashSet<Local> =
+            if super::field_moves::reseat_a1() {
+                reseat_destinations(body)
+            } else {
+                Default::default()
+            };
+        let spared: Vec<Local> = locals_collected
+            .iter()
+            .skip(body.arg_count + 1)
+            .filter(|(local, _)| named_locals.contains(local))
+            .map(|(local, _)| *local)
+            .collect();
+        if !spared.is_empty() && std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!(
+                "E5C a1-spared fn={} locals={:?}",
+                infer_cx.tcx.def_path_str(body.source.def_id()),
+                spared.iter().map(|l| l.as_u32()).collect::<Vec<_>>()
+            );
+        }
+
+        let mut locals = locals_collected.into_iter().skip(0);
 
         <Analysis as Boundary>::exit(
             infer_cx.tcx,
@@ -854,15 +1157,37 @@ where
             infer_cx.struct_ctxt.unrestricted,
             infer_cx.database,
             body,
-            locals.by_ref().take(body.arg_count + 1),
+            locals
+                .by_ref()
+                .take(body.arg_count + 1)
+                .map(|(_, sigs)| sigs),
         );
 
         // finalize temporaries
+        //
+        // R510-1(1) COUNTERFACTUAL PIN -- NEVER LANDS. era-5c report 033 found
+        // `own-assume[temporary-finalization]` in all nine relaxation cores of
+        // the bst driver variant while the corpus form has none. This gate drops
+        // the family so the seat can see whether removing it RECOVERS the model
+        // (the caller re-seat rule is then sufficient) or exposes a second wall.
+        // Diagnosis only: `CRAT_ERA5C_SKIP_FAMILY=temporary-finalization`.
+        let skip_finalization = super::field_moves::finalize_soft()
+            || std::env::var("CRAT_ERA5C_SKIP_FAMILY")
+                .unwrap_or_default()
+                .split(',')
+                .any(|name| name.trim() == "temporary-finalization");
         with_own_assume_site(OwnAssumeSite::TemporaryFinalization, || {
-            for vars in locals {
+            if skip_finalization {
+                return;
+            }
+            for (local, vars) in locals {
                 let Some(vars) = vars else {
                     continue;
                 };
+                // A1: a named local live at exit keeps its ownership bit free.
+                if named_locals.contains(&local) {
+                    continue;
+                }
                 for var in vars {
                     infer_cx
                         .database
@@ -1000,4 +1325,161 @@ fn matcher<'tcx, T, U, DB>(
             )
         }
     }
+}
+
+/// L01⁷-A1's spare set (R526-3): the named locals that are the DESTINATION of a
+/// call-result re-seat `x = f(x)`, directly or through the result temporary,
+/// with each argument resolved back through `Use(Copy|Move)` chains (bst's
+/// `root = insert(root, k)` passes a copy of `root`). Lifted out of `r#return`
+/// so a MIR-only walk can count the market without running a solve.
+pub(crate) fn reseat_destinations(
+    body: &rustc_middle::mir::Body<'_>,
+) -> rustc_data_structures::fx::FxHashSet<Local> {
+    let named: rustc_data_structures::fx::FxHashSet<Local> = body
+        .var_debug_info
+        .iter()
+        .filter_map(|info| {
+            let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value else {
+                return None;
+            };
+            place.projection.is_empty().then_some(place.local)
+        })
+        .collect();
+    let mut reseated = rustc_data_structures::fx::FxHashSet::default();
+    if std::env::var_os("CRAT_ERA5C_RESEAT_DUMP").is_some() {
+        eprintln!("E5C_MIR_FN {:?}", body.source.def_id());
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            for st in &data.statements {
+                if let rustc_middle::mir::StatementKind::Assign(a) = &st.kind {
+                    eprintln!("E5C_MIR {:?} {:?} = {:?}", block, a.0, a.1);
+                }
+            }
+            if let rustc_middle::mir::TerminatorKind::Call {
+                args,
+                destination,
+                func,
+                ..
+            } = &data.terminator().kind
+            {
+                eprintln!(
+                    "E5C_MIR {:?} CALL dest={:?} func={:?} args={:?}",
+                    block,
+                    destination,
+                    func,
+                    args.iter().map(|a| a.node.place()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let rustc_middle::mir::TerminatorKind::Call {
+            args,
+            destination,
+            func,
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        // R526-3's callee condition, its necessary half: the callee is a
+        // function OF THIS PROGRAM. Report 040 measured the syntactic form
+        // matching ~2,300 calls corpus-wide, all but a handful of them
+        // `wrapping_*` arithmetic and `ptr::offset` cursor advances
+        // (`output = output.offset(1)` is a call in MIR). A cursor's
+        // `own = false` finalization is protective -- a cursor must never
+        // become the owner of the interior of an allocation -- so those
+        // are excluded here, not merely counted.
+        let Some((callee, _)) = func.const_fn_def() else {
+            continue;
+        };
+        if !callee.is_local() {
+            continue;
+        }
+        // the locals this call consumes as arguments
+        let mut argument_locals = rustc_data_structures::fx::FxHashSet::default();
+        for arg in args.iter() {
+            if let Some(place) = arg.node.place()
+                && place.projection.is_empty()
+            {
+                argument_locals.insert(place.local);
+            }
+        }
+        if argument_locals.is_empty() || !destination.projection.is_empty() {
+            continue;
+        }
+        let result = destination.local;
+        // The argument is normally a COPY of the re-seated local --
+        // bst's `root = insert(root, k)` is `_4 = copy _2;
+        // _3 = insert(_4, _5); _2 = move _3` -- so resolve each argument
+        // back through `Use(Copy|Move)` chains to the locals it reads.
+        let mut argument_sources = argument_locals.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let rustc_middle::mir::StatementKind::Assign(assign) = &statement.kind else {
+                        continue;
+                    };
+                    let (target, rvalue) = &**assign;
+                    let rustc_middle::mir::Rvalue::Use(operand) = rvalue else { continue };
+                    let Some(source) = operand.place() else { continue };
+                    if target.projection.is_empty()
+                        && source.projection.is_empty()
+                        && argument_sources.contains(&target.local)
+                        && argument_sources.insert(source.local)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // direct form: `x = f(x)`
+        if named.contains(&result) && argument_sources.contains(&result) {
+            reseated.insert(result);
+            if std::env::var_os("CRAT_ERA5C_RESEAT_WHY").is_some() {
+                let rustc_middle::mir::TerminatorKind::Call { func, .. } = &data.terminator().kind
+                else {
+                    unreachable!()
+                };
+                eprintln!("E5C_RESEAT_WHY direct _{} {:?}", result.as_u32(), func);
+            }
+        }
+        // through the result temporary: `t = f(x); x = move t`
+        for (_, later) in body
+            .basic_blocks
+            .iter_enumerated()
+            .filter(|(b, _)| *b >= block)
+        {
+            for statement in &later.statements {
+                let rustc_middle::mir::StatementKind::Assign(assign) = &statement.kind else {
+                    continue;
+                };
+                let (target, rvalue) = &**assign;
+                let rustc_middle::mir::Rvalue::Use(operand) = rvalue else { continue };
+                let Some(source) = operand.place() else { continue };
+                if target.projection.is_empty()
+                    && source.projection.is_empty()
+                    && source.local == result
+                    && named.contains(&target.local)
+                    && argument_sources.contains(&target.local)
+                {
+                    reseated.insert(target.local);
+                    if std::env::var_os("CRAT_ERA5C_RESEAT_WHY").is_some() {
+                        let rustc_middle::mir::TerminatorKind::Call { func, .. } =
+                            &data.terminator().kind
+                        else {
+                            unreachable!()
+                        };
+                        eprintln!(
+                            "E5C_RESEAT_WHY via-temp _{} {:?}",
+                            target.local.as_u32(),
+                            func
+                        );
+                    }
+                }
+            }
+        }
+    }
+    reseated
 }

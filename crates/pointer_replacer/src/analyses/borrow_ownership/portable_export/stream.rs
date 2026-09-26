@@ -274,6 +274,7 @@ impl StreamCollector {
         resolver: &Resolver<'_, '_>,
         review: &rt::RetirementReview,
         round: Option<usize>,
+        acceptance: Option<&Value>,
     ) -> Result<(), String> {
         let family = if round.is_some() {
             ExportFamily::RetirementRounds
@@ -289,7 +290,14 @@ impl StreamCollector {
         {
             let mut writer =
                 std::io::BufWriter::with_capacity(COPY_BUFFER, &mut self.fragments.file);
-            write_review_fields(&mut writer, resolver, review, round, &mut self.residency)?;
+            write_review_fields(
+                &mut writer,
+                resolver,
+                review,
+                round,
+                acceptance,
+                &mut self.residency,
+            )?;
             writer.flush().map_err(error)?;
         }
         let fields = Fragment {
@@ -484,6 +492,7 @@ fn write_review_fields(
     r: &Resolver<'_, '_>,
     review: &rt::RetirementReview,
     round: Option<usize>,
+    acceptance: Option<&Value>,
     residency: &mut Residency,
 ) -> Result<(), String> {
     raw(w, b"{\"conflicts\":")?;
@@ -523,11 +532,17 @@ fn write_review_fields(
         },
         residency,
     )?;
+    raw(w, b",\"known_stack_entries\":")?;
+    json(w, &review.known_stack_entries)?;
     raw(w, b",\"ordinary_error_points\":")?;
     json(w, &review.ordinary_error_points)?;
     if let Some(round) = round {
         raw(w, b",\"round\":")?;
         json(w, &round)?;
+    }
+    if let Some(acceptance) = acceptance {
+        raw(w, b",\"stack_entry_acceptance\":")?;
+        json(w, acceptance)?;
     }
     raw(w, b",\"terminal\":")?;
     values(
@@ -645,7 +660,22 @@ pub(crate) fn collect_to_path(
         }
     }
     for row in &export.loans {
-        out.add(F::Loans,json!({"function":resolver.function(row.key.fn_did)?,"place":place(&row.key.place),"location":mir_location(row.key.location),"borrower":resolver.borrower(row.key.fn_did,row.key.borrower)?,"kind":tag(row.kind),"class":tag(row.class),"invalid":row.invalid}),json!({"loan":row.run_local_handle}))?;
+        let function = resolver.function(row.key.fn_did)?;
+        let mut fields = json!({"function":function,"place":place(&row.key.place),"location":mir_location(row.key.location),"borrower":resolver.borrower(row.key.fn_did,row.key.borrower)?,"kind":tag(row.kind),"class":tag(row.class),"invalid":row.invalid});
+        // The returned borrow is the typed collector's row, not a second one:
+        // the two writers answer the same question about the same loan.
+        let matches: Vec<_> = export.traversal_replay.iter().flatten().filter(|receipt| {
+            let call = &receipt.origin.candidate.call;
+            call.caller == function && call.block == row.key.location.block && call.statement == row.key.location.statement_index
+                && receipt.target.local == row.key.place.local.as_u32() && receipt.target.projection == row.key.place.proj
+                && matches!(row.key.borrower, e::BorrowerKind::CallArg {arg_index, ..} if arg_index == receipt.origin.native.argument_index)
+        }).collect();
+        if let [receipt] = matches.as_slice() {
+            fields["returned_borrow"] = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+        } else if !matches.is_empty() {
+            return Err("ambiguous returned-borrow native loan".into());
+        }
+        out.add(F::Loans, fields, json!({"loan":row.run_local_handle}))?;
     }
     if let Some(rows) = &export.residual_conflicts {
         for row in rows {
@@ -751,9 +781,17 @@ pub(crate) fn collect_to_path(
         let predecessors=row.predecessors.iter().map(|p|Ok(json!({"function":resolver.function(p.function)?,"location":location(p.location),"phase":tag(p.phase),"moment":tag(p.moment)}))).collect::<Result<Vec<_>,String>>()?;
         out.add(F::EntryWitnesses,json!({"fact":resolver.fact(&row.fact)?,"rule":rule,"entry":resolver.entry(key)?,"predecessors":predecessors}),Value::Null)?;
     }
-    out.add_review(&resolver, export.source_retirement.as_ref().unwrap(), None)?;
+    let acceptance = super::super::licensing::stack_export::collect(export)
+        .map(|accepted| accepted.stamp())
+        .unwrap_or(Value::Null);
+    out.add_review(
+        &resolver,
+        export.source_retirement.as_ref().unwrap(),
+        None,
+        Some(&acceptance),
+    )?;
     for (round, review) in export.retirement_rounds.iter().enumerate() {
-        out.add_review(&resolver, review, Some(round))?;
+        out.add_review(&resolver, review, Some(round), None)?;
     }
     let comparison = export.comparisons.as_ref().unwrap();
     out.add(

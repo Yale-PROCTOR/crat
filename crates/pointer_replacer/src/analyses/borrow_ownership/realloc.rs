@@ -30,7 +30,9 @@ mod use_evidence;
 #[cfg(test)]
 mod coverage_tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum ReallocOutcome {
     Success,
     Failure,

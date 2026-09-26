@@ -6,7 +6,7 @@ use rustc_index::{
     bit_set::{DenseBitSet, SparseBitMatrix},
 };
 use rustc_middle::{
-    mir::{Local, PlaceElem},
+    mir::{Body, Local, PlaceElem},
     ty::TyCtxt,
 };
 use rustc_mir_dataflow::points::PointIndex;
@@ -142,6 +142,7 @@ impl<'a> NativeBorrowContext<'a> {
         selected_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
         escaped_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
     ) -> NativeInference<'tcx> {
+        crate::analyses::borrow_ownership::licensing::reader_replay::begin_function(f);
         let mut inference = borrow_inference(tcx, f, &self.borrow);
         let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         let mut escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
@@ -216,19 +217,65 @@ impl<'a> NativeBorrowContext<'a> {
             "② pruning-exemption registration count must equal the effective selection"
         );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
-        let graph = NativeConstraintGraph::new(
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        use crate::analyses::borrow_ownership::licensing::traversal_replay;
+        let expected = traversal_replay::begin_function(f);
+        let mut installed = Vec::new();
+        for expected in expected {
+            let matches: Vec<_> = inference
+                .borrow_set
+                .loans
+                .iter_enumerated()
+                .filter_map(|(loan, data)| {
+                    let Borrower::CallArg(callee, arg_index) = data.assigned else { return None };
+                    let identity = SelectedCopyLendLoan {
+                        location: export::location_key(data.location()),
+                        borrowed: export::PlaceKey::from_place(data.borrowed),
+                        borrower: export::BorrowerKind::CallArg {
+                            callee: callee.local_def_index.as_u32(),
+                            arg_index,
+                        },
+                    };
+                    (identity == expected.identity).then_some(loan)
+                })
+                .collect();
+            let [loan] = matches.as_slice() else { continue };
+            let Some(receiver) = provenance_set
+                .local_data
+                .get(expected.receiver)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            if super::traversal_targets::retarget(
+                tcx,
+                body,
+                &mut inference,
+                &[(*loan, expected.owner_input.clone())],
+            )
+            .is_ok()
+            {
+                installed.push((expected, *loan, receiver));
+            }
+        }
+        let mut graph = NativeConstraintGraph::new(
+            f,
+            body,
             &inference,
             provenance_set,
             self.flows.get(&f),
             disabled_fields,
         );
+        for (_, loan, receiver) in &installed {
+            graph.membership.push((*loan, *receiver));
+        }
         let subset_graph = graph.subset_graph(provenance_set);
         inference.subset_closure = graph.subset_closure(provenance_set, &subset_graph);
         // The landed whole-body relation is computed in BOTH modes: `Off` consumes it, and `On`
         // needs it as the tripwire's reference (and leaves it on `facts` so production's own
         // consumers are untouched).
         inference.requires = graph.requires(&inference, provenance_set, &subset_graph);
-        let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
         let landed_loan_liveness = loan_liveness::compute_loan_liveness(
             tcx,
             body,
@@ -278,6 +325,9 @@ impl<'a> NativeBorrowContext<'a> {
             &escaped_lends,
         );
         inference.loan_liveness = ported_loan_liveness;
+        for (expected, loan, _) in &installed {
+            traversal_replay::observe(f, body, &inference, expected, *loan);
+        }
         let localized_requires = Some(ported_requires);
         let all_only_closure = if std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT").is_some() {
             let mut all_graph: IndexVec<Provenance, SmallVec<[Provenance; 4]>> =
@@ -362,6 +412,208 @@ impl<'a> NativeBorrowContext<'a> {
             succ_points,
             loan_reserve,
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_root_tests {
+    use std::rc::Rc;
+
+    use rustc_hir::{ItemKind, OwnerNode};
+
+    use super::*;
+    use crate::analyses::{
+        borrow::ProvenanceData,
+        borrow_ownership::{
+            construction::construct_bo_into_a16_refined,
+            crate_slots::CrateSlots,
+            licensing::reader_replay,
+            mutability_facts::MutFacts,
+            origins::compute_origins,
+            ownership_occurrence::Availability,
+            solver::{KindSolver, SlotRef},
+        },
+    };
+
+    #[test]
+    fn c05_owned_cell_reader_replays_the_exact_ifl3_loan_without_a_parameter_root() {
+        ::utils::compilation::run_compiler_on_str(r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub struct H { ptr: *mut i32 }
+pub unsafe fn release(h: *mut H) { free((*h).ptr as *mut core::ffi::c_void); }
+pub unsafe fn f() -> i32 {
+    let owner = malloc(core::mem::size_of::<i32>()) as *mut i32;
+    *owner = 1;
+    let mut h = H { ptr: owner };
+    let before = *h.ptr;
+    release(&mut h);
+    before
+}
+"#, |tcx| {
+            let mut functions = Vec::new();
+            let mut structs = Vec::new();
+            for owner in tcx.hir_crate(()).owners.iter() {
+                let Some(owner) = owner.as_owner() else { continue };
+                let OwnerNode::Item(item) = owner.node() else { continue };
+                match item.kind {
+                    ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                    ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                    _ => {}
+                }
+            }
+            let function = functions.iter().copied().find(|did| tcx.item_name((*did).to_def_id()).as_str() == "f").unwrap();
+            let program = RustProgram { tcx, functions, structs };
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let mutability = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
+            let facts = solver.ownership_facts().unwrap();
+            let effects = &facts.licensing.as_ref().unwrap().reference_effects.candidates;
+            assert_eq!(effects.len(), 1, "unchanged IFL3 reference-effect candidate");
+            let effect = &effects[0];
+            let view = facts.consumes.iter().find(|row| row.ordinal == effect.scalar_view_consume
+                && row.point.construction == effect.construction).unwrap();
+            let cell = facts.consumes.iter().find(|row| row.ordinal == effect.scalar_consume
+                && row.point.construction == effect.construction).unwrap();
+            assert_eq!(view.local, 10, "literal OL07 compiler view");
+            assert_eq!(cell.local, 4, "literal OL07 local struct");
+            assert_eq!(cell.projection, vec![export::ProjKey::Field(0)]);
+            assert_eq!(view.point, effect.scalar_read);
+            let target = facts.slot_refs[&format!("f::_{}@d0", view.local)];
+            let field_target = facts.slot_refs[&effect.field_key];
+            let body = &*tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+            assert_eq!(body.arg_count, 0, "the owning cell is not a function parameter");
+            let view_local = Local::from_u32(view.local);
+            let context = NativeBorrowContext::new(&program, origins.native_flows(),
+                |did| move |local| did == function && local == view_local, |_| |_| true);
+            let inference = borrow_inference(tcx, function, &context.borrow);
+            let provenance_set = &context.borrow.provenances[&function];
+            assert!(provenance_set.provenance_data.iter().all(|data|
+                !matches!(data, ProvenanceData::PlaceHolder(..))), "no fake parameter placeholder");
+            let mut projection = cell.projection.clone();
+            projection.push(export::ProjKey::Deref);
+            let identity = SelectedCopyLendLoan {
+                location: export::location_key(rustc_middle::mir::Location {
+                    block: rustc_middle::mir::BasicBlock::from_u32(effect.scalar_read.block.unwrap()),
+                    statement_index: effect.scalar_read.statement.unwrap(),
+                }),
+                borrowed: export::PlaceKey { local: Local::from_u32(cell.local), proj: projection },
+                borrower: export::BorrowerKind::Assign { owner: export::OwnerKey::Local(view.local) },
+            };
+            assert_eq!(inference.borrow_set.loans.iter().filter(|loan|
+                export::PlaceKey::from_place(loan.borrowed) == identity.borrowed
+                    && export::location_key(loan.location()) == identity.location
+                    && matches!(loan.assigned, Borrower::Assign(ProvenanceOwner::Local(local)) if local == view_local)
+            ).count(), 1, "actual CopyForDeref loan identifies the exact local owning cell");
+
+            // A controlled replay presentation, not an ownership solve.
+            let _facts = reader_replay::enter_facts(Some(facts.clone()));
+            let round = reader_replay::begin_round(&slots, &|slot| slot == target,
+                &|slot| slot != target && slot != field_target);
+            reader_replay::begin_function(function);
+            let graph = NativeConstraintGraph::new(function, body, &inference, provenance_set,
+                origins.native_flows().get(&function), &[]);
+            let reviewed = round.finish();
+            let receipts = serde_json::to_value(&reviewed.receipts).unwrap();
+            let owned: Vec<_> = receipts.as_array().unwrap().iter().filter(|receipt|
+                receipt["owned_cell"]["function"] == "f").collect();
+            assert_eq!(owned.len(), 1, "the local owned-cell reader needs its own replay receipt");
+            assert_eq!(owned[0]["owned_cell"], serde_json::to_value(effect).unwrap());
+            assert!(owned[0]["candidate"].is_null(), "no Parameter(0) candidate is synthesized");
+            assert_eq!(owned[0]["matched_loans"], 1);
+            assert_eq!(owned[0]["origin_linked"], true);
+            assert!(reviewed.failures.is_empty());
+            let field_provenance = provenance_set.provenance_data.iter_enumerated().find_map(|(id, data)|
+                matches!(data, ProvenanceData::Field(_, _)).then_some(id)).unwrap();
+            let view_provenance = provenance_set.local_data[view_local].unwrap();
+            assert!(graph.subset.iter().any(|(from, to, at)| *from == field_provenance
+                && *to == view_provenance && matches!(at, EdgeLocation::Point(location)
+                    if export::location_key(*location) == identity.location)), "owned field origin is linked at its exact reader loan");
+            assert_eq!([solver.check_sat_count(), solver.hard_check_count(), solver.optimize_materialization_count(),
+                solver.lazy_plain_hard_check_count(), solver.lazy_tracked_recheck_count(), solver.lazy_plain_materialization_count()], [0; 6]);
+        }).unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn f04_reader_origin_must_match_the_actual_parameter_root() {
+        ::utils::compilation::run_compiler_on_str(r#"
+pub struct H { ptr: *mut i32 }
+pub unsafe fn peek(_a: &H, b: &H) -> i32 { let view = b.ptr; *view }
+"#, |tcx| {
+            let mut functions = Vec::new();
+            let mut structs = Vec::new();
+            for owner in tcx.hir_crate(()).owners.iter() {
+                let Some(owner) = owner.as_owner() else { continue };
+                let OwnerNode::Item(item) = owner.node() else { continue };
+                match item.kind {
+                    ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                    ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                    _ => {}
+                }
+            }
+            let function = functions[0];
+            let program = RustProgram { tcx, functions, structs };
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let mutability = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
+            let facts = solver.ownership_facts().expect("actual reader construction");
+            let proofs = &facts.licensing.as_ref().unwrap().reader_transfers;
+            assert_eq!(proofs.len(), 1);
+            assert!(matches!(proofs[0].coverage, Availability::Present(_)));
+            assert_eq!(proofs[0].candidate.origin_parameter, 2);
+            let candidate = proofs[0].candidate.clone();
+            let context = NativeBorrowContext::new(&program, origins.native_flows(), |_| |_| true, |_| |_| true);
+            let inference = borrow_inference(tcx, function, &context.borrow);
+            let provenance_set = &context.borrow.provenances[&function];
+            let body = &*tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+            let replay = |facts| {
+                let _facts = reader_replay::enter_facts(Some(facts));
+                let round = reader_replay::begin_round(&slots,
+                    &|slot| matches!(slot, SlotRef::Local(..)), &|_| false);
+                reader_replay::begin_function(function);
+                assert_eq!(reader_replay::expected(function).len(), 1);
+                let graph = NativeConstraintGraph::new(function, body, &inference, provenance_set,
+                    origins.native_flows().get(&function), &[]);
+                (round.finish(), graph)
+            };
+            let (correct, graph) = replay(facts.clone());
+            assert!(correct.failures.is_empty());
+            assert_eq!(correct.receipts.len(), 1);
+            assert_eq!(correct.receipts[0].matched_loans, 1);
+            assert!(correct.receipts[0].origin_linked);
+
+            // Change only the claimed root. The field declaration, exact loan
+            // place/location/borrower and destination remain byte-identical.
+            let mut wrong = (*facts).clone();
+            Rc::make_mut(wrong.licensing.as_mut().unwrap()).reader_transfers[0]
+                .candidate.origin_parameter = 1;
+            let (wrong, wrong_graph) = replay(Rc::new(wrong));
+            assert_eq!(wrong.receipts.len(), 1);
+            assert_eq!(wrong.receipts[0].matched_loans, 1, "the exact loan still matches");
+            assert!(!wrong.receipts[0].origin_linked,
+                "global field provenance must not certify a different parameter root");
+            assert!(wrong.failures.iter().any(|failure|
+                failure.reason == reader_replay::FailureReason::OriginUnlinked));
+
+            let actual_root = provenance_set.local_data[Local::from_u32(2)].unwrap();
+            let wrong_root = provenance_set.local_data[Local::from_u32(1)].unwrap();
+            let view = provenance_set.local_data[Local::from_u32(candidate.destination.local)].unwrap();
+            let located = |graph: &NativeConstraintGraph, root| graph.subset.iter().any(|(source, target, at)| {
+                *source == root && *target == view && matches!(at, EdgeLocation::Point(location)
+                    if location.block.as_u32() == candidate.block && location.statement_index == candidate.statement)
+            });
+            assert!(located(&graph, actual_root), "accepted reader adds the actual root-to-view association at its loan site");
+            assert!(!located(&wrong_graph, wrong_root), "a false root receives no located association");
+            assert_eq!(solver.check_sat_count(), 0);
+            assert_eq!(solver.hard_check_count(), 0);
+            assert_eq!(solver.optimize_materialization_count(), 0);
+        }).unwrap_or_else(|error| error.raise());
     }
 }
 
@@ -571,6 +823,8 @@ struct NativeConstraintGraph {
 
 impl NativeConstraintGraph {
     fn new(
+        function: LocalDefId,
+        body: &Body<'_>,
         inference: &BorrowInferenceResults<'_>,
         provenance_set: &ProvenanceSet,
         origin_flow: Option<&origin_flow::OriginFlowResult>,
@@ -586,6 +840,8 @@ impl NativeConstraintGraph {
             })
             .collect();
         let disabled_fields: FxHashSet<_> = disabled_fields.iter().copied().collect();
+        let readers =
+            crate::analyses::borrow_ownership::licensing::reader_replay::expected(function);
 
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
             let Borrower::Assign(owner) = data.assigned else {
@@ -597,6 +853,81 @@ impl NativeConstraintGraph {
                 continue;
             };
             graph.membership.push((loan, lhs));
+
+            let identity = SelectedCopyLendLoan {
+                location: export::location_key(data.location()),
+                borrowed: export::PlaceKey::from_place(data.borrowed),
+                borrower: export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::from_owner(owner),
+                },
+            };
+            for reader in readers.iter().filter(|reader| reader.identity == identity) {
+                let source = field_provenances
+                    .get(&reader.field)
+                    .copied()
+                    .filter(|_| !disabled_fields.contains(&reader.field));
+                use crate::analyses::borrow_ownership::licensing::reader_replay::Root;
+                let (root_linked, parameter_root) = match &reader.root {
+                    Root::Parameter(candidate) => {
+                        let root = origin_flow.and_then(|flow| {
+                            let (roots, complete) = flow
+                                .body
+                                .depth0_argument_origins(body, data.borrowed.local)?;
+                            let expected = candidate.origin_parameter as usize;
+                            if !complete
+                                || roots.len() != 1
+                                || !roots.contains(&expected)
+                                || expected == 0
+                                || expected > body.arg_count
+                            {
+                                return None;
+                            }
+                            let local = Local::from_u32(candidate.origin_parameter);
+                            let provenance =
+                                provenance_set.local_data.get(local).copied().flatten()?;
+                            // The represented argument is the existing placeholder;
+                            // retain its exact native origin and owner correspondence.
+                            (provenance_set.provenance_data[provenance].owner()
+                                == ProvenanceOwner::Local(local))
+                            .then_some(provenance)
+                        });
+                        (root.is_some(), root)
+                    }
+                    Root::OwnedCell(effect) => {
+                        // begin_round rechecks the exact initialization/read/call
+                        // candidate. Its loan place names the local struct cell;
+                        // a struct local has no pointer parameter provenance.
+                        let local = data.borrowed.local;
+                        let local_struct = body.local_decls.get(local).is_some_and(|decl|
+                            matches!(decl.ty.kind(), rustc_middle::ty::TyKind::Adt(adt, _) if adt.is_struct()));
+                        (
+                            local.as_usize() > body.arg_count
+                                && local.as_u32() == effect.cell_place.local
+                                && local_struct,
+                            None,
+                        )
+                    }
+                };
+                if let Some(source) = source.filter(|_| root_linked) {
+                    // Only the selected, exact field-reader occurrence gains
+                    // this located association. Parameter roots add their native
+                    // link; owned cells keep the exact borrowed place identity.
+                    // Existing field All edges and invalidation semantics remain.
+                    graph
+                        .subset
+                        .push((source, lhs, EdgeLocation::Point(data.location())));
+                    if let Some(root) = parameter_root {
+                        graph
+                            .subset
+                            .push((root, lhs, EdgeLocation::Point(data.location())));
+                    }
+                }
+                crate::analyses::borrow_ownership::licensing::reader_replay::record_match(
+                    function,
+                    &identity,
+                    source.is_some() && root_linked,
+                );
+            }
 
             let rhs = data.borrowed;
             if !rhs.projection.is_empty()

@@ -277,9 +277,26 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
                 .as_ref()
                 .is_some_and(|expected| expected != &inputs)
         {
-            return Err(invalid(
-                "compiler semantic inputs differ from the sealed job".into(),
-            ));
+            return Err(invalid(format!(
+                "compiler semantic inputs differ from the sealed job \
+                 (computed program={} analysis={} toolchain={} dependencies={} configuration={}; \
+                 sealed program={} analysis={} toolchain={} dependencies={} configuration={}; \
+                 files_mismatch={})",
+                inputs.program,
+                inputs.analysis,
+                inputs.toolchain,
+                inputs.dependencies,
+                inputs.configuration,
+                job.program,
+                job.semantic.analysis,
+                job.semantic.toolchain,
+                job.semantic.dependencies,
+                job.semantic.configuration,
+                inputs
+                    .files
+                    .iter()
+                    .any(|(path, digest)| manifest.get(path) != Some(digest)),
+            )));
         }
         let key = cache_contract::semantic_key(&inputs).map_err(&invalid)?;
         if job
@@ -290,10 +307,29 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
             return Err(invalid("optional exact key mismatch".into()));
         }
         model_cache::with_test_config(false, &job.cache_dir, || {
-            if model_cache::configured_entry_path(&key).is_some_and(|path| path.exists()) {
-                return Err(invalid(
-                    "candidate entry already exists; no overwrite or rerun".into(),
-                ));
+            // R478-4: an entry already at this key is this frame's own work --
+            // a validation run, or a resumed packet. Verify it against the sealed
+            // job and SKIP; never overwrite, never stop the run. Anything that
+            // does not match is drift and still fails closed.
+            if let Some(path) = model_cache::configured_entry_path(&key).filter(|p| p.exists()) {
+                let entry = cache_contract::validate_file(&path).map_err(&invalid)?;
+                if entry.key != key || entry.inputs != inputs {
+                    return Err(invalid(
+                        "existing entry does not match the sealed job".into(),
+                    ));
+                }
+                let hashes = entry.canonical_file_hashes(&path).map_err(&invalid)?;
+                return Ok(Completed {
+                    key: key.clone(),
+                    inputs: inputs.clone(),
+                    cache_entry: path,
+                    entry_sha256: hashes.entry,
+                    payload_sha256: hashes.payload,
+                    export_sha256: hashes.exports,
+                    // 0 = nothing derived; the supervisor reads this as
+                    // `complete-existing` rather than a fresh derivation.
+                    model_entries: 0,
+                });
             }
             execution_guard::with_role(ExecutionRole::Derive, || {
                 execution_guard::clear_unknown();

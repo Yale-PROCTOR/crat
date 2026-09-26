@@ -616,7 +616,7 @@ impl Resolver<'_, '_> {
             })
             .collect::<Vec<_>>();
         Ok((
-            json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal}),
+            json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal,"known_stack_entries":review.known_stack_entries}),
             json!(diagnostics),
         ))
     }
@@ -767,7 +767,20 @@ pub(crate) fn collect(
         }
     }
     for row in &export.loans {
-        out.add(F::Loans,json!({"function":resolver.function(row.key.fn_did)?,"place":place(&row.key.place),"location":mir_location(row.key.location),"borrower":resolver.borrower(row.key.fn_did,row.key.borrower)?,"kind":tag(row.kind),"class":tag(row.class),"invalid":row.invalid}),json!({"loan":row.run_local_handle}))?;
+        let function = resolver.function(row.key.fn_did)?;
+        let mut fields = json!({"function":function,"place":place(&row.key.place),"location":mir_location(row.key.location),"borrower":resolver.borrower(row.key.fn_did,row.key.borrower)?,"kind":tag(row.kind),"class":tag(row.class),"invalid":row.invalid});
+        let matches: Vec<_> = export.traversal_replay.iter().flatten().filter(|receipt| {
+            let call = &receipt.origin.candidate.call;
+            call.caller == function && call.block == row.key.location.block && call.statement == row.key.location.statement_index
+                && receipt.target.local == row.key.place.local.as_u32() && receipt.target.projection == row.key.place.proj
+                && matches!(row.key.borrower, e::BorrowerKind::CallArg {arg_index, ..} if arg_index == receipt.origin.native.argument_index)
+        }).collect();
+        if let [receipt] = matches.as_slice() {
+            fields["returned_borrow"] = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+        } else if !matches.is_empty() {
+            return Err("ambiguous returned-borrow native loan".into());
+        }
+        out.add(F::Loans, fields, json!({"loan":row.run_local_handle}))?;
     }
     if let Some(rows) = &export.residual_conflicts {
         for row in rows {
@@ -873,7 +886,10 @@ pub(crate) fn collect(
         let predecessors=row.predecessors.iter().map(|p|Ok(json!({"function":resolver.function(p.function)?,"location":location(p.location),"phase":tag(p.phase),"moment":tag(p.moment)}))).collect::<Result<Vec<_>,String>>()?;
         out.add(F::EntryWitnesses,json!({"fact":resolver.fact(&row.fact)?,"rule":rule,"entry":resolver.entry(key)?,"predecessors":predecessors}),Value::Null)?;
     }
-    let (value, labels) = resolver.review(export.source_retirement.as_ref().unwrap())?;
+    let (mut value, labels) = resolver.review(export.source_retirement.as_ref().unwrap())?;
+    value["stack_entry_acceptance"] = super::licensing::stack_export::collect(export)
+        .map(|accepted| accepted.stamp())
+        .unwrap_or(Value::Null);
     out.add(F::RetirementFinal, value, labels)?;
     for (round, review) in export.retirement_rounds.iter().enumerate() {
         let (mut value, labels) = resolver.review(review)?;

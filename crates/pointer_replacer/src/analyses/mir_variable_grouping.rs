@@ -94,6 +94,36 @@ impl SourceVarGroups {
             .collect::<FxHashMap<_, _>>()
     }
 
+    /// era-5c R545-1: `postprocess_mut_res` with each local's bit taken from its
+    /// OUTERMOST level only (the cells it points at), not `any` depth. Used only by
+    /// the model-conditional verification facts, where a written Ref element still
+    /// reaches the outer level through Foster's (kept) load guard.
+    pub fn postprocess_mut_res_outermost(
+        &self,
+        program: &RustProgram,
+        mutability_result: &TypeQualifiers<Mutability>,
+    ) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
+        program
+            .functions
+            .iter()
+            .map(|&f| {
+                let mut muts = mutability_result
+                    .function_body_facts(f)
+                    .map(|muts| muts.first().is_some_and(|m| m.is_mutable()))
+                    .collect::<IndexVec<_, _>>();
+                if let Some(groups) = self.inner.get(&f) {
+                    for locals in groups.values() {
+                        let is_mutable = locals.iter().any(|local| muts[*local]);
+                        for local in locals {
+                            muts[*local] = is_mutable;
+                        }
+                    }
+                }
+                (f, muts)
+            })
+            .collect::<FxHashMap<_, _>>()
+    }
+
     pub fn postprocess_offset_signs(
         &self,
         access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>>,

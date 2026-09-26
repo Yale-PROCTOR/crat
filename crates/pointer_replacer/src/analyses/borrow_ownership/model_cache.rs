@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5a-r258-local-coverage-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p8-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -54,6 +54,29 @@ const ESC_MINIMAL_ALLOWLIST: &[u8] = include_bytes!("esc_minimal_allowlist.tsv")
 /// in the fingerprint. The ② allowlist is not Rust source, and named markers
 /// make a receipt auditable without reverse-engineering which code bytes imply
 /// which accepted configuration.
+/// R517-2(3): print `solver_identity`'s complete field map, so a frame's
+/// identity can be diffed against another lane's without running a census.
+/// One-liner, same env as the solve:
+///
+/// ```text
+/// <binary> e5c_print_solver_identity --exact --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "diagnostic: prints the identity field map for a cross-lane diff"]
+fn e5c_print_solver_identity() {
+    let identity = solver_identity(
+        super::a5_overlap::A5Mode::PreciseReplay,
+        Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+    );
+    eprintln!(
+        "E5C_IDENTITY_SHA256 {:x}",
+        Sha256::digest(identity.as_bytes())
+    );
+    for line in identity.lines() {
+        eprintln!("E5C_IDENTITY {line}");
+    }
+}
+
 pub(crate) fn solver_identity(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
@@ -109,6 +132,67 @@ pub(crate) fn solver_identity(
         A5World::ClosedWorldFrozenGraph.label().to_owned(),
     );
     fields.insert("analysis_frame", ANALYSIS_FRAME.to_owned());
+    // R374-1: an experiment arm must be in the identity before its cache is
+    // kept, so two arms cannot compute one semantic key.
+    fields.insert(
+        "era5b_return_port",
+        super::licensing::facts::return_port().to_string(),
+    );
+    fields.insert(
+        "era5b_interface_own",
+        super::licensing::facts::interface_own().to_string(),
+    );
+    fields.insert(
+        "era5c_move_tracking",
+        super::null_paths::move_tracking().to_string(),
+    );
+    fields.insert(
+        "era5c_allocator_contract",
+        super::allocator_contract::enabled().to_string(),
+    );
+    // R517-2(1): the L01⁵ pins were NOT in the identity, so two solves differing
+    // only in `CRAT_ERA5C_FIELD_MOVE` or `CRAT_ERA5C_LEAK_PARITY` computed one
+    // semantic key -- the R374-1 gap the seat found at `34fd7f68a`. Added here
+    // with every L01⁶ arm, before the L01⁶ solve writes a cache.
+    fields.insert(
+        "era5c_field_move",
+        super::field_moves::field_move().to_string(),
+    );
+    fields.insert(
+        "era5c_leak_parity",
+        super::field_moves::leak_parity_admission().to_string(),
+    );
+    fields.insert(
+        "era5c_reseat_a1",
+        super::field_moves::reseat_a1().to_string(),
+    );
+    fields.insert(
+        "era5c_traversal_ref",
+        super::field_moves::traversal_ref().to_string(),
+    );
+    fields.insert(
+        "era5c_own_prefer_local",
+        super::field_moves::own_prefer_local().to_string(),
+    );
+    fields.insert(
+        "era5c_finalize_soft",
+        super::field_moves::finalize_soft().to_string(),
+    );
+    fields.insert(
+        "era5c_mut_model",
+        super::field_moves::mut_model().to_string(),
+    );
+    fields.insert(
+        "era5c_lend_formal",
+        super::field_moves::lend_formal().to_string(),
+    );
+    // The diagnosis gate is not an arm, but it DOES change the constraint set,
+    // so by R374-1's own argument it belongs in the identity: a solve run with
+    // a family skipped must not compute the same key as one without.
+    fields.insert(
+        "era5c_skip_family",
+        std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default(),
+    );
     fields.insert("copy_lend_mode", CopyLendMode::current().label().to_owned());
     fields.insert(
         "esc_allowlist_sha256",
@@ -183,6 +267,23 @@ pub(crate) fn read_enabled() -> bool {
         return read;
     }
     matches!(std::env::var("CRAT_BO_CACHE").as_deref(), Ok("1"))
+}
+
+/// R471-3 (i) diagnosis: RSS at a phase boundary, behind CRAT_ERA5C_PROFILE.
+fn e5c_rss(tag: &str) {
+    if std::env::var_os("CRAT_ERA5C_PROFILE").is_none() {
+        return;
+    }
+    let gib = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<f64>().ok())
+        })
+        .map(|pages| pages * 4096.0 / 1073741824.0)
+        .unwrap_or(0.0);
+    eprintln!("E5C_PHASE {tag:<34} rss={gib:7.2} GiB");
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
@@ -377,7 +478,7 @@ fn analysis_code_fingerprint() -> String {
 }
 
 fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
-    d.join("era5a-model-cache-v1")
+    d.join("era5b-model-cache-v1")
         .join(format!("{fingerprint}.json"))
 }
 
@@ -470,33 +571,155 @@ pub(crate) fn prepare(
         let key = super::cache_contract::semantic_key(&inputs)?;
         let directory = dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("era5a-model-cache-v1");
+            .join("era5b-model-cache-v1");
+        e5c_rss("stream::collect_to_path ENTER");
         let portable =
             super::portable_export::stream::collect_to_path(program, slots, captured, &directory)?;
+        e5c_rss("stream::collect_to_path EXIT");
         let origin = super::origin_evidence::collect(program, slots, origins, Some(captured));
+        e5c_rss("origin_evidence::collect EXIT");
         let mut functions: Vec<_> = program
             .functions
             .iter()
             .map(|did| program.tcx.def_path_str(did.to_def_id()))
             .collect();
         functions.sort();
+        e5c_rss("functions built");
+        let e5c_universe: Vec<_> = universe(program.tcx, slots)
+            .ok_or("invalid slot universe")?
+            .into_keys()
+            .collect();
+        e5c_rss("universe built");
+        let e5c_model =
+            model_map(program.tcx, slots, &verified.model).ok_or("invalid accepted model keys")?;
+        e5c_rss("model_map(model) built");
+        let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
+            .ok_or("invalid baseline model keys")?;
+        e5c_rss("model_map(baseline) built");
+        // R473-4 design (A): stream the canonical origin bytes to a file,
+        // per element, and hand the cache the PATH. The whole-`Value` form that
+        // cost 31 GiB on libzahl is never built. The file is removed once the
+        // entry has copied it in (and by the guard on any early return).
+        struct OriginFile(std::path::PathBuf);
+        impl Drop for OriginFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        // Unique per call, as the exports spool is: one process runs many
+        // prepares concurrently and a pid-only name collides between them.
+        static NEXT_ORIGIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let origin_path = directory.join(format!(
+            ".origin-{}-{}.json",
+            std::process::id(),
+            NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        {
+            let file = std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&origin_path)
+                .map_err(|error| error.to_string())?;
+            let mut writer = std::io::BufWriter::new(file);
+            origin.write_canonical_json(&mut writer)?;
+            std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
+        }
+        e5c_rss("origin streamed to file");
+        // R473-4: compare the streamed file against the OLD whole-Value bytes,
+        // in the real write path, and report the first divergence. This REBUILDS
+        // the old path, so it must never ride on CRAT_ERA5C_PROFILE -- an
+        // acceptance run would then measure the proof instead of the fix.
+        if std::env::var_os("CRAT_ERA5C_BYTEPROOF").is_some() {
+            let old_bytes = serde_json::to_string(
+                &serde_json::from_str::<serde_json::Value>(&origin.canonical_json())
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let new_bytes = std::fs::read(&origin_path).map_err(|e| e.to_string())?;
+            let at = old_bytes
+                .as_bytes()
+                .iter()
+                .zip(new_bytes.iter())
+                .position(|(a, b)| a != b);
+            eprintln!(
+                "E5C_WRITE_BYTES old={} new={} identical={} first_diff={:?}",
+                old_bytes.len(),
+                new_bytes.len(),
+                old_bytes.as_bytes() == new_bytes.as_slice(),
+                at
+            );
+            if let Some(at) = at {
+                let lo = at.saturating_sub(60);
+                eprintln!(
+                    "E5C_WRITE_DIFF old=...{}...\n                 new=...{}...",
+                    String::from_utf8_lossy(
+                        &old_bytes.as_bytes()[lo..(at + 60).min(old_bytes.len())]
+                    ),
+                    String::from_utf8_lossy(&new_bytes[lo..(at + 60).min(new_bytes.len())])
+                );
+            }
+        }
+        let _origin_file = OriginFile(origin_path.clone());
+        // R473-4 byte-identity proof: stage a TWIN entry whose origin bytes come
+        // from the OLD whole-`Value` path, in this same binary at this same code
+        // fingerprint, and compare entry digests. Across a source edit the digest
+        // necessarily moves (SemanticInputs.analysis hashes src/analyses), so the
+        // before/after comparison cannot be the instrument -- this is.
+        let e5c_twin_path = if std::env::var_os("CRAT_ERA5C_BYTEPROOF").is_some() {
+            let old_bytes = serde_json::to_string(
+                &serde_json::from_str::<serde_json::Value>(&origin.canonical_json())
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let twin = directory.join(format!(
+                ".origin-twin-{}-{}.json",
+                std::process::id(),
+                NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&twin, old_bytes.as_bytes()).map_err(|e| e.to_string())?;
+            Some(twin)
+        } else {
+            None
+        };
+        let e5c_origin = super::cache_contract::stream::OriginSource::File(origin_path);
         let metadata = super::cache_contract::stream::Metadata {
             schema: super::cache_contract::SCHEMA.into(),
             key,
             inputs,
             functions,
-            universe: universe(program.tcx, slots)
-                .ok_or("invalid slot universe")?
-                .into_keys()
-                .collect(),
-            model: model_map(program.tcx, slots, &verified.model)
-                .ok_or("invalid accepted model keys")?,
-            baseline: model_map(program.tcx, slots, &verified.baseline_model)
-                .ok_or("invalid baseline model keys")?,
+            universe: e5c_universe,
+            model: e5c_model,
+            baseline: e5c_baseline,
             receipt: verified.receipt.clone(),
-            origin: serde_json::from_str(&origin.canonical_json()).map_err(|e| e.to_string())?,
+            origin: e5c_origin,
         };
-        let entry = super::cache_contract::stage_streamed(&directory, &metadata, &portable.path)?;
+        e5c_rss("Metadata built");
+        let e5c_twin = e5c_twin_path.map(|twin| {
+            let guard = OriginFile(twin.clone());
+            let mut twin_metadata = metadata.clone();
+            twin_metadata.origin = super::cache_contract::stream::OriginSource::File(twin);
+            (guard, twin_metadata)
+        });
+        let entry = super::cache_contract::stage_streamed(&directory, metadata, &portable.path)?;
+        e5c_rss("stage_streamed done");
+        if let Some((_guard, twin_metadata)) = e5c_twin {
+            let twin_entry =
+                super::cache_contract::stage_streamed(&directory, twin_metadata, &portable.path)?;
+            let digest = |e: &super::cache_contract::StreamedEntry| {
+                e.hashes
+                    .as_ref()
+                    .map(|h| h.entry.clone())
+                    .unwrap_or_default()
+            };
+            eprintln!(
+                "E5C_TWIN_DIGEST streamed={} whole_value={} identical={}",
+                digest(&entry),
+                digest(&twin_entry),
+                digest(&entry) == digest(&twin_entry)
+            );
+        }
         #[cfg(test)]
         if std::env::var("CRAT_ERA5_BYTE_PROOF").as_deref() == Ok("1") {
             use std::io::Write;
@@ -505,8 +728,9 @@ pub(crate) fn prepare(
                 .join("byte-proof");
             std::fs::create_dir_all(&proof_root).map_err(|error| error.to_string())?;
             let reference_path =
-                proof_root.join(format!("{}.reference.json", metadata.inputs.program));
-            let receipt_path = proof_root.join(format!("{}.proof.json", metadata.inputs.program));
+                proof_root.join(format!("{}.reference.json", entry.metadata.inputs.program));
+            let receipt_path =
+                proof_root.join(format!("{}.proof.json", entry.metadata.inputs.program));
             let mut reference_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -517,21 +741,29 @@ pub(crate) fn prepare(
                 .create_new(true)
                 .open(&receipt_path)
                 .map_err(|error| error.to_string())?;
-            // The frozen materializer sees the same capture and actual metadata.
+            // The frozen materializer sees the same capture and actual entry.metadata.
             // No diagnostic labels, history, identities, or bytes are normalized.
+            e5c_rss("portable_export::collect ENTER");
             let reference_exports = super::portable_export::collect(program, slots, captured)?;
+            e5c_rss("portable_export::collect EXIT");
             let reference = super::cache_contract::CompleteEntry {
-                schema: metadata.schema.clone(),
-                key: metadata.key.clone(),
-                inputs: metadata.inputs.clone(),
-                functions: metadata.functions.clone(),
-                universe: metadata.universe.clone(),
-                model: metadata.model.clone(),
-                baseline: metadata.baseline.clone(),
-                receipt: metadata.receipt.clone(),
+                schema: entry.metadata.schema.clone(),
+                key: entry.metadata.key.clone(),
+                inputs: entry.metadata.inputs.clone(),
+                functions: entry.metadata.functions.clone(),
+                universe: entry.metadata.universe.clone(),
+                model: entry.metadata.model.clone(),
+                baseline: entry.metadata.baseline.clone(),
+                receipt: entry.metadata.receipt.clone(),
                 exports: serde_json::from_str(&reference_exports.canonical_json()?)
                     .map_err(|error| error.to_string())?,
-                origin: metadata.origin.clone(),
+                origin: {
+                    // R473-4: the byte-proof reference still wants a Value;
+                    // build it from the canonical bytes (test-only path).
+                    let mut bytes = Vec::new();
+                    entry.metadata.write_origin(&mut bytes)?;
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?
+                },
             };
             let bytes = reference.canonical_json()?;
             reference_file
@@ -546,9 +778,9 @@ pub(crate) fn prepare(
             let streamed_sha256 = super::cache_contract::file_sha256(&entry.path)?;
             let proof = serde_json::json!({
                 "schema": "era5a-same-capture-byte-proof-v1",
-                "program": metadata.inputs.program,
-                "key": metadata.key,
-                "inputs": metadata.inputs,
+                "program": entry.metadata.inputs.program,
+                "key": entry.metadata.key,
+                "inputs": entry.metadata.inputs,
                 "same_capture": true,
                 "same_actual_metadata": true,
                 "additional_model_entries": 0,
@@ -558,7 +790,7 @@ pub(crate) fn prepare(
                 "streamed_sha256": streamed_sha256,
                 "reference_bytes": bytes.len(),
                 "streamed_bytes": std::fs::metadata(&entry.path).map_err(|error| error.to_string())?.len(),
-                "expected_published_entry": directory.join(format!("{}.json", metadata.key)),
+                "expected_published_entry": directory.join(format!("{}.json", entry.metadata.key)),
                 "full_cache_bytes_identical": identical,
                 "data": identical,
             });
@@ -605,7 +837,15 @@ pub(crate) fn prepared_entry(fingerprint: &str) -> Option<super::cache_contract:
             .map(|prepared| std::sync::Arc::clone(&prepared.entry))
     })?;
     let bytes = std::fs::read(&entry.path).ok()?;
-    super::cache_contract::decode(&bytes).ok()
+    // A spooled entry its own contract refuses is a refusal worth reading, not
+    // a silent `None` — the prepare slot carries it for the caller.
+    match super::cache_contract::decode(&bytes) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            PREPARE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+            None
+        }
+    }
 }
 
 fn kind_label(kind: SlotKind) -> &'static str {
@@ -669,7 +909,7 @@ pub(crate) fn store(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<PathBuf> {
-    let directory = dir()?.join("era5a-model-cache-v1");
+    let directory = dir()?.join("era5b-model-cache-v1");
     let fp = fingerprint(program, a5_mode, attestation);
     let entry = PREPARED.with(|prepared| {
         prepared
@@ -788,8 +1028,8 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5a-r258-local-coverage-v1",
-            "era5_schema=era5a-model-cache-v1",
+            "analysis_frame=era5c-l01p8-v1",
+            "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",
             "coverage_integrity=r253-inventory-complete-l2-result-propagation-v1",
@@ -1221,4 +1461,30 @@ pub(crate) fn reset_for_test() {
     LAST_SOLVE.with(|last| *last.borrow_mut() = None);
     PREPARED.with(|prepared| *prepared.borrow_mut() = None);
     PREPARE_ERROR.with(|error| *error.borrow_mut() = None);
+}
+
+#[cfg(test)]
+mod r379_configuration_probe {
+    /// R379-2: the `configuration` digest under whatever arm the environment
+    /// pins, so a sealed job can carry the value the compiler will compute
+    /// rather than one guessed from the field list.
+    #[test]
+    #[ignore = "prints the configuration digest for the current environment"]
+    fn r379_configuration_digest() {
+        use sha2::{Digest, Sha256};
+        eprintln!();
+        let identity = super::solver_identity(
+            super::super::a5_overlap::A5Mode::PreciseReplay,
+            Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        eprintln!("R379CONFIG {:x}", Sha256::digest(identity.as_bytes()));
+        for field in identity.split('\n') {
+            if field.starts_with("era5b_")
+                || field.starts_with("era5c_")
+                || field.starts_with("analysis_frame")
+            {
+                eprintln!("R379FIELD {field}");
+            }
+        }
+    }
 }

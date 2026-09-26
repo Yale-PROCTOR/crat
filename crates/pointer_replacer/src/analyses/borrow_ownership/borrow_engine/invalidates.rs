@@ -221,6 +221,7 @@ fn compute_invalidates_inner<'tcx>(
             FxHashMap::default()
         },
         routing_enabled,
+        deferring_from: None,
     }
     .visit_body(body);
 
@@ -374,6 +375,10 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     issued_loans: FxHashMap<Local, Vec<Loan>>,
     /// §NB4-R toggle (`CRAT_NB4R_ROUTING`); gates the cross-alias-write walk for sweep attribution.
     routing_enabled: bool,
+    /// era-5c (E5C-3): while a call argument's read is attributed to the call
+    /// terminator, the statement it was deferred from — its own loans are not
+    /// invalidated by their own issuing read.
+    deferring_from: Option<Location>,
 }
 
 /// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
@@ -504,6 +509,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     continue;
                 }
                 let borrow_data = &self.borrow_set.loans[loan];
+                if self.deferring_from == Some(borrow_data.location()) {
+                    continue; // era-5c: a deferred read does not invalidate its own loan
+                }
                 let copy_lend_write = kind == AccessKind::Write && self.copy_lends.contains(loan);
                 if !copy_lend_write
                     && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
@@ -715,7 +723,21 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match &statement.kind {
             StatementKind::Assign(box (lhs, rhs)) => {
-                self.consume_rvalue(location, rhs);
+                // era-5c (E5C-3): a call argument's move is placed at the call
+                // terminator when every statement between the copy and the
+                // call is a pure read — the point the ownership model already
+                // transfers the token at. The emission side hoists those reads
+                // above the move (a pure-read reordering).
+                match crate::analyses::borrow_ownership::null_paths::deferred_argument_read(
+                    self.body, location,
+                ) {
+                    Some(terminator) => {
+                        self.deferring_from = Some(location);
+                        self.consume_rvalue(terminator, rhs);
+                        self.deferring_from = None;
+                    }
+                    None => self.consume_rvalue(location, rhs),
+                }
 
                 // The assignment's destination is WRITTEN.
                 self.shallowly_access_place(location, *lhs, AccessKind::Write);

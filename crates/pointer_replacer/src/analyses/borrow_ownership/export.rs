@@ -104,7 +104,9 @@ pub(crate) fn flag_enabled() -> bool {
 /// derefs were counted rather than sequenced — made `(*p).f` and `*(p.f)`
 /// indistinguishable. A key built on that is not a key, so the encoding is
 /// total and ordered now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum ProjKey {
     Deref,
     Field(u32),
@@ -416,7 +418,9 @@ pub(crate) struct ReallocCaseReceipt {
 // §4 E-R3 — selector provenance
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum BoundaryRole {
     Source,
     Sink,
@@ -517,6 +521,19 @@ pub(crate) struct CallSite {
 /// and called it "byte-identical").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BoExport {
+    /// Recording epochs, not dynamic allocation generations or proof completion.
+    pub(crate) ownership_constructions: u32,
+    pub(crate) stack_entry_final: Option<super::licensing::stack_export::Accepted>,
+    pub(crate) ownership_licensing: Option<Vec<super::licensing::snapshot::Snapshot>>,
+    pub(crate) reader_replay: Option<Vec<super::licensing::reader_replay::Receipt>>,
+    pub(crate) traversal_replay: Option<Vec<super::licensing::traversal_replay::Receipt>>,
+    pub(crate) ownership_equations: Option<Vec<super::ownership_evidence::Equation>>,
+    pub(crate) ownership_consumes: Option<Vec<super::ownership_occurrence::Consumption>>,
+    pub(crate) ownership_terminals: Option<Vec<super::ownership_occurrence::Terminal>>,
+    pub(crate) ownership_boundary_substitutions:
+        Option<Vec<super::ownership_boundary::Substitution>>,
+    pub(crate) ownership_call_arg_registrations:
+        Option<Vec<super::ownership_boundary::CallArgRegistration>>,
     /// One carried source-event inventory from construction, independent of
     /// kind selection and the optional export recorder.
     pub source_events: Option<std::sync::Arc<super::source_events::SourceEvents>>,
@@ -649,6 +666,7 @@ thread_local! {
 /// correct without restructuring the region into a closure.
 pub(crate) struct CaptureArm {
     prev: Option<BoExport>,
+    namespace_scope: Option<super::licensing::stack_export::CaptureScope>,
     /// `false` when `CRAT_BO_EXPORT` is off: the arm installed nothing and must
     /// therefore restore nothing, or it would clobber an enclosing scope.
     armed: bool,
@@ -662,6 +680,7 @@ impl Drop for CaptureArm {
         BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.prev.take());
         // Non-`Send` scaffolding must not outlive the scope.
         VERSION_ASTS.with(|c| *c.borrow_mut() = None);
+        self.namespace_scope.take();
     }
 }
 
@@ -706,6 +725,7 @@ pub(crate) fn arm_capture() -> CaptureArm {
     if !flag_enabled() {
         return CaptureArm {
             prev: None,
+            namespace_scope: None,
             armed: false,
         };
     }
@@ -723,7 +743,11 @@ pub(crate) fn arm_capture() -> CaptureArm {
 pub(crate) fn arm_scope() -> CaptureArm {
     let prev = BO_EXPORT_CAPTURE.with(|c| c.replace(Some(BoExport::default())));
     VERSION_ASTS.with(|c| *c.borrow_mut() = None);
-    CaptureArm { prev, armed: true }
+    CaptureArm {
+        prev,
+        namespace_scope: Some(super::licensing::stack_export::enter_capture()),
+        armed: true,
+    }
 }
 
 /// Run `f` with export capture active, returning its result and the recording.
@@ -769,6 +793,44 @@ pub(crate) fn record(f: impl FnOnce(&mut BoExport)) {
     BO_EXPORT_CAPTURE.with(|c| {
         if let Some(export) = c.borrow_mut().as_mut() {
             f(export);
+        }
+    });
+}
+
+/// Optional observation of one completed normative construction. Local record
+/// ordinals stay qualified by construction; only the export's construction
+/// namespace is adjusted when it contains several independent solver builds.
+pub(crate) fn record_ownership_facts(facts: &std::rc::Rc<super::licensing::facts::Facts>) {
+    record(|capture| {
+        let offset = capture.ownership_constructions;
+        super::licensing::stack_export::record_namespace(facts, offset);
+        capture.ownership_constructions = offset
+            .checked_add(facts.constructions)
+            .expect("export construction count");
+        macro_rules! append {
+            ($target:ident,$source:ident) => {
+                let target = capture.$target.get_or_insert_with(Vec::new);
+                for source in &facts.$source {
+                    let mut row = source.clone();
+                    row.point.construction = row
+                        .point
+                        .construction
+                        .checked_add(offset)
+                        .expect("export construction identity");
+                    target.push(row);
+                }
+            };
+        }
+        append!(ownership_equations, equations);
+        append!(ownership_consumes, consumes);
+        append!(ownership_terminals, terminals);
+        append!(ownership_boundary_substitutions, boundary_substitutions);
+        append!(ownership_call_arg_registrations, call_arg_registrations);
+        if let Some(snapshot) = super::licensing::snapshot::Snapshot::capture(facts, offset) {
+            capture
+                .ownership_licensing
+                .get_or_insert_with(Vec::new)
+                .push(snapshot);
         }
     });
 }
@@ -964,10 +1026,13 @@ pub(crate) fn record_loan(identity: LoanIdentity) {
 pub(crate) fn begin_round() {
     record(|export| {
         export.loans.clear();
+        export.reader_replay = None;
+        export.traversal_replay = None;
         export.entry_protection = None;
         export.entry_accesses.clear();
         export.entry_fact_witnesses.clear();
         export.source_retirement = None;
+        export.stack_entry_final = None;
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
     });

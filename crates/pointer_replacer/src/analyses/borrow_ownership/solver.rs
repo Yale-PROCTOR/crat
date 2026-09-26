@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -140,8 +141,27 @@ impl CoreTracker {
     /// Mint a fresh track literal for one hard constraint and record its label.
     fn record(&self, label: String) -> Bool {
         if self.granularity == CoreTrackingGranularity::Family {
-            let family = core_label_family(&label)
-                .unwrap_or_else(|| panic!("unrecognized hard-constraint family: {label}"));
+            // R385-1: `CORE_LABEL_FAMILIES` predates era-5b's constraint
+            // families (`own-fold-*`, `own-original-cell-*`,
+            // `own-guarded-traversal-view-zero`, `own-traversal-license`,
+            // `a5-coarse-exclusion`), so a family-tracked probe over a program
+            // that emits them died on the panic instead of reporting a core.
+            // Family granularity has no production caller — it is the NB-R
+            // diagnostic constructor — so an unregistered label gets a family of
+            // its own head here and the probe stays usable. Registering them
+            // properly is the seat's call; the panic stays for every other
+            // granularity.
+            let derived;
+            let family = match core_label_family(&label) {
+                Some(family) => family,
+                None => {
+                    derived = format!(
+                        "unregistered::{}",
+                        label.split(['(', '[']).next().unwrap_or(&label)
+                    );
+                    derived.as_str()
+                }
+            };
             if let Some((track, _)) = self
                 .entries
                 .borrow()
@@ -212,8 +232,13 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "field-forbid",
     "field-ref-source",
     "field-ref-forbid",
+    "field-reader-kind",
+    "field-reader-support",
+    "own-field-reader",
+    "own-reference-effect",
     "return-ref-origin",
     "link-own",
+    "own-license",
     GUARDED_COMMIT_CORE_FAMILY,
     RECURRENCE_ESCALATION_CORE_FAMILY,
     "borrow-exclusion",
@@ -236,6 +261,34 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     // §NB-F: free/realloc sink selectors (no substring overlap with
     // "source-selector" — first-containment matching stays unambiguous).
     "sink-selector",
+    // Diagnostic forced assignments. They are not production constraints; they
+    // are named so a family-tracked probe can assume them and see them in the
+    // core beside the families that refuse them. No substring overlap.
+    "s23-force",
+    "r385-force",
+    // R390-2: era-5b's own families. Longest first where one contains another,
+    // because `family_of` is first-containment; every one of these is reached
+    // only after the families above, so none of them shadows an older name.
+    "own-guarded-traversal-argument-legacy",
+    "own-null-join",
+    "allocator-contract-pairing",
+    "allocator-contract-port-open",
+    "own-contract-port-drop",
+    "own-contract-port",
+    "own-guarded-traversal-view-zero",
+    "own-original-cell-legacy-frame",
+    "own-original-cell-disposition",
+    "own-fold-caller-permission",
+    "own-fold-member-permission",
+    "own-fold-caller-endpoints",
+    "own-fold-member-endpoints",
+    "own-traversal-license",
+    "own-traversal-pending",
+    "own-fold-permission",
+    "own-traversal-frame",
+    "a5-coarse-exclusion",
+    "own-original-cell",
+    "own-fold-pending",
 ];
 
 pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
@@ -255,8 +308,12 @@ pub(crate) enum OwnAssumeSite {
     LocalWrapper,
     SsaTransfer,
     TemporaryFinalization,
+    AggregateNull,
+    NonOwnedConstant,
     CastOrDepth,
     OtherInternal,
+    /// era-5c (R409-1): the allocator-contract pairing refusal.
+    AllocatorContractPairing,
 }
 
 impl OwnAssumeSite {
@@ -267,13 +324,15 @@ impl OwnAssumeSite {
             Self::LocalWrapper => "local-wrapper",
             Self::SsaTransfer => "ssa-transfer",
             Self::TemporaryFinalization => "temporary-finalization",
+            Self::AggregateNull => "aggregate-null",
+            Self::NonOwnedConstant => "non-owned-constant",
             Self::CastOrDepth => "cast-or-depth",
             Self::OtherInternal => "other-internal",
+            Self::AllocatorContractPairing => "allocator-contract-pairing",
         }
     }
 }
 
-#[cfg(test)]
 thread_local! {
     static OWN_ASSUME_SITE: Cell<OwnAssumeSite> =
         const { Cell::new(OwnAssumeSite::OtherInternal) };
@@ -324,7 +383,52 @@ pub(crate) fn with_assumption_check_trace<T>(
     (output, events)
 }
 
+/// Test-only observation of the real emission's indexed ownership ASTs and
+/// their values in each model read by the production solver.
 #[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnershipModelObservation {
+    pub(crate) snapshot_lengths: Vec<usize>,
+    pub(crate) model_reads: Vec<IndexVec<Var, bool>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct OwnershipModelCapture {
+    asts: Option<IndexVec<Var, Bool>>,
+    observation: OwnershipModelObservation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNERSHIP_MODEL_CAPTURE: RefCell<Option<OwnershipModelCapture>> =
+        const { RefCell::new(None) };
+}
+
+/// Observe without enabling BoExport, creating ASTs, or issuing queries.
+#[cfg(test)]
+pub(crate) fn with_ownership_model_observation<T>(
+    f: impl FnOnce() -> T,
+) -> (T, OwnershipModelObservation) {
+    struct Restore(Option<OwnershipModelCapture>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWNERSHIP_MODEL_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore = Restore(
+        OWNERSHIP_MODEL_CAPTURE
+            .with(|capture| capture.replace(Some(OwnershipModelCapture::default()))),
+    );
+    let output = f();
+    let capture = OWNERSHIP_MODEL_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .expect("active ownership model observation");
+    (output, capture.observation)
+}
+
 pub(crate) fn with_own_assume_site<T>(site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
     struct Restore(OwnAssumeSite);
     impl Drop for Restore {
@@ -336,21 +440,8 @@ pub(crate) fn with_own_assume_site<T>(site: OwnAssumeSite, f: impl FnOnce() -> T
     f()
 }
 
-#[cfg(not(test))]
-#[inline]
-pub(crate) fn with_own_assume_site<T>(_site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
-    f()
-}
-
-#[cfg(test)]
 pub(crate) fn current_own_assume_site() -> OwnAssumeSite {
     OWN_ASSUME_SITE.with(Cell::get)
-}
-
-#[cfg(not(test))]
-#[inline]
-pub(crate) fn current_own_assume_site() -> OwnAssumeSite {
-    OwnAssumeSite::OtherInternal
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,9 +535,18 @@ pub struct KindSolver {
     lazy_plain_materialization_count: Cell<usize>,
     hard_check_elapsed: Cell<Duration>,
     optimize_materialization_elapsed: Cell<Duration>,
+    /// R379-2: the return-port rows admitted at emission, in slot-key order.
+    /// They are ASSERTED at materialisation, not at emission, because the
+    /// refusals they must yield to — the objective, a caller's final-zero —
+    /// enter the system after emission ends. Report 048 measured that.
+    return_port_admitted: RefCell<Vec<(String, SlotRef)>>,
+    /// One entry per materialisation round: how many of those rows survived.
+    return_port_kept: RefCell<Vec<usize>>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
     round_model_failure: RefCell<Option<RoundModelFailure>>,
     demand_capture: RefCell<Option<DemandCapture>>,
+    ownership_facts: RefCell<Option<Rc<super::licensing::facts::Facts>>>,
+    original_cell_model: RefCell<Option<Rc<super::licensing::model_selection::Selection>>>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
@@ -695,10 +795,29 @@ impl KindSolver {
             lazy_plain_materialization_count: Cell::new(0),
             hard_check_elapsed: Cell::new(Duration::ZERO),
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
+            return_port_admitted: RefCell::new(Vec::new()),
+            return_port_kept: RefCell::new(Vec::new()),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
             round_model_failure: RefCell::new(None),
             demand_capture: RefCell::new(None),
+            ownership_facts: RefCell::new(None),
+            original_cell_model: RefCell::new(None),
         }
+    }
+
+    /// Retain completed construction inputs without retaining an Optimize borrow.
+    pub(crate) fn set_ownership_facts(&self, facts: Rc<super::licensing::facts::Facts>) {
+        let mut stored = self.ownership_facts.borrow_mut();
+        assert!(
+            stored.is_none(),
+            "ownership facts already bound to this solver"
+        );
+        *stored = Some(facts);
+    }
+
+    /// Shared immutable input for construction consumers and optional export.
+    pub(crate) fn ownership_facts(&self) -> Option<Rc<super::licensing::facts::Facts>> {
+        self.ownership_facts.borrow().clone()
     }
 
     /// Bind recording to this solver's actual construction, never to the last
@@ -994,6 +1113,81 @@ impl KindSolver {
         );
     }
 
+    /// L01^5 (i): the leak-parity source admission, as an OBJECTIVE term.
+    ///
+    /// W18 measured the mechanism: bst with its `free`s deleted has NO relax core
+    /// at all — nothing forbids `Owning`, the optimizer simply prefers `Ref`,
+    /// because `build` weights `ref_` at `big` and `raw` at 1 and gives `own` no
+    /// weight, so `Owning` happens only where a hard constraint (a free site)
+    /// demands it. A program that never frees therefore never owns.
+    ///
+    /// Under the leak-parity waiver (USER RULING 2026-08-31) the emitted program
+    /// MAY drop what the input leaked, receipted per site. So when the program has
+    /// NO sink at all, prefer `Owning` over `Ref` for the FIELD slots — the Box
+    /// market — and leave every hard constraint untouched: this changes what the
+    /// optimizer picks among models that are already legal, never what is legal.
+    pub(crate) fn prefer_owning_for_unsinked_fields(&self, slots: &CrateSlots) {
+        let big = self.vars.len() as u64 + 2;
+        let mut preferred = 0usize;
+        for (slot, kind_vars) in &self.vars {
+            if !matches!(slot, SlotRef::Field(_)) {
+                continue;
+            }
+            self.solver.assert_soft(&kind_vars.own, big, None);
+            preferred += 1;
+        }
+        let _ = slots;
+        // NOTE: no `ownership_evidence` row — the evidence vocabulary is a
+        // validated schema and this is an OBJECTIVE term, not an equation. The
+        // waiver receipt the 2026-08-31 ruling requires is an EMISSION-side
+        // `waiver-drop(scope-exit)` per site; it is owed by the consumer, and
+        // named as owed in report 014.
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!(
+                "E5C leak-parity: preferred own on {preferred} field slots (no sink in the program)"
+            );
+        }
+    }
+
+    /// **L01⁶ (b)** — the local-slot Owning preference, R517-12.
+    ///
+    /// A slot the licensing layer has already refused a reference has only
+    /// `raw ∨ own` left by the one-hot, and `build` weights `raw` at 1 and gives
+    /// `own` NO weight — so it settles `Raw` for want of a preference. This adds
+    /// a soft `own` at weight 2: strictly above `raw`'s 1, and far below
+    /// `ref_`'s `vars.len() + 1`, so it can never displace a reference anywhere
+    /// and never makes an illegal model legal. Purely objective, like
+    /// `prefer_owning_for_unsinked_fields`, and unlike that one it carries no
+    /// program-wide sink premise -- the caller supplies exactly the slots whose
+    /// reference was already refused.
+    ///
+    /// Era-5c report 034b priced the market before this was built: `own` is SAT
+    /// for **77 of 462** measured subjects and for **7 of the 55** CROWN Box
+    /// units, so this moves those and provably nothing else. The other 385 are
+    /// refused by hard constraints no objective term reaches.
+    pub(crate) fn prefer_owning_for_refused_reference(&self, slot: SlotRef) -> bool {
+        let Some(kind_vars) = self.vars.get(&slot) else {
+            return false;
+        };
+        self.solver.assert_soft(&kind_vars.own, 2u64, None);
+        true
+    }
+
+    /// **L01⁶ arm 3, half two** (R518-2) — seat ownership on the NAMED local.
+    ///
+    /// Weight 3: above L01⁶ (b)'s 2 so a named local outranks an anonymous one,
+    /// and still far below `ref_`'s `vars.len() + 1` so no reference is ever
+    /// displaced. Without this, dropping the finalization blanket lets the
+    /// optimum park the ownership token on a temporary — report 034 §1 measured
+    /// that as `0/13/31 → 28/8/8`.
+    pub(crate) fn prefer_owning_for_named_local(&self, slot: SlotRef) -> bool {
+        let Some(kind_vars) = self.vars.get(&slot) else {
+            return false;
+        };
+        self.solver.assert_soft(&kind_vars.own, 3u64, None);
+        true
+    }
+
     /// §9.10.2 companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
     /// Used when a field receives a value that is definitely not an owned heap allocation — an
     /// address-of (`Ref`/`RawPtr`) store, or a store whose RHS cannot be resolved to a slot
@@ -1012,6 +1206,24 @@ impl KindSolver {
             || format!("field-forbid({field:?})"),
             &!&vars.own,
         );
+    }
+
+    /// era-5c R545-2: the formal analogue of `forbid_field_own`. A formal whose
+    /// every closed-world actual is the address of a stack place or of an
+    /// interior place (`mod.rs::lend_formals`) holds memory some other object
+    /// owns -- freeing it is UB on a UB-free input -- so it is a LEND and must
+    /// never be `Owning`. Returns whether the slot exists.
+    pub(crate) fn forbid_lend_formal_own(&self, formal: SlotRef) -> bool {
+        let Some(vars) = self.vars.get(&formal) else {
+            return false;
+        };
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("lend-formal-forbid({formal:?})"),
+            &!&vars.own,
+        );
+        true
     }
 
     /// A14 field ref-worthiness: a field may be Ref only when every non-null stored value is safe
@@ -1089,6 +1301,1084 @@ impl KindSolver {
         );
     }
 
+    /// F02: only an exact statically eligible occurrence may use this guard.
+    /// Its false arm retains every ordinary kind equality.
+    pub(crate) fn field_reader_or_equate(&self, lhs: SlotRef, rhs: SlotRef, reader: &Bool) {
+        let a = &self.vars[&lhs];
+        let b = &self.vars[&rhs];
+        for (left, right, kind) in [
+            (&a.raw, &b.raw, "raw"),
+            (&a.ref_, &b.ref_, "ref"),
+            (&a.own, &b.own, "own"),
+        ] {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("field-reader-kind({lhs:?},{rhs:?},{kind})"),
+                &Bool::or(&[reader, &!left.xor(right)]),
+            );
+        }
+    }
+
+    /// L01^5 (ii): the field↔field strong-update MOVE. Where `field_moves` proves
+    /// the loaded place is overwritten on every path before any read of it, the
+    /// crate-wide field slot cannot still be observed holding the moved value, so
+    /// the kind equality between the loading local and the field slot is RELEASED
+    /// — the same shape as `field_reader_or_equate`, with a must-overwrite guard
+    /// instead of a reader effect. It asserts no kind: the local's own bit is then
+    /// settled by the source token's flow and the store-side AND coupling, and the
+    /// drop policy (R395-2: drops only at C free sites) is untouched.
+    pub(crate) fn field_move_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
+        let a = &self.vars[&lhs];
+        let b = &self.vars[&rhs];
+        // The RAW and REF bits still agree: a moved value has the same surface
+        // form as the field it came out of. Only the OWN bit is released, which
+        // is the one the crate-wide field slot cannot carry for a moved token.
+        for (left, right, kind) in [(&a.raw, &b.raw, "raw"), (&a.ref_, &b.ref_, "ref")] {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("field-move-kind({lhs:?},{rhs:?},{kind})"),
+                &!left.xor(right),
+            );
+        }
+        super::ownership_evidence::record("field-move-release", &[], None, None);
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!("E5C field-move-release {lhs:?} <- {rhs:?} (own equality released)");
+        }
+    }
+
+    pub(crate) fn reference_field_reader_or_equate(
+        &self,
+        lhs: SlotRef,
+        rhs: SlotRef,
+        effect: &Bool,
+    ) {
+        self.field_reader_or_equate(lhs, rhs, effect);
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("field-reader-kind-reference-effect({lhs:?},{rhs:?})"),
+            &effect.implies(&self.lend_guard(lhs, rhs)),
+        );
+    }
+
+    pub(crate) fn block_field_reader(&self, lhs: SlotRef, rhs: SlotRef) {
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("field-reader-kind-incomplete({lhs:?},{rhs:?})"),
+            &!self.lend_guard(lhs, rhs),
+        );
+    }
+
+    fn all_field_store_support(
+        &self,
+        facts: &super::licensing::facts::Facts,
+        field: &super::licensing::field_support::FieldProof,
+    ) -> anyhow::Result<Bool> {
+        let own = |node: super::licensing::transport::Node| -> anyhow::Result<Bool> {
+            anyhow::ensure!(
+                facts.constructions == 1 && node.construction == 0,
+                "field store construction mismatch"
+            );
+            facts
+                .ownership_asts
+                .get(Var::from_u32(node.var))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("field store ownership AST missing"))
+        };
+        let guards = |dependencies: &std::collections::BTreeMap<
+            super::licensing::facts::EquationId,
+            bool,
+        >|
+         -> anyhow::Result<Vec<Bool>> {
+            dependencies
+                .iter()
+                .map(|(key, positive)| {
+                    let predicate = &facts
+                        .guards
+                        .iter()
+                        .find(|binding| binding.equation == *key)
+                        .ok_or_else(|| anyhow::anyhow!("field store endpoint dependency missing"))?
+                        .predicate;
+                    Ok(if *positive {
+                        predicate.clone()
+                    } else {
+                        !predicate
+                    })
+                })
+                .collect()
+        };
+        let mut support = Vec::new();
+        for store in &field.stores {
+            support.push(own(store.destination_def)?);
+            support.push(!own(store.source_def)?);
+            support.extend(guards(&store.meet.guards)?);
+        }
+        for store in &field.input_stores {
+            support.push(own(store.destination_def)?);
+            support.push(!own(store.source_def)?);
+            // Every expected caller needs one complete compatible alternative.
+            for application in &store.applications {
+                let mut alternatives = Vec::new();
+                for alternative in &application.alternatives {
+                    let mut required = vec![own(alternative.route.actual_input)?];
+                    required.extend(guards(&alternative.route.guards)?);
+                    required.extend(guards(&alternative.free.guards)?);
+                    required.extend(guards(&alternative.forwarded.output.guards)?);
+                    for forwarded in &alternative.forwarded_returns {
+                        required.extend(guards(&forwarded.guards)?);
+                    }
+                    if !alternative.pending_outputs.is_empty() {
+                        required.push(Bool::from_bool(false));
+                    }
+                    alternatives.push(Bool::and(&required));
+                }
+                support.push(Bool::or(&alternatives));
+            }
+            // No new input-store permission is enabled by this conditional
+            // record. Compiler caller completeness and attestation remain due.
+            match store.caller_coverage {
+                super::licensing::field_support::CallerCoverage::PendingCompilerAndAttestation => {
+                    support.push(Bool::from_bool(false))
+                }
+                super::licensing::field_support::CallerCoverage::CertifiedFirst
+                | super::licensing::field_support::CallerCoverage::CertifiedChain => {
+                    support.push(Bool::from_bool(facts.frame_attested))
+                }
+            }
+        }
+        anyhow::ensure!(
+            !support.is_empty(),
+            "empty field support cannot license an owner"
+        );
+        Ok(Bool::and(&support))
+    }
+
+    /// Necessary local G-FOLD premises only. Caller alias, all-store and
+    /// source-flow closure remain separate; this does not activate transport.
+    pub(crate) fn constrain_fold_permission(
+        &self,
+        facts: &super::licensing::facts::Facts,
+        proof: &super::licensing::fold_call::Proof,
+        guard: &Bool,
+    ) -> anyhow::Result<()> {
+        let requirements = super::licensing::fold_permission::requirements(facts, proof)
+            .map_err(anyhow::Error::msg)?;
+        let support = self.fold_requirement_support(facts, &requirements)?;
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("own-fold-permission({:?},{})", proof.call, proof.boundary),
+            &guard.implies(&support),
+        );
+        Ok(())
+    }
+
+    fn fold_requirement_support(
+        &self,
+        facts: &super::licensing::facts::Facts,
+        requirements: &super::licensing::fold_permission::Requirements,
+    ) -> anyhow::Result<Bool> {
+        anyhow::ensure!(
+            facts.constructions == 1
+                && requirements
+                    .owning
+                    .iter()
+                    .chain(&requirements.zero)
+                    .all(|node| node.construction == 0),
+            "fold requirement construction differs"
+        );
+        let mut support = vec![Bool::from_bool(
+            facts.frame_attested
+                && super::licensing::stack_entry::current_world()
+                    == super::licensing::stack_entry::CallWorld::ClosedProgram,
+        )];
+        for key in &requirements.kind_keys {
+            let slot = facts
+                .slot_refs
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("fold kind slot missing"))?;
+            support.push(
+                self.vars
+                    .get(slot)
+                    .ok_or_else(|| anyhow::anyhow!("fold solver kind missing"))?
+                    .own
+                    .clone(),
+            );
+        }
+        for (nodes, positive) in [(&requirements.owning, true), (&requirements.zero, false)] {
+            for node in nodes {
+                let rho = facts
+                    .ownership_asts
+                    .get(Var::from_u32(node.var))
+                    .ok_or_else(|| anyhow::anyhow!("fold ownership AST missing"))?;
+                support.push(if positive { rho.clone() } else { !rho });
+            }
+        }
+        for (key, positive) in &requirements.guards {
+            let predicate = &facts
+                .guards
+                .iter()
+                .find(|g| g.equation == *key)
+                .ok_or_else(|| anyhow::anyhow!("fold endpoint/guard AST missing"))?
+                .predicate;
+            support.push(if *positive {
+                predicate.clone()
+            } else {
+                !predicate
+            });
+        }
+        Ok(Bool::and(&support))
+    }
+
+    /// Final disposition follows complete current/frozen caller certification.
+    /// Every original SSA equation, old/final-zero and field rule remains.
+    pub(crate) fn constrain_fold_callers(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<()> {
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fold caller facts missing"))?;
+        super::licensing::fold_declaration::validate(
+            facts,
+            &super::licensing::matched::guard_aliases(&facts.guards),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let current = super::licensing::fold_eligibility::plan(facts);
+        anyhow::ensure!(
+            current == frozen.fold_callers,
+            "fold caller preflight differs"
+        );
+        let members = super::licensing::fold_eligibility::member_plan(facts);
+        anyhow::ensure!(
+            members == frozen.fold_members,
+            "fold member preflight differs"
+        );
+        let mut clauses = Vec::new();
+        for row in current.as_deref().unwrap_or_default() {
+            let key = row.declaration.guard;
+            let binding = |key| -> anyhow::Result<Bool> {
+                let rows: Vec<_> = facts.guards.iter().filter(|g| g.equation == key).collect();
+                let [row] = rows.as_slice() else {
+                    anyhow::bail!("fold caller predicate missing or ambiguous")
+                };
+                Ok(row.predicate.clone())
+            };
+            let guard = binding(key)?;
+            let closed = facts.frame_attested
+                && super::licensing::stack_entry::current_world()
+                    == super::licensing::stack_entry::CallWorld::ClosedProgram;
+            // A used-child declaration is activated by its member certificate
+            // instead, on the same closed-frame premise and the same two
+            // clauses. Its parent free is the callee's, so its endpoint account
+            // is the caller's own, carried on the certificate.
+            let member = members
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row.declaration.guard == key)
+                .find_map(|row| row.outcome.as_ref().ok());
+            if closed && let Ok(proof) = &row.outcome {
+                anyhow::ensure!(
+                    proof.required_closed_frame,
+                    "fold caller frame premise missing"
+                );
+                let support = self.fold_requirement_support(facts, &proof.requirements)?;
+                clauses.push((
+                    format!("own-fold-caller-permission({key:?})"),
+                    guard.implies(&support),
+                ));
+                // The exact four original endpoints select the one obligation;
+                // the antecedent deliberately excludes the fold guard itself.
+                let endpoints = [
+                    proof.payload.source.endpoint,
+                    proof.payload.free,
+                    proof.container.source.endpoint,
+                    proof.container.free,
+                ];
+                let predicates = endpoints
+                    .into_iter()
+                    .map(binding)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                clauses.push((
+                    format!("own-fold-caller-endpoints({key:?})"),
+                    Bool::and(&predicates).implies(&guard),
+                ));
+            } else if closed && let Some(proof) = member {
+                anyhow::ensure!(
+                    proof.required_closed_frame,
+                    "fold member frame premise missing"
+                );
+                let support = self.fold_requirement_support(facts, &proof.requirements)?;
+                clauses.push((
+                    format!("own-fold-member-permission({key:?})"),
+                    guard.implies(&support),
+                ));
+                let predicates = proof
+                    .endpoints
+                    .iter()
+                    .copied()
+                    .map(&binding)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                clauses.push((
+                    format!("own-fold-member-endpoints({key:?})"),
+                    Bool::and(&predicates).implies(&guard),
+                ));
+            } else {
+                clauses.push((format!("own-fold-pending({key:?})"), !guard));
+            }
+        }
+        for (label, clause) in clauses {
+            assert_hard(&self.solver, self.tracker.as_ref(), || label, &clause);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn constrain_first_permissions(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<()> {
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("first-permission facts missing"))?;
+        let current_matched = super::licensing::matched::MatchedTransport::build(facts);
+        let current_origins = super::licensing::value_origins::ValueOrigins::build(facts);
+        let mut fields = super::licensing::field_support::audit(
+            facts,
+            &facts.field_support_inputs,
+            &current_matched,
+            &current_origins,
+        );
+        let checked = super::licensing::first_permission::plan(
+            facts,
+            &mut fields,
+            current_matched.guard_aliases(),
+        );
+        anyhow::ensure!(
+            checked == frozen.first_permissions && fields == frozen.field_support,
+            "first-permission preflight differs"
+        );
+        let mut clauses = Vec::new();
+        for decision in &checked {
+            let guard = &facts
+                .guards
+                .iter()
+                .find(|g| g.equation == decision.guard)
+                .ok_or_else(|| anyhow::anyhow!("first-permission guard missing"))?
+                .predicate;
+            let permitted = facts.frame_attested
+                && super::licensing::stack_entry::current_world()
+                    == super::licensing::stack_entry::CallWorld::ClosedProgram;
+            if permitted && let Some(proof) = &decision.proof {
+                let field = fields
+                    .iter()
+                    .find(|f| f.field_key == proof.candidate.field_key && f.supported())
+                    .ok_or_else(|| anyhow::anyhow!("first-permission all-store proof missing"))?;
+                let cell = facts
+                    .slot_refs
+                    .get(&proof.parameter_slot)
+                    .ok_or_else(|| anyhow::anyhow!("first-permission outer slot missing"))?;
+                let field_slot = facts
+                    .slot_refs
+                    .get(&proof.candidate.field_key)
+                    .ok_or_else(|| anyhow::anyhow!("first-permission field slot missing"))?;
+                let support = Bool::and(&[
+                    self.vars[cell].ref_.clone(),
+                    self.vars[field_slot].own.clone(),
+                    self.all_field_store_support(facts, field)?,
+                ]);
+                clauses.push((decision.guard, true, guard.implies(&support)));
+            } else if permitted && let Some(chain) = &decision.complete_chain {
+                let field = fields
+                    .iter()
+                    .find(|field| field.field_key == chain.put.field_key && field.supported())
+                    .ok_or_else(|| anyhow::anyhow!("complete-chain all-store proof missing"))?;
+                anyhow::ensure!(
+                    super::licensing::chain_permission::certify(
+                        facts,
+                        field,
+                        current_matched.guard_aliases()
+                    )
+                    .as_ref()
+                        == Some(chain.as_ref()),
+                    "complete-chain current proof differs"
+                );
+                let field_slot = facts
+                    .slot_refs
+                    .get(&chain.put.field_key)
+                    .ok_or_else(|| anyhow::anyhow!("complete-chain field slot missing"))?;
+                let mut support = vec![
+                    self.vars[field_slot].own.clone(),
+                    self.all_field_store_support(facts, field)?,
+                ];
+                for call in &chain.effects.calls {
+                    if call.callee == chain.put.call.callee
+                        || call.callee == chain.release.call.callee
+                        || call.caller == chain.release.call.callee
+                    {
+                        let argument = if call == &chain.put.call {
+                            chain.put.argument
+                        } else if call == &chain.release.call {
+                            chain.release.argument
+                        } else {
+                            0
+                        };
+                        let boundary = facts
+                            .boundary_substitutions
+                            .iter()
+                            .find(|b| {
+                                b.point.construction == call.construction
+                                    && b.point.function.as_ref() == Some(&call.caller)
+                                    && b.point.block == Some(call.block)
+                                    && b.point.statement == Some(call.statement)
+                                    && b.callee.as_ref() == Some(&call.callee)
+                                    && b.role == super::ownership_boundary::Role::CallArgument
+                                    && b.argument_index == Some(argument)
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("complete-chain parent boundary missing")
+                            })?;
+                        let key = format!(
+                            "{}::_{}@d0",
+                            call.callee,
+                            boundary.formal_local.ok_or_else(|| anyhow::anyhow!(
+                                "complete-chain parent local missing"
+                            ))?
+                        );
+                        let slot = facts
+                            .slot_refs
+                            .get(&key)
+                            .ok_or_else(|| anyhow::anyhow!("complete-chain parent slot missing"))?;
+                        support.push(self.vars[slot].ref_.clone());
+                    }
+                }
+                clauses.push((decision.guard, true, guard.implies(&Bool::and(&support))));
+            } else {
+                clauses.push((decision.guard, false, !guard));
+            }
+        }
+        for (id, permitted, clause) in clauses {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("own-original-cell-disposition({id:?},{permitted})"),
+                &clause,
+            );
+        }
+        Ok(())
+    }
+
+    /// era-5c (R409-1): the allocator-contract pairing refusal — the sink's
+    /// argument is assumed non-owning under the family
+    /// `allocator-contract-pairing`, so the sink's selector is leaked (the free
+    /// stays a raw-pointer free) and the pointer stays raw rather than being
+    /// released through the wrong allocator.
+    pub(crate) fn constrain_allocator_contract_pairing(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) {
+        use super::allocator_contract::{self, AllocatorClass};
+        let misusing = allocator_contract::misusing_functions(facts);
+        for port in allocator_contract::ports() {
+            let open = !misusing.contains(&port.function);
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!("E5C contract-port {} open={open}", port.function);
+            }
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || {
+                    if open {
+                        format!("allocator-contract-port-open({})", port.function)
+                    } else {
+                        format!("allocator-contract-pairing(port closed: {})", port.function)
+                    }
+                },
+                &if open {
+                    port.guard.clone()
+                } else {
+                    !&port.guard
+                },
+            );
+        }
+        // Both directions refuse the sink's argument; a libc release of a
+        // contract allocation additionally closed the caller's ports above, so
+        // the refusal is satisfiable without leaking the producer's source.
+        for refusal in allocator_contract::pairing_refusals(facts) {
+            let _: AllocatorClass = refusal.sink_class;
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!(
+                    "E5C pairing-refusal var={:?} {}",
+                    refusal.var, refusal.label
+                );
+            }
+            let x = &facts.ownership_asts[refusal.var];
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || refusal.label.clone(),
+                &!x,
+            );
+        }
+    }
+
+    /// Complete traversal calls are borrowed only under the explicit closed
+    /// frame and ordinary native replay. Unqualified declarations remain false.
+    pub(crate) fn constrain_traversal_calls(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        use super::licensing::{facts::EquationId, traversal_call, traversal_correspondence};
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("traversal facts absent"))?;
+        let candidates = traversal_call::discover(facts);
+        let proofs: Vec<_> = candidates
+            .iter()
+            .map(|c| traversal_correspondence::certify(facts, c))
+            .collect();
+        anyhow::ensure!(
+            candidates == frozen.traversal_calls && proofs == frozen.traversal_correspondences,
+            "traversal preflight differs from frozen evidence"
+        );
+        let world = facts.frame_attested
+            && super::licensing::stack_entry::current_world()
+                == super::licensing::stack_entry::CallWorld::ClosedProgram
+            && super::licensing::caller_coverage::assess(facts)
+                == super::licensing::caller_coverage::Status::Complete;
+        let predicate = |id| {
+            facts
+                .guards
+                .iter()
+                .find(|g| g.equation == id)
+                .map(|g| g.predicate.clone())
+                .ok_or_else(|| anyhow::anyhow!("traversal predicate missing"))
+        };
+        let mut clauses = Vec::new();
+        for declaration in facts
+            .equations
+            .iter()
+            .filter(|e| e.operation == "guarded-traversal-call")
+        {
+            let id = EquationId {
+                construction: declaration.point.construction,
+                ordinal: declaration.ordinal,
+            };
+            let guard = predicate(id)?;
+            let support = (|| -> Result<Bool, &'static str> {
+                if !world {
+                    return Err("world-not-closed");
+                }
+                let index = candidates
+                    .iter()
+                    .position(|c| c.guard == id)
+                    .ok_or("candidate-missing")?;
+                let callee = &candidates[index].call.callee;
+                let expected: BTreeSet<_> = facts
+                    .caller_coverage
+                    .as_ref()
+                    .ok_or("caller-coverage-absent")?
+                    .local_calls
+                    .iter()
+                    .filter(|c| &c.target == callee)
+                    .map(|c| (c.site.function.clone(), c.site.block, c.site.statement))
+                    .collect();
+                let group: Vec<_> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| &c.call.callee == callee)
+                    .collect();
+                let observed: BTreeSet<_> = group
+                    .iter()
+                    .map(|(_, c)| (c.call.caller.clone(), c.call.block, c.call.statement))
+                    .collect();
+                if expected.is_empty() || observed != expected || group.len() != expected.len() {
+                    return Err("caller-coverage-mismatch");
+                }
+                let mut requirements = Vec::new();
+                for (index, candidate) in group {
+                    let proof = proofs[index]
+                        .as_ref()
+                        .ok()
+                        .ok_or("correspondence-refused")?;
+                    let arg = facts
+                        .boundary_substitutions
+                        .iter()
+                        .find(|b| {
+                            b.point.construction == candidate.call.construction
+                                && b.ordinal == candidate.argument_boundary
+                        })
+                        .ok_or("argument-boundary-missing")?;
+                    let ret = facts
+                        .boundary_substitutions
+                        .iter()
+                        .find(|b| {
+                            b.point.construction == candidate.call.construction
+                                && b.ordinal == candidate.receiver_boundary
+                        })
+                        .ok_or("receiver-boundary-missing")?;
+                    // era-5c (E5C-2): a formal component the actual's window does
+                    // not reach (the callee's `node->left` when the caller tracks
+                    // `root->right` one level deep) is admissible under the arm
+                    // when the licence's own `formal-zero` row covers it — the
+                    // callee sees a view whose every component is non-owning,
+                    // and the caller's frame keeps its tokens. Unmatched ACTUAL
+                    // components and the receiver stay refused.
+                    let formal_zero_covers = |var: &u32| {
+                        super::null_paths::move_tracking()
+                            && facts.equations.iter().any(|e| {
+                                e.operation == "guarded-traversal-formal-zero"
+                                    && e.guard.is_some()
+                                    && e.guard == declaration.guard
+                                    && e.variables == [*var]
+                            })
+                    };
+                    if !arg.unmatched_actual_vars.is_empty()
+                        || !ret.unmatched_actual_vars.is_empty()
+                        || !ret.unmatched_formal_vars.is_empty()
+                    {
+                        return Err("boundary-unmatched-vars");
+                    }
+                    if !arg.unmatched_formal_vars.iter().all(formal_zero_covers) {
+                        return Err("argument-formal-unmatched");
+                    }
+                    let target =
+                        traversal_call::input_target(facts, proof).ok_or("input-target-missing")?;
+                    let input = facts
+                        .slot_refs
+                        .get(&target.kind_key)
+                        .ok_or("input-slot-missing")?;
+                    requirements.push(!&self.vars[input].raw);
+                    if let Some(parent) = &target.parent_key {
+                        requirements.push(
+                            !&self.vars
+                                [facts.slot_refs.get(parent).ok_or("parent-slot-missing")?]
+                            .raw,
+                        );
+                    }
+                    for key in [
+                        format!("{}::_{}@d0", callee, candidate.parameter),
+                        format!("{}::_0@d0", callee),
+                        format!(
+                            "{}::_{}@d0",
+                            candidate.call.caller, proof.native.receiver.local
+                        ),
+                    ] {
+                        requirements.push(
+                            self.vars[facts.slot_refs.get(&key).ok_or("interface-slot-missing")?]
+                                .ref_
+                                .clone(),
+                        );
+                    }
+                    requirements.push(predicate(candidate.guard).ok().ok_or("guard-missing")?);
+                    for reader_id in &proof.traversal.readers {
+                        let equation = facts
+                            .equations
+                            .iter()
+                            .find(|e| {
+                                e.point.construction == reader_id.construction
+                                    && e.ordinal == reader_id.ordinal
+                            })
+                            .ok_or("reader-equation-missing")?;
+                        let reader = facts
+                            .reader_plan
+                            .candidates
+                            .iter()
+                            .find(|r| {
+                                r.function == *callee
+                                    && Some(r.block) == equation.point.block
+                                    && Some(r.statement) == equation.point.statement
+                            })
+                            .ok_or("reader-candidate-missing")?;
+                        let field = facts
+                            .slot_refs
+                            .get(&reader.field_key)
+                            .ok_or("reader-field-slot-missing")?;
+                        requirements.push(!&self.vars[field].raw);
+                        requirements.push(
+                            self.vars[field].own.implies(
+                                &predicate(*reader_id).ok().ok_or("reader-guard-missing")?,
+                            ),
+                        );
+                    }
+                }
+                Ok(Bool::and(&requirements))
+            })();
+            // era-5c: a pending traversal names its reason when asked.
+            if let Err(reason) = &support
+                && std::env::var_os("CRAT_ERA5C_DEBUG").is_some()
+            {
+                eprintln!("E5C traversal-pending {id:?} reason={reason}");
+            }
+            let licensed = support.is_ok();
+            clauses.push((
+                id,
+                licensed,
+                match support {
+                    Ok(s) => guard.implies(&s),
+                    Err(_) => !guard,
+                },
+            ));
+        }
+        for (id, licensed, clause) in clauses {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || {
+                    if licensed {
+                        format!("own-traversal-license({id:?})")
+                    } else {
+                        "own-traversal-pending".into()
+                    }
+                },
+                &clause,
+            );
+        }
+        Ok(())
+    }
+
+    /// Permission is conditional on complete store/source/free evidence. Missing
+    /// roles retain the original borrow/frame; replay checks selected Ref views.
+    pub(crate) fn constrain_reference_field_effects(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<()> {
+        use super::licensing::matched::{SourceLineage, TerminalTarget};
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("reference-effect facts missing"))?;
+        let actual_graph = super::licensing::transport::CandidateGraph::build(facts);
+        let aliases = super::licensing::matched::guard_aliases(&facts.guards);
+        let mut clauses = Vec::new();
+        for row in facts
+            .equations
+            .iter()
+            .filter(|row| row.operation == "guarded-reference-field")
+        {
+            let key = super::licensing::facts::EquationId {
+                construction: row.point.construction,
+                ordinal: row.ordinal,
+            };
+            let guard = facts
+                .guards
+                .iter()
+                .find(|binding| binding.equation == key)
+                .ok_or_else(|| anyhow::anyhow!("missing reference-effect guard"))?;
+            let candidates: Vec<_> = frozen
+                .reference_effects
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    row.point == candidate.formation
+                        && row.variables
+                            == [
+                                candidate.payload_before.var,
+                                candidate.cell_after.var,
+                                candidate.cell_before.var,
+                            ]
+                })
+                .collect();
+            let support = (|| -> anyhow::Result<Option<Bool>> {
+                let [candidate] = candidates.as_slice() else { return Ok(None) };
+                // This edge requires all five actual obligations under the
+                // same predicate; cached support cannot replace a missing law.
+                if !actual_graph.edges.iter().any(|edge| {
+                    edge.from == candidate.cell_before
+                        && edge.to == candidate.payload_before
+                        && edge.evidence
+                            == super::licensing::transport::Evidence::ReferenceEffect(key)
+                        && edge.guard.is_some_and(|guard| {
+                            guard.required && aliases.get(&key) == Some(&guard.binding)
+                        })
+                }) {
+                    return Ok(None);
+                }
+                let Some(field) = frozen
+                    .field_support
+                    .iter()
+                    .find(|field| field.field_key == candidate.field_key && field.supported())
+                else {
+                    return Ok(None);
+                };
+                let stores: Vec<_> = field
+                    .stores
+                    .iter()
+                    .filter(|store| {
+                        store.site.function == candidate.function
+                            && store.site.place.local == candidate.cell_place.local
+                            && store.destination_def == candidate.scalar_before
+                    })
+                    .collect();
+                let [store] = stores.as_slice() else { return Ok(None) };
+                if store.meet.terminal.target != TerminalTarget::Free(candidate.free)
+                    || store.meet.terminal.lineage
+                        != SourceLineage::Exact(vec![candidate.call.clone()])
+                    || !store.discharged_outputs.iter().any(|discharge| {
+                        discharge.certificate.call == candidate.call
+                            && discharge.certificate.actual_output == candidate.payload_after
+                            && discharge.certificate.free == store.meet.terminal
+                    })
+                {
+                    return Ok(None);
+                }
+                let Some(view) = facts.consumes.iter().find(|consume| {
+                    consume.point.construction == candidate.construction
+                        && consume.ordinal == candidate.scalar_view_consume
+                }) else {
+                    return Ok(None);
+                };
+                let Some(boundary) = facts.boundary_substitutions.iter().find(|boundary| {
+                    boundary.point.construction == candidate.construction
+                        && boundary.ordinal == candidate.boundary
+                }) else {
+                    return Ok(None);
+                };
+                let Some(formal) = boundary.formal_local else { return Ok(None) };
+                let view_key = format!("{}::_{}@d0", candidate.function, view.local);
+                let callee_key = format!("{}::_{}@d0", candidate.call.callee, formal);
+                let (Some(view), Some(field_slot), Some(callee)) = (
+                    facts.slot_refs.get(&view_key),
+                    facts.slot_refs.get(&candidate.field_key),
+                    facts.slot_refs.get(&callee_key),
+                ) else {
+                    return Ok(None);
+                };
+                let mut required = vec![
+                    self.vars[view].ref_.clone(),
+                    self.vars[field_slot].own.clone(),
+                    self.vars[callee].ref_.clone(),
+                ];
+                required.push(self.all_field_store_support(facts, field)?);
+                Ok(Some(Bool::and(&required)))
+            })()?;
+            clauses.push(match support {
+                Some(support) => (
+                    "own-reference-effect-permission",
+                    guard.predicate.implies(&support),
+                ),
+                None => ("own-reference-effect-pending", !guard.predicate.clone()),
+            });
+        }
+        for (label, clause) in clauses {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || label.into(),
+                &clause,
+            );
+        }
+        Ok(())
+    }
+
+    /// An Owning declaration cannot substitute for a token in each stored
+    /// occurrence. Only the new reader alternative consumes this certificate;
+    /// unsupported roles retain the pre-existing transfer constraints.
+    pub(crate) fn constrain_reader_field_support(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<()> {
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing field support facts"))?;
+        let mut clauses = Vec::new();
+        for candidate in &frozen.reader_candidates {
+            let key = format!(
+                "{}::_{}@d0",
+                candidate.function, candidate.destination.local
+            );
+            let (Some(&lhs), Some(&rhs)) = (
+                facts.slot_refs.get(&key),
+                facts.slot_refs.get(&candidate.field_key),
+            ) else {
+                continue;
+            };
+            let reader = self.lend_guard(lhs, rhs);
+            // R388-1: under the arm, a field whose only holds are classified
+            // store sources is supported CONDITIONALLY — the condition being the
+            // conjunction those sources name. `reader => support` is unchanged;
+            // what changes is that `support` can be a formula instead of a
+            // pre-solve boolean.
+            if super::licensing::facts::interface_own()
+                && let Some(proof) = frozen
+                    .field_support
+                    .iter()
+                    .find(|proof| proof.field_key == candidate.field_key && !proof.supported())
+                && let Some(support) = self.classified_store_support(facts, proof)?
+            {
+                clauses.push((
+                    format!(
+                        "field-reader-support-classified({key},{})",
+                        candidate.field_key
+                    ),
+                    reader.implies(&support),
+                ));
+                continue;
+            }
+            let Some(proof) = frozen
+                .field_support
+                .iter()
+                .find(|proof| proof.field_key == candidate.field_key && proof.supported())
+            else {
+                clauses.push((
+                    format!("field-reader-support-held({key},{})", candidate.field_key),
+                    !reader,
+                ));
+                continue;
+            };
+            let support = self.all_field_store_support(facts, proof)?;
+            clauses.push((
+                format!("field-reader-support-owned({key},{})", candidate.field_key),
+                reader.implies(&support),
+            ));
+        }
+        for (label, clause) in clauses {
+            assert_hard(&self.solver, self.tracker.as_ref(), || label, &clause);
+        }
+        Ok(())
+    }
+
+    /// R388-1: the conjunction a field's classified store sources name. `None`
+    /// when the field carries a hold the classification does not cover — avl's
+    /// `TerminalRoleC` and `CallerCoverageC` are exactly that — so those fields
+    /// keep the pre-solve refusal and their readers stay held.
+    fn classified_store_support(
+        &self,
+        facts: &super::licensing::facts::Facts,
+        proof: &super::licensing::field_support::FieldProof,
+    ) -> anyhow::Result<Option<Bool>> {
+        use super::licensing::field_support::{Pending, StoreSourceOrigin};
+        if proof.classified.is_empty() {
+            return Ok(None);
+        }
+        // Every hold must be either a store this pass classified, or the
+        // `EmptyOwnedSupport` that follows from them. Anything else is a premise
+        // the classification does not speak to.
+        let covered = proof.holds.iter().all(|hold| {
+            hold.reason == Pending::EmptyOwnedSupport
+                || (hold.reason == Pending::OwnedInputOrOriginC
+                    && hold.site.as_ref().is_some_and(|site| {
+                        proof.classified.iter().any(|store| &store.site == site)
+                    }))
+        });
+        if !covered {
+            return Ok(None);
+        }
+        let mut conjuncts: Vec<Bool> = Vec::new();
+        for store in &proof.classified {
+            match &store.origin {
+                StoreSourceOrigin::Fresh | StoreSourceOrigin::Null => {}
+                StoreSourceOrigin::Input(key) | StoreSourceOrigin::FieldToken(key) => {
+                    let Some(&slot) = facts.slot_refs.get(key) else {
+                        return Ok(None);
+                    };
+                    conjuncts.push(self.vars[&slot].own.clone());
+                }
+                StoreSourceOrigin::Unknown => return Ok(None),
+            }
+        }
+        let refs: Vec<&Bool> = conjuncts.iter().collect();
+        Ok(Some(if refs.is_empty() {
+            Bool::from_bool(true)
+        } else {
+            Bool::and(&refs)
+        }))
+    }
+
+    /// Checked O-OWN grants add responsibility through the mandatory mirror.
+    /// Eligibility changes no objective weight and relaxes no SSA law.
+    pub(crate) fn apply_licensing_grants(
+        &self,
+        facts: &super::licensing::facts::Facts,
+    ) -> anyhow::Result<usize> {
+        let frozen = facts
+            .licensing
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing frozen licensing facts"))?;
+        let mut resolved = Vec::new();
+        for grant in &frozen.objective_grants {
+            anyhow::ensure!(
+                grant.discharged_gates == super::licensing::grants::HardGate::ALL,
+                "grant has an incomplete or duplicated hard-gate proof inventory"
+            );
+            anyhow::ensure!(
+                grant.carrier.construction == 0 && facts.constructions == 1,
+                "grant AST must belong to this construction"
+            );
+            anyhow::ensure!(
+                facts
+                    .slot_refs
+                    .get(&grant.slot_key)
+                    .is_some_and(|slot| self.vars.contains_key(slot)),
+                "grant has no actual kind join"
+            );
+            let rho = facts
+                .ownership_asts
+                .get(Var::from_u32(grant.carrier.var))
+                .ok_or_else(|| anyhow::anyhow!("missing grant responsibility AST"))?;
+            let source = frozen
+                .matched
+                .guard_aliases()
+                .get(&grant.meet.source.endpoint)
+                .ok_or_else(|| anyhow::anyhow!("missing grant source dependency"))?;
+            anyhow::ensure!(
+                grant.meet.guards.get(source) == Some(&true),
+                "grant lost source dependency"
+            );
+            if let super::licensing::matched::TerminalTarget::Free(endpoint) =
+                grant.meet.terminal.target
+            {
+                let sink = frozen
+                    .matched
+                    .guard_aliases()
+                    .get(&endpoint)
+                    .ok_or_else(|| anyhow::anyhow!("missing grant sink dependency"))?;
+                anyhow::ensure!(
+                    grant.meet.guards.get(sink) == Some(&true),
+                    "grant lost sink dependency"
+                );
+            }
+            let mut dependencies = Vec::new();
+            for (key, required) in &grant.meet.guards {
+                let predicate = &facts
+                    .guards
+                    .iter()
+                    .find(|binding| &binding.equation == key)
+                    .ok_or_else(|| anyhow::anyhow!("missing actual grant predicate"))?
+                    .predicate;
+                dependencies.push(if *required {
+                    predicate.clone()
+                } else {
+                    !predicate
+                });
+            }
+            resolved.push((grant, Bool::and(&dependencies).implies(rho)));
+        }
+        for (grant, clause) in &resolved {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || {
+                    format!(
+                        "own-license({}:{}:{})",
+                        grant.function, grant.slot_key, grant.carrier.var
+                    )
+                },
+                clause,
+            );
+        }
+        Ok(resolved.len())
+    }
+
     /// §NB1 SAFE-MONO clause: `safe(target) ⇒ safe(layer)` — a safe (`¬raw`)
     /// target cannot sit behind a raw pointer `layer` that was dereferenced to
     /// reach it. `safe(x) ≡ ¬raw(x)` (one-hot), so this is `raw(target) ∨
@@ -1162,6 +2452,92 @@ impl KindSolver {
             || format!("borrow-exclusion({issuer:?},{requirers:?})"),
             &Bool::or(&refs),
         );
+    }
+
+    /// R377-1: the return-port rule. `add_borrow_exclusion` already denies `ref`
+    /// for every allocation source; this denies `raw` as well, which leaves the
+    /// one-hot's `own` — "Owning at the return port". The caller inherits it
+    /// through the ordinary `link_own` solidification, so nothing new is
+    /// emitted on the caller's side.
+    ///
+    /// R379-2: the row is RECORDED here and asserted at materialisation. At
+    /// emission the objective and the final-zero obligations are not in the
+    /// system yet, so a check here is satisfiable and the refusal it must yield
+    /// to appears only later — report 048 measured exactly that
+    /// (`emitted=true` for all three of `o03`'s slots).
+    pub(crate) fn require_own(&self, key: &str, slot: SlotRef) {
+        assert!(self.vars.contains_key(&slot), "unknown slot: {slot:?}");
+        let mut admitted = self.return_port_admitted.borrow_mut();
+        if admitted.iter().all(|(existing, _)| existing != key) {
+            admitted.push((key.to_owned(), slot));
+            admitted.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+    }
+
+    /// R379-2: the rows kept by each materialisation round, and the set that was
+    /// admitted at emission. The cost receipt the seat reads.
+    pub(crate) fn return_port_receipt(&self) -> (Vec<String>, Vec<usize>) {
+        (
+            self.return_port_admitted
+                .borrow()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect(),
+            self.return_port_kept.borrow().clone(),
+        )
+    }
+
+    /// R379-2: assert every admitted return-port row, then let the caller's own
+    /// `check` decide. On `Unsat` the caller bisects; with none admitted this
+    /// asserts nothing and the round is exactly today's.
+    fn assert_return_port_rows(&self, rows: &[(String, SlotRef)]) {
+        // Scope-local, so asserted the way the assumption bundle is rather than
+        // through `assert_hard`: that path bumps the tracked hard-assertion
+        // count, which `relax_selectors_hard_typed`'s T2 no-bypass tripwire
+        // reconciles against mandatory tracks plus typed endpoints — and a
+        // popped scope does not un-bump it, so the next round trips.
+        for (_, slot) in rows {
+            self.solver.assert(&self.vars[slot].own);
+        }
+    }
+
+    /// R379-2: the admissible subset, found deterministically in slot-key order.
+    /// Called ONLY when the round was `Unsat` with every row asserted, so the
+    /// common case costs no extra check at all.
+    ///
+    /// A prefix bisection was the first shape and it is wrong: admissibility is
+    /// not monotone in slot-key order, so the maximal subset is not a prefix and
+    /// a bisection keeps rows a later row is refused for. This adds one row at a
+    /// time inside a single scope and keeps each that leaves the system
+    /// satisfiable — greedy, exact for "no kept row is refused", and at most one
+    /// check per admitted row on a round that was going to fail anyway.
+    fn return_port_admissible_subset(
+        &self,
+        rows: &[(String, SlotRef)],
+        bundle: &[Bool],
+    ) -> Vec<(String, SlotRef)> {
+        let mut kept = Vec::new();
+        self.solver.push();
+        for literal in bundle {
+            self.solver.assert(literal);
+        }
+        for row in rows {
+            self.solver.push();
+            self.assert_return_port_rows(std::slice::from_ref(row));
+            self.check_sat_count
+                .set(self.check_sat_count.get().saturating_add(1));
+            if self.solver.check(&[]) == SatResult::Sat {
+                // Keep it asserted: the next row is judged against a system that
+                // already carries everything kept before it.
+                kept.push(row.clone());
+            } else {
+                self.solver.pop();
+            }
+        }
+        for _ in 0..=kept.len() {
+            self.solver.pop();
+        }
+        kept
     }
 
     /// A5 coarse pricing control: a may-overlapping formal pair cannot both
@@ -1318,6 +2694,21 @@ impl KindSolver {
         );
     }
 
+    /// R385-1 companion to `assert_owning`: FORCE a slot `Ref` for the
+    /// forced-assignment core probe. Compute-only, no production caller.
+    pub(crate) fn assert_ref(&self, slot: SlotRef) {
+        let vars = self
+            .vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("r385-force-ref({slot:?})"),
+            &vars.ref_,
+        );
+    }
+
     pub fn check(&self) -> SatResult {
         execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         // §NB-R guard: a no-assumption check on a tracked solver is vacuously
@@ -1400,6 +2791,16 @@ impl KindSolver {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(assumptions);
+        // R467-2 profile: the size of the query actually handed to z3.
+        if self.check_sat_count.get() == 1 && std::env::var("CRAT_ERA5C_PROFILE").is_ok() {
+            eprintln!(
+                "E5C_QUERY hard={} tracks={} assumptions={} vars={}",
+                self.hard_assertion_count(),
+                self.mandatory_tracks().len(),
+                bundle.len(),
+                self.vars.len()
+            );
+        }
         let outcome = self.solver.check(&bundle);
         let query_reason = (outcome == SatResult::Unknown)
             .then(|| self.solver.get_reason_unknown())
@@ -1538,6 +2939,18 @@ impl KindSolver {
         self.solver.set_params(&fixed_query_params());
     }
 
+    /// R484-1: the Raw-causal census forces `ref_` and reads the UNSAT core.
+    /// Raw is the residual kind -- the objective prefers `ref_` -- so "why is
+    /// this subject Raw?" is exactly "what forbids `ref_`?".
+    #[cfg(test)]
+    pub(crate) fn ref_literal(&self, slot: SlotRef) -> Bool {
+        self.vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"))
+            .ref_
+            .clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn owning_literal(&self, slot: SlotRef) -> Bool {
         self.vars
@@ -1638,7 +3051,19 @@ impl KindSolver {
             Some(epoch)
         });
 
+        let mut relax_rounds = 0usize;
+        let profile_rounds = std::env::var("CRAT_ERA5C_PROFILE").is_ok();
         loop {
+            // R467-2 profile: the relax loop's shape — rounds and live assumptions.
+            if profile_rounds && relax_rounds % 200 == 0 {
+                eprintln!(
+                    "E5C_RELAX round={relax_rounds} assumptions={} dropped={} tracks={}",
+                    assumptions.len(),
+                    dropped.len(),
+                    self.mandatory_tracks().len()
+                );
+            }
+            relax_rounds += 1;
             self.prepare_demand_query(QueryPhase::SelectorSearch, None);
             match self.hard_check_with_assumptions(hard, &assumptions) {
                 SatResult::Sat => break,
@@ -1658,6 +3083,13 @@ impl KindSolver {
                             .is_some()
                     });
                     let core_labels = self.core_labels(selectors, &core);
+                    // era-5c: name the core a leaked selector came from.
+                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                        for label in &core_labels {
+                            eprintln!("E5C relax-core {label}");
+                        }
+                        eprintln!("E5C relax-core-end");
+                    }
                     if t2_core.is_empty() {
                         self.record_round_model_failure(RoundModelFailure::HardUnsat {
                             active_t2: assumptions.len(),
@@ -1790,12 +3222,53 @@ impl KindSolver {
                 .get()
                 .saturating_add(1),
         );
+        // R379-2: the return-port rows go in HERE, where the system is complete —
+        // the objective and the final-zero obligations are in it, so a refusal
+        // they carry is visible and the rows yield to it. All at once, so the
+        // common case costs no extra check; the bisection below runs only when
+        // the round is `Unsat` with every row asserted.
+        let mut rows = self.return_port_admitted.borrow().clone();
         self.solver.push();
         for literal in &bundle {
             self.solver.assert(literal);
         }
+        self.assert_return_port_rows(&rows);
         self.prepare_demand_query(QueryPhase::Materialization, None);
-        let outcome = self.solver.check(&[]);
+        // R467-2 profile: the size of the materialization query handed to z3.
+        if std::env::var("CRAT_ERA5C_PROFILE").is_ok() {
+            eprintln!(
+                "E5C_QUERY materialization#{} hard={} tracks={} bundle={} rows={} vars={}",
+                self.optimize_materialization_count.get(),
+                self.hard_assertion_count(),
+                self.mandatory_tracks().len(),
+                bundle.len(),
+                rows.len(),
+                self.vars.len()
+            );
+        }
+        let mut outcome = self.solver.check(&[]);
+        if outcome == SatResult::Unsat && !rows.is_empty() {
+            self.solver.pop();
+            rows = self.return_port_admissible_subset(&rows, &bundle);
+            self.solver.push();
+            for literal in &bundle {
+                self.solver.assert(literal);
+            }
+            self.assert_return_port_rows(&rows);
+            self.prepare_demand_query(QueryPhase::Materialization, None);
+            self.check_sat_count
+                .set(self.check_sat_count.get().saturating_add(1));
+            outcome = self.solver.check(&[]);
+        }
+        self.return_port_kept.borrow_mut().push(rows.len());
+        if std::env::var("CRAT_R377_DEBUG").is_ok() {
+            eprintln!(
+                "R377ROUND admitted={} kept={} outcome={outcome:?}",
+                self.return_port_admitted.borrow().len(),
+                rows.len()
+            );
+        }
+        let outcome = outcome;
         let query_reason = (outcome == SatResult::Unknown)
             .then(|| self.solver.get_reason_unknown())
             .flatten();
@@ -1945,6 +3418,13 @@ impl KindSolver {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
                     let core = self.solver.get_unsat_core();
+                    // era-5c: name the core a leaked selector came from.
+                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                        for label in self.core_labels(selectors, &core) {
+                            eprintln!("E5C relax-core {label}");
+                        }
+                        eprintln!("E5C relax-core-end");
+                    }
                     let in_core = |s: &Bool| core.iter().any(|c| c == s);
                     // §S2-1 (NB-F review F2): the drop choice on a MIXED
                     // source/sink core is a deliberate policy — drop sinks
@@ -2145,9 +3625,36 @@ impl KindSolver {
     /// Bool against the SAME live model, using the same [`is_true`] helper so
     /// the two readouts cannot disagree.
     fn read_version_owns(&self, model: &Model) {
+        *self.original_cell_model.borrow_mut() = self.ownership_facts().map(|facts| {
+            Rc::new(super::licensing::model_selection::Selection::from_model(
+                facts,
+                |predicate| {
+                    model
+                        .eval(predicate, true)
+                        .and_then(|value| value.as_bool())
+                },
+            ))
+        });
         super::export::record_version_owns_from(|asts| {
             asts.iter().map(|b| is_true(model, b)).collect()
         });
+        #[cfg(test)]
+        OWNERSHIP_MODEL_CAPTURE.with(|capture| {
+            if let Some(capture) = capture.borrow_mut().as_mut() {
+                let asts = capture.asts.as_ref().expect("ownership emission snapshot");
+                capture
+                    .observation
+                    .model_reads
+                    .push(asts.iter().map(|b| is_true(model, b)).collect());
+            }
+        });
+    }
+
+    /// Immutable carrier from the latest successful model read; never infer guards from kinds.
+    pub(crate) fn original_cell_selection(
+        &self,
+    ) -> Option<std::rc::Rc<super::licensing::model_selection::Selection>> {
+        self.original_cell_model.borrow().clone()
     }
 
     fn read_kinds(&self, model: &Model) -> FxHashMap<SlotRef, SlotKind> {
@@ -2322,6 +3829,7 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// their own retractable assumption class).
     tracker: Option<&'opt CoreTracker>,
     z3_ast: IndexVec<Var, Bool>,
+    ownership_facts: super::licensing::facts::Builder,
     source_sink_emissions: usize,
     /// One selector literal per `source` (malloc) ownership assertion. The owning
     /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
@@ -2336,11 +3844,247 @@ pub(crate) struct BoOwnDatabase<'opt> {
 }
 
 impl BoOwnDatabase<'_> {
+    pub(crate) fn declare_pending_fold(&mut self, key: (u32, usize)) {
+        let candidate = {
+            // R353-2: era-5b's own addition; the pin had no such constraint.
+            if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+                return;
+            }
+            let facts = self.ownership_facts.borrow();
+            if facts.fold_declarations.is_none() {
+                return;
+            }
+            facts
+                .boundary_substitutions
+                .iter()
+                .find(|b| (b.point.construction, b.ordinal) == key)
+                .and_then(|b| super::licensing::fold_declaration::eligible(&facts, b))
+        };
+        let Some((call, argument)) = candidate else { return };
+        let predicate = Bool::fresh_const("pending-subtree-fold");
+        let Some(guard) =
+            super::ownership_evidence::record_key("guarded-fold-call", &[], None, Some(&predicate))
+        else {
+            return;
+        };
+        super::licensing::facts::record(|facts| {
+            facts
+                .fold_declarations
+                .as_mut()
+                .expect("new fold frame")
+                .push(super::licensing::fold_declaration::Declaration {
+                    guard,
+                    boundary: key.1,
+                    call,
+                    argument,
+                })
+        });
+        // Post-freeze preflight installs either complete caller permission
+        // or the same hard pending hold. Declaration syntax grants nothing.
+    }
+
+    /// One pending predicate declared before the receiver. Syntax grants no
+    /// permission; keep the ordinary equations and explicitly hold the guard.
+    pub(crate) fn begin_pending_traversal(&mut self, callee: &str) -> Option<(Bool, usize)> {
+        let parameter =
+            super::licensing::traversal_call::preliminary(&self.ownership_facts.borrow(), callee)?;
+        let guard = Bool::fresh_const("traversal-call");
+        super::ownership_evidence::record("guarded-traversal-call", &[], None, Some(&guard));
+
+        Some((guard, parameter.checked_sub(1)? as usize))
+    }
+
+    pub(crate) fn traversal_view_zero(&mut self, guard: &Bool, var: Var, formal: bool) {
+        let operation = if formal {
+            // R353-2: era-5b's own addition; the pin had no such constraint.
+            if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+                return;
+            }
+            "guarded-traversal-formal-zero"
+        } else {
+            "guarded-traversal-view-zero"
+        };
+        super::ownership_evidence::record(operation, &[var], None, Some(guard));
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-{operation}"),
+            &guard.implies(&!&self.z3_ast[var]),
+        );
+    }
+
+    pub(crate) fn traversal_caller_frame(&mut self, guard: &Bool, before: Var, after: Var) {
+        super::ownership_evidence::record(
+            "guarded-traversal-frame",
+            &[before, after],
+            None,
+            Some(guard),
+        );
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || "own-traversal-frame".into(),
+            &guard.implies(&self.z3_ast[before].eq(&self.z3_ast[after])),
+        );
+    }
+
+    pub(crate) fn pending_traversal_pair(&mut self, guard: &Bool, variables: &[Var]) {
+        // R353-2: era-5b's own addition; the pin had no such constraint.
+        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            return;
+        }
+        let (operation, clause) = match variables {
+            [a, b] => (
+                "guarded-traversal-receiver-legacy",
+                self.z3_ast[*a].eq(&self.z3_ast[*b]),
+            ),
+            [a, b, c, d] => (
+                "guarded-traversal-argument-legacy",
+                Bool::and(&[
+                    self.z3_ast[*a].eq(&self.z3_ast[*b]),
+                    self.z3_ast[*c].eq(&self.z3_ast[*d]),
+                ]),
+            ),
+            _ => unreachable!("pending traversal legacy tuple"),
+        };
+        super::ownership_evidence::record(operation, variables, None, Some(guard));
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-{operation}"),
+            &guard.not().implies(&clause),
+        );
+    }
+
+    /// Complete the candidate's conditional reference equations only after
+    /// exact call/output occurrences have been recorded. Permission is separate.
+    pub(crate) fn emit_reference_effect_obligations(&mut self) -> anyhow::Result<()> {
+        use super::ownership_boundary::Variables;
+        let facts = self.ownership_facts.borrow().clone();
+        let plan = super::licensing::ref_effects::Plan::build(&facts);
+        let mut obligations = Vec::new();
+        for candidate in &plan.candidates {
+            let matches: Vec<_> = facts
+                .equations
+                .iter()
+                .filter(|row| {
+                    row.point == candidate.formation
+                        && row.operation == "guarded-reference-field"
+                        && row.variables
+                            == [
+                                candidate.payload_before.var,
+                                candidate.cell_after.var,
+                                candidate.cell_before.var,
+                            ]
+                })
+                .collect();
+            let [formation] = matches.as_slice() else { continue };
+            let key = super::licensing::facts::EquationId {
+                construction: formation.point.construction,
+                ordinal: formation.ordinal,
+            };
+            let guard = facts
+                .guards
+                .iter()
+                .find(|binding| binding.equation == key)
+                .ok_or_else(|| anyhow::anyhow!("reference-effect producer guard missing"))?
+                .predicate
+                .clone();
+            let boundary = facts
+                .boundary_substitutions
+                .iter()
+                .find(|row| {
+                    row.point.construction == candidate.construction
+                        && row.ordinal == candidate.boundary
+                })
+                .ok_or_else(|| anyhow::anyhow!("reference-effect call missing"))?;
+            let Variables::UseDef {
+                use_var: outer_before,
+                def_var: outer_after,
+            } = boundary
+                .reference_peel
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("reference-effect peel missing"))?
+                .skipped
+            else {
+                anyhow::bail!("reference-effect outer window missing")
+            };
+            for (operation, point, left, right, zeros) in [
+                (
+                    "guarded-reference-scalar-read",
+                    candidate.scalar_read.clone(),
+                    candidate.scalar_after.var,
+                    candidate.scalar_before.var,
+                    false,
+                ),
+                (
+                    "guarded-reference-output",
+                    boundary.point.clone(),
+                    candidate.cell_after.var,
+                    candidate.payload_after.var,
+                    false,
+                ),
+                (
+                    "guarded-reference-outer",
+                    boundary.point.clone(),
+                    outer_after,
+                    outer_before,
+                    true,
+                ),
+                (
+                    "guarded-reference-view-zero",
+                    candidate.scalar_read.clone(),
+                    candidate.scalar_view_new.var,
+                    candidate.scalar_view_old.var,
+                    true,
+                ),
+            ] {
+                let left = Var::from_u32(left);
+                let right = Var::from_u32(right);
+                anyhow::ensure!(
+                    self.z3_ast.get(left).is_some() && self.z3_ast.get(right).is_some(),
+                    "reference-effect ownership AST missing"
+                );
+                obligations.push((operation, point, left, right, zeros, guard.clone()));
+            }
+        }
+        for (operation, point, left, right, zeros, guard) in obligations {
+            let _function = super::ownership_evidence::function(|| point.function.clone().unwrap());
+            let _location = super::ownership_evidence::location(
+                &point.phase,
+                point.block.unwrap(),
+                point.statement,
+            );
+            super::ownership_evidence::record(operation, &[left, right], None, Some(&guard));
+            let left = &self.z3_ast[left];
+            let right = &self.z3_ast[right];
+            let relation = if zeros {
+                Bool::and(&[!left, !right])
+            } else {
+                !left.xor(right)
+            };
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-reference-effect-{operation}"),
+                &guard.implies(&relation),
+            );
+        }
+        Ok(())
+    }
+
     /// E-R2: hand the export a snapshot of the `Var -> Bool` map so the model
     /// readout can evaluate per-version ownership after emission has ended.
     /// Recording-only; no-op unless a capture scope is active.
     pub(crate) fn snapshot_version_asts(&self) {
         super::export::record_version_asts(&self.z3_ast);
+        #[cfg(test)]
+        OWNERSHIP_MODEL_CAPTURE.with(|capture| {
+            if let Some(capture) = capture.borrow_mut().as_mut() {
+                capture.observation.snapshot_lengths.push(self.z3_ast.len());
+                capture.asts = Some(self.z3_ast.clone());
+            }
+        });
     }
 }
 
@@ -2352,6 +4096,7 @@ impl<'opt> BoOwnDatabase<'opt> {
             optimize,
             tracker,
             z3_ast,
+            ownership_facts: Rc::new(RefCell::new(super::licensing::facts::Facts::default())),
             source_sink_emissions: 0,
             source_selectors: Vec::new(),
             source_keys: Vec::new(),
@@ -2362,6 +4107,16 @@ impl<'opt> BoOwnDatabase<'opt> {
 
     pub(crate) fn z3_ast_len(&self) -> usize {
         self.z3_ast.len()
+    }
+
+    /// Expose this database's builder to the existing occurrence producers.
+    pub(crate) fn activate_facts(&self) -> super::licensing::facts::Scope {
+        super::licensing::facts::activate(&self.ownership_facts)
+    }
+
+    /// Call after ending the scope and collecting the existing stats/selectors.
+    pub(crate) fn freeze_facts(self) -> Rc<super::licensing::facts::Facts> {
+        super::licensing::facts::freeze(self.ownership_facts, self.z3_ast)
     }
 
     pub(crate) fn source_sink_emissions(&self) -> usize {
@@ -2559,6 +4314,7 @@ impl Database for BoOwnDatabase<'_> {
     }
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
+        super::ownership_evidence::record("linear", &[x, y, z], None, None);
         let label = || format!("own-linear({x:?}+{y:?}={z:?})");
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, &!y]));
@@ -2575,6 +4331,16 @@ impl Database for BoOwnDatabase<'_> {
         source_use: Var,
         ensure_move: bool,
     ) {
+        super::ownership_evidence::record(
+            if ensure_move {
+                "guarded-move"
+            } else {
+                "guarded-copy"
+            },
+            &[destination_def, source_def, source_use],
+            None,
+            Some(lend),
+        );
         self.push_guarded_copy_constraints(
             lend,
             destination_def,
@@ -2584,11 +4350,382 @@ impl Database for BoOwnDatabase<'_> {
         );
     }
 
+    fn push_guarded_contract_port(&mut self, guard: &Bool, dest: Var, ret: Var) {
+        super::ownership_evidence::record("guarded-contract-port", &[dest, ret], None, Some(guard));
+        let d = &self.z3_ast[dest];
+        let r = &self.z3_ast[ret];
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-contract-port({dest:?}={ret:?})"),
+            &Bool::or(&[&!guard, &!d.xor(r)]),
+        );
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-contract-port-drop({dest:?}<={ret:?})"),
+            &Bool::or(&[guard, &!d, r]),
+        );
+    }
+
     fn push_guarded_lend_source(&mut self, lend: &Bool, source_def: Var, source_use: Var) {
+        super::ownership_evidence::record(
+            "guarded-lend-source",
+            &[source_def, source_use],
+            None,
+            Some(lend),
+        );
         self.push_guarded_lend_source_constraints(lend, source_def, source_use);
     }
 
+    fn push_guarded_field_reader(
+        &mut self,
+        reader: &Bool,
+        destination_def: Var,
+        source_def: Var,
+        source_use: Var,
+        ensure_move: bool,
+    ) {
+        // R353-2: era-5b's own addition; the pin had no such constraint.
+        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_readers() {
+            return;
+        }
+        super::ownership_evidence::record(
+            if ensure_move {
+                "guarded-reader-move"
+            } else {
+                "guarded-reader-copy"
+            },
+            &[destination_def, source_def, source_use],
+            None,
+            Some(reader),
+        );
+        let destination = &self.z3_ast[destination_def];
+        let after = &self.z3_ast[source_def];
+        let before = &self.z3_ast[source_use];
+        let transfer = if ensure_move {
+            Bool::and(&[!destination.xor(before), !after])
+        } else {
+            Bool::and(&[
+                !Bool::and(&[destination, after]),
+                destination.implies(before),
+                after.implies(before),
+                before.implies(&Bool::or(&[destination, after])),
+            ])
+        };
+        let view = Bool::and(&[!destination, !after.xor(before)]);
+        for (clause, role) in [
+            (reader.implies(&view), "view"),
+            ((!reader).implies(&transfer), "transfer"),
+        ] {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-field-reader-{role}"),
+                &clause,
+            );
+        }
+    }
+
+    fn push_guarded_field_reader_tail(&mut self, reader: &Bool, post: Var, pre: Var, source: bool) {
+        super::ownership_evidence::record(
+            if source {
+                // R353-2: era-5b's own addition; the pin had no such constraint.
+                if !super::licensing::facts::joint()
+                    || super::licensing::facts::skip_joint_readers()
+                {
+                    return;
+                }
+                "guarded-reader-source-tail"
+            } else {
+                "guarded-reader-view-tail"
+            },
+            &[post, pre],
+            None,
+            Some(reader),
+        );
+        let post = &self.z3_ast[post];
+        let pre = &self.z3_ast[pre];
+        let obligation = if source {
+            !post.xor(pre)
+        } else {
+            Bool::and(&[!post, !pre])
+        };
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || "own-field-reader-precision".into(),
+            &reader.implies(&obligation),
+        );
+    }
+
+    fn try_original_cell_argument(
+        &mut self,
+        boundary: &super::ownership_boundary::Substitution,
+    ) -> bool {
+        // R353-2: era-5b's own addition; the pin had no such constraint.
+        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            return false;
+        }
+        use super::{
+            licensing::{cell_effects, facts::EquationId},
+            ownership_boundary::Variables,
+            ownership_occurrence::Availability::Present,
+        };
+        let values = {
+            let facts = self.ownership_facts.borrow();
+            let Some(candidate) = cell_effects::at_boundary(&facts, boundary) else {
+                return false;
+            };
+            let Some(frame) = cell_effects::frame(&facts, &candidate) else {
+                return false;
+            };
+            let id = EquationId {
+                construction: frame.point.construction,
+                ordinal: frame.ordinal,
+            };
+            let Some(binding) = facts.guards.iter().find(|binding| binding.equation == id) else {
+                return false;
+            };
+            let Some(original) = facts.consumes.iter().find(|row| {
+                row.point.construction == candidate.call.construction
+                    && row.ordinal == candidate.original_consume
+            }) else {
+                return false;
+            };
+            let Present(window) = &original.projected else {
+                return false;
+            };
+            let [pair] = boundary.matched.as_slice() else {
+                return false;
+            };
+            let (
+                Variables::UseDef {
+                    use_var: formal_pre,
+                    def_var: formal_post,
+                },
+                Variables::UseDef {
+                    use_var: legacy_pre,
+                    def_var: legacy_post,
+                },
+            ) = (&pair.formal, &pair.actual)
+            else {
+                return false;
+            };
+            let Some(peel) = &boundary.reference_peel else { return false };
+            let Variables::UseDef {
+                use_var: outer_pre,
+                def_var: outer_post,
+            } = peel.skipped
+            else {
+                return false;
+            };
+            (
+                binding.predicate.clone(),
+                [
+                    *formal_pre,
+                    *formal_post,
+                    *legacy_pre,
+                    *legacy_post,
+                    window.use_start,
+                    window.def_start,
+                    outer_pre,
+                    outer_post,
+                ],
+            )
+        };
+        let (guard, raw) = values;
+        let [
+            formal_pre,
+            formal_post,
+            legacy_pre,
+            legacy_post,
+            cell_pre,
+            cell_post,
+            outer_pre,
+            outer_post,
+        ] = raw.map(Var::from_u32);
+        for (operation, variables) in [
+            (
+                "guarded-original-cell-argument",
+                vec![formal_pre, formal_post, cell_pre, cell_post],
+            ),
+            (
+                "guarded-original-cell-legacy",
+                vec![formal_pre, legacy_pre, formal_post, legacy_post],
+            ),
+            ("guarded-original-cell-outer", vec![outer_pre, outer_post]),
+        ] {
+            super::ownership_evidence::record(operation, &variables, None, Some(&guard));
+        }
+        let eq = |a: Var, b: Var| !self.z3_ast[a].xor(&self.z3_ast[b]);
+        let original = Bool::and(&[eq(formal_pre, cell_pre), eq(formal_post, cell_post)]);
+        let legacy = Bool::and(&[eq(formal_pre, legacy_pre), eq(formal_post, legacy_post)]);
+        let outer = Bool::and(&[!&self.z3_ast[outer_pre], !&self.z3_ast[outer_post]]);
+        for (role, clause) in [
+            ("argument", guard.implies(&original)),
+            ("legacy", (!&guard).implies(&legacy)),
+            ("outer", guard.implies(&outer)),
+        ] {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-original-cell-{role}"),
+                &clause,
+            );
+        }
+        true
+    }
+
+    fn try_original_cell_frame(
+        &mut self,
+        reference: &super::ssa::consume::Consume<std::ops::Range<Var>>,
+        cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
+    ) -> bool {
+        // R353-2: era-5b's own addition; the pin had no such constraint.
+        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            return false;
+        }
+        use super::ownership_occurrence::Availability::Present;
+        let Some(point) = super::ownership_evidence::point() else { return false };
+        let Some(candidate) =
+            super::licensing::cell_effects::early(&self.ownership_facts.borrow(), &point)
+        else {
+            return false;
+        };
+        if reference.r#use.end.as_u32() - reference.r#use.start.as_u32() != 2
+            || cell.r#use.end.as_u32() - cell.r#use.start.as_u32() != 1
+        {
+            return false;
+        }
+        let payload = super::ssa::consume::Consume {
+            r#use: reference.r#use.start + 1u32,
+            def: reference.def.start + 1u32,
+        };
+        let original = super::ssa::consume::Consume {
+            r#use: cell.r#use.start,
+            def: cell.def.start,
+        };
+        let transfer_scope = super::ownership_occurrence::transfer(&payload, &original, false);
+        let exact = super::ownership_occurrence::current_transfer().is_some_and(|transfer| {
+            matches!((&transfer.source, &transfer.destination), (Present(source), Present(destination))
+                if source.consume == candidate.original_consume && destination.consume == candidate.reference_consume)
+        });
+        drop(transfer_scope);
+        if !exact {
+            return false;
+        }
+        // The native reference is always a view. In particular a future put
+        // output must never become a token owned by this temporary.
+        for var in reference.r#use.clone().chain(reference.def.clone()) {
+            self.push_assume_impl(var, false);
+        }
+        let guard = Bool::fresh_const("original_cell_effect");
+        {
+            let _transfer = super::ownership_occurrence::transfer(&payload, &original, false);
+            super::ownership_evidence::record(
+                "guarded-original-cell-frame",
+                &[payload.def, original.def, original.r#use],
+                None,
+                Some(&guard),
+            );
+        }
+        let before = &self.z3_ast[original.r#use];
+        let after = &self.z3_ast[original.def];
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || "own-original-cell-legacy-frame".into(),
+            &(!&guard).implies(&!before.xor(after)),
+        );
+        // Full post-freeze preflight installs either permission or !guard.
+        // This declaration does not claim a disposition before all facts exist.
+        super::ownership_evidence::record(
+            "guarded-original-cell-declared",
+            &[],
+            None,
+            Some(&guard),
+        );
+        true
+    }
+
+    fn try_reference_field_effect(
+        &mut self,
+        reference: &super::ssa::consume::Consume<std::ops::Range<Var>>,
+        cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
+    ) -> bool {
+        // R353-2: era-5b's own addition; the pin had no such constraint.
+        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            return false;
+        }
+        use super::ownership_occurrence::{Availability::Present, PathStep};
+        if !super::licensing::facts::active()
+            || reference.r#use.end.as_u32() - reference.r#use.start.as_u32() != 2
+            || cell.r#use.end.as_u32() - cell.r#use.start.as_u32() != 1
+        {
+            return false;
+        }
+        let payload = super::ssa::consume::Consume {
+            r#use: reference.r#use.start + 1u32,
+            def: reference.def.start + 1u32,
+        };
+        let original = super::ssa::consume::Consume {
+            r#use: cell.r#use.start,
+            def: cell.def.start,
+        };
+        let scope = super::ownership_occurrence::transfer(&payload, &original, false);
+        let exact = super::ownership_occurrence::current_transfer().is_some_and(|transfer| {
+            let (Present(source), Present(destination)) = (transfer.source, transfer.destination)
+            else {
+                return false;
+            };
+            source.projection.is_empty()
+                && destination.projection.is_empty()
+                && matches!(source.path.as_slice(), [PathStep::Field { .. }])
+                && destination.path.len() == 2
+                && destination.path[0] == PathStep::Deref
+                && destination.path[1] == source.path[0]
+        });
+        drop(scope);
+        if !exact {
+            return false;
+        }
+        for old in reference.r#use.clone() {
+            self.push_assume_impl(old, false);
+        }
+        self.push_assume_impl(reference.def.start, false);
+        let effect = Bool::fresh_const("reference_field_effect");
+        let _scope = super::ownership_occurrence::transfer(&payload, &original, false);
+        super::ownership_evidence::record(
+            "guarded-reference-field",
+            &[payload.def, original.def, original.r#use],
+            None,
+            Some(&effect),
+        );
+        let input = &self.z3_ast[payload.def];
+        let before = &self.z3_ast[original.r#use];
+        let after = &self.z3_ast[original.def];
+        // The selected effect must later connect the actual call output to
+        // `after`. Until that proof is installed, the guard is held false.
+        for (clause, role) in [
+            (effect.implies(&!input.xor(before)), "input"),
+            (
+                (!&effect).implies(&Bool::and(&[!input, !after.xor(before)])),
+                "legacy",
+            ),
+        ] {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-reference-effect-{role}"),
+                &clause,
+            );
+        }
+        true
+    }
+
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        super::ownership_evidence::record("assume", &[x], Some(sign), None);
         #[cfg(test)]
         let label = || {
             let site = current_own_assume_site();
@@ -2602,18 +4739,42 @@ impl Database for BoOwnDatabase<'_> {
     }
 
     fn push_equal_impl(&mut self, x: Var, y: Var) {
+        // R471-3 (ii): name the emitter of one specific equality. Diagnosis only.
+        if let Ok(want) = std::env::var("CRAT_ERA5C_EQ_BACKTRACE") {
+            let here = format!("{x:?},{y:?}");
+            let here = here.replace("Var(", "").replace(')', "");
+            if here.split(',').map(str::trim).collect::<Vec<_>>().join(",") == want {
+                eprintln!(
+                    "E5C_EQ_BACKTRACE pair=({x:?},{y:?})\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+        super::ownership_evidence::record("equal", &[x, y], None, None);
         let label = || format!("own-equal({x:?},{y:?})");
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
         assert_hard(self.optimize, self.tracker, label, &!(x.xor(y)));
     }
 
     fn push_less_equal_impl(&mut self, x: Var, y: Var) {
+        super::ownership_evidence::record("less-equal", &[x, y], None, None);
         let label = || format!("own-le({x:?}<={y:?})");
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
     }
 
+    /// era-5c: the phi edge whose incoming component is known null. Recorded
+    /// under its own operation and family so a core names it, never as a bare
+    /// `less-equal`.
+    fn push_null_join_impl(&mut self, x: Var, y: Var) {
+        super::ownership_evidence::record("null-join", &[x, y], None, None);
+        let label = || format!("own-null-join({x:?}<={y:?})");
+        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
+    }
+
     fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
+        super::ownership_evidence::record("eq-min", &[x, y, z], None, None);
         let label = || format!("own-eqmin({x:?}=min({y:?},{z:?}))");
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
@@ -2641,10 +4802,14 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
-        self.source_keys.push(super::export::current_t2_assert_key(
-            super::export::BoundaryRole::Source,
-            var,
-        ));
+        let key = super::export::current_t2_assert_key(super::export::BoundaryRole::Source, var);
+        super::ownership_evidence::record_endpoint(
+            &key,
+            self.source_selectors
+                .last()
+                .expect("source selector just pushed"),
+        );
+        self.source_keys.push(key);
         // E-R3 capture: index-aligned with `source_selectors` by construction —
         // this is the only writer and it pushes exactly once. Recording-only.
         super::export::record_selector(super::export::BoundaryRole::Source, var);
@@ -2662,10 +4827,14 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.sink_selectors.push(selector);
-        self.sink_keys.push(super::export::current_t2_assert_key(
-            super::export::BoundaryRole::Sink,
-            var,
-        ));
+        let key = super::export::current_t2_assert_key(super::export::BoundaryRole::Sink, var);
+        super::ownership_evidence::record_endpoint(
+            &key,
+            self.sink_selectors
+                .last()
+                .expect("sink selector just pushed"),
+        );
+        self.sink_keys.push(key);
         // E-R3 capture: sink twin of the source push above; same alignment
         // guarantee, same recording-only contract.
         super::export::record_selector(super::export::BoundaryRole::Sink, var);

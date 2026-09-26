@@ -201,6 +201,8 @@ pub(crate) struct CopyLendPairCandidate {
 }
 
 pub(crate) struct BoConstruction {
+    pub(crate) ownership_facts: std::rc::Rc<super::licensing::facts::Facts>,
+    pub(crate) ownership_transport: super::licensing::transport::CandidateGraph,
     pub(crate) source_events: std::sync::Arc<super::source_events::SourceEvents>,
     pub(crate) qualifier_facts: super::qualifier_facts::QualifierFacts,
     pub(crate) array_fields: super::array_fields::ArrayFieldFacts,
@@ -293,6 +295,36 @@ impl A5PreledgerDeclineReason {
             Self::CoarseVerification => "coarse-verification",
         }
     }
+}
+
+/// Name which of `verify_to_fixpoint`'s `None` exits fired, from the stats it
+/// fills on the way out (era-5c report 040).
+fn precise_verification_cause(stats: &super::borrow_verify::RoundStats) -> String {
+    let cause = if stats.cap_exhausted {
+        "cap-exhausted".to_owned()
+    } else if let Some(field) = stats.field_conflict_decline {
+        format!(
+            "field-conflict field={field:?} kind={:?}",
+            stats.field_conflict_kind
+        )
+    } else if !stats.source_retirement_decline.is_empty() {
+        format!(
+            "source-retirement unresolved={} first={:?}",
+            stats.source_retirement_decline.len(),
+            stats.source_retirement_decline.first()
+        )
+    } else {
+        "round-solve-unsat-or-reader-failure".to_owned()
+    };
+    format!(
+        "{cause}; rounds={} commits_conflict={} commits_per_round={:?} dropped_sinks={} dropped_sources={} repair={:?}",
+        stats.rounds,
+        stats.commits_conflict,
+        stats.commits_per_round,
+        stats.dropped_sinks,
+        stats.dropped_sources,
+        stats.repair
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -785,6 +817,14 @@ fn construct_bo_into_with_esc(
         selectors.keys(),
     ));
     Ok(BoConstruction {
+        ownership_transport: super::licensing::transport::CandidateGraph::build(
+            &solver
+                .ownership_facts()
+                .expect("ownership emission retains normative facts"),
+        ),
+        ownership_facts: solver
+            .ownership_facts()
+            .expect("ownership emission retains normative facts"),
         source_events,
         qualifier_facts,
         array_fields,
@@ -989,6 +1029,14 @@ pub(crate) fn construct_tracked_census_baseline(
         selectors.keys(),
     ));
     Ok(BoConstruction {
+        ownership_transport: super::licensing::transport::CandidateGraph::build(
+            &solver
+                .ownership_facts()
+                .expect("ownership emission retains normative facts"),
+        ),
+        ownership_facts: solver
+            .ownership_facts()
+            .expect("ownership emission retains normative facts"),
         source_events,
         qualifier_facts,
         array_fields,
@@ -1356,6 +1404,7 @@ fn solve_bo_a5_config_inner(
     refined: bool,
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
+    let _call_world = super::licensing::stack_entry::enter_world(attestation);
     super::execution_guard::enter_model().map_err(|refusal| {
         A5PreledgerDecline::from_error(A5PreledgerDeclineReason::BaselineConstruction, refusal)
     })?;
@@ -1691,9 +1740,17 @@ fn solve_bo_a5_config_with_source_events(
                 mut_facts,
                 &plan.effective_overlaps,
             );
+            // era-5c report 040: the verification loop has seven `None` exits,
+            // each recorded in `RoundStats`, and this site used to discard them
+            // (`detail: None`) -- brotli's L01⁶ decline could not say which one
+            // fired. Carry the cause in the decline's detail.
+            let detail = precise_verification_cause(&stats);
             (
                 model.ok_or_else(|| {
-                    A5PreledgerDecline::at(A5PreledgerDeclineReason::PreciseVerification)
+                    A5PreledgerDecline::with_detail(
+                        A5PreledgerDeclineReason::PreciseVerification,
+                        detail,
+                    )
                 })?,
                 stats,
             )

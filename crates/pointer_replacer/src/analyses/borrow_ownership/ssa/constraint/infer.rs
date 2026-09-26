@@ -4,7 +4,7 @@ use rustc_data_structures::graph::Successors;
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        BasicBlock, BasicBlockData, Body, BorrowKind, CastKind, Local, Location,
+        AggregateKind, BasicBlock, BasicBlockData, Body, BorrowKind, CastKind, Local, Location,
         NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, Statement,
         StatementKind, Terminator, TerminatorKind,
     },
@@ -40,8 +40,21 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
 
     fn join_phi_nodes<'a>(
         infer_cx: &'a mut Self::Ctxt,
+        bb: BasicBlock,
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
     );
+
+    /// era-5c: one incoming version of a phi node, with the CFG edge it arrives
+    /// on, so the join can consult the edge's path facts. Default: nothing.
+    fn phi_edge(
+        _infer_cx: &mut Self::Ctxt,
+        _pred: BasicBlock,
+        _succ: BasicBlock,
+        _local: Local,
+        _ty: Ty<'tcx>,
+        _rhs: SSAIdx,
+    ) {
+    }
 
     fn interpret_consume(
         infer_cx: &mut Self::Ctxt,
@@ -64,6 +77,15 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         location: Option<Location>,
     );
 
+    fn aggregate(
+        infer_cx: &mut Self::Ctxt,
+        body: &Body<'tcx>,
+        place: Place<'tcx>,
+        kind: &AggregateKind<'tcx>,
+        destination: Option<Consume<Self::LocalSig>>,
+        operands: &[(&Operand<'tcx>, Option<Consume<Self::LocalSig>>)],
+    );
+
     fn cast<const ENSURE_MOVE: bool>(
         infer_cx: &mut Self::Ctxt,
         ty: Ty<'tcx>,
@@ -75,6 +97,17 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
     fn borrow(infer_cx: &mut Self::Ctxt, consume: Consume<Self::LocalSig>) {
         Self::assume(infer_cx, consume.r#use, false);
         Self::assume(infer_cx, consume.def, false);
+    }
+
+    fn mutable_reference(
+        infer_cx: &mut Self::Ctxt,
+        destination: Consume<Self::LocalSig>,
+        source: Option<Consume<Self::LocalSig>>,
+    ) {
+        Self::borrow(infer_cx, destination);
+        if let Some(source) = source {
+            Self::lend(infer_cx, source);
+        }
     }
 
     fn lend(infer_cx: &mut Self::Ctxt, consume: Consume<Self::LocalSig>);
@@ -95,6 +128,20 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         Self::assume(infer_cx, result.r#use, false)
     }
 
+    fn constant_source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>, is_null: bool) {
+        if is_null {
+            Self::unknown_source(infer_cx, result);
+        } else {
+            crate::analyses::borrow_ownership::solver::with_own_assume_site(
+                crate::analyses::borrow_ownership::solver::OwnAssumeSite::NonOwnedConstant,
+                || {
+                    Self::assume(infer_cx, result.r#use, false);
+                    Self::assume(infer_cx, result.def, false);
+                },
+            );
+        }
+    }
+
     fn unknown_sink(_: &mut Self::Ctxt, _: Consume<Self::LocalSig>);
 
     fn cast_to_c_void(
@@ -110,6 +157,8 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         // args: Self::CallArgs,
         args: &[Spanned<Operand<'tcx>>],
         callee: &Operand<'tcx>,
+        body: &Body<'tcx>,
+        location: Location,
     );
 
     fn r#return<'a>(
@@ -229,10 +278,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
         }
 
-        Infer::join_phi_nodes(
-            infer_cx.borrow_mut(),
-            self.state.join_points.phi_nodes_mut(),
-        );
+        for (bb, nodes) in self.state.join_points.data.iter_enumerated_mut() {
+            let _ownership_phi = crate::analyses::borrow_ownership::ownership_evidence::location(
+                "phi",
+                bb.as_u32(),
+                None,
+            );
+            Infer::join_phi_nodes(infer_cx.borrow_mut(), bb, nodes.iter_enumerated_mut());
+        }
     }
 
     fn go_basic_block<'db, Infer>(
@@ -281,6 +334,11 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             } else {
                 continue;
             };
+            let _ownership_edge = crate::analyses::borrow_ownership::ownership_evidence::location(
+                "realloc-edge",
+                bb.as_u32(),
+                None,
+            );
             for operation in &plan.operations {
                 let locals = match operation {
                     ReallocEdgeOperation::Old { local }
@@ -341,10 +399,25 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
         }
 
-        for succ in self.body.basic_blocks.successors(bb) {
+        for (edge_ordinal, succ) in self.body.basic_blocks.successors(bb).enumerate() {
             for (local, phi_node) in self.state.join_points[succ].iter_enumerated_mut() {
                 let ssa_idx = self.state.name_state.get_name(local);
+                crate::analyses::borrow_ownership::licensing::coverage::record_phi_edge(
+                    bb.as_u32(),
+                    edge_ordinal,
+                    succ.as_u32(),
+                    local.as_u32(),
+                    ssa_idx.as_u32(),
+                );
                 phi_node.rhs.push(ssa_idx);
+                Infer::phi_edge(
+                    infer_cx,
+                    bb,
+                    succ,
+                    local,
+                    self.body.local_decls[local].ty,
+                    ssa_idx,
+                );
                 tracing::debug!("using {:?} at Phi({:?}), use: {:?}", local, succ, ssa_idx)
             }
         }
@@ -358,6 +431,11 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
     ) where
         Infer: InferMode<'rn, 'db, 'tcx>,
     {
+        let _ownership_point = crate::analyses::borrow_ownership::ownership_evidence::location(
+            "statement",
+            location.block.as_u32(),
+            Some(location.statement_index),
+        );
         match &statement.kind {
             StatementKind::Assign(box (place, rvalue)) => {
                 self.go_assign::<Infer>(infer_cx, place, rvalue, location)
@@ -402,6 +480,15 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
     ) where
         Infer: InferMode<'rn, 'db, 'tcx>,
     {
+        let _ownership_point = crate::analyses::borrow_ownership::ownership_evidence::location(
+            if matches!(terminator.kind, TerminatorKind::Return) {
+                "return"
+            } else {
+                "terminator"
+            },
+            location.block.as_u32(),
+            Some(location.statement_index),
+        );
         match &terminator.kind {
             TerminatorKind::Call {
                 func,
@@ -420,21 +507,25 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                             consume_place_at::<Infer>(&arg, self.body, location, self, infer_cx);
                     }
                 }
-                Infer::call(infer_cx, destination, args, func);
+                Infer::call(infer_cx, destination, args, func, self.body, location);
             }
             TerminatorKind::Return => {
                 tracing::debug!("processing terminator {:?}", terminator.kind);
 
                 assert!(self.state.try_consume_at(RETURN_PLACE, location).is_none());
 
-                Infer::r#return(
-                    infer_cx,
-                    self.body
-                        .local_decls
-                        .indices()
-                        .map(|local| (local, self.state.name_state.try_get_name(local))),
-                    self.body,
+                let selected: Vec<_> = self
+                    .body
+                    .local_decls
+                    .indices()
+                    .map(|local| (local, self.state.name_state.try_get_name(local)))
+                    .collect();
+                crate::analyses::borrow_ownership::licensing::coverage::record_return_selection(
+                    selected
+                        .iter()
+                        .map(|(local, ssa)| (local.as_u32(), ssa.map(|ssa| ssa.as_u32()))),
                 );
+                Infer::r#return(infer_cx, selected.into_iter(), self.body);
             }
             TerminatorKind::SwitchInt { discr, .. } => {
                 if let Some(discr) = discr.place() {
@@ -462,12 +553,28 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
         let stmt_ty = lhs.ty(self.body, self.tcx).ty;
 
         match rhs {
-            Rvalue::Use(Operand::Constant(_))
-            | Rvalue::WrapUnsafeBinder(Operand::Constant(_), _) => {
+            Rvalue::Use(operand @ Operand::Constant(_))
+            | Rvalue::WrapUnsafeBinder(operand @ Operand::Constant(_), _) => {
                 if let Some(lhs_consume) =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
-                    Infer::unknown_source(infer_cx, lhs_consume);
+                    if crate::analyses::borrow_ownership::licensing::facts::joint()
+                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
+                    {
+                        Infer::constant_source(
+                            infer_cx,
+                            lhs_consume,
+                            crate::analyses::borrow_ownership::source_events::operand_is_null(
+                                operand,
+                                &[],
+                                self.tcx,
+                            ),
+                        );
+                    } else {
+                        // The pin models every constant pointer, null included,
+                        // as an unknown source.
+                        Infer::unknown_source(infer_cx, lhs_consume);
+                    }
                     tracing::debug!("constant pointer rvalue {:?}", rhs)
                 }
             }
@@ -478,7 +585,25 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 if let Some(lhs_consume) =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
-                    Infer::unknown_source(infer_cx, lhs_consume);
+                    if matches!(operand, Operand::Constant(_)) {
+                        if crate::analyses::borrow_ownership::licensing::facts::joint()
+                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
+                    {
+                            Infer::constant_source(
+                                infer_cx,
+                                lhs_consume,
+                                crate::analyses::borrow_ownership::source_events::operand_is_null(
+                                    operand,
+                                    &[],
+                                    self.tcx,
+                                ),
+                            );
+                        } else {
+                            Infer::unknown_source(infer_cx, lhs_consume);
+                        }
+                    } else {
+                        Infer::unknown_source(infer_cx, lhs_consume);
+                    }
                     tracing::debug!("untrusted pointer source: raw address {:?}", operand)
                 }
             }
@@ -504,20 +629,35 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 }
             }
 
-            Rvalue::Cast(_, Operand::Constant(box constant), _) => {
+            Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
                 // let lhs_consume = self.state.try_consume_at(lhs.local, location);
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
-                    // Constant pointer values (including null) are modeled as unknown sources.
-                    Infer::unknown_source(infer_cx, lhs_consume);
+                    if crate::analyses::borrow_ownership::licensing::facts::joint()
+                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
+                    {
+                        Infer::constant_source(
+                            infer_cx,
+                            lhs_consume,
+                            crate::analyses::borrow_ownership::source_events::operand_is_null(
+                                operand,
+                                &[],
+                                self.tcx,
+                            ),
+                        );
+                    } else {
+                        // The pin models every constant pointer, null included,
+                        // as an unknown source.
+                        Infer::unknown_source(infer_cx, lhs_consume);
+                    }
                 } else if !lhs.projection.is_empty()
                     && self.state.consume_chain.call_arg_temps.remove(&lhs.local)
                 {
                     tracing::debug!(
                         "cleared stale call_arg_temp flag for projected lhs {:?} = {:?}",
                         lhs,
-                        constant
+                        operand
                     );
                 }
             }
@@ -638,9 +778,13 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
 
                 if let Some(lhs_consume) = lhs_consume {
-                    Infer::borrow(infer_cx, lhs_consume);
-                    if let Some(rhs_consume) = rhs_consume {
-                        Infer::lend(infer_cx, rhs_consume);
+                    if matches!(rvalue, Rvalue::Ref(..)) {
+                        Infer::mutable_reference(infer_cx, lhs_consume, rhs_consume);
+                    } else {
+                        Infer::borrow(infer_cx, lhs_consume);
+                        if let Some(rhs_consume) = rhs_consume {
+                            Infer::lend(infer_cx, rhs_consume);
+                        }
                     }
                 } else {
                     // assert!(self.state.consume_chain.call_arg_temps.contains(&lhs.local));
@@ -680,15 +824,19 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 // }
             }
 
-            Rvalue::Aggregate(_, rhs) => {
-                let _ = consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-
-                for rhs in rhs {
-                    let Some(rhs) = rhs.place() else { continue };
-                    let _ = consume_place_at::<Infer>(&rhs, self.body, location, self, infer_cx);
-                }
-
-                // TODO
+            Rvalue::Aggregate(kind, rhs) => {
+                let destination =
+                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                let operands: Vec<_> = rhs
+                    .iter()
+                    .map(|operand| {
+                        let consume = operand.place().and_then(|place| {
+                            consume_place_at::<Infer>(&place, self.body, location, self, infer_cx)
+                        });
+                        (operand, consume)
+                    })
+                    .collect();
+                Infer::aggregate(infer_cx, self.body, *lhs, kind, destination, &operands);
             }
 
             Rvalue::Repeat(operand, _) => {

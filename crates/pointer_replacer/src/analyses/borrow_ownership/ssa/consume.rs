@@ -2,8 +2,8 @@ use rustc_data_structures::sso::SsoHashSet;
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
-        BasicBlock, BasicBlockData, Body, CastKind, ClearCrossCrate, Local, LocalInfo, Location,
-        Place, ProjectionElem, Rvalue, TerminatorKind, VarDebugInfoContents,
+        AggregateKind, BasicBlock, BasicBlockData, Body, CastKind, ClearCrossCrate, Local,
+        LocalInfo, Location, Place, ProjectionElem, Rvalue, TerminatorKind, VarDebugInfoContents,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     },
     ty::TyCtxt,
@@ -308,10 +308,17 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
                 {
                     return;
                 }
+                Rvalue::Aggregate(kind, _)
+                    if !matches!(kind.as_ref(),
+                    AggregateKind::Adt(did,_,_,_,active_field)
+                        if active_field.is_none() && self.tcx.adt_def(*did).is_struct()
+                            && self.crate_ctxt.struct_ctxt.is_struct_of_concerned(did)) =>
+                {
+                    return;
+                }
                 Rvalue::BinaryOp(_, _)
                 | Rvalue::UnaryOp(_, _)
                 | Rvalue::NullaryOp(_, _)
-                | Rvalue::Aggregate(_, _)
                 | Rvalue::Discriminant(_)
                 | Rvalue::Len(_)
                 | Rvalue::ShallowInitBox(_, _)

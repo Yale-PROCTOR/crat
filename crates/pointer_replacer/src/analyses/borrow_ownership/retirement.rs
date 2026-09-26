@@ -135,6 +135,9 @@ pub(crate) struct RetirementReview {
     /// Actual ordinary error points, kept separate from the loan inventory.
     pub(crate) ordinary_error_points: usize,
     pub(crate) terminal: BTreeMap<SourceEventKey, EventDisposition>,
+    /// Exact caller evidence used only by the existing heap-only/known-stack
+    /// disjointness rule, never by generic Input/Stack comparisons.
+    pub(crate) known_stack_entries: Vec<super::licensing::stack_entry::KnownStackEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +256,8 @@ struct Context {
     locals: FxHashMap<(LocalDefId, ProvenanceOwner), SlotRef>,
     fields: FxHashMap<StructFieldSlot, SlotRef>,
     refs: FxHashSet<SlotRef>,
+    known_stack_entries: Vec<super::licensing::stack_entry::KnownStackEntry>,
+    function_names: BTreeMap<String, LocalDefId>,
     safe_holders: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
     copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
     exact_kinds: bool,
@@ -310,6 +315,24 @@ pub(crate) fn begin(
     let entries = protected_entry::current().expect("validated parameter-entry scope");
     let objects = ObjectFacts::analyze(program, slots, &source, origin_flows);
     let routed = routes::expand(program, &source, &objects);
+    let known_stack_entries = super::licensing::reader_replay::selected_owned_cells()
+        .map(|(facts, selected)| {
+            let mut known = super::licensing::stack_entry::collect_known_stack_entries(
+                program,
+                slots,
+                &facts,
+                &selected,
+                super::licensing::stack_entry::current_world(),
+            )
+            .unwrap_or_default();
+            if let Some(selection) = super::licensing::model_selection::current(&facts) {
+                known.extend(super::licensing::chain_entry::collect(
+                    program, slots, &facts, &selection,
+                ));
+            }
+            known
+        })
+        .unwrap_or_default();
     let exact = MODEL.with(|current| current.borrow().clone());
     let mut context = Context {
         source,
@@ -321,6 +344,12 @@ pub(crate) fn begin(
         locals: FxHashMap::default(),
         fields: FxHashMap::default(),
         refs: FxHashSet::default(),
+        known_stack_entries,
+        function_names: program
+            .functions
+            .iter()
+            .map(|&function| (program.tcx.def_path_str(function), function))
+            .collect(),
         safe_holders: Vec::new(),
         copy_graph: local_outcome::copy_graph(program, slots),
         exact_kinds: exact.is_some(),
@@ -611,7 +640,7 @@ impl Context {
                 }
             }
             for entry in active_entries {
-                let target = ObjectSet {
+                let mut target = ObjectSet {
                     roots: FxHashSet::from_iter([ObjectRoot::Input {
                         function,
                         parameter: entry.key.parameter,
@@ -619,6 +648,47 @@ impl Context {
                     }]),
                     unknown: false,
                 };
+                if heap_only
+                    && event.source.key.role == SourceRole::Free
+                    && event.phase == SourcePhase::Call
+                    && event.route.is_empty()
+                    && entry.key.depth == 0
+                {
+                    for proof in &self.known_stack_entries {
+                        if self.keys.get(&entry.key.slot) != Some(&proof.parameter_slot)
+                            || proof.parameter != entry.key.parameter.as_u32()
+                            || proof.free_point.function.as_ref()
+                                != Some(&event.source.key.function)
+                            || proof.free_point.block != Some(event.source.key.block)
+                            || proof.free_point.statement != Some(event.source.key.statement)
+                        {
+                            continue;
+                        }
+                        let roots: Option<FxHashSet<_>> = proof
+                            .callers
+                            .iter()
+                            .map(|caller| {
+                                self.function_names
+                                    .get(&caller.call.caller)
+                                    .map(|&function| ObjectRoot::Stack {
+                                        function,
+                                        local: rustc_middle::mir::Local::from_u32(
+                                            caller.cell.local,
+                                        ),
+                                    })
+                            })
+                            .collect();
+                        if let Some(roots) = roots
+                            && !roots.is_empty()
+                        {
+                            target = ObjectSet {
+                                roots,
+                                unknown: false,
+                            };
+                            review.known_stack_entries.push(proof.clone());
+                        }
+                    }
+                }
                 let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
                     continue;
                 };
@@ -858,6 +928,9 @@ impl RetirementScope {
             review.demotions.append(&mut latest.demotions);
             review.unresolved.append(&mut latest.unresolved);
             review.coverage.append(&mut latest.coverage);
+            review
+                .known_stack_entries
+                .append(&mut latest.known_stack_entries);
         }
         for &function in context.latest.keys() {
             review.unresolved.push(RetirementUnresolved {

@@ -63,6 +63,25 @@ impl MutProvider for bool {
     }
 }
 
+/// era-5c R545-1: the verification round's provider -- the caller's facts AND the
+/// round's model-conditional facts (`MutFacts::from_program_gated`). The gated
+/// facts drop guards and read only the outermost level, so they are a subset of
+/// the ungated ones; the AND keeps a forced-mutable caller (`bool`) meaningful.
+#[derive(Clone, Copy)]
+pub(crate) struct RoundMut<'a, M> {
+    pub(crate) base: M,
+    pub(crate) round: Option<&'a MutFacts>,
+}
+
+impl<M: MutProvider> MutProvider for RoundMut<'_, M> {
+    fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
+        self.base.is_mutable(fn_did, local)
+            && self
+                .round
+                .is_none_or(|round| round.is_mutable(fn_did, local))
+    }
+}
+
 impl MutProvider for &MutFacts {
     fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
         MutFacts::is_mutable(self, fn_did, local)
@@ -127,6 +146,36 @@ impl MutFacts {
     pub(crate) fn from_program(program: &RustProgram) -> MutFacts {
         let result = mutability_analysis(program);
         let mutables = SourceVarGroups::new(program).postprocess_mut_res(program, &result);
+        MutFacts {
+            mutables,
+            all_mut: false,
+        }
+    }
+
+    /// era-5c R545-1: the same facts with Foster's load guard (`lhs ⇒ p` for
+    /// `lhs = copy (*p)…`) kept only where `keep_load` says so, and each local's bit
+    /// taken from its OUTERMOST level (the cells its loans borrow). The verification
+    /// replay keeps it where the LOADED level is not Raw in the round's model: a Raw
+    /// inner level makes the writes through it raw-pointer writes, so the table it
+    /// came from is only read and its reborrow is shared.
+    pub(crate) fn from_program_gated<'tcx>(
+        program: &RustProgram<'tcx>,
+        keep_load: &dyn Fn(LocalDefId, &rustc_middle::mir::Place<'tcx>) -> bool,
+    ) -> MutFacts {
+        let result = crate::analyses::type_qualifier::foster::mutability::mutability_analysis_gated(
+            program,
+            Some(keep_load),
+        );
+        let groups = SourceVarGroups::new(program);
+        // W47 fault F1 (test builds only): the old any-depth per-local bit.
+        #[cfg(test)]
+        if std::env::var("CRAT_E5C_W47_FAULT").as_deref() == Ok("any-depth") {
+            return MutFacts {
+                mutables: groups.postprocess_mut_res(program, &result),
+                all_mut: false,
+            };
+        }
+        let mutables = groups.postprocess_mut_res_outermost(program, &result);
         MutFacts {
             mutables,
             all_mut: false,

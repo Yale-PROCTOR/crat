@@ -167,8 +167,83 @@ fn add_coherence_impl<'tcx>(
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
     remove_copy_equates: bool,
 ) {
-    for bbdata in body.basic_blocks.iter() {
-        for stmt in &bbdata.statements {
+    // R351-3: in pass 1 both maps stay empty, so the dispatch below falls
+    // through to the pin's unconditional `equate`. The pin asserted one kind
+    // equality here; era-5b's guarded form is the seat's prime suspect for the
+    // 52 `ref -> raw`, and pass 1 is what tests that.
+    // R371-2: under the repair arm both maps stay empty in the joint pass too,
+    // so the dispatch falls through to the pin's unconditional `equate` — the
+    // general equate is restored, never deleted.
+    let joint = super::licensing::facts::Pass::current() == super::licensing::facts::Pass::Joint
+        && !super::licensing::facts::repair()
+        // R467-2 diagnosis: `readers` omits era-5b's field-reader / reference-reader
+        // guard maps so their cost can be measured. Verdicts are NOT valid with it on.
+        && !std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default().split(',').any(|s| s.trim() == "readers");
+    // L01^5 (ii): the strong-update field moves of this body (empty unless the
+    // pin is on), consulted just before the pin's unconditional `equate`.
+    let field_moves = super::field_moves::compute(body);
+    let field_readers = solver
+        .ownership_facts()
+        .filter(|_| joint)
+        .map(|facts| super::licensing::readers::guards_for_body(&facts, solver, fn_did, body))
+        .unwrap_or_default();
+    let mut reference_readers = FxHashMap::default();
+    if joint
+        && let Some(facts) = solver.ownership_facts()
+        && let Some(frozen) = &facts.licensing
+    {
+        for candidate in &frozen.reference_effects.candidates {
+            let Some(view) = facts.consumes.iter().find(|row| {
+                row.point.construction == candidate.construction
+                    && row.ordinal == candidate.scalar_view_consume
+            }) else {
+                continue;
+            };
+            let view_key = format!("{}::_{}@d0", candidate.function, view.local);
+            let (Some(&lhs @ SlotRef::Local(owner, _)), Some(&rhs @ SlotRef::Field(_))) = (
+                facts.slot_refs.get(&view_key),
+                facts.slot_refs.get(&candidate.field_key),
+            ) else {
+                continue;
+            };
+            if owner != fn_did {
+                continue;
+            }
+            let rows: Vec<_> = facts
+                .equations
+                .iter()
+                .filter(|row| {
+                    row.point == candidate.formation
+                        && row.operation == "guarded-reference-field"
+                        && row.variables
+                            == [
+                                candidate.payload_before.var,
+                                candidate.cell_after.var,
+                                candidate.cell_before.var,
+                            ]
+                })
+                .collect();
+            let [row] = rows.as_slice() else { continue };
+            let key = super::licensing::facts::EquationId {
+                construction: candidate.construction,
+                ordinal: row.ordinal,
+            };
+            let Some(guard) = facts.guards.iter().find(|binding| binding.equation == key) else {
+                continue;
+            };
+            reference_readers.insert(
+                Location {
+                    block: rustc_middle::mir::BasicBlock::from_u32(
+                        candidate.scalar_read.block.unwrap(),
+                    ),
+                    statement_index: candidate.scalar_read.statement.unwrap(),
+                },
+                (lhs, rhs, guard.predicate.clone()),
+            );
+        }
+    }
+    for (block, bbdata) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, stmt) in bbdata.statements.iter().enumerate() {
             let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
                 continue;
             };
@@ -197,11 +272,37 @@ fn add_coherence_impl<'tcx>(
                                 let lhs = to_slot_ref(la, fn_did);
                                 let rhs = to_slot_ref(ra, fn_did);
                                 if d == 0
+                                    && let Some((expected_lhs, expected_rhs, effect)) =
+                                        reference_readers.get(&Location {
+                                            block,
+                                            statement_index,
+                                        })
+                                    && lhs == *expected_lhs
+                                    && rhs == *expected_rhs
+                                    && matches!(rvalue, Rvalue::CopyForDeref(_))
+                                {
+                                    solver.reference_field_reader_or_equate(lhs, rhs, effect);
+                                } else if d == 0
+                                    && let Some(reader) = field_readers.get(&Location {
+                                        block,
+                                        statement_index,
+                                    })
+                                {
+                                    solver.field_reader_or_equate(lhs, rhs, reader);
+                                } else if d == 0
                                     && copy_lends.is_some_and(|pairs| {
                                         pairs.contains(&CopyLendPair::new(lhs, rhs))
                                     })
                                 {
                                     solver.lend_or_equate(lhs, rhs);
+                                } else if d == 0
+                                    && field_moves.is_move(Location {
+                                        block,
+                                        statement_index,
+                                    })
+                                {
+                                    // L01^5 (ii): the load moves the field's token.
+                                    solver.field_move_or_equate(lhs, rhs);
                                 } else {
                                     solver.equate(lhs, rhs);
                                 }
@@ -332,18 +433,20 @@ pub(crate) fn add_coherence_tagging_uses<'tcx>(
 /// wrongly permit `Owning`). Value-preserving `Cast` (`malloc() as *mut T`) is followed to its
 /// operand so a typed field's allocation still counts as owned.
 ///
-/// RESIDUAL (documented, accepted): constant stores are skipped as null (`(*p).f = null` is
-/// free-safe). A NON-null pointer constant (`(*p).f = 0x1000 as *mut T`) is also skipped but
-/// is NOT owned, so a field mixing such a constant with a malloc elsewhere could over-claim.
-/// This is exceedingly rare in C2Rust output and BO is behind the codegen guardrail; closing
-/// it needs null-vs-non-null constant classification. Call-return-into-field is NOT a gap —
-/// MIR routes calls through a temp, caught as a normal `Use` store.
+/// Null constants are empty alternatives. Non-null or unevaluated constants
+/// block ownership: a field mixing them with an allocation is not all-owned.
+/// Call-return-into-field routes through a MIR temporary and is handled as a
+/// normal `Use` store.
 pub(crate) fn constrain_field_ownership(
     solver: &KindSolver,
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) {
-    let (owned_stores, blocked) = scan_field_stores(slots, program);
+    let null_stores = solver
+        .ownership_facts()
+        .map(|facts| certified_null_stores(&facts))
+        .unwrap_or_default();
+    let (owned_stores, blocked) = scan_field_stores(slots, program, &null_stores);
     for (field, rhs) in &owned_stores {
         if !blocked.contains(field) {
             solver.constrain_field_own(*field, rhs);
@@ -378,7 +481,7 @@ pub(crate) fn constrain_field_ref_worthiness(
     let opaque_sources = origin_flows
         .map(|flows| positive_opaque_return_slots(slots, program, flows))
         .unwrap_or_default();
-    let (stores, blocked) = scan_field_stores(slots, program);
+    let (stores, blocked) = scan_field_stores(slots, program, &[]);
     let mut fields = stores.keys().copied().collect::<FxHashSet<_>>();
     fields.extend(blocked.iter().copied());
     fields.extend(
@@ -512,13 +615,93 @@ pub(crate) fn positive_opaque_return_slots(
     opaque
 }
 
+/// Authenticate transported None at each exact store, without confusing a
+/// nullable or mixed kind slot with a definitely empty stored occurrence.
+fn certified_null_stores(
+    facts: &super::licensing::facts::Facts,
+) -> Vec<(
+    super::licensing::field_support::Site,
+    super::ownership_access::PlaceSyntax,
+)> {
+    use super::{
+        licensing::{
+            field_support::StoredValue,
+            transport::Node,
+            value_origins::{OriginAtom, ValueOrigins},
+        },
+        ownership_occurrence::Availability::Present,
+    };
+    let Some(frozen) = &facts.licensing else {
+        return Vec::new();
+    };
+    let observations: Vec<_> = frozen
+        .field_support
+        .iter()
+        .flat_map(|field| field.null_stores.iter())
+        .collect();
+    if observations.is_empty() {
+        return Vec::new();
+    }
+    // Reconstruct current alternatives; an old cached proof cannot erase a
+    // new non-null store demand after its actual evidence changes.
+    let origins = ValueOrigins::build(facts);
+    let mut result = Vec::new();
+    for store in &facts.field_support_inputs.stores {
+        let StoredValue::Value(source) = &store.value else {
+            continue;
+        };
+        if !observations.contains(&&store.site) {
+            continue;
+        }
+        let rows: Vec<_> = facts
+            .consumes
+            .iter()
+            .filter(|row| row.point.function.as_ref() == Some(&store.site.function))
+            .cloned()
+            .collect();
+        let equations: Vec<_> = facts.equations.iter().filter(|equation| equation.point.function.as_ref() == Some(&store.site.function)
+            && equation.point.block == Some(store.site.block) && equation.point.statement == Some(store.site.statement)
+            && matches!(equation.operation.as_str(), "equal" | "linear") && equation.validate().is_ok()
+            && equation.transfer.as_ref().is_some_and(|transfer| matches!((&transfer.destination, &transfer.source), (Present(destination), Present(rhs))
+                if destination.local == store.site.place.local && destination.projection == store.site.place.projection
+                    && rhs.local == source.local && rhs.projection == source.projection))).collect();
+        let [equation] = equations.as_slice() else {
+            continue;
+        };
+        if super::ownership_occurrence::validate(
+            &store.site.function,
+            &rows,
+            &[(*equation).clone()],
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let transfer = equation.transfer.as_ref().unwrap();
+        if origins.at(Node {
+            construction: equation.point.construction,
+            var: transfer.source_use,
+        }) != std::collections::BTreeSet::from([OriginAtom::Null])
+        {
+            continue;
+        }
+        result.push((store.site.clone(), source.clone()));
+    }
+    result
+}
+
 /// §S2-3 — the field-store ownership scan, shared by `constrain_field_ownership` (which emits the
 /// `field.own <=> AND(stored owns)` constraints from it) and the sweep's field-yield histogram (which
 /// counts Owning candidates from it). Returns per-field owned-store RHS places and the set of fields
-/// blocked by a non-owned store. Byte-identical to the scan `constrain_field_ownership` inlined before.
+/// blocked by a non-owned store. Production may discharge exact SSA-proved
+/// None stores; callers without those facts retain the source-only scan.
 fn scan_field_stores(
     slots: &CrateSlots,
     program: &RustProgram<'_>,
+    null_stores: &[(
+        super::licensing::field_support::Site,
+        super::ownership_access::PlaceSyntax,
+    )],
 ) -> (FxHashMap<SlotRef, Vec<SlotRef>>, FxHashSet<SlotRef>) {
     let mut owned_stores: FxHashMap<SlotRef, Vec<SlotRef>> = FxHashMap::default();
     let mut blocked: FxHashSet<SlotRef> = FxHashSet::default();
@@ -530,8 +713,9 @@ fn scan_field_stores(
             .borrow();
         let body = &*body_ref;
 
-        for bbdata in body.basic_blocks.iter() {
-            for stmt in &bbdata.statements {
+        let function = program.tcx.def_path_str(fn_did);
+        for (block, bbdata) in body.basic_blocks.iter_enumerated() {
+            for (statement, stmt) in bbdata.statements.iter().enumerate() {
                 let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
                     continue;
                 };
@@ -554,6 +738,27 @@ fn scan_field_stores(
                         let f = SlotRef::Field(fid);
                         match operand {
                             Operand::Copy(p) | Operand::Move(p) => {
+                                let mut destination =
+                                    super::ownership_access::PlaceSyntax::from(*lhs);
+                                destination
+                                    .projection
+                                    .push(super::export::ProjKey::Field(field_idx.as_u32()));
+                                let key = super::slot_key::field_key(
+                                    program.tcx,
+                                    struct_did,
+                                    field_idx.index(),
+                                    0,
+                                );
+                                if null_stores.iter().any(|(site, rhs)| {
+                                    site.function == function
+                                        && site.block == block.as_u32()
+                                        && site.statement == statement
+                                        && site.field_key == key
+                                        && site.place == destination
+                                        && *rhs == super::ownership_access::PlaceSyntax::from(*p)
+                                }) {
+                                    continue;
+                                }
                                 match resolve_place(slots, fn_did, body, *p, 0, None) {
                                     Some(r) => owned_stores
                                         .entry(f)
@@ -564,7 +769,12 @@ fn scan_field_stores(
                                     }
                                 }
                             }
-                            Operand::Constant(_) => {} // null/const: free-safe, skip
+                            Operand::Constant(_) => {
+                                if !super::source_events::operand_is_null(operand, &[], program.tcx)
+                                {
+                                    blocked.insert(f);
+                                }
+                            }
                         }
                     }
                     continue;
@@ -585,12 +795,35 @@ fn scan_field_stores(
                     Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
                     | Rvalue::CopyForDeref(p)
                     | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(*p),
-                    Rvalue::Use(Operand::Constant(_))
-                    | Rvalue::Cast(_, Operand::Constant(_), _) => {
+                    Rvalue::Use(operand @ Operand::Constant(_))
+                    | Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
+                        if !super::source_events::operand_is_null(operand, &[], program.tcx) {
+                            blocked.insert(f);
+                        }
                         continue;
                     }
                     _ => None,
                 };
+                if let Some(rhs) = rhs_place
+                    && let super::slots::SlotOwner::Field(field) = slots.field_slots.slot(fid).owner
+                {
+                    let key = super::slot_key::field_key(
+                        program.tcx,
+                        field.struct_did,
+                        field.field_index,
+                        0,
+                    );
+                    if null_stores.iter().any(|(site, source)| {
+                        site.function == function
+                            && site.block == block.as_u32()
+                            && site.statement == statement
+                            && site.field_key == key
+                            && site.place == super::ownership_access::PlaceSyntax::from(*lhs)
+                            && *source == super::ownership_access::PlaceSyntax::from(rhs)
+                    }) {
+                        continue;
+                    }
+                }
                 match rhs_place.and_then(|p| resolve_place(slots, fn_did, body, p, 0, None)) {
                     Some(r) => owned_stores
                         .entry(f)
@@ -616,13 +849,14 @@ fn scan_field_stores(
 }
 
 /// §S2-3 — Owning-candidate fields (≥1 owned store and no blocking non-owned store) and the blocked
-/// set, for the field-yield histogram. Derived from the same `scan_field_stores` the solver
-/// constraints use, so the candidate count matches what `constrain_field_own` was applied to.
+/// set, for the source-only field-yield histogram. This caller has no normative
+/// SSA null evidence, so its syntactic candidates are an upper bound, not the
+/// refined production field-and constraint set or a measured Owning verdict.
 pub(crate) fn field_ownership_candidates(
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) -> (FxHashSet<SlotRef>, FxHashSet<SlotRef>) {
-    let (owned_stores, blocked) = scan_field_stores(slots, program);
+    let (owned_stores, blocked) = scan_field_stores(slots, program, &[]);
     let candidates = owned_stores
         .keys()
         .copied()

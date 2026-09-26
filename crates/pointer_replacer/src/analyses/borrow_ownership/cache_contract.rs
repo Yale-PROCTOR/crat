@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-pub(crate) const SCHEMA: &str = "era5a-model-cache-v1";
+pub(crate) const SCHEMA: &str = "era5b-model-cache-v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SemanticInputs {
@@ -145,6 +145,11 @@ impl CompleteEntry {
         let origin: super::origin_evidence::OriginEvidence =
             serde_json::from_value(self.origin.clone())
                 .map_err(|e| format!("required origin evidence: {e}"))?;
+        let declares_ownership = origin.declares_ownership_family()?;
+        if declares_ownership {
+            super::licensing::snapshot::validate_origin(&origin, &self.universe)?;
+            super::licensing::stack_export::validate(&origin, &exports, &self.model)?;
+        }
         let functions: BTreeSet<_> = self.functions.iter().cloned().collect();
         if functions.len() != self.functions.len()
             || functions.iter().any(String::is_empty)
@@ -161,7 +166,47 @@ impl CompleteEntry {
         for function in &origin.functions {
             use super::origin_evidence::{OriginAvailability, OriginMissing};
             let gaps = &function.ownership;
-            if gaps.equations != OriginMissing::OwnershipEquationsNotExported
+            if let OriginAvailability::Present(equations) = &gaps.equations {
+                super::ownership_evidence::validate_function(equations, &function.function)
+                    .map_err(str::to_owned)?;
+                let OriginAvailability::Present(consumes) = &gaps.consumes else {
+                    return Err("required ownership consumes not recorded".into());
+                };
+                let OriginAvailability::Present(boundaries) = &gaps.boundary_substitutions else {
+                    return Err("required boundary substitutions not recorded".into());
+                };
+                let OriginAvailability::Present(registrations) = &gaps.call_arg_registrations
+                else {
+                    return Err("required call-argument registrations not recorded".into());
+                };
+                super::ownership_occurrence::validate(&function.function, consumes, equations)?;
+                let OriginAvailability::Present(terminals) = &gaps.terminals else {
+                    return Err("required ownership terminals not recorded".into());
+                };
+                super::ownership_boundary::validate_shapes(
+                    &function.function,
+                    boundaries,
+                    registrations,
+                )?;
+                super::ownership_occurrence::validate_terminal_shapes(
+                    &function.function,
+                    terminals,
+                )?;
+                super::ownership_boundary::validate_links(
+                    &function.function,
+                    boundaries,
+                    registrations,
+                    consumes,
+                    equations,
+                )?;
+                super::ownership_occurrence::validate_terminal_links(
+                    terminals, boundaries, equations,
+                )?;
+            }
+            if gaps.equation_valuation_join != OriginMissing::EquationValuationJoinNotRecorded
+                || gaps.origin_closure != OriginMissing::OriginClosureNotComputed
+                || gaps.boundary_terminal_roster
+                    != OriginMissing::IndependentSlotOwnershipJoinNotRecorded
                 || gaps.dynamic_epochs != OriginMissing::DynamicEpochNotRepresented
                 || gaps.partner_free != OriginMissing::PartnerFreeCorrespondenceNotExported
                 || gaps.conservation != OriginMissing::ConservationNotProved
@@ -343,7 +388,7 @@ pub(crate) fn equal_files(left: &Path, right: &Path) -> Result<bool, String> {
 /// PortableExport-order proof file. The full validator is run on staged bytes.
 pub(crate) fn stage_streamed(
     directory: &Path,
-    metadata: &stream::Metadata,
+    metadata: stream::Metadata,
     exports: &Path,
 ) -> Result<StreamedEntry, String> {
     use std::{
@@ -364,9 +409,11 @@ pub(crate) fn stage_streamed(
         .write(true)
         .open(&path)
         .map_err(|e| e.to_string())?;
+    // R471-3 (i): MOVE the metadata in. Cloning it duplicated the multi-GiB
+    // origin `Value`, which was half of libzahl's 37.4 GiB peak.
     let mut staged = StreamedEntry {
         path,
-        metadata: metadata.clone(),
+        metadata,
         hashes: None,
         remove_on_drop: true,
     };
@@ -395,7 +442,10 @@ pub(crate) fn stage_streamed(
     let mut export_input =
         std::io::BufReader::new(std::fs::File::open(exports).map_err(|e| e.to_string())?);
     let export_length = std::io::copy(&mut export_input, &mut writer).map_err(|e| e.to_string())?;
-    field!(b",\"origin\":", &meta.origin);
+    writer
+        .write_all(b",\"origin\":")
+        .map_err(|e| e.to_string())?;
+    meta.write_origin(&mut writer)?;
     writer.write_all(b"}").map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
     writer.get_ref().sync_all().map_err(|e| e.to_string())?;
@@ -415,13 +465,27 @@ pub(crate) fn stage_streamed(
         .map_err(|e| e.to_string())?;
     std::io::copy(&mut input.take(export_length), &mut export_hash).map_err(|e| e.to_string())?;
     export_hash.write_all(b",").map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut export_hash, &meta.origin).map_err(|e| e.to_string())?;
+    meta.write_origin(&mut export_hash)?;
     export_hash.write_all(b"]").map_err(|e| e.to_string())?;
     staged.hashes = Some(StreamHashes {
         entry: file_sha256(&staged.path)?,
         payload: payload.finish(),
         exports: export_hash.finish(),
     });
+    // R473-4: the byte-identity proof for design (A). Diagnosis print only.
+    if std::env::var_os("CRAT_ERA5C_PROFILE").is_some()
+        && let Some(h) = &staged.hashes
+    {
+        eprintln!(
+            "E5C_ENTRY_DIGEST entry={} payload={} exports={} bytes={}",
+            h.entry,
+            h.payload,
+            h.exports,
+            std::fs::metadata(&staged.path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        );
+    }
     Ok(staged)
 }
 

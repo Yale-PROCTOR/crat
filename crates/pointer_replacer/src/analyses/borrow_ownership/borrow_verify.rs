@@ -203,6 +203,18 @@ struct WitnessedSlotConflict {
 struct Revalidated<T> {
     conflicts: T,
     retirement: super::retirement::RetirementReview,
+    reader_failures: Vec<super::licensing::reader_replay::Failure>,
+}
+
+fn finish_readers(
+    scope: super::licensing::reader_replay::RoundScope,
+) -> Vec<super::licensing::reader_replay::Failure> {
+    let result = scope.finish();
+    super::export::record(|export| {
+        export.reader_replay = Some(result.receipts);
+        export.traversal_replay = Some(result.traversal_receipts);
+    });
+    result.failures
 }
 
 fn finish_retirement(
@@ -368,6 +380,11 @@ fn revalidate_replaying_with_flows(
         parameter_overlaps,
     );
     assert!(
+        reviewed.reader_failures.is_empty(),
+        "unresolved reader proof in diagnostic replay: {:?}",
+        reviewed.reader_failures
+    );
+    assert!(
         reviewed.retirement.unresolved.is_empty(),
         "unresolved source retirement in diagnostic replay: {:?}",
         reviewed.retirement.unresolved
@@ -387,6 +404,7 @@ fn revalidate_replaying_reviewed(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> Revalidated<FxHashMap<LocalDefId, Vec<SlotConflict>>> {
+    let reader_scope = super::licensing::reader_replay::begin_round(slots, &is_ref, &is_raw);
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
     let retirement_scope = super::retirement::begin(program, slots, origin_flows, &is_ref);
     let is_ref = &is_ref;
@@ -480,6 +498,7 @@ fn revalidate_replaying_reviewed(
     Revalidated {
         conflicts: map_edges_to_slots(slots, edges),
         retirement: finish_retirement(retirement_scope),
+        reader_failures: finish_readers(reader_scope),
     }
 }
 
@@ -496,6 +515,7 @@ fn revalidate_replaying_witnessed(
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> Revalidated<FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>>> {
+    let reader_scope = super::licensing::reader_replay::begin_round(slots, &is_ref, &is_raw);
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
     let retirement_scope = super::retirement::begin(program, slots, origin_flows, &is_ref);
     let is_ref = &is_ref;
@@ -577,6 +597,12 @@ fn revalidate_replaying_witnessed(
                         .collect::<Vec<_>>();
                     invalidators.sort_by_key(slotref_key);
                     invalidators.dedup();
+                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                        eprintln!(
+                            "E5C witnessed-conflict fn={fn_did:?} loan={loan} at={loan_location:?} issuer={issuer:?} requirers={:?} invalidators={invalidators:?} esc={}",
+                            edge.requirers, edge.esc_issuer_first
+                        );
+                    }
                     WitnessedSlotConflict {
                         conflict: SlotConflict {
                             issuer,
@@ -605,6 +631,7 @@ fn revalidate_replaying_witnessed(
     Revalidated {
         conflicts,
         retirement: finish_retirement(retirement_scope),
+        reader_failures: finish_readers(reader_scope),
     }
 }
 
@@ -795,6 +822,84 @@ pub(super) enum LoopBackend {
     HardCheckRoundOptimize,
 }
 
+/// era-5c R545-1: the mutability facts of one verification round. Foster's load
+/// guard (`lhs = copy (*p)…` ⇒ `p` mutable) is kept unless the LOADED level is
+/// `Raw` in `model`: writes through a Raw level are raw-pointer writes, so the
+/// table they were loaded from is only read and its reborrow is shared. A level
+/// the walk cannot map keeps the guard.
+pub(crate) fn round_mutability_facts<'tcx>(
+    program: &RustProgram<'tcx>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> super::mutability_facts::MutFacts {
+    let tcx = program.tcx;
+    let keep_load = |fn_did: LocalDefId, load: &rustc_middle::mir::Place<'tcx>| -> bool {
+        // W47 fault F2 (test builds only): the model condition dropped.
+        #[cfg(test)]
+        if std::env::var("CRAT_E5C_W47_FAULT").as_deref() == Ok("no-model") {
+            return true;
+        }
+        match loaded_slot(tcx, slots, fn_did, load) {
+            Some(slot) => model.get(&slot) != Some(&SlotKind::Raw),
+            None => true,
+        }
+    };
+    super::mutability_facts::MutFacts::from_program_gated(program, &keep_load)
+}
+
+/// The slot of the pointer VALUE a place names: `(*p)` is `p@d1`, `(*p).f` is
+/// field `f@d0`, `(*(*p).f)` is `f@d1`; indexing keeps the level. `None` when the
+/// walk leaves the slot universe (unions, tuples, downcasts, unregistered owners).
+fn loaded_slot<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    place: &rustc_middle::mir::Place<'tcx>,
+) -> Option<SlotRef> {
+    use rustc_middle::mir::ProjectionElem;
+    let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+    let mut ty = body.local_decls[place.local].ty;
+    let mut field: Option<super::slots::StructFieldSlot> = None;
+    let mut depth: u8 = 0;
+    for elem in place.projection.iter() {
+        match elem {
+            ProjectionElem::Deref => {
+                depth = depth.checked_add(1)?;
+                ty = ty.builtin_deref(true)?;
+            }
+            ProjectionElem::Field(index, field_ty) => {
+                let rustc_middle::ty::TyKind::Adt(adt, _) = ty.kind() else {
+                    return None;
+                };
+                if !adt.is_struct() {
+                    return None;
+                }
+                field = Some(super::slots::StructFieldSlot {
+                    struct_did: adt.did().as_local()?,
+                    field_index: index.index(),
+                });
+                depth = 0;
+                ty = field_ty;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                ty = ty.builtin_index()?;
+            }
+            _ => return None,
+        }
+    }
+    match field {
+        Some(field) => slots
+            .field_slots
+            .slot_for_field_depth(field, depth)
+            .map(SlotRef::Field),
+        None => slots
+            .fn_local_slots
+            .get(&fn_did)?
+            .slot_for_local_depth(place.local, depth)
+            .map(|id| SlotRef::Local(fn_did, id)),
+    }
+}
+
 fn solve_round_model(
     solver: &KindSolver,
     selectors: &Selectors,
@@ -950,6 +1055,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let _reader_facts = super::licensing::reader_replay::enter_facts(solver.ownership_facts());
     let source_inventory = super::source_events::for_construction(program);
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
@@ -1005,6 +1111,8 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
         super::export::begin_round();
+        let _original_cell_model =
+            super::licensing::model_selection::enter(solver.original_cell_selection());
         let active_escaped_copy_lends = escaped_copy_lends
             .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
         let _retirement_model = super::retirement::model_scope(&model);
@@ -1018,6 +1126,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
+        // R545-1: a table's reborrow is unique only when a Ref level below it is
+        // written -- the round's facts drop the load guard where the loaded level
+        // is Raw in THIS round's model (era-5c report 045).
+        let round_facts =
+            super::field_moves::mut_model().then(|| round_mutability_facts(program, slots, &model));
+        let round_mutable = super::mutability_facts::RoundMut {
+            base: is_mutable,
+            round: round_facts.as_ref(),
+        };
         let reviewed = revalidate_replaying_reviewed(
             program,
             slots,
@@ -1058,7 +1175,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
                 SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
                 SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
             },
-            is_mutable,
+            round_mutable,
             selected_copy_lends.as_ref(),
             active_escaped_copy_lends.as_ref(),
             parameter_overlaps,
@@ -1068,6 +1185,20 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             return (None, stats);
         }
         let raw_targets = reviewed.retirement.raw_targets();
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!(
+                "E5C retirement raw_targets={raw_targets:?} demotions={} conflicts={} unresolved={}",
+                reviewed.retirement.demotions.len(),
+                reviewed.retirement.conflicts.len(),
+                reviewed.retirement.unresolved.len()
+            );
+            for row in &reviewed.retirement.demotions {
+                eprintln!("E5C retirement-demotion {row:?}");
+            }
+            for row in &reviewed.retirement.conflicts {
+                eprintln!("E5C retirement-conflict {row:?}");
+            }
+        }
         if !raw_targets.is_empty() {
             for target in &raw_targets {
                 solver.assume(*target, SlotKind::Raw);
@@ -1086,6 +1217,19 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             continue;
         }
         let mut conflicts = reviewed.conflicts;
+        for failure in &reviewed.reader_failures {
+            let Some(target @ SlotRef::Local(function, _)) = failure.target else {
+                return (None, stats);
+            };
+            // A missing required proof is an obligation failure, with no
+            // invented legacy Loan ID. The existing monotone Ref exclusion
+            // keeps the Mode-A bound and all solver caps unchanged.
+            conflicts.entry(function).or_default().push(SlotConflict {
+                issuer: Some(target),
+                requirers: Vec::new(),
+                esc_issuer_first: false,
+            });
+        }
         append_retirement_targets(&mut conflicts, &reviewed.retirement);
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
         // residual is the A′ principle extended to field requirers: the field is a live requirer the
@@ -1138,6 +1282,13 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
                 });
                 for (_did, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
+                        // era-5c: name the conflict a Mode-A commit came from.
+                        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                            eprintln!(
+                                "E5C mode-a-commit slot={slot:?} issuer={:?} requirers={:?} esc_issuer_first={}",
+                                conflict.issuer, conflict.requirers, conflict.esc_issuer_first
+                            );
+                        }
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
                         committed += 1;
@@ -1211,6 +1362,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
             // committed like any `Ref` slot and a non-`Ref` field residual already declined above, so
             // this path no longer silently accepts a dropped-`Field` residual (the old Local-only gap).
+            super::licensing::stack_export::accept(solver.ownership_facts());
             return (Some(model), stats);
         }
         model = match solve_round_model(solver, selectors, backend, hard.as_ref()) {
@@ -1370,6 +1522,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let _reader_facts = super::licensing::reader_replay::enter_facts(solver.ownership_facts());
     let source_inventory = super::source_events::for_construction(program);
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
@@ -1432,6 +1585,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         }
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
+        let _original_cell_model =
+            super::licensing::model_selection::enter(solver.original_cell_selection());
         let active_escaped_copy_lends = escaped_copy_lends
             .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
         let _retirement_model = super::retirement::model_scope(&model);
@@ -1525,6 +1680,17 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         }
         let conflicts = reviewed.conflicts;
         let mut observations = Vec::new();
+        for failure in &reviewed.reader_failures {
+            let Some(target @ SlotRef::Local(function, _)) = failure.target else {
+                return (None, stats);
+            };
+            observations.push(ConflictObservation::new(
+                function.local_def_index.as_u32(),
+                target,
+                Some(target),
+                Vec::new(),
+            ));
+        }
         for target in reviewed.retirement.targets() {
             let row = reviewed
                 .retirement
@@ -1608,6 +1774,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                 );
                 stats.commits_per_round.push(0);
                 emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                super::licensing::stack_export::accept(solver.ownership_facts());
                 return (Some(model), stats);
             }
             L2RoundPlan::Continue {
@@ -1816,6 +1983,7 @@ fn model_accepts_with_flows_impl(
     );
     if !reviewed.retirement.unresolved.is_empty()
         || !reviewed.retirement.conflicts.is_empty()
+        || !reviewed.reader_failures.is_empty()
         || !reviewed.retirement.demotions.is_empty()
     {
         return false;

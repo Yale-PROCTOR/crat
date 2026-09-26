@@ -73,7 +73,7 @@ def semantic_key(inputs):
     # Rust SemanticInputs struct declaration order, with BTreeMap file order.
     ordered = {"program": inputs["program"], "files": dict(sorted(inputs["files"].items()))}
     ordered.update((k, inputs[k]) for k in ("analysis", "toolchain", "dependencies", "configuration"))
-    return digest(b"era5a-model-cache-v1\0" + encoded(ordered, sort=False))
+    return digest(b"era5b-model-cache-v1\0" + encoded(ordered, sort=False))
 
 
 def resource_rows(seal, active):
@@ -192,7 +192,7 @@ def reconcile(runtime, job, job_hash, files, process):
     body = runtime.read(entry_path)
     require(digest(body) == complete["entry_sha256"], "entry body digest")
     entry = decode(body)
-    require(entry["schema"] == "era5a-model-cache-v1" and entry["key"] == key and entry["inputs"] == inputs,
+    require(entry["schema"] == "era5b-model-cache-v1" and entry["key"] == key and entry["inputs"] == inputs,
             "entry semantic identity")
     universe = entry["universe"]
     require(len(universe) == len(set(universe)) and set(entry["model"]) == set(universe)
