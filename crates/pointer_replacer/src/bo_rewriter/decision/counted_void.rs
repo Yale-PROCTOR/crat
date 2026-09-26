@@ -1746,7 +1746,7 @@ fn types_disjoint<'tcx>(
 /// Does `outer` hold a value of type `inner`, reflexively and transitively,
 /// through fields (every variant's), arrays and tuples? Indirection is not
 /// containment.
-fn type_contains<'tcx>(
+pub(super) fn type_contains<'tcx>(
     tcx: TyCtxt<'tcx>,
     outer: rustc_middle::ty::Ty<'tcx>,
     inner: rustc_middle::ty::Ty<'tcx>,

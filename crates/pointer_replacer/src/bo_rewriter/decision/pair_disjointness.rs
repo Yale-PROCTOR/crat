@@ -245,8 +245,21 @@ enum RootClass {
         /// itself contract-backed (brotli's `BrotliAllocate`, which allocates
         /// through `(*m).alloc_func`). The certificate says so by name.
         freshness: Freshness,
+        /// R579-3: the field was admitted through a fresh LOCAL or an in-block
+        /// OFFSET of another field ([`FreshFieldFact`]). Its block may be
+        /// another admitted field's (`buffer_ = data_ + 2`), so it separates
+        /// only from its own base, never from another field.
+        same_base_only: bool,
     },
     Unknown,
+}
+
+/// R479-4a / R579-3: what the whole-program store scan admitted a pointer field
+/// with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshFieldFact {
+    freshness: Freshness,
+    same_base_only: bool,
 }
 
 impl RootClass {
@@ -452,10 +465,16 @@ impl PairDisjointnessIndex {
         let fresh_fields = allocator_data_fields(tcx, &local_functions, &allocators);
         #[cfg(test)]
         if std::env::var_os("W6P_DUMP_FIELDS").is_some() {
-            for ((adt, field), freshness) in &fresh_fields {
+            for ((adt, field), fact) in &fresh_fields {
                 println!(
-                    "W6P_FIELD\t{}\t{field}\t{freshness:?}",
-                    tcx.def_path_str(*adt)
+                    "W6P_FIELD\t{}\t{field}\t{:?}{}",
+                    tcx.def_path_str(*adt),
+                    fact.freshness,
+                    if fact.same_base_only {
+                        "\tsame-base-only"
+                    } else {
+                        ""
+                    }
                 );
             }
             for (did, index) in &allocators.views {
@@ -479,7 +498,9 @@ impl PairDisjointnessIndex {
             };
             let body = tcx.hir_body(body_id);
             let typeck = tcx.typeck(caller);
-            let (classes, why, prefixes) = classify_locals(tcx, typeck, body, &allocators, caller);
+            let (mut classes, why, prefixes) =
+                classify_locals(tcx, typeck, body, &allocators, caller);
+            carry_fresh_field_reads(tcx, typeck, body, &mut classes, &fresh_fields);
             binding_roots.insert(caller.local_def_index.as_u32(), classes.clone());
             let mut collector = CallCollector {
                 tcx,
@@ -1137,6 +1158,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 field,
                 base,
                 freshness,
+                same_base_only,
             },
             other,
         )
@@ -1147,6 +1169,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 field,
                 base,
                 freshness,
+                same_base_only,
             },
         ) => {
             let kind = |freshness: Freshness| match freshness {
@@ -1154,12 +1177,18 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 Freshness::Contract => CertificateKind::DistinctRootsUnderContract,
             };
             return match other {
+                // R579-3: a field admitted through a local or an offset may
+                // hold another admitted field's block, so the different-fields
+                // clause never reads it.
                 RootClass::FreshField {
                     adt: other_adt,
                     field: other_field,
                     freshness: other_freshness,
+                    same_base_only: other_same_base_only,
                     ..
-                } => ((adt, field) != (other_adt, other_field))
+                } => ((adt, field) != (other_adt, other_field)
+                    && !same_base_only
+                    && !other_same_base_only)
                     .then(|| kind(freshness.join(other_freshness))),
                 _ => (other.object_id() == Some(base))
                     .then(|| kind(freshness.join(other.freshness()))),
@@ -2082,13 +2111,36 @@ fn view_of_formal(
 /// copy of a local or another field, a parameter, an indirect allocator call
 /// through a function pointer) refuses the field outright, so the admitted set
 /// is exactly the fields whose contents the closed world can account for.
+///
+/// R579-3 widens the admission by two store shapes, each keeping the claim the
+/// pair rule reads — the block was returned while the base object was live:
+///
+/// * **(c)** a `FreshAlloc` local of the storing body (every assignment an
+///   allocator result or null, its address never taken) stored into a field of
+///   ENTRY storage. The base object existed at the storing function's entry and
+///   the allocation happened in its body.
+/// * **(d)** `(*b).g.offset(k)` (`add`, `wrapping_*`) where `g` is itself
+///   admitted and read out of the SAME base object: the value stays inside
+///   `g`'s block. Admitted only while `g` is — a greatest fixpoint.
+///
+/// A field admitted either way is `same_base_only`: under (d) it names another
+/// field's block, and under (c) one local may be stored into two fields, so
+/// the different-fields clause never separates it.
+///
+/// And every admission — R479-4a's own included — is refused for a struct that
+/// the program writes WITHOUT a field store ([`struct_writes_outside_field_stores`]):
+/// a whole-struct copy, a byte writer aimed at it or at a container of it, or
+/// a pointer reaching it cast to another non-byte, non-void pointee (R538-7 /
+/// R544-4). Any of those can put another object's pointer in the field.
 fn allocator_data_fields(
     tcx: TyCtxt<'_>,
     functions: &FxHashSet<LocalDefId>,
     oracle: &AllocatorOracle<'_>,
-) -> FxHashMap<(DefId, Symbol), Freshness> {
+) -> FxHashMap<(DefId, Symbol), FreshFieldFact> {
     let mut allocator: FxHashMap<(DefId, Symbol), Freshness> = FxHashMap::default();
     let mut refused: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
+    let mut same_base_only: FxHashSet<(DefId, Symbol)> = FxHashSet::default();
+    let mut offsets: Vec<((DefId, Symbol), (DefId, Symbol))> = Vec::new();
     for &function in functions {
         let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
             continue;
@@ -2098,13 +2150,198 @@ fn allocator_data_fields(
             typeck: tcx.typeck(function),
             oracle,
             function,
+            body: tcx.hir_body(body_id),
+            classes: None,
             allocator: &mut allocator,
             refused: &mut refused,
+            same_base_only: &mut same_base_only,
+            offsets: &mut offsets,
         };
         collector.visit_body(tcx.hir_body(body_id));
     }
-    allocator.retain(|key, _| !refused.contains(key));
+    // (d)'s fields are candidates on their offset stores alone.
+    for (field, _) in &offsets {
+        allocator.entry(*field).or_insert(Freshness::Proven);
+    }
+    let structs: FxHashSet<DefId> = allocator.keys().map(|(adt, _)| *adt).collect();
+    let written = struct_writes_outside_field_stores(tcx, &structs);
+    allocator.retain(|key, _| !refused.contains(key) && !written.contains(&key.0));
+    // The greatest fixpoint over (d): a field derived from an unadmitted field
+    // leaves, and a derived field is as contract-backed as its source.
+    loop {
+        let mut changed = false;
+        for (field, source) in &offsets {
+            let Some(&current) = allocator.get(field) else {
+                continue;
+            };
+            match allocator.get(source).copied() {
+                Some(freshness) => {
+                    let joined = current.join(freshness);
+                    if joined != current {
+                        allocator.insert(*field, joined);
+                        changed = true;
+                    }
+                }
+                None => {
+                    allocator.remove(field);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     allocator
+        .into_iter()
+        .map(|(key, freshness)| {
+            (
+                key,
+                FreshFieldFact {
+                    freshness,
+                    same_base_only: same_base_only.contains(&key),
+                },
+            )
+        })
+        .collect()
+}
+
+/// libc and `core::ptr` writers that can put bytes into a struct without a
+/// field store. Matched by name, as R538-7 matches them; `realloc` moves the
+/// object's bytes into a new block.
+const STRUCT_BYTE_WRITERS: &[&str] = &[
+    "memcpy",
+    "memmove",
+    "memset",
+    "realloc",
+    "bcopy",
+    "bzero",
+    "fread",
+    "read",
+    "recv",
+    "strcpy",
+    "strncpy",
+    "memccpy",
+    "copy",
+    "copy_nonoverlapping",
+    "write",
+    "write_bytes",
+    "write_unaligned",
+    "copy_from",
+    "copy_to",
+    "copy_from_nonoverlapping",
+    "copy_to_nonoverlapping",
+];
+
+/// R579-3 refusals (3) and (4): the structs among `structs` that the program
+/// writes other than through a field store — so a pointer field of one may
+/// hold another object's pointer without any store the admission scan reads.
+///
+/// * a whole-value write of a type that holds the struct at any depth (`*dst =
+///   *src`, a container assigned whole, a struct literal field copied from a
+///   place): a struct LITERAL is exempt as a whole, because its own fields are
+///   scanned as stores;
+/// * a byte writer ([`STRUCT_BYTE_WRITERS`]) any of whose arguments points at
+///   a type holding the struct (R538-7);
+/// * a pointer reaching the struct cast to another pointee that is neither a
+///   byte nor `void` (R544-4's pun: `*(rb as *mut *mut u8) = p` writes the
+///   first field).
+fn struct_writes_outside_field_stores<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    structs: &FxHashSet<DefId>,
+) -> FxHashSet<DefId> {
+    struct Writes<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'a TypeckResults<'tcx>,
+        structs: &'a [(DefId, Ty<'tcx>)],
+        written: &'a mut FxHashSet<DefId>,
+    }
+    impl<'tcx> Writes<'_, 'tcx> {
+        /// Every struct `ty` holds by value, at any depth.
+        fn held_by(&mut self, ty: Ty<'tcx>) {
+            for &(adt, adt_ty) in self.structs {
+                if super::counted_void::type_contains(self.tcx, ty, adt_ty) {
+                    self.written.insert(adt);
+                }
+            }
+        }
+
+        /// Every struct the pointee of `ty` holds, when `ty` is a pointer.
+        fn reached_by(&mut self, ty: Ty<'tcx>) {
+            if let Some(pointee) = ty.builtin_deref(true) {
+                self.held_by(pointee);
+            }
+        }
+
+        fn is_struct_literal(expr: &Expr<'_>) -> bool {
+            matches!(peel_casts(expr).kind, ExprKind::Struct(..))
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Writes<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            match &expr.kind {
+                ExprKind::Assign(place, value, _) if !Self::is_struct_literal(value) => {
+                    self.held_by(self.typeck.expr_ty(place));
+                }
+                ExprKind::Struct(_, fields, _) => {
+                    for field in *fields {
+                        if !Self::is_struct_literal(field.expr) {
+                            self.held_by(self.typeck.expr_ty(field.expr));
+                        }
+                    }
+                }
+                ExprKind::Cast(inner, _) => {
+                    let from = self.typeck.expr_ty(inner);
+                    let to = self.typeck.expr_ty(expr);
+                    if let (Some(from_pointee), Some(to_pointee)) =
+                        (from.builtin_deref(true), to.builtin_deref(true))
+                        && from_pointee != to_pointee
+                        && !matches!(
+                            to_pointee.kind(),
+                            ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8)
+                        )
+                        && !super::void_pointee::has_void_pointee(self.tcx, to, 1)
+                    {
+                        self.held_by(from_pointee);
+                    }
+                }
+                ExprKind::Call(callee, args) => {
+                    if let Some(did) = callee_def_id(callee)
+                        && STRUCT_BYTE_WRITERS.contains(&self.tcx.item_name(did).as_str())
+                    {
+                        for arg in *args {
+                            self.reached_by(self.typeck.expr_ty(peel_casts(arg)));
+                        }
+                    }
+                }
+                ExprKind::MethodCall(segment, receiver, args, _)
+                    if STRUCT_BYTE_WRITERS.contains(&segment.ident.name.as_str()) =>
+                {
+                    self.reached_by(self.typeck.expr_ty(peel_casts(receiver)));
+                    for arg in *args {
+                        self.reached_by(self.typeck.expr_ty(peel_casts(arg)));
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let structs: Vec<(DefId, Ty<'tcx>)> = structs
+        .iter()
+        .map(|&adt| (adt, tcx.type_of(adt).instantiate_identity()))
+        .collect();
+    let mut written = FxHashSet::default();
+    for owner in tcx.hir_body_owners() {
+        let mut writes = Writes {
+            tcx,
+            typeck: tcx.typeck(owner),
+            structs: &structs,
+            written: &mut written,
+        };
+        writes.visit_body(tcx.hir_body_owned_by(owner));
+    }
+    written
 }
 
 struct DataFieldStoreCollector<'a, 'tcx> {
@@ -2112,8 +2349,15 @@ struct DataFieldStoreCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     oracle: &'a AllocatorOracle<'a>,
     function: LocalDefId,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    /// The storing body's binding classes, derived on first need for (c).
+    classes: Option<FxHashMap<HirId, RootClass>>,
     allocator: &'a mut FxHashMap<(DefId, Symbol), Freshness>,
     refused: &'a mut FxHashSet<(DefId, Symbol)>,
+    same_base_only: &'a mut FxHashSet<(DefId, Symbol)>,
+    /// (d): `(field, source)` — `field` was stored an offset of `source` read
+    /// out of the same base object.
+    offsets: &'a mut Vec<((DefId, Symbol), (DefId, Symbol))>,
 }
 
 impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
@@ -2177,9 +2421,57 @@ impl<'tcx> DataFieldStoreCollector<'_, 'tcx> {
                 .entry(key)
                 .and_modify(|seen| *seen = seen.join(freshness))
                 .or_insert(freshness);
-        } else if !is_null_literal(value) {
+        } else if !is_null_literal(value) && !self.admits_through_local_or_offset(key, base, value)
+        {
             self.refused.insert(key);
         }
+    }
+
+    /// R579-3 (c) and (d). `base` is the place the field is stored into.
+    fn admits_through_local_or_offset(
+        &mut self,
+        key: (DefId, Symbol),
+        base: &Expr<'_>,
+        value: &Expr<'_>,
+    ) -> bool {
+        let (tcx, typeck, body, oracle, function) =
+            (self.tcx, self.typeck, self.body, self.oracle, self.function);
+        let classes = self
+            .classes
+            .get_or_insert_with(|| classify_locals(tcx, typeck, body, oracle, function).0);
+        let value = peel_casts(value);
+        let (base_class, _) = place_provenance(tcx, typeck, classes, base);
+        // (c): the base existed at entry, the block was allocated in this body.
+        if let Some(local) = resolved_local(value)
+            && let Some(RootClass::FreshAlloc(_, freshness)) = classes.get(&local).copied()
+            && matches!(base_class, RootClass::EntryStorage(_))
+        {
+            self.allocator
+                .entry(key)
+                .and_modify(|seen| *seen = seen.join(freshness))
+                .or_insert(freshness);
+            self.same_base_only.insert(key);
+            return true;
+        }
+        // (d): an offset of an admitted field of the SAME base object.
+        if let ExprKind::MethodCall(segment, receiver, [_], _) = &value.kind
+            && matches!(
+                segment.ident.name.as_str(),
+                "offset" | "add" | "wrapping_add" | "wrapping_offset"
+            )
+            && let ExprKind::Field(source_base, source_field) = &peel_casts(receiver).kind
+            && let Some(source) = data_field_key(tcx, typeck, source_base, source_field.name)
+            && let Some(object) = base_class.object_id()
+            && place_provenance(tcx, typeck, classes, source_base)
+                .0
+                .object_id()
+                == Some(object)
+        {
+            self.offsets.push((key, source));
+            self.same_base_only.insert(key);
+            return true;
+        }
+        false
     }
 }
 
@@ -2655,6 +2947,140 @@ fn classify_locals<'tcx>(
     (classes, why, prefixes)
 }
 
+/// R579-3 (ii), the carry. A pointer local still `Unknown` takes the root of an
+/// admitted field it reads — `data = (*s).ringbuffer_.buffer_` names the block
+/// that field holds, separated from `*s` — when:
+///
+/// * it is declared by a `let` with a plain binding and is not a parameter
+///   (a parameter's entry value is another source nobody reads here);
+/// * its address is never taken, so no callee can retarget it;
+/// * every assignment, the initializer included, is null or a read `X.F` of
+///   ONE admitted `F` out of ONE base object.
+///
+/// Two fields, two bases, or any other source leave it `Unknown`.
+fn carry_fresh_field_reads<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    classes: &mut FxHashMap<HirId, RootClass>,
+    fresh_fields: &FxHashMap<(DefId, Symbol), FreshFieldFact>,
+) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Reads {
+        /// Only null so far.
+        Null,
+        One {
+            key: (DefId, Symbol),
+            base: HirId,
+        },
+        Refused,
+    }
+    struct Scan<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'a TypeckResults<'tcx>,
+        classes: &'a FxHashMap<HirId, RootClass>,
+        fresh_fields: &'a FxHashMap<(DefId, Symbol), FreshFieldFact>,
+        declared: FxHashSet<HirId>,
+        reads: FxHashMap<HirId, Reads>,
+    }
+    impl Scan<'_, '_> {
+        fn assign(&mut self, local: HirId, value: &Expr<'_>) {
+            let value = peel_casts(value);
+            let next = if is_null_literal(value) {
+                Reads::Null
+            } else {
+                match &value.kind {
+                    ExprKind::Field(base, field) => {
+                        data_field_key(self.tcx, self.typeck, base, field.name)
+                            .filter(|key| self.fresh_fields.contains_key(key))
+                            .and_then(|key| {
+                                let (class, _) =
+                                    place_provenance(self.tcx, self.typeck, self.classes, base);
+                                Some(Reads::One {
+                                    key,
+                                    base: class.object_id()?,
+                                })
+                            })
+                            .unwrap_or(Reads::Refused)
+                    }
+                    _ => Reads::Refused,
+                }
+            };
+            let joined = match (self.reads.get(&local).copied(), next) {
+                (None | Some(Reads::Null), next) => next,
+                (Some(current), Reads::Null) => current,
+                (Some(current), next) if current == next => current,
+                _ => Reads::Refused,
+            };
+            self.reads.insert(local, joined);
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Scan<'_, 'tcx> {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if let PatKind::Binding(_, hir_id, _, None) = local.pat.kind {
+                self.declared.insert(hir_id);
+                if let Some(init) = local.init {
+                    self.assign(hir_id, init);
+                }
+            }
+            intravisit::walk_local(self, local);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            match &expr.kind {
+                ExprKind::Assign(place, value, _) => {
+                    if let Some(local) = resolved_local(place) {
+                        self.assign(local, value);
+                    }
+                }
+                // A compound assignment, or the binding's own address taken:
+                // its value is no longer one read.
+                ExprKind::AssignOp(_, place, _) | ExprKind::AddrOf(_, _, place) => {
+                    if let Some(local) = resolved_local(peel_casts(place)) {
+                        self.reads.insert(local, Reads::Refused);
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut scan = Scan {
+        tcx,
+        typeck,
+        classes,
+        fresh_fields,
+        declared: FxHashSet::default(),
+        reads: FxHashMap::default(),
+    };
+    scan.visit_body(body);
+    let (declared, reads) = (scan.declared, scan.reads);
+    for (local, reads) in reads {
+        let Reads::One { key, base } = reads else {
+            continue;
+        };
+        // `declared` holds only `let`-bound plain bindings, so a parameter —
+        // whose entry value is a source this scan never sees — is out.
+        if !declared.contains(&local) || classes.get(&local).copied() != Some(RootClass::Unknown) {
+            continue;
+        }
+        let FreshFieldFact {
+            freshness,
+            same_base_only,
+        } = fresh_fields[&key];
+        classes.insert(
+            local,
+            RootClass::FreshField {
+                adt: key.0,
+                field: key.1,
+                base,
+                freshness,
+                same_base_only,
+            },
+        );
+    }
+}
+
 /// R513-3. Replace a path rooted at a single-definition view local by the path
 /// it is a view OF: `*br` with `br = &mut (*s).br` is `(*s).br`. Only a path
 /// through the local's POINTEE folds — a path at the local's own slot names its
@@ -3071,7 +3497,7 @@ struct CallCollector<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     locals: &'a FxHashSet<LocalDefId>,
     classes: &'a FxHashMap<HirId, RootClass>,
-    fresh_fields: &'a FxHashMap<(DefId, Symbol), Freshness>,
+    fresh_fields: &'a FxHashMap<(DefId, Symbol), FreshFieldFact>,
     why: &'a FxHashMap<HirId, UnknownWhy>,
     /// R513-3: the place each single-definition view local is a view OF.
     prefixes: &'a FxHashMap<HirId, PlacePath>,
@@ -3206,14 +3632,17 @@ fn fresh_field_root<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &TypeckResults<'tcx>,
     classes: &FxHashMap<HirId, RootClass>,
-    fresh_fields: &FxHashMap<(DefId, Symbol), Freshness>,
+    fresh_fields: &FxHashMap<(DefId, Symbol), FreshFieldFact>,
     arg: &Expr<'_>,
 ) -> Option<RootClass> {
     let ExprKind::Field(base, field) = &peel_casts(arg).kind else {
         return None;
     };
     let key = data_field_key(tcx, typeck, base, field.name)?;
-    let freshness = *fresh_fields.get(&key)?;
+    let FreshFieldFact {
+        freshness,
+        same_base_only,
+    } = *fresh_fields.get(&key)?;
     // The base must itself name one object, or "same base" names nothing.
     let (base_class, _) = place_provenance(tcx, typeck, classes, base);
     Some(RootClass::FreshField {
@@ -3221,6 +3650,7 @@ fn fresh_field_root<'tcx>(
         field: key.1,
         base: base_class.object_id()?,
         freshness,
+        same_base_only,
     })
 }
 

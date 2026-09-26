@@ -100,9 +100,9 @@ mod pair_disjoint_field_seam_tests;
 #[cfg(test)]
 mod pair_disjointness_tests;
 #[cfg(test)]
-mod pair_fresh_field_tests;
-#[cfg(test)]
 mod pair_field_origin_tests;
+#[cfg(test)]
+mod pair_fresh_field_tests;
 #[cfg(test)]
 mod pair_projection_recovery_tests;
 #[cfg(test)]

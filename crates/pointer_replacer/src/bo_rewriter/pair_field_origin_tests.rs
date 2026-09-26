@@ -21,7 +21,7 @@ const RING: &str = r#"
         fn memcpy(d: *mut c_void, s: *const c_void, n: u64) -> *mut c_void;
     }
     #[repr(C)] #[derive(Copy, Clone)] pub struct MemoryManager { pub opaque: *mut c_void }
-    /*RING_DECL*/#[repr(C)] #[derive(Copy, Clone)] pub struct RingBuffer { pub size_: u32, pub data_: *mut u8, pub buffer_: *mut u8 }
+    #[repr(C)] #[derive(Copy, Clone)] pub struct RingBuffer { pub size_: u32, pub data_: *mut u8, pub buffer_: *mut u8 }
     #[repr(C)] #[derive(Copy, Clone)] pub struct Hasher { pub extra: *mut c_void, pub dict_num: u32 }
     #[repr(C)] #[derive(Copy, Clone)] pub struct Params { pub quality: i32 }
     #[repr(C)] #[derive(Copy, Clone)] pub struct State { pub mm: MemoryManager, pub ringbuffer_: RingBuffer, pub hasher_: Hasher, pub params: Params }
@@ -83,7 +83,10 @@ fn outcomes(src: &str, caller: &str, callee: &str, left: usize, right: usize) ->
                 && tcx.item_name(row.callee.to_def_id()).as_str() == callee
                 && (row.left, row.right) == (left, right)
             {
-                found.push(format!("{}|{}|{}", row.outcome, row.left_class, row.right_class));
+                found.push(format!(
+                    "{}|{}|{}",
+                    row.outcome, row.left_class, row.right_class
+                ));
             }
         }
     })
@@ -101,7 +104,8 @@ fn certified(rows: &[String]) -> bool {
 
 fn assert_unproved(rows: &[String], what: &str) {
     assert!(
-        rows.iter().all(|row| row.starts_with("pair-disjointness-unproved")),
+        rows.iter()
+            .all(|row| row.starts_with("pair-disjointness-unproved")),
         "{what}: {rows:?}"
     );
 }
@@ -150,10 +154,7 @@ fn w6v_hasher_tree_parameter_pairs_certify_through_encode_data() {
 #[test]
 fn w6v_a_void_pointer_field_is_admitted_on_the_same_discipline() {
     let src = variant("", "")
-        .replace(
-            "pub buffer_: *mut u8 }",
-            "pub buffer_: *mut c_void }",
-        )
+        .replace("pub buffer_: *mut u8 }", "pub buffer_: *mut c_void }")
         .replace(
             "(*rb).buffer_ = 0 as *mut u8;",
             "(*rb).buffer_ = 0 as *mut c_void;",
@@ -287,8 +288,8 @@ fn w6v_control_two_offset_related_fields_are_not_separated() {
     );
     let rows = outcomes(&src, "Views", "TwoViews", 0, 1);
     assert!(
-        rows.iter().all(|row| row.contains("fresh-field:data_")
-            && row.contains("fresh-field:buffer_")),
+        rows.iter()
+            .all(|row| row.contains("fresh-field:data_") && row.contains("fresh-field:buffer_")),
         "both sides are admitted fields: {rows:?}"
     );
     assert_unproved(&rows, "data_ beside buffer_");
