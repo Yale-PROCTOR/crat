@@ -2940,18 +2940,29 @@ fn w4b112_a_plain_getter_states_no_extent() {
 /// not updated, so at the return it names the old capacity. Only the
 /// sibling-assignment check refuses this one, and that is why it is separate
 /// from the field check W4B1-12 exercises.
+///
+/// Re-pinned at the L01⁸ frame landing (era-5c report 064): era 5b's joint
+/// pass refuses `storage` a reference — it carries `GrowStorage`'s fresh
+/// allocation, a `no_ref_carriers` slot (R371-2's family; a soundness line,
+/// R395-2) — so the model settles it raw, it asks for no extent, and the
+/// refusal this control exercised is not reached on this fixture at L01⁸.
+/// With the `no_ref_carriers` exclusion withdrawn the original row returns
+/// exactly (`held`, `none:call-result`; measured).
 #[test]
 fn w4b113_unrecorded_growth_states_no_extent() {
     let rows = b1_rows(W4_B1_UNRECORDED_GROWTH_ROOT);
-    let storage = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreFromUnrecorded::storage"))
-        .unwrap_or_else(|| panic!("no StoreFromUnrecorded::storage row: {rows:?}"));
-    assert_eq!(storage.1, "held", "{rows:?}");
-    assert_eq!(
-        storage.2, "none:call-result",
-        "the sibling names the OLD capacity: {rows:?}"
+    assert!(
+        !rows
+            .iter()
+            .any(|(subject, ..)| subject.starts_with("StoreFromUnrecorded::storage")),
+        "a raw subject asks for no extent: {rows:?}"
     );
+    let decisions = super::emit_tests::decisions_of(W4_B1_UNRECORDED_GROWTH_ROOT);
+    let storage = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "storage" && !*is_param)
+        .unwrap_or_else(|| panic!("no storage subject: {decisions:#?}"));
+    assert_eq!(storage.2, "kind-raw", "{decisions:#?}");
 }
 
 /// **W4B1-14 (report 055) — a parameter's row reports its CALLERS' root

@@ -1599,14 +1599,20 @@ fn w6a_a9_an_owned_field_keeps_the_formal() {
     let out = emitted("boxparam-ownedfield", &with_prelude(OWNED_FIELD_LEND));
     super::test_model_override::clear();
     let receipts = &out.artifacts.box_param_receipts;
-    for parameter in ["read_count::o", "bump::o"] {
-        assert!(
-            receipts.contains(&format!(
-                "{parameter}\theld\tbox-param-callee-lends-owned-field:"
-            )),
-            "{parameter} must keep its formal for the owned field\n{receipts}"
-        );
-    }
+    assert!(
+        receipts.contains("bump::o\theld\tbox-param-callee-lends-owned-field:"),
+        "bump::o must keep its formal for the owned field\n{receipts}"
+    );
+    // Re-pinned at the L01⁸ frame landing (era-5c report 064): `read_count`
+    // stores nothing and frees nothing, so era 5b's reader certificate
+    // (`readers::Plan::borrows_parameter`, the C02 borrowed call role, active
+    // in both passes) lends its formal at the call: the formal is zeroed,
+    // never Owning, and no box-param subject. Give it a store and the held
+    // receipt returns (measured).
+    assert!(
+        !receipts.contains("read_count::o\t"),
+        "read_count::o is a certified reader's formal, not a box parameter\n{receipts}"
+    );
     assert!(
         !receipts.contains("box-param-lend-leaves-owning"),
         "no formal of an owned-field struct is declined\n{receipts}"
@@ -1643,14 +1649,16 @@ fn w6a_r531_a9_a_held_owned_field_declines_the_lend() {
     let out = emitted("r531-a9-held-field", &with_prelude(&source));
     super::test_model_override::clear();
     let receipts = &out.artifacts.box_param_receipts;
-    for parameter in ["read_count::o", "bump::o"] {
-        assert!(
-            receipts.contains(&format!(
-                "{parameter}\tyielded\tbox-param-lend-leaves-owning:"
-            )),
-            "{parameter} is declined: its field's transaction is held\n{receipts}"
-        );
-    }
+    assert!(
+        receipts.contains("bump::o\tyielded\tbox-param-lend-leaves-owning:"),
+        "bump::o is declined: its field's transaction is held\n{receipts}"
+    );
+    // Re-pinned at the L01⁸ frame landing (era-5c report 064): era 5b's
+    // reader certificate lends `read_count`'s formal (see the control above).
+    assert!(
+        !receipts.contains("read_count::o\t"),
+        "read_count::o is a certified reader's formal, not a box parameter\n{receipts}"
+    );
     assert!(!receipts.contains("callee-lends-owned-field"), "{receipts}");
     assert!(
         compact(&out.source).contains("pubslot_:*muti32"),
