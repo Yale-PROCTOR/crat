@@ -2159,6 +2159,32 @@ fn allocator_data_fields(
         };
         collector.visit_body(tcx.hir_body(body_id));
     }
+    // R583-5 (G3): every OTHER body the program owns is a store site too. A
+    // `static` or `const` initializer's struct literal writes each pointer
+    // field it names exactly as a store does — a self-referential sentinel
+    // (`Node { next: &raw mut SENTINEL }`) puts the base object into its own
+    // field — and a visit of a function does not enter a closure's body. Such
+    // a literal can never call an allocator, so every non-null pointer it
+    // names refuses the field.
+    for owner in tcx.hir_body_owners() {
+        if functions.contains(&owner) {
+            continue;
+        }
+        let body = tcx.hir_body_owned_by(owner);
+        let mut collector = DataFieldStoreCollector {
+            tcx,
+            typeck: tcx.typeck(owner),
+            oracle,
+            function: owner,
+            body,
+            classes: None,
+            allocator: &mut allocator,
+            refused: &mut refused,
+            same_base_only: &mut same_base_only,
+            offsets: &mut offsets,
+        };
+        collector.visit_body(body);
+    }
     // (d)'s fields are candidates on their offset stores alone.
     for (field, _) in &offsets {
         allocator.entry(*field).or_insert(Freshness::Proven);
