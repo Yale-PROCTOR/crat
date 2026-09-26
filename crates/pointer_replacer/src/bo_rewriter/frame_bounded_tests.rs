@@ -382,3 +382,66 @@ pub unsafe fn parse(mut src: *const u8, mut dom: *mut u8, mut value: *mut *mut u
     assert!(kept.contains("KEPT = p;"), "fixture edit applied");
     assert_ne!(retention_row(&kept, "parse", 0).0, "no-retain");
 }
+
+/// **R578-4 (relay 088) — json.h's hand-off.** `json_get_string_size` hands
+/// `&*src.offset(k)` — the written field's pointer — to `json_hexadecimal_value`,
+/// which only reads through it; its row is `unknown` because its cursor `p` has
+/// three definitions (`p = 0; p = c; p = p.offset(1)`), a withheld certificate
+/// and not a store. Batch 40 read json.h's `json_parse_ex` arg0 `retains`
+/// (store `_27` through `_8`) for exactly this.
+const HANDED_TO_A_MULTI_DEF_READER: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case, unused_assignments)]
+#[repr(C)]
+pub struct State { pub src: *const u8, pub size: usize, pub offset: usize }
+unsafe fn hex_value(mut c: *const u8, mut size: usize) -> i32 {
+    let mut p = 0 as *const u8;
+    let mut r: i32 = 0;
+    p = c;
+    while (p.offset_from(c) as usize) < size {
+        r = r.wrapping_mul(16).wrapping_add(*p as i32);
+        p = p.offset(1 as isize);
+    }
+    return r;
+}
+unsafe fn get_string(mut st: *mut State) -> i32 {
+    let mut src = (*st).src;
+    return hex_value(&*src.offset((*st).offset as isize), 4 as usize);
+}
+pub unsafe fn parse(mut src: *const u8, mut size: usize) -> i32 {
+    let mut state = State { src: 0 as *const u8, size: 0, offset: 0 };
+    if src.is_null() { return 0; }
+    state.src = src;
+    state.size = size;
+    return get_string(&mut state);
+}
+"#;
+
+#[test]
+fn wave6o_a_hand_off_to_a_multi_def_reader_discharges() {
+    let (reader, reason) = retention_row(HANDED_TO_A_MULTI_DEF_READER, "hex_value", 0);
+    assert_eq!(
+        (reader.as_str(), reason.as_str()),
+        ("unknown", "retention-multi-def"),
+        "the fixture exercises the withheld-by-multi-def row"
+    );
+    let (verdict, reason) = retention_row(HANDED_TO_A_MULTI_DEF_READER, "parse", 0);
+    assert_eq!(verdict, "no-retain", "reason={reason}");
+    assert!(
+        reason.starts_with("retention-discharged:frame-bounded(subject=arg0,"),
+        "{reason}"
+    );
+}
+
+/// Control: the multi-def reader ALSO keeps its cursor — a store the walk sees —
+/// so the hand-off is not certified and the hold stands.
+#[test]
+fn wave6o_a_hand_off_to_a_multi_def_reader_that_stores_keeps_the_hold() {
+    let input = HANDED_TO_A_MULTI_DEF_READER
+        .replace(
+            "unsafe fn hex_value(",
+            "static mut KEPT: *const u8 = 0 as *const u8;\nunsafe fn hex_value(",
+        )
+        .replace("    return r;\n}", "    KEPT = p;\n    return r;\n}");
+    assert!(input.contains("KEPT = p;"), "fixture edit applied");
+    assert_ne!(retention_row(&input, "parse", 0).0, "no-retain");
+}

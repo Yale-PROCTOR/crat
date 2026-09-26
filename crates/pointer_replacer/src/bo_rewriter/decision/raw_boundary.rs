@@ -2251,6 +2251,44 @@ fn container_contents_facts<'tcx>(
     (ok, passes, value_passes)
 }
 
+/// **R578-4 (relay 088).** Is a local callee position that the written field's
+/// pointer is handed to certified not to keep it? A `no-retain` row is. So is a
+/// row withheld ONLY because a local has several definitions (which value it
+/// holds is unknown — json.h's `json_hexadecimal_value` cursor `p = 0; p = c;
+/// p = p.offset(1)`): the walk still records every store of a reachable local
+/// (`descendant_free`'s premise), so with no store, no open step but multi-def
+/// and core pointer methods, and every dependency certified, the handed
+/// pointer is read and not kept. A row whose reason is multi-def is attested:
+/// an unattested walk reports that first.
+fn handed_position_certified(
+    key: &(LocalDefId, usize),
+    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+    all: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
+) -> bool {
+    match rows.get(key) {
+        Some(RetentionVerdict::NoRetain { .. }) => true,
+        Some(RetentionVerdict::Unknown {
+            reason: RetentionUnknownReason::MultiDef,
+            ..
+        }) => all.get(key).is_some_and(|facts| {
+            facts.retains.is_empty()
+                && facts.unknowns.iter().all(|(reason, steps)| {
+                    *reason == RetentionUnknownReason::MultiDef
+                        || steps
+                            .iter()
+                            .all(|step| step.detail.ends_with(CORE_POINTER_METHOD_TAG))
+                })
+                && facts.dependencies.iter().all(|dependency| {
+                    matches!(
+                        rows.get(&(dependency.callee, dependency.argument_index)),
+                        Some(RetentionVerdict::NoRetain { .. })
+                    )
+                })
+        }),
+        _ => false,
+    }
+}
+
 /// **R573-3 (relay 086): R476-1 clause (3), the fields half, keyed.** Does this
 /// container callee — and every local callee it passes the container on to —
 /// leave the pointer loaded from the WRITTEN field confined
@@ -3937,7 +3975,7 @@ fn frame_bounded_discharge(
         if !bounded
             .field_handed
             .iter()
-            .all(|key| matches!(rows.get(key), Some(RetentionVerdict::NoRetain { .. })))
+            .all(|key| handed_position_certified(key, rows, all))
         {
             return None;
         }
