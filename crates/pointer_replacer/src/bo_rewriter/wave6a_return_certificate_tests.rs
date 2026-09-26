@@ -2472,3 +2472,54 @@ fn w6a_r579_a_lone_field_load_return_keeps_its_hold() {
         "{context}"
     );
 }
+
+/// **R583-7 (wave-6f 071's residual)** — the certified stores a field
+/// transaction moves follow the CURRENT delivery. After the stage that
+/// delivered `left` / `right`, `insert`'s two stores are field moves and its
+/// raw-place transfers are gone; if a later stage iteration no longer
+/// delivers the fields, the transfers come back and the moves go — they are
+/// recomputed from `store_fields`, not accumulated.
+#[test]
+fn w6a_r583_field_moves_follow_the_current_delivery() {
+    let _frame = frame_locks();
+    bst_frame();
+    let observed = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decide");
+        let subjects: Vec<_> = table.entries.iter().map(|(s, _)| s.clone()).collect();
+        let mut certificates = table.return_certificates.clone();
+        let state = |certificates: &super::decision::return_certificate::Certificates| {
+            let insert = certificates
+                .callees
+                .values()
+                .find(|c| c.callee_path == "insert")
+                .expect("insert is certified");
+            (
+                insert.field_moves.len(),
+                insert
+                    .site_edits
+                    .iter()
+                    .filter(|(_, edit)| edit.receipt == "return-certificate-store-transfer")
+                    .count(),
+            )
+        };
+        let delivered = state(&certificates);
+        let changed = super::decision::return_certificate::withdraw_delivered_owned_fields(
+            &mut certificates,
+            tcx,
+            &subjects,
+            &|_, _| false,
+            &|_, _| None,
+        );
+        (delivered, changed, state(&certificates))
+    })
+    .expect("fixture compiles");
+    super::test_model_override::clear();
+    assert_eq!(observed, ((2, 0), true, (0, 2)));
+}

@@ -105,6 +105,10 @@ pub(crate) struct Certificate {
     /// The stores the field transaction moves: their functions follow this
     /// certificate's class.
     pub(crate) field_moves: Vec<(LocalDefId, Span)>,
+    /// The raw-place transfer of every store, as certified: a store leaves
+    /// `site_edits` while its field is delivered and returns when it is not
+    /// (`withdraw_delivered_owned_fields` recomputes, R583-7).
+    pub(crate) store_transfers: Vec<(LocalDefId, BoxExprEdit)>,
     pub(crate) receipts: Vec<String>,
 }
 
@@ -130,6 +134,9 @@ pub(crate) struct Certificates {
 /// R561-4 W1: the receipt a re-seated receiver's plan carries; the C1 chain
 /// reads it to tell a re-seat from a use of the moved owner.
 pub(crate) const RESEAT_RECEIPT: &str = "reseat-receiver generations=";
+
+/// A certified call stored into a raw place: `Box::into_raw` at the store.
+const STORE_TRANSFER: &str = "return-certificate-store-transfer";
 
 /// R579-4 R1: the receipt a re-rendered struct-fill plan carries.
 const RERENDERED: &str = "return-certificate-struct-fill-rerendered";
@@ -249,25 +256,33 @@ pub(crate) fn withdraw_delivered_owned_fields(
     let mut changed = false;
     let mut rerendered: FxHashSet<LocalDefId> = FxHashSet::default();
     for c in certificates.callees.values_mut() {
-        let moved: Vec<(LocalDefId, Span)> = c
+        // R583-7: recomputed against THIS iteration's delivery, never
+        // accumulated — a field a later iteration refuses takes its store's
+        // raw transfer back.
+        let moves: Vec<(LocalDefId, Span)> = c
             .store_fields
             .iter()
-            .filter(|(f, span, (did, index))| {
-                delivered(*did, *index) && !c.field_moves.contains(&(*f, *span))
-            })
+            .filter(|(_, _, (did, index))| delivered(*did, *index))
             .map(|(f, span, _)| (*f, *span))
             .collect();
-        for (f, span) in moved {
-            c.site_edits.retain(|(g, edit)| {
-                !(*g == f
-                    && edit.span == span
-                    && edit.receipt == "return-certificate-store-transfer")
-            });
-            c.receipts.push(format!(
-                "field-store-move site={}",
-                super::emitability::EmitabilityFacts::site(tcx, span)
-            ));
-            c.field_moves.push((f, span));
+        if moves != c.field_moves {
+            c.site_edits
+                .retain(|(_, edit)| edit.receipt != STORE_TRANSFER);
+            c.site_edits.extend(
+                c.store_transfers
+                    .iter()
+                    .filter(|(f, edit)| !moves.contains(&(*f, edit.span)))
+                    .cloned(),
+            );
+            c.receipts
+                .retain(|receipt| !receipt.starts_with("field-store-move "));
+            c.receipts.extend(moves.iter().map(|(_, span)| {
+                format!(
+                    "field-store-move site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *span)
+                )
+            }));
+            c.field_moves = moves;
             changed = true;
         }
         if !c
@@ -2922,6 +2937,7 @@ fn certify<'tcx, 's>(
         adopted: sources.adopted.iter().map(|(h, _)| (callee, *h)).collect(),
         store_fields: Vec::new(),
         field_moves: Vec::new(),
+        store_transfers: Vec::new(),
         receipts: Vec::new(),
     };
     let let_receivers = receivers_of.get(&callee).map(Vec::as_slice).unwrap_or(&[]);
@@ -3136,7 +3152,7 @@ fn certify<'tcx, 's>(
                 BoxExprEdit {
                     span: *span,
                     replacement,
-                    receipt: "return-certificate-store-transfer",
+                    receipt: STORE_TRANSFER,
                 },
             ));
             admitted_calls.push(*span);
@@ -3202,6 +3218,11 @@ fn certify<'tcx, 's>(
     certificate.receivers = planned_receivers;
     certificate.returned_receivers = returned_receivers;
     certificate.returning_callers = returning_callers;
+    certificate.store_transfers = site_edits
+        .iter()
+        .filter(|(_, edit)| edit.receipt == STORE_TRANSFER)
+        .cloned()
+        .collect();
     certificate.site_edits = site_edits;
     certificate.store_fields = store_fields;
     certificate.transfers = transfers;
