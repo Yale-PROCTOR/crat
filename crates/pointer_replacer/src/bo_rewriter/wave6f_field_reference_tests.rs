@@ -609,31 +609,36 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
         "deleteNode's formal is either raw or the re-seated owner:\n{source}"
     );
-    let bridges = |moves: usize, stores: usize| {
+    let bridges = |moves: usize, stores: usize, certified: usize| {
         format!(
-            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;count-companion="
+            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;certified-move={certified};count-companion="
         )
     };
     // R561-6: ownership-fields' `67df47077` types the moved-out owner of a
     // freed container (`deleteNode`'s `temp` / `temp_0`) as `Option<Box<node>>`,
     // so the take is no longer a raw move: re-seated, raw-move is 0.
-    let ((left_moves, left_stores), (right_moves, right_stores)) = if reseated {
-        ((0, 1), (0, 1))
-    } else {
-        ((3, 3), (4, 4))
-    };
+    let ((left_moves, left_stores, left_certified), (right_moves, right_stores, right_certified)) =
+        if reseated {
+            // R583-7: `deleteNode`'s result certifies (wave-6a R579-4), so its
+            // stores are certified moves — one into `left`, two into `right`.
+            // `insert` does not certify in this fixture (its `newNode` stays
+            // raw here), so its stores keep `from_raw`.
+            ((0, 1, 1), (0, 1, 2))
+        } else {
+            ((3, 3, 0), (4, 4, 0))
+        };
     assert_eq!(
         observed.bridges,
         vec![
             (
                 "node".to_owned(),
                 "left".to_owned(),
-                bridges(left_moves, left_stores)
+                bridges(left_moves, left_stores, left_certified)
             ),
             (
                 "node".to_owned(),
                 "right".to_owned(),
-                bridges(right_moves, right_stores)
+                bridges(right_moves, right_stores, right_certified)
             ),
         ]
     );
@@ -1144,7 +1149,7 @@ fn w6f_thin_owned_field_free_site_transfers_and_memcpy_takes_a_raw_view() {
         vec![(
             "Holder".to_owned(),
             "slot_".to_owned(),
-            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;count-companion=".to_owned()
+            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;certified-move=0;count-companion=".to_owned()
         )]
     );
     let (source, emitted_count, reverted) = emitted_source(&outcome);
@@ -3385,4 +3390,104 @@ fn main_the_seam_plans_no_glue_over_an_owned_field_argument() {
             .any(|receipt| receipt.starts_with("owned-field-renders:node.right")),
         "{receipts:?}"
     );
+}
+
+/// The F-c fixture (R583-7): `holder.item` is an owned field; `make_item`
+/// returns a fresh `item` and certifies (`Box<item>`); `attach`'s ONLY site
+/// of the field is the certified-call store; `value` reads it, `release`
+/// frees it. `make_item` is not an owner of `holder.item`.
+const CERTIFIED_STORE: &str = include_str!("wave6f_fixture_certified_store.rs");
+
+/// Witness 41 (R583-7, report 071) — **a certified-call store that is a
+/// function's ONLY site of an owned field puts that function in the
+/// field's withdrawal key; its revert, from any cause, withdraws the
+/// transaction and the tree stays raw.**
+///
+/// `apply_wraps` applies every edit of an ACTIVE transaction whatever the
+/// edit owner's own revert status. A `from_raw` store types against a raw
+/// callee, so it may stay outside the key; a certified move
+/// (`Some(make_item(v))`) types only while the certificate is applied, and a
+/// certificate is dropped once any owner of it — the storer included — is
+/// reverted. So the storer must be a dependent owner (`finalize`'s
+/// certified-call arm, ≈ 3860). Without it the key here is EMPTY and an
+/// unrelated revert of `attach` ships `Some(make_item(v))` against a raw
+/// `make_item`: the program degrades (`recovery-degraded`, no compiling
+/// subset). The revert is forced through the loop's own seed
+/// (`CRAT_W6F_FORCE_REVERT`), the "unrelated cause".
+#[test]
+fn w6f_a_certified_store_alone_joins_the_key_and_its_revert_withdraws() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    let frame = || {
+        super::test_model_override::set(
+            "w6f-certified-store-frame",
+            vec![("holder".to_owned(), 0, SlotKind::Owning)],
+            Vec::new(),
+        )
+    };
+    // The key and the receipt: `attach` is the ONLY dependent owner, and the
+    // bridges column counts the one certified move.
+    frame();
+    let row = field_receipt_row(CERTIFIED_STORE, "holder", "item");
+    super::test_model_override::clear();
+    assert_eq!(
+        (row[2].as_str(), row[3].as_str(), row[11].as_str()),
+        ("applied", "opt-box", "attach"),
+        "{row:?}"
+    );
+    assert!(row[8].contains(";certified-move=1;"), "{row:?}");
+    // The production refresh reads the forced revert as a withdrawal.
+    frame();
+    let status = refreshed_revert_status(CERTIFIED_STORE, "holder", "item", &["attach"], None);
+    super::test_model_override::clear();
+    assert_eq!(status, "withdrawn");
+
+    let run = |force: &str| -> RewriteOutcome {
+        frame();
+        if !force.is_empty() {
+            // SAFETY: the frame lock serializes the witnesses that set env.
+            unsafe { std::env::set_var("CRAT_W6F_FORCE_REVERT", force) };
+        }
+        let outcome = emitted_with("w6f-certified-store", CERTIFIED_STORE, &|_| {});
+        unsafe { std::env::remove_var("CRAT_W6F_FORCE_REVERT") };
+        super::test_model_override::clear();
+        outcome
+    };
+    // Unforced: the certified move delivers.
+    let base = run("");
+    let (source, emitted_count, reverted) = emitted_source(&base);
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!((emitted_count, reverted), (3, 0), "{source}");
+    for needle in [
+        "pub item: Option<Box<item>>,",
+        "pub unsafe extern \"C\" fn make_item(mut v: i32) -> Box<item> {",
+        "(*h).item = Some(make_item(v));",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    // Forced: `attach` reverts for no reason of the field's; the transaction
+    // withdraws with it, the callee follows, and the tree compiles raw. (At
+    // `4ff73addb` `make_item` follows through a round-1 E0308 at its own
+    // `return p;` — the certificate's local `Box` plan outlives its withheld
+    // signature when a storer reverts; wave-6a's side, reported in 072. The
+    // final tree and the count are the same either way.)
+    let forced = run("attach");
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        ..
+    } = &forced
+    else {
+        panic!("an unrelated revert of the certified storer degraded the program");
+    };
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(*reverted_count, 2, "attach and make_item\n{source}");
+    for needle in [
+        "pub item: *mut item,",
+        "pub unsafe extern \"C\" fn make_item(mut v: i32) -> *mut item {",
+        "(*h).item = make_item(v);",
+    ] {
+        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
+    }
+    assert!(!flat.contains("Some(make_item"), "{source}");
 }

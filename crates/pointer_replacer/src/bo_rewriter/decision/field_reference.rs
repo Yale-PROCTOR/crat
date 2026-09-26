@@ -355,6 +355,9 @@ pub(crate) const WRAP_PLACE: &str = "__crat_place";
 /// / source-proved deallocator, and through a user-named allocator contract.
 pub(crate) const DEALLOC_TRANSFER: &str = "owned-field-dealloc-transfer";
 pub(crate) const DEALLOC_TRANSFER_CONTRACT: &str = "owned-field-dealloc-transfer-contract";
+/// R579-4 C2: a certified callee's result stored into an owned field through
+/// a safe base — the owner moved in, no `from_raw` bridge (R583-7 counts it).
+pub(crate) const CERTIFIED_MOVE: &str = "owned-field-store-certified-move";
 
 /// A function's signature plan: the generated lifetime, the parameters that
 /// carry it and whether the return type mentions the struct.
@@ -662,7 +665,7 @@ impl FieldTransactions {
                     .count()
             };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};count-companion={}\t-\t{}\t{}\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};certified-move={};count-companion={}\t-\t{}\t{}\n",
                 t.struct_path,
                 t.field_name,
                 t.delivered_form_key(),
@@ -684,6 +687,11 @@ impl FieldTransactions {
                 count(DEALLOC_TRANSFER) + count(DEALLOC_TRANSFER_CONTRACT),
                 count(DEALLOC_TRANSFER_CONTRACT),
                 t.value_instances,
+                // R583-7: a certified callee's owner moved into the field
+                // through a safe base — no `from_raw` bridge. Through a raw
+                // base the same move is `owned-field-raw-store` (the PLACE's
+                // kind, which the AST layer keys on) and counts there.
+                count(CERTIFIED_MOVE),
                 t.count_companions
                     .iter()
                     .map(|c| format!(
@@ -4252,7 +4260,7 @@ fn owned_sites<'t>(
                         span: site.span,
                         replacement,
                         kind: if certified_move {
-                            "owned-field-store-certified-move"
+                            CERTIFIED_MOVE
                         } else {
                             "owned-field-store"
                         },
