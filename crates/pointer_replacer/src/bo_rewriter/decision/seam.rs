@@ -3276,6 +3276,20 @@ pub(crate) struct BoxBaseViewRetirement {
     pub(crate) argument: Span,
 }
 
+/// **R575-6** — a call `counted_void::aliased_storage_twin` refused: a converted
+/// position's storage root is also a raw position's root, the callee is no leaf,
+/// so its pristine raw twin cannot be emitted and every position holds
+/// `SiteOverlap`. Recorded so the post-seam withdrawal keys on exactly this gate
+/// and never on a look-alike `SiteOverlap`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AliasedTwinRefusal {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) call_span: Span,
+    /// The converted positions: the callee's parameter index and its subject.
+    pub(crate) converted: Vec<(usize, HirId)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
     /// **R544-3** — degraded partners whose blocked-class D4 was paid by a pair
@@ -3354,6 +3368,9 @@ pub(crate) struct SeamPlan {
     /// (`box-expression:retired-under-base-view`) — applied to the table after
     /// every synthesis, which is what both the planner and the AST read.
     pub box_base_view_retirements: Vec<BoxBaseViewRetirement>,
+    /// **R575-6** — the calls the aliased-storage twin refused, read by the
+    /// post-seam withdrawal in `finish_decide`.
+    pub aliased_twin_refusals: Vec<AliasedTwinRefusal>,
     /// Typed PAIR sites, including zero-syntax and blocked roles, retained for
     /// signature-class completeness rather than reconstructed from TSV.
     pub pair_sites: Vec<super::co_conversion::PairSiteDecision>,
@@ -4968,14 +4985,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                     }
                 }
             }
-            if let Some(Ok(indices)) = &aliased_twin {
-                super::counted_void::record_alias_twin(
+            match &aliased_twin {
+                Some(Ok(indices)) => super::counted_void::record_alias_twin(
                     table,
                     &mut counted_void_calls,
                     site,
                     *callee,
                     indices,
-                );
+                ),
+                Some(Err(_)) => plan.aliased_twin_refusals.push(AliasedTwinRefusal {
+                    caller: site.caller,
+                    callee: *callee,
+                    call_span: site.span,
+                    converted: positions
+                        .iter()
+                        .filter(|pos| pos.expected != Form::Raw)
+                        .filter_map(|pos| {
+                            param_key
+                                .get(&(*callee, pos.index))
+                                .map(|(_, hir)| (pos.index, *hir))
+                        })
+                        .collect(),
+                }),
+                None => {}
             }
             // A converted `&mut` place beside an argument that READS the same
             // local: the unconverted arguments are hoisted before the call

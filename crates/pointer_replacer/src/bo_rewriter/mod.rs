@@ -192,6 +192,8 @@ mod a5_inner_argument_tests;
 mod additive_tests;
 #[cfg(test)]
 mod address_view_tests;
+#[cfg(test)]
+mod aliased_storage_withdrawal_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.
@@ -8086,6 +8088,13 @@ fn finish_decide<'tcx>(
     > = std::collections::BTreeMap::new();
     // R586-2: the sole-origin formals decided mutable, grown by the fixpoint.
     let mut sole_origin_upgrades = rustc_hash::FxHashSet::default();
+    // R575-6: subjects the aliased-storage twin's refusals withdrew to raw, with
+    // the refused calls. Learned per profile like the A5 roles, and grows only
+    // within one, so the re-derivation below terminates.
+    let mut aliased_storage_withdrawn: rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        String,
+    > = rustc_hash::FxHashMap::default();
     let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
     let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
     let a5_role_bound = facts
@@ -8103,6 +8112,7 @@ fn finish_decide<'tcx>(
         if a5_role_profile.as_ref() != Some(&profile) {
             a5_roles.clear();
             a5_role_proofs.clear();
+            aliased_storage_withdrawn.clear();
             a5_role_profile = Some(profile);
         }
         let mut ctors = ctors.clone();
@@ -8455,6 +8465,8 @@ fn finish_decide<'tcx>(
         }
         // R586-2: the sole-origin upgrades, on the table the ladder settled.
         decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);
+        // R575-6: on the settled table, before anything is planned from it.
+        apply_aliased_storage_withdrawals(tcx, &mut table, &aliased_storage_withdrawn);
         // **After the re-decide, deliberately.** `decide` returns a fresh table,
         // so anything recorded on the old one is gone; the seam's C-string
         // licences are recomputed here, on whatever table the ladder settled.
@@ -8795,6 +8807,13 @@ fn finish_decide<'tcx>(
             &coconv,
             &mut table,
         );
+        // R575-6: read the refusals off the SETTLED seams only. Before A5's
+        // fallback roles converge a call its PAIR row will own (a raw-view role)
+        // still reaches the twin's gate, and a withdrawal learned there is wrong
+        // for the settled table (brotli's `WriteMetadataHeader`).
+        if record_aliased_storage_withdrawals(tcx, &table, &mut aliased_storage_withdrawn) {
+            continue;
+        }
         let returned_child_mut_bindings = table
             .seams
             .edits
@@ -13325,5 +13344,112 @@ fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
                     .push("box-expression:retired-under-base-view".to_owned());
             }
         }
+    }
+}
+
+/// **R575-6 — the aliased-storage withdrawal, read off the settled synthesis.** A callee
+/// whose calls `counted_void::aliased_storage_twin` refused (a converted position
+/// beside a raw alias of its storage root, and no leaf for the pristine twin) is
+/// held on every such call. When the callee's class has exactly ONE safe subject
+/// and every refused call converts only that subject, the hold protects nothing
+/// that delivers: the subject is withdrawn to raw, and its callers' arguments
+/// coerce to it exactly as the input's did. Returns whether a subject was newly
+/// withdrawn, so the caller re-derives once.
+fn record_aliased_storage_withdrawals(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    withdrawn: &mut rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        String,
+    >,
+) -> bool {
+    let mut by_callee = std::collections::BTreeMap::<
+        u32,
+        (
+            rustc_hir::def_id::LocalDefId,
+            Vec<&decision::seam::AliasedTwinRefusal>,
+        ),
+    >::new();
+    for refusal in &table.seams.aliased_twin_refusals {
+        by_callee
+            .entry(refusal.callee.local_def_index.as_u32())
+            .or_insert((refusal.callee, Vec::new()))
+            .1
+            .push(refusal);
+    }
+    let mut grew = false;
+    for (callee, refusals) in by_callee.into_values() {
+        let mut safe = table.entries.iter().filter(|(subject, decision)| {
+            subject.fn_did == callee
+                && match decision {
+                    decision::Decision::Degraded(_) => false,
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_) => true,
+                }
+        });
+        let (Some((only, _)), None) = (safe.next(), safe.next()) else {
+            continue;
+        };
+        if !refusals.iter().all(|refusal| {
+            !refusal.converted.is_empty()
+                && refusal
+                    .converted
+                    .iter()
+                    .all(|(_, hir_id)| *hir_id == only.hir_id)
+        }) {
+            continue;
+        }
+        let seams = refusals
+            .iter()
+            .map(|refusal| {
+                format!(
+                    "{}@{}",
+                    tcx.def_path_str(refusal.caller.to_def_id()),
+                    decision::emitability::EmitabilityFacts::site(tcx, refusal.call_span)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        grew |= withdrawn
+            .insert((only.fn_did, only.hir_id), seams)
+            .is_none();
+    }
+    grew
+}
+
+/// **R575-6** — the withdrawals recorded so far, applied to a freshly decided
+/// table before anything is planned from it.
+fn apply_aliased_storage_withdrawals(
+    tcx: TyCtxt<'_>,
+    table: &mut decision::DecisionTable,
+    withdrawn: &rustc_hash::FxHashMap<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId), String>,
+) {
+    for (subject, decision) in &mut table.entries {
+        let Some(seams) = withdrawn.get(&(subject.fn_did, subject.hir_id)) else {
+            continue;
+        };
+        // A subject degraded on its own reason keeps that reason.
+        match decision {
+            decision::Decision::Degraded(_) => continue,
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => {}
+        }
+        *decision = decision::Decision::Degraded(decision::Degradation {
+            subject: subject.label.clone(),
+            site: decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            reason: decision::DegradeReason::AliasedStorageWithdrawn {
+                seams: seams.clone(),
+            },
+        });
     }
 }

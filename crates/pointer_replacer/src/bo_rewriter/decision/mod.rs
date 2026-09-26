@@ -871,6 +871,15 @@ pub(crate) enum DegradeReason {
     /// the *binding mode*, one edit away, where a genuinely unsupported use is
     /// a missing capability. Two different owed items must not read as one.
     OptNeedsMutBinding,
+    /// **R575-6 — withdrawn to raw because the aliased-storage twin refused its
+    /// callers.** The subject is its function's only safe one, and every refused
+    /// call converts it beside a raw alias of its storage root (`f(s, &mut
+    /// (*s).field)` with `s` raw) into a callee that is no leaf. The hold protected
+    /// nothing that delivers; raw, the arguments coerce exactly as the input's
+    /// did. `seams` names the refused calls.
+    AliasedStorageWithdrawn {
+        seams: String,
+    },
 }
 
 impl DegradeReason {
@@ -914,6 +923,7 @@ impl DegradeReason {
             DegradeReason::OptUseUnsupported => "opt-use-unsupported",
             DegradeReason::OptLocalConstruction => "opt-local-construction",
             DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
+            DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
             // Names the indirection: the class's key is payload, reported by
@@ -934,6 +944,7 @@ impl DegradeReason {
             DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
             DegradeReason::BoxFailure { failure } => failure.detail(),
             DegradeReason::SignatureClassHeld { reason } => reason.clone(),
+            DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
             }
