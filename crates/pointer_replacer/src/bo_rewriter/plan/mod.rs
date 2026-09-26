@@ -1582,6 +1582,14 @@ pub(crate) fn finalize_signature_classes(
             {
                 (false, None)
             }
+            // R584-5: withdrawn to raw on the settled table (the aliased-storage
+            // twin's refusal). Its arm requirements are co-conversion's, from
+            // before the withdrawal; its raw form is the input's, so it neither
+            // requires an arm of its class nor blocks it.
+            Decision::Degraded(super::decision::Degradation {
+                reason: super::decision::DegradeReason::AliasedStorageWithdrawn { .. },
+                ..
+            }) => continue,
             Decision::Degraded(record) => (false, Some(record.reason.key())),
         };
         if emits {

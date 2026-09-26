@@ -78,8 +78,15 @@ fn line(key: &str, row: &Row) -> String {
 }
 
 fn frame() -> super::E1Capture {
+    frame_of("CRAT_R575_BROTLI")
+}
+
+/// The one-iteration capture of the program whose substrate `lib.rs` the
+/// variable names (its configured exposure row is the explicit-empty one, as
+/// brotli's and heman's are).
+fn frame_of(var: &str) -> super::E1Capture {
     let root = std::path::PathBuf::from(
-        std::env::var("CRAT_R575_BROTLI").expect("CRAT_R575_BROTLI: brotli's substrate lib.rs"),
+        std::env::var(var).unwrap_or_else(|_| panic!("{var}: the program's substrate lib.rs")),
     );
     assert_eq!(
         std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref(),
@@ -279,6 +286,113 @@ fn r575_6_brotli_out_size_is_withdrawn_and_encode_data_is_ready() {
         Some(row) if row.decision == "ref" && row.exclusion == "-" => {}
         Some(row) => failures.push(format!("control: {}", line(PAIR_OWNED, row))),
         None => failures.push(format!("control: no row for {PAIR_OWNED}")),
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// **R584-5 — a withdrawn subject does not hold its class.** The withdrawal
+/// happens on the settled table, after co-conversion gave the subject its arm
+/// requirements. heman's four withdrawn normalizers (batch 42:
+/// `held:blocked-subject:aliased-storage-withdrawn` plus
+/// `missing-required-arm:c`) are the cheap frame for brotli's
+/// `DecodeVarLenUint8`. Their classes, by this substrate's `LocalDefIndex`:
+const HEMAN_WITHDRAWN: [(u32, &str); 4] = [
+    (259, "src::kazmath::plane::kmPlaneNormalize"),
+    (310, "src::kazmath::quaternion::kmQuaternionNormalize"),
+    (408, "src::kazmath::vec2::kmVec2Normalize"),
+    (456, "src::kazmath::vec3::kmVec3Normalize"),
+];
+/// The control: `kmAABB3Scale`'s `pOut#1` is degraded `escapes-via-return`
+/// beside a converting `pIn#2`, and that degradation still holds its class.
+const HEMAN_CONTROL: u32 = 64;
+
+#[test]
+#[ignore = "R584-5: heman's frame; run by hand with CRAT_R584_HEMAN and the landed frame's env"]
+fn r584_5_heman_withdrawn_classes_are_not_held() {
+    let capture = frame_of("CRAT_R584_HEMAN");
+    let rows = rows(&capture.subject_receipt);
+    // The plan's per-subject arm outcome (`atomic_arm_outcomes_tsv`), read by
+    // column name: a held class names its hold in `blocking_reason`.
+    let outcomes = &capture.raw_boundary_artifacts.arm_outcomes;
+    let mut lines = outcomes.lines();
+    let header = lines
+        .next()
+        .unwrap_or_default()
+        .split('\t')
+        .collect::<Vec<_>>();
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|c| *c == name)
+            .unwrap_or_else(|| panic!("arm outcomes lack `{name}`: {header:?}"))
+    };
+    let (owner_at, required_at, terminal_at, reason_at) = (
+        column("owner"),
+        column("required_arms"),
+        column("terminal"),
+        column("blocking_reason"),
+    );
+    let arm_rows = lines
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        // Rows carry one column more than the header names (R471-2's ordinals).
+        .filter(|f| f.len() >= header.len())
+        .collect::<Vec<_>>();
+    let of = |owner: &str| {
+        arm_rows
+            .iter()
+            .filter(|f| f[owner_at] == owner)
+            .map(|f| {
+                format!(
+                    "required={} terminal={} reason={}",
+                    f[required_at], f[terminal_at], f[reason_at]
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut record = Vec::new();
+    let mut failures = Vec::new();
+    for (class, owner) in HEMAN_WITHDRAWN {
+        let withdrawn = rows
+            .iter()
+            .filter(|(_, row)| row.owner == owner && row.reason == "aliased-storage-withdrawn")
+            .map(|(key, row)| line(key, row))
+            .collect::<Vec<_>>();
+        let outcome = of(owner);
+        record.push(format!("== {class} {owner}"));
+        record.extend(withdrawn.iter().cloned());
+        record.extend(outcome.iter().cloned());
+        // The frame still withdraws the subject (084's hook, unchanged) …
+        if withdrawn.len() != 1 {
+            failures.push(format!("witness: {owner} withdraws {withdrawn:?}"));
+        }
+        // … and its class is held neither for it nor for the arm it no longer needs.
+        let held = outcome
+            .iter()
+            .filter(|o| {
+                o.contains("aliased-storage-withdrawn") || o.contains("missing-required-arm")
+            })
+            .collect::<Vec<_>>();
+        if !held.is_empty() {
+            failures.push(format!(
+                "witness: {owner}'s class is held for the withdrawal: {held:?}"
+            ));
+        }
+    }
+    let control = of("src::kazmath::aabb3::kmAABB3Scale");
+    record.push(format!(
+        "== control {HEMAN_CONTROL} src::kazmath::aabb3::kmAABB3Scale"
+    ));
+    record.extend(control.iter().cloned());
+    if !control
+        .iter()
+        .any(|o| o.contains("blocked-subject:escapes-via-return"))
+    {
+        failures.push(format!(
+            "control: kmAABB3Scale is no longer held on escapes-via-return: {control:?}"
+        ));
+    }
+    if let Ok(out) = std::env::var("CRAT_R584_OUT") {
+        std::fs::write(out, record.join("\n") + "\n").expect("write the witness record");
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
