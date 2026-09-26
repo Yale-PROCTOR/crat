@@ -10972,7 +10972,9 @@ unsafe extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
 
-pub unsafe fn pass(_x: *mut core::ffi::c_void) {}
+// This fixture requires an unclassified contract to retain its mixed core.
+unsafe extern "C" { fn retain_for_policy_fixture(x: *mut core::ffi::c_void); }
+pub unsafe fn pass(x: *mut core::ffi::c_void) { retain_for_policy_fixture(x); }
 
 pub unsafe fn source_side() -> *mut core::ffi::c_void {
     let m = unsafe { malloc(4) };
@@ -11129,7 +11131,9 @@ unsafe extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
 
-pub unsafe fn pass(_x: *mut core::ffi::c_void) {}
+// This fixture requires an unclassified contract to retain its mixed core.
+unsafe extern "C" { fn retain_for_policy_fixture(x: *mut core::ffi::c_void); }
+pub unsafe fn pass(x: *mut core::ffi::c_void) { retain_for_policy_fixture(x); }
 
 pub unsafe fn source_side() -> *mut core::ffi::c_void {
     let m = unsafe { malloc(4) };

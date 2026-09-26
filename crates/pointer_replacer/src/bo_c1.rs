@@ -35324,3 +35324,178 @@ fn r492_1_the_pair_columns_survive_a_typed_failure() {
         "exactly two callers: the failure return and the ordinary path"
     );
 }
+
+/// R385-1: the forced-assignment probe. Assert the kinds the user's goal needs
+/// on a corpus program and report the MINIMAL UNSAT core by rule family, so the
+/// missing LICENCES are measured before any is built.
+///
+/// `CRAT_R385_PROGRAM` names the program's `lib.rs`; `CRAT_R385_TARGETS` is a
+/// comma-separated `slot-key=own|ref` list. Print-only: no production caller, no
+/// model recorded, and the default arm does not reach it.
+#[test]
+#[ignore = "forced-assignment core probe; reads the program and targets from the environment"]
+fn r385_forced_assignment_probe() {
+    use z3::{SatResult, ast::Bool};
+
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, coherence::add_coherence, crate_slots::CrateSlots,
+        emit_crate_ownership_constraints, origins::compute_origins, solver::KindSolver,
+    };
+
+    // R325-1: the first `eprintln!` under `--nocapture` shares the test-name line.
+    eprintln!();
+    let path = std::env::var("CRAT_R385_PROGRAM").expect("CRAT_R385_PROGRAM names a lib.rs");
+    let targets: Vec<(String, String)> = std::env::var("CRAT_R385_TARGETS")
+        .expect("CRAT_R385_TARGETS is slot-key=own|ref, comma separated")
+        .split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let (key, kind) = entry
+                .trim()
+                .split_once('=')
+                .expect("each target is slot-key=own|ref");
+            (key.to_owned(), kind.to_owned())
+        })
+        .collect();
+
+    ::utils::compilation::run_compiler_on_path(std::path::Path::new(&path), |tcx| {
+        // era-5c: `CRAT_R385_WORLD=closed` runs the probe inside the attested
+        // closed call world the corpus jobs run in (`CRAT_BO_A5_ATTESTATION=
+        // frozen_benchmark_graph`), so licences that need it read as licensed
+        // rather than pending. Default: the unknown world, as before.
+        let _world = (std::env::var("CRAT_R385_WORLD").as_deref() == Ok("closed")).then(|| {
+            crate::analyses::borrow_ownership::licensing::stack_entry::enter_world(Some(
+                crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            ))
+        });
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        // Family granularity: one assumption marker per labelled family, which is
+        // what makes the core readable as "which rule refuses", not "which clause".
+        let solver = if std::env::var("CRAT_R385_GRANULARITY").as_deref() == Ok("assertion") {
+            // Per-assertion tracking: the core names the exact ROWS,
+            // not just the families they belong to.
+            KindSolver::new_tracked(&slots)
+        } else {
+            KindSolver::new_family_tracked(&slots)
+        };
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        let tracker = solver.tracker().expect("tracked");
+        tracker.set_context("coherence");
+        for &did in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            add_coherence(&solver, &slots, did, &body);
+        }
+        let facts = solver.ownership_facts().expect("frozen facts");
+        if let Some(frozen) = facts.licensing.as_ref() {
+            for proof in &frozen.field_support {
+                eprintln!(
+                    "R385 FIELD {} supported={} holds={:?} classified={:?}",
+                    proof.field_key,
+                    proof.supported(),
+                    proof
+                        .holds
+                        .iter()
+                        .map(|h| format!("{:?}", h.reason))
+                        .collect::<Vec<_>>(),
+                    proof.classified
+                );
+            }
+        }
+        let mut missing = Vec::new();
+        tracker.set_context("r385-forced-assignment");
+        for (key, kind) in &targets {
+            let Some(&slot) = facts.slot_refs.get(key) else {
+                missing.push(key.clone());
+                continue;
+            };
+            match kind.as_str() {
+                "own" => solver.assert_owning(slot),
+                "ref" => solver.assert_ref(slot),
+                other => panic!("target kind must be own or ref; got {other:?}"),
+            }
+            eprintln!("R385 target {key}={kind} slot={slot:?}");
+        }
+        for key in &missing {
+            eprintln!("R385 target {key} NOT-A-SLOT");
+        }
+        // R390-2 separation probe: `CRAT_R385_DROP` is a comma-separated list of
+        // substrings; a track whose label contains one is left OUT of the
+        // assumptions, which relaxes exactly that constraint. The literal
+        // `sink-selector` drops the free/realloc sink selectors.
+        let drops: Vec<String> = std::env::var("CRAT_R385_DROP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .collect();
+        let mut assumptions: Vec<Bool> = tracker
+            .tracks()
+            .into_iter()
+            .filter(|track| {
+                let label = tracker.label_of(track).unwrap_or_default();
+                let keep = !drops
+                    .iter()
+                    .any(|d| d != "sink-selector" && label.contains(d));
+                if !keep {
+                    eprintln!("R385 DROPPED {label}");
+                }
+                keep
+            })
+            .collect();
+        assumptions.extend(
+            selectors
+                .all()
+                .iter()
+                .filter(|literal| {
+                    !(drops.iter().any(|d| d == "sink-selector") && selectors.is_sink(literal))
+                })
+                .cloned(),
+        );
+        match solver.optimize().check(&assumptions) {
+            SatResult::Sat => eprintln!(
+                "R385 VERDICT=SAT — the assignment is admissible under the hard system; \
+                 what settles the slots lower is the objective's preference, not a rule"
+            ),
+            SatResult::Unknown => eprintln!("R385 VERDICT=UNKNOWN"),
+            SatResult::Unsat => {
+                let core = solver.optimize().get_unsat_core();
+                let mut by_family: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for literal in &core {
+                    let label = tracker.label_of(literal).unwrap_or_else(|| {
+                        if selectors.is_sink(literal) {
+                            "sink-selector".to_owned()
+                        } else {
+                            "source-selector".to_owned()
+                        }
+                    });
+                    let family =
+                        crate::analyses::borrow_ownership::solver::core_label_family(&label)
+                            .unwrap_or("UNFAMILIED")
+                            .to_owned();
+                    by_family.entry(family).or_default().push(label);
+                }
+                eprintln!(
+                    "R385 VERDICT=UNSAT core={} families={}",
+                    core.len(),
+                    by_family.len()
+                );
+                for (family, labels) in &by_family {
+                    let mut labels = labels.clone();
+                    labels.sort();
+                    labels.dedup();
+                    eprintln!("R385 FAMILY {family} rows={} {labels:?}", labels.len());
+                }
+            }
+        }
+    })
+    .unwrap_or_else(|e| e.raise());
+}
