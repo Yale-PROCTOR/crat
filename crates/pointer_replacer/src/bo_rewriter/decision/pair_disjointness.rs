@@ -463,8 +463,16 @@ impl PairDisjointnessIndex {
         let allocators = allocator_wrappers(tcx, &local_functions, indirect_calls);
         // R479-4a: needs the wrapper set, so it is derived after it.
         let fresh_fields = allocator_data_fields(tcx, &local_functions, &allocators);
+        // R601-4 (G4): needs the admitted fields, so it is derived after them.
+        let getters = field_getters(tcx, &local_functions, &allocators, &fresh_fields);
         #[cfg(test)]
         if std::env::var_os("W6P_DUMP_FIELDS").is_some() {
+            for (did, (position, (_, field))) in &getters {
+                println!(
+                    "W6P_GETTER\t{}\t{position}\t{field}",
+                    tcx.def_path_str(*did)
+                );
+            }
             for ((adt, field), fact) in &fresh_fields {
                 println!(
                     "W6P_FIELD\t{}\t{field}\t{:?}{}",
@@ -500,7 +508,7 @@ impl PairDisjointnessIndex {
             let typeck = tcx.typeck(caller);
             let (mut classes, why, prefixes) =
                 classify_locals(tcx, typeck, body, &allocators, caller);
-            carry_fresh_field_reads(tcx, typeck, body, &mut classes, &fresh_fields);
+            carry_fresh_field_reads(tcx, typeck, body, &mut classes, &fresh_fields, &getters);
             binding_roots.insert(caller.local_def_index.as_u32(), classes.clone());
             let mut collector = CallCollector {
                 tcx,
@@ -3032,6 +3040,10 @@ fn classify_locals<'tcx>(
 /// * every assignment, the initializer included, is null or a read `X.F` of
 ///   ONE admitted `F` out of ONE base object.
 ///
+/// R601-4 (G4): a call of a [`field_getters`] callee is the same read one call
+/// boundary away — `storage_0 = GetBrotliStorage(s, n)` reads `(*s).storage_` —
+/// and its base object is the root of the argument at the getter's formal.
+///
 /// Two fields, two bases, or any other source leave it `Unknown`.
 fn carry_fresh_field_reads<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -3039,6 +3051,7 @@ fn carry_fresh_field_reads<'tcx>(
     body: &'tcx rustc_hir::Body<'tcx>,
     classes: &mut FxHashMap<HirId, RootClass>,
     fresh_fields: &FxHashMap<(DefId, Symbol), FreshFieldFact>,
+    getters: &FxHashMap<DefId, (usize, (DefId, Symbol))>,
 ) {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Reads {
@@ -3055,6 +3068,7 @@ fn carry_fresh_field_reads<'tcx>(
         typeck: &'a TypeckResults<'tcx>,
         classes: &'a FxHashMap<HirId, RootClass>,
         fresh_fields: &'a FxHashMap<(DefId, Symbol), FreshFieldFact>,
+        getters: &'a FxHashMap<DefId, (usize, (DefId, Symbol))>,
         declared: FxHashSet<HirId>,
         reads: FxHashMap<HirId, Reads>,
     }
@@ -3078,6 +3092,21 @@ fn carry_fresh_field_reads<'tcx>(
                             })
                             .unwrap_or(Reads::Refused)
                     }
+                    ExprKind::Call(callee, args) => callee_def_id(callee)
+                        .and_then(|did| self.getters.get(&did).copied())
+                        .and_then(|(position, key)| {
+                            let (class, _) = argument_provenance(
+                                self.tcx,
+                                self.typeck,
+                                self.classes,
+                                args.get(position)?,
+                            );
+                            Some(Reads::One {
+                                key,
+                                base: class.object_id()?,
+                            })
+                        })
+                        .unwrap_or(Reads::Refused),
                     _ => Reads::Refused,
                 }
             };
@@ -3125,6 +3154,7 @@ fn carry_fresh_field_reads<'tcx>(
         typeck,
         classes,
         fresh_fields,
+        getters,
         declared: FxHashSet::default(),
         reads: FxHashMap::default(),
     };
@@ -3154,6 +3184,86 @@ fn carry_fresh_field_reads<'tcx>(
             },
         );
     }
+}
+
+/// R601-4 (G4): the callees whose EVERY return is the null literal or a read
+/// `(*f).F` of ONE admitted field `F` out of the pointee of ONE formal `f` —
+/// brotli's `GetBrotliStorage`, `return (*s).storage_`. Such a call hands back
+/// the block that field holds, exactly as a direct read would, so the carry
+/// keys the caller's local to the root of the argument at `f`.
+///
+/// The formal must still name the storage it entered with (`EntryStorage`), or
+/// the object the field was read out of is not the argument's. Any other return
+/// — a view of the formal's own storage (`GetHashTable`'s `small_table_`), a
+/// second field, the same field of a second formal — refuses the callee: the
+/// result may then be that other storage, so no single block names it.
+fn field_getters(
+    tcx: TyCtxt<'_>,
+    functions: &FxHashSet<LocalDefId>,
+    oracle: &AllocatorOracle<'_>,
+    fresh_fields: &FxHashMap<(DefId, Symbol), FreshFieldFact>,
+) -> FxHashMap<DefId, (usize, (DefId, Symbol))> {
+    let mut getters = FxHashMap::default();
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else {
+            continue;
+        };
+        let output = tcx.fn_sig(function).skip_binder().skip_binder().output();
+        if !matches!(output.kind(), ty::RawPtr(..)) {
+            continue;
+        }
+        let body = tcx.hir_body(body_id);
+        let mut returns = ReturnCollector {
+            returns: Vec::new(),
+        };
+        returns.visit_body(body);
+        if let ExprKind::Block(block, _) = &body.value.kind
+            && let Some(tail) = block.expr
+        {
+            returns.returns.push(tail);
+        }
+        let params: Vec<HirId> = body
+            .params
+            .iter()
+            .filter_map(|param| match param.pat.kind {
+                PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                _ => None,
+            })
+            .collect();
+        let typeck = tcx.typeck(function);
+        let (classes, _why, _prefixes) = classify_locals(tcx, typeck, body, oracle, function);
+        let mut read = None;
+        let mut every = true;
+        for expr in &returns.returns {
+            if is_null_literal(expr) {
+                continue;
+            }
+            let this = match &peel_casts(expr).kind {
+                ExprKind::Field(base, field) => data_field_key(tcx, typeck, base, field.name)
+                    .filter(|key| fresh_fields.contains_key(key))
+                    .and_then(|key| {
+                        let (class, _) = place_provenance(tcx, typeck, &classes, base);
+                        let RootClass::EntryStorage(formal) = class else {
+                            return None;
+                        };
+                        Some((params.iter().position(|p| *p == formal)?, key))
+                    }),
+                _ => None,
+            };
+            match (read, this) {
+                (None, Some(this)) => read = Some(this),
+                (Some(seen), Some(this)) if seen == this => {}
+                _ => {
+                    every = false;
+                    break;
+                }
+            }
+        }
+        if let Some(read) = read.filter(|_| every) {
+            getters.insert(function.to_def_id(), read);
+        }
+    }
+    getters
 }
 
 /// R513-3. Replace a path rooted at a single-definition view local by the path
