@@ -1472,10 +1472,20 @@ fn avl_frame() {
 /// field's load; `box-param-caller-unknown` ×3 — the rotation / `insert`
 /// fixpoint), while on the batch-10 composition ownership-fields' newer
 /// build delivers all FIVE as `Box::new(..)` / `Box::into_raw(..)` and the
-/// three parameters hold `box-param-callee-use` instead. So the pin is
-/// the DICHOTOMY: while ANY owner is held the transaction is inactive and
-/// the struct keeps `*mut Node`; when every owner delivers the struct must
-/// carry `Option<Box<Node>>`. That is the tripwire for the Box-first route.
+/// three parameters hold `box-param-callee-use` instead.
+///
+/// **R585-3 (b) — the dichotomy is on the TRANSACTION, not the eight
+/// owners.** The struct form follows the transaction's dependent owners,
+/// READERS included: with wave-6a's walls (`899b5f099`) all eight owners
+/// decide `Box`, yet `minValueNode` — a reader of `left` and a dependent
+/// owner of both `Node` transactions — is class-held
+/// (`blocked-subject:escapes-via-return`), its hold withdraws the fields,
+/// and the field closure then reverts every owner. So the pin reads the
+/// transaction's FINAL `revert_status` from the run's own refreshed receipt
+/// (`raw_boundary_artifacts.field_transactions`, the census column):
+/// `withdrawn` ⇒ the struct keeps `*mut Node`; `active` ⇒ it carries
+/// `Option<Box<Node>>`. It stays the tripwire for the Box-first route: it
+/// fails only if the declaration disagrees with its own transaction.
 #[test]
 fn w6f_avl_rotation_fields_derive_and_follow_their_box_locals() {
     let _frame = frame_lock();
@@ -1491,6 +1501,8 @@ fn w6f_avl_rotation_fields_derive_and_follow_their_box_locals() {
             "{row:?}"
         );
     }
+    // Diagnostics only: which of the eight Box owners hold ("held" = does not
+    // deliver a Box; the reason keys move with the native family).
     let owners = [
         "newNode::node",
         "rightRotate::x",
@@ -1501,28 +1513,53 @@ fn w6f_avl_rotation_fields_derive_and_follow_their_box_locals() {
         "leftRotate::x",
         "insert::node",
     ];
-    // "Held" is read as "does not deliver a Box", not by the native family's
-    // reason text: those keys move (at `8e84dc6d` the five loads/`malloc`
-    // hold `box-initializer-unsupported` and the three parameters
-    // `box-param-caller-unknown`; on the batch-10 composition the five
-    // deliver and the three hold `box-param-callee-use` instead).
     let held: Vec<&str> = owners
         .into_iter()
         .filter(|label| !decision_of(&observed, label).starts_with("Box("))
         .collect();
-    let (source, _, _) = emitted_source(&outcome);
+    let RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = &outcome
+    else {
+        panic!("avl degraded");
+    };
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    if held.is_empty() {
-        // Every owner delivers: the fields must be the owned form.
-        assert!(
-            flat.contains("pub left: Option<Box<Node>>,"),
-            "every Box local delivers, so the field must too\n{source}"
-        );
-    } else {
-        // A held owner withholds its class, so the transaction is inactive
-        // and the struct keeps the raw field it came with.
-        assert!(flat.contains("pub left: *mut Node,"), "{held:?}\n{source}");
-        assert!(!flat.contains("Option<Box<Node>>"), "{held:?}\n{source}");
+    for field in ["left", "right"] {
+        // `struct field status form sites owners impls signature_plans bridges
+        // cause revert_status dependent_owners`, at the FINAL revert state.
+        let cells: Vec<&str> = raw_boundary_artifacts
+            .field_transactions
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').collect::<Vec<&str>>())
+            .find(|cells| cells[0].ends_with("Node") && cells[1] == field)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no final receipt row for Node.{field}\n{}",
+                    raw_boundary_artifacts.field_transactions
+                )
+            });
+        match cells[10] {
+            // The transaction withdrew — by a held owner, or a held READER
+            // (`minValueNode`) in its key: the struct keeps the raw field.
+            "withdrawn" => {
+                assert!(
+                    flat.contains(&format!("pub {field}: *mut Node,")),
+                    "Node.{field} withdrawn (held owners {held:?}; key {}), so the field stays raw\n{source}",
+                    cells[11]
+                );
+            }
+            // The transaction survived: the declaration is the owned form.
+            "active" => {
+                assert!(
+                    flat.contains(&format!("pub {field}: Option<Box<Node>>,")),
+                    "Node.{field} active, so the field must be owned\n{source}"
+                );
+            }
+            other => panic!("Node.{field}: unexpected revert_status {other:?}"),
+        }
     }
     // The readers this lane does not own deliver either way.
     assert!(
