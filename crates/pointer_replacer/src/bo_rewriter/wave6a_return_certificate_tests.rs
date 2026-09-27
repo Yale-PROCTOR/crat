@@ -2771,8 +2771,9 @@ fn avl_round1(name: &str, source: &str) -> (super::wave6a_allocation_tests::Emit
 /// and return the owner they move out of a field alone (wall 3). The round-1
 /// tree carries it whole: every signature certified, every store a plain
 /// move, the lend of the optional owner its own view, no `from_raw` /
-/// `into_raw`. Where no round fails (ownership-fields' moved-load
-/// projection, report 112 §1, in place) it is also the emitted tree.
+/// `into_raw`. With ownership-fields' moved-load projection on the line
+/// (`eb24609de`, report 112 §1) no round fails, so it is the emitted tree and
+/// nothing reverts (R586-3).
 #[test]
 fn w6a_r583_the_recursive_certificate_moves_avl_whole() {
     let (out, round1) = avl_round1("r583-avl", AVL);
@@ -2824,9 +2825,15 @@ fn w6a_r583_the_recursive_certificate_moves_avl_whole() {
         !text.contains("from_raw") && !text.contains("into_raw"),
         "{context}"
     );
-    if out.artifacts.first_failing_verify_tree.is_empty() {
-        assert_eq!(out.reverted, 0, "{context}");
-    }
+    assert!(
+        out.artifacts.first_failing_verify_tree.is_empty(),
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+    assert!(
+        text.contains("publeft:Option<Box<Node>>,") && text.contains("pubright:Option<Box<Node>>,"),
+        "{context}"
+    );
 }
 
 /// The avl frame's holds on the Box-parameter family, one line per hold.
