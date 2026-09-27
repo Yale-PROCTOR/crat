@@ -25,7 +25,13 @@
 use std::collections::BTreeSet;
 
 use rustc_hash::FxHashSet;
-use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_hir::{
+    Expr, ExprKind, HirId,
+    def::{DefKind, Res},
+    def_id::{DefId, LocalDefId},
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::{TyCtxt, TyKind, TypeckResults};
 
 use super::{
     Decision, DecisionTable, SubjectKind,
@@ -54,9 +60,11 @@ pub(crate) fn sole_origin(sources: &BTreeSet<FnSignatureSlot>) -> Option<u32> {
 
 /// The formal of every function whose return interface is the mutable scalar
 /// fallback, whose return borrows from that one formal and returns it, and
-/// which has no other pointer subject: the subjects to decide mutable. Read
-/// after the lifetime plan and the return interfaces are settled.
+/// which has no other pointer subject and a closed body (no static read, no call
+/// outside the standard library): the subjects to decide mutable. Read after the
+/// lifetime plan and the return interfaces are settled.
 pub(crate) fn targets(
+    tcx: TyCtxt<'_>,
     table: &DecisionTable,
     facts: &EmitabilityFacts,
 ) -> FxHashSet<(LocalDefId, HirId)> {
@@ -100,7 +108,7 @@ pub(crate) fn targets(
         let decided_ref = table.entries.iter().any(|(subject, decision)| {
             subject.fn_did == function && subject.hir_id == formal && is_ref(decision)
         });
-        if sole_subject && returns_formal && decided_ref {
+        if sole_subject && returns_formal && decided_ref && closed_body(tcx, function) {
             targets.insert((function, formal));
         }
     }
@@ -136,6 +144,59 @@ pub(crate) fn apply(
     }
     upgraded.sort();
     upgraded
+}
+
+/// **R590-2** — the body reads no static and calls nothing outside `core` /
+/// `std` / `alloc`, so no pointer the sole-subject condition cannot see (a static,
+/// or one a callee holds) reaches the formal's pointee while the `&mut` lives. A
+/// foreign read of that pointee would pop the `&mut`'s `Unique` (Stacked Borrows).
+fn closed_body(tcx: TyCtxt<'_>, function: LocalDefId) -> bool {
+    struct V<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx TypeckResults<'tcx>,
+        open: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+            let library = |did: DefId| {
+                matches!(
+                    self.tcx.crate_name(did.krate).as_str(),
+                    "core" | "std" | "alloc"
+                )
+            };
+            match &expression.kind {
+                ExprKind::Path(qpath) => {
+                    if let Res::Def(DefKind::Static { .. }, _) =
+                        self.typeck.qpath_res(qpath, expression.hir_id)
+                    {
+                        self.open = true;
+                    }
+                }
+                ExprKind::Call(callee, _) => match self.typeck.expr_ty(callee).kind() {
+                    TyKind::FnDef(did, _) if library(*did) => {}
+                    _ => self.open = true,
+                },
+                ExprKind::MethodCall(..) => {
+                    if !self
+                        .typeck
+                        .type_dependent_def_id(expression.hir_id)
+                        .is_some_and(library)
+                    {
+                        self.open = true;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+    let mut visitor = V {
+        tcx,
+        typeck: tcx.typeck(function),
+        open: false,
+    };
+    visitor.visit_body(tcx.hir_body_owned_by(function));
+    !visitor.open
 }
 
 /// A plain `Ref` decision (exhaustive by rule, `import_denylist`).

@@ -253,3 +253,74 @@ fn r586_2_a_second_pointer_subject_keeps_the_rule_out() {
         out.tree()
     );
 }
+
+/// The static-read residual's shape (R590-2): `first` reads another `Node`
+/// through a static pointer while `node` lives. As `&mut`, `node` would assert
+/// uniqueness over a pointee the static may alias; a foreign read pops it
+/// (Stacked Borrows). The body is not closed, so the rule stays out.
+const R590_STATIC_READ: &str = r#"
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+}
+pub static mut ROOT: *mut Node = 0 as *mut Node;
+#[no_mangle]
+pub unsafe extern "C" fn first(mut node: *mut Node) -> *mut Node {
+    let _k = (*ROOT).key + (*node).key;
+    return node;
+}
+"#;
+
+/// The same read one call away: a program callee that reads the static.
+const R590_CALLEE_READ: &str = r#"
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+}
+pub static mut ROOT: *mut Node = 0 as *mut Node;
+pub unsafe fn root_key() -> i32 {
+    return (*ROOT).key;
+}
+#[no_mangle]
+pub unsafe extern "C" fn first(mut node: *mut Node) -> *mut Node {
+    let _k = root_key() + (*node).key;
+    return node;
+}
+"#;
+
+/// **R590-2 witness (the closed body).** A static read during the formal's span
+/// keeps the rule out: `first` stays raw, held on the return seam as before.
+#[test]
+fn r590_2_a_static_read_keeps_the_rule_out() {
+    let out = fixture(R590_STATIC_READ);
+    assert!(
+        exclusion(&out, "first::node#1").contains("seam-shared-to-mut"),
+        "{}",
+        out.subjects
+    );
+    assert!(
+        super::wave6a_allocation_tests::compact(out.tree())
+            .contains("fnfirst(mutnode:*mutNode)->*mutNode{"),
+        "{}",
+        out.tree()
+    );
+}
+
+/// **R590-2 witness (the closed body, one call away).** A call to a program
+/// function keeps the rule out: the callee may reach the pointee through a
+/// pointer the rule cannot see.
+#[test]
+fn r590_2_a_program_callee_keeps_the_rule_out() {
+    let out = fixture(R590_CALLEE_READ);
+    assert!(
+        exclusion(&out, "first::node#1").contains("seam-shared-to-mut"),
+        "{}",
+        out.subjects
+    );
+    assert!(
+        super::wave6a_allocation_tests::compact(out.tree())
+            .contains("fnfirst(mutnode:*mutNode)->*mutNode{"),
+        "{}",
+        out.tree()
+    );
+}

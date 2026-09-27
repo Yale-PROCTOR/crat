@@ -8662,7 +8662,7 @@ fn finish_decide<'tcx>(
         // return is decided mutable. The origin is read from the settled plan,
         // so a new target re-derives the stage with the upgrade applied at the
         // decide (the field transactions render the view's mutability).
-        let targets = decision::return_origin_mutability::targets(&table, &facts);
+        let targets = decision::return_origin_mutability::targets(tcx, &table, &facts);
         if !targets.is_subset(&sole_origin_upgrades) {
             sole_origin_upgrades.extend(targets);
             continue;
