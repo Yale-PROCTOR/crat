@@ -9604,8 +9604,10 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
         })
         .expect("E2-W1 fixture compiles before rewriting");
 
+    // R586-2: `p` is the sole origin of the `*mut` scalar return, so it is
+    // decided mutable (it was shared, held on the return seam's shared-to-mut).
     assert!(
-        matches!(decision, super::decision::Decision::Ref { mutable: false }),
+        matches!(decision, super::decision::Decision::Ref { mutable: true }),
         "{decision:#?}"
     );
     assert_eq!(permits, 1);

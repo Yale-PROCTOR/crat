@@ -317,6 +317,8 @@ mod return_family_premise_tests;
 #[cfg(test)]
 mod return_family_tests;
 #[cfg(test)]
+mod return_origin_mutability_frame_tests;
+#[cfg(test)]
 mod return_receiver_shape_tests;
 #[cfg(test)]
 mod return_receiver_tests;
@@ -8080,6 +8082,8 @@ fn finish_decide<'tcx>(
         decision::field_reference::FieldKey,
         String,
     > = std::collections::BTreeMap::new();
+    // R586-2: the sole-origin formals decided mutable, grown by the fixpoint.
+    let mut sole_origin_upgrades = rustc_hash::FxHashSet::default();
     let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
     let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
     let a5_role_bound = facts
@@ -8447,6 +8451,8 @@ fn finish_decide<'tcx>(
             };
             table = decision::decide(&ctx, &subjects);
         }
+        // R586-2: the sole-origin upgrades, on the table the ladder settled.
+        decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);
         // **After the re-decide, deliberately.** `decide` returns a fresh table,
         // so anything recorded on the old one is gone; the seam's C-string
         // licences are recomputed here, on whatever table the ladder settled.
@@ -8652,6 +8658,15 @@ fn finish_decide<'tcx>(
             &lifetime_eligibility,
             &return_family_functions,
         );
+        // R586-2 (main 118): a formal that is the sole origin of a mutable scalar
+        // return is decided mutable. The origin is read from the settled plan,
+        // so a new target re-derives the stage with the upgrade applied at the
+        // decide (the field transactions render the view's mutability).
+        let targets = decision::return_origin_mutability::targets(&table, &facts);
+        if !targets.is_subset(&sole_origin_upgrades) {
+            sole_origin_upgrades.extend(targets);
+            continue;
+        }
         for failure in decision::return_receiver::validate_current(&return_receivers, &table) {
             table
                 .return_receivers

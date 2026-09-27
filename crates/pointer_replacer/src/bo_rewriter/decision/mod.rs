@@ -109,6 +109,7 @@ pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
+pub(crate) mod return_origin_mutability;
 pub(crate) mod return_receiver;
 pub(crate) mod return_through_raw_field;
 pub(crate) mod returned_child;
