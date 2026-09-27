@@ -143,6 +143,68 @@ fn stable_array_pointer(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> bool {
         && typeck.expr_ty(expression).is_raw_ptr()
 }
 
+/// R593-2 (a1): the argument's root keeps its raw text (Degraded, or not a
+/// subject of the caller).
+fn root_stays_raw(root: Option<&Decision>) -> bool {
+    match root {
+        None | Some(Decision::Degraded(_)) => true,
+        Some(
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. },
+        ) => false,
+    }
+}
+
+/// R593-2 (a2): `(*root).field` with `root` a thin `ref` (`(*s).f` reads the same
+/// for `&T` and `*mut T`), the field a raw pointer that no field transaction
+/// delivers.
+fn raw_field_read_through_ref(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    expression: &Expr<'_>,
+    root: Option<&Decision>,
+) -> bool {
+    let thin_ref = match root {
+        Some(Decision::Ref { .. }) => true,
+        None
+        | Some(
+            Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_),
+        ) => false,
+    };
+    let ExprKind::Field(base, _) = expression.kind else { return false };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, inner) = base.kind else { return false };
+    let ExprKind::Path(QPath::Resolved(_, path)) = inner.kind else { return false };
+    if !thin_ref || !matches!(path.res, Res::Local(_)) {
+        return false;
+    }
+    let typeck = tcx.typeck(expression.hir_id.owner.def_id);
+    let Some(struct_did) = typeck
+        .expr_ty(base)
+        .ty_adt_def()
+        .and_then(|adt| adt.did().as_local())
+    else {
+        return false;
+    };
+    let Some(field) = typeck.opt_field_index(expression.hir_id) else { return false };
+    typeck.expr_ty(expression).is_raw_ptr()
+        && !table.field_transactions.applied.iter().any(|transaction| {
+            transaction.array.is_none()
+                && transaction.key.struct_did == struct_did
+                && transaction.key.field_index == field.as_usize()
+        })
+}
+
 fn return_dependencies<'tcx>(
     tcx: TyCtxt<'tcx>,
     expression: &'tcx Expr<'tcx>,
@@ -317,14 +379,6 @@ fn current_alternative(
     if input_form != Form::Raw {
         return Err("callee-parameter-input-native-target-unbuilt");
     }
-    if matches!(arg.shape, ArgShape::RawExpr { .. })
-        && !expression.is_some_and(|expression| stable_array_pointer(tcx, expression))
-    {
-        return Err("callee-parameter-input-raw-expression-not-proven-stable");
-    }
-    if matches!(arg.shape, ArgShape::Other | ArgShape::Cast { .. }) {
-        return Err("callee-parameter-input-source-shape-unbuilt");
-    }
     let root_decision = arg.shape.place_root().and_then(|root| {
         table
             .entries
@@ -332,6 +386,24 @@ fn current_alternative(
             .find(|(subject, _)| subject.fn_did == caller && subject.hir_id == root)
             .map(|(_, decision)| decision)
     });
+    // R593-2 (main 120): a raw expression's found form is `Raw` by shape, which
+    // holds only while its text still reads a raw pointer. (a1) Over a root that
+    // stays raw (Degraded, or not a subject) it renders unchanged: the
+    // zero-syntax branch below. (a2) A field read through a thin converted `ref`
+    // whose field no transaction delivers reads the same raw pointer. Anything
+    // else keeps the stability gate.
+    if matches!(arg.shape, ArgShape::RawExpr { .. })
+        && !root_stays_raw(root_decision)
+        && !expression.is_some_and(|expression| {
+            stable_array_pointer(tcx, expression)
+                || raw_field_read_through_ref(tcx, table, expression, root_decision)
+        })
+    {
+        return Err("callee-parameter-input-raw-expression-not-proven-stable");
+    }
+    if matches!(arg.shape, ArgShape::Other | ArgShape::Cast { .. }) {
+        return Err("callee-parameter-input-source-shape-unbuilt");
+    }
     // R551-5 joint (a): a `Box` owner is NOT refused. `form_of(Box)` is
     // `Raw`, so it must also skip the zero-syntax shortcut below — a Box
     // owner's text is never a raw pointer — and supply its raw view, tiered

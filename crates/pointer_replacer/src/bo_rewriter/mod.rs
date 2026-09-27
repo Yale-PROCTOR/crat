@@ -305,6 +305,8 @@ mod r216_boundary_tests;
 #[cfg(test)]
 mod r233_shape_emission_tests;
 #[cfg(test)]
+mod r593_raw_expression_tests;
+#[cfg(test)]
 mod raw_receiver_tests;
 #[cfg(test)]
 mod retalias_semantics_tests;
