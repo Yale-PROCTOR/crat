@@ -90,8 +90,10 @@ pub(crate) struct Guards {
     pub(crate) emission_seconds: u64,
 }
 /// Required guard identities; validating them never authorizes a changed budget.
+/// L01⁹ (R579-1, era-5c 068): the worker wall is 6 h. L01⁸'s lil derived in 13,220 s,
+/// 92 % of the former 4 h, and L01⁹'s arms add rounds.
 pub(crate) const REQUIRED_GUARDS: Guards = Guards {
-    worker_seconds: 14_400,
+    worker_seconds: 21_600,
     query_seconds: 600,
     emission_seconds: 900,
 };

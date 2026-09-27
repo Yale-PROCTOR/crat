@@ -43,7 +43,7 @@ fn fixture() -> Value {
         "schema":SCHEMA,"key":semantic_key(&inputs).unwrap(),"inputs":inputs,
         "functions":[],"universe":[],"model":{},"baseline":{},
         "receipt":"status=ok\ndata=true\n", "origin":{"functions":[]},
-        "exports":{"schema":portable_export::SCHEMA,"licensing_deferred":true,
+        "exports":{"schema":portable_export::SCHEMA,"licensing_in_origin_evidence":true,
             "identities":identities,"scope_gaps":["ownership-occurrence-construction-not-recorded","ownership-values-are-latest-supplied-valuation"],
             "families":families,"diagnostics":[]}
     })
@@ -275,7 +275,7 @@ fn r281_cache_stream_rejects_corrupt_envelopes_references_and_metadata() {
     case["exports"]["scope_gaps"] = json!([]);
     cases.push(case);
     let mut case = valid.clone();
-    case["exports"]["licensing_deferred"] = json!(false);
+    case["exports"]["licensing_in_origin_evidence"] = json!(false);
     cases.push(case);
     let mut case = valid.clone();
     case["key"] = json!("0".repeat(64));

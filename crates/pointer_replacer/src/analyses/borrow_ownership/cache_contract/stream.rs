@@ -134,6 +134,17 @@ impl OriginFacts {
     }
 }
 
+/// L01⁹ wall 4: the `move-store-obligations` family as the reader found it.
+/// It is small (one row per qualifying store), so the streamed reader keeps it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum MoveStoreCapture {
+    /// Not read from an entry (a writer-side `Metadata`).
+    #[default]
+    Missing,
+    NotRecorded(String),
+    Captured(Vec<BTreeMap<String, Value>>),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Metadata {
     pub(crate) schema: String,
@@ -145,9 +156,28 @@ pub(crate) struct Metadata {
     pub(crate) baseline: BTreeMap<String, String>,
     pub(crate) receipt: String,
     pub(crate) origin: OriginSource,
+    pub(crate) move_store: MoveStoreCapture,
 }
 
 impl Metadata {
+    /// The frame's store-as-move obligations for a consumer that asks
+    /// (ownership-fields 069's discharge): refused unless the entry carries them.
+    pub(crate) fn move_store_obligations(
+        &self,
+    ) -> Result<Vec<portable_export::MoveStoreRow>, String> {
+        match &self.move_store {
+            MoveStoreCapture::Missing => {
+                Err("move-store obligations not read from an entry".into())
+            }
+            MoveStoreCapture::NotRecorded(reason) => {
+                Err(format!("move-store obligations not recorded: {reason}"))
+            }
+            MoveStoreCapture::Captured(records) => {
+                portable_export::decode_move_store(&CaptureAvailability::Captured, records)
+            }
+        }
+    }
+
     pub(crate) fn validate_meta(&self) -> Result<(), String> {
         if self.schema != SCHEMA || self.key != semantic_key(&self.inputs)? {
             return Err("cache schema or semantic key mismatch".into());
@@ -317,7 +347,30 @@ impl TryFrom<CompleteEntry> for Metadata {
     type Error = String;
 
     fn try_from(entry: CompleteEntry) -> Result<Self, String> {
+        let move_store = {
+            let family = &entry.exports["families"]["move-store-obligations"];
+            let availability: CaptureAvailability =
+                serde_json::from_value(family["availability"].clone())
+                    .map_err(|e| format!("move-store availability: {e}"))?;
+            match availability {
+                CaptureAvailability::NotRecorded { reason } => {
+                    MoveStoreCapture::NotRecorded(reason)
+                }
+                CaptureAvailability::Captured => MoveStoreCapture::Captured(
+                    family["records"]
+                        .as_array()
+                        .ok_or("move-store records")?
+                        .iter()
+                        .map(|r| {
+                            serde_json::from_value(r["fields"].clone())
+                                .map_err(|e| format!("move-store fields: {e}"))
+                        })
+                        .collect::<Result<_, String>>()?,
+                ),
+            }
+        };
         Ok(Self {
+            move_store,
             schema: entry.schema,
             key: entry.key,
             inputs: entry.inputs,
@@ -467,8 +520,9 @@ impl<'de> Visitor<'de> for MetadataVisitor {
                 _ => return Err(de::Error::custom(format!("unknown cache field: {name}"))),
             }
         }
-        required(exports, "exports")?;
+        let move_store = required(exports, "exports")?;
         Ok(Metadata {
+            move_store,
             schema: required(schema, "schema")?,
             key: required(key, "key")?,
             inputs: required(inputs, "inputs")?,
@@ -486,24 +540,26 @@ impl<'de> Visitor<'de> for MetadataVisitor {
 struct ExportSummary {
     referenced: BTreeSet<String>,
     diagnostic_families: BTreeSet<ExportFamily>,
+    move_store_records: Vec<BTreeMap<String, Value>>,
+    move_store_not_recorded: Option<String>,
 }
 
 struct Exports;
 impl<'de> DeserializeSeed<'de> for Exports {
-    type Value = ();
+    type Value = MoveStoreCapture;
 
-    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<MoveStoreCapture, D::Error> {
         d.deserialize_map(self)
     }
 }
 impl<'de> Visitor<'de> for Exports {
-    type Value = ();
+    type Value = MoveStoreCapture;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("portable exports")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<MoveStoreCapture, A::Error> {
         let (mut schema, mut licensing, mut identities, mut gaps, mut families, mut diagnostics) =
             (None, None, None, None, None, None);
         let mut summary = ExportSummary::default();
@@ -512,7 +568,7 @@ impl<'de> Visitor<'de> for Exports {
             unique(&mut seen, &name)?;
             match name.as_str() {
                 "schema" => schema = Some(next::<String, _>(&mut map)?),
-                "licensing_deferred" => licensing = Some(next::<bool, _>(&mut map)?),
+                "licensing_in_origin_evidence" => licensing = Some(next::<bool, _>(&mut map)?),
                 "identities" => identities = Some(next::<BTreeSet<String>, _>(&mut map)?),
                 "scope_gaps" => gaps = Some(next::<BTreeSet<ScopeGap>, _>(&mut map)?),
                 "families" => families = Some(map.next_value_seed(Families(&mut summary))?),
@@ -523,7 +579,7 @@ impl<'de> Visitor<'de> for Exports {
             }
         }
         if required(schema, "schema")? != portable_export::SCHEMA
-            || !required(licensing, "licensing_deferred")?
+            || !required(licensing, "licensing_in_origin_evidence")?
         {
             return Err(de::Error::custom(
                 "portable export schema/licensing mismatch",
@@ -545,7 +601,10 @@ impl<'de> Visitor<'de> for Exports {
         {
             return Err(de::Error::custom("unresolved portable identity"));
         }
-        Ok(())
+        Ok(match summary.move_store_not_recorded {
+            Some(reason) => MoveStoreCapture::NotRecorded(reason),
+            None => MoveStoreCapture::Captured(summary.move_store_records),
+        })
     }
 }
 
@@ -561,7 +620,7 @@ impl<'de> Visitor<'de> for Families<'_> {
     type Value = BTreeSet<ExportFamily>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("twenty export families")
+        f.write_str("twenty-one export families")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -627,6 +686,14 @@ impl<'de> Visitor<'de> for Family<'_> {
                     && !reason.is_empty()
                     && source_rows == 0
                     && records == 0 => {}
+            CaptureAvailability::NotRecorded { reason }
+                if self.family == ExportFamily::MoveStoreObligations
+                    && !reason.is_empty()
+                    && source_rows == 0
+                    && records == 0 =>
+            {
+                self.summary.move_store_not_recorded = Some(reason);
+            }
             _ => return Err(de::Error::custom("required capture unavailable")),
         }
         if source_rows != records {
@@ -721,6 +788,9 @@ impl<'de> Visitor<'de> for Record<'_> {
         self.summary
             .referenced
             .extend(required(references, "references")?);
+        if self.family == ExportFamily::MoveStoreObligations {
+            self.summary.move_store_records.push(fields);
+        }
         Ok(())
     }
 }

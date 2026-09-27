@@ -35,11 +35,12 @@ pub(crate) mod export;
 mod infer;
 // era-5c report 040: the A1 spare-set, for the MIR-walk market count.
 pub(crate) use infer::reseat_destinations;
+pub(crate) mod field_moves;
 pub(crate) mod l2;
 pub(crate) mod licensing;
 pub(crate) mod model_cache;
+pub(crate) mod move_store;
 pub(crate) mod mutability_facts;
-pub(crate) mod field_moves;
 pub(crate) mod null_paths;
 #[cfg(test)]
 mod null_paths_tests;
@@ -509,8 +510,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // L01^5 (i): a program with no sink can never be forced to own (W18). Under
     // the leak-parity waiver, prefer Box for its field slots. Pin-gated and
     // objective-only: no hard constraint changes, so nothing legal becomes illegal.
-    if super::borrow_ownership::field_moves::leak_parity_admission()
-        && selectors.sinks().is_empty()
+    if super::borrow_ownership::field_moves::leak_parity_admission() && selectors.sinks().is_empty()
     {
         kind_solver.prefer_owning_for_unsinked_fields(slots);
     }
@@ -585,7 +585,17 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     }
     // L01⁶ arm 3 half two (R518-2): with the finalization blanket gone, prefer
     // the NAMED locals as owners so the token is not smeared onto temporaries.
-    if field_moves::finalize_soft() {
+    if field_moves::finalize_soft() || field_moves::own_named() {
+        // L01⁹ (R565-3 STOP 3, `CRAT_ERA5C_OWN_NAMED`): arm 3's weight-3 Owning
+        // preference, detached from FINALIZE_SOFT, on named locals AND fields.
+        if field_moves::own_named() {
+            for index in 0..slots.field_slots.len() {
+                let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
+                if slots.field_slots.slot(id).depth == 0 {
+                    kind_solver.prefer_owning_for_named_local(SlotRef::Field(id));
+                }
+            }
+        }
         let mut named = 0usize;
         for did in crate_ctxt.fns() {
             let fn_did = did.expect_local();
@@ -632,16 +642,19 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
                 continue;
             };
-            let body = crate_ctxt.tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+            let body = crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(fn_did)
+                .borrow();
             let caller = caller_derived_locals(&body, crate_ctxt.tcx);
             for index in 0..universe.len() {
                 let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
                 if let slots::SlotOwner::Local(local) = universe.slot(id).owner
                     && !caller.contains(&local)
                 {
-                    preferred_locals +=
-                        kind_solver.prefer_owning_for_refused_reference(SlotRef::Local(fn_did, id))
-                            as usize;
+                    preferred_locals += kind_solver
+                        .prefer_owning_for_refused_reference(SlotRef::Local(fn_did, id))
+                        as usize;
                 }
             }
         }
@@ -649,6 +662,43 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             eprintln!(
                 "E5C l016-b: preferred own on {preferred_own} refused-reference + {preferred_locals} non-caller local slots"
             );
+        }
+    }
+    if field_moves::ref_weight_named() {
+        // L01⁹ measurement arm (R563-2): the Ref weight counts named locals only.
+        let mut named = 0usize;
+        for did in crate_ctxt.fns() {
+            let fn_did = did.expect_local();
+            let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+                continue;
+            };
+            let body = crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(fn_did)
+                .borrow();
+            let names: rustc_data_structures::fx::FxHashSet<_> = body
+                .var_debug_info
+                .iter()
+                .filter_map(|info| match info.value {
+                    rustc_middle::mir::VarDebugInfoContents::Place(place)
+                        if place.projection.is_empty() =>
+                    {
+                        Some(place.local)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for index in 0..universe.len() {
+                let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
+                if let slots::SlotOwner::Local(local) = universe.slot(id).owner
+                    && names.contains(&local)
+                {
+                    named += kind_solver.prefer_ref_for_named(SlotRef::Local(fn_did, id)) as usize;
+                }
+            }
+        }
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!("E5C ref-weight-named: Ref weight on {named} named local slots");
         }
     }
     if field_moves::lend_formal() {
@@ -680,7 +730,11 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         let rss = || -> f64 {
             std::fs::read_to_string("/proc/self/statm")
                 .ok()
-                .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<f64>().ok()))
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .nth(1)
+                        .and_then(|p| p.parse::<f64>().ok())
+                })
                 .map(|pages| pages * 4096.0 / 1073741824.0)
                 .unwrap_or(0.0)
         };
@@ -690,7 +744,12 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
                 let value = $e;
                 if profile {
                     let now = rss();
-                    eprintln!("E5C_PROFILE {:<34} rss={:7.2} GiB  delta={:+7.2}", $name, now, now - mark);
+                    eprintln!(
+                        "E5C_PROFILE {:<34} rss={:7.2} GiB  delta={:+7.2}",
+                        $name,
+                        now,
+                        now - mark
+                    );
                     mark = now;
                 }
                 value
@@ -703,29 +762,56 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         let skip = |name: &str| skipped.split(',').any(|s| s.trim() == name);
         step!("start", ());
         if !skip("grants") {
-            step!("apply_licensing_grants", kind_solver.apply_licensing_grants(&facts)?);
+            step!(
+                "apply_licensing_grants",
+                kind_solver.apply_licensing_grants(&facts)?
+            );
         }
         if !skip("transfers") {
-            step!("block_incomplete_transfers", licensing::readers::block_incomplete_transfers(&facts, kind_solver));
+            step!(
+                "block_incomplete_transfers",
+                licensing::readers::block_incomplete_transfers(&facts, kind_solver)
+            );
         }
         if !skip("reader_field_support") {
-            step!("constrain_reader_field_support", kind_solver.constrain_reader_field_support(&facts)?);
+            step!(
+                "constrain_reader_field_support",
+                kind_solver.constrain_reader_field_support(&facts)?
+            );
         }
         if !skip("reference_field_effects") {
-            step!("constrain_reference_field_effects", kind_solver.constrain_reference_field_effects(&facts)?);
+            step!(
+                "constrain_reference_field_effects",
+                kind_solver.constrain_reference_field_effects(&facts)?
+            );
         }
         if !skip("first_permissions") {
-            step!("constrain_first_permissions", kind_solver.constrain_first_permissions(&facts)?);
+            step!(
+                "constrain_first_permissions",
+                kind_solver.constrain_first_permissions(&facts)?
+            );
         }
         if !skip("traversal_calls") {
-            step!("constrain_traversal_calls", kind_solver.constrain_traversal_calls(&facts)?);
+            step!(
+                "constrain_traversal_calls",
+                kind_solver.constrain_traversal_calls(&facts)?
+            );
         }
         if !skip("fold_callers") {
-            step!("constrain_fold_callers", kind_solver.constrain_fold_callers(&facts)?);
+            step!(
+                "constrain_fold_callers",
+                kind_solver.constrain_fold_callers(&facts)?
+            );
         }
         // era-5c (R409-1): an allocation is released by its own allocator.
-        step!("allocator_contract_pairing", kind_solver.constrain_allocator_contract_pairing(&facts));
-        step!("record_ownership_facts", export::record_ownership_facts(&facts));
+        step!(
+            "allocator_contract_pairing",
+            kind_solver.constrain_allocator_contract_pairing(&facts)
+        );
+        step!(
+            "record_ownership_facts",
+            export::record_ownership_facts(&facts)
+        );
     }
     kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))
@@ -1215,8 +1301,10 @@ fn caller_derived_locals<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
 ) -> rustc_data_structures::fx::FxHashSet<rustc_middle::mir::Local> {
     use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind};
-    let mut caller: rustc_data_structures::fx::FxHashSet<rustc_middle::mir::Local> =
-        (1..=body.arg_count).map(rustc_middle::mir::Local::from_usize).collect();
+    let mut caller: rustc_data_structures::fx::FxHashSet<rustc_middle::mir::Local> = (1..=body
+        .arg_count)
+        .map(rustc_middle::mir::Local::from_usize)
+        .collect();
     let mut changed = true;
     while changed {
         changed = false;
@@ -1236,10 +1324,19 @@ fn caller_derived_locals<'tcx>(
                     changed = true;
                 }
             }
-            if let TerminatorKind::Call { func, args, destination, .. } = &data.terminator().kind
+            if let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &data.terminator().kind
                 && destination.projection.is_empty()
-                && func.const_fn_def().is_some_and(|(callee, _)| !callee.is_local())
-                && args.iter().any(|arg| arg.node.place().is_some_and(|p| caller.contains(&p.local)))
+                && func
+                    .const_fn_def()
+                    .is_some_and(|(callee, _)| !callee.is_local())
+                && args
+                    .iter()
+                    .any(|arg| arg.node.place().is_some_and(|p| caller.contains(&p.local)))
                 && caller.insert(destination.local)
             {
                 changed = true;

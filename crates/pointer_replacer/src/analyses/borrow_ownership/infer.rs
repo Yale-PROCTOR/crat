@@ -571,6 +571,19 @@ where
         bb: BasicBlock,
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
     ) {
+        // L01⁹ (`CRAT_ERA5C_DEAD_JOIN`): a non-parameter local's version 0 is its
+        // never-assigned value; a join edge carrying it carries no value (rustc's
+        // borrow check rejects a use after a join where the local may be
+        // uninitialized), so it adds no ownership equality.
+        let dead_join_arguments = super::field_moves::dead_join().then(|| {
+            infer_cx
+                .tcx
+                .fn_sig(infer_cx.function)
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .len()
+        });
         for (local, phi_node) in phi_nodes {
             // This is not necessary if phi nodes have been prune
             phi_node.rhs.sort();
@@ -578,6 +591,11 @@ where
             let lhs = phi_node.lhs;
             for rhs in phi_node.rhs.iter().copied() {
                 if lhs == rhs {
+                    continue;
+                }
+                if dead_join_arguments
+                    .is_some_and(|arguments| rhs.as_u32() == 0 && local.as_usize() > arguments)
+                {
                     continue;
                 }
                 let Some(lhs_sigs) = infer_cx.fn_body_sig[local].get(lhs).cloned() else {
@@ -1134,6 +1152,16 @@ where
             } else {
                 Default::default()
             };
+        let null_exit: FxHashSet<Local> = if super::field_moves::null_exit() {
+            null_at_exit_locals(infer_cx.tcx, body)
+        } else {
+            FxHashSet::default()
+        };
+        let exit_close: FxHashSet<Local> = if super::field_moves::exit_close() {
+            exit_close_locals(infer_cx.tcx, body)
+        } else {
+            FxHashSet::default()
+        };
         let spared: Vec<Local> = locals_collected
             .iter()
             .skip(body.arg_count + 1)
@@ -1186,6 +1214,14 @@ where
                 };
                 // A1: a named local live at exit keeps its ownership bit free.
                 if named_locals.contains(&local) {
+                    continue;
+                }
+                // L01⁹ null-at-exit: a local null on every exit path owns nothing.
+                if null_exit.contains(&local) {
+                    continue;
+                }
+                // L01⁹ narrow R101 close: a fresh call result, live at exit.
+                if exit_close.contains(&local) {
                     continue;
                 }
                 for var in vars {
@@ -1332,6 +1368,279 @@ fn matcher<'tcx, T, U, DB>(
 /// with each argument resolved back through `Use(Copy|Move)` chains (bst's
 /// `root = insert(root, k)` passes a copy of `root`). Lifted out of `r#return`
 /// so a MIR-only walk can count the market without running a solve.
+/// L01⁹ (`CRAT_ERA5C_EXIT_CLOSE`, R563-2 STOP 2, addendum 101's scope-exit waiver):
+/// the narrow implicit close. A named, non-parameter local whose every definition
+/// is the result of a call to a program function that returns a FRESH allocation
+/// (`returns_fresh_allocation`), and whose value is never returned nor stored
+/// through a place, may be live and owning at exit: the emitted program closes it
+/// by drop there (`waiver-drop(scope-exit)`, receipted by the consumer). Its exit
+/// finalization is skipped. quadtree's `test_node::node` is the shape.
+pub(crate) fn exit_close_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<Local> {
+    use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind, VarDebugInfoContents};
+    let named: FxHashSet<Local> = body
+        .var_debug_info
+        .iter()
+        .filter_map(|info| match info.value {
+            VarDebugInfoContents::Place(place) if place.projection.is_empty() => Some(place.local),
+            _ => None,
+        })
+        .filter(|local| local.as_usize() > body.arg_count)
+        .collect();
+    let mut out = FxHashSet::default();
+    'local: for &local in &named {
+        let mut defined_by_fresh_call = false;
+        // the local and its plain copies carry its value
+        let mut carriers = FxHashSet::from_iter([local]);
+        loop {
+            let before = carriers.len();
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    if let StatementKind::Assign(box (
+                        lhs,
+                        Rvalue::Use(operand) | Rvalue::Cast(_, operand, _),
+                    )) = &statement.kind
+                        && lhs.projection.is_empty()
+                        && operand
+                            .place()
+                            .is_some_and(|p| p.projection.is_empty() && carriers.contains(&p.local))
+                    {
+                        carriers.insert(lhs.local);
+                    }
+                }
+            }
+            if carriers.len() == before {
+                break;
+            }
+        }
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                if lhs.local == local && lhs.projection.is_empty() {
+                    continue 'local; // a non-call definition
+                }
+                let carried = match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand
+                        .place()
+                        .is_some_and(|p| p.projection.is_empty() && carriers.contains(&p.local)),
+                    _ => false,
+                };
+                // returned, or stored through a place
+                if carried
+                    && (lhs.local == rustc_middle::mir::RETURN_PLACE || !lhs.projection.is_empty())
+                {
+                    continue 'local;
+                }
+            }
+            if let TerminatorKind::Call {
+                func, destination, ..
+            } = &data.terminator().kind
+                && destination.local == local
+            {
+                // W58's fault (`CRAT_E5C_W58_FAULT=any-call`) takes any call result.
+                let fresh = std::env::var("CRAT_E5C_W58_FAULT").as_deref() == Ok("any-call")
+                    || func.const_fn_def().is_some_and(|(callee, _)| {
+                        callee.as_local().is_some() && returns_fresh_allocation(tcx, callee, 2)
+                    });
+                if !fresh || !destination.projection.is_empty() {
+                    continue 'local;
+                }
+                defined_by_fresh_call = true;
+            }
+        }
+        if defined_by_fresh_call {
+            out.insert(local);
+        }
+    }
+    out
+}
+
+/// Whether every value a program function returns is a fresh allocation: a
+/// `malloc`/`calloc`/`realloc`/`strdup` result (through plain copies and casts), a
+/// null constant, or (to `depth`) the result of another such program function.
+fn returns_fresh_allocation(
+    tcx: TyCtxt<'_>,
+    callee: rustc_span::def_id::DefId,
+    depth: u32,
+) -> bool {
+    use rustc_middle::mir::{RETURN_PLACE, Rvalue, StatementKind, TerminatorKind};
+    let Some(local) = callee.as_local() else { return false };
+    if !tcx.hir_node_by_def_id(local).body_id().is_some() {
+        return false;
+    }
+    let body = tcx.mir_drops_elaborated_and_const_checked(local).borrow();
+    // walk back from the return place through copies and casts
+    let mut sources = FxHashSet::from_iter([RETURN_PLACE]);
+    let mut fresh_calls = 0usize;
+    loop {
+        let before = sources.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else { continue };
+                if !lhs.projection.is_empty() || !sources.contains(&lhs.local) {
+                    continue;
+                }
+                match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => match operand.place() {
+                        Some(p) if p.projection.is_empty() => {
+                            sources.insert(p.local);
+                        }
+                        Some(_) => return false, // loaded through a place
+                        None => {}               // a constant (null)
+                    },
+                    _ => return false,
+                }
+            }
+        }
+        if sources.len() == before {
+            break;
+        }
+    }
+    for data in body.basic_blocks.iter() {
+        if let TerminatorKind::Call {
+            func, destination, ..
+        } = &data.terminator().kind
+            && destination.projection.is_empty()
+            && sources.contains(&destination.local)
+        {
+            let Some((def, _)) = func.const_fn_def() else { return false };
+            let name = tcx.item_name(def);
+            let allocator = matches!(name.as_str(), "malloc" | "calloc" | "realloc" | "strdup");
+            if !(allocator || (depth > 0 && returns_fresh_allocation(tcx, def, depth - 1))) {
+                return false;
+            }
+            fresh_calls += 1;
+        }
+    }
+    // parameters are not fresh
+    !sources
+        .iter()
+        .any(|l| l.as_usize() >= 1 && l.as_usize() <= body.arg_count)
+        && fresh_calls > 0
+}
+
+/// L01⁹ (`CRAT_ERA5C_NULL_EXIT`, R563-1, era-5c 055 buffer wall 1): the non-parameter
+/// locals that are NULL on every path reaching a return. A local qualifies when
+/// a block that tests `local.is_null()` dominates every return, the not-null
+/// successor of that test never reaches a return (it diverges, e.g. into
+/// `__assert_fail`), and the local is not reassigned after the test. A null
+/// pointer owns nothing, so the exit finalization has nothing to assert on it.
+pub(crate) fn null_at_exit_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<Local> {
+    use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind, UnOp};
+    let mut out = FxHashSet::default();
+    let returns: Vec<BasicBlock> = body
+        .basic_blocks
+        .iter_enumerated()
+        .filter(|(_, data)| matches!(data.terminator().kind, TerminatorKind::Return))
+        .map(|(block, _)| block)
+        .collect();
+    if returns.is_empty() {
+        return out;
+    }
+    let reachable = |from: BasicBlock| -> FxHashSet<BasicBlock> {
+        let mut seen = FxHashSet::default();
+        let mut stack = vec![from];
+        while let Some(block) = stack.pop() {
+            if seen.insert(block) {
+                stack.extend(body.basic_blocks[block].terminator().successors());
+            }
+        }
+        seen
+    };
+    let dominators = body.basic_blocks.dominators();
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            target: Some(next),
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee, _)) = func.const_fn_def() else {
+            continue;
+        };
+        if tcx.item_name(callee).as_str() != "is_null" {
+            continue;
+        }
+        let [arg] = &args[..] else { continue };
+        let Some(place) = arg.node.place() else { continue };
+        if !place.projection.is_empty() {
+            continue;
+        }
+        // The argument is usually a copy made in the calling block (`_t = copy L`).
+        let tested = data
+            .statements
+            .iter()
+            .rev()
+            .find_map(|statement| match &statement.kind {
+                StatementKind::Assign(box (lhs, Rvalue::Use(operand)))
+                    if lhs.local == place.local && lhs.projection.is_empty() =>
+                {
+                    Some(
+                        operand
+                            .place()
+                            .filter(|p| p.projection.is_empty())
+                            .map_or(place.local, |p| p.local),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or(place.local);
+        if tested.as_usize() <= body.arg_count {
+            continue;
+        }
+        let switch = &body.basic_blocks[*next];
+        let (mut condition, mut negated) = (destination.local, false);
+        for statement in &switch.statements {
+            if let StatementKind::Assign(box (lhs, Rvalue::UnaryOp(UnOp::Not, operand))) =
+                &statement.kind
+                && operand
+                    .place()
+                    .is_some_and(|p| p.local == condition && p.projection.is_empty())
+            {
+                condition = lhs.local;
+                negated = !negated;
+            }
+        }
+        let TerminatorKind::SwitchInt { discr, targets } = &switch.terminator().kind else {
+            continue;
+        };
+        if discr
+            .place()
+            .is_none_or(|p| p.local != condition || !p.projection.is_empty())
+        {
+            continue;
+        }
+        let Some(zero) = targets.target_for_value(0).into() else { continue };
+        let (not_null, null) = if negated {
+            (targets.otherwise(), zero)
+        } else {
+            (zero, targets.otherwise())
+        };
+        // W57's fault (`CRAT_E5C_W57_FAULT=no-diverge`) skips the divergence check.
+        let diverges = std::env::var("CRAT_E5C_W57_FAULT").as_deref() == Ok("no-diverge")
+            || !reachable(not_null).iter().any(|b| returns.contains(b));
+        if !diverges || !returns.iter().all(|r| dominators.dominates(*next, *r)) {
+            continue;
+        }
+        let reassigned = reachable(null).iter().any(|block| {
+            let data = &body.basic_blocks[*block];
+            data.statements.iter().any(|statement| {
+                matches!(&statement.kind, StatementKind::Assign(box (lhs, _)) if lhs.local == tested)
+            }) || matches!(&data.terminator().kind,
+                TerminatorKind::Call { destination, .. } if destination.local == tested)
+        });
+        if !reassigned {
+            out.insert(tested);
+        }
+    }
+    out
+}
+
 pub(crate) fn reseat_destinations(
     body: &rustc_middle::mir::Body<'_>,
 ) -> rustc_data_structures::fx::FxHashSet<Local> {

@@ -70,7 +70,7 @@ pub(crate) struct Row {
 pub(crate) struct ProofEvidence {
     pub(crate) schema: String,
     pub(crate) claim: Claim,
-    pub(crate) licensing_deferred: bool,
+    pub(crate) licensing_in_origin_evidence: bool,
     /// None means capture unavailable; Some(empty) is an observed empty family.
     pub(crate) families: BTreeMap<Family, Option<Vec<Row>>>,
     pub(crate) missing: BTreeSet<Missing>,
@@ -80,7 +80,7 @@ impl Default for ProofEvidence {
         Self {
             schema: "era5a-proof-evidence-v2".into(),
             claim: Claim::SourceObservationsOnly,
-            licensing_deferred: true,
+            licensing_in_origin_evidence: true,
             families: FAMILIES.into_iter().map(|f| (f, None)).collect(),
             missing: MISSING.into_iter().collect(),
         }
@@ -360,7 +360,7 @@ impl ProofEvidence {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.schema != "era5a-proof-evidence-v2"
-            || !self.licensing_deferred
+            || !self.licensing_in_origin_evidence
             || self.missing != MISSING.into_iter().collect()
         {
             return Err("schema/licensing or required Missing evidence changed".into());

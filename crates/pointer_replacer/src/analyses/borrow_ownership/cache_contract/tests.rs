@@ -1005,7 +1005,7 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
     // Integrity-only synthetic empty model; no claim that a model was solved.
     let mut exports = PortableExport {
         schema: portable_export::SCHEMA.into(),
-        licensing_deferred: true,
+        licensing_in_origin_evidence: true,
         identities: Default::default(),
         scope_gaps: [
             ScopeGap::OwnershipOccurrenceConstructionNotRecorded,

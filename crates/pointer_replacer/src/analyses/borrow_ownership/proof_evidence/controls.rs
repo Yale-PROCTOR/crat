@@ -38,7 +38,7 @@ fn control(code: &str, own: &[&str], nonown: &[&str], refs: &[&str]) {
         };
         let plain=run();let (captured,export)=export::with_bo_export(run);
         assert_eq!(plain,captured,"complete model, emission stats, exact selectors, ordinary replay and hard constraints remain unchanged");
-        let evidence=ProofEvidence::from_export(tcx,&export);evidence.validate().unwrap();assert!(evidence.licensing_deferred);
+        let evidence=ProofEvidence::from_export(tcx,&export);evidence.validate().unwrap();assert!(evidence.licensing_in_origin_evidence);
         let origin=origin_evidence::collect(&program,&slots,&origins,Some(&export));assert!(!origin.functions.is_empty());
         assert!(export.demand_evidence.is_some());
         let did=*program.functions.iter().find(|d|tcx.item_name(d.to_def_id()).as_str()=="f").unwrap();

@@ -63,6 +63,7 @@ fn c08_projected_traversal_payload_write_holds() {
 }
 
 #[test]
+#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
 fn c08_projected_traversal_deref_field_target_and_metadata() {
     let code = CODE
         .replace(

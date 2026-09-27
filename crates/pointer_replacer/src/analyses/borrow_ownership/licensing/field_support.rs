@@ -797,6 +797,21 @@ pub(crate) enum StoreSourceOrigin {
     Input(String),
     /// The token was loaded from this field. Supported iff that field owns.
     FieldToken(String),
+    /// L01⁹ rule 1a′ (`CRAT_ERA5C_ORIGIN_SET`): the token is one of several
+    /// origins -- parameters it came in as, fields it was loaded from (in any
+    /// function, e.g. a rotation's `x = (*y).left` returned through a call).
+    /// Supported iff every one of these slots owns.
+    All(Vec<String>),
+    /// L01⁹ rule 2′ (`CRAT_ERA5C_MOVED_INPUT`): a parameter's token stored into the
+    /// field by a LINEAR transfer, in a program whose callers are all known. The
+    /// field's post-store token (`token`) is the support: `own-linear` makes the
+    /// parameter's pre-store token the exclusive or of it and the parameter's
+    /// post-store token, so if it owns, the parameter keeps nothing -- a later
+    /// free of the parameter, or its return to a caller that frees it, needs the
+    /// post-store token to own and is refused.
+    MovedInput {
+        token: Node,
+    },
     /// Not classifiable from recorded origins. Never supported.
     Unknown,
 }
@@ -1449,11 +1464,65 @@ pub(crate) fn audit(
             .filter_map(|hold| hold.site.clone())
             .collect();
         for site in held {
+            if proof.classified.iter().any(|store| store.site == site) {
+                continue;
+            }
             let origin = classify_store_source(facts, origins, &site);
             proof.classified.push(ClassifiedStore { site, origin });
         }
+        // L01⁹ rule 2′: a parameter store held for its terminal role or its
+        // callers is supported by its own post-store token, when the transfer is
+        // linear and the program's callers are all known.
+        if super::super::field_moves::moved_input()
+            && super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete
+        {
+            let moved: Vec<(Site, Node)> = proof
+                .input_stores
+                .iter()
+                .filter(|input| {
+                    proof.holds.iter().any(|hold| {
+                        hold.site.as_ref() == Some(&input.site)
+                            && matches!(hold.reason, Pending::TerminalRoleC | Pending::CallerCoverageC)
+                    })
+                })
+                // `linear`: the split is at the store. `equal` by MOVE: the stored
+                // operand is a moved-out temporary, and the split happened at the
+                // copy that made it (`_t = copy x`, `own-linear`). An `equal` from a
+                // copied operand keeps its hold: the source may still carry the token.
+                .filter(|input| {
+                    facts.equations.iter().any(|row| {
+                        row.point.construction == input.equation.construction
+                            && row.ordinal == input.equation.ordinal
+                            && moved_transfer(
+                                &row.operation,
+                                row.transfer.as_ref().is_some_and(|t| t.by_move),
+                            )
+                    })
+                })
+                .map(|input| (input.site.clone(), input.destination_def))
+                .collect();
+            for (site, token) in moved {
+                if std::env::var("CRAT_R388_DEBUG").is_ok() {
+                    eprintln!(
+                        "R388SET {} {}:{} -> MovedInput(token={})",
+                        site.function, site.block, site.statement, token.var
+                    );
+                }
+                proof.classified.push(ClassifiedStore {
+                    site,
+                    origin: StoreSourceOrigin::MovedInput { token },
+                });
+            }
+        }
     }
     fields.into_values().collect()
+}
+
+/// L01⁹ rule 2′: whether a store's transfer hands the whole token to the field --
+/// `linear` (the split is at the store) or `equal` by move (a moved-out temporary,
+/// split at the copy that made it). An `equal` from a copied operand does not.
+pub(crate) fn moved_transfer(operation: &str, by_move: bool) -> bool {
+    operation == "linear" || (operation == "equal" && by_move)
 }
 
 /// R388-1: the origin of the value a store puts into a field, from the recorded
@@ -1523,8 +1592,98 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
             .flatten()
         })
     };
+    // L01⁹ rule 1a′: collect every origin slot instead of giving up at the second.
+    if super::super::field_moves::origin_set() {
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for atom in &atoms {
+            match atom {
+                OriginAtom::Fresh(_) | OriginAtom::Null => {}
+                OriginAtom::Input(port)
+                | OriginAtom::UnresolvedInput { formal: port, .. }
+                | OriginAtom::UnclassifiedInput { formal: port, .. } => match parameter(*port) {
+                    Some(key) => {
+                        keys.insert(key);
+                    }
+                    None => {
+                        if std::env::var("CRAT_R388_DEBUG").is_ok() {
+                            eprintln!(
+                                "R388SET {} {}:{} no entry row for port {port:?}",
+                                site.function, site.block, site.statement
+                            );
+                        }
+                        return StoreSourceOrigin::Unknown;
+                    }
+                },
+                // A load anywhere in the program (vars are program-wide per
+                // construction): the field it was loaded from.
+                OriginAtom::Unknown(port) => {
+                    // The port is the load's definition, or the field place's
+                    // own use window at the load (the token as read out of it).
+                    let loaded: BTreeSet<String> = facts
+                        .field_support_inputs
+                        .loads
+                        .iter()
+                        .filter(|load| {
+                            facts.consumes.iter().any(|consume| {
+                                consume.point.function.as_deref()
+                                    == Some(load.site.function.as_str())
+                                    && consume.point.block == Some(load.site.block)
+                                    && consume.point.statement == Some(load.site.statement)
+                                    && consume.point.construction == port.construction
+                                    && matches!(
+                                        &consume.projected,
+                                        Availability::Present(window)
+                                            if window.def_start == port.var
+                                                || window.use_start == port.var
+                                    )
+                            })
+                        })
+                        .map(|load| load.site.field_key.clone())
+                        .collect();
+                    if loaded.is_empty() {
+                        if std::env::var("CRAT_R388_DEBUG").is_ok() {
+                            eprintln!(
+                                "R388SET {} {}:{} no load for port {port:?}",
+                                site.function, site.block, site.statement
+                            );
+                        }
+                        return StoreSourceOrigin::Unknown;
+                    }
+                    keys.extend(loaded);
+                }
+                _ => return StoreSourceOrigin::Unknown,
+            }
+        }
+        let result = match keys.len() {
+            0 => StoreSourceOrigin::Fresh,
+            _ => StoreSourceOrigin::All(keys.into_iter().collect()),
+        };
+        if std::env::var("CRAT_R388_DEBUG").is_ok() {
+            eprintln!(
+                "R388SET {} {}:{} -> {result:?}",
+                site.function, site.block, site.statement
+            );
+        }
+        return result;
+    }
+    let origin = classify_single_origin(facts, site, &atoms, parameter);
+    if std::env::var("CRAT_R388_DEBUG").is_ok() {
+        eprintln!(
+            "R388SET {} {}:{} -> {origin:?}",
+            site.function, site.block, site.statement
+        );
+    }
+    origin
+}
+
+fn classify_single_origin(
+    facts: &Facts,
+    site: &Site,
+    atoms: &BTreeSet<OriginAtom>,
+    parameter: impl Fn(Node) -> Option<String>,
+) -> StoreSourceOrigin {
     let mut origin = StoreSourceOrigin::Fresh;
-    for atom in &atoms {
+    for atom in atoms {
         match atom {
             OriginAtom::Fresh(_) | OriginAtom::Null => {}
             OriginAtom::Input(port)

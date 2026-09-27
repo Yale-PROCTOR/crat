@@ -442,14 +442,14 @@ impl StreamCollector {
             self.write_families(w, true)?;
             raw(w, b",\"identities\":")?;
             json(w, &self.identities)?;
-            raw(w, b",\"licensing_deferred\":true,\"schema\":")?;
+            raw(w, b",\"licensing_in_origin_evidence\":true,\"schema\":")?;
             json(w, &SCHEMA)?;
             raw(w, b",\"scope_gaps\":")?;
             json(w, &gaps)?;
         } else {
             raw(w, b"{\"schema\":")?;
             json(w, &SCHEMA)?;
-            raw(w, b",\"licensing_deferred\":true,\"identities\":")?;
+            raw(w, b",\"licensing_in_origin_evidence\":true,\"identities\":")?;
             json(w, &self.identities)?;
             raw(w, b",\"scope_gaps\":")?;
             json(w, &gaps)?;
@@ -688,6 +688,22 @@ pub(crate) fn collect_to_path(
             .availability = CaptureAvailability::NotRecorded {
             reason: "producer did not record an L2 residual certificate".into(),
         };
+    }
+    match written_move_store_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MoveStoreObligations, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::MoveStoreObligations)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: MOVE_STORE_NOT_RECORDED.into(),
+            };
+        }
     }
     for row in &export.realloc_version_sites {
         out.add(F::ReallocVersions,json!({"function":resolver.function(row.fn_did)?,"event":realloc_key(&row.event),"outcome":tag(row.outcome),"edge":row.edge,"location":mir_location(row.location),"local":row.local.as_u32(),"use_present":row.use_var.is_some()}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.as_u32()}))?;

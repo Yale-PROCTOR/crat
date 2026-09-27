@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{crate_slots::CrateSlots, export::BoExport};
 use crate::utils::rustc::RustProgram;
 
-pub(crate) const SCHEMA: &str = "era5a-portable-export-v1";
+/// v2 (L01⁹, R574-5 (iii)): adds `move-store-obligations`, so the store-as-move
+/// obligations travel with the frame. A v1 export carries no such family.
+pub(crate) const SCHEMA: &str = "era5a-portable-export-v2";
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -33,9 +35,12 @@ pub(crate) enum ExportFamily {
     ArrayFields,
     DemandEvidence,
     ProofEvidence,
+    /// L01⁹ wall 4: one row per qualifying store (design record §3.3);
+    /// `NotRecorded` when `CRAT_ERA5C_MOVE_STORE` is off.
+    MoveStoreObligations,
 }
 
-pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 20] = [
+pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 21] = [
     ExportFamily::OwnershipVersions,
     ExportFamily::OwnershipValues,
     ExportFamily::SourceSelectors,
@@ -56,6 +61,7 @@ pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 20] = [
     ExportFamily::ArrayFields,
     ExportFamily::DemandEvidence,
     ExportFamily::ProofEvidence,
+    ExportFamily::MoveStoreObligations,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -134,7 +140,7 @@ pub(crate) struct DiagnosticRecord {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PortableExport {
     pub(crate) schema: String,
-    pub(crate) licensing_deferred: bool,
+    pub(crate) licensing_in_origin_evidence: bool,
     /// Resolved canonical identities; references never rely on numeric handles.
     pub(crate) identities: BTreeSet<String>,
     pub(crate) scope_gaps: BTreeSet<ScopeGap>,
@@ -144,7 +150,7 @@ pub(crate) struct PortableExport {
 
 impl PortableExport {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schema != SCHEMA || !self.licensing_deferred {
+        if self.schema != SCHEMA || !self.licensing_in_origin_evidence {
             return Err("portable export schema/licensing mismatch".into());
         }
         if self.families.keys().copied().collect::<BTreeSet<_>>()
@@ -156,8 +162,10 @@ impl PortableExport {
             match &payload.availability {
                 CaptureAvailability::Captured => {}
                 CaptureAvailability::NotRecorded { reason }
-                    if *family == ExportFamily::ResidualConflicts
-                        && !reason.is_empty()
+                    if matches!(
+                        family,
+                        ExportFamily::ResidualConflicts | ExportFamily::MoveStoreObligations
+                    ) && !reason.is_empty()
                         && payload.source_rows == 0
                         && payload.records.is_empty() => {}
                 _ => return Err(format!("required capture unavailable: {family:?}")),
@@ -638,6 +646,7 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         F::ReallocCases => vec!["event", "outcome"],
         F::RetirementRounds => vec!["round"],
         F::RetirementFinal | F::DemandEvidence | F::ProofEvidence => vec![],
+        F::MoveStoreObligations => vec!["function", "store"],
         _ => fields.keys().map(String::as_str).collect(),
     };
     let identity = selected
@@ -654,6 +663,201 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         "{family:?}/{}",
         serde_json::to_string(&identity).map_err(|e| e.to_string())?
     ))
+}
+
+/// L01⁹ wall 4: the typed row of the `move-store-obligations` family. The
+/// writer serializes it and every reader decodes it, so the two cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreRow {
+    pub(crate) function: String,
+    pub(crate) store: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) container: u32,
+    pub(crate) field: MoveStoreField,
+    pub(crate) alias: Vec<u32>,
+    pub(crate) uses: Vec<MoveStoreUse>,
+    pub(crate) kept: Vec<u32>,
+    pub(crate) kept_uses: Vec<MoveStoreUse>,
+    /// R577-5: the members whose loans the store cleared, with their round kinds.
+    pub(crate) cleared: Vec<MoveStoreCleared>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreCleared {
+    pub(crate) local: u32,
+    /// `owning` or `ref`: a `Raw` member keeps its loan (3.2).
+    pub(crate) kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreLocation {
+    pub(crate) block: u32,
+    pub(crate) statement: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreField {
+    pub(crate) structure: String,
+    pub(crate) field_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreUse {
+    pub(crate) location: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) local: u32,
+    pub(crate) kind: String,
+    pub(crate) dominated: bool,
+}
+
+/// Why the family is `NotRecorded`: the arm was off, so no loan was removed.
+pub(crate) const MOVE_STORE_NOT_RECORDED: &str =
+    "CRAT_ERA5C_MOVE_STORE off: no store-as-move loan was removed";
+
+/// The rows a producer recorded, in the portable form; `None` = arm off.
+pub(crate) fn move_store_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<MoveStoreRow>>, String> {
+    let Some(rows) = &export.move_store_obligations else {
+        return Ok(None);
+    };
+    // R577-5's witness fault: the cleared members vanish from the rows.
+    let drop_cleared = std::env::var("CRAT_E5C_W62_FAULT").ok().as_deref() == Some("drop-cleared");
+    let tcx = program.tcx;
+    let span = |span: rustc_span::Span| super::ownership_occurrence::SourceSpan {
+        file: tcx
+            .sess
+            .source_map()
+            .span_to_filename(span)
+            .prefer_local()
+            .to_string(),
+        lo: span.lo().0,
+        hi: span.hi().0,
+    };
+    let location = |location: Location| MoveStoreLocation {
+        block: location.block.as_u32(),
+        statement: location.statement_index,
+    };
+    let uses = |uses: &[super::move_store::ObligationUse]| {
+        uses.iter()
+            .map(|u| MoveStoreUse {
+                location: location(u.location),
+                span: span(u.span),
+                local: u.local.as_u32(),
+                kind: u.kind.as_str().into(),
+                dominated: u.dominated,
+            })
+            .collect::<Vec<_>>()
+    };
+    let resolver = Resolver { program, slots };
+    rows.iter()
+        .map(|row| {
+            Ok(MoveStoreRow {
+                function: resolver.function(row.function)?,
+                store: location(row.store),
+                span: span(row.span),
+                container: row.container.as_u32(),
+                field: MoveStoreField {
+                    structure: tcx.def_path_str(row.field.struct_did),
+                    field_index: row.field.field_index,
+                },
+                alias: row.alias.iter().map(|l| l.as_u32()).collect(),
+                uses: uses(&row.uses),
+                kept: row.kept.iter().map(|l| l.as_u32()).collect(),
+                kept_uses: uses(&row.kept_uses),
+                cleared: if drop_cleared {
+                    Vec::new()
+                } else {
+                    row.cleared
+                        .iter()
+                        .map(|&(local, kind)| MoveStoreCleared {
+                            local: local.as_u32(),
+                            kind: match kind {
+                                super::SlotKind::Raw => "raw",
+                                super::SlotKind::Ref => "ref",
+                                super::SlotKind::Owning => "owning",
+                            }
+                            .into(),
+                        })
+                        .collect()
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(|mut rows| {
+            rows.sort_by(move_store_order);
+            Some(rows)
+        })
+}
+
+/// The rows both writers serialize: `move_store_rows`, except under W62's
+/// `drop-rows` fault, where they vanish from the export only (the round trip
+/// must see the loss against the model's own rows).
+pub(crate) fn written_move_store_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<MoveStoreRow>>, String> {
+    let rows = move_store_rows(program, slots, export)?;
+    if std::env::var("CRAT_E5C_W62_FAULT").ok().as_deref() == Some("drop-rows") {
+        return Ok(rows.map(|_| Vec::new()));
+    }
+    Ok(rows)
+}
+
+/// The family's one row order, for the writer and every reader alike: the
+/// portable family keeps its records by key, not in production order.
+fn move_store_order(a: &MoveStoreRow, b: &MoveStoreRow) -> std::cmp::Ordering {
+    (&a.function, a.store.block, a.store.statement).cmp(&(
+        &b.function,
+        b.store.block,
+        b.store.statement,
+    ))
+}
+
+/// The consumer's accessor (ownership-fields 069's discharge reads these): a
+/// family that is `NotRecorded` or rows that do not decode are refused.
+pub(crate) fn decode_move_store(
+    availability: &CaptureAvailability,
+    records: &[BTreeMap<String, Value>],
+) -> Result<Vec<MoveStoreRow>, String> {
+    if let CaptureAvailability::NotRecorded { reason } = availability {
+        return Err(format!("move-store obligations not recorded: {reason}"));
+    }
+    let mut rows = records
+        .iter()
+        .map(|fields| {
+            serde_json::from_value(Value::Object(fields.clone().into_iter().collect()))
+                .map_err(|e| format!("move-store row: {e}"))
+        })
+        .collect::<Result<Vec<MoveStoreRow>, String>>()?;
+    rows.sort_by(move_store_order);
+    Ok(rows)
+}
+
+impl PortableExport {
+    /// The rows, or a refusal: a v1 export, a missing family, or `NotRecorded`.
+    pub(crate) fn move_store_obligations(&self) -> Result<Vec<MoveStoreRow>, String> {
+        if self.schema != SCHEMA {
+            return Err(format!(
+                "move-store obligations need {SCHEMA}, got {}",
+                self.schema
+            ));
+        }
+        let family = self
+            .families
+            .get(&ExportFamily::MoveStoreObligations)
+            .ok_or("move-store obligations family missing")?;
+        let records: Vec<_> = family.records.iter().map(|r| r.fields.clone()).collect();
+        decode_move_store(&family.availability, &records)
+    }
 }
 
 impl PortableExport {
@@ -713,7 +917,7 @@ pub(crate) fn collect(
     required(export.demand_evidence.is_some(), "demand evidence")?;
     let mut out = PortableExport {
         schema: SCHEMA.into(),
-        licensing_deferred: true,
+        licensing_in_origin_evidence: true,
         identities: BTreeSet::new(),
         scope_gaps: BTreeSet::from([
             ScopeGap::OwnershipOccurrenceConstructionNotRecorded,
@@ -793,6 +997,22 @@ pub(crate) fn collect(
             .availability = CaptureAvailability::NotRecorded {
             reason: "producer did not record an L2 residual certificate".into(),
         };
+    }
+    match written_move_store_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MoveStoreObligations, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::MoveStoreObligations)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: MOVE_STORE_NOT_RECORDED.into(),
+            };
+        }
     }
     for row in &export.realloc_version_sites {
         out.add(F::ReallocVersions,json!({"function":resolver.function(row.fn_did)?,"event":realloc_key(&row.event),"outcome":tag(row.outcome),"edge":row.edge,"location":mir_location(row.location),"local":row.local.as_u32(),"use_present":row.use_var.is_some()}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.as_u32()}))?;

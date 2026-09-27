@@ -62,7 +62,7 @@ fn e5_sched_source_facts_do_not_become_emitted_history_proof() {
         assert!(!rows(&e, Family::Entry).is_empty());
         assert!(!rows(&e, Family::Observation).is_empty());
         assert!(e.missing.contains(&Missing::EmittedSchedule));
-        assert!(e.licensing_deferred);
+        assert!(e.licensing_in_origin_evidence);
         assert_eq!(e.claim, Claim::SourceObservationsOnly);
         e.validate().unwrap();
         let json = e.canonical_json().unwrap();
@@ -131,7 +131,7 @@ fn e5_proof_schema_rejects_duplicate_dangling_and_claim_promotion() {
             .push("missing-entry".into());
         assert!(dangling.validate().is_err());
         let mut licensing = e.clone();
-        licensing.licensing_deferred = false;
+        licensing.licensing_in_origin_evidence = false;
         assert!(licensing.validate().is_err());
         let mut schedule = e.clone();
         schedule.missing.remove(&Missing::EmittedSchedule);

@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p8-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p9-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -114,7 +114,10 @@ pub(crate) fn solver_identity(
     fields.insert("field_inner_facts", "explicit-availability-v1".to_owned());
     fields.insert("array_fields", "uniform-element-raw-holds-v1".to_owned());
     fields.insert("proof_evidence", "source-only-v2".to_owned());
-    fields.insert("ownership_licensing", "deferred-era5b".to_owned());
+    fields.insert(
+        "ownership_licensing",
+        "era5b-in-solve-origin-evidence-v1".to_owned(),
+    );
     fields.insert("a14", A14_MARKER.to_owned());
     fields.insert("a16", A16_MARKER.to_owned());
     fields.insert("a2_mode", A2Mode::current().label().to_owned());
@@ -185,6 +188,112 @@ pub(crate) fn solver_identity(
     fields.insert(
         "era5c_lend_formal",
         super::field_moves::lend_formal().to_string(),
+    );
+    fields.insert(
+        "era5c_copy_lend",
+        super::field_moves::copy_lend().to_string(),
+    );
+    fields.insert(
+        "era5c_deref_reader",
+        super::field_moves::deref_reader().to_string(),
+    );
+    fields.insert(
+        "era5c_field_own_repair",
+        super::field_moves::field_own_repair().to_string(),
+    );
+    fields.insert(
+        "era5c_null_exit",
+        super::field_moves::null_exit().to_string(),
+    );
+    fields.insert(
+        "era5c_moved_input",
+        super::field_moves::moved_input().to_string(),
+    );
+    fields.insert(
+        "era5c_move_store",
+        super::field_moves::move_store().to_string(),
+    );
+    fields.insert(
+        "era5c_own_named",
+        super::field_moves::own_named().to_string(),
+    );
+    fields.insert(
+        "era5c_origin_set",
+        super::field_moves::origin_set().to_string(),
+    );
+    fields.insert(
+        "era5c_exit_close",
+        super::field_moves::exit_close().to_string(),
+    );
+    fields.insert(
+        "era5c_dead_join",
+        super::field_moves::dead_join().to_string(),
+    );
+    fields.insert(
+        "era5c_ref_weight_named",
+        format!("{:?}", super::field_moves::ref_weight_temporary()),
+    );
+    // R551 (spec lane B3 (a)): era-5b's three constraint-changing switches were
+    // covered only by the launch digest. They are the identity's now.
+    fields.insert(
+        "era5b_pass",
+        if super::licensing::facts::joint() {
+            "joint"
+        } else {
+            "era5a"
+        }
+        .to_owned(),
+    );
+    fields.insert(
+        "era5b_repair",
+        super::licensing::facts::repair().to_string(),
+    );
+    fields.insert(
+        "era5b_relax_frame",
+        super::licensing::facts::relax_frame().to_string(),
+    );
+    // The test-build fault hooks are compiled into the worker (a test binary):
+    // a set one changes the model, so it names the key.
+    fields.insert(
+        "era5c_test_faults",
+        [
+            "CRAT_E5C_W47_FAULT",
+            "CRAT_E5C_W49_FAULT",
+            "CRAT_E5C_W52_FAULT",
+            "CRAT_E5C_W55_FAULT",
+            "CRAT_E5C_W57_FAULT",
+            "CRAT_E5C_W58_FAULT",
+            "CRAT_E5C_W60_FAULT",
+            "CRAT_E5C_W61_FAULT",
+            "CRAT_E5C_W62_FAULT",
+        ]
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(","),
+    );
+    // R551 (B2): the never-land diagnosis pins stay in the tree, inert unless
+    // set; a run with any of them set keys apart from every frame solve.
+    fields.insert(
+        "era5c_diagnostics",
+        [
+            "CRAT_ERA5C_BYTEPROOF",
+            "CRAT_ERA5C_DEBUG",
+            "CRAT_ERA5C_EQ_BACKTRACE",
+            "CRAT_ERA5C_FIELDSIZE",
+            "CRAT_ERA5C_PROFILE",
+            "CRAT_ERA5C_RESEAT_DUMP",
+            "CRAT_ERA5C_RESEAT_WHY",
+        ]
+        .iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(","),
     );
     // The diagnosis gate is not an arm, but it DOES change the constraint set,
     // so by R374-1's own argument it belongs in the identity: a solve run with
@@ -694,6 +803,7 @@ pub(crate) fn prepare(
             baseline: e5c_baseline,
             receipt: verified.receipt.clone(),
             origin: e5c_origin,
+            move_store: Default::default(),
         };
         e5c_rss("Metadata built");
         let e5c_twin = e5c_twin_path.map(|twin| {
@@ -823,6 +933,30 @@ pub(crate) fn prepare(
             PREPARED.with(|p| *p.borrow_mut() = None);
             PREPARE_ERROR.with(|e| *e.borrow_mut() = Some(error));
         }
+    }
+}
+
+/// L01⁹ wall 4 (R574-5 (iii)): the prepared entry's store-as-move obligations,
+/// for the rewriter's discharge (ownership-fields 069 §4). A loaded entry already
+/// carries them from the streamed read; a staged one is read back once.
+/// Refused unless the entry records them.
+pub(crate) fn prepared_move_store_obligations(
+    fingerprint: &str,
+) -> Result<Vec<super::portable_export::MoveStoreRow>, String> {
+    let (path, metadata) = PREPARED
+        .with(|prepared| {
+            prepared
+                .borrow()
+                .as_ref()
+                .filter(|prepared| prepared.entry.metadata.key == fingerprint)
+                .map(|prepared| (prepared.entry.path.clone(), prepared.entry.metadata.clone()))
+        })
+        .ok_or("no prepared entry for this fingerprint")?;
+    match metadata.move_store {
+        super::cache_contract::stream::MoveStoreCapture::Missing => {
+            super::cache_contract::validate_file(&path)?.move_store_obligations()
+        }
+        _ => metadata.move_store_obligations(),
     }
 }
 
@@ -1028,7 +1162,7 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5c-l01p8-v1",
+            "analysis_frame=era5c-l01p9-v1",
             "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",
@@ -1038,7 +1172,7 @@ mod tests {
             "field_inner_facts=explicit-availability-v1",
             "array_fields=uniform-element-raw-holds-v1",
             "proof_evidence=source-only-v2",
-            "ownership_licensing=deferred-era5b",
+            "ownership_licensing=era5b-in-solve-origin-evidence-v1",
             "query_timeout_ms=600000",
             "a5_mode=precise_replay",
             "a5_world=closed_world_frozen_graph",

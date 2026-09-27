@@ -161,6 +161,7 @@ fn w_vw_1_a_borrowed_view_that_is_dropped_certifies() {
 }
 
 #[test]
+#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
 fn w_vw_2_the_rotation_certifies() {
     with_facts(&format!("{WIDE_PRELUDE}{VW2}"), |facts| {
         certify(facts, "rotate", 1).expect("the parameter is folded under its own descendant");

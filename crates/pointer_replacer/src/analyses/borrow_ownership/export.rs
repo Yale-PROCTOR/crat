@@ -554,6 +554,10 @@ pub(crate) struct BoExport {
     pub version_sites: Vec<VersionSite>,
     /// E-R2 per-`Var` ownership, evaluated from the accepted model.
     pub version_owns: Option<IndexVec<Var, bool>>,
+    /// L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): the final round's store-as-move
+    /// obligations (design record §3.3). In-process only: not in the portable
+    /// export or the cache entry until the seat rules on the schema.
+    pub(crate) move_store_obligations: Option<Vec<super::move_store::MoveStoreObligation>>,
     /// E-R3 selector provenance, index-aligned with `Selectors`.
     pub source_sites: Vec<SelectorSite>,
     pub sink_sites: Vec<SelectorSite>,
@@ -1035,7 +1039,16 @@ pub(crate) fn begin_round() {
         export.stack_entry_final = None;
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
+        export.move_store_obligations = None;
     });
+}
+
+/// L01⁹ wall 4: this round's store-as-move obligations (the final round's remain).
+pub(crate) fn record_move_store_obligations(rows: &[super::move_store::MoveStoreObligation]) {
+    if !capturing() {
+        return;
+    }
+    record(|export| export.move_store_obligations = Some(rows.to_vec()));
 }
 
 // `snapshot()` and `with_capture_suspended()` were DELETED in the allow-list

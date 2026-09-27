@@ -14,6 +14,8 @@ pub(crate) struct Selection {
     values: BTreeMap<EquationId, bool>,
     traversal_owns: BTreeMap<super::transport::Node, bool>,
     fold_values: Option<super::fold_custody::Values>,
+    /// L01⁹ wall 4: the move-store candidates' destination post-store own values.
+    move_store_owns: BTreeMap<u32, bool>,
 }
 impl Selection {
     /// Evaluate actual original-cell predicates in the existing live Model.
@@ -61,7 +63,22 @@ impl Selection {
                     .map(|value| (node, value))
             })
             .collect();
+        let move_store_owns = if super::super::field_moves::move_store() {
+            super::super::move_store::destination_vars(&facts)
+                .into_iter()
+                .filter_map(|var| {
+                    facts
+                        .ownership_asts
+                        .get(super::super::ssa::constraint::Var::from_u32(var))
+                        .and_then(|ast| evaluate(ast))
+                        .map(|value| (var, value))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         Self {
+            move_store_owns,
             fold_values: super::fold_custody::capture(&facts, &mut evaluate),
             facts,
             values,
@@ -85,6 +102,13 @@ impl Selection {
 
     pub(crate) fn values(&self, facts: &Rc<Facts>) -> Option<BTreeMap<EquationId, bool>> {
         Rc::ptr_eq(facts, &self.facts).then(|| self.values.clone())
+    }
+
+    /// L01⁹ wall 4: whether a store's destination post-store token owns in this model.
+    pub(crate) fn move_store_own(&self, facts: &Rc<Facts>, var: u32) -> Option<bool> {
+        Rc::ptr_eq(facts, &self.facts)
+            .then(|| self.move_store_owns.get(&var).copied())
+            .flatten()
     }
 
     pub(crate) fn value(&self, facts: &Rc<Facts>, guard: EquationId) -> Option<bool> {

@@ -289,6 +289,15 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "a5-coarse-exclusion",
     "own-original-cell",
     "own-fold-pending",
+    // R551 (spec lane B4): era-5c's own families, registered. Each matched no
+    // family before (it took the family-granularity `unregistered::` fallback),
+    // so appending them cannot shadow an older name under first-containment.
+    "lend-formal-forbid",
+    "field-move-kind",
+    "own-guarded-traversal-formal-zero",
+    "own-guarded-traversal-receiver-legacy",
+    // L01⁹ rule 1b.
+    "deref-reader-kind",
 ];
 
 pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
@@ -777,8 +786,17 @@ impl KindSolver {
         if add_objective {
             // Prefer Ref where hard constraints allow it, then Raw over unnecessary Owning.
             let big = vars.len() as u64 + 1;
-            for kind_vars in vars.values() {
-                solver.assert_soft(&kind_vars.ref_, big, None);
+            // L01⁹ measurement arm: locals get their Ref weight from
+            // `prefer_ref_for_named`, and only the named ones.
+            let temporary = super::field_moves::ref_weight_temporary();
+            for (slot, kind_vars) in &vars {
+                match (temporary, slot) {
+                    (Some(0), SlotRef::Local(..)) => {}
+                    (Some(weight), SlotRef::Local(..)) => {
+                        solver.assert_soft(&kind_vars.ref_, weight, None)
+                    }
+                    _ => solver.assert_soft(&kind_vars.ref_, big, None),
+                }
                 solver.assert_soft(&kind_vars.raw, 1u64, None);
             }
         }
@@ -1149,6 +1167,17 @@ impl KindSolver {
         }
     }
 
+    /// L01⁹ measurement arm (`CRAT_ERA5C_REF_WEIGHT_NAMED`): the Ref weight of a
+    /// named local's slot, the one `build` withholds from every local.
+    pub(crate) fn prefer_ref_for_named(&self, slot: SlotRef) -> bool {
+        let Some(kind_vars) = self.vars.get(&slot) else {
+            return false;
+        };
+        self.solver
+            .assert_soft(&kind_vars.ref_, self.vars.len() as u64 + 1, None);
+        true
+    }
+
     /// **L01⁶ (b)** — the local-slot Owning preference, R517-12.
     ///
     /// A slot the licensing layer has already refused a reference has only
@@ -1342,10 +1371,31 @@ impl KindSolver {
                 &!left.xor(right),
             );
         }
-        super::ownership_evidence::record("field-move-release", &[], None, None);
         if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
             eprintln!("E5C field-move-release {lhs:?} <- {rhs:?} (own equality released)");
         }
+    }
+
+    /// L01⁹ rule 1b (`CRAT_ERA5C_DEREF_READER`): a deref-only field read. The
+    /// temporary shares the field's surface form (raw iff the field is raw); a
+    /// reader of a Ref field is Ref (it never owns borrowed memory); a reader of
+    /// an Owning field is Ref or Owning, as its own ownership versions decide --
+    /// the equate forced Owning, which a temporary finalized at exit cannot be.
+    pub(crate) fn deref_reader_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
+        let a = &self.vars[&lhs];
+        let b = &self.vars[&rhs];
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("deref-reader-kind({lhs:?},{rhs:?},raw)"),
+            &!a.raw.xor(&b.raw),
+        );
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("deref-reader-kind({lhs:?},{rhs:?},ref)"),
+            &b.ref_.implies(&a.ref_),
+        );
     }
 
     pub(crate) fn reference_field_reader_or_equate(
@@ -2263,12 +2313,24 @@ impl KindSolver {
         // Every hold must be either a store this pass classified, or the
         // `EmptyOwnedSupport` that follows from them. Anything else is a premise
         // the classification does not speak to.
-        let covered = proof.holds.iter().all(|hold| {
-            hold.reason == Pending::EmptyOwnedSupport
-                || (hold.reason == Pending::OwnedInputOrOriginC
-                    && hold.site.as_ref().is_some_and(|site| {
-                        proof.classified.iter().any(|store| &store.site == site)
-                    }))
+        let covered = proof.holds.iter().all(|hold| match hold.reason {
+            Pending::EmptyOwnedSupport => true,
+            Pending::OwnedInputOrOriginC => hold.site.as_ref().is_some_and(|site| {
+                proof.classified.iter().any(|store| {
+                    &store.site == site
+                        && !matches!(store.origin, StoreSourceOrigin::MovedInput { .. })
+                })
+            }),
+            // L01⁹ rule 2′: only a moved-input classification covers these.
+            Pending::TerminalRoleC | Pending::CallerCoverageC => {
+                hold.site.as_ref().is_some_and(|site| {
+                    proof.classified.iter().any(|store| {
+                        &store.site == site
+                            && matches!(store.origin, StoreSourceOrigin::MovedInput { .. })
+                    })
+                })
+            }
+            _ => false,
         });
         if !covered {
             return Ok(None);
@@ -2282,6 +2344,27 @@ impl KindSolver {
                         return Ok(None);
                     };
                     conjuncts.push(self.vars[&slot].own.clone());
+                }
+                StoreSourceOrigin::All(keys) => {
+                    for key in keys {
+                        let Some(&slot) = facts.slot_refs.get(key) else {
+                            return Ok(None);
+                        };
+                        conjuncts.push(self.vars[&slot].own.clone());
+                    }
+                }
+                StoreSourceOrigin::MovedInput { token } => {
+                    anyhow::ensure!(
+                        facts.constructions == 1 && token.construction == 0,
+                        "moved-input construction mismatch"
+                    );
+                    let Some(own) = facts.ownership_asts.get(Var::from_u32(token.var)) else {
+                        return Ok(None);
+                    };
+                    // W60's fault (`CRAT_E5C_W60_FAULT=no-token`) drops the token term.
+                    if std::env::var("CRAT_E5C_W60_FAULT").as_deref() != Ok("no-token") {
+                        conjuncts.push(own.clone());
+                    }
                 }
                 StoreSourceOrigin::Unknown => return Ok(None),
             }

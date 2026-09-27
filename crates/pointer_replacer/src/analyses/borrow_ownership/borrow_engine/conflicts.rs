@@ -84,6 +84,12 @@ fn overwrite_with_engine_facts<'tcx>(
         ),
     };
     inference.invalidates = invalidates;
+    crate::analyses::borrow_ownership::move_store::clear_removed(
+        f,
+        &inference.borrow_set,
+        &inference.loan_liveness,
+        &mut inference.invalidates,
+    );
     inference.errors = super::errors::compute_errors(
         &inference.borrow_set,
         &inference.loan_liveness,
@@ -114,6 +120,12 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
             copy_lends,
         );
     inference.invalidates = invalidates;
+    crate::analyses::borrow_ownership::move_store::clear_removed(
+        f,
+        &inference.borrow_set,
+        &inference.loan_liveness,
+        &mut inference.invalidates,
+    );
     inference.errors = super::errors::compute_errors(
         &inference.borrow_set,
         &inference.loan_liveness,

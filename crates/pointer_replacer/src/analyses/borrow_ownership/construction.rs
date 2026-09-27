@@ -123,7 +123,12 @@ impl CopyLendMode {
         if let Some(mode) = COPY_LEND_MODE_OVERRIDE.with(Cell::get) {
             return mode;
         }
-        Self::Baseline
+        // R549-2 (i): the production selector (`CRAT_ERA5C_COPY_LEND`, default off).
+        if super::field_moves::copy_lend() {
+            Self::LendArm
+        } else {
+            Self::Baseline
+        }
     }
 
     #[cfg(test)]
@@ -735,9 +740,327 @@ fn construct_bo_a5_reference(
         origins,
         mut_facts,
         solver,
-        CopyLendMode::Baseline,
+        CopyLendMode::current(),
         false,
     )
+}
+
+/// One eligible-or-not copy pair of the A12 funnel on the A5 frame (R549-2 (ii)).
+#[cfg(test)]
+pub(crate) struct FrameFunnelRow {
+    pub(crate) fn_did: LocalDefId,
+    pub(crate) lhs_local: Local,
+    pub(crate) rhs_local: Local,
+    pub(crate) sites: usize,
+    /// `None` = S1 (eligible under C1–C4).
+    pub(crate) drop: Option<CopyLendEligibilityDrop>,
+    /// S2: the lend reading (destination Ref, source Owning) is satisfiable in the
+    /// frame's hard universe; `None` for an ineligible pair.
+    pub(crate) lend: Option<z3::SatResult>,
+    /// The source alone Owning, for attribution; `None` for an ineligible pair.
+    pub(crate) source_own: Option<z3::SatResult>,
+    pub(crate) shape: &'static str,
+}
+
+/// The A12 funnel S0 → S2 on the A5 frame's reference construction (R549-2 (ii),
+/// R552-5): S0 = every depth-0 local copy pair, S1 = C1–C4 eligible, S2 = the lend
+/// reading satisfiable in the hard universe (endpoint selectors free) built under
+/// the caller's arms, `CRAT_ERA5C_COPY_LEND=on` included. Measurement only.
+#[cfg(test)]
+pub(crate) fn copy_lend_frame_funnel(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    query_timeout: Duration,
+) -> Vec<FrameFunnelRow> {
+    assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
+    let _world = super::licensing::stack_entry::enter_world(Some(
+        WholeProgramAttestation::FrozenBenchmarkGraph,
+    ));
+    super::execution_guard::enter_model().expect("funnel model entry");
+    let inventory = std::sync::Arc::new(super::source_events::collect(program));
+    super::source_events::with_inventory(&inventory, || {
+        let candidates =
+            analyze_copy_lend_candidates(program, slots, mut_facts, origins.native_flows());
+        let solver = KindSolver::new_hard_only(slots);
+        solver.set_random_seed(0);
+        solver.set_query_timeout(query_timeout);
+        let construction = construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+            .expect("funnel frame construction");
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| candidate.drop.is_none())
+            .map(|candidate| candidate.pair)
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            eligible, construction.eligibility.pairs,
+            "funnel classifier and frame eligibility diverged"
+        );
+        super::coherence::constrain_field_ownership(&solver, slots, program);
+        candidates
+            .into_iter()
+            .map(|CopyLendPairCandidate { pair, sites, drop }| {
+                let (lend, source_own) = if drop.is_none() {
+                    (
+                        Some(
+                            solver.check_with_assumptions(&[solver.lend_guard(pair.lhs, pair.rhs)]),
+                        ),
+                        Some(solver.check_with_assumptions(&[solver.owning_literal(pair.rhs)])),
+                    )
+                } else {
+                    (None, None)
+                };
+                let site = sites[0];
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(site.fn_did)
+                    .borrow();
+                FrameFunnelRow {
+                    fn_did: site.fn_did,
+                    lhs_local: site.lhs_local,
+                    rhs_local: site.rhs_local,
+                    sites: sites.len(),
+                    drop,
+                    lend,
+                    source_own,
+                    shape: copy_lend_source_consumer(
+                        program,
+                        &body,
+                        site.rhs_local,
+                        site.lhs_local,
+                    ),
+                }
+            })
+            .collect()
+    })
+}
+
+/// A4 (R560): why a slot is not Owning / not Ref at the frame. On the A5 reference
+/// construction's hard universe (assertion-tracked), each target is asked
+/// `own` and `ref ∧ ¬own`, first alone ("hard") and then with every `holds` slot
+/// kept at its accepted kind ("held": Ref slots keep `ref`, Owning slots keep
+/// `own`). An UNSAT hard query names the constraints (the core's labels); an
+/// UNSAT held query that is SAT hard names the accepted kinds it would cost (the
+/// objective's trade); SAT held means only the verify loop can explain the kind.
+/// Measurement only; one row per target and query.
+#[cfg(test)]
+pub(crate) fn a4_wall_probe(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    targets: &[(String, SlotRef)],
+    holds: &[(String, SlotRef, bool)],
+    query_timeout: Duration,
+) -> Vec<String> {
+    use z3::{SatResult, ast::Bool};
+    let _world = super::licensing::stack_entry::enter_world(Some(
+        WholeProgramAttestation::FrozenBenchmarkGraph,
+    ));
+    super::execution_guard::enter_model().expect("a4 model entry");
+    let inventory = std::sync::Arc::new(super::source_events::collect(program));
+    super::source_events::with_inventory(&inventory, || {
+        let solver = KindSolver::new_hard_only(slots);
+        solver.set_random_seed(0);
+        solver.set_query_timeout(query_timeout);
+        construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+            .expect("a4 frame construction");
+        super::coherence::constrain_field_ownership(&solver, slots, program);
+        let tracker = solver.tracker().expect("mandatory tracker");
+        // Counterfactual: `CRAT_E5C_A4_DROP` = `|`-separated label substrings;
+        // every tracked constraint whose label contains one is switched off.
+        let drop: Vec<String> = std::env::var("CRAT_E5C_A4_DROP")
+            .unwrap_or_default()
+            .split('|')
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let base: Vec<Bool> = tracker
+            .labeled_tracks()
+            .into_iter()
+            .filter(|(_, label)| !drop.iter().any(|d| label.contains(d.as_str())))
+            .map(|(track, _)| track)
+            .collect();
+        let check = |extra: &[Bool]| -> SatResult {
+            let mut assumptions = base.clone();
+            assumptions.extend_from_slice(extra);
+            solver.optimize().check(&assumptions)
+        };
+        let verdict = |r: SatResult| match r {
+            SatResult::Sat => "sat",
+            SatResult::Unsat => "unsat",
+            SatResult::Unknown => "unknown",
+        };
+        let mut rows = Vec::new();
+        for (key, slot) in targets {
+            let own = solver.owning_literal(*slot);
+            let ref_only = Bool::and(&[&solver.ref_literal(*slot), &own.not()]);
+            let fast = std::env::var_os("CRAT_E5C_A4_FAST").is_some();
+            for (goal, force) in [("own", own.clone()), ("ref", ref_only)] {
+                if fast && goal == "ref" {
+                    continue;
+                }
+                let core = |r: SatResult, extra: &[(Bool, String)]| -> String {
+                    if r != SatResult::Unsat {
+                        return "-".to_owned();
+                    }
+                    // Deletion-minimal: a tracked constraint is kept only if the
+                    // query turns SAT without it (untracked asserts stay on).
+                    let mut kept: Vec<Bool> = solver
+                        .optimize()
+                        .get_unsat_core()
+                        .into_iter()
+                        .filter(|literal| *literal != force)
+                        .collect();
+                    if kept.len() <= 400 {
+                        let mut index = 0;
+                        while index < kept.len() {
+                            let mut trial = kept.clone();
+                            trial.remove(index);
+                            let mut assumptions = trial.clone();
+                            assumptions.push(force.clone());
+                            // untracked asserts stay on; dropped tracks stay off
+                            let keep_off: Vec<Bool> = tracker
+                                .labeled_tracks()
+                                .into_iter()
+                                .filter(|(_, l)| drop.iter().any(|d| l.contains(d.as_str())))
+                                .map(|(t, _)| t.not())
+                                .collect();
+                            assumptions.extend(keep_off);
+                            if solver.optimize().check(&assumptions) == SatResult::Unsat {
+                                kept = trial;
+                            } else {
+                                index += 1;
+                            }
+                        }
+                    }
+                    let mut held = Vec::new();
+                    let mut labels = Vec::new();
+                    for literal in kept {
+                        if let Some((_, k)) = extra.iter().find(|(l, _)| *l == literal) {
+                            held.push(k.clone());
+                        } else if let Some(label) = tracker.label_of(&literal) {
+                            labels.push(label);
+                        } else {
+                            labels.push(format!("?{literal}"));
+                        }
+                    }
+                    held.sort();
+                    labels.sort();
+                    format!(
+                        "held[{}]={} | hard[{}]={}",
+                        held.len(),
+                        held.join(","),
+                        labels.len(),
+                        labels.join(" ; ")
+                    )
+                };
+                let hard = check(std::slice::from_ref(&force));
+                if fast {
+                    rows.push(format!("{key}\t{goal}\t{}\t-\t-\t-", verdict(hard)));
+                    continue;
+                }
+                let hard_core = core(hard, &[]);
+                let extra = holds
+                    .iter()
+                    .filter(|(_, other, _)| other != slot)
+                    .map(|(k, other, owning)| {
+                        let literal = if *owning {
+                            solver.owning_literal(*other)
+                        } else {
+                            solver.ref_literal(*other)
+                        };
+                        (literal, k.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let mut assumptions = vec![force.clone()];
+                assumptions.extend(extra.iter().map(|(l, _)| l.clone()));
+                let held = check(&assumptions);
+                let held_core = core(held, &extra);
+                rows.push(format!(
+                    "{key}\t{goal}\t{}\t{}\t{hard_core}\t{held_core}",
+                    verdict(hard),
+                    verdict(held)
+                ));
+            }
+        }
+        rows
+    })
+}
+
+/// How the source of a copy pair is consumed: a call taking the source's value
+/// (the source, or a copy or cast of it other than the pair's destination) as an
+/// argument. `free` = libc `free` (the `q = p; … free(p)` shape); `local-callee` =
+/// a function of the program (W52_RETIRE's local-consumer shape); `other-call`;
+/// `no-call`. The first three are ranked in that order.
+#[cfg(test)]
+fn copy_lend_source_consumer(
+    program: &RustProgram<'_>,
+    body: &Body<'_>,
+    source: Local,
+    destination: Local,
+) -> &'static str {
+    use rustc_middle::mir::TerminatorKind;
+    let mut carriers = FxHashSet::from_iter([source]);
+    loop {
+        let before = carriers.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let rhs = match rvalue {
+                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
+                    | Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => rhs,
+                    _ => continue,
+                };
+                if lhs.projection.is_empty()
+                    && rhs.projection.is_empty()
+                    && lhs.local != destination
+                    && carriers.contains(&rhs.local)
+                {
+                    carriers.insert(lhs.local);
+                }
+            }
+        }
+        if carriers.len() == before {
+            break;
+        }
+    }
+    let mut rank = 0u8;
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
+            continue;
+        };
+        let carries = args.iter().any(|arg| match &arg.node {
+            Operand::Copy(place) | Operand::Move(place) => {
+                place.projection.is_empty() && carriers.contains(&place.local)
+            }
+            Operand::Constant(_) => false,
+        });
+        if !carries {
+            continue;
+        }
+        let here = match func.const_fn_def() {
+            Some((def_id, _))
+                if def_id
+                    .as_local()
+                    .is_some_and(|local| program.functions.contains(&local)) =>
+            {
+                2
+            }
+            Some((def_id, _)) if program.tcx.item_name(def_id).as_str() == "free" => 3,
+            _ => 1,
+        };
+        rank = rank.max(here);
+    }
+    match rank {
+        3 => "free",
+        2 => "local-callee",
+        1 => "other-call",
+        _ => "no-call",
+    }
 }
 
 fn construct_bo_into_with_esc(
@@ -978,7 +1301,7 @@ fn construct_bo_into_a16_refined_with_esc(
             origins,
             mut_facts,
             solver,
-            CopyLendMode::Baseline,
+            CopyLendMode::current(),
         )?
     } else {
         construct_bo_a5_reference(program, slots, origins, mut_facts, solver)?
@@ -1142,10 +1465,10 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
     Option<FxHashMap<SlotRef, SlotKind>>,
     super::borrow_verify::RoundStats,
 ) {
-    assert_eq!(
+    assert_ne!(
         construction.mode,
-        CopyLendMode::Baseline,
-        "A5 focused replay must keep the independent CopyLend switch at baseline"
+        CopyLendMode::RemovalOnly,
+        "A5 focused replay runs Baseline or the LendArm selector, never RemovalOnly"
     );
     with_construction_replay(construction, || {
         verify_constructed_to_fixpoint(
@@ -1433,10 +1756,13 @@ fn solve_bo_a5_config_with_source_events(
     refined: bool,
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
-    assert_eq!(
+    // R549-2 (i): the A5 frame runs Baseline, or LendArm under
+    // `CRAT_ERA5C_COPY_LEND=on`; RemovalOnly is a measurement mode with no
+    // environment route and never reaches the frame.
+    assert_ne!(
         CopyLendMode::current(),
-        CopyLendMode::Baseline,
-        "the A5 loop-2 matrix keeps dormant CopyLend semantics at baseline"
+        CopyLendMode::RemovalOnly,
+        "the A5 frame runs Baseline or the LendArm selector, never RemovalOnly"
     );
 
     let baseline_solver = KindSolver::new(slots);
@@ -2219,11 +2545,16 @@ mod mode_tests {
         assert_eq!(left, "schema=x\nstatus=ok\ndata=true\na=1\nz=3\n");
     }
 
+    /// R549-2 (i) retires `copy_lend_production_stays_dormant_without_an_environment_switch`:
+    /// the default stays Baseline; the selector's `on` reaching LendArm is pinned in
+    /// `null_paths_tests::e5c_w52_the_copy_lend_selector_defaults_off_and_reaches_the_arm`.
     #[test]
-    fn copy_lend_production_stays_dormant_without_an_environment_switch() {
+    fn copy_lend_defaults_to_baseline_without_the_selector() {
         assert_eq!(CopyLendMode::default(), CopyLendMode::Baseline);
         assert_eq!(CopyLendMode::default().label(), "baseline");
-        assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
+        if std::env::var_os("CRAT_ERA5C_COPY_LEND").is_none() {
+            assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
+        }
     }
 
     #[test]

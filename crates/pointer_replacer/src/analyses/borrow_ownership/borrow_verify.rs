@@ -941,6 +941,10 @@ fn selected_copy_lends_for_round(
     escaped: Option<&SelectedCopyLendLoans>,
 ) -> SelectedCopyLendLoans {
     let mut selected = escaped.cloned().unwrap_or_default();
+    // W52 fault (test builds only): the lend's loans never reach the replay.
+    #[cfg(test)]
+    let pair_lends =
+        pair_lends.filter(|_| std::env::var("CRAT_E5C_W52_FAULT").as_deref() != Ok("no-loan"));
     if let Some(pairs) = pair_lends {
         for (fn_did, loans) in selected_copy_lend_sites(program, slots, pairs, model) {
             selected.entry(fn_did).or_default().extend(loans);
@@ -1135,6 +1139,17 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             base: is_mutable,
             round: round_facts.as_ref(),
         };
+        // L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): this round's qualifying stores issue
+        // no loan on a local that is not `Raw` during the replay (era-5c 060a).
+        let _move_store = super::field_moves::move_store().then(|| {
+            super::move_store::enter_round(
+                program,
+                slots,
+                solver.ownership_facts(),
+                solver.original_cell_selection(),
+                &model,
+            )
+        });
         let reviewed = revalidate_replaying_reviewed(
             program,
             slots,
@@ -1241,6 +1256,33 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // (No Local fixture forces this arm — its coverage rests on that invariant, not a synthesized
         // case.) The field early-return runs first, so the assert now effectively guards Locals only.
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
+            // L01⁹ (`CRAT_ERA5C_FIELD_OWN_REPAIR`): an OWNING field in a residual
+            // is demoted (`¬own`, monotone) instead of declining the program.
+            if super::field_moves::field_own_repair()
+                && model.get(&field) == Some(&SlotKind::Owning)
+            {
+                let owning: rustc_hash::FxHashSet<SlotRef> = conflicts
+                    .values()
+                    .flatten()
+                    .flat_map(|c| c.issuer.into_iter().chain(c.requirers.iter().copied()))
+                    .filter(|s| {
+                        matches!(s, SlotRef::Field(_)) && model.get(s) == Some(&SlotKind::Owning)
+                    })
+                    .collect();
+                for field in &owning {
+                    solver.forbid_field_own(*field);
+                }
+                stats.commits_conflict += owning.len();
+                stats.commits_per_round.push(owning.len());
+                let Some((next, dropped)) =
+                    solve_round_model(solver, selectors, backend, hard.as_ref())
+                else {
+                    return (None, stats);
+                };
+                model = next;
+                record_dropped(&mut stats, selectors, &dropped);
+                continue;
+            }
             stats.field_conflict_decline = Some(field);
             stats.field_conflict_kind = model.get(&field).copied();
             return (None, stats);
