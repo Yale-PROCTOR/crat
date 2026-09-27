@@ -37,7 +37,10 @@
 
 use super::super::{
     bridge_receipt::SignatureClassId,
-    decision::{Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind, seam::Form},
+    decision::{
+        Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind,
+        seam::{Form, ZeroBridgeSite},
+    },
 };
 
 /// Whether every arm `required` of the degraded `subject` is paid by the
@@ -97,14 +100,31 @@ pub(crate) fn keeps_interface_dependency(
     table: &DecisionTable,
     (dependent, dependency): (SignatureClassId, SignatureClassId),
 ) -> bool {
-    let explained_by_zero_syntax = table.seams.zero_bridges.iter().any(|site| {
-        site.owner_class == dependent
-            && SignatureClassId::of(site.caller) == dependency
-            && site.bridge_kind == "interface-call-zero-syntax"
-            && matches!(site.argument_kind, "bare-local" | "cast-of-local")
-            && site.found_form != Form::Raw.key()
-    });
-    if explained_by_zero_syntax {
+    let zero_syntax = table
+        .seams
+        .zero_bridges
+        .iter()
+        .filter(|site| {
+            site.owner_class == dependent
+                && SignatureClassId::of(site.caller) == dependency
+                && site.bridge_kind == "interface-call-zero-syntax"
+                && matches!(site.argument_kind, "bare-local" | "cast-of-local")
+                && site.found_form != Form::Raw.key()
+        })
+        .collect::<Vec<_>>();
+    // R585-4: a zero-syntax site whose callee position seals the caller's
+    // input-form rendering (`kept_target_input_source`, the `source-input:`
+    // carrier the terminal selection applies when the caller's class is
+    // withheld) does not tie the callee to a caller that the predecessor stage
+    // already held: that hold is the caller's own wall, and a held caller costs
+    // the callee nothing there (batch 39's `HasherSetup -> PrepareH2`). A caller
+    // held only now may be held BY this callee's new transaction (heman's
+    // `transform_* -> edt`), and the edge is what lets the family loop see it.
+    let caller_held_before = table.predecessor_held_classes.contains(&dependency);
+    if zero_syntax
+        .iter()
+        .any(|site| !(caller_held_before && source_input_sealed(table, site)))
+    {
         return true;
     }
     let mut views = table
@@ -117,8 +137,10 @@ pub(crate) fn keeps_interface_dependency(
         .flat_map(|call| call.views.iter())
         .peekable();
     if views.peek().is_none() {
-        // Not an A5-induced pair; whoever produced it keeps it.
-        return true;
+        // Not an A5-induced pair; whoever produced it keeps it, unless its only
+        // explanation is zero-syntax sites that all seal the source's input.
+        return zero_syntax.is_empty()
+            || explained_by_another_seam_producer(table, dependent, dependency);
     }
     views.any(|view| {
         let converting_source = view.source_node.is_some_and(|(owner, hir_id)| {
@@ -138,6 +160,41 @@ pub(crate) fn keeps_interface_dependency(
             })
         });
         matches!(view.argument_shape, "bare-local" | "cast-of-local") && converting_source
+    })
+}
+
+/// R585-4: the callee position of a zero-syntax interface site has the sealed
+/// `source-input:` alternative from that very caller.
+fn source_input_sealed(table: &DecisionTable, site: &ZeroBridgeSite) -> bool {
+    site.span.is_some_and(|span| {
+        table
+            .seams
+            .callee_parameter_inputs
+            .get(&(site.owner_class, span.lo().0, span.hi().0))
+            .is_some_and(|input| {
+                input.caller == site.caller && input.kept_target_input_source.is_some()
+            })
+    })
+}
+
+/// R585-4: the seam's other producers of a `(callee, caller)` pair that the plan
+/// can see: a native Box lend or a cursor element view at a zero-syntax site,
+/// and the interface inventory's expression arm.
+fn explained_by_another_seam_producer(
+    table: &DecisionTable,
+    dependent: SignatureClassId,
+    dependency: SignatureClassId,
+) -> bool {
+    table.seams.zero_bridges.iter().any(|site| {
+        site.owner_class == dependent
+            && SignatureClassId::of(site.caller) == dependency
+            && (site.found_form == "native-box-lend"
+                || site.bridge_kind == "interface-call-cursor-element-view"
+                || site.found_form.starts_with("cursor"))
+    }) || table.seams.edits.iter().any(|edit| {
+        edit.owner_class == dependent
+            && SignatureClassId::of(edit.bridge.caller) == dependency
+            && edit.root_identity == "interface-inventory"
     })
 }
 
@@ -411,8 +468,10 @@ pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_c
     /// `callee::p` (zero syntax, `found = ref-mut`), while `caller`'s class is
     /// held by its degraded node `r` (stored into a `static mut`, `d4`). If
     /// `callee` applied alone, `callee(q)` would hand a raw `q` to `&mut i32`
-    /// (`E0308`), so the `(callee, caller)` dependency is real and is kept:
-    /// `p` reads `dependency-class-held`.
+    /// (`E0308`), so the `(callee, caller)` dependency held `p` on
+    /// `dependency-class-held`. R585-4: `callee`'s position seals `q`'s input
+    /// form, and `caller` is held from the predecessor stage on, so the held
+    /// caller renders `callee(&mut *q)` and the edge is dropped.
     const ZERO_SYNTAX_DEPENDENCY_SHAPE: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
 pub static mut KEPT: *mut i32 = 0 as *mut i32;
@@ -535,16 +594,17 @@ pub unsafe fn caller(r: *mut i32) {
         );
     }
 
+    /// R585-4 re-pin. `caller` is held on its own degraded `r` at every stage
+    /// (the predecessor's too), and `callee`'s position seals `q`'s input form:
+    /// the held caller renders `callee(&mut *q)` (the source-input carrier), so
+    /// the E0308 this control guarded cannot arise and `callee` stands alone.
     #[test]
     fn zero_syntax_dependency_on_a_held_caller_is_kept() {
         let got = run(ZERO_SYNTAX_DEPENDENCY_SHAPE);
         let exclusion = column(&got.subjects, "callee::p#1", "exclusion");
-        assert!(
-            exclusion.starts_with("terminal-not-applied:dependency-class-held:"),
-            "{exclusion}\n{}",
-            got.subjects
-        );
-        assert_eq!(column(&got.subjects, "callee::p#1", "placed"), "0");
+        assert_eq!(exclusion, "-", "{}", got.subjects);
+        assert_eq!(column(&got.subjects, "callee::p#1", "placed"), "1");
+        assert!(got.tree().contains("callee(&mut *q)"), "{}", got.tree());
         assert!(
             column(&got.subjects, "caller::q#1", "exclusion")
                 .starts_with("terminal-not-applied:blocked-subject:"),
@@ -1835,5 +1895,136 @@ pub unsafe fn is_valid(buf: *mut core::ffi::c_void, size: i32, ptype: *mut i32) 
                 got.tree()
             );
         }
+    }
+}
+
+/// **R585-4 — a zero-syntax interface edge whose callee position seals the
+/// caller's input-form rendering does not tie the callee to the caller.**
+#[cfg(test)]
+mod sealed_source_input_tests {
+    use super::keeps_interface_dependency;
+    use crate::bo_rewriter::{
+        bridge_receipt::{BridgeRetentionTier, SignatureClassId},
+        decision::{
+            DecisionTable,
+            callee_parameter_input::{CalleeParameterInput, SeamAlternative},
+            seam::{Form, SeamInputRendering, ZeroBridgeSite},
+        },
+    };
+
+    /// Two functions: `callee` (class 0) and `caller` (class 1), one zero-syntax
+    /// bare-local site between them, and — per `seal` — the callee position's
+    /// `source-input:` carrier from `sealed_by` (a caller) or none.
+    fn with_site(
+        seal: Option<bool>,
+        another_producer: bool,
+        held_before: bool,
+        check: impl FnOnce(&DecisionTable, (SignatureClassId, SignatureClassId)) + Send,
+    ) {
+        ::utils::compilation::run_compiler_on_str(
+            "fn callee(_p: *const u8) {}\nfn caller() {}\nfn other() {}",
+            |tcx| {
+                let mut owners = tcx.hir_body_owners().collect::<Vec<_>>();
+                owners.sort_by_key(|did| did.local_def_index.as_u32());
+                let [callee, caller, other] = owners[..] else { panic!("three functions") };
+                let span = tcx.def_span(caller);
+                let (dependent, dependency) =
+                    (SignatureClassId::of(callee), SignatureClassId::of(caller));
+                let mut table = DecisionTable::default();
+                if held_before {
+                    table.predecessor_held_classes.insert(dependency);
+                }
+                table.seams.zero_bridges.push(ZeroBridgeSite {
+                    owner_class: dependent,
+                    caller,
+                    span: Some(span),
+                    arm: "c",
+                    position: "arg0".to_owned(),
+                    bridge_kind: "interface-call-zero-syntax",
+                    expected_form: "slice-shared",
+                    found_form: "slice-shared",
+                    argument_kind: "bare-local",
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: None,
+                });
+                if another_producer {
+                    table.seams.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: dependent,
+                        caller,
+                        span: Some(tcx.def_span(callee)),
+                        arm: "glue",
+                        position: "arg1".to_owned(),
+                        bridge_kind: "interface-call-zero-syntax",
+                        expected_form: "ref-shared",
+                        found_form: "native-box-lend",
+                        argument_kind: "bare-local",
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                }
+                if let Some(from_this_caller) = seal {
+                    let carrier = SeamAlternative {
+                        rendering: SeamInputRendering::ZeroSyntax { found: Form::Raw },
+                        arg_span: span,
+                        bridge: None,
+                    };
+                    table.seams.callee_parameter_inputs.insert(
+                        (dependent, span.lo().0, span.hi().0),
+                        CalleeParameterInput {
+                            caller: if from_this_caller { caller } else { other },
+                            node: (callee, rustc_hir::CRATE_HIR_ID),
+                            input_form: Form::Raw,
+                            source_node: None,
+                            target_atom_ids: Vec::new(),
+                            source_atom_ids: Vec::new(),
+                            current_source: Err("fixture"),
+                            input_source: Err("fixture"),
+                            kept_target_input_source: Some(carrier),
+                            input_source_required_classes: Default::default(),
+                            preflight_hold: None,
+                        },
+                    );
+                }
+                check(&table, (dependent, dependency));
+            },
+        )
+        .expect("the fixture compiles");
+    }
+
+    #[test]
+    fn r585_4_a_sealed_zero_syntax_edge_does_not_hold_the_callee() {
+        with_site(Some(true), false, true, |table, edge| {
+            assert!(!keeps_interface_dependency(table, edge));
+        });
+    }
+
+    #[test]
+    fn r585_4_an_unsealed_zero_syntax_edge_is_kept() {
+        with_site(None, false, true, |table, edge| {
+            assert!(keeps_interface_dependency(table, edge));
+        });
+    }
+
+    #[test]
+    fn r585_4_a_carrier_from_another_caller_does_not_seal() {
+        with_site(Some(false), false, true, |table, edge| {
+            assert!(keeps_interface_dependency(table, edge));
+        });
+    }
+
+    #[test]
+    fn r585_4_a_sealed_edge_another_producer_explains_is_kept() {
+        with_site(Some(true), true, true, |table, edge| {
+            assert!(keeps_interface_dependency(table, edge));
+        });
+    }
+
+    #[test]
+    fn r585_4_a_caller_held_only_now_keeps_the_sealed_edge() {
+        with_site(Some(true), false, false, |table, edge| {
+            assert!(keeps_interface_dependency(table, edge));
+        });
     }
 }

@@ -333,6 +333,8 @@ mod returned_child_tests;
 #[cfg(test)]
 mod revert_input_tests;
 #[cfg(test)]
+mod sealed_source_edge_frame_tests;
+#[cfg(test)]
 mod seam_terminal_tests;
 #[cfg(test)]
 mod sibling_audit_tests;
@@ -8987,6 +8989,11 @@ fn finish_decide<'tcx>(
         // the coverage gate — every comparison in it is against the collector's own
         // This is the same pure plan/class/terminal-interface preparation used
         // by emit_files. It performs no AST emission or analysis derivation.
+        // R585-4: class formation reads which callers the predecessor stage held.
+        table.predecessor_held_classes = predecessor
+            .as_ref()
+            .map(|prior| prior.plan.held_classes())
+            .unwrap_or_default();
         let prepared = prepare_plan_files(
             tcx,
             &table,

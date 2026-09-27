@@ -222,6 +222,7 @@ mod tests {
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
+            predecessor_held_classes: Default::default(),
             entries,
             exposure: None,
             arm_requirements: Default::default(),

@@ -1339,10 +1339,20 @@ mod a5_wrapper_subsumes_a_selected_view_bridge {
 /// composition, where the same fixture collided before the row.
 #[test]
 fn quadtree_mutable_reborrow_over_weakened_argument_places() {
-    let input = quadtree_fixture::QUADTREE_FIND;
+    // R585-4: driven from a FILE, as the census is. The string entry drops the
+    // AST grafts on bare-local call arguments (the revert-found-form twin a
+    // held caller's source-input carrier renders), so it cannot witness this.
+    let dir = std::env::temp_dir().join(format!(
+        "crat-quadtree-find-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture directory");
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, quadtree_fixture::QUADTREE_FIND).expect("fixture file");
     let outcome = super::rewrite_core_injected(
-        ::utils::compilation::str_to_input(input),
-        None,
+        ::utils::compilation::path_to_input(&root),
+        Some(&root),
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         false,

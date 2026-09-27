@@ -1032,6 +1032,12 @@ pub(crate) struct DecisionTable {
     pub(crate) declaration_pointees: declaration::DeclarationPointees,
     pub(crate) declaration_patterns: declaration_pattern::PatternDeclarations,
     pub(crate) input_interfaces: interface::InputInterfaces,
+    /// **R585-4** — the classes the family loop's predecessor stage held, set
+    /// before each stage is planned (empty at `Core`). A caller already held at
+    /// the predecessor is held on a wall of its own, not by this stage's new
+    /// transactions (`plan::class_split::keeps_interface_dependency`).
+    pub(crate) predecessor_held_classes:
+        std::collections::BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
     pub entries: Vec<(Subject, Decision)>,
     pub(crate) exposure: Option<exposure::ExposurePolicy>,
     pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
@@ -1391,6 +1397,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         cursor_receipts,
         sibling_overlap_inventory: Default::default(),
         input_interfaces: ctx.input_interfaces.clone(),
+        predecessor_held_classes: Default::default(),
         declaration_patterns: ctx
             .declaration_patterns
             .iter()
@@ -3057,6 +3064,7 @@ mod self_consistency_tests {
             declaration_pointees: Default::default(),
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
+            predecessor_held_classes: Default::default(),
             exposure: None,
             arm_requirements: FxHashMap::default(),
             seams: Default::default(),
