@@ -1475,12 +1475,13 @@ impl GlueSpec {
             return "raw-boundary";
         }
         // Before the core match, which would read the owner view's `Bare`
-        // core with no wrapper as `index` (main 116 §2).
+        // core with no wrapper as `index` (main 116 §2). This column's own
+        // vocabulary is underscored (R588-5).
         if let Some(mutable) = self.option_view {
             return if mutable {
-                "owner-option-view-mut"
+                "owner_option_view_mut"
             } else {
-                "owner-option-view"
+                "owner_option_view"
             };
         }
         match self.null_arm {
@@ -2845,16 +2846,17 @@ mod tests {
         // `index`, and the core match called the same spec `scalar-reference`.
         for spec in every_owner_view_spec() {
             let mutable = spec.option_view.expect("an owner view");
-            let key = if mutable {
-                "owner-option-view-mut"
+            // Each column keeps its own vocabulary (R588-5).
+            let keys = if mutable {
+                ("owner_option_view_mut", "owner-option-view-mut")
             } else {
-                "owner-option-view"
+                ("owner_option_view", "owner-option-view")
             };
             let rendered = spec.render("p").expect("an owner view renders");
             assert_eq!(inferred_shape(&rendered), "index", "{rendered}");
             assert_eq!(
                 (spec.shape_key(), spec.template_key()),
-                (key, key),
+                keys,
                 "an owner view carries its own glue shape and bridge kind: {spec:?}"
             );
         }
