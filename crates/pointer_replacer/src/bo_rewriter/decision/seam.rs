@@ -1397,6 +1397,15 @@ impl GlueSpec {
         if let Some(raw) = self.raw_boundary.as_ref() {
             return raw.template.key();
         }
+        // The owner view is a `Bare` core with neither a wrapper nor an unwrap:
+        // left to the core match it would read `scalar-reference` (main 116 §2).
+        if let Some(mutable) = self.option_view {
+            return if mutable {
+                "owner-option-view-mut"
+            } else {
+                "owner-option-view"
+            };
+        }
         if self.null_arm == NullArm::PointerApi {
             return match self.core {
                 GlueCore::RawOption if self.mutable => "c-raw-option-mut",
@@ -1465,6 +1474,15 @@ impl GlueSpec {
         if self.raw_boundary.is_some() {
             return "raw-boundary";
         }
+        // Before the core match, which would read the owner view's `Bare`
+        // core with no wrapper as `index` (main 116 §2).
+        if let Some(mutable) = self.option_view {
+            return if mutable {
+                "owner-option-view-mut"
+            } else {
+                "owner-option-view"
+            };
+        }
         match self.null_arm {
             NullArm::LiteralNone => return "none",
             NullArm::Checked => {
@@ -1510,9 +1528,12 @@ impl GlueSpec {
             //   wrapper, rendering `&w X[0]`, which the retired classifier fell
             //   through to `index`. It is corpus-ZERO on the frozen corpus, and
             //   corpus-zero is not unreachable.
-            // - `Bare` here is genuinely unreachable: with neither an unwrap
-            //   nor a wrapper it renders the argument unchanged, and `glue`
-            //   returns `Ok(None)` for every pairing that would need it.
+            // - `Bare` here is unreachable: with neither an unwrap nor a
+            //   wrapper it renders the argument unchanged, and `glue` returns
+            //   `Ok(None)` for every pairing that would need it. The one spec
+            //   that is a `Bare` core with neither, the owner view
+            //   (`option_view`, R583-8), takes its own key above, before
+            //   this match.
             //
             // Both are matched together because the classifier gave both the
             // same answer; only the reachability claim differed.
@@ -2818,6 +2839,25 @@ mod tests {
                 "carried and inferred shapes must agree on a bare argument: {spec:?}"
             );
         }
+        // The owner views (R583-8) are the one bare-argument case where the
+        // carried keys depart from the classifier ON PURPOSE (main 116 §2):
+        // `p.as_deref()` matches none of its prefixes, so it fell through to
+        // `index`, and the core match called the same spec `scalar-reference`.
+        for spec in every_owner_view_spec() {
+            let mutable = spec.option_view.expect("an owner view");
+            let key = if mutable {
+                "owner-option-view-mut"
+            } else {
+                "owner-option-view"
+            };
+            let rendered = spec.render("p").expect("an owner view renders");
+            assert_eq!(inferred_shape(&rendered), "index", "{rendered}");
+            assert_eq!(
+                (spec.shape_key(), spec.template_key()),
+                (key, key),
+                "an owner view carries its own glue shape and bridge kind: {spec:?}"
+            );
+        }
     }
 
     /// **THE RENDERER REFUSES A LENGTH-LESS SLICE ADAPTER.**
@@ -3136,6 +3176,68 @@ mod tests {
             "the product must reach every emitting arm exactly; got {}",
             out.len()
         );
+        out
+    }
+
+    /// Every owner view `owner_view_candidate` can name, by driving it over
+    /// `(owner shape, optional owner, formal form)`: an optional `Box` owner at
+    /// an optional formal of its own shape, `as_deref()` / `as_deref_mut()`.
+    fn every_owner_view_spec() -> Vec<GlueSpec> {
+        use crate::bo_rewriter::decision::box_facts::{BoxPlan, BoxShape};
+        let owner = |shape, optional| {
+            Decision::Box(BoxPlan {
+                shape,
+                optional,
+                expr_edits: Vec::new(),
+                delete_statements: Vec::new(),
+                receipts: Vec::new(),
+                fabricated_extent: false,
+                pointee_override: None,
+                inferred_binding: false,
+                overwrite_spans: Vec::new(),
+                retained_sink: false,
+                implicit_scope_close: false,
+            })
+        };
+        let forms = [
+            Raw,
+            Ref { mutable: true },
+            Ref { mutable: false },
+            Slice { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Opt {
+                mutable: false,
+                slice: false,
+            },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+            Opt {
+                mutable: false,
+                slice: true,
+            },
+        ];
+        let mut out = Vec::new();
+        for shape in [BoxShape::Sized, BoxShape::Slice] {
+            for optional in [true, false] {
+                for expected in forms {
+                    if let Some(candidate) =
+                        owner_view_candidate(Some(&owner(shape, optional)), expected, "p")
+                        && candidate.spec.option_view.is_some()
+                    {
+                        out.push(candidate.spec);
+                    }
+                }
+            }
+        }
+        // Exactly the two optional owners at the two optional formals of
+        // their own shape, shared and mutable.
+        assert_eq!(out.len(), 4, "owner views: {out:?}");
         out
     }
 }
