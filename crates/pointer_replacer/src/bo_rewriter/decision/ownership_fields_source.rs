@@ -190,8 +190,10 @@ pub(crate) struct SourcePlan {
     /// R445(b): every field projection THROUGH this owner (`(*x).height`),
     /// with `true` where the projection is written. A `Box<T>` owner needs no
     /// edit at these (it auto-derefs), an `Option<Box<T>>` one does, and only
-    /// this permit knows where they are.
-    field_projections: Vec<(Span, bool)>,
+    /// this permit knows where they are. The projection's own `HirId` rides
+    /// along (R585-3): a LOAD that the field family renders as a move
+    /// (`.take()`) is a write too, and only the native stage can tell.
+    field_projections: Vec<(Span, bool, HirId)>,
     /// The MIR local that receives the allocator's result: the one source of
     /// every pointer into this fresh allocation while the root never escapes.
     allocation_local: u32,
@@ -223,7 +225,7 @@ impl SourcePlan {
         self.load_field
     }
 
-    pub(crate) fn field_projections(&self) -> &[(Span, bool)] {
+    pub(crate) fn field_projections(&self) -> &[(Span, bool, HirId)] {
         &self.field_projections
     }
 
@@ -956,7 +958,7 @@ pub(crate) fn derive<'tcx>(
         }
     }
     let mut field_bases: BTreeSet<(u32, Span)> = BTreeSet::new();
-    let mut field_projections: Vec<(Span, bool)> = Vec::new();
+    let mut field_projections: Vec<(Span, bool, HirId)> = Vec::new();
     if constructor.shape == BoxShape::Sized {
         for e in &expressions.0 {
             let ExprKind::Field(base, _) = e.kind else { continue };
@@ -971,7 +973,7 @@ pub(crate) fn derive<'tcx>(
                         ..
                     }) if target.hir_id == e.hir_id
                 );
-                field_projections.push((operand.span, written));
+                field_projections.push((operand.span, written, e.hir_id));
             }
         }
     }

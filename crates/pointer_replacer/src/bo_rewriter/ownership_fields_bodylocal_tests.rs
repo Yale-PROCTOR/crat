@@ -2980,6 +2980,160 @@ fn holder_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxPlan
     })
     .unwrap()
 }
+/// **R585-3 — a moved load through an optional owner is a write.** avl's
+/// rotation loads an owned field of its moved-out owner into an `Owning`
+/// local (`let mut T2 = (*x).right;`); the field family renders that load as a
+/// move (`….right.take()`), which borrows `x` uniquely. Opened shared for a
+/// read (`x.as_deref()`) it is E0596, and on the L01⁹ frame the two rotations'
+/// classes revert with every class they close over (wave-6a 112 §1). The
+/// fixture and frame are wave-6a's avl probe under report 067's ten Owning
+/// units. Controls: a pure read of an owned field (`height((*x).left)`, a
+/// `Ref` formal) stays shared; an assignment target stays unique.
+#[test]
+fn r585_a_moved_load_through_an_optional_owner_opens_it_uniquely() {
+    use crate::analyses::borrow_ownership::SlotKind::{Owning, Ref};
+    const AVL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+// r585 moved-load fixture
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub key: i32,
+    pub left: *mut Node,
+    pub right: *mut Node,
+    pub height: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn height(mut N: *mut Node) -> i32 {
+    if N.is_null() { return 0 as i32; }
+    return (*N).height;
+}
+#[no_mangle]
+pub unsafe extern "C" fn max(mut a: i32, mut b: i32) -> i32 {
+    return if a > b { a } else { b };
+}
+#[no_mangle]
+pub unsafe extern "C" fn newNode(mut key: i32) -> *mut Node {
+    let mut node = malloc(::std::mem::size_of::<Node>()) as *mut Node;
+    (*node).key = key;
+    (*node).left = 0 as *mut Node;
+    (*node).right = 0 as *mut Node;
+    (*node).height = 1 as i32;
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn rightRotate(mut y: *mut Node) -> *mut Node {
+    let mut x = (*y).left;
+    let mut T2 = (*x).right;
+    (*y).left = T2;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    (*x).right = y;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    return x;
+}
+#[no_mangle]
+pub unsafe extern "C" fn leftRotate(mut x: *mut Node) -> *mut Node {
+    let mut y = (*x).right;
+    let mut T2 = (*y).left;
+    (*x).right = T2;
+    (*x).height = max(height((*x).left), height((*x).right)) + 1 as i32;
+    (*y).left = x;
+    (*y).height = max(height((*y).left), height((*y).right)) + 1 as i32;
+    return y;
+}
+#[no_mangle]
+pub unsafe extern "C" fn getBalance(mut N: *mut Node) -> i32 {
+    if N.is_null() { return 0 as i32; }
+    return height((*N).left) - height((*N).right);
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node {
+    if node.is_null() { return newNode(key); }
+    if key < (*node).key {
+        (*node).left = insert((*node).left, key);
+    } else if key > (*node).key {
+        (*node).right = insert((*node).right, key);
+    } else { return node }
+    (*node).height = 1 as i32 + max(height((*node).left), height((*node).right));
+    let mut balance = getBalance(node);
+    if balance > 1 as i32 && key < (*(*node).left).key {
+        return rightRotate(node);
+    }
+    if balance < -(1 as i32) && key > (*(*node).right).key {
+        return leftRotate(node);
+    }
+    if balance > 1 as i32 && key > (*(*node).left).key {
+        (*node).left = leftRotate((*node).left);
+        return rightRotate(node);
+    }
+    if balance < -(1 as i32) && key < (*(*node).right).key {
+        (*node).right = rightRotate((*node).right);
+        return leftRotate(node);
+    }
+    return node;
+}
+"#;
+    let _frame = super::test_model_override::frame_lock();
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(
+        "r585 moved-load fixture",
+        vec![
+            ("Node".to_owned(), 1, Owning),
+            ("Node".to_owned(), 2, Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), Owning),
+            ("newNode::node".to_owned(), Owning),
+            ("rightRotate::y".to_owned(), Owning),
+            ("rightRotate::x".to_owned(), Owning),
+            ("rightRotate::T2".to_owned(), Owning),
+            ("leftRotate::x".to_owned(), Owning),
+            ("leftRotate::y".to_owned(), Owning),
+            ("leftRotate::T2".to_owned(), Owning),
+            ("height::N".to_owned(), Ref),
+            ("getBalance::N".to_owned(), Ref),
+        ],
+    );
+    let out = super::wave6a_allocation_tests::emitted("r585-moved-load", AVL);
+    super::test_model_override::clear();
+    let text: String = out.source.split_whitespace().collect();
+    let context = format!(
+        "{}\n{}\n{}",
+        out.artifacts.final_reverts, out.artifacts.first_failing_verify_tree, out.source
+    );
+    // The two moved loads open their owner uniquely.
+    assert!(
+        text.contains("=(*x.as_deref_mut().unwrap()).right.take();"),
+        "{context}"
+    );
+    assert!(
+        text.contains("=(*y.as_deref_mut().unwrap()).left.take();"),
+        "{context}"
+    );
+    assert!(
+        !text.contains("as_deref().unwrap()).right.take()"),
+        "{context}"
+    );
+    assert!(
+        !text.contains("as_deref().unwrap()).left.take()"),
+        "{context}"
+    );
+    // Control: a pure read of an owned field keeps the shared projection.
+    assert!(
+        text.contains("height((*x.as_deref().unwrap()).left"),
+        "{context}"
+    );
+    // Control: an assignment target stays unique, as before.
+    assert!(
+        text.contains("(*x.as_deref_mut().unwrap()).height="),
+        "{context}"
+    );
+}
 
 #[test]
 fn r457_a_synthesised_struct_literal_initialises_each_field_in_its_delivered_form() {

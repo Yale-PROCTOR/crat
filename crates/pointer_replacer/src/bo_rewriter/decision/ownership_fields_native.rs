@@ -908,6 +908,9 @@ pub(crate) mod field_form_override {
 /// by it (`return_certificate::confirm_adopted`).
 pub(crate) const CERTIFIED_RETURN_RECEIPT: &str = "native-box-transfer-at-return-certified";
 const DECLARATION_TYPE_RECEIPT: &str = "native-box-declaration-type";
+/// **R585-3** — an optional owner opened uniquely because the projection is a
+/// moved load of an owned field (`moved_load`).
+const MOVED_LOAD_RECEIPT: &str = "native-box-optional-owner-moved-load";
 const VIEW_ALIAS_TYPE_RECEIPT: &str = "native-box-view-alias-type";
 
 /// R402-2(a): register the explicit declaration type of every native Box
@@ -1067,6 +1070,122 @@ fn fresh_allocation_peer_disjoint(
         peer.as_u32(),
         closure.iter().map(|l| l.as_u32()).collect::<Vec<_>>()
     ))
+}
+
+/// **R585-3.** Is this projection `(*x).f` through a native owner a load that
+/// the field family renders as a MOVE (`.take()`, a unique borrow of `x`)?
+///
+/// Two readings, either of which suffices. The first is the family's own
+/// edit at this span, as the table carries it now. The second is the model's,
+/// which no later round's transaction set can change: the family moves an
+/// owned field out exactly when its consumer is `Owning` (`consumer_edit`:
+/// `take()` into a `Box`, `take().map_or(.., into_raw)` into a raw one), so
+/// an `Owning` field loaded into an `Owning` local or formal is a move. Either
+/// reading can only widen a read into a write; `as_deref_mut()` at a lone
+/// load is always well-typed.
+fn moved_load(
+    inputs: &Inputs<'_, '_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    projection: HirId,
+) -> bool {
+    use rustc_hir::{ExprKind, Node as HirNode, PatKind, QPath, def::Res};
+    use rustc_middle::ty::TyKind;
+
+    use crate::analyses::borrow_ownership::slots::StructFieldSlot;
+    let tcx = inputs.program.tcx;
+    let HirNode::Expr(load) = tcx.hir_node(projection) else { return false };
+    let family_moves = table
+        .field_transactions
+        .applied
+        .iter()
+        .flat_map(|transaction| &transaction.expression_edits)
+        .any(|edit| {
+            edit.owner == owner
+                && edit.span == load.span
+                && matches!(
+                    edit.kind,
+                    "owned-field-move"
+                        | "owned-field-raw-move"
+                        | super::field_reference::DEALLOC_TRANSFER
+                        | super::field_reference::DEALLOC_TRANSFER_CONTRACT
+                )
+        });
+    if family_moves {
+        return true;
+    }
+    let ExprKind::Field(base, _) = load.kind else { return false };
+    let typeck = tcx.typeck(owner);
+    let TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else { return false };
+    let (Some(struct_did), Some(field_index)) =
+        (adt.did().as_local(), typeck.opt_field_index(load.hir_id))
+    else {
+        return false;
+    };
+    let field_owning = inputs
+        .slots
+        .field_slots
+        .slot_for_field_depth(
+            StructFieldSlot {
+                struct_did,
+                field_index: field_index.as_usize(),
+            },
+            0,
+        )
+        .map(SlotRef::Field)
+        .and_then(|slot| inputs.model.get(&slot).copied())
+        == Some(SlotKind::Owning);
+    if !field_owning {
+        return false;
+    }
+    let owning_subject = |fn_did: LocalDefId, pick: &dyn Fn(&super::Subject) -> bool| {
+        table.entries.iter().any(|(subject, _)| {
+            subject.fn_did == fn_did
+                && pick(subject)
+                && outer_owning(inputs.slots, inputs.model, subject)
+        })
+    };
+    match tcx.parent_hir_node(load.hir_id) {
+        // `let t = (*x).f;` — the consumer is the binding.
+        HirNode::LetStmt(local) if local.init.is_some_and(|init| init.hir_id == load.hir_id) => {
+            match local.pat.kind {
+                PatKind::Binding(_, binding, _, None) => {
+                    owning_subject(owner, &|subject| subject.hir_id == binding)
+                }
+                _ => false,
+            }
+        }
+        HirNode::Expr(parent) => match parent.kind {
+            // `t = (*x).f;` — the consumer is the assigned local.
+            ExprKind::Assign(target, value, _) if value.hir_id == load.hir_id => {
+                match target.kind {
+                    ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                        Res::Local(binding) => {
+                            owning_subject(owner, &|subject| subject.hir_id == binding)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+            // `g((*x).f)` — the consumer is the local callee's formal.
+            ExprKind::Call(function, arguments) => {
+                let Some(index) = arguments.iter().position(|a| a.hir_id == load.hir_id) else {
+                    return false;
+                };
+                let TyKind::FnDef(callee, _) = typeck.expr_ty(function).kind() else {
+                    return false;
+                };
+                callee.as_local().is_some_and(|callee| {
+                    owning_subject(callee, &|subject| {
+                        matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                    })
+                })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn derive_bundle(
@@ -1258,11 +1377,19 @@ fn derive_bundle(
     // an optional one must be opened: shared for a read, so the two reads in
     // `max(height((*x).left), height((*x).right))` coexist instead of taking
     // two mutable borrows of the same local; unique for a write.
+    //
+    // R585-3: a LOAD of an owned field that the field family renders as a
+    // move (`let mut T2 = (*x).right;` → `….right.take()`) mutates the field,
+    // so it is a write as well; opened shared it is E0596 (avl's rotations).
     if optional_owner {
-        for &(span, written) in source.field_projections() {
+        for &(span, written, projection) in source.field_projections() {
+            let moved = !written && moved_load(inputs, table, subject.fn_did, projection);
+            if moved {
+                receipts.push(format!("{MOVED_LOAD_RECEIPT} span={span:?}"));
+            }
             edits.push(BoxExprEdit {
                 span,
-                replacement: if written {
+                replacement: if written || moved {
                     format!("{name}.as_deref_mut().unwrap()")
                 } else {
                     format!("{name}.as_deref().unwrap()")
