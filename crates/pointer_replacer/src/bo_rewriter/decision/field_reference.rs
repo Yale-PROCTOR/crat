@@ -1665,6 +1665,107 @@ fn path_local(expr: &Expr<'_>) -> Option<HirId> {
     }
 }
 
+/// **R597-3 — a stored parameter that borrows a sibling of its own
+/// container.** `site` stores the parameter `source` into `(*container).f`,
+/// both parameters of the storing function. Walk the (container, source)
+/// argument pair up the callers: a pair rooted in ONE local is the
+/// self-borrow — the field would borrow a sibling of the object that holds
+/// it (brotli's `s.hasher_.privat._H35.params = &s.params`, report 076); a
+/// pair of the caller's own parameters continues the walk; anything else
+/// ends it. Bounded by the (callee, pair) set it has visited.
+fn store_is_container_self_borrow(tcx: TyCtxt<'_>, functions: &[LocalDefId], site: &Site) -> bool {
+    let (SiteKind::Store, Some(Rhs::Subject(source)), Some(container)) =
+        (site.kind, &site.rhs, site.base)
+    else {
+        return false;
+    };
+    let param_index = |owner: LocalDefId, binding: HirId| -> Option<usize> {
+        tcx.hir_body_owned_by(owner)
+            .params
+            .iter()
+            .position(|param| param.pat.hir_id == binding)
+    };
+    let (Some(c), Some(s)) = (
+        param_index(site.owner, container.1),
+        param_index(site.owner, source.1),
+    ) else {
+        return false;
+    };
+    let mut work = vec![(site.owner, c, s)];
+    let mut seen: FxHashSet<(LocalDefId, usize, usize)> = FxHashSet::default();
+    while let Some((callee, c, s)) = work.pop() {
+        if !seen.insert((callee, c, s)) {
+            continue;
+        }
+        for &caller in functions {
+            let body = tcx.hir_body_owned_by(caller);
+            let mut pairs = CallRoots {
+                callee,
+                c,
+                s,
+                pairs: Vec::new(),
+            };
+            pairs.visit_expr(body.value);
+            for (root_c, root_s) in pairs.pairs {
+                let (Some(root_c), Some(root_s)) = (root_c, root_s) else { continue };
+                if root_c == root_s {
+                    return true;
+                }
+                let position =
+                    |binding: HirId| body.params.iter().position(|p| p.pat.hir_id == binding);
+                if let (Some(pc), Some(ps)) = (position(root_c), position(root_s)) {
+                    work.push((caller, pc, ps));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The root locals of the `c`-th and `s`-th arguments of every call to
+/// `callee` in one body.
+struct CallRoots {
+    callee: LocalDefId,
+    c: usize,
+    s: usize,
+    pairs: Vec<(Option<HirId>, Option<HirId>)>,
+}
+
+impl<'tcx> Visitor<'tcx> for CallRoots {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if let ExprKind::Call(callee, args) = expr.kind
+            && let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+            && let Res::Def(rustc_hir::def::DefKind::Fn, did) = path.res
+            && did.as_local() == Some(self.callee)
+            && let (Some(c), Some(s)) = (args.get(self.c), args.get(self.s))
+        {
+            self.pairs.push((arg_root(c), arg_root(s)));
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// The local whose object an argument points into: the local passed on, or
+/// `&` of a place rooted in it. A pointer LOADED from a field (`(*s).q`)
+/// points out of the local's object.
+fn arg_root(expr: &Expr<'_>) -> Option<HirId> {
+    match expr.kind {
+        ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => arg_root(inner),
+        ExprKind::AddrOf(_, _, place) => place_root(place),
+        _ => path_local(expr),
+    }
+}
+
+/// The local a place is rooted in, through fields, indexing and a deref of
+/// the local's own pointer (`*(*s).q` derefs a loaded pointer: none).
+fn place_root(expr: &Expr<'_>) -> Option<HirId> {
+    match expr.kind {
+        ExprKind::Field(inner, _) | ExprKind::Index(inner, _, _) => place_root(inner),
+        ExprKind::Unary(UnOp::Deref, pointer) => arg_root(pointer),
+        _ => path_local(expr),
+    }
+}
+
 pub(crate) fn derive(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -2025,6 +2126,17 @@ pub(crate) fn derive(
         }
         if cause.is_none() && !owning {
             cause = container_holds.get(&key.struct_did).cloned();
+            // R597-3: a nested container is only a lifetime to carry when
+            // the stored borrow comes from OUTSIDE the container's object. A
+            // stored parameter whose callers hand the container and the
+            // source from one object is a self-borrow no lifetime types.
+            if cause.as_deref() == Some("field-transaction-incomplete:nested-container")
+                && key_sites
+                    .iter()
+                    .any(|site| store_is_container_self_borrow(tcx, &program.functions, site))
+            {
+                cause = Some("field-transaction-incomplete:container-self-borrow".to_owned());
+            }
         }
         if cause.is_none() && owning {
             // The union / static / alias holds still apply; a struct that

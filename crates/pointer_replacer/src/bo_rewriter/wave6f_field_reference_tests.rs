@@ -3735,3 +3735,76 @@ fn w6f_an_owned_field_in_a_copy_container_holds() {
         )
     );
 }
+
+/// The self-borrow fixture (R597-3): `Hx.params` is stored from a parameter
+/// by `initialize`; `Hx` lives in the union `U`, which lives in `Hasher`,
+/// which lives in `State` beside `State.params`; `encode` hands `setup` both
+/// `&mut (*s).hasher_` and `&mut (*s).params` — brotli's `H35` shape.
+const SELF_BORROW: &str = include_str!("wave6f_fixture_self_borrow.rs");
+
+/// Witness 42 (R597-3, report 076) — **a stored parameter that borrows a
+/// sibling of its own container holds `container-self-borrow`, not
+/// `nested-container`.** The union `U` mentions `Hx`, so the struct-level
+/// scan records `nested-container`; that reads as a lift (give `U`,
+/// `Hasher`, `State` the lifetime). It is not one: along the caller chain
+/// `encode -> setup -> initialize` the container argument and the stored one
+/// are rooted in one object, `*s` — the field would borrow `s.params` from
+/// inside `s.hasher_`, a self-referential struct no lifetime parameter
+/// types. Control: the same program whose caller hands a `params` from
+/// ANOTHER object keeps `nested-container`.
+#[test]
+fn w6f_a_stored_sibling_borrow_holds_container_self_borrow() {
+    let _frame = frame_lock();
+    use crate::analyses::borrow_ownership::SlotKind;
+    let frame = || {
+        super::test_model_override::set(
+            "w6f-self-borrow-frame",
+            vec![("Hx".to_owned(), 1, SlotKind::Ref)],
+            Vec::new(),
+        )
+    };
+    frame();
+    let row = field_receipt_row(SELF_BORROW, "Hx", "params");
+    super::test_model_override::clear();
+    assert_eq!(
+        (row[2].as_str(), row[9].as_str()),
+        ("held", "field-transaction-incomplete:container-self-borrow"),
+        "{row:?}"
+    );
+    // Control: `params` from a different object than the container's.
+    let other = SELF_BORROW.replace(
+        "pub unsafe extern \"C\" fn encode(mut s: *mut State) {\n    setup(&mut (*s).hasher_, &mut (*s).params);",
+        "pub unsafe extern \"C\" fn encode(mut s: *mut State, mut p: *mut Params) {\n    setup(&mut (*s).hasher_, p);",
+    );
+    assert_ne!(other, SELF_BORROW, "the control edit applies");
+    frame();
+    let row = field_receipt_row(&other, "Hx", "params");
+    super::test_model_override::clear();
+    assert_eq!(
+        (row[2].as_str(), row[9].as_str()),
+        ("held", "field-transaction-incomplete:nested-container"),
+        "{row:?}"
+    );
+    // Control: a pointer LOADED from a field of `*s` points out of `*s`,
+    // whether passed as the value or re-borrowed through its deref.
+    for argument in ["(*s).shared", "&mut *(*s).shared"] {
+        let loaded = SELF_BORROW
+            .replace(
+                "    pub params: Params,\n}",
+                "    pub params: Params,\n    pub shared: *mut Params,\n}",
+            )
+            .replace(
+                "setup(&mut (*s).hasher_, &mut (*s).params);",
+                &format!("setup(&mut (*s).hasher_, {argument});"),
+            );
+        assert!(loaded.contains("pub shared") && loaded.contains(argument));
+        frame();
+        let row = field_receipt_row(&loaded, "Hx", "params");
+        super::test_model_override::clear();
+        assert_eq!(
+            (row[2].as_str(), row[9].as_str()),
+            ("held", "field-transaction-incomplete:nested-container"),
+            "{argument}: {row:?}"
+        );
+    }
+}
