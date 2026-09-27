@@ -11,16 +11,18 @@
 
 /// `first` holds on the return seam (its read-only formal decides shared under a
 /// `*mut` return), so its class reverts and its callers' arguments must take its
-/// raw input form.
+/// raw input form. It reads a static (R596-2): the sole-origin rule's closed-body
+/// condition keeps it out, so `first` stays held with that rule in the line too.
 const SHAPES: &str = r#"
 #[repr(C)]
 pub struct Node {
     pub key: i32,
     pub child: *mut Node,
 }
+pub static mut ROOT: *mut Node = 0 as *mut Node;
 #[no_mangle]
 pub unsafe extern "C" fn first(mut node: *mut Node) -> *mut Node {
-    let _k = (*node).key;
+    let _k = (*node).key + (*ROOT).key;
     return node;
 }
 pub unsafe fn caller(mut base: *mut Node, mut out: *mut i32) {
@@ -114,7 +116,8 @@ fn r593_a2_a_field_read_through_a_ref_reads_raw() {
 
 /// A field the field-reference transaction delivers (`Holder.node`, stored by
 /// the c2rust `let ref mut fresh = (*h).node; *fresh = n;` idiom, wave-6f's H35
-/// shape), read through a thin `ref` into the held `first`.
+/// shape), read through a thin `ref` into the held `first` (held on the return
+/// seam; its static read keeps the sole-origin rule out, R596-2).
 const DELIVERED_FIELD: &str = r#"
 #[repr(C)]
 pub struct Node {
@@ -126,9 +129,10 @@ pub struct Holder {
     pub fresh: i32,
     pub node: *mut Node,
 }
+pub static mut ROOT: *mut Node = 0 as *mut Node;
 #[no_mangle]
 pub unsafe extern "C" fn first(mut node: *mut Node) -> *mut Node {
-    let _k = (*node).key;
+    let _k = (*node).key + (*ROOT).key;
     return node;
 }
 pub unsafe extern "C" fn init_holder(mut h: *mut Holder, mut n: *mut Node) {
