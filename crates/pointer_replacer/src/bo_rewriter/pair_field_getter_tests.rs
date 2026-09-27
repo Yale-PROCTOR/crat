@@ -152,14 +152,20 @@ pub unsafe fn Emit(mut s: *mut S) {
 "#;
 
 /// C4: `cmds` is same-base-only (R579-3); a getter does not launder that.
+/// R603-4 separates it from a field admitted by direct calls alone, so its
+/// partner here is `scratch` stored through a local too: two local-admitted
+/// fields may hold one block.
 const GETTER_OF_A_SAME_BASE_ONLY_FIELD: &str = r#"
+pub unsafe fn Regrow(mut s: *mut S) {
+    let mut t = malloc(16) as *mut u8;
+    (*s).scratch = t;
+}
 pub unsafe fn GetCmds(mut s: *mut S) -> *mut u8 {
     return (*s).cmds;
 }
 pub unsafe fn Emit(mut s: *mut S) {
     let mut c = GetCmds(s);
-    let mut out = GetStorage(s, 128);
-    Relay(c, out);
+    Relay(c, (*s).scratch);
 }
 "#;
 
@@ -280,7 +286,7 @@ fn w6p_g4_a_same_base_only_field_is_still_refused_beside_another_field() {
     );
     assert!(
         verdict.is_err(),
-        "R579-3: `cmds` separates only from its own base: got {verdict:?}"
+        "R579-3 / R603-4: two local-admitted fields stay apart only from their base: got {verdict:?}"
     );
 }
 

@@ -248,8 +248,11 @@ enum RootClass {
         /// R579-3: the field was admitted through a fresh LOCAL or an in-block
         /// OFFSET of another field ([`FreshFieldFact`]). Its block may be
         /// another admitted field's (`buffer_ = data_ + 2`), so it separates
-        /// only from its own base, never from another field.
+        /// from another field only as R603-4 allows.
         same_base_only: bool,
+        /// R603-4: some store into the field is an OFFSET (R579-3 (d)), so its
+        /// block may be another admitted field's.
+        via_offset: bool,
     },
     Unknown,
 }
@@ -260,6 +263,7 @@ enum RootClass {
 struct FreshFieldFact {
     freshness: Freshness,
     same_base_only: bool,
+    via_offset: bool,
 }
 
 impl RootClass {
@@ -475,14 +479,15 @@ impl PairDisjointnessIndex {
             }
             for ((adt, field), fact) in &fresh_fields {
                 println!(
-                    "W6P_FIELD\t{}\t{field}\t{:?}{}",
+                    "W6P_FIELD\t{}\t{field}\t{:?}{}{}",
                     tcx.def_path_str(*adt),
                     fact.freshness,
                     if fact.same_base_only {
                         "\tsame-base-only"
                     } else {
                         ""
-                    }
+                    },
+                    if fact.via_offset { "\tvia-offset" } else { "" }
                 );
             }
             for (did, index) in &allocators.views {
@@ -1167,6 +1172,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 base,
                 freshness,
                 same_base_only,
+                via_offset,
             },
             other,
         )
@@ -1178,6 +1184,7 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 base,
                 freshness,
                 same_base_only,
+                via_offset,
             },
         ) => {
             let kind = |freshness: Freshness| match freshness {
@@ -1185,18 +1192,23 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 Freshness::Contract => CertificateKind::DistinctRootsUnderContract,
             };
             return match other {
-                // R579-3: a field admitted through a local or an offset may
-                // hold another admitted field's block, so the different-fields
-                // clause never reads it.
+                // R579-3 / R603-4: two DIFFERENT fields hold two different
+                // allocations unless one block can reach both. An OFFSET store
+                // (d) puts another field's block into the field, and one local
+                // stored through (c) into BOTH fields is one block; a field
+                // admitted through a local beside one that never is holds a
+                // different allocator evaluation's block.
                 RootClass::FreshField {
                     adt: other_adt,
                     field: other_field,
                     freshness: other_freshness,
                     same_base_only: other_same_base_only,
+                    via_offset: other_via_offset,
                     ..
                 } => ((adt, field) != (other_adt, other_field)
-                    && !same_base_only
-                    && !other_same_base_only)
+                    && !via_offset
+                    && !other_via_offset
+                    && !(same_base_only && other_same_base_only))
                     .then(|| kind(freshness.join(other_freshness))),
                 _ => (other.object_id() == Some(base))
                     .then(|| kind(freshness.join(other.freshness()))),
@@ -2132,8 +2144,9 @@ fn view_of_formal(
 ///   `g`'s block. Admitted only while `g` is — a greatest fixpoint.
 ///
 /// A field admitted either way is `same_base_only`: under (d) it names another
-/// field's block, and under (c) one local may be stored into two fields, so
-/// the different-fields clause never separates it.
+/// field's block, and under (c) one local may be stored into two fields. R603-4
+/// keeps (d) apart as `via_offset`, which the different-fields clause never
+/// separates, while a (c) field separates from a field that is neither.
 ///
 /// And every admission — R479-4a's own included — is refused for a struct that
 /// the program writes WITHOUT a field store ([`struct_writes_outside_field_stores`]):
@@ -2234,6 +2247,7 @@ fn allocator_data_fields(
                 FreshFieldFact {
                     freshness,
                     same_base_only: same_base_only.contains(&key),
+                    via_offset: offsets.iter().any(|(field, _)| *field == key),
                 },
             )
         })
@@ -3172,6 +3186,7 @@ fn carry_fresh_field_reads<'tcx>(
         let FreshFieldFact {
             freshness,
             same_base_only,
+            via_offset,
         } = fresh_fields[&key];
         classes.insert(
             local,
@@ -3181,6 +3196,7 @@ fn carry_fresh_field_reads<'tcx>(
                 base,
                 freshness,
                 same_base_only,
+                via_offset,
             },
         );
     }
@@ -3383,10 +3399,13 @@ impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
 
     /// The conditional as a whole: admitted only when it is a CONDITIONAL (a
     /// bare allocator call is already handled ahead of this) and at least one
-    /// arm allocates.
+    /// arm allocates. R603-4 (G5): a statement-less BLOCK around an allocator
+    /// call is that allocation too — its value is the call's result
+    /// (`storage = { BrotliAllocate(..) as *mut u8 }`); the arm walk refuses a
+    /// block with statements.
     fn conditional_allocator(&self, value: &Expr<'_>) -> Option<Freshness> {
         let value = peel_casts(value);
-        if !matches!(value.kind, ExprKind::If(..)) {
+        if !matches!(value.kind, ExprKind::If(..) | ExprKind::Block(..)) {
             return None;
         }
         self.conditional_allocator_arm(value)?
@@ -3827,6 +3846,7 @@ fn fresh_field_root<'tcx>(
     let FreshFieldFact {
         freshness,
         same_base_only,
+        via_offset,
     } = *fresh_fields.get(&key)?;
     // The base must itself name one object, or "same base" names nothing.
     let (base_class, _) = place_provenance(tcx, typeck, classes, base);
@@ -3836,6 +3856,7 @@ fn fresh_field_root<'tcx>(
         base: base_class.object_id()?,
         freshness,
         same_base_only,
+        via_offset,
     })
 }
 
