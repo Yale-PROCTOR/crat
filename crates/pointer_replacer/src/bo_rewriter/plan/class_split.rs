@@ -599,7 +599,7 @@ pub unsafe fn caller(r: *mut i32) {
     /// the held caller renders `callee(&mut *q)` (the source-input carrier), so
     /// the E0308 this control guarded cannot arise and `callee` stands alone.
     #[test]
-    fn zero_syntax_dependency_on_a_held_caller_is_kept() {
+    fn zero_syntax_dependency_on_a_predecessor_held_caller_is_released() {
         let got = run(ZERO_SYNTAX_DEPENDENCY_SHAPE);
         let exclusion = column(&got.subjects, "callee::p#1", "exclusion");
         assert_eq!(exclusion, "-", "{}", got.subjects);
