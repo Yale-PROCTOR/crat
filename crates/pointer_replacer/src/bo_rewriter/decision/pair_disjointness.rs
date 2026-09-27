@@ -915,10 +915,25 @@ impl PairDisjointnessIndex {
         if self.immutable_formals.contains(&(callee, left))
             && self.immutable_formals.contains(&(callee, right))
         {
-            // R492-3: the FACT is derived here (`is_shared_read_pair`), but the
-            // verdict is not. `decision/shared_read_pairs.rs` owns the
-            // shared/shared case in the CONSUMER role (R396-2), and this index
-            // refuses the pair to it on purpose — report 031 STOP 1.
+            // R492-3: the FACT is derived here (`is_shared_read_pair`).
+            // `decision/shared_read_pairs.rs` owns the shared/shared case in the
+            // CONSUMER role (R396-2) for every TWO-argument call — it rewrites
+            // the addresses itself and pins that such a call's A5 overlap
+            // verdict stays `Overlapping` — so there this index refuses the pair
+            // to it on purpose (report 031 STOP 1).
+            //
+            // R593-4: in any OTHER call the consumer never takes the pair, and a
+            // pair whose two positions both carry the fact — `*const` in the
+            // input, nothing written through either, no mutable reborrow of
+            // either — needs no disjointness: two shared borrows of one place
+            // are what Rust permits. One position without the fact keeps the
+            // refusal.
+            if site.args.len() != 2
+                && self.shared_reads.contains(&(callee, left))
+                && self.shared_reads.contains(&(callee, right))
+            {
+                return Ok(CertificateKind::ReadReadShared);
+            }
             return Err(Unproved::ReadReadPeers);
         }
         // The same syntactic place, however it is cast, is never disjoint from
