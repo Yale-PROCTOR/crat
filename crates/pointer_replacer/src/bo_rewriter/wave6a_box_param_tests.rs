@@ -861,6 +861,60 @@ pub struct registry { pub table: *mut ht }
     }
 }
 
+/// **W6S-17 (R641-12) — the optional form through a pointer alias.** ht's
+/// exported consumer spelled `ht_destroy(mut table: ht_t)`, `ht_t = *mut ht`,
+/// with a lending third signature (the shape above that waives the consumer):
+/// the declaration is spelled from the alias's resolved pointee,
+/// `Option<Box<crate::ht>>`, as the raw spelling's `Option<Box<ht>>`.
+#[test]
+fn w6s17_an_alias_spelled_exported_consumer_takes_option_box() {
+    const SOURCE: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+pub type ht_t = *mut ht;
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_destroy(mut table: ht_t) {
+    free(table as *mut core::ffi::c_void);
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table).length; }
+"#;
+    let out = emitted("w6s17-ht-alias", &format!("{PRELUDE}{SOURCE}"));
+    let src = compact(&out.source);
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.box_param_receipts, out.artifacts.return_certificate_receipts
+    );
+    assert!(
+        src.contains("fnht_destroy(muttable:Option<Box<crate::ht>>)")
+            && receipts.contains("exported-consumer-waiver callee=ht_destroy"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        out.artifacts.declaration_rows.iter().any(|row| {
+            row.original_type_form == "ht_t" && row.settled_emitted_type == "Option<Box<crate::ht>>"
+        }),
+        "{:#?}",
+        out.artifacts.declaration_rows
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "ht_destroy::table"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+}
+
 /// **R517-9 — the callee-less exported producer.** ht's `ht_create` with a
 /// lending third signature (`ht_length`, the corpus's `ht_get` / `ht_set`):
 /// the closure holds, nothing in the program receives the result, and the

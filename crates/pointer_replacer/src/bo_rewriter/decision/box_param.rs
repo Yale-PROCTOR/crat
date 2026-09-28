@@ -110,6 +110,22 @@ pub(crate) struct Chains {
     pub(crate) formal_labels: FxHashMap<(LocalDefId, HirId), (String, String, usize)>,
 }
 
+/// **W6S-17 (R641-12)** — a formal the chains plan (`lil_free(mut lil:
+/// lil_t)`). Spelled through a pointer alias, its declaration is the chain's,
+/// not the declaration family's: the members move a `Box` into it from the
+/// first family stage on, and a formal left raw under them is bridged as a
+/// lend and freed twice.
+pub(crate) fn planned_formal(chains: &Chains, node: (LocalDefId, HirId)) -> bool {
+    chains.formal_labels.contains_key(&node) && chains.plans.contains_key(&node)
+}
+
+/// [`planned_formal`] for a subject spelled through a pointer alias.
+pub(crate) fn alias_formal(chains: &Chains, subject: &Subject) -> bool {
+    subject.decl_shape == super::DeclShape::Alias
+        && matches!(subject.kind, SubjectKind::Param { .. })
+        && planned_formal(chains, (subject.fn_did, subject.hir_id))
+}
+
 /// Withdraw a formal's plan (and the member plans its chain inserted) with a
 /// typed hold and without its admission receipt.
 fn withdraw_formal(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) {
@@ -1344,6 +1360,7 @@ pub(crate) fn derive<'tcx>(
     consuming: &FxHashSet<(DefId, usize)>,
     raw_surface: &dyn Fn(LocalDefId) -> bool,
     exported_pairs: &super::exported_pair::Closure,
+    declaration_pointees: &super::declaration::DeclarationPointees,
 ) -> Chains {
     let mut out = Chains::default();
     let mut scans: FxHashMap<LocalDefId, Scan<'tcx>> = FxHashMap::default();
@@ -2500,13 +2517,16 @@ pub(crate) fn derive<'tcx>(
         };
         // **R636-4 — a formal spelled through a pointer alias** (`mut lil:
         // lil_t`, `lil_t = *mut _lil_t`) has no pointee span for the surface
-        // to put `Box<..>` on, and `declaration::emitted_type` spells only the
-        // borrowed forms: its declaration would stay raw under members that
-        // move a Box into it, the argument bridged as a lend and the block
-        // freed twice. So the chain holds typed until that rendering exists
-        // (the declaration family's). Asked last, so every other hold keeps its
-        // reason.
-        if param.decl_shape == super::DeclShape::Alias {
+        // to put `Box<..>` on: its declaration would stay raw under members
+        // that move a Box into it, the argument bridged as a lend and the
+        // block freed twice. **W6S-17 (R641-12)**: the declaration is spelled
+        // from the alias's compiler-resolved pointee (`declaration_pointees`)
+        // at every stage the chain applies, so the chain holds typed only
+        // where that pointee cannot be named. Asked last, so every other hold
+        // keeps its reason.
+        if param.decl_shape == super::DeclShape::Alias
+            && !declaration_pointees.contains_key(&(param.fn_did, param.hir_id))
+        {
             hold(format!("box-param-alias-formal:{callee_path}"), &mut out);
             continue;
         }

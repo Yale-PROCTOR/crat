@@ -154,6 +154,27 @@ pub(crate) fn pointee_source<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
     ty.to_string()
 }
 
+/// **W6S-17 (R641-12)** — a Box chain's formal spelled through a pointer
+/// alias (`lil_free(mut lil: lil_t)`): the plain-pointer path's `Box<T>` /
+/// `Box<[T]>` / `Option<..>`, over the alias's resolved pointee (or the plan's
+/// pointee override) instead of a pointee span. `None` for any other form.
+pub(crate) fn box_formal_type(decision: &Decision, pointee: &str) -> Option<String> {
+    let Decision::Box(plan) = decision else { return None };
+    let pointee = plan
+        .pointee_override
+        .map_or(pointee, |element| element.source_name());
+    let boxed = if matches!(plan.shape, super::box_facts::BoxShape::Slice) {
+        format!("Box<[{pointee}]>")
+    } else {
+        format!("Box<{pointee}>")
+    };
+    Some(if plan.optional {
+        format!("Option<{boxed}>")
+    } else {
+        boxed
+    })
+}
+
 /// Render only the borrowed forms licensed for the declaration family. The
 /// source pointee is already resolved, and lifetime selection remains owned
 /// by the existing lifetime planner.

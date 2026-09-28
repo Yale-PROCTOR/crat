@@ -8121,6 +8121,7 @@ fn finish_decide<'tcx>(
         &consuming_formals,
         &raw_surface,
         &exported_pairs,
+        &declaration_pointees,
     );
     // R450-8 rung 3: the chain has spoken — an owner whose release was a
     // transfer into a formal it did not plan is withdrawn.

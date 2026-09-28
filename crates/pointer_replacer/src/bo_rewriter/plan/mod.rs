@@ -3396,6 +3396,9 @@ fn declaration_receipts(
                 .map(|ty| ty.pointee.as_str())
                 .or_else(|| pattern.map(|carrier| carrier.pointee.as_str()))
                 .and_then(|pointee| {
+                    if super::decision::box_param::alias_formal(&table.box_params, subject) {
+                        return super::decision::declaration::box_formal_type(decision, pointee);
+                    }
                     super::decision::declaration::emitted_type(
                         decision,
                         pointee,
@@ -5021,11 +5024,19 @@ pub(crate) fn plan(
                     continue;
                 }
             };
-            let Some(replacement) = super::decision::declaration::emitted_type(
-                decision,
-                &resolved.pointee,
-                declaration_lifetime(table, subject),
-            ) else {
+            // W6S-17: a Box chain's formal is spelled as the plain-pointer
+            // path spells it, over the resolved pointee.
+            let replacement =
+                if super::decision::box_param::alias_formal(&table.box_params, subject) {
+                    super::decision::declaration::box_formal_type(decision, &resolved.pointee)
+                } else {
+                    super::decision::declaration::emitted_type(
+                        decision,
+                        &resolved.pointee,
+                        declaration_lifetime(table, subject),
+                    )
+                };
+            let Some(replacement) = replacement else {
                 unplaceable.push(Unplaceable {
                     owner_class: SignatureClassId::of(subject.fn_did),
                     bridge: surface_bridge(),

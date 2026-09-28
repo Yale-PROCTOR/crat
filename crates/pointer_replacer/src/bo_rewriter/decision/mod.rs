@@ -1454,6 +1454,8 @@ pub(crate) fn decide_with_raw_fallbacks(
             .filter(|(node, _)| {
                 ctx.family_policy
                     .enabled_for(**node, FamilyStage::Declaration)
+                    // W6S-17: a Box chain's formal is the chain's declaration.
+                    || box_param::planned_formal(ctx.box_params, **node)
             })
             .map(|(node, pointee)| (*node, pointee.clone()))
             .collect(),
@@ -2182,9 +2184,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // compiler type. Every other shape keeps its prior refusal, including
     // existing reference patterns. Passing this representation gate does not
     // bypass the frozen kind, use, borrowing or lifetime gates below. Earlier
-    // family stages deliberately retain the pre-item alias disposition.
+    // family stages deliberately retain the pre-item alias disposition — all
+    // but a Box chain's formal (W6S-17), whose declaration is the chain's.
     let alias_supported = subject.decl_shape == DeclShape::Alias
-        && family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+        && (family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+            || box_param::alias_formal(ctx.box_params, subject))
         && declaration_pointees.contains_key(&(subject.fn_did, subject.hir_id));
     if subject.decl_shape != DeclShape::RawPtr && !alias_supported {
         return degrade(

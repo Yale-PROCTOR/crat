@@ -3514,6 +3514,19 @@ unsafe extern "C" fn fnc_jaileval(mut lil: lil_t) -> size_t {
 "#;
 
 fn lil_new_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    lil_new_emitted_as(
+        name,
+        source,
+        crate::analyses::borrow_ownership::SlotKind::Owning,
+    )
+}
+
+/// [`lil_new_emitted`] with the model's kind for `lil_free::lil` given.
+fn lil_new_emitted_as(
+    name: &str,
+    source: &str,
+    lil_free: crate::analyses::borrow_ownership::SlotKind,
+) -> super::wave6a_allocation_tests::Emitted {
     use crate::analyses::borrow_ownership::SlotKind;
     let _frame = frame_locks();
     super::test_model_override::set(
@@ -3524,7 +3537,7 @@ fn lil_new_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::
         ],
         vec![
             ("lil_new::lil".to_owned(), SlotKind::Owning),
-            ("lil_free::lil".to_owned(), SlotKind::Owning),
+            ("lil_free::lil".to_owned(), lil_free),
             ("repl::lil".to_owned(), SlotKind::Owning),
             ("nonint::lil".to_owned(), SlotKind::Owning),
             ("fnc_jaileval::sublil".to_owned(), SlotKind::Owning),
@@ -3606,41 +3619,130 @@ fn w6a_r623_lil_new_and_its_three_receivers_move_into_a_null_testing_lil_free() 
     assert_eq!(out.reverted, 0, "{context}");
 }
 
-/// The corpus spelling: `lil_free(mut lil: lil_t)`. The surface has no pointee
-/// span to put `Box<..>` on and no alias spelling for a Box, so the chain
-/// holds typed (`box-param-alias-formal`), the certificate withdraws on the
-/// transfer it cannot confirm, and nothing reverts — `lil_alloc_env`,
-/// certified on its own, still delivers.
+/// The corpus spelling: `lil_free(mut lil: lil_t)`. **W6S-17 (R641-12,
+/// wave-6s relay 071)**: the declaration is spelled from the alias's
+/// compiler-resolved pointee (`lil_t` → `_lil_t`), so the chain plans the
+/// formal as it does the raw spelling, and `lil_new`, its three receivers
+/// and `lil_free` all deliver with nothing reverted. (Before: no pointee span
+/// for `Box<..>`, the chain held typed `box-param-alias-formal`.)
 #[test]
-fn w6a_r623_lils_alias_spelled_consumer_holds_typed_and_reverts_nothing() {
+fn w6a_r623_lils_alias_spelled_consumer_delivers_a_box_formal() {
     let out = lil_new_emitted("r623-lil-new-alias", LIL_NEW);
+    alias_formal_delivers(&out, "lil_t");
+}
+
+/// What the alias spelling delivers: the raw spelling's chain, certificate and
+/// uses, with the formal's declaration `Box<crate::_lil_t>` in place of the
+/// alias `alias`.
+fn alias_formal_delivers(out: &super::wave6a_allocation_tests::Emitted, alias: &str) {
+    let (receipts, context) = lil_new_context(out);
+    let text = compact(&out.source);
+    assert!(
+        receipts.contains("box-param-chain callee=lil_free index=0 sink=free"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate callee=lil_new ")
+            && receipts.contains("receivers=3 [repl::lil,nonint::lil,fnc_jaileval::sublil]"),
+        "{context}"
+    );
+    assert!(
+        text.contains("fnlil_free(mutlil:Box<crate::_lil_t>){iffalse{return;}"),
+        "{context}"
+    );
+    assert!(
+        !text.contains(&format!("fnlil_free(mutlil:{alias})")),
+        "{context}"
+    );
+    assert!(text.contains("drop(lil);}"), "{context}");
+    assert!(!text.contains("from_mut(lil.as_mut())"), "{context}");
+    // The declaration's receipt reads the `Box` it applied, not a held pointee.
+    assert!(
+        out.artifacts.declaration_rows.iter().any(|row| {
+            row.original_type_form == alias && row.settled_emitted_type == "Box<crate::_lil_t>"
+        }),
+        "{:#?}\n{context}",
+        out.artifacts.declaration_rows
+    );
+    for subject in [
+        "lil_new::lil",
+        "lil_free::lil",
+        "repl::lil",
+        "nonint::lil",
+        "fnc_jaileval::sublil",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{context}"
+        );
+    }
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// **W6S-17 (R641-12)**: an alias of the alias (`lil_ref = lil_t`) resolves to
+/// the same compiler type, so the formal delivers the same `Box<_lil_t>`.
+#[test]
+fn w6s17_a_double_alias_formal_delivers_a_box_formal() {
+    let source = LIL_NEW
+        .replace(
+            "pub type lil_t = *mut _lil_t;\n",
+            "pub type lil_t = *mut _lil_t;\npub type lil_ref = lil_t;\n",
+        )
+        .replace(
+            "pub unsafe extern \"C\" fn lil_free(mut lil: lil_t)",
+            "pub unsafe extern \"C\" fn lil_free(mut lil: lil_ref)",
+        );
+    assert_eq!(source.matches("lil_ref").count(), 2);
+    let out = lil_new_emitted("w6s17-double-alias", &source);
+    alias_formal_delivers(&out, "lil_ref");
+}
+
+/// **W6S-17 control: an alias to the pointee, not to a pointer**
+/// (`lil_free(mut lil: *mut lil_obj)`, `lil_obj = _lil_t`). The declaration is
+/// a raw pointer whose pointee text the plain path keeps: `Box<lil_obj>`, as
+/// before the rule, which reads only pointer aliases.
+#[test]
+fn w6s17_control_a_pointee_alias_keeps_its_own_spelling() {
+    let source = LIL_NEW
+        .replace(
+            "pub type lil_t = *mut _lil_t;\n",
+            "pub type lil_t = *mut _lil_t;\npub type lil_obj = _lil_t;\n",
+        )
+        .replace(
+            "pub unsafe extern \"C\" fn lil_free(mut lil: lil_t)",
+            "pub unsafe extern \"C\" fn lil_free(mut lil: *mut lil_obj)",
+        );
+    assert_eq!(source.matches("lil_obj").count(), 2);
+    let out = lil_new_emitted("w6s17-pointee-alias", &source);
     let (receipts, context) = lil_new_context(&out);
     assert!(
-        receipts.contains("lil_free::lil\theld\tbox-param-alias-formal:lil_free"),
-        "{context}"
-    );
-    // The receivers' transfer into `lil_free` is a consumer's now, so the
-    // certificate asks the chain to confirm it, and withdraws when it cannot.
-    assert!(
-        receipts.contains(
-            "lil_new::lil\theld\treturn-certificate-transfer-unconfirmed:lil_new:lil_free#0"
-        ),
+        receipts.contains("box-param-chain callee=lil_free index=0 sink=free"),
         "{context}"
     );
     assert!(
-        reason_of(&out.degradations, "repl::lil").is_some(),
-        "{context}"
-    );
-    assert!(
-        receipts.contains("return-certificate callee=lil_alloc_env ")
-            && !receipts.contains("return-certificate callee=lil_new "),
-        "{context}"
-    );
-    assert!(
-        !compact(&out.source).contains("from_mut(lil.as_mut())"),
+        compact(&out.source).contains("fnlil_free(mutlil:Box<lil_obj>){iffalse{return;}"),
         "{context}"
     );
     assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// **W6S-17 control: an alias-spelled formal no chain plans**
+/// (`register_stdcmds(mut lil: lil_t)`, the owner's lend) keeps the
+/// declaration family's borrowed form; the rule reads only planned formals.
+#[test]
+fn w6s17_control_an_alias_formal_no_chain_plans_keeps_its_form() {
+    let out = lil_new_emitted("w6s17-no-chain", LIL_NEW);
+    let (receipts, context) = lil_new_context(&out);
+    let text = compact(&out.source);
+    assert!(
+        !receipts.contains("box-param-chain callee=register_stdcmds "),
+        "{context}"
+    );
+    assert!(
+        text.contains("fnregister_stdcmds(mutlil:&mutcrate::_lil_t)"),
+        "{context}"
+    );
 }
 
 /// Relay 123's controls on the delivering spelling, one violation each: a
@@ -3720,18 +3822,24 @@ unsafe extern "C" fn drop_one() -> i32 {
 /// **R636-4, from the review of `ef7aa6579`: a hand-on stands with the
 /// formal it hands into.** `release(l)`'s only sink is the move on into
 /// `lil_free`, so it is planned as a `Box` formal on the consumer set's word.
-/// Where `lil_free` then holds (its alias spelling), `release`'s `Box` would
-/// meet a raw formal, bridged as a lend and freed twice; so the hand-on
-/// withdraws with its transferee (`box-param-hand-on-unplanned`). Where
-/// `lil_free` is planned, `release` delivers.
+/// Where `lil_free` then holds late (its chain's own hold, after the consumer
+/// set: here the model reads its formal as a borrow; W6S-17 delivers the alias
+/// spelling this test first held on), `release`'s `Box` would meet a raw
+/// formal, bridged as a lend and freed twice; so the hand-on withdraws with
+/// its transferee (`box-param-hand-on-unplanned`). Where `lil_free` is
+/// planned, `release` delivers.
 #[test]
 fn w6a_r623_a_formal_handed_on_stands_with_the_formal_it_hands_into() {
     let base = &LIL_NEW[..LIL_NEW.find("unsafe extern \"C\" fn repl()").expect("repl")];
-    let out = lil_new_emitted("r623-hand-on-held", &format!("{base}{RELEASE}"));
+    let out = lil_new_emitted_as(
+        "r623-hand-on-held",
+        &format!("{base}{RELEASE}"),
+        crate::analyses::borrow_ownership::SlotKind::Ref,
+    );
     let (receipts, context) = lil_new_context(&out);
     let text = compact(&out.source);
     assert!(
-        receipts.contains("lil_free::lil\theld\tbox-param-alias-formal:lil_free"),
+        receipts.contains("lil_free::lil\theld\tbox-param-model:lil_free::lil:Some(Ref)"),
         "{context}"
     );
     assert!(
