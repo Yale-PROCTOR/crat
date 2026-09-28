@@ -1058,6 +1058,16 @@ fn anchors(
     // Restore anchors are kept apart so they never count as a covering request
     // for a collision partner or a later protected owner (R220 parity).
     let mut restore = BTreeSet::<SignatureClassId>::new();
+    // **R606-3 — roots first.** A request triggered by a class held on its own
+    // reason (a collision, a dropped site, a refusal, or a new dependency on a
+    // class held on its own reason) is a root. A new dependency on a class held
+    // only through `dependency-class-held:*` waits while the round has a root: it
+    // may be ready once the root is retired (brotli's fourteen
+    // `StitchToPreviousBlockH*` behind 2337, held only through 2440's collision at
+    // each stage's first candidate and ready at the next). A round with no root
+    // issues them all, so strict progress stands.
+    let mut root_seen = false;
+    let mut waiting = BTreeSet::<SignatureClassId>::new();
     // Exact predecessor edit identity (including replacement digest) establishes
     // age. Generated A5/C sites keep the stage that introduced the transaction;
     // their generic bridge-kind strings do not establish precedence.
@@ -1097,6 +1107,7 @@ fn anchors(
                     Anchor::Direct(site.into_iter().collect()),
                 ),
             );
+            root_seen = true;
         }
     }
     for (owner, class) in &candidate.plan.class_finalization.classes {
@@ -1115,6 +1126,7 @@ fn anchors(
             })
             .collect::<Vec<_>>();
         if let Some(site) = new_dropped.first() {
+            root_seen = true;
             requested.entry(*owner).or_insert_with(|| {
                 (
                     format!(
@@ -1161,6 +1173,7 @@ fn anchors(
                 && !old.is_some_and(|old| old.hold_reasons().contains(reason))
         });
         if let Some(reason) = new_refusal {
+            root_seen = true;
             requested.entry(*owner).or_insert_with(|| {
                 (
                     format!("unwitnessed-family-refusal:{reason}"),
@@ -1215,6 +1228,21 @@ fn anchors(
                     .is_some_and(|old| old.depends_on.contains(dependency))
             });
             if let Some(dependency) = new_dependency.filter(|_| enabled(current)) {
+                let dependency_only = candidate
+                    .plan
+                    .class_finalization
+                    .classes
+                    .get(dependency)
+                    .is_some_and(|held| {
+                        held.hold_reasons()
+                            .iter()
+                            .all(|reason| reason.starts_with("dependency-class-held:"))
+                    });
+                if dependency_only {
+                    waiting.insert(current);
+                } else {
+                    root_seen = true;
+                }
                 requested.insert(
                     current,
                     (
@@ -1267,6 +1295,11 @@ fn anchors(
         // is then a restore anchor, not an `unrestored` failure.
         if (requested.len(), restore.len()) == before {
             restore.insert(owner);
+        }
+    }
+    if root_seen {
+        for owner in &waiting {
+            requested.remove(owner);
         }
     }
     for owner in restore {

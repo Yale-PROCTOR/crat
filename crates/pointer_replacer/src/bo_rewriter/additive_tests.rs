@@ -838,3 +838,108 @@ fn r459_5_a_declaration_rendered_by_another_plan_is_not_a_blocker() {
         );
     });
 }
+
+/// **R606-3 — roots first.** `slice` carries a new refusal of its own (the root),
+/// `reference` newly depends on it and is held only through that dependency, and
+/// `earlier_callee` newly depends on `reference`. The round retires the root and
+/// `reference`'s edge to it; `earlier_callee`'s request, triggered by a
+/// dependency-only hold, waits for the next round, when `reference` may be ready
+/// again (brotli's fourteen `StitchToPreviousBlockH*` behind 2337 behind 2440).
+#[test]
+fn r606_3_a_dependency_only_hold_waits_for_its_root() {
+    with_baseline(|prior| {
+        let root = owner(&prior, "slice_values");
+        let middle = owner(&prior, "reference_value");
+        let dependent = owner(&prior, "callee_value");
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == root)
+            .unwrap()
+            .block_reasons
+            .push("blocked-subject:slice-cursor-use".to_owned());
+        inputs
+            .iter_mut()
+            .find(|input| input.id == middle)
+            .unwrap()
+            .depends_on
+            .push(root);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == dependent)
+            .unwrap()
+            .depends_on
+            .push(middle);
+        let candidate = candidate(&prior, inputs);
+        let classes = &candidate.plan.class_finalization.classes;
+        assert!(
+            classes[&middle]
+                .hold_reasons()
+                .iter()
+                .all(|r| r.starts_with("dependency-class-held:")),
+            "the middle class is held only through its dependency: {:?}",
+            classes[&middle].hold_reasons()
+        );
+        assert!(!classes[&dependent].is_ready());
+        let withdrawals = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        let requested = withdrawals
+            .iter()
+            .filter(|w| !w.unresolved)
+            .map(|w| (w.owner, w.cause.clone()))
+            .collect::<Vec<_>>();
+        let owners = requested.iter().map(|(o, _)| *o).collect::<BTreeSet<_>>();
+        assert!(owners.contains(&root), "{requested:?}");
+        assert!(owners.contains(&middle), "{requested:?}");
+        assert!(
+            !owners.contains(&dependent),
+            "a dependency-only hold waits while its root is retired: {requested:?}"
+        );
+    });
+}
+
+/// **R606-3 control — a round with no root still retires.** `slice` was already
+/// held at the prior stage and `reference` already depended on it, so the only new
+/// fact is `earlier_callee`'s edge to `reference`, held only through a dependency.
+/// No request of the round has a root, so that request is issued (strict progress).
+#[test]
+fn r606_3_a_round_with_only_dependency_only_requests_issues_them() {
+    with_baseline(|baseline| {
+        let root = owner(&baseline, "slice_values");
+        let middle = owner(&baseline, "reference_value");
+        let dependent = owner(&baseline, "callee_value");
+        let mut inputs = class_inputs(&baseline);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == root)
+            .unwrap()
+            .block_reasons
+            .push("pre-existing-held-class".to_owned());
+        inputs
+            .iter_mut()
+            .find(|input| input.id == middle)
+            .unwrap()
+            .depends_on
+            .push(root);
+        let prior = candidate(&baseline, inputs);
+        assert!(!prior.plan.class_finalization.classes[&middle].is_ready());
+        assert!(prior.plan.class_finalization.classes[&dependent].is_ready());
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == dependent)
+            .unwrap()
+            .depends_on
+            .push(middle);
+        let candidate = candidate(&prior, inputs);
+        assert_eq!(
+            requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
+            BTreeSet::from([dependent]),
+            "with no root in the round, the dependency-only request is issued"
+        );
+    });
+}
