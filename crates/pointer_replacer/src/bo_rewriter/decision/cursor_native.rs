@@ -289,6 +289,17 @@ pub(crate) fn promote(
             ) {
                 return None;
             }
+            // wave-6b (R609-4, R422-7): a byte view is exactly one scalar's
+            // storage, so an index outside it was UB in the input whatever its
+            // sign; the view keeps its exact extent and never becomes a cursor
+            // over a fallback one.
+            if ctx
+                .void_region
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|region| region.shape == super::void_region::Shape::ByteView)
+            {
+                return None;
+            }
             if let Some(plan) = wrapper::plan(ctx, subject, decision, entries) {
                 return Some((index, plan));
             }

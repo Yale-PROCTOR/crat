@@ -289,16 +289,13 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
             "{function}: the byte view is a child of the formal's region: {source}"
         );
     }
-    // The read views deliver: two as byte slices, and `copy_be64`'s, whose
-    // index is the loop's `7 - i`, as the cursor family's safe form.
+    // The three read views deliver as exact byte slices — `copy_be64`'s too,
+    // whose index is the loop's `7 - i`: the view is one scalar's storage, so
+    // the cursor family does not take it over a fallback extent (R422-7).
     assert_eq!(
         c.matches("letmutsource:&[u8]=core::slice::from_raw_parts(")
             .count(),
-        2,
-        "{source}"
-    );
-    assert!(
-        c.contains("crate::slice_cursor::SliceCursor::from_raw_parts(psourceas*mutlibc::c_uchar"),
+        3,
         "{source}"
     );
     assert!(
@@ -313,17 +310,9 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
         ),
         "an integer local's address is bridged as its four bytes: {source}"
     );
-    // Nothing this rule builds fabricates an extent. The one fallback in the
-    // file is the CURSOR family's constructor for `copy_be64::source`, which
-    // this fixture's sign analysis sends there (`7 - i` is unknown) and the
-    // corpus decides `slice` at batch 48; it is not a byte-region form.
-    assert_eq!(
-        c.matches("crate::FALLBACK_SLICE_EXTENT").count(),
-        c.matches(
-            "SliceCursor::from_raw_parts(psourceas*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"
-        )
-        .count(),
-        "the byte regions' extents are the scalar's size, never fabricated: {source}"
+    assert!(
+        !source.contains("FALLBACK_SLICE_EXTENT"),
+        "the extent is the scalar's size, never fabricated: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
