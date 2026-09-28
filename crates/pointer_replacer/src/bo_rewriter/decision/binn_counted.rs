@@ -629,7 +629,51 @@ pub(crate) fn width_at_literal(
     if position == index || uses.writes.contains_key(&discriminant) {
         return None;
     }
+    // The arms compare the tag's OWN value: a match over a cast of it
+    // (`match dest_type as u8`) selects by the converted value, which the
+    // literal at the call does not state.
+    struct CastScrutinee {
+        discriminant: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for CastScrutinee {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Match(scrutinee, _, _) = e.kind {
+                let mut bare = scrutinee;
+                while let ExprKind::DropTemps(inner) = bare.kind {
+                    bare = inner;
+                }
+                if local_of(strip_casts(scrutinee)) == Some(self.discriminant)
+                    && local_of(bare) != Some(self.discriminant)
+                {
+                    self.found = true;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut cast = CastScrutinee {
+        discriminant,
+        found: false,
+    };
+    cast.visit_expr(body.value);
+    if cast.found {
+        return None;
+    }
     let literal = literal_of(args.get(position)?)?;
+    // ... and the literal must BE that value: `4294967393i64 as i32` is 97 at
+    // run time, not the number written.
+    let bits = match typeck.node_type(discriminant).kind() {
+        TyKind::Int(t) => t.bit_width().unwrap_or(64) - 1,
+        TyKind::Uint(t) => t.bit_width().unwrap_or(64),
+        _ => return None,
+    };
+    if 1u128
+        .checked_shl(bits as u32)
+        .is_some_and(|bound| literal >= bound)
+    {
+        return None;
+    }
     Some(
         arms.iter()
             .filter(|(literals, _)| literals.contains(&literal))

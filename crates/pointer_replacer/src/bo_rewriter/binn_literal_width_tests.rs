@@ -270,6 +270,34 @@ fn w6b_a_width_the_call_does_not_select_keeps_the_hold() {
                 "97",
             ),
         ),
+        // the tag is matched through a cast: `353` selects arm 97 at run time
+        (
+            "cast-scrutinee",
+            fixture(
+                &edited(
+                    "match dest_type {\n        33 => { *(pdest as *mut i8) = vint64 as i8; }",
+                    "match dest_type as u8 {\n        33 => { *(pdest as *mut i8) = vint64 as i8; }",
+                )
+                .replace(
+                    "97 => { *(pdest as *mut i32) = vint64 as i32; }",
+                    "97 => { *(pdest as *mut i64) = vint64; }",
+                ),
+                "i32",
+                "353",
+            ),
+        ),
+        // the literal wraps: `4294967393i64 as i32` is 97 at run time
+        (
+            "wrapping-literal",
+            fixture(
+                &edited(
+                    "97 => { *(pdest as *mut i32) = vint64 as i32; }",
+                    "97 => { *(pdest as *mut i64) = vint64; }",
+                ),
+                "i32",
+                "4294967393i64 as i32",
+            ),
+        ),
         // the wildcard arm accesses: an access under no literal
         (
             "wildcard-access",
