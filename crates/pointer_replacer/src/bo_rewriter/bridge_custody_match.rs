@@ -2795,6 +2795,40 @@ fn optional_reference_payload(text: &str) -> MatchResult<Option<(bool, String)>>
     )))
 }
 
+/// A pending bridge hands its value to the callee's formal as a raw pointer, so
+/// that formal must be raw in the emitted tree.
+fn pending_target_raw(
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+) -> MatchResult<()> {
+    let parameter = target
+        .parameters
+        .get(index)
+        .ok_or("pending-target-absent")?;
+    if !matches!(pointer_type(&parameter.type_text)?, PointerType::Raw(_)) {
+        return Err("pending-target-is-not-raw".into());
+    }
+    Ok(())
+}
+
+/// R605-2: the pending-target check on one emitted source, for the witness.
+#[cfg(test)]
+pub(crate) fn pending_target_check_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        pending_target_raw(target, index)
+    })
+}
+
 fn pending_selected_argument(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -2803,18 +2837,7 @@ fn pending_selected_argument(
     index: usize,
 ) -> MatchResult<Vec<BindingWitness>> {
     let target = target_owner(input, expected)?;
-    if !matches!(
-        pointer_type(
-            &target
-                .parameters
-                .get(index)
-                .ok_or("pending-target-absent")?
-                .type_text
-        )?,
-        PointerType::Raw(_)
-    ) {
-        return Err("pending-target-is-not-raw".into());
-    }
+    pending_target_raw(target, index)?;
     if expected.pending_source.as_ref().is_some_and(|source| {
         matches!(
             &source.shape,

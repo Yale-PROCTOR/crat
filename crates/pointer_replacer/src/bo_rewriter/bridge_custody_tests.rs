@@ -2848,3 +2848,35 @@ fn r568_1_b_an_element_address_through_the_owner_view_is_the_original_element() 
         "one argument"
     );
 }
+
+/// **R605-2 (main 127) — a formal typed through a raw-pointer `type` item is raw.**
+/// brotli's `BrotliBuildMetaBlockGreedyInternal(.., literal_context_lut: ContextLut,
+/// ..)` with `pub type ContextLut = *const uint8_t;`: batch 47's two pending
+/// sibling-overlap bridges at argument 6 read `pending-target-is-not-raw` and failed
+/// custody (`data=false`), though the formal is raw and the emitted calls were
+/// byte-identical to batch 46's. A non-pointer alias stays not raw (the control).
+#[test]
+fn r605_2_a_pending_target_typed_through_a_raw_alias_is_raw() {
+    use crate::bo_rewriter::bridge_custody_match::pending_target_check_for_test as check;
+    const EMITTED: &str = "mod metablock {
+    pub type ContextLut = *const u8;
+    pub type Count = usize;
+    pub unsafe fn callee(lut: ContextLut, n: Count, written: *const u8) {}
+}
+";
+    assert_eq!(
+        check(EMITTED, "metablock::callee", 0),
+        Ok(()),
+        "the alias of a raw pointer"
+    );
+    assert_eq!(
+        check(EMITTED, "metablock::callee", 1),
+        Err("pending-target-is-not-raw".to_owned()),
+        "a non-pointer alias is not raw"
+    );
+    assert_eq!(
+        check(EMITTED, "metablock::callee", 2),
+        Ok(()),
+        "a written raw pointer"
+    );
+}
