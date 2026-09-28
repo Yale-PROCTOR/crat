@@ -98,6 +98,8 @@ mod ownership_fields_cp2_tests;
 #[cfg(test)]
 mod ownership_fields_native_tests;
 #[cfg(test)]
+mod pair_allocated_here_tests;
+#[cfg(test)]
 mod pair_allocation_identity_tests;
 #[cfg(test)]
 mod pair_conditional_store_tests;

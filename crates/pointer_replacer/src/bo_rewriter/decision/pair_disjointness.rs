@@ -187,7 +187,8 @@ fn root_side(class: RootClass) -> usize {
         RootClass::FreshAlloc(..)
         | RootClass::StackObject(_)
         | RootClass::Static(_)
-        | RootClass::FreshField { .. } => 1,
+        | RootClass::FreshField { .. }
+        | RootClass::AllocatedHere(..) => 1,
         RootClass::Unknown => 2,
     }
 }
@@ -304,6 +305,14 @@ enum RootClass {
         /// block may be another admitted field's.
         via_offset: bool,
     },
+    /// R641-9 (the fold): a pointer local — not a parameter, its own address
+    /// never taken — whose every assignment is null, an allocator result, or a
+    /// derivation of a binding that is fresh or already such a local (a least
+    /// fixpoint). Every block it holds was allocated during this activation,
+    /// after its entry. It names no ONE object: after `pairs = new_array` two
+    /// locals are one block, so it separates only from storage no such block
+    /// can be.
+    AllocatedHere(HirId, Freshness),
     Unknown,
 }
 
@@ -320,7 +329,7 @@ impl RootClass {
     /// The contract receipt this root carries, if its freshness rests on one.
     fn freshness(self) -> Freshness {
         match self {
-            Self::FreshAlloc(_, freshness) => freshness,
+            Self::FreshAlloc(_, freshness) | Self::AllocatedHere(_, freshness) => freshness,
             _ => Freshness::Proven,
         }
     }
@@ -332,7 +341,9 @@ impl RootClass {
     fn object_id(self) -> Option<HirId> {
         match self {
             Self::FreshAlloc(id, _) | Self::StackObject(id) | Self::EntryStorage(id) => Some(id),
-            Self::FreshField { .. } | Self::Static(_) | Self::Unknown => None,
+            Self::FreshField { .. } | Self::Static(_) | Self::AllocatedHere(..) | Self::Unknown => {
+                None
+            }
         }
     }
 }
@@ -1343,7 +1354,8 @@ impl PairDisjointnessIndex {
                     RootClass::Static(other) if other != statik => {}
                     RootClass::StackObject(_)
                     | RootClass::FreshAlloc(..)
-                    | RootClass::FreshField { .. } => {}
+                    | RootClass::FreshField { .. }
+                    | RootClass::AllocatedHere(..) => {}
                     RootClass::EntryStorage(_) => {
                         let Some(up) = self.formal_of(*caller, arg.class) else {
                             ok = false;
@@ -1508,6 +1520,19 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         }
         _ => {}
     }
+    // R641-9: a local that only ever holds blocks allocated during this
+    // activation. An entry object existed at the activation's entry and an
+    // allocator never returns storage overlapping a live object; a stack object
+    // or a static is no block an allocator returns — rule (f)'s argument, so its
+    // receipt. Beside another fresh local, or another such local, it may be the
+    // same block.
+    match (a, b) {
+        (RootClass::AllocatedHere(..), other) | (other, RootClass::AllocatedHere(..)) => {
+            return predates_or_is_not_a_block(other)
+                .then_some(CertificateKind::AllocationIdentity);
+        }
+        _ => {}
+    }
     // R482-4(4). A static is a named global: distinct from another static,
     // from this frame's stack and from a block allocated inside this body. A
     // parameter's pointee may BE the static, so that pair is refused.
@@ -1526,6 +1551,8 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                 | RootClass::FreshField { .. }
                 | RootClass::Static(_)
                 | RootClass::Unknown => None,
+                // Answered by R641-9's arm above.
+                RootClass::AllocatedHere(..) => None,
             };
         }
         _ => {}
@@ -1538,7 +1565,10 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
         return None;
     };
     match other {
-        RootClass::Unknown | RootClass::FreshField { .. } | RootClass::Static(_) => None,
+        RootClass::Unknown
+        | RootClass::FreshField { .. }
+        | RootClass::Static(_)
+        | RootClass::AllocatedHere(..) => None,
         RootClass::FreshAlloc(..) | RootClass::StackObject(_) | RootClass::EntryStorage(_) => {
             (fresh.object_id() != other.object_id()).then(|| {
                 match fresh.freshness().join(other.freshness()) {
@@ -1948,6 +1978,10 @@ impl PairDisjointnessIndex {
                 RootClass::FreshAlloc(_, Freshness::Contract) => "fresh-contract".to_owned(),
                 RootClass::StackObject(_) => "stack".to_owned(),
                 RootClass::EntryStorage(_) => "entry".to_owned(),
+                RootClass::AllocatedHere(_, Freshness::Proven) => "allocated-here".to_owned(),
+                RootClass::AllocatedHere(_, Freshness::Contract) => {
+                    "allocated-here-contract".to_owned()
+                }
                 RootClass::FreshField {
                     field, freshness, ..
                 } => match freshness {
@@ -3272,6 +3306,55 @@ fn classify_locals<'tcx>(
             break;
         }
     }
+    // R641-9 (the fold), after R460-8's single derivation: a pointer local still
+    // `Unknown` — not a parameter, its own address never taken — whose every
+    // assignment is null, an allocator result, or a derivation of a binding
+    // that is fresh or already such a local holds only blocks allocated during
+    // this activation. A least fixpoint: a cycle of derivations with no
+    // allocation under it stays `Unknown`, and so does a local that is only
+    // ever null.
+    for _ in 0..8 {
+        let mut changed = false;
+        for (&hir_id, fact) in &facts {
+            if !fact.is_pointer
+                || fact.is_param
+                || fact.address_taken
+                || classes.get(&hir_id).copied() != Some(RootClass::Unknown)
+            {
+                continue;
+            }
+            let mut freshness: Option<Freshness> = None;
+            let mut allocated = true;
+            for kind in &fact.assignments {
+                let source = match kind {
+                    AssignKind::Null => continue,
+                    AssignKind::Derived(base) if *base == hir_id => continue,
+                    AssignKind::Allocator(source) => *source,
+                    AssignKind::Derived(base) => match classes.get(base).copied() {
+                        Some(
+                            RootClass::FreshAlloc(_, source) | RootClass::AllocatedHere(_, source),
+                        ) => source,
+                        _ => {
+                            allocated = false;
+                            break;
+                        }
+                    },
+                    AssignKind::Other => {
+                        allocated = false;
+                        break;
+                    }
+                };
+                freshness = Some(freshness.map_or(source, |acc| acc.join(source)));
+            }
+            if allocated && let Some(freshness) = freshness {
+                classes.insert(hir_id, RootClass::AllocatedHere(hir_id, freshness));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     // R478-5: the reason is read AFTER the fixpoint, so a binding the fixpoint
     // rescued reads `Known` and only the residue is attributed.
     let why = facts
@@ -3901,6 +3984,7 @@ fn describe_class(class: RootClass) -> &'static str {
         RootClass::EntryStorage(_) => "entry-but-not-a-formal",
         RootClass::FreshField { .. } => "fresh-field",
         RootClass::Static(_) => "static",
+        RootClass::AllocatedHere(..) => "allocated-here",
         RootClass::Unknown => "unknown",
     }
 }
