@@ -685,6 +685,74 @@ fn size_of_type_argument<'tcx>(
     args.types().next()
 }
 
+/// **wave-6l (R608-1, STOP 3): the count's VALUE, in bytes, where it is a
+/// compile-time constant** — integer literals, `size_of::<T>()` (its layout
+/// size) and their products (`*`, `wrapping_mul`). heman's `kmVec4Assign`
+/// copies `size_of::<c_float>() * 4` bytes of a `kmVec4`, four `f32`s: the
+/// spelling names another type, the value is the pointee's own size, so the
+/// claim is exactly one element.
+///
+/// **Every node's value must fit that node's own type**, casts included: a
+/// narrowing or sign-changing cast (`255u16 as i8 as u16`) and a wrapping
+/// product both CHANGE the value, and a value this walk cannot state exactly
+/// answers `None` — a wrong constant would release the thin-extent hold.
+fn constant_byte_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: rustc_hir::def_id::LocalDefId,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &Expr<'_>,
+) -> Option<u64> {
+    let value = match expr.kind {
+        ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => {
+            constant_byte_count(tcx, owner, typeck, inner)?
+        }
+        ExprKind::Lit(literal) => match literal.node {
+            rustc_ast::LitKind::Int(value, _) => u64::try_from(value.get()).ok()?,
+            _ => return None,
+        },
+        ExprKind::Call(..) => {
+            let ty = size_of_type_argument(tcx, typeck, expr)?;
+            type_size(tcx, owner, ty)?
+        }
+        ExprKind::Binary(op, left, right) if op.node == rustc_hir::BinOpKind::Mul => {
+            constant_byte_count(tcx, owner, typeck, left)?
+                .checked_mul(constant_byte_count(tcx, owner, typeck, right)?)?
+        }
+        ExprKind::MethodCall(segment, receiver, [argument], _)
+            if segment.ident.name.as_str() == "wrapping_mul" =>
+        {
+            constant_byte_count(tcx, owner, typeck, receiver)?
+                .checked_mul(constant_byte_count(tcx, owner, typeck, argument)?)?
+        }
+        _ => return None,
+    };
+    let max = match typeck.expr_ty(expr).kind() {
+        rustc_middle::ty::TyKind::Uint(kind) => match kind.bit_width() {
+            Some(bits) => u64::MAX >> (64 - bits.min(64)),
+            None => u64::MAX >> (64 - tcx.data_layout.pointer_size.bits().min(64)),
+        },
+        rustc_middle::ty::TyKind::Int(kind) => match kind.bit_width() {
+            Some(bits) => u64::MAX >> (65 - bits.min(64)),
+            None => u64::MAX >> (65 - tcx.data_layout.pointer_size.bits().min(64)),
+        },
+        _ => return None,
+    };
+    (value <= max).then_some(value)
+}
+
+/// A sized type's layout size in bytes; `None` for anything without one.
+fn type_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: rustc_hir::def_id::LocalDefId,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Option<u64> {
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner);
+    tcx.layout_of(typing_env.as_query_input(ty))
+        .ok()
+        .filter(|layout| layout.is_sized())
+        .map(|layout| layout.size.bytes())
+}
+
 fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
     let peeled = peel_casts(expr);
     let ExprKind::AddrOf(_, Mutability::Mut, storage) = peeled.kind else {
@@ -1389,6 +1457,22 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                         rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
                                             size_of_type_argument(self.tcx, typeck, count)
                                                 == Some(*pointee)
+                                                // wave-6l (R608-1, STOP 3): the
+                                                // count's value, not its
+                                                // spelling, is the claim — at a
+                                                // BYTE count only.
+                                                || contract.extent
+                                                    == super::raw_boundary_contracts::ArgumentExtent::ByteCount
+                                                    && type_size(self.tcx, self.fn_did, *pointee)
+                                                    .filter(|size| *size > 0)
+                                                    .is_some_and(|size| {
+                                                        constant_byte_count(
+                                                            self.tcx,
+                                                            self.fn_did,
+                                                            typeck,
+                                                            count,
+                                                        ) == Some(size)
+                                                    })
                                         }
                                         _ => false,
                                     };
@@ -2923,6 +3007,20 @@ fn collect_slice_uses_with_family(
                         span: admitted.value_span,
                         replacement: admitted.value,
                         bridge_kind: "sized-assignment",
+                    }));
+                }
+                // wave-6l (R608-1): every assignment stores a string literal,
+                // so each builds its own evidence-backed slice.
+                if let Some((span, replacement)) = super::sized_assignment::admit_literal(
+                    self.tcx,
+                    use_expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                ) {
+                    return Some(Some(UseEdit {
+                        span,
+                        replacement,
+                        bridge_kind: "literal-assignment",
                     }));
                 }
                 if !self.advance_ok.contains(&key) {

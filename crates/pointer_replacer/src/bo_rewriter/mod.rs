@@ -183,6 +183,8 @@ mod wave6l_local_box_exemption_tests;
 #[cfg(test)]
 mod wave6l_nested_composition_tests;
 #[cfg(test)]
+mod wave6l_nul_contract_tests;
+#[cfg(test)]
 mod wave6l_return_origin_tests;
 #[cfg(test)]
 mod wave6o_callee_frame_bounded_tests;

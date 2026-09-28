@@ -319,6 +319,17 @@ pub(crate) struct SliceConstructionPlan {
     pub(crate) unsafe_context: UnsafeContextPresentation,
 }
 
+/// wave-6l (R608-1): the byte length, NUL included, of a single
+/// NUL-terminated byte-string literal under its casts — the arm test
+/// [`Construction::StringLiteral`] applies, for one literal.
+pub(crate) fn string_literal_bytes(expr: &rustc_hir::Expr<'_>) -> Option<usize> {
+    let mut arms = Vec::new();
+    (matches!(Collector::peel(expr).kind, rustc_hir::ExprKind::Lit(_))
+        && Collector::literal_arms(expr, &mut arms))
+    .then(|| arms.first().map(|arm| arm.bytes))
+    .flatten()
+}
+
 pub(crate) fn slice_constructor_available(
     facts: &ConstructionFacts,
     node: (LocalDefId, HirId),

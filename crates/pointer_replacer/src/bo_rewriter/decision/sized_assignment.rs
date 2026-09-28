@@ -214,6 +214,60 @@ pub(crate) fn admit(
     })
 }
 
+/// **wave-6l (R608-1) — a literal assignment is its own construction.**
+///
+/// libzahl's `zrand::pathname`: `let mut pathname = 0 as *const c_char;` and
+/// then, per `match` arm, `pathname = b"/dev/urandom\0" as *const u8 as
+/// *const c_char;`. The binding only ever holds a string literal or the null
+/// it was declared with, so under the slice form each assignment builds
+/// `&[c_char]` of THAT literal's own byte length — an evidence-backed extent,
+/// the literal being its own evidence — and the declaration's null is the
+/// empty slice (R517-10). Admitted when the declaration is the null
+/// initializer and EVERY assignment to the binding stores such a literal; a
+/// literal is read-only, so a mutable subject is never admitted.
+///
+/// Returns the right-hand side's span and the construction replacing it.
+pub(crate) fn admit_literal(
+    tcx: TyCtxt<'_>,
+    use_expr: &Expr<'_>,
+    key: (LocalDefId, HirId),
+    mutable: bool,
+) -> Option<(rustc_span::Span, String)> {
+    if mutable {
+        return None;
+    }
+    let rustc_hir::Node::Expr(assign) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return None;
+    };
+    let ExprKind::Assign(lhs, rhs, _) = assign.kind else {
+        return None;
+    };
+    if lhs.hir_id != use_expr.hir_id || !declared_null(tcx, key.1) {
+        return None;
+    }
+    let all = assignments(tcx, key.0, key.1);
+    if all.is_empty()
+        || !all
+            .iter()
+            .all(|(_, value)| super::construction::string_literal_bytes(value).is_some())
+    {
+        return None;
+    }
+    let bytes = super::construction::string_literal_bytes(rhs)?;
+    let pointer = tcx.sess.source_map().span_to_snippet(rhs.span).ok()?;
+    let unsafe_fn = tcx
+        .hir_node_by_def_id(key.0)
+        .fn_sig()
+        .is_some_and(|sig| sig.header.is_unsafe());
+    Some((
+        rhs.span,
+        crate::bo_rewriter::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts({pointer}, {bytes}usize)"),
+            unsafe_fn,
+        ),
+    ))
+}
+
 /// The slice this assignment builds: the field's own pointer, the sibling's
 /// count, in the constructor the subject's mutability asks for.
 ///

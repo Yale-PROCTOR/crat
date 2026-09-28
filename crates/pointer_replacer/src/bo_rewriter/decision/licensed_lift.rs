@@ -86,6 +86,10 @@ pub(crate) struct LiftReceipt {
     /// local callee" are answered by completely different builds. The reason
     /// alone cannot choose between them.
     pub(crate) use_shape: Option<&'static str>,
+    /// **wave-6l (R608-1): the lift took the NULLABLE slice form**
+    /// (`Option<&[T]>`), because the program null-tests the subject and the
+    /// plain slice has no image for that test.
+    pub(crate) nullable: bool,
 }
 
 /// **Which arm refused, and why.**
@@ -146,6 +150,10 @@ impl LiftReceipt {
         }
         match self.width_bytes {
             Some(width) => format!("evidence(licensed-width:{}:{index}:{width})", self.callee),
+            // wave-6l (R608-1): every value the binding ever holds is a string
+            // literal of its own length (the declaration's null is `&[]`), so
+            // no extent is fabricated anywhere.
+            None if !self.fallback => format!("evidence(literal-bytes:{}:{index})", self.callee),
             None => format!("fallback(extent-lift@addendum-77:{}:{index})", self.callee),
         }
     }
@@ -272,6 +280,31 @@ pub(crate) fn slice_rewrites(
         .unwrap_or_default()
 }
 
+/// **wave-6l (R608-1): the nullable twin of [`slice_uses_supported`].** The
+/// program null-tests the subject — a raw-only `is_null`, every other raw-only
+/// use slice arithmetic — and the Option walker has an image for every use,
+/// so `Option<&[T]>` is well typed where the plain slice is not (the test
+/// itself is the use the plain slice cannot render). A local needs its
+/// initializer's constructor, exactly as the ladder's own Opt arm asks.
+fn nullable_slice_supported(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let node = (subject.fn_did, subject.hir_id);
+    ctx.facts.raw_only_uses.get(&node).is_some_and(|uses| {
+        uses.iter().any(|(op, _)| op == "is_null")
+            && uses.iter().all(|(op, _)| {
+                op == "is_null" || super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+            })
+    }) && ctx
+        .opt_uses
+        .get(&node)
+        .is_some_and(|uses| uses.unsupported.is_none())
+        && match subject.kind {
+            SubjectKind::Param { .. } => true,
+            SubjectKind::Local => {
+                super::construction::slice_constructor_available(ctx.constructions, node)
+            }
+        }
+}
+
 /// The shape of the use that has no slice image, when there is one — the
 /// column that separates "an assignment target" from "an argument at a local
 /// callee", which are answered by different builds entirely.
@@ -308,6 +341,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
                 fallback: false,
                 declined: Some(Refusal::Unlicensed(why)),
                 use_shape: unsupported_use_shape(ctx, (subject.fn_did, subject.hir_id)),
+                nullable: false,
             });
         };
         // **The width question is asked FIRST, whatever happens next** (report
@@ -392,6 +426,7 @@ pub(crate) fn promote(ctx: &Ctx<'_, '_>, entries: &mut [(Subject, Decision)]) ->
             fallback: false,
             declined: None,
             use_shape: None,
+            nullable: false,
         });
     }
     receipts.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -416,7 +451,12 @@ pub(crate) fn receipts_tsv(receipts: &[LiftReceipt]) -> String {
                     .map_or_else(|| "-".to_owned(), |index| index.to_string()),
                 lift.width_bytes
                     .map_or_else(|| "-".to_owned(), |width| width.to_string()),
-                if lift.mutable { "mut-slice" } else { "slice" },
+                match (lift.nullable, lift.mutable) {
+                    (false, true) => "mut-slice",
+                    (false, false) => "slice",
+                    (true, true) => "opt-mut-slice",
+                    (true, false) => "opt-slice",
+                },
                 match (lift.declined, lift.fallback) {
                     (Some(refusal), _) => refusal.class(),
                     (None, true) => "fallback",
@@ -560,9 +600,10 @@ pub(crate) fn promote_fallback(
                 fallback: false,
                 declined: Some(Refusal::Declined(why)),
                 use_shape: unsupported_use_shape(ctx, (subject.fn_did, subject.hir_id)),
+                nullable: false,
             });
         };
-    let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>)> = entries
+    let candidates: FxHashMap<(LocalDefId, HirId), (String, Option<usize>, bool)> = entries
         .iter()
         .filter_map(|(subject, decision)| {
             let named = match decision {
@@ -613,7 +654,13 @@ pub(crate) fn promote_fallback(
             // delivered in a form carrying an extent", and the `Degraded` filter
             // above is exactly that test.
             let node = (subject.fn_did, subject.hir_id);
-            if !slice_uses_supported(ctx, node) {
+            // R608-1 is a ruling about NUL-contract positions: the nullable
+            // twin is taken for thin-extent rows only, never for a
+            // local-callee access row.
+            let nullable = named.0 == "thin-extent"
+                && !slice_uses_supported(ctx, node)
+                && nullable_slice_supported(ctx, subject);
+            if !slice_uses_supported(ctx, node) && !nullable {
                 decline(subject, named.0.clone(), named.1, "slice-use-unsupported");
                 return None;
             }
@@ -640,19 +687,43 @@ pub(crate) fn promote_fallback(
                 decline(subject, named.0.clone(), named.1, "one-place-root");
                 return None;
             }
-            Some((node, named))
+            Some((node, (named.0, named.1, nullable)))
         })
         .collect();
     let mut receipts = Vec::new();
     for (subject, decision) in entries.iter_mut() {
-        let Some((callee, parameter_index)) = candidates.get(&(subject.fn_did, subject.hir_id))
+        let Some((callee, parameter_index, nullable)) =
+            candidates.get(&(subject.fn_did, subject.hir_id))
         else {
             continue;
         };
-        *decision = Decision::Slice {
-            mutable: subject.mutable,
-            uses: slice_rewrites(ctx, (subject.fn_did, subject.hir_id)),
+        *decision = if *nullable {
+            Decision::Opt {
+                mutable: subject.mutable,
+                slice: true,
+                uses: super::wave5r::optional_uses(
+                    ctx.tcx,
+                    subject,
+                    true,
+                    ctx.opt_uses
+                        .get(&(subject.fn_did, subject.hir_id))
+                        .map(|uses| uses.rewrites.clone())
+                        .unwrap_or_default(),
+                ),
+            }
+        } else {
+            Decision::Slice {
+                mutable: subject.mutable,
+                uses: slice_rewrites(ctx, (subject.fn_did, subject.hir_id)),
+            }
         };
+        // wave-6l (R608-1): a literal-only binding lifts on its literals' own
+        // lengths — the `literal-assignment` edits carry them and the null
+        // declaration renders `&[]` — so its row is evidence, not the waiver.
+        let literal_evidence = !*nullable
+            && slice_rewrites(ctx, (subject.fn_did, subject.hir_id))
+                .iter()
+                .any(|edit| edit.bridge_kind == "literal-assignment");
         receipts.push(LiftReceipt {
             subject: subject.label.clone(),
             subject_key: subject_key(ctx, subject),
@@ -660,9 +731,10 @@ pub(crate) fn promote_fallback(
             parameter_index: *parameter_index,
             width_bytes: None,
             mutable: subject.mutable,
-            fallback: true,
+            fallback: !literal_evidence,
             declined: None,
             use_shape: None,
+            nullable: *nullable,
         });
     }
     drop(decline);

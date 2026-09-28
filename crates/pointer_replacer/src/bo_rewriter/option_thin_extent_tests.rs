@@ -41,6 +41,11 @@ fn held_thin(input: &str, function: &str, binding: &str, reason: &str) {
 /// rgba::rgba_from_rgb_string — a nullable `*const c_char` handed to
 /// `strstr`, which reads to the NUL: the R272-1 shape, previously bridged
 /// from `Option<&i8>` (report 004 claim 9).
+///
+/// **Re-pinned by R608-1 (wave-6l 054).** The seat ruled a NUL-contract
+/// foreign use ARRAY evidence: the held row is now lifted to the optional
+/// SLICE under §77's receipted fallback. The claim that survives is this
+/// witness's own — no ONE-element view reaches the NUL position.
 #[test]
 fn wave6o_thin_optional_at_a_nul_foreign_position_holds() {
     let input = r#"
@@ -53,7 +58,19 @@ unsafe fn rgba_from_rgb_string(str: *const i8) -> i32 {
     return *str as i32;
 }
 "#;
-    held_thin(input, "rgba_from_rgb_string", "str", "held:thin-extent");
+    assert!(verify::type_checks_str(input));
+    let (decision, _) = decision_and_reason(input, "rgba_from_rgb_string", "str");
+    assert!(
+        matches!(decision, Decision::Opt { slice: true, .. }),
+        "the NUL position lifts the thin optional to the optional slice: {decision:?}"
+    );
+    let output = ast_emitted_source_of(input).expect("lifted emission");
+    assert!(output.contains("str: Option<&[i8]>"), "{output}");
+    assert!(
+        !output.contains("str: Option<&i8>"),
+        "no one-element view may reach the position: {output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
 }
 
 /// A nullable thin pointer handed to a LOCAL callee whose `c_void` parameter
