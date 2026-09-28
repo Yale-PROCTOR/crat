@@ -359,6 +359,9 @@ pub(crate) const DEALLOC_TRANSFER_CONTRACT: &str = "owned-field-dealloc-transfer
 /// R579-4 C2: a certified callee's result stored into an owned field through
 /// a safe base — the owner moved in, no `from_raw` bridge (R583-7 counts it).
 pub(crate) const CERTIFIED_MOVE: &str = "owned-field-store-certified-move";
+/// R641-7 D4 (a): the hold of an owned store whose raw value is not traced to
+/// an allocation (the reclaim arm would `Box::from_raw` it).
+const NOT_AN_ALLOCATION: &str = "field-transaction-incomplete:owned-store-source-not-an-allocation";
 /// R622-3 (Extension X §5.2): a safe-base store over an owned RECURSIVE
 /// value with no depth-0 witness — ownership-fields' `StoreClose::Leak`,
 /// `::std::mem::forget(::std::mem::replace(&mut PLACE, VALUE))`: the old
@@ -852,6 +855,29 @@ fn struct_of(ty: Ty<'_>) -> Option<LocalDefId> {
             TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => ty = *inner,
             _ => return adt_local(ty),
         }
+    }
+}
+
+/// The program ADTs a field of type `ty` holds BY VALUE: the type itself,
+/// through arrays, tuples and a foreign ADT's type arguments (`Option<S>`
+/// is not `Copy` either) — never behind a pointer or reference, and never in
+/// `ManuallyDrop`, which is how a union may hold a non-`Copy` value.
+fn held_by_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<LocalDefId> {
+    match ty.kind() {
+        TyKind::Adt(def, args) => match def.did().as_local() {
+            Some(did) => vec![did],
+            None if tcx.def_path_str(def.did()).ends_with("ManuallyDrop") => Vec::new(),
+            None => args
+                .types()
+                .flat_map(|inner| held_by_value(tcx, inner))
+                .collect(),
+        },
+        TyKind::Array(inner, _) | TyKind::Slice(inner) => held_by_value(tcx, *inner),
+        TyKind::Tuple(items) => items
+            .iter()
+            .flat_map(|inner| held_by_value(tcx, inner))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1856,11 +1882,23 @@ pub(crate) fn derive(
     // 3. Type mentions: signatures, other struct fields, statics, impls.
     let mut impls_of: FxHashMap<LocalDefId, Vec<LocalDefId>> = FxHashMap::default();
     let mut container_holds: FxHashMap<LocalDefId, String> = FxHashMap::default();
+    // R641-7 D4 (b): the program ADTs with a `Copy` / `Clone` impl, and which
+    // ADT holds which BY VALUE (`(container, container is a union)`).
+    let mut copy_like: FxHashSet<LocalDefId> = FxHashSet::default();
+    let mut held_by_value_in: FxHashMap<LocalDefId, Vec<(LocalDefId, bool)>> = FxHashMap::default();
     for item_id in tcx.hir_crate_items(()).free_items() {
         let item = tcx.hir_item(item_id);
         match item.kind {
             rustc_hir::ItemKind::Impl(im) => {
                 let self_ty = tcx.type_of(item.owner_id.def_id).skip_binder();
+                if let Some(trait_ref) = im.of_trait
+                    && let Some(trait_did) = trait_ref.trait_def_id()
+                    && (tcx.lang_items().copy_trait() == Some(trait_did)
+                        || tcx.lang_items().clone_trait() == Some(trait_did))
+                    && let Some(did) = adt_local(self_ty)
+                {
+                    copy_like.insert(did);
+                }
                 if let Some(did) = adt_local(self_ty)
                     && struct_dids.contains(&did)
                 {
@@ -1878,6 +1916,12 @@ pub(crate) fn derive(
                 if let TyKind::Adt(adt, substs) = ty.kind() {
                     for field_def in adt.all_fields() {
                         let field_ty = field_def.ty(tcx, substs);
+                        for held in held_by_value(tcx, field_ty) {
+                            held_by_value_in
+                                .entry(held)
+                                .or_default()
+                                .push((did, adt.is_union()));
+                        }
                         for target in &struct_dids {
                             if *target != did && mentions_struct(field_ty, *target) {
                                 container_holds.entry(*target).or_insert_with(|| {
@@ -1934,6 +1978,27 @@ pub(crate) fn derive(
         }
     }
 
+    // R641-7 D4 (b): an owned field's struct may not sit BY VALUE in a union
+    // (E0740: a union field must be `Copy` or `ManuallyDrop`) nor under a
+    // `Copy` / `Clone` container (E0204: the derived pair cannot hold a
+    // `Box`), at any depth of by-value containment.
+    let in_copy_or_union = |target: LocalDefId| -> bool {
+        let mut seen: FxHashSet<LocalDefId> = FxHashSet::default();
+        let mut work = vec![target];
+        while let Some(held) = work.pop() {
+            if !seen.insert(held) {
+                continue;
+            }
+            for &(container, union) in held_by_value_in.get(&held).into_iter().flatten() {
+                if union || copy_like.contains(&container) {
+                    return true;
+                }
+                work.push(container);
+            }
+        }
+        false
+    };
+
     // 4. Assemble candidates, in declaration order. Every converting
     // reference field of a struct shares the struct's ONE generated lifetime
     // (E lifted the one-field-per-struct hold: brotli's `BlockEncoder`
@@ -1968,6 +2033,11 @@ pub(crate) fn derive(
                 && !hold.ends_with("nested-container")
             {
                 cause = Some(hold.clone());
+            }
+            // ... unless the container holds it by value where a `Box`
+            // cannot live (D4 (b)).
+            if cause.is_none() && in_copy_or_union(key.struct_did) {
+                cause = Some("field-transaction-incomplete:owned-in-by-value-container".to_owned());
             }
         }
         // An owned field walked by element / offset is `Option<Box<[T]>>`
@@ -3574,6 +3644,14 @@ pub(crate) fn finalize(
         .filter(|candidate| candidate.owning)
         .map(|candidate| (candidate.key.struct_did, candidate.key.field_index))
         .collect();
+    // R641-7 D4 (a): every owned candidate's sites, for the reclaim guard's
+    // field obligations.
+    let owned_candidate_sites: FxHashMap<FieldKey, &[Site]> = candidates
+        .candidates
+        .values()
+        .filter(|candidate| candidate.owning)
+        .map(|candidate| (candidate.key, candidate.sites.as_slice()))
+        .collect();
     for candidate in candidates.candidates.values() {
         let mut cause: Option<String> = None;
         let mut edits = Vec::new();
@@ -3601,6 +3679,7 @@ pub(crate) fn finalize(
                 &mut argument_forms,
                 &owning_fields,
                 &mut recursive_closes,
+                &owned_candidate_sites,
             );
         }
         for site in candidate.sites.iter().filter(|_| !candidate.owning) {
@@ -4036,6 +4115,7 @@ fn owned_sites<'t>(
     argument_forms: &mut Vec<(Span, Form)>,
     owning_fields: &[(LocalDefId, usize)],
     recursive_closes: &mut Vec<(LocalDefId, &'static str, bool)>,
+    owned_candidate_sites: &FxHashMap<FieldKey, &[Site]>,
 ) {
     let null_mut = "core::ptr::null_mut()";
     let null_const = "core::ptr::null()";
@@ -4162,6 +4242,13 @@ fn owned_sites<'t>(
             )),
         }
     };
+    // R641-7 D4 (a): a raw value the field reclaims must be traced to an
+    // allocation; otherwise the transaction holds typed.
+    let reclaimable = |site: &Site| -> bool {
+        expr_with_span(tcx, site.owner, site.span).is_some_and(|value| {
+            allocation_rooted(tcx, table, owned_candidate_sites, site.owner, value)
+        })
+    };
     // R622-3: the safe-base stores (edit index, site), closed after the loop,
     // once every move-out of the field is planned.
     let mut safe_stores: Vec<(usize, &Site)> = Vec::new();
@@ -4212,7 +4299,13 @@ fn owned_sites<'t>(
                             });
                             continue;
                         }
-                        Some(Decision::Degraded(_)) | None => from_raw(),
+                        Some(Decision::Degraded(_)) | None => {
+                            if !reclaimable(site) {
+                                cause.get_or_insert_with(|| NOT_AN_ALLOCATION.to_owned());
+                                continue;
+                            }
+                            from_raw()
+                        }
                         Some(other) => {
                             cause.get_or_insert_with(|| {
                                 format!(
@@ -4238,7 +4331,13 @@ fn owned_sites<'t>(
                         });
                         continue;
                     }
-                    Some(Rhs::RawExpression) => from_raw(),
+                    Some(Rhs::RawExpression) => {
+                        if !reclaimable(site) {
+                            cause.get_or_insert_with(|| NOT_AN_ALLOCATION.to_owned());
+                            continue;
+                        }
+                        from_raw()
+                    }
                     // **R579-4 C2** — a certified callee's result IS an owner
                     // of the certificate's shape: moved in as `Subject(Box)`'s
                     // is, `inner` from an optional output, `Some(inner)` from
@@ -4265,7 +4364,13 @@ fn owned_sites<'t>(
                                 });
                                 continue;
                             }
-                            None => from_raw(),
+                            None => {
+                                if !reclaimable(site) {
+                                    cause.get_or_insert_with(|| NOT_AN_ALLOCATION.to_owned());
+                                    continue;
+                                }
+                                from_raw()
+                            }
                         }
                     }
                     None => {
@@ -4513,6 +4618,369 @@ fn owned_sites<'t>(
             };
         }
     }
+}
+
+/// **R641-7 D4 (a) — the reclaim arm takes only an allocation.** A raw value
+/// an owned field reclaims (`NonNull::new(v).map(Box::from_raw)`) must be
+/// traced to an allocation:
+/// - null;
+/// - a pinned allocator's result (the contract table, libc's row included;
+///   `realloc` is absent: it releases one generation and makes another);
+/// - a certified callee's owner, or a local callee whose every return is one
+///   of these;
+/// - a local whose every definition is one, never address-taken;
+/// - a formal whose every call site in the program passes one (a function
+///   never called stops it; one used other than as a callee stops it when
+///   something can call it indirectly: a call through a fn pointer of its
+///   arity, or a foreign function taking a fn pointer);
+/// - a load of an owned field every store into which is one.
+///
+/// Obligations close coinductively over the visited set (a value only ever
+/// comes from finitely many steps back to a leaf), within a fixed budget. A
+/// place address (`&mut (*o).f`), a load of any other field, pointer
+/// arithmetic or anything else stops it: brotli's `H35.common` is fed
+/// `&mut (*hasher).common` (report 089).
+fn allocation_rooted<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    table: &DecisionTable,
+    owned_sites: &FxHashMap<FieldKey, &[Site]>,
+    owner: LocalDefId,
+    value: &'tcx Expr<'tcx>,
+) -> bool {
+    enum Need<'tcx> {
+        Value(LocalDefId, &'tcx Expr<'tcx>),
+        Formal(LocalDefId, usize),
+        Local(LocalDefId, HirId),
+        Returns(LocalDefId),
+        Field(FieldKey),
+    }
+    #[derive(PartialEq, Eq, Hash)]
+    enum Seen {
+        Formal(LocalDefId, usize),
+        Local(LocalDefId, HirId),
+        Returns(LocalDefId),
+        Field(FieldKey),
+    }
+    const BUDGET: usize = 1024;
+    let allocator = |did: rustc_hir::def_id::DefId| {
+        let name = tcx.item_name(did);
+        super::allocator_contract::CONTRACTS
+            .iter()
+            .any(|contract| contract.allocators.iter().any(|a| a.name == name.as_str()))
+    };
+    let mut seen: FxHashSet<Seen> = FxHashSet::default();
+    let mut work = vec![Need::Value(owner, value)];
+    let mut steps = 0usize;
+    while let Some(need) = work.pop() {
+        steps += 1;
+        if steps > BUDGET {
+            return false;
+        }
+        match need {
+            Need::Value(f, e) => {
+                if super::emitability::is_zero_literal(e) {
+                    continue;
+                }
+                let mut e = e;
+                while let ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) = e.kind {
+                    e = inner;
+                }
+                match e.kind {
+                    ExprKind::Call(callee, _) => {
+                        let ExprKind::Path(qpath) = &callee.kind else { return false };
+                        let Res::Def(rustc_hir::def::DefKind::Fn, did) =
+                            tcx.typeck(f).qpath_res(qpath, callee.hir_id)
+                        else {
+                            return false;
+                        };
+                        if allocator(did) {
+                            continue;
+                        }
+                        let Some(local) = did.as_local() else { return false };
+                        if tcx.hir_maybe_body_owned_by(local).is_none() {
+                            return false;
+                        }
+                        if table.return_certificates.callees.contains_key(&local) {
+                            continue;
+                        }
+                        if seen.insert(Seen::Returns(local)) {
+                            work.push(Need::Returns(local));
+                        }
+                    }
+                    ExprKind::Path(QPath::Resolved(_, path)) => {
+                        let Res::Local(binding) = path.res else { return false };
+                        let params = tcx.hir_body_owned_by(f).params;
+                        match params.iter().position(|p| p.pat.hir_id == binding) {
+                            Some(index) => {
+                                if seen.insert(Seen::Formal(f, index)) {
+                                    work.push(Need::Formal(f, index));
+                                }
+                            }
+                            None => {
+                                if seen.insert(Seen::Local(f, binding)) {
+                                    work.push(Need::Local(f, binding));
+                                }
+                            }
+                        }
+                    }
+                    ExprKind::Field(base, ident) => {
+                        let Some(struct_did) = adt_local(tcx.typeck(f).expr_ty(base)) else {
+                            return false;
+                        };
+                        let Some(field_index) = tcx
+                            .adt_def(struct_did)
+                            .non_enum_variant()
+                            .fields
+                            .iter()
+                            .position(|field| field.name == ident.name)
+                        else {
+                            return false;
+                        };
+                        let key = FieldKey {
+                            struct_did,
+                            field_index,
+                        };
+                        if !owned_sites.contains_key(&key) {
+                            return false;
+                        }
+                        if seen.insert(Seen::Field(key)) {
+                            work.push(Need::Field(key));
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            Need::Formal(callee, index) => {
+                let mut calls = CallsOf {
+                    tcx,
+                    owner: callee,
+                    callee,
+                    index,
+                    arity: tcx
+                        .fn_sig(callee)
+                        .skip_binder()
+                        .inputs()
+                        .skip_binder()
+                        .len(),
+                    args: Vec::new(),
+                    escapes: false,
+                    indirect: false,
+                };
+                for caller in tcx.hir_body_owners() {
+                    calls.owner = caller;
+                    calls.visit_body(tcx.hir_body_owned_by(caller));
+                }
+                // An escaping function has callers the walk cannot list only
+                // when something can call it indirectly: an in-program call
+                // through a fn pointer of its arity, or a foreign function that
+                // takes a fn pointer (a callback the library calls with any
+                // value). The program is closed otherwise (the frozen graph).
+                if calls.args.is_empty()
+                    || (calls.escapes && (calls.indirect || foreign_takes_fn_pointer(tcx)))
+                {
+                    return false;
+                }
+                work.extend(
+                    calls
+                        .args
+                        .into_iter()
+                        .map(|(caller, arg)| Need::Value(caller, arg)),
+                );
+            }
+            Need::Local(f, binding) => {
+                let mut defs = DefsOf {
+                    binding,
+                    values: Vec::new(),
+                    address_taken: false,
+                };
+                defs.visit_body(tcx.hir_body_owned_by(f));
+                if defs.address_taken || defs.values.is_empty() {
+                    return false;
+                }
+                work.extend(defs.values.into_iter().map(|v| Need::Value(f, v)));
+            }
+            Need::Returns(f) => {
+                let body = tcx.hir_body_owned_by(f);
+                let mut returns = ReturnsOf(Vec::new());
+                returns.visit_body(body);
+                if let ExprKind::Block(block, _) = body.value.kind
+                    && let Some(tail) = block.expr
+                {
+                    returns.0.push(tail);
+                }
+                if returns.0.is_empty() {
+                    return false;
+                }
+                work.extend(returns.0.into_iter().map(|v| Need::Value(f, v)));
+            }
+            Need::Field(key) => {
+                for site in owned_sites[&key]
+                    .iter()
+                    .filter(|site| matches!(site.kind, SiteKind::Store | SiteKind::Literal))
+                {
+                    match &site.rhs {
+                        Some(Rhs::Null | Rhs::AllocationWithLength(_)) => {}
+                        Some(_) => {
+                            let Some(v) = expr_with_span(tcx, site.owner, site.span) else {
+                                return false;
+                            };
+                            work.push(Need::Value(site.owner, v));
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The `index`-th argument of every call to `callee` in one body; whether the
+/// body names `callee` other than as a callee (it escapes); and whether it
+/// calls anything through a fn pointer of `callee`'s arity.
+struct CallsOf<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    callee: LocalDefId,
+    index: usize,
+    arity: usize,
+    args: Vec<(LocalDefId, &'tcx Expr<'tcx>)>,
+    escapes: bool,
+    indirect: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for CallsOf<'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let names = |e: &Expr<'_>| {
+            matches!(&e.kind, ExprKind::Path(qpath)
+                if matches!(self.tcx.typeck(self.owner).qpath_res(qpath, e.hir_id),
+                    Res::Def(rustc_hir::def::DefKind::Fn, did) if did.as_local() == Some(self.callee)))
+        };
+        if let ExprKind::Call(callee, args) = expr.kind
+            && names(callee)
+        {
+            match args.get(self.index) {
+                Some(arg) => self.args.push((self.owner, arg)),
+                None => self.escapes = true,
+            }
+            for arg in args {
+                self.visit_expr(arg);
+            }
+            return;
+        }
+        if let ExprKind::Call(callee, args) = expr.kind
+            && args.len() == self.arity
+            && matches!(
+                self.tcx.typeck(self.owner).expr_ty_adjusted(callee).kind(),
+                TyKind::FnPtr(..)
+            )
+        {
+            self.indirect = true;
+        }
+        if names(expr) {
+            self.escapes = true;
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// Whether any foreign function of the program takes a fn pointer (through
+/// `Option` or anywhere in a parameter's type): a function that escapes into
+/// such a library may be called back with any value.
+fn foreign_takes_fn_pointer(tcx: TyCtxt<'_>) -> bool {
+    tcx.hir_crate_items(()).foreign_items().any(|item| {
+        let did = item.owner_id.def_id;
+        matches!(tcx.def_kind(did), rustc_hir::def::DefKind::Fn)
+            && tcx
+                .fn_sig(did)
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .iter()
+                .any(|input| {
+                    input.walk().any(|arg| {
+                        arg.as_type()
+                            .is_some_and(|ty| matches!(ty.kind(), TyKind::FnPtr(..)))
+                    })
+                })
+    })
+}
+
+/// Every value a local `binding` is given in one body, and whether its
+/// address is taken (a write through the address is a definition this does
+/// not see).
+struct DefsOf<'tcx> {
+    binding: HirId,
+    values: Vec<&'tcx Expr<'tcx>>,
+    address_taken: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for DefsOf<'tcx> {
+    fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+        if local.pat.hir_id == self.binding
+            && let Some(init) = local.init
+        {
+            self.values.push(init);
+        }
+        if let rustc_hir::PatKind::Binding(mode, ..) = local.pat.kind
+            && mode.0 != rustc_hir::ByRef::No
+            && local
+                .init
+                .is_some_and(|init| path_local(init) == Some(self.binding))
+        {
+            self.address_taken = true;
+        }
+        intravisit::walk_local(self, local);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match expr.kind {
+            ExprKind::Assign(lhs, rhs, _) if path_local(lhs) == Some(self.binding) => {
+                self.values.push(rhs);
+            }
+            ExprKind::AddrOf(_, _, inner) if path_local(inner) == Some(self.binding) => {
+                self.address_taken = true;
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// The value of every `return` in one body.
+struct ReturnsOf<'tcx>(Vec<&'tcx Expr<'tcx>>);
+
+impl<'tcx> Visitor<'tcx> for ReturnsOf<'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if let ExprKind::Ret(Some(value)) = expr.kind {
+            self.0.push(value);
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// The outermost expression of `owner`'s body spanning exactly `span`.
+fn expr_with_span<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    span: Span,
+) -> Option<&'tcx Expr<'tcx>> {
+    struct Find<'tcx>(Span, Option<&'tcx Expr<'tcx>>);
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.1.is_some() {
+                return;
+            }
+            if expr.span == self.0 {
+                self.1 = Some(expr);
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find(span, None);
+    find.visit_body(tcx.hir_body_owned_by(owner));
+    find.1
 }
 
 fn local_pointee(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {

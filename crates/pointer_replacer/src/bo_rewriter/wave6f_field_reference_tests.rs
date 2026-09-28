@@ -3626,3 +3626,112 @@ fn w6f_a_live_overwrite_of_a_recursive_owned_field_leaks_receipted() {
         );
     }
 }
+
+/// The D4 fixture (R641-7): `Hx.common` owned, stored by `initialize` from
+/// its formal, freed by `release`; `Hx` held by value in `Outer`, which has
+/// no `Copy` pair; `setup` passes an allocation. Each witness edits it once.
+const OWNED_GUARDS: &str = include_str!("wave6f_fixture_owned_guards.rs");
+
+/// The D4 frame: `Hx.common` Owning; the stored formal Raw, so the store
+/// reaches the reclaim arm (`NonNull::new(v).map(Box::from_raw)`).
+fn owned_guards_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6f-owned-guards-frame",
+        vec![("Hx".to_owned(), 1, SlotKind::Owning)],
+        vec![
+            ("initialize::common".to_owned(), SlotKind::Raw),
+            ("initialize::self_0".to_owned(), SlotKind::Ref),
+            ("setup::o".to_owned(), SlotKind::Ref),
+            ("release::self_0".to_owned(), SlotKind::Ref),
+        ],
+    );
+}
+
+/// `Hx.common`'s receipt row (status, cause) under the D4 frame.
+fn owned_guards_row(source: &str) -> (String, String) {
+    owned_guards_frame();
+    let row = field_receipt_row(source, "Hx", "common");
+    super::test_model_override::clear();
+    (row[2].clone(), row[9].clone())
+}
+
+const SETUP_ALLOCATES: &str =
+    "initialize(malloc(::std::mem::size_of::<Common>() as u64) as *mut Common, &mut (*o).inner);";
+
+/// Witness 44 (R641-7 D4 (a); report 089 §3) — **the reclaim arm takes only
+/// an allocation.** A raw value an owned field reclaims becomes a `Box`; fed
+/// a field address (`&mut (*o).common`, brotli's `H35.common` shape) the
+/// `Box` would free memory no allocator gave out. The formal's every caller
+/// must pass an allocation: one address among allocating callers holds it.
+/// Control: the fixture's own allocating caller applies.
+#[test]
+fn w6f_an_owned_field_fed_by_a_field_address_holds() {
+    let _frame = frame_lock();
+    assert_eq!(
+        owned_guards_row(OWNED_GUARDS),
+        ("applied".to_owned(), "-".to_owned()),
+        "control: an allocating caller"
+    );
+    let address = OWNED_GUARDS.replace(
+        SETUP_ALLOCATES,
+        "initialize(&mut (*o).common, &mut (*o).inner);",
+    );
+    assert_ne!(address, OWNED_GUARDS);
+    assert_eq!(
+        owned_guards_row(&address),
+        (
+            "held".to_owned(),
+            "field-transaction-incomplete:owned-store-source-not-an-allocation".to_owned()
+        ),
+        "a field address"
+    );
+    let one_of_two = format!(
+        "{OWNED_GUARDS}pub unsafe extern \"C\" fn setup2(mut o: *mut Outer) {{\n    initialize(&mut (*o).common, &mut (*o).inner);\n}}\n"
+    );
+    assert_eq!(
+        owned_guards_row(&one_of_two),
+        (
+            "held".to_owned(),
+            "field-transaction-incomplete:owned-store-source-not-an-allocation".to_owned()
+        ),
+        "one caller of two passes an address"
+    );
+}
+
+/// Witness 45 (R641-7 D4 (b)) — **an owned field's struct held by value in a
+/// union holds typed.** A union field must be `Copy` or `ManuallyDrop`
+/// (E0740), and a `Box` field makes `Hx` neither; without the hold the
+/// emission fails at verify and reverts. Control: `Outer` a struct.
+#[test]
+fn w6f_an_owned_field_in_a_union_member_holds() {
+    let _frame = frame_lock();
+    let union = OWNED_GUARDS.replace("pub struct Outer {", "pub union Outer {");
+    assert_ne!(union, OWNED_GUARDS);
+    assert_eq!(
+        owned_guards_row(&union),
+        (
+            "held".to_owned(),
+            "field-transaction-incomplete:owned-in-by-value-container".to_owned()
+        )
+    );
+}
+
+/// Witness 46 (R641-7 D4 (b)) — **an owned field's struct held by value
+/// under a `Copy` container holds typed.** The container's `Copy` / `Clone`
+/// pair cannot hold a `Box` (E0204). Control: `Outer` without the pair
+/// (witness 44's control).
+#[test]
+fn w6f_an_owned_field_in_a_copy_container_holds() {
+    let _frame = frame_lock();
+    let copy = format!(
+        "{OWNED_GUARDS}impl ::core::marker::Copy for Outer {{}}\nimpl ::core::clone::Clone for Outer {{\n    fn clone(&self) -> Outer {{\n        *self\n    }}\n}}\n"
+    );
+    assert_eq!(
+        owned_guards_row(&copy),
+        (
+            "held".to_owned(),
+            "field-transaction-incomplete:owned-in-by-value-container".to_owned()
+        )
+    );
+}
