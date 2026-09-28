@@ -66,6 +66,7 @@ use crate::{
             mutability::mutability_analysis,
         },
     },
+    bo_rewriter::ownership_fields::lifecycle::{DEPTH_WITNESS_NONE, WAIVER_LEAK_RECURSIVE},
     utils::rustc::RustProgram,
 };
 
@@ -358,6 +359,15 @@ pub(crate) const DEALLOC_TRANSFER_CONTRACT: &str = "owned-field-dealloc-transfer
 /// R579-4 C2: a certified callee's result stored into an owned field through
 /// a safe base — the owner moved in, no `from_raw` bridge (R583-7 counts it).
 pub(crate) const CERTIFIED_MOVE: &str = "owned-field-store-certified-move";
+/// R622-3 (Extension X §5.2): a safe-base store over an owned RECURSIVE
+/// value with no depth-0 witness — ownership-fields' `StoreClose::Leak`,
+/// `::std::mem::forget(::std::mem::replace(&mut PLACE, VALUE))`: the old
+/// value leaks as C leaked it instead of dropping to an unbounded depth.
+pub(crate) const RECURSIVE_LEAK: &str = "owned-field-recursive-leak";
+/// The edit kinds that render the field expression MOVED OUT (`.take()`):
+/// the place holds `None` after one — the `moved` spans R622-3's witnesses
+/// read (the classifier matches a field expression's own span).
+const MOVED_OUT: [&str; 2] = ["owned-field-move", "owned-field-raw-move"];
 
 /// A function's signature plan: the generated lifetime, the parameters that
 /// carry it and whether the return type mentions the struct.
@@ -402,6 +412,11 @@ pub(crate) struct FieldTransaction {
     /// scope exit the language drops — addendum 101's
     /// `waiver-drop(scope-exit)` for a libc-freed allocation, receipted.
     pub value_instances: usize,
+    /// R622-3: the receipt of each safe-base store into a RECURSIVE owned
+    /// field — `(storing function, receipt, a certified move)`, the receipt
+    /// `depth-witness(none)` (the old value is `None`) or
+    /// `waiver-leak(recursive-drop)` (a [`RECURSIVE_LEAK`] edit).
+    pub recursive_closes: Vec<(LocalDefId, &'static str, bool)>,
     /// R411 §2: the count companions of a fat field — the storing
     /// function's parameter that fills the SIBLING field bounding the fat
     /// field's element reads: `(callee, stored parameter index, count
@@ -664,8 +679,14 @@ impl FieldTransactions {
                     .filter(|edit| edit.kind == kind)
                     .count()
             };
+            let closes = |receipt: &str, certified_only: bool| {
+                t.recursive_closes
+                    .iter()
+                    .filter(|(_, r, certified)| *r == receipt && (*certified || !certified_only))
+                    .count()
+            };
             out.push_str(&format!(
-                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};certified-move={};count-companion={}\t-\t{}\t{}\n",
+                "{}\t{}\tapplied\t{}\t{}\t{}\t{}\t{}\traw-move={};raw-view={};raw-store={};dealloc-transfer={};allocator-contract={};waiver-drop-scope-exit={};certified-move={};depth-witness-none={};waiver-leak-recursive-drop={};count-companion={}\t-\t{}\t{}\n",
                 t.struct_path,
                 t.field_name,
                 t.delivered_form_key(),
@@ -690,8 +711,11 @@ impl FieldTransactions {
                 // R583-7: a certified callee's owner moved into the field
                 // through a safe base — no `from_raw` bridge. Through a raw
                 // base the same move is `owned-field-raw-store` (the PLACE's
-                // kind, which the AST layer keys on) and counts there.
-                count(CERTIFIED_MOVE),
+                // kind, which the AST layer keys on) and counts there. A
+                // certified move that leaks (R622-3) is still that move.
+                count(CERTIFIED_MOVE) + closes(WAIVER_LEAK_RECURSIVE, true),
+                closes(DEPTH_WITNESS_NONE, false),
+                closes(WAIVER_LEAK_RECURSIVE, false),
                 t.count_companions
                     .iter()
                     .map(|c| format!(
@@ -3542,11 +3566,20 @@ pub(crate) fn finalize(
             _ => field_text.to_owned(),
         }
     };
+    // R622-3: the owning edges a store's payload is checked for recursion
+    // through — every owned field this derivation plans.
+    let owning_fields: Vec<(LocalDefId, usize)> = candidates
+        .candidates
+        .values()
+        .filter(|candidate| candidate.owning)
+        .map(|candidate| (candidate.key.struct_did, candidate.key.field_index))
+        .collect();
     for candidate in candidates.candidates.values() {
         let mut cause: Option<String> = None;
         let mut edits = Vec::new();
         let mut load_locals = Vec::new();
         let mut argument_forms = Vec::new();
+        let mut recursive_closes = Vec::new();
         for owner in &candidate.owners {
             if matches!(
                 exposure.plan(*owner),
@@ -3566,6 +3599,8 @@ pub(crate) fn finalize(
                 &mut edits,
                 &mut load_locals,
                 &mut argument_forms,
+                &owning_fields,
+                &mut recursive_closes,
             );
         }
         for site in candidate.sites.iter().filter(|_| !candidate.owning) {
@@ -3901,6 +3936,7 @@ pub(crate) fn finalize(
             } else {
                 0
             },
+            recursive_closes,
             hoists: candidate
                 .sites
                 .iter()
@@ -3998,6 +4034,8 @@ fn owned_sites<'t>(
     edits: &mut Vec<ExpressionEdit>,
     load_locals: &mut Vec<(NodeKey, String)>,
     argument_forms: &mut Vec<(Span, Form)>,
+    owning_fields: &[(LocalDefId, usize)],
+    recursive_closes: &mut Vec<(LocalDefId, &'static str, bool)>,
 ) {
     let null_mut = "core::ptr::null_mut()";
     let null_const = "core::ptr::null()";
@@ -4124,6 +4162,9 @@ fn owned_sites<'t>(
             )),
         }
     };
+    // R622-3: the safe-base stores (edit index, site), closed after the loop,
+    // once every move-out of the field is planned.
+    let mut safe_stores: Vec<(usize, &Site)> = Vec::new();
     for site in &candidate.sites {
         match site.kind {
             // G build 3: an owned ARRAY's null initializer is the whole
@@ -4255,17 +4296,25 @@ fn owned_sites<'t>(
                             wrap: true,
                         });
                     }
-                    _ => edits.push(ExpressionEdit {
-                        owner: site.owner,
-                        span: site.span,
-                        replacement,
-                        kind: if certified_move {
-                            CERTIFIED_MOVE
-                        } else {
-                            "owned-field-store"
-                        },
-                        wrap: true,
-                    }),
+                    _ => {
+                        // A FIELD store only: an owned-element array's store
+                        // (`a[i] = ..`, G) is not a field place, and its
+                        // elements are byte buffers, not recursive payloads.
+                        if site.kind == SiteKind::Store && candidate.array.is_none() {
+                            safe_stores.push((edits.len(), site));
+                        }
+                        edits.push(ExpressionEdit {
+                            owner: site.owner,
+                            span: site.span,
+                            replacement,
+                            kind: if certified_move {
+                                CERTIFIED_MOVE
+                            } else {
+                                "owned-field-store"
+                            },
+                            wrap: true,
+                        })
+                    }
                 }
             }
             SiteKind::Load => {
@@ -4423,6 +4472,45 @@ fn owned_sites<'t>(
                     }),
                 }
             }
+        }
+    }
+    // **R622-3 (Extension X §5.2) — the close a safe-base store makes.** The
+    // plain assignment drops the old owner (waiver 101). When the payload is
+    // recursive that drop has no depth bound, so ownership-fields' classifier
+    // asks for a witness that the old value is `None` (a depth-0 close) and
+    // otherwise leaks it: the store becomes `forget(replace(&mut PLACE,
+    // VALUE))`, C's leak kept. `moved` is every field expression this plan
+    // renders as a move out, which the witnesses read.
+    let moved: Vec<Span> = edits
+        .iter()
+        .filter(|edit| MOVED_OUT.contains(&edit.kind))
+        .map(|edit| edit.span)
+        .collect();
+    for (index, site) in safe_stores {
+        let Some(assign_span) = site.assign_span else {
+            cause.get_or_insert_with(|| {
+                "field-transaction-incomplete:store-without-assignment".to_owned()
+            });
+            continue;
+        };
+        let close = super::ownership_fields_store_close::store_close(
+            tcx,
+            site.owner,
+            assign_span,
+            owning_fields,
+            &moved,
+        );
+        let Some(receipt) = close.receipt() else { continue };
+        let certified = edits[index].kind == CERTIFIED_MOVE;
+        recursive_closes.push((site.owner, receipt, certified));
+        if let Some(leak) = close.render(WRAP_PLACE, &edits[index].replacement) {
+            edits[index] = ExpressionEdit {
+                owner: site.owner,
+                span: assign_span,
+                replacement: leak,
+                kind: RECURSIVE_LEAK,
+                wrap: true,
+            };
         }
     }
 }

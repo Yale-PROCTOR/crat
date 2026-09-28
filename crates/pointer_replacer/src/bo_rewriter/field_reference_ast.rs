@@ -591,14 +591,18 @@ impl MutVisitor for Wraps<'_> {
         let mut wrapped = parsed;
         // A null test wraps its RECEIVER: `<field>.is_null()` becomes
         // `<field>.is_none()`, the raw method call itself is consumed.
-        // A raw-base store wraps the whole assignment: the PLACE and the
-        // value are substituted separately.
+        // A raw-base store, and a recursive store's leak (R622-3), wrap the
+        // whole assignment: the PLACE and the value are substituted
+        // separately.
         let (inner, place) = match (kind, &mut e.kind) {
             ("owned-field-is-null", rustc_ast::ExprKind::MethodCall(call)) => (
                 std::mem::replace(&mut call.receiver.kind, rustc_ast::ExprKind::Dummy),
                 None,
             ),
-            ("owned-field-raw-store", rustc_ast::ExprKind::Assign(lhs, rhs, _)) => (
+            (
+                "owned-field-raw-store" | "owned-field-recursive-leak",
+                rustc_ast::ExprKind::Assign(lhs, rhs, _),
+            ) => (
                 std::mem::replace(&mut rhs.kind, rustc_ast::ExprKind::Dummy),
                 Some(std::mem::replace(&mut lhs.kind, rustc_ast::ExprKind::Dummy)),
             ),
@@ -644,6 +648,7 @@ impl MutVisitor for Wraps<'_> {
             (
                 "owned-field-is-null"
                 | "owned-field-raw-store"
+                | "owned-field-recursive-leak"
                 | "owned-field-dealloc-transfer"
                 | "owned-field-dealloc-transfer-contract"
                 | "owned-field-element",

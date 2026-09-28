@@ -609,37 +609,35 @@ fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
         reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
         "deleteNode's formal is either raw or the re-seated owner:\n{source}"
     );
-    let bridges = |moves: usize, stores: usize, certified: usize| {
+    let bridges = |(moves, stores, certified, witnessed): (usize, usize, usize, usize)| {
         format!(
-            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;certified-move={certified};count-companion="
+            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;certified-move={certified};depth-witness-none={witnessed};waiver-leak-recursive-drop=0;count-companion="
         )
     };
     // R561-6: ownership-fields' `67df47077` types the moved-out owner of a
     // freed container (`deleteNode`'s `temp` / `temp_0`) as `Option<Box<node>>`,
     // so the take is no longer a raw move: re-seated, raw-move is 0.
-    let ((left_moves, left_stores, left_certified), (right_moves, right_stores, right_certified)) =
-        if reseated {
-            // R583-7: `deleteNode`'s result certifies (wave-6a R579-4), so its
-            // stores are certified moves — one into `left`, two into `right`.
-            // `insert` does not certify in this fixture (its `newNode` stays
-            // raw here), so its stores keep `from_raw`.
-            ((0, 1, 1), (0, 1, 2))
-        } else {
-            ((3, 3, 0), (4, 4, 0))
-        };
+    //
+    // R622-3 (the bst control): `node` is recursive, so every SAFE-base store
+    // is closed by ownership-fields' classifier, and each is witnessed — the
+    // old value is `None` — so none leaks and the text is unchanged. Re-seated,
+    // `insert`'s and `deleteNode`'s stores are safe-base (left 2, right 3);
+    // `newNode`'s goes through a raw base (`ptr::write`, which closes
+    // nothing). Unseated, every store is raw-base.
+    let (left, right) = if reseated {
+        // R583-7: `deleteNode`'s result certifies (wave-6a R579-4), so its
+        // stores are certified moves — one into `left`, two into `right`.
+        // `insert` does not certify in this fixture (its `newNode` stays raw
+        // here), so its stores keep `from_raw`.
+        ((0, 1, 1, 2), (0, 1, 2, 3))
+    } else {
+        ((3, 3, 0, 0), (4, 4, 0, 0))
+    };
     assert_eq!(
         observed.bridges,
         vec![
-            (
-                "node".to_owned(),
-                "left".to_owned(),
-                bridges(left_moves, left_stores, left_certified)
-            ),
-            (
-                "node".to_owned(),
-                "right".to_owned(),
-                bridges(right_moves, right_stores, right_certified)
-            ),
+            ("node".to_owned(), "left".to_owned(), bridges(left)),
+            ("node".to_owned(), "right".to_owned(), bridges(right)),
         ]
     );
     // The seam sees an owned argument in its consumer's form: no glue is
@@ -1149,7 +1147,7 @@ fn w6f_thin_owned_field_free_site_transfers_and_memcpy_takes_a_raw_view() {
         vec![(
             "Holder".to_owned(),
             "slot_".to_owned(),
-            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;certified-move=0;count-companion=".to_owned()
+            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;certified-move=0;depth-witness-none=0;waiver-leak-recursive-drop=0;count-companion=".to_owned()
         )]
     );
     let (source, emitted_count, reverted) = emitted_source(&outcome);
@@ -3528,4 +3526,103 @@ fn w6f_a_certified_store_alone_joins_the_key_and_its_revert_withdraws() {
         assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
     assert!(!flat.contains("Some(make_item"), "{source}");
+}
+
+/// The final (post-revert) field receipt's cells for `Node.<field>`: the
+/// census column the witnesses of R622-3 read.
+fn final_node_cells<'a>(outcome: &'a RewriteOutcome, field: &str) -> Vec<&'a str> {
+    let RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("degraded");
+    };
+    raw_boundary_artifacts
+        .field_transactions
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<&str>>())
+        .find(|cells| cells[0].ends_with("Node") && cells[1] == field)
+        .unwrap_or_else(|| {
+            panic!(
+                "no final receipt row for Node.{field}\n{}",
+                raw_boundary_artifacts.field_transactions
+            )
+        })
+}
+
+/// Witness 43 (R622-3; Extension X §5.2; ownership-fields 079, option (A))
+/// — **a store that overwrites a LIVE owned recursive field leaks the old
+/// subtree, receipted.** The live-overwrite avl variant stores
+/// `newNode(key)` into `(*node).left` without taking the old child first
+/// (C leaks it). Through a safe base W6F-3 renders a plain assignment, which
+/// drops the old `Option<Box<Node>>` — a recursive drop of unbounded depth.
+/// With no depth-0 witness the store renders
+/// `::std::mem::forget(::std::mem::replace(&mut PLACE, RHS))`, keeping C's
+/// leak, and the field's receipt counts `waiver-leak-recursive-drop`.
+///
+/// Control: avl's own text — `insert`'s stores take the place in their RHS,
+/// the rotations' were taken earlier in the block, `newNode`'s overwrite the
+/// constructor's `None` — renders no leak, and all ten stores are receipted
+/// `depth-witness-none`.
+///
+/// Both texts drop `minValueNode`, a READER of `left` with no store: under
+/// `avl_frame` it degrades `escapes-via-return`, its class hold withdraws
+/// both `Node` transactions, and no store would render at all (witness 19's
+/// `withdrawn` branch). On the corpus at L01⁹ it is `&mut` and avl delivers
+/// whole (wave-6a 119).
+#[test]
+fn w6f_a_live_overwrite_of_a_recursive_owned_field_leaks_receipted() {
+    let _frame = frame_lock();
+    let own = AVL.replace(
+        "pub unsafe extern \"C\" fn minValueNode(mut node: *mut Node) -> *mut Node {\n    while !((*node).left).is_null() {\n        node = (*node).left;\n    }\n    return node;\n}\n",
+        "",
+    );
+    assert_ne!(own, AVL, "the reader is dropped");
+    let live = own.replace(
+        "(*node).left = insert((*node).left, key);",
+        "(*node).left = newNode(key);",
+    );
+    assert_ne!(live, own, "the variant applies");
+    avl_frame();
+    let outcome = emitted("avl", &live);
+    super::test_model_override::clear();
+    let (source, _, _) = emitted_source(&outcome);
+    let bare: String = source.split_whitespace().collect();
+    let left = final_node_cells(&outcome, "left");
+    assert_eq!(
+        left[10], "active",
+        "the transaction renders: {left:?}\n{source}"
+    );
+    let store = source
+        .lines()
+        .find(|line| line.contains(".left =") && line.contains("newNode(key)"))
+        .unwrap_or("<no store line>");
+    assert!(
+        bare.contains(
+            "::std::mem::forget(::std::mem::replace(&mut(*node.as_deref_mut().unwrap()).left,Some(newNode(key))));"
+        ) && !bare.contains(".left=Some(newNode(key))"),
+        "the live overwrite leaks: {store}\n{source}"
+    );
+    // The leaked store is still `newNode`'s certified move; `left`'s other
+    // four stores are witnessed.
+    assert!(
+        left[8].contains("certified-move=2;depth-witness-none=4;waiver-leak-recursive-drop=1;"),
+        "{left:?}"
+    );
+    // Control: avl's own ten stores are witnessed, and nothing leaks.
+    avl_frame();
+    let own = emitted("avl", &own);
+    super::test_model_override::clear();
+    let (own_source, _, _) = emitted_source(&own);
+    assert!(!own_source.contains("::std::mem::forget"), "{own_source}");
+    for field in ["left", "right"] {
+        let cells = final_node_cells(&own, field);
+        assert_eq!(cells[10], "active", "{cells:?}");
+        assert!(
+            cells[8].contains("depth-witness-none=5;waiver-leak-recursive-drop=0"),
+            "Node.{field}: {cells:?}"
+        );
+    }
 }
