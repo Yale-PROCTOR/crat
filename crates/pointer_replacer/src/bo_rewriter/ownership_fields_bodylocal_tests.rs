@@ -2241,13 +2241,45 @@ fn r395_zero_capable_transfer_is_held() {
     .unwrap();
 }
 
+/// R619-8 restated this control: its allocator was `System` itself, which
+/// R443-1 declares in every emitted crate and which IS the libc-free contract.
+/// A user type stays refused even when it only forwards to `System`.
 #[test]
 fn r395_custom_global_allocator_is_not_a_c_free_contract() {
-    let source = "#[global_allocator] static A:std::alloc::System=std::alloc::System; pub fn f(){}";
+    let source = "use std::alloc::{GlobalAlloc, Layout, System};
+pub struct Forward;
+unsafe impl GlobalAlloc for Forward {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe { System.alloc(layout) } }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe { System.dealloc(ptr, layout) } }
+}
+#[global_allocator] static A: Forward = Forward;
+pub fn f() {}";
     ::utils::compilation::run_compiler_on_str(source, |tcx| {
         assert!(!super::decision::ownership_fields_native::c_free_allocator_compatible(tcx));
     })
     .unwrap();
+}
+
+/// **R619-8 — `#[global_allocator] System` is the libc-free contract.** R443-1
+/// has every emitted crate declare exactly this item; `System`'s `dealloc` is
+/// libc `free`, as with no declaration, so the gate reads it compatible. The
+/// undeclared crate is the control that stays compatible, and a `System`
+/// declared under another path spelling is the same type.
+#[test]
+fn r619_the_system_global_allocator_is_the_c_free_contract() {
+    for source in [
+        "#[global_allocator]\nstatic __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;\npub fn f() {}",
+        "use std::alloc::System as S;\n#[global_allocator] static A: S = S;\npub fn f() {}",
+        "pub fn f() {}",
+    ] {
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            assert!(
+                super::decision::ownership_fields_native::c_free_allocator_compatible(tcx),
+                "{source}"
+            );
+        })
+        .unwrap();
+    }
 }
 
 /// R431, the native half: a local MOVED OUT of another object's field is an

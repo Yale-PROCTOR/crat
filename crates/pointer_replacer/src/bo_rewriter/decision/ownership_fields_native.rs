@@ -811,16 +811,86 @@ fn stable_raw_formal(table: &DecisionTable, callee: LocalDefId, argument: usize)
 }
 
 /// Pinned Linux System-allocation / libc-free contract. The complete current
-/// crate graph must contain no user global allocator, including dependencies.
-/// Numeric nonempty payloads avoid the dangling zero-layout sentinel.
+/// crate graph must contain no user global allocator, including dependencies,
+/// except `std::alloc::System` declared by this crate: `System`'s `dealloc` is
+/// libc `free`, exactly as with no declaration (R443-1 has every emitted crate
+/// declare it; R619-8). Numeric nonempty payloads avoid the dangling
+/// zero-layout sentinel.
 pub(crate) fn c_free_allocator_compatible(tcx: rustc_middle::ty::TyCtxt<'_>) -> bool {
+    // The crate graph and the local declaration exist only once expansion has
+    // loaded them; asked first, before any other query, both read empty.
+    let _ = tcx.hir_crate_items(());
     tcx.sess.target.os == "linux"
-        && !tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+        && (!tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+            || global_allocator_is_system(tcx))
         && tcx.crates(()).iter().all(|c| !tcx.has_global_allocator(*c))
         && tcx
             .crates(())
             .iter()
             .any(|c| tcx.crate_name(*c).as_str() == "std")
+}
+/// `#[global_allocator]` expands into allocator shims (`__rust_alloc`,
+/// `__rust_dealloc`, ...) that call `GlobalAlloc` on the declared static. The
+/// declaration is `System` only when every such call in every shim names
+/// `std::alloc::System` as its receiver type; a type that merely forwards to
+/// `System` is still a user allocator.
+fn global_allocator_is_system(tcx: rustc_middle::ty::TyCtxt<'_>) -> bool {
+    use rustc_hir::{
+        Expr, ExprKind,
+        def::{DefKind, Res},
+        intravisit::{self, Visitor},
+    };
+    use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+    struct Calls<'a, 'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        system: usize,
+        other: usize,
+    }
+    impl<'tcx> Visitor<'tcx> for Calls<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(callee, _) = expr.kind
+                && let ExprKind::Path(qpath) = &callee.kind
+                && let Res::Def(DefKind::AssocFn, method) =
+                    self.typeck.qpath_res(qpath, callee.hir_id)
+                && let Some(global_alloc) = self.tcx.trait_of_item(method)
+                && self.tcx.item_name(global_alloc).as_str() == "GlobalAlloc"
+                && self.tcx.crate_name(global_alloc.krate).as_str() == "core"
+            {
+                let receiver = self.typeck.node_args(callee.hir_id).type_at(0);
+                match receiver.kind() {
+                    rustc_middle::ty::TyKind::Adt(def, _)
+                        if self.tcx.def_path_str(def.did()) == "std::alloc::System" =>
+                    {
+                        self.system += 1
+                    }
+                    _ => self.other += 1,
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let (mut system, mut other) = (0, 0);
+    for shim in tcx.hir_crate_items(()).definitions() {
+        if tcx.def_kind(shim) != DefKind::Fn
+            || !tcx
+                .codegen_fn_attrs(shim)
+                .flags
+                .contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
+        {
+            continue;
+        }
+        let mut calls = Calls {
+            tcx,
+            typeck: tcx.typeck(shim),
+            system: 0,
+            other: 0,
+        };
+        calls.visit_body(tcx.hir_body_owned_by(shim));
+        system += calls.system;
+        other += calls.other;
+    }
+    system > 0 && other == 0
 }
 pub(crate) fn raw_lend_argument(
     shape: BoxShape,
