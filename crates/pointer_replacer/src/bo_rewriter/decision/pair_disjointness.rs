@@ -968,9 +968,7 @@ impl PairDisjointnessIndex {
                     break 'sites;
                 };
                 callers += 1;
-                if field.stored_fields.contains(&key)
-                    && matches!(other.class, RootClass::EntryStorage(_))
-                {
+                if field.stored_fields.contains(&key) && predates_or_is_not_a_block(other.class) {
                     continue;
                 }
                 // One level up: both arguments are the caller's own stable
@@ -1181,7 +1179,7 @@ impl PairDisjointnessIndex {
         // at that entry. An allocator never returns storage overlapping a live
         // object, so they are distinct allocations whatever their types.
         for (field, other) in [(a, b), (b, a)] {
-            if field.stored_since_entry && matches!(other.class, RootClass::EntryStorage(_)) {
+            if field.stored_since_entry && predates_or_is_not_a_block(other.class) {
                 return Ok(CertificateKind::AllocationIdentity);
             }
         }
@@ -1410,6 +1408,18 @@ impl PairDisjointnessIndex {
         }
         out
     }
+}
+
+/// R624-1 / R628-7 (f): the other side of an allocation-identity pair. An
+/// entry object existed at the caller's entry, before the field's block was
+/// allocated; a stack object or a static is no block an allocator ever returns.
+/// Either way the two are distinct allocations. A fresh local is not: the field
+/// may have been admitted through that very local (R579-3 (c)).
+fn predates_or_is_not_a_block(class: RootClass) -> bool {
+    matches!(
+        class,
+        RootClass::EntryStorage(_) | RootClass::StackObject(_) | RootClass::Static(_)
+    )
 }
 
 /// (a): one side a fresh object of the caller, the other a distinct fresh

@@ -292,6 +292,40 @@ pub unsafe fn Write(mut mb: *mut Split) {
 }
 "#;
 
+/// W6: `BrotliCompressBufferQuality10`'s shape — at the caller, the other side
+/// is a STACK object (`m = &mut memory_manager`), which no allocator returned.
+const A_STACK_OBJECT_AT_THE_CALLER: &str = r#"
+pub unsafe fn Write() {
+    let mut mm: u32 = 0;
+    let mut x: *mut u32 = &mut mm;
+    let mut s = Split { map: 0 as *mut u32, view: 0 as *mut u32, n: 0 };
+    Fill(&mut s);
+    Store(x, &mut s);
+}
+"#;
+
+/// W7: the local form beside a stack object. Its address is taken twice, so
+/// R466-5's fresh-stack certificate (address first taken at the call) does not
+/// answer first.
+const A_STACK_OBJECT_LOCALLY: &str = r#"
+pub unsafe fn Build(mut mb: *mut Split) {
+    let mut local: u32 = 0;
+    let mut first: *mut u32 = &mut local;
+    let mut second: *mut u32 = &mut local;
+    (*mb).map = malloc(16) as *mut u32;
+    Use2(second, (*mb).map);
+}
+"#;
+
+/// C16: a fresh local IS the field's block — `map` is admitted through it.
+const THE_FIELDS_OWN_LOCAL: &str = r#"
+pub unsafe fn Build(mut mb: *mut Split) {
+    let mut c = malloc(16) as *mut u32;
+    (*mb).map = c;
+    Use2(c, (*mb).map);
+}
+"#;
+
 fn source(extra: &str) -> String {
     format!("{PRELUDE}{extra}")
 }
@@ -427,4 +461,25 @@ fn w6p_r628_fp_a_callers_unknown_other_side_is_refused() {
         1,
     );
     assert!(verdict.is_err(), "got {verdict:?}");
+}
+
+#[test]
+fn w6p_r628_fp_a_stack_object_at_the_caller_is_not_an_allocation() {
+    assert_eq!(
+        verdict(&chain(A_STACK_OBJECT_AT_THE_CALLER), "Store", "Use2", 0, 1),
+        Ok(CertificateKind::AllocationIdentity)
+    );
+}
+
+#[test]
+fn w6p_r628_f_a_stack_object_is_not_an_allocation() {
+    assert_eq!(
+        verdict(&source(A_STACK_OBJECT_LOCALLY), "Build", "Use2", 0, 1),
+        Ok(CertificateKind::AllocationIdentity)
+    );
+}
+
+#[test]
+fn w6p_r628_f_the_fields_own_local_is_refused() {
+    refused(THE_FIELDS_OWN_LOCAL, "Build");
 }
