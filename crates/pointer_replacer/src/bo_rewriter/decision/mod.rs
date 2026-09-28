@@ -1050,6 +1050,16 @@ pub(crate) struct DecisionTable {
     /// transactions (`plan::class_split::keeps_interface_dependency`).
     pub(crate) predecessor_held_classes:
         std::collections::BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    /// **R631-12** — the calls where L01¹⁰'s arm (a) admitted a read through a
+    /// received reborrow: the call's span, its caller, and the caller's MIR
+    /// local the reborrow lends (the loan's owner). The emission hoists those
+    /// reads while that subject is emitted in a reference form
+    /// (`arg_order_hoist`). Empty until the analysis exports them.
+    pub(crate) arg_order_hoists: rustc_hash::FxHashSet<(
+        (u32, u32),
+        rustc_span::def_id::LocalDefId,
+        rustc_middle::mir::Local,
+    )>,
     pub entries: Vec<(Subject, Decision)>,
     pub(crate) exposure: Option<exposure::ExposurePolicy>,
     pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
@@ -1410,6 +1420,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         sibling_overlap_inventory: Default::default(),
         input_interfaces: ctx.input_interfaces.clone(),
         predecessor_held_classes: Default::default(),
+        arg_order_hoists: Default::default(),
         declaration_patterns: ctx
             .declaration_patterns
             .iter()
@@ -3088,6 +3099,7 @@ mod self_consistency_tests {
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
             predecessor_held_classes: Default::default(),
+            arg_order_hoists: Default::default(),
             exposure: None,
             arm_requirements: FxHashMap::default(),
             seams: Default::default(),

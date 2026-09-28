@@ -6222,6 +6222,7 @@ mod tests {
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
             predecessor_held_classes: Default::default(),
+            arg_order_hoists: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
@@ -6314,6 +6315,7 @@ mod tests {
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
             predecessor_held_classes: Default::default(),
+            arg_order_hoists: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: crate::bo_rewriter::decision::seam::SeamPlan {
@@ -6404,6 +6406,7 @@ mod tests {
             declaration_patterns: Default::default(),
             input_interfaces: Default::default(),
             predecessor_held_classes: Default::default(),
+            arg_order_hoists: Default::default(),
             arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),

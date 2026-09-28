@@ -208,6 +208,10 @@ mod additive_tests;
 mod address_view_tests;
 #[cfg(test)]
 mod aliased_storage_withdrawal_tests;
+/// **R631-12** — the argument-order hoist, the emission premise of L01¹⁰'s arm (a).
+mod arg_order_hoist;
+#[cfg(test)]
+mod arg_order_hoist_tests;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.

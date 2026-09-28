@@ -5053,6 +5053,9 @@ fn transform_with<'tcx>(
     )?;
     super::wave6r_option_reborrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     super::slice_forms_ast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    // R631-12: every argument-level edit is in place; the arm-(a) reads are
+    // hoisted above their call's received reborrow.
+    super::arg_order_hoist::apply(table, &mut krate, &mut guard);
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
     super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
 
