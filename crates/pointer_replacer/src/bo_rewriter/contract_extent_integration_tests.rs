@@ -1620,6 +1620,12 @@ pub unsafe fn g(src: *const i8) {
 /// typed reason `pending-sibling-overlap` instead of a `&[i8]` whose type moves
 /// under the pending site. A literal whose only site has no risky sibling
 /// (`strlen`) still delivers.
+///
+/// **Re-pinned by R608-1 (STOP 2 of wave-6l 053, approved; wave-6l 054).** A
+/// binding that only ever holds a string literal is never a pending site: a
+/// sibling that aliases it can only READ it, because writing a string literal
+/// is UB in the input (§28). Both literals now deliver as `&[i8]` over their
+/// own lengths; the rule the witness pins moved to the non-literal sources.
 const CE_S04_PENDING_SIBLING: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut)]
 extern "C" {
@@ -1646,11 +1652,10 @@ fn ce_s04_a_literal_at_a_pending_sibling_site_keeps_its_raw_form() {
     // still decides — it is what sends the subject past every evidence arm — and
     // the waiver then lifts it with the fabricated extent. The claim is asserted
     // where it still states the rule: on the receipt, which must say `fallback`.
-    assert_eq!(fmt.2, "pending-sibling-overlap", "{decisions:#?}");
+    assert_eq!(fmt.2, "<emitted>", "{decisions:#?}");
     let source = emitted(CE_S04_PENDING_SIBLING);
-    // The literal's own argument text may now be the waiver's slice bridge; the
-    // claim that survives is that `fmt` never reaches the CONTRACT's fat form.
-    assert!(!source.contains("fmt: &[i8]"), "{source}");
+    assert!(source.contains("fmt: &[i8]"), "{source}");
+    assert!(source.contains("fmt.as_ptr()"), "{source}");
 
     // libtree's `strcpy(p, box_vertical)`: the written destination `p` is the
     // risky sibling of the literal source.
@@ -1676,7 +1681,7 @@ pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
         .iter()
         .find(|(name, is_param, _)| name == "box_vertical" && !*is_param)
         .expect("CE-S04 box_vertical subject");
-    assert_eq!(local.2, "pending-sibling-overlap", "{decisions:#?}");
+    assert_eq!(local.2, "<emitted>", "{decisions:#?}");
 }
 
 /// R419-3 at the CONTRACT-ALONE arm: urlparser's `get_part::format#2` — the

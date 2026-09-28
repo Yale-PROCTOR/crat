@@ -1,10 +1,10 @@
 //! wave-6l relay 057 (R608-1): C strings at NUL-contract positions take the
-//! slice family, and a constant count equal to the pointee's size is one
-//! element.
+//! slice family, a string-literal source is not a pending sibling-overlap
+//! site, and a constant count equal to the pointee's size is one element.
 //!
 //! Every fixture is the reduced corpus shape named on its constant. Their
 //! decisions at the base (`8070b43cf`) were `held:thin-extent`,
-//! `return-not-adapted` — the RED record is the
+//! `return-not-adapted` and `pending-sibling-overlap` — the RED record is the
 //! probe log filed with report 054 — and each rule has a fault that restores it.
 
 fn emitted_from_file(source: &str) -> super::RewriteOutcome {
@@ -184,6 +184,35 @@ pub unsafe fn kmVec4Assign(mut pOut: *mut kmVec4, mut pIn: *const kmVec4) -> *mu
     memcpy(pOut as *mut core::ffi::c_void, pIn as *const core::ffi::c_void,
         (::std::mem::size_of::<f32>() as u64).wrapping_mul(4 as i32 as u64));
     return pOut;
+}
+"#;
+
+/// urlparser `url_parse::fmt` / libtree `print_error::box_vertical`: a string
+/// literal handed to a call whose sibling is WRITTEN (`sprintf`'s buffer, `strcpy`'s
+/// destination).
+const PROBE_LITERAL_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn sprintf(s: *mut i8, format: *const i8, ...) -> i32;
+    fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+}
+pub unsafe fn url_parse(mut is_ssh: bool, mut tmp_path: *mut i8) -> *mut i8 {
+    let mut path = malloc(64) as *mut i8;
+    if path.is_null() {
+        return 0 as *mut i8;
+    }
+    let mut fmt = (if is_ssh as i32 != 0 {
+        b"%s\0" as *const u8 as *const i8
+    } else {
+        b"/%s\0" as *const u8 as *const i8
+    }) as *mut i8;
+    sprintf(path, fmt, tmp_path);
+    path
+}
+pub unsafe fn print_error(mut p: *mut i8) {
+    let mut box_vertical = b"    |\0" as *const u8 as *const i8;
+    strcpy(p, box_vertical);
 }
 "#;
 
@@ -374,6 +403,54 @@ fn w6l_nul_the_catcher_stays_held_at_its_local_callee_argument() {
         "{decisions:#?}"
     );
     assert_eq!(reason(&decisions, "s", true), "<emitted>", "{decisions:#?}");
+}
+
+/// W6 — both halves of the R419-3 hold exempt a literal-only source, and the
+/// sibling audit states the premise at each site.
+#[test]
+fn w6l_nul_w6_a_literal_source_is_not_a_pending_sibling_site() {
+    let decisions = super::emit_tests::decisions_of(PROBE_LITERAL_SIBLING);
+    assert_eq!(
+        reason(&decisions, "fmt", false),
+        "<emitted>",
+        "{decisions:#?}"
+    );
+    assert_eq!(
+        reason(&decisions, "box_vertical", false),
+        "<emitted>",
+        "{decisions:#?}"
+    );
+    let (source, artifacts) = emitted_source(PROBE_LITERAL_SIBLING);
+    assert!(source.contains("sprintf(path, fmt.as_ptr(),"), "{source}");
+    assert!(
+        source.contains("strcpy(p.as_mut_ptr(), box_vertical.as_ptr())"),
+        "{source}"
+    );
+    // `tmp_path` (a parameter) is still a pending source at `sprintf`; the
+    // literals are not.
+    assert!(
+        artifacts.pending_sibling_receipts.iter().all(|site| site
+            .receipt
+            .potential
+            .site
+            .argument_index
+            == 2
+            && site.receipt.potential.site.callee.path == "sprintf"),
+        "the one pending site left is tmp_path's: {:#?}",
+        artifacts.pending_sibling_receipts
+    );
+    let literal_rows = artifacts
+        .sibling_audit_rows
+        .iter()
+        .filter(|row| row.outcome == super::sibling_audit::Outcome::LiteralSourceReadOnly)
+        .collect::<Vec<_>>();
+    assert_eq!(literal_rows.len(), 2, "{:#?}", artifacts.sibling_audit_rows);
+    assert!(
+        literal_rows
+            .iter()
+            .all(|row| row.data && row.issues.is_empty()),
+        "{literal_rows:#?}"
+    );
 }
 
 /// W7 — the count's value, not its spelling: one element, no thin-extent hold.

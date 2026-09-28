@@ -169,6 +169,10 @@ pub(crate) struct SiblingPotential {
     pub source_shape: &'static str,
     pub siblings: Vec<SiblingEvidence>,
     pub local_post_call: LocalPostCallEvidence,
+    /// **R608-1:** the source binding only ever holds a string literal
+    /// ([`super::construction::literal_only_binding`]) — a read-only referent
+    /// no sibling can write on a UB-free input, so never a pending site.
+    pub source_literal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,6 +641,9 @@ pub(crate) fn collect_inventory_from(
                 ..
             } => LocalPostCallEvidence::Unknown("native-expression-mir-argument-local-unavailable"),
         };
+        let source_literal = source.declared().is_some_and(|subject| {
+            super::construction::literal_only_binding(tcx, subject.fn_did, subject.hir_id)
+        });
         let potential = SiblingPotential {
             site: site.key.clone(),
             caller,
@@ -647,6 +654,7 @@ pub(crate) fn collect_inventory_from(
             source_shape: site.source_shape,
             siblings,
             local_post_call,
+            source_literal,
         };
         match source_evidence {
             SourceBridgeEvidence::WholeSubject
@@ -1018,6 +1026,22 @@ pub(crate) fn select_pending(
 }
 
 fn pending_site_eligible(potential: &SiblingPotential, state: TerminalSiteState) -> bool {
+    !potential.source_literal && pending_site_premise(potential, state)
+}
+
+/// **R608-1 — the literal-source exemption, stated.** The site meets every
+/// premise of the R419-3 pending hold but its source only ever holds a string
+/// literal: a risky sibling can alias it only by writing a literal, which is
+/// UB in the input already (§28), so the site is an ordinary delivered one.
+/// The sibling audit reports it under its own outcome so the census counts it.
+pub(crate) fn literal_source_exempt(
+    potential: &SiblingPotential,
+    state: TerminalSiteState,
+) -> bool {
+    potential.source_literal && pending_site_premise(potential, state)
+}
+
+fn pending_site_premise(potential: &SiblingPotential, state: TerminalSiteState) -> bool {
     let borrowed_source = match state.source_form {
         Form::NestedSlice { .. } | Form::Cursor { .. } => false,
         Form::Raw => false,

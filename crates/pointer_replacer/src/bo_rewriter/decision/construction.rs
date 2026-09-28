@@ -886,6 +886,66 @@ pub(crate) fn walked_construction<'a>(
     }
 }
 
+/// **R608-1 (STOP 2 of wave-6l 053) — a binding that only ever holds a
+/// string literal.** Its `let` initializer is a NUL-terminated byte-string
+/// literal (or an `if` chain of them, [`Construction::StringLiteral`]'s own arm
+/// test) and nothing in the body assigns to it. Such a binding's referent is
+/// static and read-only, so a sibling argument of the same call that aliases
+/// it can only READ it — writing a string literal is already UB in C, and
+/// crat's claims are conditional on a UB-free input (§28). Read by BOTH halves
+/// of the R419-3 pending sibling-overlap hold, so the decision and the
+/// terminal instrument can never disagree about which sites it exempts.
+pub(crate) fn literal_only_binding(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> bool {
+    let rustc_hir::Node::Pat(pat) = tcx.hir_node(binding) else {
+        return false;
+    };
+    let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(pat.hir_id) else {
+        return false;
+    };
+    let Some(init) = local.init else {
+        return false;
+    };
+    let mut arms = Vec::new();
+    if !(matches!(
+        Collector::peel(init).kind,
+        rustc_hir::ExprKind::Lit(_) | rustc_hir::ExprKind::If(..)
+    ) && Collector::literal_arms(init, &mut arms))
+    {
+        return false;
+    }
+    struct Assigned<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for Assigned<'tcx> {
+        // A closure body assigning the binding would break the premise too.
+        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(lhs, _, _) | rustc_hir::ExprKind::AssignOp(_, lhs, _) =
+                expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut assigned = Assigned {
+        tcx,
+        binding,
+        found: false,
+    };
+    rustc_hir::intravisit::Visitor::visit_body(&mut assigned, tcx.hir_body_owned_by(owner));
+    !assigned.found
+}
+
 pub(crate) fn root_extent(
     tcx: TyCtxt<'_>,
     facts: &ConstructionFacts,

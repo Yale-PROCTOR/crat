@@ -227,6 +227,7 @@ fn pending_site() -> PendingSite {
                 source_shape: "unsealed:deref",
                 siblings: Vec::new(),
                 local_post_call: LocalPostCallEvidence::ParameterProtected,
+                source_literal: false,
             },
             source_form: Form::Ref { mutable: false },
             target_form: Form::Raw,

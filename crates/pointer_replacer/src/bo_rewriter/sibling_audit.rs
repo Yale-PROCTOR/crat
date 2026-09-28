@@ -174,6 +174,10 @@ pub(crate) enum Outcome {
     DeadUnprotected,
     NoRiskySibling,
     PendingWaiver,
+    /// R608-1: the site meets the pending hold's premise, but its source only
+    /// ever holds a string literal — no sibling can write it on a UB-free
+    /// input (§28), so it is delivered as an ordinary site.
+    LiteralSourceReadOnly,
     CoverageGap,
     /// R304-2: the source is a pointer LOADED through the subject — a value,
     /// not a view of it — so the site is held under its own name.
@@ -267,6 +271,9 @@ fn outcome(input: &Input) -> Outcome {
             .is_empty()
     {
         return Outcome::PendingWaiver;
+    }
+    if represented_source && sibling_overlap::literal_source_exempt(potential, input.terminal) {
+        return Outcome::LiteralSourceReadOnly;
     }
     let coverage = SourceBridgeCoverage {
         potential: potential.clone(),

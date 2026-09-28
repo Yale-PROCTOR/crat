@@ -1899,7 +1899,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // held subject.
         Decision::Slice { mutable: false, .. } if literal_construction => {
             // A string literal's referent is static: no frame binding is it.
-            if pending_sibling::pending_site(ctx.facts, receiver_node, true).is_some() {
+            // **R608-1 (STOP 2 approved):** and no sibling can WRITE it on a
+            // UB-free input (§28), so a literal-only binding is never a
+            // pending site — the terminal instrument reads the same predicate
+            // (`sibling_overlap::literal_source_exempt`).
+            if !construction::literal_only_binding(ctx.tcx, subject.fn_did, subject.hir_id)
+                && pending_sibling::pending_site(ctx.facts, receiver_node, true).is_some()
+            {
                 degrade(
                     subject,
                     EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),

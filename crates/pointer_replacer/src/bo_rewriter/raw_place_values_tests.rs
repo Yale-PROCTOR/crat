@@ -120,10 +120,13 @@ fn wave6k_ht_next_raw_field_read_is_a_declared_reborrow() {
 
 /// A static literal is not a raw-place value. Its consumer reads to the NUL,
 /// so the thin reference is held (R272-1). Wave-4's counted-literal rule
-/// (R410-9 (b)) would deliver it as `&[i8]` — but `sprintf(path, fmt, ..)`
-/// writes the sibling `path` at the same call, a pending sibling-overlap site
-/// (R419-3 / R304-2): the literal keeps its raw form under the typed reason
-/// `pending-sibling-overlap`.
+/// (R410-9 (b)) delivers it as `&[i8]` over its own length.
+///
+/// **Re-pinned by R608-1 (wave-6l 054).** `sprintf(path, fmt, ..)` writes the
+/// sibling `path` at the same call, which used to make the site pending
+/// (R419-3 / R304-2); a literal-only binding is exempt — a sibling aliasing a
+/// literal can only read it, writing one is UB in the input (§28). The claim
+/// that survives is the raw-place one: the literal is never a thin reference.
 #[test]
 fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
     ::utils::compilation::run_compiler_on_str(URL_FMT, |tcx| {
@@ -141,14 +144,8 @@ fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
             .find(|(s, _)| s.param_name.as_deref() == Some("fmt"))
             .expect("subject");
         assert!(
-            matches!(
-                decision,
-                Decision::Degraded(super::decision::Degradation {
-                    reason: super::decision::DegradeReason::PendingSiblingOverlap,
-                    ..
-                })
-            ),
-            "{} must keep a typed hold at its pending sibling site: {decision:?}",
+            matches!(decision, Decision::Slice { mutable: false, .. }),
+            "{} delivers as the literal's own shared slice: {decision:?}",
             subject.label
         );
         assert!(
