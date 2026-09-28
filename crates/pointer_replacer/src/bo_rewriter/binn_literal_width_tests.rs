@@ -245,6 +245,31 @@ fn w6b_a_width_the_call_does_not_select_keeps_the_hold() {
                 "97",
             ),
         ),
+        // an access under ANOTHER tag's match: source_type 129 (the call's
+        // literal there) writes eight bytes whatever dest_type selects
+        (
+            "two-tags",
+            fixture(
+                &edited(
+                    "129 => { vint64 = *(psource as *mut i64); }",
+                    "129 => { vint64 = *(psource as *mut i64); *(pdest as *mut i64) = 0; }",
+                ),
+                "i32",
+                "97",
+            ),
+        ),
+        // the place is borrowed, not read or written in place
+        (
+            "borrowed-place",
+            fixture(
+                &edited(
+                    "97 => { *(pdest as *mut i32) = vint64 as i32; }",
+                    "97 => { let r = &mut *(pdest as *mut i32); *r = vint64 as i32; }",
+                ),
+                "i32",
+                "97",
+            ),
+        ),
         // the wildcard arm accesses: an access under no literal
         (
             "wildcard-access",
