@@ -1979,3 +1979,75 @@ pub unsafe extern "C" fn url_parse(mut n: usize, mut data: *mut url_data_t) -> i
     );
     assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
 }
+
+/// **R641-11 (a), from the review of `38dccedfd`.** A kept guard's return is
+/// copied in the enclosing function's own spelling (`return 0 as *mut rec;`).
+/// Where the allocation-return certificate converts THAT function's return
+/// (`make`'s owner `r`), the copy would no longer type — so the libc row
+/// yields the scratch owner, and the certificate renders the original guard's
+/// return as its own `None`.
+#[test]
+fn w6a_r641_a_kept_guard_in_a_certified_function_yields() {
+    const MAKE: &str = r#"
+// w6a-r641-certified-scratch
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct rec {
+    pub n: usize,
+    pub first: u32,
+}
+pub unsafe extern "C" fn make(mut n: usize) -> *mut rec {
+    let mut r = malloc(::std::mem::size_of::<rec>() as std::os::raw::c_ulong) as *mut rec;
+    (*r).n = n;
+    (*r).first = 0 as u32;
+    let mut buf = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<u32>() as std::os::raw::c_ulong)) as *mut u32;
+    if buf.is_null() {
+        return 0 as *mut rec;
+    }
+    *buf.offset(0 as isize) = 7 as u32;
+    free(buf as *mut core::ffi::c_void);
+    return r;
+}
+pub unsafe extern "C" fn use_make(mut n: usize) -> usize {
+    let mut r = make(n);
+    if r.is_null() {
+        return 0 as usize;
+    }
+    let mut k = (*r).n;
+    free(r as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6a-r641-certified-scratch",
+        Vec::new(),
+        vec![
+            ("make::r".to_owned(), SlotKind::Owning),
+            ("use_make::r".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted("r641-certified-scratch", MAKE);
+    super::test_model_override::clear();
+    let text = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{:#?}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.allocator_contract_receipts,
+        out.degradations,
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate callee=make output=Option<Box<"),
+        "{context}"
+    );
+    assert!(!text.contains("letmutbuf:Box<"), "{context}");
+    assert!(text.contains("ifbuf.is_null(){returnNone;}"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+}

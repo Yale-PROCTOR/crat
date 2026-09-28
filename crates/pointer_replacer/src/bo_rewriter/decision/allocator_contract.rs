@@ -168,6 +168,9 @@ pub(crate) struct Plans {
     pub(crate) yields: Vec<(String, String)>,
     /// Admitted rows: (label, receipt).
     pub(crate) admitted: Vec<(String, String)>,
+    /// **R641-11 (a)** — owners whose null guard is kept on the raw result;
+    /// its return is copied in the enclosing function's raw spelling.
+    pub(crate) kept_guards: FxHashSet<(LocalDefId, HirId)>,
     /// **R450-8 rung 3**: owners whose release is a callee's — (owner, callee,
     /// argument index, label, whether this contract's refusals are receipts).
     /// [`confirm_transfers`] demotes every owner whose callee the chain did
@@ -231,6 +234,19 @@ impl Plans {
 pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
     let node = (subject.fn_did, subject.hir_id);
     if let Some(plan) = ctx.allocator_contracts.plans.get(&node) {
+        // R641-11 (a), from the review of `38dccedfd`: a kept guard's return
+        // is copied in the enclosing function's raw spelling. Where the
+        // return certificate converts that function's return, the copy would
+        // not type, so the libc row yields the owner (a receipt, never a
+        // decision) and the certificate renders the original guard's return.
+        if ctx.allocator_contracts.kept_guards.contains(&node)
+            && ctx
+                .return_certificates
+                .callees
+                .contains_key(&subject.fn_did)
+        {
+            return None;
+        }
         return Some(Decision::Box(plan.clone()));
     }
     let (_, hold) = ctx.allocator_contracts.holds.get(&node)?;
@@ -1511,6 +1527,9 @@ pub(crate) fn derive<'tcx>(
                     implicit_scope_close: false,
                 },
             );
+            if !kept_guards.is_empty() {
+                out.kept_guards.insert(node);
+            }
         }
         // **A move's destination must be an owner this rule ADMITS**, not
         // merely a candidate (report 027). The destination has its own uses and
