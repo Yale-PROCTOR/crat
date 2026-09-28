@@ -825,6 +825,73 @@ fn w6l_nul_c12_an_unstated_callee_width_keeps_the_hold() {
     );
 }
 
+/// C13 (R631-3, Codex 059) — a dereference that only forms an address is not
+/// an access: the callee takes `&raw const *(p as *const u8)` and reads a
+/// `u32` through it, beside ordinary `u8` reads. The hold stays.
+const PROBE_ADDRESS_THEN_WIDER: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn ReadVia(p: *const core::ffi::c_void) -> u32 {
+    let q = &raw const *(p as *const u8);
+    (*(p as *const u8) as u32).wrapping_add(q.cast::<u32>().read_unaligned())
+}
+unsafe fn Hash5(data: *const u8) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let h = ReadVia(data as *const core::ffi::c_void);
+    return h.wrapping_add(*data as u32);
+}
+pub struct Ctx {
+    pub data: *const u8,
+}
+pub unsafe fn caller(mut ctx: *mut Ctx) -> u32 {
+    Hash5((*ctx).data)
+}
+"#;
+
+#[test]
+fn w6l_nul_c13_an_address_formed_by_a_dereference_keeps_the_hold() {
+    let decisions = super::emit_tests::decisions_of(PROBE_ADDRESS_THEN_WIDER);
+    assert_eq!(
+        reason(&decisions, "data", true),
+        "held:local-callee-access-extent",
+        "{decisions:#?}"
+    );
+}
+
+/// C14 (R631-3, Codex 059) — a wider read inside a closure the callee runs is
+/// an access too.
+const PROBE_CLOSURE_WIDER: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn ReadClosure(p: *const core::ffi::c_void) -> u32 {
+    let wide = || unsafe { *(p as *const u32) };
+    (*(p as *const u8) as u32).wrapping_add(wide())
+}
+unsafe fn Hash6(data: *const u8) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let h = ReadClosure(data as *const core::ffi::c_void);
+    return h.wrapping_add(*data as u32);
+}
+pub struct Ctx {
+    pub data: *const u8,
+}
+pub unsafe fn caller(mut ctx: *mut Ctx) -> u32 {
+    Hash6((*ctx).data)
+}
+"#;
+
+#[test]
+fn w6l_nul_c14_a_wider_read_in_a_closure_keeps_the_hold() {
+    let decisions = super::emit_tests::decisions_of(PROBE_CLOSURE_WIDER);
+    assert_eq!(
+        reason(&decisions, "data", true),
+        "held:local-callee-access-extent",
+        "{decisions:#?}"
+    );
+}
+
 const CONTROL_ONE_ELEMENT_LOCAL: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case)]
 unsafe fn read_one(p: *const u32) -> u32 {

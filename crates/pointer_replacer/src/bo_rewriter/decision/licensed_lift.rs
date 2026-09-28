@@ -693,6 +693,20 @@ fn access_widths(
                         }
                     }
                     ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
+                        // A dereference that only forms an address
+                        // (`&raw const *p`, `&*p`) accesses nothing here and
+                        // hands a pointer on whose later width is unseen
+                        // (Codex 059).
+                        if matches!(
+                            self.tcx.parent_hir_node(parent.hir_id),
+                            Node::Expr(rustc_hir::Expr {
+                                kind: ExprKind::AddrOf(..),
+                                ..
+                            })
+                        ) {
+                            self.unknown = true;
+                            return;
+                        }
                         match self.width_of(current) {
                             Some(width) => self.widths.push(width),
                             None => self.unknown = true,
@@ -739,6 +753,13 @@ fn access_widths(
         }
     }
     impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+        // A closure the callee runs reads through its captures (Codex 059).
+        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+
         fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
             if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
                 && path.res == rustc_hir::def::Res::Local(self.binding)
