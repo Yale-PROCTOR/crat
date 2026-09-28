@@ -569,6 +569,7 @@ impl PairDisjointnessIndex {
                 classify_locals(tcx, typeck, body, &allocators, caller);
             carry_fresh_field_reads(tcx, typeck, body, &mut classes, &fresh_fields, &getters);
             binding_roots.insert(caller.local_def_index.as_u32(), classes.clone());
+            let stable = stable_bindings(typeck, body);
             let mut collector = CallCollector {
                 tcx,
                 typeck,
@@ -577,6 +578,7 @@ impl PairDisjointnessIndex {
                 fresh_fields: &fresh_fields,
                 why: &why,
                 prefixes: &prefixes,
+                stable: &stable,
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -3861,6 +3863,8 @@ struct CallCollector<'a, 'tcx> {
     why: &'a FxHashMap<HirId, UnknownWhy>,
     /// R513-3: the place each single-definition view local is a view OF.
     prefixes: &'a FxHashMap<HirId, PlacePath>,
+    /// R628-7: the bindings that name one storage for the whole body.
+    stable: &'a FxHashSet<HirId>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -3900,19 +3904,25 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                             RootClass::FreshField {
                                 adt,
                                 field,
-                                base,
                                 via_offset: false,
                                 ..
                             },
-                            ExprKind::Field(..),
-                        ) => field_stored_since_entry(
-                            self.tcx,
-                            self.typeck,
-                            self.classes,
-                            expr,
-                            (adt, field),
-                            base,
-                        ),
+                            ExprKind::Field(object, _),
+                        ) => place_provenance(self.tcx, self.typeck, self.classes, object)
+                            .1
+                            // R628-7: a place rooted at a binding that moves
+                            // names other storage at the call than at the store.
+                            .filter(|base| self.stable.contains(&base.root))
+                            .is_some_and(|base| {
+                                field_stored_since_entry(
+                                    self.tcx,
+                                    self.typeck,
+                                    self.classes,
+                                    expr,
+                                    (adt, field),
+                                    &base,
+                                )
+                            }),
                         _ => false,
                     };
                     ArgRecord {
@@ -3945,7 +3955,58 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
     }
 }
 
-/// R624-1 (f): does a store into field `key` of the object `base` run on every
+/// R628-7: the bindings that name ONE storage for the whole body — never the
+/// whole target of an assignment and, for a pointer, whose own address is never
+/// taken (a callee could re-point it). A place rooted at one is the same place
+/// at a store and at a later read.
+fn stable_bindings<'tcx>(
+    typeck: &TypeckResults<'tcx>,
+    body: &'tcx rustc_hir::Body<'tcx>,
+) -> FxHashSet<HirId> {
+    struct Scan<'a, 'tcx> {
+        typeck: &'a TypeckResults<'tcx>,
+        bindings: FxHashSet<HirId>,
+        moved: FxHashSet<HirId>,
+    }
+    impl<'tcx> Visitor<'tcx> for Scan<'_, 'tcx> {
+        fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
+            if let PatKind::Binding(_, hir_id, ..) = pat.kind {
+                self.bindings.insert(hir_id);
+            }
+            intravisit::walk_pat(self, pat);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            match &expr.kind {
+                ExprKind::Assign(place, _, _) | ExprKind::AssignOp(_, place, _) => {
+                    if let Some(binding) = resolved_local(peel_casts(place)) {
+                        self.moved.insert(binding);
+                    }
+                }
+                ExprKind::AddrOf(_, _, operand) => {
+                    if let Some(binding) = resolved_local(peel_casts(operand))
+                        && matches!(self.typeck.node_type(binding).kind(), ty::RawPtr(..))
+                    {
+                        self.moved.insert(binding);
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut scan = Scan {
+        typeck,
+        bindings: FxHashSet::default(),
+        moved: FxHashSet::default(),
+    };
+    scan.visit_body(body);
+    scan.bindings
+        .retain(|binding| !scan.moved.contains(binding));
+    scan.bindings
+}
+
+/// R624-1 (f): does a store into field `key` of the place `base` run on every
 /// path from the caller's entry to `call`? Every EARLIER statement of every
 /// block enclosing the call lies on each such path — structured control flow:
 /// a `return`, `break` or `continue` only removes paths — so one of them
@@ -3957,7 +4018,7 @@ fn field_stored_since_entry<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     call: &Expr<'_>,
     key: (DefId, Symbol),
-    base: HirId,
+    base: &PlacePath,
 ) -> bool {
     for (_, node) in tcx.hir_parent_iter(call.hir_id) {
         match node {
@@ -3983,7 +4044,7 @@ fn field_stored_since_entry<'tcx>(
     false
 }
 
-/// A statement that stores field `key` of `base`: the assignment itself, or a
+/// A statement that stores field `key` of the place `base`: the assignment, or a
 /// plain block (every statement of which runs) holding one.
 fn statement_stores_field<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -3991,7 +4052,7 @@ fn statement_stores_field<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     stmt: &rustc_hir::Stmt<'_>,
     key: (DefId, Symbol),
-    base: HirId,
+    base: &PlacePath,
 ) -> bool {
     let (StmtKind::Semi(expr) | StmtKind::Expr(expr)) = stmt.kind else {
         return false;
@@ -4005,15 +4066,19 @@ fn expression_stores_field<'tcx>(
     classes: &FxHashMap<HirId, RootClass>,
     expr: &Expr<'_>,
     key: (DefId, Symbol),
-    base: HirId,
+    base: &PlacePath,
 ) -> bool {
     match &expr.kind {
         ExprKind::Assign(place, _, _) => {
             let ExprKind::Field(object, field) = &peel_casts(place).kind else {
                 return false;
             };
+            // R628-7: the SAME place the argument reads, not only the same
+            // root object — `(*t).a.map` is not `(*t).b.map`.
             data_field_key(tcx, typeck, object, field.name) == Some(key)
-                && place_provenance(tcx, typeck, classes, object).0.object_id() == Some(base)
+                && place_provenance(tcx, typeck, classes, object)
+                    .1
+                    .is_some_and(|stored| stored.same_place(base))
         }
         ExprKind::Block(block, None) => {
             block

@@ -164,6 +164,28 @@ pub unsafe fn Build(mut x: *mut u32, mut mb: *mut Split) {
 }
 "#;
 
+/// C9: the store is into the SAME field key of the same root object, but at
+/// another place — `(*t).a.map` stored, `(*t).b.map` read. `b.map`'s block may
+/// predate the entry.
+const STORED_INTO_A_SIBLING_PLACE: &str = r#"
+#[repr(C)]
+pub struct Two { pub a: Split, pub b: Split }
+pub unsafe fn Build(mut x: *mut u32, mut t: *mut Two) {
+    (*t).a.map = malloc(16) as *mut u32;
+    Use2(x, (*t).b.map);
+}
+"#;
+
+/// C10: the base pointer moves between the store and the call — `(*p).map` at
+/// the call is the NEXT element's field, whose block may predate the entry.
+const THE_BASE_MOVES_AFTER_THE_STORE: &str = r#"
+pub unsafe fn Build(mut x: *mut u32, mut p: *mut Split) {
+    (*p).map = malloc(16) as *mut u32;
+    p = p.offset(1);
+    Use2(x, (*p).map);
+}
+"#;
+
 fn source(extra: &str) -> String {
     format!("{PRELUDE}{extra}")
 }
@@ -228,4 +250,14 @@ fn w6p_r624_f_a_store_in_the_callers_callee_is_out_of_the_local_form() {
 #[test]
 fn w6p_r624_f_a_local_read_before_the_store_is_refused() {
     refused(A_LOCAL_READ_BEFORE_THE_STORE, "Build");
+}
+
+#[test]
+fn w6p_r624_f_a_store_into_a_sibling_place_is_refused() {
+    refused(STORED_INTO_A_SIBLING_PLACE, "Build");
+}
+
+#[test]
+fn w6p_r624_f_a_base_that_moves_after_the_store_is_refused() {
+    refused(THE_BASE_MOVES_AFTER_THE_STORE, "Build");
 }
