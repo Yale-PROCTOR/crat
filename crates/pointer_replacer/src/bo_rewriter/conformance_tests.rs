@@ -208,3 +208,52 @@ fn conformance_core_coverage_catches_a_foreign_construct() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// **RetainedLifecycle over MIR (C2b, R615-1) — implicit releases.** A Box
+/// owner live at an early return is released by its scope-exit drop, which no
+/// syntax shows. With the census's `waiver-drop(scope-exit)` receipt for the
+/// function the release is receipted; the fault removes the receipt.
+#[test]
+fn conformance_retained_lifecycle_catches_an_unreceipted_implicit_release() {
+    let Some(script) = tool("c2b_implicit_release.py") else {
+        println!("SKIP conformance_retained_lifecycle (C2b): docs/agents/tools/conformance absent");
+        return;
+    };
+    let deps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deps_crate/target/debug/deps");
+    if !deps.exists() {
+        println!("SKIP conformance_retained_lifecycle (C2b): deps_crate not built");
+        return;
+    }
+    let dir = scratch("c2b");
+    let (census, out) = (dir.join("census"), dir.join("mir"));
+    fs::create_dir_all(census.join("emitted-trees/p")).unwrap();
+    fs::write(
+        census.join("emitted-trees/p/lib.rs"),
+        "pub unsafe fn f(flag: i32) -> i32 {\n\
+             let b: Option<Box<i32>> = Some(Box::new(1));\n\
+             if flag != 0 {\n\
+                 return 0;\n\
+             }\n\
+             drop(b);\n\
+             1\n\
+         }\n",
+    )
+    .unwrap();
+    let receipts = census.join("p.return-certificate-receipts.tsv");
+    fs::write(
+        &receipts,
+        "function\treceipt\ncrate::f\twaiver-drop(scope-exit) site=<program>/lib.rs:2:9: 2:10\n",
+    )
+    .unwrap();
+    let args = [census.as_path(), out.as_path(), deps.as_path()];
+    let clean = receipt(&script, &args, "p");
+    assert_eq!(
+        (field(&clean, "scope_exit"), field(&clean, "unreceipted")),
+        ("1", "0"),
+        "{clean}"
+    );
+    fs::write(&receipts, "function\treceipt\n").unwrap();
+    let faulted = receipt(&script, &args, "p");
+    assert_eq!(field(&faulted, "unreceipted"), "1", "{faulted}");
+    fs::remove_dir_all(dir).unwrap();
+}
