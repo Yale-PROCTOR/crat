@@ -449,8 +449,8 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
     // A count that spells a CALL is not licensed as the constructions' length
     // (each construction would evaluate it again): both constructions take
-    // the fabricated extent under the waiver and the count stays the single,
-    // original scalar argument inside its conditional.
+    // the arrays' own length (R625) and the count stays the single, original
+    // scalar argument inside its conditional.
     let source = r#"
         #![allow(dead_code, unused_unsafe, static_mut_refs)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -477,9 +477,9 @@ fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() 
     let count_pos = output.rfind("next_n()").expect("count remains");
     assert!(count_pos > if_pos, "the count was hoisted: {output}");
     assert_eq!(
-        output.matches("crate::FALLBACK_SLICE_EXTENT").count(),
+        output.matches("(4) as usize").count(),
         2,
-        "both constructions take the waived extent rather than re-evaluating the count:\n{output}"
+        "both constructions take the arrays' length rather than re-evaluating the count:\n{output}"
     );
 }
 
@@ -743,15 +743,16 @@ fn ce_d03_a_raw_caller_argument_keeps_the_promotion() {
     );
     assert!(source.contains("name: &[i8]"), "{source}");
     assert!(
-        source.contains("core::slice::from_raw_parts(KEY.as_ptr(), crate::FALLBACK_SLICE_EXTENT)"),
-        "the raw argument takes the waived fallback extent at the call, never a widened reference:\n{source}"
+        source.contains("core::slice::from_raw_parts(KEY.as_ptr(), (2) as usize)"),
+        "the raw argument takes a construction at the call (R625: the static's own length), never a widened reference:\n{source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
 /// Three hops: the requirement travels `strcmp` → `find_local::name` →
-/// `find::name`; the top caller hands a raw pointer, so exactly one fallback
-/// construction exists and every hop between is zero-syntax.
+/// `find::name`; the top caller hands a raw pointer, so exactly one
+/// construction exists (the static's own length, R625) and every hop between
+/// is zero-syntax.
 const CE_D04_CHAIN: &str = r#"
 #![allow(dead_code, unused_unsafe)]
 extern "C" {
@@ -778,9 +779,11 @@ fn ce_d04_the_requirement_propagates_along_the_whole_chain() {
     assert!(source.contains("fn find(name: &[i8])"), "{source}");
     assert!(source.contains("find_local(name)"), "{source}");
     assert_eq!(
-        source.matches("FALLBACK_SLICE_EXTENT").count(),
-        2,
-        "one construction at the top plus the constant's declaration:\n{source}"
+        source
+            .matches("from_raw_parts(KEY.as_ptr(), (2) as usize)")
+            .count(),
+        1,
+        "one construction, at the top:\n{source}"
     );
     assert!(!source.contains("from_ref("), "{source}");
 }
@@ -933,12 +936,15 @@ fn ce_f02_fwrite_composes_a_non_unit_size_into_the_count() {
         "{plans:#?}"
     );
     // The composed spelling is not a single parameter, so no caller argument
-    // carries it: the caller's construction takes the fallback extent, and the
-    // callee's own bridge still reads `4 * n` bytes of a slice that is at least
-    // that long under the waiver.
+    // carries it: the caller's construction takes the array's own length
+    // (R625), and the callee's own bridge still reads `4 * n` bytes of a slice
+    // that a UB-free input makes at least that long.
     let output = attested_emitted(CE_F02_FWRITE_COMPOSED_SIZE);
     assert!(output.contains("buffer: &[u8]"), "{output}");
-    assert!(output.contains("crate::FALLBACK_SLICE_EXTENT"), "{output}");
+    assert!(
+        output.contains("from_raw_parts(bytes.as_ptr(), (16) as usize)"),
+        "{output}"
+    );
 }
 
 /// A non-byte element (`fwrite(values, 8, n, f)` over `*const f64`) keeps
@@ -1031,10 +1037,8 @@ fn ce_a01_a_nul_contract_alone_parameter_promotes_over_ptr_fatness() {
     assert!(source.contains("fdopen(fh, mode.as_ptr())"), "{source}");
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains(
-            "core::slice::from_raw_parts(OUT_NAME.as_mut_ptr(), crate::FALLBACK_SLICE_EXTENT)"
-        ),
-        "the array-decay caller takes the waived fallback extent:\n{source}"
+        flat.contains("core::slice::from_raw_parts(OUT_NAME.as_mut_ptr(), (8) as usize)"),
+        "the array-decay caller takes the array's length (R625):\n{source}"
     );
     assert!(
         flat.contains(
