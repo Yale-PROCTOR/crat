@@ -257,3 +257,216 @@ fn conformance_retained_lifecycle_catches_an_unreceipted_implicit_release() {
     assert_eq!(field(&faulted, "unreceipted"), "1", "{faulted}");
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// The receipt line of `condition` for `program` (x_instruments prints three).
+fn x_receipt(script: &Path, args: &[&Path], condition: &str) -> String {
+    let output = Command::new("python3")
+        .arg(script)
+        .args(args)
+        .output()
+        .expect("python3 runs the checker");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("conformance {condition} program=p ")))
+        .unwrap_or_else(|| {
+            panic!(
+                "no {condition} receipt:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .to_owned()
+}
+
+/// A census fixture for the X instruments: the tree, the census's frame
+/// columns, and the tables they read.
+fn x_fixture(tag: &str, tree: &str, receipts: &str, admissions: &str) -> (PathBuf, PathBuf) {
+    let dir = scratch(tag);
+    let census = dir.join("census");
+    fs::create_dir_all(census.join("emitted-trees/p")).unwrap();
+    fs::write(census.join("emitted-trees/p/lib.rs"), tree).unwrap();
+    fs::write(census.join("p.return-certificate-receipts.tsv"), receipts).unwrap();
+    let frame = "c\tL\tsha\tw\ttrue\trelease\t0\t0\tm\tw\ta\tx\ty";
+    let header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\t\
+                  resource_configured_mib\tresource_effective_mib\ta5_mode\ta5_world\ta5_attestation\t\
+                  cache_manifest_sha256\tlaunch_env_sha256";
+    let rows: String = admissions
+        .lines()
+        .map(|row| format!("{frame}\t{row}\n"))
+        .collect();
+    fs::write(
+        census.join("p.raw-boundary-ownership-fields-native.tsv"),
+        format!(
+            "{header}\tprogram\tsubject_key\towner_fn\tmir_local\tis_param\tptr_depth\t\
+             model_kind\tfinal_decision\tconsidered\tnative_status\n{rows}"
+        ),
+    )
+    .unwrap();
+    (dir, census)
+}
+
+/// **GeneratedRetirement (R625-3)** — every Drop of a Box-carrying place is a
+/// row. A scope-exit release with its `waiver-drop(scope-exit)` receipt is
+/// receipted; the fault removes the receipt.
+#[test]
+fn conformance_generated_retirement_catches_an_unreceipted_release() {
+    let Some(script) = tool("x_instruments.py") else {
+        println!("SKIP conformance_generated_retirement: docs/agents/tools/conformance absent");
+        return;
+    };
+    let deps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deps_crate/target/debug/deps");
+    if !deps.exists() {
+        println!("SKIP conformance_generated_retirement: deps_crate not built");
+        return;
+    }
+    let tree = "pub unsafe fn f(flag: i32) -> i32 {\n\
+                    let b: Option<Box<i32>> = Some(Box::new(1));\n\
+                    if flag != 0 {\n\
+                        return 0;\n\
+                    }\n\
+                    drop(b);\n\
+                    1\n\
+                }\n";
+    let admit = "p\tcrate::f::b#1\tcrate::f\t1\tfalse\t1\towning\tbox\ttrue\tselected";
+    let receipt =
+        "function\treceipt\ncrate::f\twaiver-drop(scope-exit) site=<program>/lib.rs:2:9: 2:10\n";
+    let (dir, census) = x_fixture("x1", tree, receipt, admit);
+    let out = dir.join("out");
+    let args = [census.as_path(), out.as_path(), deps.as_path()];
+    let clean = x_receipt(&script, &args, "GeneratedRetirement");
+    assert_eq!(
+        (
+            field(&clean, "implicit_release_sites"),
+            field(&clean, "unreceipted"),
+            field(&clean, "unwind")
+        ),
+        ("1", "0", "0"),
+        "{clean}"
+    );
+    fs::write(
+        census.join("p.return-certificate-receipts.tsv"),
+        "function\treceipt\n",
+    )
+    .unwrap();
+    let faulted = x_receipt(&script, &args, "GeneratedRetirement");
+    assert_eq!(field(&faulted, "unreceipted"), "1", "{faulted}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// **RemainingRoots (R625-3)** — an implicit release is accounted when its
+/// owner's admission receipt exists and no pointer derived from the owner is
+/// live at the drop. Two faults: a raw alias read after the drop, and the
+/// admission row removed.
+#[test]
+fn conformance_remaining_roots_catches_a_live_alias_and_a_missing_admission() {
+    let Some(script) = tool("x_instruments.py") else {
+        println!("SKIP conformance_remaining_roots: docs/agents/tools/conformance absent");
+        return;
+    };
+    let deps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deps_crate/target/debug/deps");
+    if !deps.exists() {
+        println!("SKIP conformance_remaining_roots: deps_crate not built");
+        return;
+    }
+    let tree = |use_after: &str| {
+        format!(
+            "pub unsafe fn g(flag: i32) -> i32 {{\n\
+                 let p: *const i32;\n\
+                 {{\n\
+                     let b: Box<i32> = Box::new(7);\n\
+                     p = &*b;\n\
+                 }}\n\
+                 {use_after}\n\
+                 let _ = (flag, p);\n\
+                 0\n\
+             }}\n"
+        )
+    };
+    let admit = "p\tcrate::g::b#3\tcrate::g\t3\tfalse\t1\towning\tbox\ttrue\tselected";
+    let receipt =
+        "function\treceipt\ncrate::g\twaiver-drop(scope-exit) site=<program>/lib.rs:4:13: 4:14\n";
+    let (dir, census) = x_fixture("x2", &tree(""), receipt, admit);
+    let out = dir.join("out");
+    let args = [census.as_path(), out.as_path(), deps.as_path()];
+    let clean = x_receipt(&script, &args, "RemainingRoots");
+    assert_eq!(
+        (field(&clean, "all_roots"), field(&clean, "unproved")),
+        ("1", "0"),
+        "{clean}"
+    );
+    fs::write(
+        census.join("emitted-trees/p/lib.rs"),
+        tree("if flag != 0 { return *p; }"),
+    )
+    .unwrap();
+    let alias = x_receipt(&script, &args, "RemainingRoots");
+    assert_eq!(
+        field(&alias, "unproved"),
+        "1",
+        "a live alias at the drop: {alias}"
+    );
+    fs::write(census.join("emitted-trees/p/lib.rs"), tree("")).unwrap();
+    let (_, census2) = (dir.clone(), census.clone());
+    fs::write(
+        census2.join("p.raw-boundary-ownership-fields-native.tsv"),
+        "corpus\tanalysis_frame\n",
+    )
+    .unwrap();
+    let unadmitted = x_receipt(&script, &args, "RemainingRoots");
+    assert_eq!(
+        field(&unadmitted, "unproved"),
+        "1",
+        "no admission: {unadmitted}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// **OwnershipRealization (R625-3)** — the owner ledger: a Box closed by its
+/// explicit `drop` (the C free site's image) is `closed_explicit`; the fault
+/// deletes the drop, and the close becomes implicit.
+#[test]
+fn conformance_ownership_realization_catches_a_deleted_drop() {
+    let Some(script) = tool("x_instruments.py") else {
+        println!("SKIP conformance_ownership_realization: docs/agents/tools/conformance absent");
+        return;
+    };
+    let deps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deps_crate/target/debug/deps");
+    if !deps.exists() {
+        println!("SKIP conformance_ownership_realization: deps_crate not built");
+        return;
+    }
+    let tree = |release: &str| {
+        format!(
+            "pub unsafe fn h() -> i32 {{\n\
+                 let c: Box<i32> = Box::new(3);\n\
+                 let v = *c;\n\
+                 {release}\n\
+                 v\n\
+             }}\n"
+        )
+    };
+    let (dir, census) = x_fixture("x3", &tree("drop(c);"), "function\treceipt\n", "");
+    let out = dir.join("out");
+    let args = [census.as_path(), out.as_path(), deps.as_path()];
+    let clean = x_receipt(&script, &args, "OwnershipRealization");
+    assert_eq!(
+        (
+            field(&clean, "closed_explicit"),
+            field(&clean, "closed_implicit"),
+            field(&clean, "open")
+        ),
+        ("1", "0", "0"),
+        "{clean}"
+    );
+    fs::write(census.join("emitted-trees/p/lib.rs"), tree("")).unwrap();
+    let faulted = x_receipt(&script, &args, "OwnershipRealization");
+    assert_eq!(
+        (
+            field(&faulted, "closed_explicit"),
+            field(&faulted, "closed_implicit")
+        ),
+        ("0", "1"),
+        "{faulted}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
