@@ -340,7 +340,15 @@ pub(crate) fn collect(
             elements: if byte_pointee(&element_pointee(fact)) {
                 Ok(count.expression.clone())
             } else {
-                Err(CountGap::UnitsUnproved)
+                // wave-6l (R615-7): a CONSTANT byte count over a sized pointee
+                // divides into an exact element count — the value, never the
+                // spelling (rule 3's evaluator).
+                match (count.constant_bytes, count.operand_pointee_bytes) {
+                    (Some(bytes), Some(size)) if size > 0 && bytes % size == 0 => {
+                        Ok((bytes / size).to_string())
+                    }
+                    _ => Err(CountGap::UnitsUnproved),
+                }
             },
         });
         let requirement = match contract.extent {

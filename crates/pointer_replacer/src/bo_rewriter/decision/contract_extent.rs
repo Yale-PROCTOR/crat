@@ -328,7 +328,15 @@ pub(crate) fn select(
         // Equal expression text at two calls is not an equal dynamic value.
         // Until a covering backing extent is proved, retain both sites and
         // attribute the missing length instead of selecting a source-order win.
-        LengthPlan::Fallback(FallbackReason::MultipleRequirements)
+        //
+        // wave-6l (R615-7): equal CONSTANT element counts are an equal value —
+        // every site is an exact access of the same literal number of elements
+        // (brotli `dist_cache`: read 4, written 4), so that number is the
+        // evidence. Anything else keeps the fallback.
+        match equal_constant_exact_counts(&sites) {
+            Some(plan) => plan,
+            None => LengthPlan::Fallback(FallbackReason::MultipleRequirements),
+        }
     } else {
         match &sites[0].requirement {
             Requirement::ExactAccess(Some(count)) => match &count.elements {
@@ -371,6 +379,31 @@ pub(crate) fn select(
         length,
         sites,
         contract_alone,
+    })
+}
+
+/// wave-6l (R615-7): every site is `ExactAccess` with a proved element count
+/// that is a decimal constant, and all the constants are equal.
+fn equal_constant_exact_counts(sites: &[ContractSite]) -> Option<LengthPlan> {
+    let mut first: Option<(&CountOperand, u64)> = None;
+    for site in sites {
+        let Requirement::ExactAccess(Some(count)) = &site.requirement else {
+            return None;
+        };
+        let value = count.elements.as_ref().ok()?.trim().parse::<u64>().ok()?;
+        match first {
+            None => first = Some((count, value)),
+            Some((_, seen)) if seen == value => {}
+            Some(_) => return None,
+        }
+    }
+    let (count, value) = first?;
+    Some(LengthPlan::Evidence {
+        elements: value.to_string(),
+        source: LengthSource::ExactContract {
+            site: count.site.clone(),
+            argument_index: count.argument_index,
+        },
     })
 }
 

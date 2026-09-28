@@ -5580,6 +5580,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                             false,
                             Some(LenEvidence::Elsewhere),
                         )
+                    } else if let Some(elements) = contract_count
+                        .as_deref()
+                        .filter(|elements| elements.parse::<u64>().is_ok())
+                    {
+                        // wave-6l (R615-7): an exact contract count that is a
+                        // CONSTANT element count (brotli `dist_cache`: 16
+                        // bytes of `c_int` = 4) names no argument and is the
+                        // same value in every caller's scope.
+                        (Some(elements.to_owned()), false, Some(arm))
                     } else {
                         (
                             companion

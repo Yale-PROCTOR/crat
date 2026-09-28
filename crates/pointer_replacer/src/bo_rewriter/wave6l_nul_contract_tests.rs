@@ -816,3 +816,162 @@ fn w6l_nul_c6_a_one_element_local_callee_keeps_the_thin_optional() {
         artifacts.licensed_lifts
     );
 }
+
+/// brotli `BrotliCreateHqZopfliBackwardReferences::dist_cache#9`: `memcpy`
+/// both ways of `4 * size_of::<c_int>()` bytes — four elements spelled in
+/// bytes, at two exact sites.
+const PROBE_DIST_CACHE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: *mut i32) {
+    let mut orig_dist_cache: [i32; 4] = [0; 4];
+    memcpy(orig_dist_cache.as_mut_ptr() as *mut core::ffi::c_void,
+        dist_cache as *const core::ffi::c_void,
+        (4 as i32 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
+    if num_bytes > 1 {
+        memcpy(dist_cache as *mut core::ffi::c_void,
+            orig_dist_cache.as_mut_ptr() as *const core::ffi::c_void,
+            (4 as i32 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
+    }
+}
+pub struct State {
+    pub dist_cache_: [i32; 16],
+}
+pub unsafe fn caller(mut s: *mut State, mut n: u64) {
+    ZopfliRefs(n, ((*s).dist_cache_).as_mut_ptr());
+}
+"#;
+
+/// The subject's contract-extent length plan, rendered.
+fn contract_length(fixture: &str, subject: &str) -> String {
+    ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(fixture),
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx(tcx)?;
+            let (key, _) = table
+                .entries
+                .iter()
+                .find(|(entry, _)| entry.param_name.as_deref() == Some(subject))
+                .map(|(entry, decision)| ((entry.fn_did, entry.hir_id), decision))
+                .ok_or_else(|| format!("no subject {subject}"))?;
+            Ok::<_, String>(
+                table
+                    .contract_extent_promotions
+                    .get(&key)
+                    .map_or_else(|| "no-promotion".to_owned(), |p| format!("{:?}", p.length)),
+            )
+        },
+    )
+    .expect("fixture compiles")
+    .expect("subject found")
+}
+
+fn flat(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// W9 (R615-7, STOP 2) — the count's value divided by the pointee's size is
+/// an exact element count, the two sites agree on it, and every caller
+/// constructs over it instead of the §77 fallback.
+#[test]
+fn w6l_nul_w9_a_constant_byte_count_is_an_element_count_at_every_caller() {
+    let length = contract_length(PROBE_DIST_CACHE, "dist_cache");
+    assert!(length.starts_with("Evidence { elements: \"4\""), "{length}");
+    let (source, _) = emitted_source(PROBE_DIST_CACHE);
+    let source = flat(&source);
+    assert!(
+        source.contains("fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: &mut [i32])"),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            "core::slice::from_raw_parts_mut(((*s).dist_cache_).as_mut_ptr(), (4) as usize)"
+        ),
+        "{source}"
+    );
+    assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+}
+
+/// C7 — a constant that is not a whole number of elements claims none.
+const CONTROL_PARTIAL_ELEMENT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn head(mut dist_cache: *mut i32) {
+    let mut out: [u8; 8] = [0; 8];
+    memcpy(out.as_mut_ptr() as *mut core::ffi::c_void,
+        dist_cache as *const core::ffi::c_void, 6 as u64);
+}
+pub unsafe fn caller(mut p: *mut i32) {
+    head(p);
+}
+"#;
+
+/// C8 — two constant sites that disagree are two requirements. The caller
+/// hands an initialized array, so the WRITE site is a site too (a write
+/// position counts only over initialized elements).
+const CONTROL_UNEQUAL_CONSTANTS: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn refs(mut num_bytes: u64, mut dist_cache: *mut i32) {
+    let mut orig: [i32; 4] = [0; 4];
+    memcpy(orig.as_mut_ptr() as *mut core::ffi::c_void,
+        dist_cache as *const core::ffi::c_void,
+        (4 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
+    if num_bytes > 1 {
+        memcpy(dist_cache as *mut core::ffi::c_void,
+            orig.as_mut_ptr() as *const core::ffi::c_void,
+            (2 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
+    }
+}
+pub struct State {
+    pub dist_cache_: [i32; 16],
+}
+pub unsafe fn caller(mut s: *mut State, mut n: u64) {
+    refs(n, ((*s).dist_cache_).as_mut_ptr());
+}
+"#;
+
+/// C9 — a runtime byte count over a sized pointee proves no units.
+const CONTROL_RUNTIME_BYTES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn copy_in(mut dst: *mut u8, mut src: *const i32, mut n: u64) {
+    memcpy(dst as *mut core::ffi::c_void, src as *const core::ffi::c_void,
+        n.wrapping_mul(::std::mem::size_of::<i32>() as u64));
+}
+pub unsafe fn caller(mut d: *mut u8, mut s: *const i32, mut n: u64) {
+    copy_in(d, s, n);
+}
+"#;
+
+#[test]
+fn w6l_nul_c7_a_partial_element_constant_stays_fallback() {
+    let length = contract_length(CONTROL_PARTIAL_ELEMENT, "dist_cache");
+    assert!(!length.starts_with("Evidence"), "{length}");
+    let (source, _) = emitted_source(CONTROL_PARTIAL_ELEMENT);
+    assert!(!flat(&source).contains("(1) as usize"), "{source}");
+}
+
+#[test]
+fn w6l_nul_c8_unequal_constant_sites_stay_fallback() {
+    let length = contract_length(CONTROL_UNEQUAL_CONSTANTS, "dist_cache");
+    assert_eq!(length, "Fallback(MultipleRequirements)");
+    let (source, _) = emitted_source(CONTROL_UNEQUAL_CONSTANTS);
+    let source = flat(&source);
+    assert!(!source.contains("(4) as usize"), "{source}");
+    assert!(!source.contains("(2) as usize"), "{source}");
+}
+
+#[test]
+fn w6l_nul_c9_a_runtime_byte_count_stays_unproved() {
+    let length = contract_length(CONTROL_RUNTIME_BYTES, "src");
+    assert!(!length.starts_with("Evidence"), "{length}");
+}

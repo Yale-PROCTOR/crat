@@ -1570,12 +1570,27 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                         }
                                         _ => false,
                                     };
+                                let operand_pointee_bytes =
+                                    match typeck.expr_ty(peel_casts(arg)).kind() {
+                                        rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                            type_size(self.tcx, self.fn_did, *pointee)
+                                        }
+                                        _ => None,
+                                    };
                                 Some(super::raw_boundary::ContractCountOperandFact {
                                     argument_index: count_index,
                                     span: count.span,
                                     expression,
                                     exact: contract.count_is_exact,
                                     one_pointee,
+                                    constant_bytes: (contract.size_argument_index.is_none()
+                                        && contract.extent
+                                            == super::raw_boundary_contracts::ArgumentExtent::ByteCount)
+                                        .then(|| {
+                                            constant_byte_count(self.tcx, self.fn_did, typeck, count)
+                                        })
+                                        .flatten(),
+                                    operand_pointee_bytes,
                                 })
                             });
                             let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {

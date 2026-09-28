@@ -708,6 +708,12 @@ pub(crate) struct ContractCountOperandFact {
     /// module sees it (`binn`, a C2Rust alias) while a printed pointee is the
     /// resolved item (`src::binn::binn_struct`).
     pub one_pointee: bool,
+    /// wave-6l (R615-7): the count's exact VALUE in bytes where it is a
+    /// compile-time constant, and the byte size of the argument's own pointee
+    /// — together an element count (`dist_cache`'s `4 * size_of::<c_int>()`
+    /// over `c_int` is 4 elements) where the spelling alone proves no units.
+    pub constant_bytes: Option<u64>,
+    pub operand_pointee_bytes: Option<u64>,
     /// The contract describes the whole range rather than an upper limit.
     /// Units and typed construction validity remain separate decision gates.
     pub exact: bool,
