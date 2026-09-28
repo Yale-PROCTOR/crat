@@ -541,6 +541,147 @@ fn written_through(tcx: TyCtxt<'_>, cast: &Expr<'_>) -> bool {
     }
 }
 
+/// **The bytes a local callee accesses through its `void *` parameter at ONE
+/// call, when a literal at that call selects them** (wave-6b, R607-1 leg B).
+///
+/// `copy_int_value` touches `pdest` only as `*(pdest as *mut T) = ..` inside
+/// the arm of each literal of `match dest_type`, and `binn_get_int32` passes
+/// `0x61`: at that call the callee accesses `size_of::<c_int>()` bytes at
+/// offset zero and nothing else, whichever the direction. A literal that
+/// selects no arm reaches only the callee's `_` arm, which touches nothing
+/// (an access under `_` is under no literal and refuses the whole table), so
+/// the width is `0`.
+///
+/// Every use must be a null test, or a cast of the bare binding dereferenced
+/// in place — read or written, never borrowed — under a literal arm of ONE
+/// match over an unchanged sibling parameter. The parameter is never
+/// reassigned and no closure sees the body. Anything else is `None`: the width
+/// is not known at the call, and the caller's hold stands.
+pub(crate) fn width_at_literal(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    call: &Expr<'_>,
+) -> Option<u64> {
+    let ExprKind::Call(_, args) = call.kind else { return None };
+    if !tcx.hir_body_owners().any(|did| did == callee) {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(callee);
+    let params = body
+        .params
+        .iter()
+        .map(|p| match p.pat.kind {
+            PatKind::Binding(_, id, _, None) => Some(id),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let target = *params.get(index)?;
+    let typeck = tcx.typeck(callee);
+    let Node::Pat(pat) = tcx.hir_node(target) else { return None };
+    if !super::void_pointee::has_void_pointee(tcx, typeck.pat_ty(pat), 1) {
+        return None;
+    }
+    let mut uses = Uses {
+        target,
+        found: Vec::new(),
+        writes: FxHashMap::default(),
+        closures: false,
+    };
+    uses.visit_expr(body.value);
+    if uses.closures || uses.writes.contains_key(&target) {
+        return None;
+    }
+    let mut discriminant: Option<HirId> = None;
+    let mut arms: Vec<(Vec<u128>, u64)> = Vec::new();
+    for use_ in uses.found {
+        let Node::Expr(parent) = tcx.parent_hir_node(use_.hir_id) else { return None };
+        match parent.kind {
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == use_.hir_id && segment.ident.name.as_str() == "is_null" => {}
+            ExprKind::Cast(operand, _) if operand.hir_id == use_.hir_id => {
+                let TyKind::RawPtr(pointee, _) = typeck.expr_ty(parent).kind() else { return None };
+                let Node::Expr(deref) = tcx.parent_hir_node(parent.hir_id) else { return None };
+                let ExprKind::Unary(rustc_hir::UnOp::Deref, _) = deref.kind else { return None };
+                // A borrow of the place is a reference that may outlive the
+                // arm; only a read or a write in place has the arm's width.
+                if deref.span.from_expansion()
+                    || matches!(
+                        tcx.parent_hir_node(deref.hir_id),
+                        Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+                    )
+                {
+                    return None;
+                }
+                let size = size_of(tcx, callee, *pointee)?;
+                let (scrutinee, literals) = enclosing_literal_arm(tcx, deref)?;
+                if discriminant.is_some_and(|d| d != scrutinee) {
+                    return None;
+                }
+                discriminant = Some(scrutinee);
+                arms.push((literals, size));
+            }
+            _ => return None,
+        }
+    }
+    let discriminant = discriminant?;
+    let position = params.iter().position(|p| *p == discriminant)?;
+    if position == index || uses.writes.contains_key(&discriminant) {
+        return None;
+    }
+    let literal = literal_of(args.get(position)?)?;
+    Some(
+        arms.iter()
+            .filter(|(literals, _)| literals.contains(&literal))
+            .map(|(_, size)| *size)
+            .max()
+            .unwrap_or(0),
+    )
+}
+
+/// Does the width a literal selects at this call fit ONE element of the
+/// caller's thin root (wave-6b, R607-1 leg B)? The root's own pointee is what
+/// its one-element claim covers; a `void` root covers no element and never
+/// fits. The call is the one at `call_span` in `caller`.
+pub(crate) fn literal_width_fits_root(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    call_span: rustc_span::Span,
+    callee: LocalDefId,
+    index: usize,
+    root: HirId,
+) -> bool {
+    struct Find<'tcx> {
+        span: rustc_span::Span,
+        found: Option<&'tcx Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.span && matches!(e.kind, ExprKind::Call(..)) {
+                self.found = Some(e);
+                return;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    if !tcx.hir_body_owners().any(|did| did == caller) {
+        return false;
+    }
+    let mut find = Find {
+        span: call_span,
+        found: None,
+    };
+    find.visit_expr(tcx.hir_body_owned_by(caller).value);
+    let Some(call) = find.found else { return false };
+    let Some(width) = width_at_literal(tcx, callee, index, call) else { return false };
+    let ty = tcx.typeck(caller).node_type(root);
+    let TyKind::RawPtr(pointee, _) = ty.kind() else { return false };
+    if super::void_pointee::has_void_pointee(tcx, ty, 1) {
+        return false;
+    }
+    size_of(tcx, caller, *pointee).is_some_and(|element| width <= element)
+}
+
 /// A typed-width read parameter's contract, or `None` (the R271-1 hold stands).
 pub(crate) fn prove(tcx: TyCtxt<'_>, s: &Subject) -> Option<Contract> {
     if s.ptr_depth != 1 || !matches!(s.kind, SubjectKind::Param { .. }) {

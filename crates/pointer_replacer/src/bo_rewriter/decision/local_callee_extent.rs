@@ -673,6 +673,25 @@ pub(crate) fn collect(
                     {
                         continue;
                     }
+                    // **R607-1 leg B (wave-6b) — a literal at THIS call selects
+                    // the width.** A `void` parameter's cast reads as an access
+                    // of unbounded width; where the callee's every access sits
+                    // under a literal arm of one sibling tag and this call
+                    // passes that tag as a literal, the width is the arm's, and
+                    // one element of the root covering it leaves the hold
+                    // nothing to protect at this site. Other sites keep theirs.
+                    if matches!(access.reason, AccessReason::VoidPointee { .. })
+                        && super::binn_counted::literal_width_fits_root(
+                            tcx,
+                            site.caller,
+                            site.span,
+                            *callee,
+                            arg.index,
+                            root,
+                        )
+                    {
+                        continue;
+                    }
                     out.entry((site.caller, root))
                         .or_insert_with(|| access.clone());
                 }
