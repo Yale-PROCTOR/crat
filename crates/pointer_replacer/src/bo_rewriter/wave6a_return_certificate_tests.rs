@@ -3033,3 +3033,317 @@ fn w6a_r583_an_undelivered_chain_field_withdraws_the_chain() {
         out.artifacts.box_param_receipts
     );
 }
+
+/// lil's `alloc_value` and `lil_new`, reduced: a `calloc(1, size_of::<T>())`
+/// block filled in place (field stores, one reading another, a nested
+/// allocation freed with the owner on its own failure path, a lend before the
+/// return) and returned; each with a receiver that frees it.
+const FILLED_IN_PLACE: &str = r#"
+// w6a-r615-filled-in-place
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct value {
+    pub l: usize,
+    pub d: *mut u8,
+}
+#[repr(C)]
+pub struct env {
+    pub depth: i32,
+}
+#[repr(C)]
+pub struct interp {
+    pub env: *mut env,
+    pub rootenv: *mut env,
+    pub callbacks: [Option<unsafe extern "C" fn(*mut interp) -> i32>; 4],
+    pub count: usize,
+}
+unsafe extern "C" fn alloc_value(mut n: usize) -> *mut value {
+    let mut val = calloc(1 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;
+    if val.is_null() {
+        return 0 as *mut value;
+    }
+    if n > 0 as usize {
+        (*val).l = n;
+        (*val).d = malloc(n.wrapping_add(1 as usize)) as *mut u8;
+        if ((*val).d).is_null() {
+            free(val as *mut core::ffi::c_void);
+            return 0 as *mut value;
+        }
+    } else {
+        (*val).l = 0 as usize;
+        (*val).d = 0 as *mut u8;
+    }
+    return val;
+}
+unsafe extern "C" fn use_value(mut n: usize) -> usize {
+    let mut v = alloc_value(n);
+    if v.is_null() {
+        return 0 as usize;
+    }
+    let mut l = (*v).l;
+    free((*v).d as *mut core::ffi::c_void);
+    free(v as *mut core::ffi::c_void);
+    return l;
+}
+unsafe extern "C" fn alloc_env() -> *mut env {
+    let mut e = malloc(::core::mem::size_of::<env>()) as *mut env;
+    (*e).depth = 0 as i32;
+    return e;
+}
+unsafe extern "C" fn register_all(mut it: *mut interp) {
+    (*it).count = 4 as usize;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_new() -> *mut interp {
+    let mut lil = calloc(1 as i32 as usize, ::core::mem::size_of::<interp>()) as *mut interp;
+    (*lil).env = alloc_env();
+    (*lil).rootenv = (*lil).env;
+    register_all(lil);
+    return lil;
+}
+unsafe extern "C" fn two_values() -> *mut value {
+    let mut pair = calloc(2 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;
+    (*pair).l = 1 as usize;
+    return pair;
+}
+unsafe extern "C" fn env_sized_value() -> *mut value {
+    let mut small = calloc(1 as i32 as usize, ::core::mem::size_of::<env>()) as *mut value;
+    (*small).l = 1 as usize;
+    return small;
+}
+unsafe extern "C" fn take_two() -> usize {
+    let mut p = two_values();
+    let mut q = env_sized_value();
+    let mut n = (*p).l.wrapping_add((*q).l);
+    free(p as *mut core::ffi::c_void);
+    free(q as *mut core::ffi::c_void);
+    return n;
+}
+unsafe extern "C" fn repl() -> usize {
+    let mut lil = lil_new();
+    let mut count = (*lil).count;
+    free((*lil).env as *mut core::ffi::c_void);
+    free(lil as *mut core::ffi::c_void);
+    return count;
+}
+"#;
+
+fn filled_in_place_frame() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6a-r615-filled-in-place",
+        vec![
+            ("value".to_owned(), 1, SlotKind::Raw),
+            ("interp".to_owned(), 0, SlotKind::Raw),
+            ("interp".to_owned(), 1, SlotKind::Raw),
+        ],
+        vec![
+            ("alloc_value::val".to_owned(), SlotKind::Owning),
+            ("lil_new::lil".to_owned(), SlotKind::Owning),
+            ("use_value::v".to_owned(), SlotKind::Owning),
+            ("repl::lil".to_owned(), SlotKind::Owning),
+            ("two_values::pair".to_owned(), SlotKind::Owning),
+            ("env_sized_value::small".to_owned(), SlotKind::Owning),
+            ("take_two::p".to_owned(), SlotKind::Owning),
+            ("take_two::q".to_owned(), SlotKind::Owning),
+        ],
+    );
+}
+
+fn filled_in_place_emitted(name: &str) -> super::wave6a_allocation_tests::Emitted {
+    let _frame = frame_locks();
+    filled_in_place_frame();
+    let out = emitted(name, FILLED_IN_PLACE);
+    super::test_model_override::clear();
+    out
+}
+
+/// **R615-4 (1)** — a contract allocation FILLED IN PLACE is a certificate
+/// source: `calloc(1, size_of::<T>())` is one zero-filled `T`, so the owner is
+/// `Box::from_raw(..)` around the allocation itself, its fields written
+/// through the Box. Before, `alloc_value` held `…:shape` (the literal path
+/// takes `malloc` only) and `lil_new` `struct-literal:ConstructorShape` (no
+/// literal spells a callback array).
+#[test]
+fn w6a_r615_a_block_filled_in_place_is_a_certificate_source() {
+    let out = filled_in_place_emitted("r615-filled");
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let text = compact(&out.source);
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    for callee in ["alloc_value", "lil_new"] {
+        assert!(
+            receipts.contains(&format!("return-certificate callee={callee} "))
+                && receipts.contains("source=filled-in-place"),
+            "{callee}\n{context}"
+        );
+    }
+    assert!(
+        text.contains("letmutval:Box<crate::value>=::std::boxed::Box::from_raw(calloc("),
+        "{context}"
+    );
+    assert!(
+        text.contains("letmutlil:Box<crate::interp>=::std::boxed::Box::from_raw(calloc("),
+        "{context}"
+    );
+    assert!(
+        !text.contains("into_raw(val") && !text.contains("into_raw(lil"),
+        "{context}"
+    );
+    for receiver in ["use_value::v", "repl::lil"] {
+        assert_eq!(
+            reason_of(&out.degradations, receiver),
+            None,
+            "{receiver}\n{context}"
+        );
+    }
+}
+
+/// Controls: a block of TWO elements (`calloc(2, ..)`) and a block measured
+/// by ANOTHER type (`calloc(1, size_of::<env>()) as *mut value`, smaller than
+/// a `value`) are not one zero-filled `T`, and keep their holds.
+#[test]
+fn w6a_r615_two_elements_or_another_types_size_keep_their_holds() {
+    let out = filled_in_place_emitted("r615-filled-controls");
+    let receipts = &out.artifacts.return_certificate_receipts;
+    for owner in ["two_values::pair", "env_sized_value::small"] {
+        assert!(
+            receipts.lines().any(|line| line.starts_with(owner)
+                && line.contains("\theld\treturn-certificate-allocation:")
+                && line.ends_with(":shape")),
+            "{owner}\n{receipts}"
+        );
+    }
+    assert!(
+        !compact(&out.source).contains("from_raw(calloc(2"),
+        "{}",
+        out.source
+    );
+}
+
+/// bst's `newNode` allocated by `calloc(1, size_of::<node>())`, under
+/// era-5c's frame, where the node's two fields are delivered: a zero-filled
+/// block is a `node` only while its fields keep a zero-valid form, so the
+/// filled-in-place certificate withdraws (`struct-field:..:owned-field`).
+#[test]
+fn w6a_r615_a_delivered_field_withdraws_the_filled_in_place_certificate() {
+    let source = BST.replace(
+        "malloc(::std::mem::size_of::<node>()) as *mut node",
+        "calloc(1 as i32 as usize, ::std::mem::size_of::<node>()) as *mut node",
+    );
+    let source = source.replace(
+        "    fn malloc(size: usize) -> *mut core::ffi::c_void;",
+        "    fn malloc(size: usize) -> *mut core::ffi::c_void;\n    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;",
+    );
+    let out = bst_emitted("r615-bst-calloc", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("return-certificate-struct-field:newNode:owned-field"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("Box::from_raw(calloc("),
+        "{}",
+        out.source
+    );
+}
+
+/// The watched set reaches every field a zero-filled block holds BY VALUE:
+/// its own, a nested struct's, and an array element struct's; a pointer's
+/// target is not held by value.
+#[test]
+fn w6a_r615_the_watched_fields_are_every_field_held_by_value() {
+    let src = r#"
+#[repr(C)] pub struct link { pub next: *mut item, pub tag: i32 }
+#[repr(C)] pub struct item { pub key: i32, pub inner: link, pub pair: [link; 2], pub far: *mut link }
+pub fn keep(_: item) {}
+"#;
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let named = |name: &str| {
+            tcx.hir_crate_items(())
+                .definitions()
+                .find(|did| {
+                    tcx.opt_item_name(did.to_def_id())
+                        .is_some_and(|n| n.as_str() == name)
+                })
+                .expect(name)
+        };
+        let (item, link) = (named("item"), named("link"));
+        let ty = tcx.type_of(item.to_def_id()).instantiate_identity();
+        let mut fields =
+            super::decision::return_certificate::fields_held_by_value_for_test(tcx, ty);
+        fields.sort_by_key(|(did, index)| (tcx.item_name(did.to_def_id()).to_string(), *index));
+        assert_eq!(
+            fields,
+            vec![
+                (item, 0),
+                (item, 1),
+                (item, 2),
+                (item, 3),
+                (link, 0),
+                (link, 1)
+            ]
+        );
+    })
+    .unwrap();
+}
+
+/// The watch reaches INTO a struct held by value: a zero-filled `holder`
+/// carries a whole `node`, whose delivered fields (era-5c's bst frame) make
+/// the zero a `node` no longer is — withdrawn, where the model-Owning fields
+/// of `holder` itself (none) would have watched nothing.
+#[test]
+fn w6a_r615_a_field_delivered_inside_a_by_value_struct_withdraws() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let source = BST.replace(
+        "    fn malloc(size: usize) -> *mut core::ffi::c_void;",
+        "    fn malloc(size: usize) -> *mut core::ffi::c_void;\n    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;",
+    ) + r#"
+#[repr(C)]
+pub struct holder {
+    pub n: node,
+    pub count: i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn newHolder() -> *mut holder {
+    let mut h = calloc(1 as i32 as usize, ::std::mem::size_of::<holder>()) as *mut holder;
+    (*h).count = 1 as i32;
+    return h;
+}
+"#;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r578-bst-frame",
+        vec![
+            ("node".to_owned(), 1, SlotKind::Owning),
+            ("node".to_owned(), 2, SlotKind::Owning),
+        ],
+        vec![
+            ("insert::node".to_owned(), SlotKind::Owning),
+            ("deleteNode::root".to_owned(), SlotKind::Owning),
+            ("newNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp".to_owned(), SlotKind::Owning),
+            ("deleteNode::temp_0".to_owned(), SlotKind::Owning),
+            ("minValueNode::node".to_owned(), SlotKind::Ref),
+            ("deleteNode::temp_1".to_owned(), SlotKind::Ref),
+            ("newHolder::h".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted("r615-holder", &source);
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let context = format!("{receipts}\n{}", out.source);
+    assert!(
+        compact(&out.source).contains("publeft:Option<Box<node>>,"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate-struct-field:newHolder:owned-field"),
+        "{context}"
+    );
+}

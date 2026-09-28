@@ -415,6 +415,35 @@ fn contract_of(
 /// The count of a contract allocation from its size argument: `n *
 /// size_of::<T>()` (either order, through casts) → `Slice` with count `n`;
 /// `size_of::<T>()` alone → `Sized`.
+/// **R615-4** — `calloc(1, size_of::<T>())` under its casts, with `T` the
+/// owner's pointee: ONE zero-filled `T`, the allocation-return certificate's
+/// filled-in-place source. The span is the whole cast chain, which the
+/// certificate's `Box::from_raw(..)` wraps.
+pub(crate) fn single_zeroed_allocation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    e: &Expr<'_>,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+) -> Option<Span> {
+    let call = peel_casts(e);
+    let (_, allocator) = contract_of(tcx, callee_of(call)?)?;
+    let Extent::ElementCount {
+        count_index,
+        size_index,
+    } = allocator?.extent
+    else {
+        return None;
+    };
+    let ExprKind::Call(_, args) = &call.kind else { return None };
+    let count = peel_casts(args.get(count_index)?);
+    let ExprKind::Lit(lit) = &count.kind else { return None };
+    let rustc_ast::LitKind::Int(value, _) = lit.node else { return None };
+    let size = peel_casts(args.get(size_index)?);
+    let ExprKind::Call(size_of, []) = &size.kind else { return None };
+    let measured = tcx.typeck(owner).node_args(size_of.hir_id).types().next()?;
+    (value.get() == 1 && size_of_call(size) && measured == pointee).then_some(e.span)
+}
+
 fn size_of_call(e: &Expr<'_>) -> bool {
     let e = peel_casts(e);
     let ExprKind::Call(callee, args) = &e.kind else { return false };

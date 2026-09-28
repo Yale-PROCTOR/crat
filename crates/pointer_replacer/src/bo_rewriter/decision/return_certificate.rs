@@ -246,6 +246,46 @@ pub(crate) fn confirm_transfers(
 /// DELIVERED owned field is that transaction's move (`Rhs::Call`), so the
 /// certificate's raw transfer at the same span leaves its site edits for
 /// `field_moves`, whose functions still follow the certificate's class.
+/// **R615-4** — every field a zero-filled `ty` holds by value: its own, and
+/// those of each program struct it contains by value (directly or in an
+/// array). A zero-filled block is a valid `ty` while none of them is delivered
+/// in a form whose zero is invalid; the filled-in-place certificate watches
+/// them all.
+fn fields_held_by_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Vec<(LocalDefId, usize)> {
+    let mut out = Vec::new();
+    let mut stack = vec![ty];
+    let mut seen: FxHashSet<LocalDefId> = FxHashSet::default();
+    while let Some(ty) = stack.pop() {
+        let mut ty = ty;
+        while let TyKind::Array(element, _) = ty.kind() {
+            ty = *element;
+        }
+        let TyKind::Adt(adt, args) = ty.kind() else { continue };
+        let Some(did) = adt.did().as_local() else { continue };
+        if !seen.insert(did) {
+            continue;
+        }
+        for (index, field) in adt.all_fields().enumerate() {
+            if adt.is_struct() {
+                out.push((did, index));
+            }
+            stack.push(field.ty(tcx, args));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn fields_held_by_value_for_test<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Vec<(LocalDefId, usize)> {
+    fields_held_by_value(tcx, ty)
+}
+
 pub(crate) fn withdraw_delivered_owned_fields(
     certificates: &mut Certificates,
     tcx: TyCtxt<'_>,
@@ -2620,8 +2660,70 @@ fn certify<'tcx, 's>(
                 };
                 let ordinary =
                     facts.plan_for_subject(tcx, subject, slot, constructions, slots, subjects);
+                // **R615-4** — a contract allocation FILLED IN PLACE:
+                // `calloc(1, size_of::<T>())` is one zero-filled `T`, so the
+                // owner is the Box around the allocation itself (the libc
+                // row's two insertions) and its fields are written through it.
+                // Zero-filled is a valid `T` while every field keeps a form
+                // whose zero is valid (C2Rust's own field types all do), so
+                // every field of `T`, and of each struct it holds by value,
+                // is watched: a delivered one withdraws the certificate after
+                // `finalize` (R528-3's withdrawal).
+                let filled_in_place = match (&ordinary, construction) {
+                    (
+                        Err(BoxPlanFailure::InitializerUnsupported),
+                        Some(Construction::Alloc { .. }),
+                    ) if constructions
+                        .owner_overwrites
+                        .get(&key)
+                        .is_none_or(Vec::is_empty) =>
+                    {
+                        constructions.init_hirs.get(&key).and_then(|init| {
+                            super::allocator_contract::single_zeroed_allocation(
+                                tcx,
+                                callee,
+                                tcx.hir_node(*init).expect_expr(),
+                                ty,
+                            )
+                        })
+                    }
+                    _ => None,
+                };
                 match ordinary {
                     Ok(plan) => (plan, "ordinary-plan".to_owned()),
+                    Err(BoxPlanFailure::InitializerUnsupported) if filled_in_place.is_some() => {
+                        let span = filled_in_place.expect("the guard");
+                        owned_fields = fields_held_by_value(tcx, ty);
+                        (
+                            BoxPlan {
+                                shape: BoxShape::Sized,
+                                optional: false,
+                                expr_edits: vec![
+                                    BoxExprEdit {
+                                        span: span.shrink_to_lo(),
+                                        replacement: "::std::boxed::Box::from_raw(".to_owned(),
+                                        receipt: "return-certificate-filled-in-place",
+                                    },
+                                    BoxExprEdit {
+                                        span: span.shrink_to_hi(),
+                                        replacement: ")".to_owned(),
+                                        receipt: "return-certificate-filled-in-place-close",
+                                    },
+                                ],
+                                delete_statements: Vec::new(),
+                                receipts: vec![format!(
+                                    "return-certificate-filled-in-place pointee={pointee}"
+                                )],
+                                fabricated_extent: false,
+                                pointee_override: None,
+                                inferred_binding: subject.ty_span.is_none(),
+                                overwrite_spans: Vec::new(),
+                                retained_sink: true,
+                                implicit_scope_close: false,
+                            },
+                            "filled-in-place".to_owned(),
+                        )
+                    }
                     Err(BoxPlanFailure::InitializerUnsupported) => {
                         // **R525-3 edit (a)** — one definition of the
                         // synthesised literal, ownership-fields'. It spells
@@ -2800,7 +2902,7 @@ fn certify<'tcx, 's>(
             Some(Construction::CallResult | Construction::NullLit)
         ) || matches!(
             receipt.as_str(),
-            "struct-fill" | "constructor" | "ordinary-plan"
+            "struct-fill" | "constructor" | "ordinary-plan" | "filled-in-place"
         );
         // The owner's uses (a receiver's were walked by `receiver_plan`).
         if allocation {
