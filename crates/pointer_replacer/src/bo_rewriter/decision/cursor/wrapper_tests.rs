@@ -2465,3 +2465,40 @@ fn slicecursor_r609_the_three_negative_rows_are_held() {
         );
     }
 }
+
+/// **R615-5 — a slice use inside a cursor's index** (report 076 §3). bzip2's
+/// `BZ2_hbCreateDecodeTables` reads `base[length[i] + 1]`: the cursor's element
+/// edit renders its index from source text, and that text holds the slice
+/// family's `length[i]` edit. Two same-class edits over one interval held the
+/// class (`intra-class-interval-overlap`), so `base` and `limit` never
+/// delivered. Composed, the element takes `length`'s rendered text and the AST
+/// pass skips the inner span, as the constructor already does.
+#[test]
+fn slicecursor_a_slice_use_inside_a_cursor_index_composes() {
+    const MAIN: &str = r#"
+fn main() {
+    let mut s = DState { len: [[0; 258]; 6], limit: [[0; 258]; 6], base: [[0; 258]; 6], perm: [[0; 258]; 6] };
+    s.len[0][..4].copy_from_slice(&[1, 2, 3, 3]);
+    unsafe { decode_tables(&mut s, 0, 1, 3, 4); }
+    assert_eq!(&s.limit[0][1..4], &[0, 2, 7]);
+    assert_eq!(&s.base[0][1..5], &[0, 1, 4, 4]);
+    assert_eq!(&s.perm[0][..4], &[0, 1, 2, 3]);
+}
+"#;
+    let input =
+        include_str!("../../testdata/r615-nested-composition/bz2_hb_create_decode_tables.rs");
+    // The expected tables are the input's own.
+    compile(input, Some(MAIN));
+    let decisions = cursor_decisions(input);
+    for param in [
+        "BZ2_hbCreateDecodeTables::base",
+        "BZ2_hbCreateDecodeTables::limit",
+    ] {
+        assert!(
+            decisions.contains(&(param.to_owned(), true)),
+            "{param} must deliver once the nested use composes: {decisions:?}"
+        );
+    }
+    let source = emitted(input);
+    compile(&source, Some(MAIN));
+}

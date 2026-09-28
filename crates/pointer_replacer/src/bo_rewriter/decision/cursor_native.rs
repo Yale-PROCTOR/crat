@@ -617,10 +617,11 @@ fn compose_nested_uses(
             receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
             continue;
         }
-        // The reverse nesting: a cursor edit (a constructor or an advance)
-        // that CONTAINS another subject's use edit takes that inner's rendered
-        // text in place of the inner's original text and records the inner
-        // span, which the AST pass then skips.
+        // The reverse nesting: a cursor edit (a constructor, an advance, or —
+        // R615-5 — an element or address whose index holds another subject's
+        // use, `base[length[i] + 1]`) that CONTAINS another subject's use edit
+        // takes that inner's rendered text in place of the inner's original
+        // text and records the inner span, which the AST pass then skips.
         let mut contained = Vec::new();
         {
             let uses = match &entries[index].1 {
@@ -634,7 +635,10 @@ fn compose_nested_uses(
                 | Decision::Degraded(_) => Vec::new(),
             };
             for (k, outer) in uses.iter().enumerate() {
-                if !matches!(outer.bridge_kind, "cursor-constructor" | "cursor-advance") {
+                if !matches!(
+                    outer.bridge_kind,
+                    "cursor-constructor" | "cursor-advance" | "cursor-element" | "cursor-address"
+                ) {
                     continue;
                 }
                 let mut text = outer.replacement.clone();

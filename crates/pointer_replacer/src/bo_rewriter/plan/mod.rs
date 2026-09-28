@@ -525,9 +525,11 @@ fn nested_ast_composition(
         // A wrapper cursor constructor composed over its outer table's element
         // rewrite (`*table.offset(k)` → `table[k]`): the outer edit is part of
         // the constructor text and the AST pass applies only the constructor.
+        // R615-5 (slicecursor 079): the same for a cursor's element or address
+        // whose index holds another subject's use (`base[length[i] + 1]`).
         let cursor_constructor_over_element = matches!(
             outer.key.bridge_kind.as_str(),
-            "cursor-constructor" | "cursor-advance"
+            "cursor-constructor" | "cursor-advance" | "cursor-element" | "cursor-address"
         ) && inner.key.bridge_kind == "subject-use"
             && contains(outer, inner);
         // Another family's value edit (`Some(&*in_0.offset(k))`) over a cursor's
