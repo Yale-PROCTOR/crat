@@ -3924,3 +3924,90 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: i32) -> *mut n
     assert!(text.contains("drop(root);returntemp.map_or("), "{context}");
     assert!(!text.contains("drop(root);returntemp;"), "{context}");
 }
+
+/// R618-1: one run of the ht line's reduced shapes — the named local Owning by
+/// override (batch 48's L01⁹ model has ht's `new_entries` Owning), the whole
+/// pipeline. Returns the owner's native row, the emitted source and reverts.
+fn r618_emit(marker: &str, body: &str, owner: &str) -> (String, String, usize) {
+    use crate::analyses::borrow_ownership::SlotKind::Owning;
+    let source = format!(
+        "// {marker}\n{}\n#[repr(C)] #[derive(Copy, Clone)] pub struct entry {{ pub key: *const i8, pub value: *mut core::ffi::c_void }}\n#[repr(C)] #[derive(Copy, Clone)] pub struct table {{ pub entries: *mut entry, pub capacity: usize }}\n{body}",
+        declarations()
+    );
+    let _frame = super::test_model_override::frame_lock();
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(marker, vec![], vec![(owner.to_owned(), Owning)]);
+    let out = super::wave6a_allocation_tests::emitted(marker, &source);
+    super::test_model_override::clear();
+    let local = owner.rsplit("::").next().unwrap_or(owner);
+    let row = out
+        .artifacts
+        .ownership_native
+        .lines()
+        .find(|l| {
+            l.split('\t')
+                .next()
+                .is_some_and(|k| k.contains(&format!("::{local}#")))
+        })
+        .unwrap_or_default()
+        .to_owned();
+    (row, out.source, out.reverted)
+}
+
+/// The reduced ht `ht_expand` shape: a `calloc`ed table of two-raw-pointer
+/// entries, filled element by element, the old table freed, the new one
+/// stored into the table. Wall (i) alone: no lend, no guard.
+const R618_FILL: &str = "pub unsafe fn expand(t: *mut table) -> bool {
+    let n = (*t).capacity.wrapping_mul(2);
+    let mut fresh = calloc(n, core::mem::size_of::<entry>()) as *mut entry;
+    let mut i = 0usize;
+    while i < (*t).capacity {
+        let e = *(*t).entries.offset(i as isize);
+        if !e.key.is_null() { (*fresh.offset((e.key as usize % n) as isize)).key = e.key; }
+        i = i.wrapping_add(1);
+    }
+    free((*t).entries as *mut core::ffi::c_void);
+    (*t).entries = fresh;
+    (*t).capacity = n;
+    true
+}";
+
+/// **R618-1 (i) — a `calloc`ed aggregate needs no supplied fields when every
+/// field admits the all-zero value.** F04 holds an aggregate owner whose
+/// fields the program does not all supply, because a `malloc`ed one is
+/// indeterminate and the spelled zero literal is only a placeholder. A
+/// `calloc`ed one is zero-filled: the literal IS its value wherever each
+/// field's zero is the all-zero bit pattern, which `zero_value` guarantees by
+/// refusing any form without one (r457, before F04). Control: the same shape
+/// `malloc`ed keeps F04's hold.
+#[test]
+fn r618_a_calloc_aggregate_of_zero_valid_fields_needs_no_supplied_fields() {
+    let (row, source, reverted) = r618_emit("r618 calloc aggregate", R618_FILL, "expand::fresh");
+    let text: String = source.split_whitespace().collect();
+    let context = format!("{row}\n{source}");
+    assert!(
+        !row.contains("native-aggregate-fields-supplied"),
+        "{context}"
+    );
+    assert!(row.contains("\tselected\t"), "{context}");
+    assert!(
+        text.contains(
+            "entry]>=::std::vec![crate::entry{key:::core::ptr::null(),value:::core::ptr::null_mut()"
+        ) && text.contains("into_boxed_slice()"),
+        "{context}"
+    );
+    assert_eq!(reverted, 0, "{context}");
+    // Control: `malloc`ed, the same aggregate keeps its placeholder hold.
+    let malloced = R618_FILL.replace(
+        "calloc(n, core::mem::size_of::<entry>())",
+        "malloc(n.wrapping_mul(core::mem::size_of::<entry>()))",
+    );
+    assert_ne!(malloced, R618_FILL);
+    let (row, source, _) = r618_emit("r618 malloc aggregate", &malloced, "expand::fresh");
+    assert!(
+        row.contains("native-aggregate-fields-supplied"),
+        "{row}\n{source}"
+    );
+}

@@ -759,8 +759,17 @@ pub(crate) fn derive<'tcx>(
     // and the spelled zero is a placeholder the program overwrites. An owner
     // MOVED out of a field (R431) is a fully initialised object: there is no
     // placeholder to supply.
+    //
+    // R618-1 (i): neither is a `calloc`ed one. `calloc` zero-fills, so the
+    // literal the constructor spells IS the allocation's value wherever each
+    // field's zero is the all-zero bit pattern — and `zero_value` has already
+    // refused, before this point, every field whose form has no such zero
+    // (r457: a delivered form with no zero holds the literal). ht's
+    // `ht_expand::new_entries`, filled only through a lend, is the shape.
+    let zero_filled = tcx.item_name(constructor.allocator).as_str() == "calloc";
     if let TyKind::Adt(def, _) = element.kind()
         && !constructor.field_load
+        && !zero_filled
     {
         let mut supplied = BTreeSet::new();
         let mut whole = false;
