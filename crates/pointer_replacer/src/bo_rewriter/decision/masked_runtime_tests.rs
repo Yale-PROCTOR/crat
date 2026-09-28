@@ -245,3 +245,38 @@ pub unsafe fn run(n: usize) -> u8 {
         "{rows:#?}"
     );
 }
+
+/// Z3 (Codex 062b finding 1) — a zero-preserving update (`gap += 0`,
+/// `gap = gap.wrapping_add(0)`) keeps the local only ever `0`.
+#[test]
+fn w6l_mask_z3_a_zero_preserving_update_keeps_the_companion_refused() {
+    let input = fixture(&ZERO_ROOT.replace(
+        "    let mut gap = 0 as usize;\n    Iterate(n, gap, (*s).dc)",
+        "    let mut gap = 0 as usize;\n    gap += 0;\n    gap = gap.wrapping_add(0);\n    Iterate(n, gap, (*s).dc)",
+    ));
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(!flat(&source).contains("(gap) as usize"), "{source}");
+}
+
+/// M3 (Codex 062b finding 3) — the runtime length on either side of
+/// `wrapping_add`: `len.wrapping_add(ix & mask)` is the same read.
+#[test]
+fn w6l_mask_m3_a_runtime_length_on_the_receiver_side_is_held() {
+    let input = fixture(
+        r###"
+unsafe fn Reader(data: *const u8, ix: usize, mask: usize, len: usize) -> u8 {
+    *data.offset(len.wrapping_add(ix & mask) as isize)
+}
+pub unsafe fn run(n: usize) -> u8 {
+    let buf: [u8; 4224] = [7; 4224];
+    Reader(buf.as_ptr(), n, 4095, 1)
+}
+"###,
+    );
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(&input);
+    assert_eq!(
+        reason(&rows, "data"),
+        "held:masked-index-runtime-length",
+        "{rows:#?}"
+    );
+}
