@@ -98,6 +98,12 @@ pub(crate) struct Chains {
         FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
     /// The member plans a chain inserted, withdrawn with it.
     pub(crate) chain_members: FxHashMap<(LocalDefId, HirId), Vec<(LocalDefId, HirId)>>,
+    /// **R620-3** — an exported store consumer's formal handed on to the
+    /// storing formal: it stands only while that formal is planned.
+    pub(crate) store_hand_ons: FxHashMap<(LocalDefId, HirId), (LocalDefId, HirId)>,
+    /// **R620-3** — the store consumers' formals: their block is the outside
+    /// caller's C string, so libc may free it.
+    pub(crate) external_blocks: FxHashSet<(LocalDefId, HirId)>,
     /// A planned formal's (label, callee path, index), for its withdrawal.
     pub(crate) formal_labels: FxHashMap<(LocalDefId, HirId), (String, String, usize)>,
 }
@@ -114,6 +120,12 @@ fn withdraw_formal(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) 
         chains.receipts.retain(|r| {
             !r.starts_with(&format!("box-param-reseat callee={callee} index={index} "))
                 && !r.starts_with(&format!("box-param-chain callee={callee} index={index} "))
+                && !r.starts_with(&format!(
+                    "exported-consumer-store callee={callee} index={index} "
+                ))
+                && !r.starts_with(&format!(
+                    "box-param-store-c-free-lift callee={callee} index={index} "
+                ))
         });
         chains
             .holds
@@ -144,6 +156,11 @@ fn confirm_hand_ons(chains: &mut Chains) -> bool {
                 && members.iter().any(|m| !chains.plans.contains_key(m))
             {
                 withdrawn.push((*formal, "box-param-chain-member-withdrawn"));
+            }
+        }
+        for (formal, transferee) in &chains.store_hand_ons {
+            if chains.plans.contains_key(formal) && !chains.plans.contains_key(transferee) {
+                withdrawn.push((*formal, "box-param-hand-on-unplanned"));
             }
         }
         if withdrawn.is_empty() {
@@ -1153,6 +1170,69 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
     }
 }
 
+/// **R620-3 (a) — the emitted crate's allocator is the system's** (R443-1):
+/// then a block Rust allocates is a `malloc` block, and a C `free` of it is
+/// defined. Read from the crate, whose items the emission keeps; R443-2's
+/// (B′) appends the same declaration to every emitted crate root, and at its
+/// composition this reads that emission too. The declaration is found by its
+/// static's type (the attribute is the builtin macro's, consumed at
+/// expansion): a crate declaring another allocator BESIDE an unrelated
+/// `System` static would read as `System` — the corpus declares none.
+pub(crate) fn emitted_allocator_is_system(tcx: TyCtxt<'_>) -> bool {
+    tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+        && tcx.hir_crate_items(()).definitions().any(|did| {
+            matches!(tcx.def_kind(did), DefKind::Static { .. })
+                && matches!(tcx.type_of(did).instantiate_identity().kind(),
+                    TyKind::Adt(adt, _) if tcx.def_path_str(adt.did()) == "std::alloc::System")
+        })
+}
+
+/// A positive integer literal under its casts (`8 as usize`).
+fn positive_literal(text: &str) -> bool {
+    let head = text.trim().trim_start_matches('(');
+    let head = head.split(" as ").next().unwrap_or_default();
+    head.trim()
+        .trim_end_matches(')')
+        .parse::<u128>()
+        .is_ok_and(|n| n > 0)
+}
+
+/// **R620-3** — the body's FIRST act measures the formal as a C string
+/// (`strlen(p)`, C2Rust's hoisted-argument block included): the formal is a
+/// block of `strlen + 1` elements (`strdup`'s postcondition), and non-null,
+/// since a null argument there is UB in the input (§28).
+fn entry_measures_c_string(tcx: TyCtxt<'_>, param: &Subject) -> bool {
+    let Some(body_id) = tcx.hir_node_by_def_id(param.fn_did).body_id() else { return false };
+    let mut e = tcx.hir_body(body_id).value;
+    loop {
+        e = match e.kind {
+            ExprKind::Block(block, _) => match block.stmts.first() {
+                Some(statement) => match statement.kind {
+                    rustc_hir::StmtKind::Let(local) => match local.init {
+                        Some(init) => init,
+                        None => return false,
+                    },
+                    rustc_hir::StmtKind::Semi(inner) | rustc_hir::StmtKind::Expr(inner) => inner,
+                    rustc_hir::StmtKind::Item(_) => return false,
+                },
+                None => match block.expr {
+                    Some(inner) => inner,
+                    None => return false,
+                },
+            },
+            ExprKind::Ret(Some(value)) | ExprKind::DropTemps(value) => value,
+            ExprKind::Call(callee, [argument]) => {
+                let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return false };
+                let Res::Def(DefKind::Fn, did) = path.res else { return false };
+                return foreign_fn(tcx, did)
+                    && tcx.item_name(did).as_str() == "strlen"
+                    && bare_local(argument) == Some(param.hir_id);
+            }
+            _ => return false,
+        };
+    }
+}
+
 /// **W6A-A9's companion gate** (report 044). The pointee of `param` is a
 /// struct one of whose fields the model calls `Owning`: another family owns
 /// that field, its edit is an owned one, and an owned edit cannot sit inside
@@ -1236,6 +1316,7 @@ pub(crate) fn derive<'tcx>(
             .and_then(|u| u.slot_for_local_depth(s.local, 0))
             .map(|slot| SlotRef::Local(s.fn_did, slot))
     };
+    let system_allocator = emitted_allocator_is_system(tcx);
     let mut params: Vec<&Subject> = subjects
         .iter()
         .filter(|s| matches!(s.kind, SubjectKind::Param { .. }) && s.ptr_depth == 1)
@@ -1429,6 +1510,7 @@ pub(crate) fn derive<'tcx>(
         // `free` releases would take a Rust-allocated block to libc's
         // `free`; that composition is wave-6f's owned FIELD (W6F-3), where the
         // store is a move into an owned field and the drop is theirs.
+        let mut c_freed_store: Option<DefId> = None;
         if let Some((_, statement)) = store {
             let _ = statement;
             let field = scan
@@ -1445,14 +1527,22 @@ pub(crate) fn derive<'tcx>(
                     continue;
                 }
                 Some(field) if scans.values().any(|s| s.freed_fields.contains(&field)) => {
-                    hold(
-                        format!(
-                            "box-param-store-c-free:{callee_path}:{}",
-                            tcx.def_path_str(field)
-                        ),
-                        &mut out,
-                    );
-                    continue;
+                    // **R620-3 (a)**: under R443 the emitted crate's allocator
+                    // is the system's, so a block Rust allocated IS a block
+                    // libc may free. The refusal lifts where that declaration
+                    // stands; each member's block is checked once the members
+                    // are known (below).
+                    if !system_allocator {
+                        hold(
+                            format!(
+                                "box-param-store-c-free:{callee_path}:{}",
+                                tcx.def_path_str(field)
+                            ),
+                            &mut out,
+                        );
+                        continue;
+                    }
+                    c_freed_store = Some(field);
                 }
                 Some(_) => {}
             }
@@ -1822,6 +1912,37 @@ pub(crate) fn derive<'tcx>(
             hold(reason, &mut out);
             continue;
         }
+        // R620-3 (a): libc's `free` is handed each member's block, so each must
+        // be a real one — an outside caller's C string (a store consumer's
+        // formal), or an ordinary allocation whose count is a positive
+        // literal: `vec![0; 0]` is a dangling pointer, not a `malloc` block.
+        let mut lift_receipt = None;
+        if let Some(field) = c_freed_store {
+            let empty_possible = member_plans.iter().find(|(key, plan, _, _)| {
+                if moved_on_members.contains(key) {
+                    return !out.external_blocks.contains(key);
+                }
+                certificates.plans.contains_key(key)
+                    || contract_plans.contains_key(key)
+                    || !matches!(plan.shape, BoxShape::Slice)
+                    || !matches!(constructions.by_binding.get(key),
+                        Some(Construction::Alloc { count: Some(count), .. }) if positive_literal(count))
+            });
+            if let Some((_, _, label, _)) = empty_possible {
+                hold(
+                    format!(
+                        "box-param-store-c-free:{callee_path}:{}:member-block:{label}",
+                        tcx.def_path_str(field)
+                    ),
+                    &mut out,
+                );
+                continue;
+            }
+            lift_receipt = Some(format!(
+                "box-param-store-c-free-lift callee={callee_path} index={hir_index} field={} allocator=System",
+                tcx.def_path_str(field)
+            ));
+        }
         // **R531-4 (iii) — an OPTIONAL owner moves into the consuming formal.**
         // A producer that can return null makes its certified receiver an
         // `Option<Box<T>>`, and the call hands that owner on as written, so
@@ -1944,6 +2065,38 @@ pub(crate) fn derive<'tcx>(
             // `Option` formal is refused by the owner walk below
             // (`optional-owner-escapes`).
             && no_caller_export;
+        // **R620-3 (USER) — R534 extended to a consumer that STORES its
+        // formal** into storage the program later frees: itself (C2's lifted
+        // store, above) or by handing it on to the formal that stores it.
+        // Built for a C string, whose first act measures it (`strlen`): the
+        // surface takes `Box<[T]>`, non-null.
+        let transferee = moved_on.and_then(|_| {
+            let (callee, index) = scan.calls.iter().find_map(|(callee, _, args)| {
+                let index = args
+                    .iter()
+                    .position(|a| a.map(|(hir, _)| hir) == Some(param.hir_id))?;
+                Some((*callee, index))
+            })?;
+            let subject = subjects.iter().find(|s| {
+                Some(s.fn_did) == callee.as_local()
+                    && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)
+            })?;
+            let callee_scan = scans.get(&subject.fn_did)?;
+            store_sink(tcx, callee_scan, subject)?;
+            let field = callee_scan
+                .store_fields
+                .iter()
+                .find(|(hir, _)| *hir == subject.hir_id)?
+                .1;
+            scans
+                .values()
+                .any(|s| s.freed_fields.contains(&field))
+                .then_some((subject.fn_did, subject.hir_id))
+        });
+        let store_consumer = consumer_waiver
+            && frees.is_empty()
+            && (c_freed_store.is_some() || transferee.is_some())
+            && entry_measures_c_string(tcx, param);
         if call_count == 0 && !exported_pair && !consumer_waiver {
             hold(format!("box-param-no-callers:{callee_path}"), &mut out);
             continue;
@@ -1960,7 +2113,7 @@ pub(crate) fn derive<'tcx>(
         // `None` on failure; `free(NULL)` is legal C) — `None` is null's image
         // (R534-1: ht's pair closes as `ht_create() -> Option<Box<ht>>` /
         // `ht_destroy(table: Option<Box<ht>>)`). Its uses are the owner walk's.
-        let optional = optional || consumer_waiver;
+        let optional = optional || (consumer_waiver && !store_consumer);
         let Some(param_slot) = slot_of(param) else { continue };
         // The formal's kind: Owning admits; Raw admits when every caller
         // transfers a CERTIFIED owner (A1-c) — the same licensing wall R410-5
@@ -1977,7 +2130,8 @@ pub(crate) fn derive<'tcx>(
         });
         if !(formal_kind == Some(SlotKind::Owning)
             || (formal_kind == Some(SlotKind::Raw) && certified_callers)
-            || (store.is_some() && matches!(formal_kind, Some(SlotKind::Raw | SlotKind::Ref))))
+            || ((store.is_some() || store_consumer)
+                && matches!(formal_kind, Some(SlotKind::Raw | SlotKind::Ref))))
         {
             hold(
                 format!("box-param-model:{}:{formal_kind:?}", param.label),
@@ -2008,7 +2162,7 @@ pub(crate) fn derive<'tcx>(
             // the formal's own pointee decides, and only a SIZED one — a
             // `Box<[T]>` formal would need an extent the surface does not
             // carry.
-            None if exported_pair || consumer_waiver => (false, None),
+            None if exported_pair || consumer_waiver => (store_consumer, None),
             None => {
                 hold(format!("box-param-shape:{callee_path}:no-shape"), &mut out);
                 continue;
@@ -2172,6 +2326,60 @@ pub(crate) fn derive<'tcx>(
                     continue;
                 }
             }
+        } else if store_consumer {
+            // R620-3: the store consumer's uses are the owner walk's — its
+            // lend (`strlen`; the raw-boundary glue spells `as_ptr()`) and
+            // its one sink, the store or the hand-on; nothing else.
+            let lend_oracle =
+                super::return_certificate::LendOracle::new(tcx, functions, slots, model);
+            match super::return_certificate::owner_uses(
+                tcx,
+                param,
+                BoxShape::Slice,
+                false,
+                false,
+                &frees,
+                &|did, index| lend_oracle.lend(did, index),
+                &|did, index| consuming.contains(&(did, index)),
+                &|_| false,
+            ) {
+                Ok(uses)
+                    if uses.returns.is_empty()
+                        && match (store, moved_on) {
+                            (Some((value, _)), None) => {
+                                matches!(uses.stores.as_slice(), [stored] if stored.contains(value))
+                                    && uses.transfers.is_empty()
+                            }
+                            (None, Some(argument)) => {
+                                uses.stores.is_empty()
+                                    && matches!(uses.transfers.as_slice(), [(_, _, call)] if call.contains(argument))
+                            }
+                            _ => false,
+                        } =>
+                {
+                    let mut edits = param_edits;
+                    edits.extend(
+                        uses.edits.into_iter().filter(|edit| {
+                            store.is_none_or(|(value, _)| !edit.span.overlaps(value))
+                        }),
+                    );
+                    edits
+                }
+                Ok(_) => {
+                    hold(
+                        format!("box-param-callee-use:{callee_path}:store-consumer-escapes"),
+                        &mut out,
+                    );
+                    continue;
+                }
+                Err(form) => {
+                    hold(
+                        format!("box-param-callee-use:{callee_path}:store-consumer:{form}"),
+                        &mut out,
+                    );
+                    continue;
+                }
+            }
         } else {
             param_edits
         };
@@ -2205,7 +2413,12 @@ pub(crate) fn derive<'tcx>(
             if exported_pair { " exported-pair-closure" } else { "" },
             members.join(",")
         ));
-        if consumer_waiver {
+        out.receipts.extend(lift_receipt);
+        if store_consumer {
+            out.receipts.push(format!(
+                "exported-consumer-store callee={callee_path} index={hir_index} extent=strlen+1"
+            ));
+        } else if consumer_waiver {
             out.receipts
                 .push(format!("exported-consumer-waiver callee={callee_path}"));
         }
@@ -2268,6 +2481,10 @@ pub(crate) fn derive<'tcx>(
                 implicit_scope_close: false,
             },
         );
+        if store_consumer {
+            out.external_blocks.insert(formal);
+            out.store_hand_ons.extend(transferee.map(|t| (formal, t)));
+        }
     }
     confirm_hand_ons(&mut out);
     out

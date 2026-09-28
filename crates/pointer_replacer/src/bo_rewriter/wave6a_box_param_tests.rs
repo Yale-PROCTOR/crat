@@ -2373,3 +2373,312 @@ fn w6a_r561_5_input_form_caller_weakens_the_same_place_twice() {
         "no E0499 at the input-form call:\n{source}"
     );
 }
+
+/// The emitted crate's allocator is the system's (R443-1): the declaration
+/// relay wave-6a/120 gates the `store-c-free` lift on.
+const SYSTEM_ALLOCATOR: &str =
+    "\n#[global_allocator]\nstatic GLOBAL: std::alloc::System = std::alloc::System;\n";
+
+/// **R620-3 (a) — a store into a field C frees lifts under R443.** The
+/// refusal `w6a_c2_store_into_a_c_freed_field_is_refused` pins was written
+/// before R443: a Rust-allocated block reaching libc's `free` is defined once
+/// the emitted crate's global allocator IS the system's, because then the
+/// block is a `malloc`/`calloc` block. So the lift reads that declaration,
+/// and each member's block must be a real one: `vec![0; 0]` is a dangling
+/// pointer that libc's `free` would be handed, so an ordinary allocation
+/// lifts only on a positive literal count. Controls, one violation each: no
+/// declaration, a declared allocator that is not `System`, a count the
+/// program computes.
+#[test]
+fn w6a_r620_a_c_freed_store_lifts_under_the_declared_system_allocator() {
+    const FREED: &str = r#"
+#[repr(C)]
+pub struct slot { pub key: *mut i8, pub value: i32 }
+unsafe extern "C" fn slot_set(mut slots: *mut slot, mut index: usize, mut key: *mut i8) {
+    (*slots.offset(index as isize)).key = key;
+}
+pub unsafe extern "C" fn table_put(mut slots: *mut slot, mut index: usize) {
+    let mut key = calloc(8 as usize, ::std::mem::size_of::<i8>()) as *mut i8;
+    slot_set(slots, index, key);
+}
+pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
+    free((*slots.offset(index as isize)).key as *mut core::ffi::c_void);
+    (*slots.offset(index as isize)).key = 0 as *mut i8;
+}
+"#;
+    let declared = format!("{FREED}{SYSTEM_ALLOCATOR}");
+    let out = emitted("r620-store-cfree-system", &with_prelude(&declared));
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("mutkey:Box<[i8]>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("slots[index].key=Box::into_raw(key)as*muti8;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        receipts.contains("box-param-chain callee=slot_set index=2 sink=store"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains(
+            "box-param-store-c-free-lift callee=slot_set index=2 field=slot::key allocator=System"
+        ),
+        "{receipts}"
+    );
+
+    let custom = format!(
+        "{FREED}\nstruct A;\nunsafe impl std::alloc::GlobalAlloc for A {{\n    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {{ std::alloc::GlobalAlloc::alloc(&std::alloc::System, l) }}\n    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {{ std::alloc::GlobalAlloc::dealloc(&std::alloc::System, p, l) }}\n}}\n#[global_allocator]\nstatic GLOBAL: A = A;\n"
+    );
+    let computed = declared.replace(
+        "pub unsafe extern \"C\" fn table_put(mut slots: *mut slot, mut index: usize) {\n    let mut key = calloc(8 as usize,",
+        "pub unsafe extern \"C\" fn table_put(mut slots: *mut slot, mut index: usize, mut n: usize) {\n    let mut key = calloc(n,",
+    );
+    assert_ne!(computed, declared);
+    for (name, source, reason) in [
+        (
+            "r620-store-cfree-undeclared",
+            FREED.to_owned(),
+            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key",
+        ),
+        (
+            "r620-store-cfree-custom",
+            custom,
+            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key",
+        ),
+        (
+            "r620-store-cfree-computed",
+            computed,
+            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key:member-block:table_put::key",
+        ),
+    ] {
+        let out = emitted(name, &with_prelude(&source));
+        let receipts = &out.artifacts.box_param_receipts;
+        assert!(
+            !compact(&out.source).contains("Box<[i8]>"),
+            "{name}: {}",
+            out.source
+        );
+        assert!(receipts.contains(reason), "{name}\n{receipts}");
+        assert!(
+            !receipts.contains("box-param-store-c-free-lift"),
+            "{name}\n{receipts}"
+        );
+    }
+}
+
+/// buffer's `buffer_new_with_string` reduced (batch 48,
+/// `buffer_new_with_string::str` `thin-extent`): an exported entry nothing in
+/// the program calls measures its C string and hands it on, in C2Rust's
+/// hoisted-argument block, to an exported callee that stores it into
+/// `(*self_0).alloc`, which `buffer_free` frees.
+const EXPORTED_STORE: &str = r#"
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+}
+#[repr(C)]
+pub struct buffer_t { pub len: usize, pub alloc: *mut i8, pub data: *mut i8 }
+#[no_mangle]
+pub unsafe extern "C" fn buffer_new_with_string(mut str: *mut i8) -> *mut buffer_t {
+    return {
+        let __arg_1 = strlen(str);
+        buffer_new_with_string_length(str, __arg_1)
+    };
+}
+#[no_mangle]
+pub unsafe extern "C" fn buffer_new_with_string_length(mut str: *mut i8, mut len: usize) -> *mut buffer_t {
+    let mut self_0 = malloc(::std::mem::size_of::<buffer_t>()) as *mut buffer_t;
+    if self_0.is_null() {
+        return 0 as *mut buffer_t;
+    }
+    (*self_0).len = len;
+    (*self_0).alloc = str;
+    (*self_0).data = (*self_0).alloc;
+    return self_0;
+}
+#[no_mangle]
+pub unsafe extern "C" fn buffer_free(mut self_0: *mut buffer_t) {
+    free((*self_0).alloc as *mut core::ffi::c_void);
+    free(self_0 as *mut core::ffi::c_void);
+}
+"#;
+
+/// The same consumer storing its formal ITSELF into the field the program
+/// frees (R620-3's other shape: C2's lifted store with no member).
+const EXPORTED_DIRECT_STORE: &str = r#"
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+}
+#[repr(C)]
+pub struct buffer_t { pub len: usize, pub alloc: *mut i8, pub data: *mut i8 }
+#[no_mangle]
+pub unsafe extern "C" fn buffer_adopt(mut holder: *mut buffer_t, mut str: *mut i8) {
+    let mut len = strlen(str);
+    (*holder).len = len;
+    (*holder).alloc = str;
+}
+#[no_mangle]
+pub unsafe extern "C" fn buffer_release(mut holder: *mut buffer_t) {
+    free((*holder).alloc as *mut core::ffi::c_void);
+}
+"#;
+
+/// **R620-3 (USER) — R534 extends to an exported consumer that STORES its
+/// formal** into storage the program later frees. buffer's entry takes the
+/// owning form at its surface: `Box<[i8]>`, because the body's first act is
+/// `strlen(str)`, which makes the formal a C string (a block of
+/// `strlen + 1` elements, `strdup`'s postcondition) and non-null (a null
+/// argument is UB in the input, §28). It moves on into the storing callee,
+/// whose store releases it (`Box::into_raw`) into the field `buffer_free`
+/// frees: C2's store chain with the waived formal as its one member, lifted
+/// under the declared system allocator. Receipted `exported-consumer-store`.
+#[test]
+fn w6a_r620_an_exported_store_consumer_takes_the_owning_form() {
+    let declared = format!("{EXPORTED_STORE}{SYSTEM_ALLOCATOR}");
+    let out = emitted("r620-exported-store", &with_prelude(&declared));
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("fnbuffer_new_with_string(mutstr:Box<[i8]>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains("fnbuffer_new_with_string_length(mutstr:Box<[i8]>,"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(src.contains("strlen(str.as_"), "{}", out.source);
+    assert!(
+        src.contains("buffer_new_with_string_length(str,__arg_1)"),
+        "{}",
+        out.source
+    );
+    assert!(
+        src.contains("(*self_0).alloc=Box::into_raw(str)as*muti8;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        receipts.contains(
+            "exported-consumer-store callee=buffer_new_with_string index=0 extent=strlen+1"
+        ),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains(
+            "box-param-store-c-free-lift callee=buffer_new_with_string_length index=0 field=buffer_t::alloc allocator=System"
+        ),
+        "{receipts}"
+    );
+    assert!(
+        !receipts.contains("exported-consumer-waiver callee=buffer_new_with_string"),
+        "{receipts}"
+    );
+
+    // The same consumer storing the formal ITSELF, into the field the
+    // program frees: C2's lifted store with no member at all.
+    let out = emitted(
+        "r620-exported-direct-store",
+        &with_prelude(&format!("{EXPORTED_DIRECT_STORE}{SYSTEM_ALLOCATOR}")),
+    );
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        src.contains("mutstr:Box<[i8]>)"),
+        "{}\n{receipts}",
+        out.source
+    );
+    assert!(
+        src.contains(".alloc=Box::into_raw(str)as*muti8;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        receipts.contains("exported-consumer-store callee=buffer_adopt index=1 extent=strlen+1"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains(
+            "box-param-store-c-free-lift callee=buffer_adopt index=1 field=buffer_t::alloc allocator=System"
+        ),
+        "{receipts}"
+    );
+}
+
+/// R620-3's controls, one violation each: without the allocator declaration
+/// the store stays refused; a field the program never frees is not the
+/// ruled shape (R534's own store control, `ht_park`, is that one); a formal
+/// tested for null before it is measured may be null, so it is not a
+/// non-null C string. Outside the extension nothing supersedes the model,
+/// so the formal keeps its own verdict (`Ref`). And a consumer that stores
+/// its formal AND hands it to another consumer has two sinks: the owner walk
+/// refuses it.
+#[test]
+fn w6a_r620_the_store_extension_holds_outside_its_shape() {
+    let declared = format!("{EXPORTED_STORE}{SYSTEM_ALLOCATOR}");
+    let never_freed =
+        declared.replace("    free((*self_0).alloc as *mut core::ffi::c_void);\n", "");
+    let tested = declared.replace(
+        "    return {\n        let __arg_1 = strlen(str);",
+        "    if str.is_null() {\n        return 0 as *mut buffer_t;\n    }\n    return {\n        let __arg_1 = strlen(str);",
+    );
+    let two_sinks = format!("{EXPORTED_DIRECT_STORE}{SYSTEM_ALLOCATOR}")
+        .replace(
+            "    let mut len = strlen(str);\n",
+            "    let mut len = strlen(str);\n    keep(str);\n",
+        )
+        .replace(
+            "#[no_mangle]\npub unsafe extern \"C\" fn buffer_adopt",
+            "static mut KEPT: *mut i8 = 0 as *mut i8;\nunsafe extern \"C\" fn keep(mut s: *mut i8) {\n    KEPT = s;\n}\n#[no_mangle]\npub unsafe extern \"C\" fn buffer_adopt",
+        );
+    assert_ne!(never_freed, declared);
+    assert_ne!(tested, declared);
+    assert!(two_sinks.contains("keep(str);") && two_sinks.contains("KEPT = s;"));
+    for (name, source, reason) in [
+        (
+            "r620-exported-store-undeclared",
+            EXPORTED_STORE.to_owned(),
+            "box-param-store-c-free:buffer_new_with_string_length:buffer_t::alloc",
+        ),
+        (
+            "r620-exported-store-never-freed",
+            never_freed,
+            "buffer_new_with_string::str\theld\tbox-param-model:buffer_new_with_string::str:Some(Ref)",
+        ),
+        (
+            "r620-exported-store-tested",
+            tested,
+            "buffer_new_with_string::str\theld\tbox-param-model:buffer_new_with_string::str:Some(Ref)",
+        ),
+        (
+            "r620-exported-store-two-sinks",
+            two_sinks,
+            "buffer_adopt::str\theld\tbox-param-callee-use:buffer_adopt:store-consumer-escapes",
+        ),
+    ] {
+        let out = emitted(name, &with_prelude(&source));
+        let src = compact(&out.source);
+        let receipts = &out.artifacts.box_param_receipts;
+        assert!(
+            !src.contains("mutstr:Box<[i8]>") && !src.contains("mutstr:Option<Box<"),
+            "{name}: {}\n{receipts}",
+            out.source
+        );
+        assert!(receipts.contains(reason), "{name}\n{receipts}");
+        assert!(
+            !receipts.contains("exported-consumer-store"),
+            "{name}\n{receipts}"
+        );
+    }
+}
