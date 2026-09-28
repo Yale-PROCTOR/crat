@@ -234,18 +234,11 @@ fn parameter_access(
         // evidence that the opaque address is accessed at some real width. A
         // `c_void` parameter that is only passed on or compared accesses
         // nothing and is not in scope.
-        match facts.address_observations.iter().find(|fact| {
+        let cast = facts.address_observations.iter().find(|fact| {
             fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
-        }) {
-            Some(cast) => AccessReason::VoidPointee {
-                cast_to: cast.target_type.clone(),
-            },
-            // wave-6l (Codex 062 finding 2): handed UNCAST to a counted
-            // foreign position (`fill(d: *mut c_void) { memcpy(d, s, 16) }`),
-            // the footprint is the contract's, and no cast is needed to say so.
-            None => AccessReason::ForeignContract {
-                at: counted_foreign_footprint(facts, key)?,
-            },
+        })?;
+        AccessReason::VoidPointee {
+            cast_to: cast.target_type.clone(),
         }
     } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
         uses.iter().find(|(op, span)| {

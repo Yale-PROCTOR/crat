@@ -196,9 +196,10 @@ fn w6l_seethrough_f1c_a_nul_walk_is_not_a_counted_footprint() {
     );
 }
 
-/// Codex 062 (findings 2, 3): the counted footprint through a `c_void`
-/// wrapper that hands its parameter to `memcpy` uncast, and through a cast
-/// between two forwarders.
+/// Codex 062 (finding 3): the counted footprint through a cast between two
+/// forwarders. (`fill_raw`, an uncast `c_void` wrapper, is finding 2's shape:
+/// whether its 16 bytes pass one element depends on the CALLER's element, so
+/// the callee-side arm leaves it to the caller-aware conjunct.)
 const FOOTPRINT_HOPS: &str = r#"
 #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
 extern "C" {
@@ -225,21 +226,6 @@ pub unsafe fn caller(mut p: *mut Pair) {
     relay(r, (*p).b);
 }
 "#;
-
-/// F2 (Codex 062 finding 2) — a `c_void` parameter handed uncast to a counted
-/// position: no cast names a width, and the footprint is still 16 bytes.
-#[test]
-fn w6l_seethrough_f2_a_void_wrapper_passes_the_counted_footprint_on() {
-    let map = access_map(FOOTPRINT_HOPS);
-    let row = map
-        .iter()
-        .find(|(label, _)| label == "caller::v")
-        .unwrap_or_else(|| panic!("caller::v is not held: {map:#?}"));
-    assert!(
-        row.1.ends_with("foreign-contract:memcpy:0:byte-count"),
-        "{map:#?}"
-    );
-}
 
 /// F3 (Codex 062 finding 3) — the counted footprint is followed through a
 /// cast between two forwarders, as the NUL see-through follows casts.
