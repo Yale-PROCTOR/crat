@@ -280,3 +280,14 @@ pub unsafe fn run(n: usize) -> u8 {
         "{rows:#?}"
     );
 }
+
+/// Zc4 — Z3's control: `gap += n` may make it non-zero, so its licence stands.
+#[test]
+fn w6l_mask_zc4_a_runtime_increment_stays_licensed() {
+    let input = fixture(&ZERO_ROOT.replace(
+        "    let mut gap = 0 as usize;\n    Iterate(n, gap, (*s).dc)",
+        "    let mut gap = 0 as usize;\n    gap += n;\n    Iterate(n, gap, (*s).dc)",
+    ));
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(flat(&source).contains("(gap) as usize"), "{source}");
+}

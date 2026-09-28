@@ -196,6 +196,45 @@ fn zero_literal(e: &Expr<'_>) -> bool {
     matches!(peel(e).kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(n, _) if n.get() == 0))
 }
 
+/// `x OP rhs` keeps `x == 0` zero: `+ - | ^ << >>` by a literal `0`, or `* &`
+/// by anything.
+fn zero_preserving_op(op: rustc_ast::AssignOpKind, rhs: &Expr<'_>) -> bool {
+    use rustc_ast::AssignOpKind::*;
+    match op {
+        MulAssign | BitAndAssign => true,
+        AddAssign | SubAssign | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
+            zero_literal(rhs)
+        }
+        DivAssign | RemAssign => false,
+    }
+}
+
+/// `x = x.wrapping_add(0)` and its kin, or `x = x + 0`: the value `x` had.
+fn preserves_zero(id: HirId, rhs: &Expr<'_>) -> bool {
+    match peel(rhs).kind {
+        ExprKind::MethodCall(segment, receiver, [argument], _) => {
+            local_of(receiver) == Some(id)
+                && match segment.ident.name.as_str() {
+                    "wrapping_mul" => true,
+                    "wrapping_add" | "wrapping_sub" | "wrapping_shl" | "wrapping_shr" => {
+                        zero_literal(argument)
+                    }
+                    _ => false,
+                }
+        }
+        ExprKind::Binary(op, left, right) => {
+            use rustc_hir::BinOpKind::*;
+            local_of(left) == Some(id)
+                && match op.node {
+                    Mul | BitAnd => true,
+                    Add | Sub | BitOr | BitXor | Shl | Shr => zero_literal(right),
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 fn local_of(e: &Expr<'_>) -> Option<HirId> {
     match peel(e).kind {
         ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
@@ -298,15 +337,18 @@ impl<'tcx> Definitions<'tcx> {
                     && let Some(id) = local_of(lhs)
                 {
                     self.1.assigned.insert(id);
-                    if !zero_literal(rhs) {
+                    if !zero_literal(rhs) && !preserves_zero(id, rhs) {
                         self.1.nonzero.insert(id);
                     }
                 }
-                if let ExprKind::AssignOp(_, lhs, _) = e.kind
+                // Codex 062b: `x += 0`, `x |= 0`, `x *= y` leave a zero zero.
+                if let ExprKind::AssignOp(op, lhs, rhs) = e.kind
                     && let Some(id) = local_of(lhs)
                 {
                     self.1.assigned.insert(id);
-                    self.1.nonzero.insert(id);
+                    if !zero_preserving_op(op.node, rhs) {
+                        self.1.nonzero.insert(id);
+                    }
                 }
                 // A borrowed local may be written through the borrow.
                 if let ExprKind::AddrOf(_, _, place) = e.kind
@@ -367,7 +409,8 @@ impl<'tcx> Definitions<'tcx> {
             ExprKind::MethodCall(segment, receiver, [argument], _)
                 if matches!(segment.ident.name.as_str(), "wrapping_add" | "add") =>
             {
-                self.masked(receiver) && !constant(argument)
+                (self.masked(receiver) && !constant(argument))
+                    || (self.masked(argument) && !constant(receiver))
             }
             _ => false,
         }
