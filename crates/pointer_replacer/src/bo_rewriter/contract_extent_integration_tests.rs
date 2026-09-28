@@ -1275,7 +1275,7 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
         ::utils::compilation::str_to_input(CE_V01_VOID_CAST_COUNTED_POSITION),
         |tcx| {
             let (_table, ctx) = super::decide_table_with_ctx(tcx)?;
-            let held = super::decision::thin_extent::collect(&ctx.facts);
+            let held = super::decision::thin_extent::collect(tcx, &ctx.facts);
             Ok::<_, String>(
                 ctx.subjects
                     .iter()
@@ -1287,7 +1287,15 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
     )
     .expect("CE-V01 fixture compiles")
     .expect("CE-V01 decision table");
-    assert_eq!(held, vec!["save_file::buffer".to_owned()], "{held:?}");
+    // wave-6l R641 (re-pin, annotated): `top::x` is handed bare to
+    // `save_file::buffer`, which reaches the counted position, so the
+    // thin-extent set follows the parameter one call up and holds it too —
+    // a thin `&u8` there would reach `fwrite`'s counted footprint.
+    assert_eq!(
+        held,
+        vec!["save_file::buffer".to_owned(), "top::x".to_owned()],
+        "{held:?}"
+    );
     // (b) End to end: #1b's `fwrite` rider promotes the position with its
     // caller's chain; nothing thin reaches the void cast.
     let source = emitted(CE_V01_VOID_CAST_COUNTED_POSITION);

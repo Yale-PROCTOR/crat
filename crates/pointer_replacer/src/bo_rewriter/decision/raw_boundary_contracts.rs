@@ -259,6 +259,11 @@ const TABLE: &[ContractRow] = &[
     row("sscanf", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("stat", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     row("stat", 1, PointeeAccess::Write).with(ArgumentExtent::OneElement),
+    // wave-6l (R641): glibc's inline `stat` is `__xstat(_STAT_VER, path, buf)`,
+    // and C2Rust emits the wrapper as a LOCAL function (brotli, libtree), so
+    // the foreign symbol a path reaches is this one.
+    row("__xstat", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
+    row("__xstat", 2, PointeeAccess::Write).with(ArgumentExtent::OneElement),
     return_alias_row("strcat", 0, PointeeAccess::Write).with(ArgumentExtent::UnboundedWrite),
     return_alias_row("strcat", 1, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),
     return_alias_row("strchr", 0, PointeeAccess::Read).with(ArgumentExtent::NulTerminated),

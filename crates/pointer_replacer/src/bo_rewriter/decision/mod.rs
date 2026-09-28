@@ -51,6 +51,8 @@ pub(crate) mod construction_values;
 pub(crate) mod contract_extent;
 pub(crate) mod contract_extent_adapter;
 #[cfg(test)]
+mod contract_seethrough_tests;
+#[cfg(test)]
 mod counted_extent_tests;
 pub(crate) mod counted_void;
 mod counted_void_handle;

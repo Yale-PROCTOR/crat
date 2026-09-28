@@ -34,8 +34,12 @@
 
 use rustc_hash::FxHashSet;
 use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_middle::ty::TyCtxt;
 
-use super::{emitability::EmitabilityFacts, raw_boundary_contracts::classify_contract};
+use super::{
+    emitability::{ArgShape, EmitabilityFacts},
+    raw_boundary_contracts::classify_contract,
+};
 
 /// Does this exact foreign position consume more than one element?
 ///
@@ -74,7 +78,14 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 
 /// Subjects that reach such a position. A subject in this set may not take a
 /// THIN reference form.
-pub(crate) fn collect(facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
+///
+/// **wave-6l (R641): directly, or through a local callee's parameter.** A
+/// subject handed, bare or under casts, to a local callee parameter that is
+/// itself in the set reaches the same position one call deeper: brotli's
+/// `CopyStat(input_path)` calls C2Rust's local copy of glibc's inline
+/// `stat(p, b) { __xstat(1, p, b) }`, and the NUL walk is `__xstat`'s. Followed
+/// to a fixpoint, so a chain of such forwarders is one fact.
+pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
     let mut out = FxHashSet::default();
     for fact in &facts.foreign_call_args {
         if !position_consumes_many_elements(&fact.callee, fact.argument_index, &fact.target)
@@ -86,5 +97,31 @@ pub(crate) fn collect(facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)
             out.insert((fact.caller, root));
         }
     }
-    out
+    loop {
+        let mut grew = false;
+        for (callee, sites) in &facts.call_args {
+            if tcx.hir_node_by_def_id(*callee).body_id().is_none() {
+                continue;
+            }
+            let params = tcx.hir_body_owned_by(*callee).params;
+            for site in sites {
+                for arg in &site.args {
+                    let (ArgShape::BareLocal(root) | ArgShape::CastOfLocal { binding: root, .. }) =
+                        arg.shape
+                    else {
+                        continue;
+                    };
+                    let Some(param) = params.get(arg.index) else {
+                        continue;
+                    };
+                    if out.contains(&(*callee, param.pat.hir_id)) {
+                        grew |= out.insert((site.caller, root));
+                    }
+                }
+            }
+        }
+        if !grew {
+            return out;
+        }
+    }
 }

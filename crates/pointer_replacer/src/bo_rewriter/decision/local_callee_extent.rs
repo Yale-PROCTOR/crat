@@ -86,6 +86,13 @@ pub(crate) enum AccessReason {
     VoidPointee { cast_to: String },
     /// The body offsets or indexes the parameter.
     PointerArithmetic { op: String },
+    /// **wave-6l (R641, main 131 §6 finding 6).** The parameter is handed,
+    /// bare or under casts, to a FOREIGN position whose pinned contract has a
+    /// counted or unbounded footprint past one element (`memcpy(dst as *mut
+    /// c_void, .., 16)`). Carries `symbol:index:extent`. A NUL-terminated
+    /// read is not this arm's: the NUL walk is R608-1's, through the
+    /// thin-extent set.
+    ForeignContract { at: String },
     /// The parameter accesses nothing itself and hands the pointer, bare, to
     /// a callee parameter that does (W-C9, fix-2 one call deeper: a thin
     /// caller bridged into the forwarder reads wide through a one-element
@@ -100,6 +107,7 @@ impl AccessReason {
             Self::VoidPointee { cast_to } => format!("void-pointee-cast-to:{cast_to}"),
             Self::PointerArithmetic { op } => format!("pointer-arithmetic:{op}"),
             Self::Forwarded { into } => format!("forwarded-into:{into}"),
+            Self::ForeignContract { at } => format!("foreign-contract:{at}"),
         }
     }
 }
@@ -228,6 +236,8 @@ fn parameter_access(
         })
     }) {
         AccessReason::PointerArithmetic { op: op.clone() }
+    } else if let Some(at) = counted_foreign_footprint(facts, key) {
+        AccessReason::ForeignContract { at }
     } else {
         // No access of its own: the first callee parameter it is handed to,
         // bare, that accesses wide (a cycle accesses nothing).
@@ -359,6 +369,39 @@ fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::S
 /// - [`Fallback`](NulWalk::Fallback) — the walk can stop before the NUL, so
 ///   `strlen` at the caller could read bytes the input never reads. The §77
 ///   fallback extent with its receipt is what that takes.
+/// **wave-6l (R641, main 131 §6 finding 6) — the contract arm.** The first
+/// foreign position this parameter reaches, bare or under casts, whose pinned
+/// contract writes or reads a COUNTED or unbounded footprint past one element:
+/// `symbol:index:extent`. A byte count that spells the pointee's own size is
+/// one element and is not one (`thin_extent::byte_count_is_one_element`), and
+/// a NUL-terminated read is left to the thin-extent set (the `strlen` control).
+fn counted_foreign_footprint(
+    facts: &EmitabilityFacts,
+    (function, binding): (LocalDefId, HirId),
+) -> Option<String> {
+    use super::raw_boundary_contracts::{ArgumentExtent, classify_contract};
+    facts.foreign_call_args.iter().find_map(|fact| {
+        if fact.caller != function || fact.direct_subject_root() != Some(binding) {
+            return None;
+        }
+        let contract = classify_contract(&fact.callee, fact.argument_index, &fact.target).ok()?;
+        (matches!(
+            contract.extent,
+            ArgumentExtent::ByteCount
+                | ArgumentExtent::ElementCount
+                | ArgumentExtent::UnboundedWrite
+        ) && !super::thin_extent::byte_count_is_one_element(fact))
+        .then(|| {
+            format!(
+                "{}:{}:{}",
+                fact.callee.symbol,
+                fact.argument_index,
+                contract.extent.key()
+            )
+        })
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NulWalk {
     Exact,
