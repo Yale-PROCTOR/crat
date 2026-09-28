@@ -4043,3 +4043,283 @@ fn r618_a_calloc_aggregate_of_zero_valid_fields_needs_no_supplied_fields() {
         "{row}\n{source}"
     );
 }
+
+/// R641-6 (4a, design (B)): heman's out-parameter allocation, reduced from the
+/// derived substrate — `osn_context`, `allocate_perm` (a raw writer the block
+/// is lent to), `open_simplex_noise` (the `#[no_mangle]` callee writing
+/// `*ctx = malloc(..)`, with both failure paths: a null `*ctx`, and
+/// `free(*ctx); return rc;`), `open_simplex_noise_free` (a null guard and the
+/// field frees through the root before its retirement), a reader, and a caller
+/// shaped like `heman_ops_emboss`. `CALLER` is the caller's body after its
+/// `let`; `CALLEE_EXTRA` is spliced into the callee after the allocation.
+fn r641_heman(callee_extra: &str, caller: &str) -> String {
+    format!(
+        r#"pub type int16_t = i16;
+pub type int64_t = i64;
+#[repr(C)] #[derive(Copy, Clone)] pub struct osn_context {{ pub perm: *mut int16_t, pub permGradIndex3D: *mut int16_t }}
+pub static mut KEEP: *mut osn_context = 0 as *mut osn_context;
+unsafe extern "C" fn allocate_perm(mut ctx: *mut osn_context, mut nperm: i32, mut ngrad: i32) -> i32 {{
+    if !((*ctx).perm).is_null() {{ free((*ctx).perm as *mut core::ffi::c_void); }}
+    if !((*ctx).permGradIndex3D).is_null() {{ free((*ctx).permGradIndex3D as *mut core::ffi::c_void); }}
+    (*ctx).perm = malloc((::std::mem::size_of::<int16_t>()).wrapping_mul(nperm as usize)) as *mut int16_t;
+    if ((*ctx).perm).is_null() {{ return -(12 as i32); }}
+    (*ctx).permGradIndex3D = malloc((::std::mem::size_of::<int16_t>()).wrapping_mul(ngrad as usize)) as *mut int16_t;
+    if ((*ctx).permGradIndex3D).is_null() {{ free((*ctx).perm as *mut core::ffi::c_void); return -(12 as i32); }}
+    return 0 as i32;
+}}
+#[no_mangle]
+pub unsafe extern "C" fn open_simplex_noise(mut seed: int64_t, mut ctx: *mut *mut osn_context) -> i32 {{
+    let mut rc: i32 = 0;
+    let mut perm = 0 as *mut int16_t;
+    *ctx = malloc(::std::mem::size_of::<osn_context>()) as *mut osn_context;
+    if (*ctx).is_null() {{ return -(12 as i32); }}
+    {callee_extra}
+    (**ctx).perm = 0 as *mut int16_t;
+    (**ctx).permGradIndex3D = 0 as *mut int16_t;
+    rc = allocate_perm(*ctx, 256 as i32, 256 as i32);
+    if rc != 0 {{ free(*ctx as *mut core::ffi::c_void); return rc; }}
+    perm = (**ctx).perm;
+    let mut i = 255 as i32;
+    while i >= 0 as i32 {{ *perm.offset(i as isize) = (seed % 7) as int16_t; i -= 1; }}
+    return 0 as i32;
+}}
+#[no_mangle]
+pub unsafe extern "C" fn open_simplex_noise_free(mut ctx: *mut osn_context) {{
+    if ctx.is_null() {{ return; }}
+    if !((*ctx).perm).is_null() {{ free((*ctx).perm as *mut core::ffi::c_void); (*ctx).perm = 0 as *mut int16_t; }}
+    if !((*ctx).permGradIndex3D).is_null() {{ free((*ctx).permGradIndex3D as *mut core::ffi::c_void); (*ctx).permGradIndex3D = 0 as *mut int16_t; }}
+    free(ctx as *mut core::ffi::c_void);
+}}
+#[no_mangle]
+pub unsafe extern "C" fn open_simplex_noise2(mut ctx: *mut osn_context, mut x: f64, mut y: f64) -> f64 {{
+    return *((*ctx).perm).offset(3 as isize) as f64 + x + y;
+}}
+#[no_mangle]
+pub unsafe extern "C" fn emboss(mut seed: i32, mut n: i32) -> f64 {{
+    let mut ctx = 0 as *mut osn_context;
+{caller}
+}}"#
+    )
+}
+
+const R641_CALLER: &str = "    open_simplex_noise(seed as int64_t, &mut ctx);
+    let mut acc = 0.0f64;
+    let mut i = 0 as i32;
+    while i < n { acc += open_simplex_noise2(ctx, i as f64, 0.5f64); i += 1; }
+    open_simplex_noise_free(ctx);
+    return acc;";
+
+/// **R641-6 — the out-parameter's block is the caller's Box.** The caller's
+/// `ctx` is an `Option<Box<osn_context>>` handed to the unchanged raw callee
+/// through the null-pointer niche (`Option<Box<T>>` has `*mut T`'s layout);
+/// the callee's certificate (the out pointer only dereferenced; every return
+/// leaves `*out` null or a fresh `malloc` of the element; the block lent to
+/// `allocate_perm` under the no-retention proof) makes what lands there a
+/// fresh, unshared block. Failure path 2 frees the block and returns nonzero,
+/// and a nonzero return is the only one that can leave a freed block behind, so
+/// the caller nulls its slot on a nonzero return (R641-6's null-after-free, placed
+/// in the caller: the callee is shared by six callers). The reader takes
+/// `as_deref().unwrap()` (a panic where C dereferences null); the free callee
+/// takes the block back as a raw pointer and its C `free` is the release.
+#[test]
+fn r641_a_heman_out_parameter_block_is_the_callers_box() {
+    let (row, source, reverted) = r618_emit(
+        "r641 heman out-parameter",
+        &r641_heman("", R641_CALLER),
+        "emboss::ctx",
+    );
+    // The emitted program for the Miri run (`R641_EMIT_DIR`), test-only.
+    if let Ok(dir) = std::env::var("R641_EMIT_DIR") {
+        std::fs::write(format!("{dir}/r641-emitted.rs"), &source).unwrap();
+    }
+    let text: String = source.split_whitespace().collect();
+    let context = format!("{row}\n{source}");
+    assert!(row.contains("\tselected\t"), "{context}");
+    assert!(
+        text.contains(
+            "letmutctx:::std::option::Option<::std::boxed::Box<crate::osn_context>>=None;"
+        ),
+        "{context}"
+    );
+    // The call writes the block through the slot's raw view; a nonzero
+    // return nulls the slot through the same view (the callee's failure path
+    // freed the block), never reading it as a Box.
+    assert!(
+        text.contains("{let__crat_rc=open_simplex_noise(seedasint64_t,::core::ptr::from_mut(&mutctx).cast::<*mutcrate::osn_context>());if__crat_rc!=0{*::core::ptr::from_mut(&mutctx).cast::<*mutcrate::osn_context>()=::core::ptr::null_mut();}__crat_rc};"),
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise2(ctx.as_deref().unwrap(),"),
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise_free((ctx.map_or(::core::ptr::null_mut(),::std::boxed::Box::into_raw)as*mutosn_context));"),
+        "{context}"
+    );
+    // The callee is untouched: its signature and its failure path stay C's.
+    assert!(
+        text.contains("pubunsafeextern\"C\"fnopen_simplex_noise(mutseed:int64_t,mutctx:*mut*mutosn_context)->i32{"),
+        "{context}"
+    );
+    assert!(
+        text.contains("ifrc!=0{free(*ctxas*mutcore::ffi::c_void);returnrc;}"),
+        "{context}"
+    );
+    let receipts = r641_receipts("r641 heman out-parameter", &r641_heman("", R641_CALLER));
+    for receipt in [
+        "native-out-parameter-constructor callee=open_simplex_noise argument=1",
+        "native-out-parameter-null-after-free",
+        "native-out-parameter-lend callee=allocate_perm arg=0",
+    ] {
+        assert!(
+            receipts.iter().any(|r| r.contains(receipt)),
+            "{receipt}\n{receipts:#?}"
+        );
+    }
+    assert_eq!(reverted, 0, "{context}");
+}
+
+/// The Box plan's receipts for `emboss::ctx` (Owning by override, as in
+/// `r618_emit`), read from the decision table itself.
+fn r641_receipts(marker: &str, body: &str) -> Vec<String> {
+    use crate::analyses::borrow_ownership::SlotKind::Owning;
+    let source = format!(
+        "// {marker}\n{}\n#[repr(C)] #[derive(Copy, Clone)] pub struct entry {{ pub key: *const i8, pub value: *mut core::ffi::c_void }}\n#[repr(C)] #[derive(Copy, Clone)] pub struct table {{ pub entries: *mut entry, pub capacity: usize }}\n{body}",
+        declarations()
+    );
+    let _frame = super::test_model_override::frame_lock();
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(marker, vec![], vec![("emboss::ctx".to_owned(), Owning)]);
+    let receipts = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        table
+            .entries
+            .iter()
+            .find_map(|(subject, decision)| match decision {
+                Decision::Box(plan)
+                    if subject.param_name.as_deref() == Some("ctx")
+                        && tcx.item_name(subject.fn_did.to_def_id()).as_str() == "emboss" =>
+                {
+                    Some(plan.receipts.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    })
+    .unwrap();
+    super::test_model_override::clear();
+    receipts
+}
+
+/// Control (W1): a callee that keeps a copy of the block (`KEEP = *ctx`) is
+/// no out-parameter allocator — the block has a second holder — so the caller
+/// stays raw on the constructor, exactly as today.
+#[test]
+fn r641_b_a_callee_that_keeps_the_block_is_refused() {
+    let (row, source, _) = r618_emit(
+        "r641 kept out-parameter",
+        &r641_heman("KEEP = *ctx;", R641_CALLER),
+        "emboss::ctx",
+    );
+    assert!(
+        row.contains("Source(Missing(\"native-out-parameter-certificate\"))"),
+        "{row}\n{source}"
+    );
+    assert!(
+        source.contains("let mut ctx = 0 as *mut osn_context;"),
+        "{row}\n{source}"
+    );
+}
+
+/// Control (W4): a caller reading `ctx` after a failing call takes the same
+/// `unwrap()` view — `None` after either failure path — and panics where C
+/// dereferences a null or freed pointer.
+#[test]
+fn r641_c_a_read_after_a_failing_call_is_the_null_arm() {
+    let caller = "    let mut rc = open_simplex_noise(seed as int64_t, &mut ctx);
+    let mut acc = 0.0f64;
+    if rc != 0 { acc = open_simplex_noise2(ctx, 0.0f64, 0.0f64); }
+    open_simplex_noise_free(ctx);
+    return acc;";
+    let (row, source, reverted) = r618_emit(
+        "r641 read after failure",
+        &r641_heman("", caller),
+        "emboss::ctx",
+    );
+    let text: String = source.split_whitespace().collect();
+    assert!(row.contains("\tselected\t"), "{row}\n{source}");
+    assert!(
+        text.contains("open_simplex_noise2(ctx.as_deref().unwrap(),"),
+        "{row}\n{source}"
+    );
+    assert_eq!(reverted, 0, "{row}\n{source}");
+}
+
+/// Control (W5): the free callee reached through a function pointer is no
+/// provable release, so the owner holds.
+#[test]
+fn r641_d_the_free_callee_through_a_fn_pointer_is_refused() {
+    let caller = "    open_simplex_noise(seed as int64_t, &mut ctx);
+    let mut acc = open_simplex_noise2(ctx, 0.5f64, 0.5f64);
+    let mut release: unsafe extern \"C\" fn(*mut osn_context) = open_simplex_noise_free;
+    release(ctx);
+    return acc;";
+    let (row, source, _) = r618_emit(
+        "r641 free through a pointer",
+        &r641_heman("", caller),
+        "emboss::ctx",
+    );
+    assert!(
+        row.contains("Source(UnsupportedOwnerUse)"),
+        "{row}\n{source}"
+    );
+}
+
+/// Control (W1): a callee that frees `*out` and then returns a local it has
+/// just tested EQUAL to 0 could hand the caller a freed block on a return the
+/// caller does not null — refused (only the `x != 0` guard admits the free).
+#[test]
+fn r641_e_a_free_before_a_zero_return_is_refused() {
+    let (row, source, _) = r618_emit(
+        "r641 free before zero",
+        &r641_heman(
+            "let mut z: i32 = 0; if z == 0 { free(*ctx as *mut core::ffi::c_void); return z; }",
+            R641_CALLER,
+        ),
+        "emboss::ctx",
+    );
+    assert!(
+        row.contains("native-out-parameter-free-without-nonzero-return"),
+        "{row}\n{source}"
+    );
+}
+
+/// Control (W1): a callee that takes a reference INTO the block and keeps it
+/// (`KEEP = &mut **ctx`, or the address of one of its fields) would alias the
+/// caller's Box after the call — refused.
+#[test]
+fn r641_f_a_reference_into_the_block_is_refused() {
+    for extra in [
+        "KEEP = &mut **ctx as *mut osn_context;",
+        "let mut field: *mut *mut int16_t = &mut (**ctx).perm;",
+    ] {
+        let (row, source, _) = r618_emit(
+            "r641 reference into the block",
+            &r641_heman(extra, R641_CALLER),
+            "emboss::ctx",
+        );
+        assert!(
+            row.contains("Source(Missing(\"native-out-parameter-certificate\"))"),
+            "{extra}\n{row}\n{source}"
+        );
+    }
+}

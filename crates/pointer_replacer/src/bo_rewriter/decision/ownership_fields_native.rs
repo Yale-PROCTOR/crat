@@ -1305,9 +1305,13 @@ fn derive_bundle(
     if field_load.is_some() && field_form.is_none() {
         return Err(NativeHold::Missing("native-field-load-field-not-owned"));
     }
+    // R641-6 (4a): an out-parameter's callee may leave the slot null, so
+    // that owner is optional as well.
     let optional_owner = field_form
         .as_deref()
-        .is_some_and(|form| form.to_lowercase().contains("opt"));
+        .is_some_and(|form| form.to_lowercase().contains("opt"))
+        || source.out_parameter().is_some();
+    let out_owner = source.out_parameter().is_some();
     // R450 (wave-6f 030 STOP 1): the FIELD's own form carries the payload's
     // shape as well as its optionality. A field delivered `opt-box-slice` is
     // `Option<Box<[T]>>`, so the local taking its `take()` is spelled the same
@@ -1396,6 +1400,56 @@ fn derive_bundle(
         return Err(NativeHold::Missing("native-view-alias-family-owned"));
     }
     edits.extend_from_slice(source.scalar_edits());
+    // **R641-6 (4a, design (B))** — the owner's block is written by the
+    // callee through the `Option<Box<T>>` slot itself: the slot has `*mut T`'s
+    // layout (the null-pointer niche), so the unchanged raw callee writes a
+    // fresh block or null straight into it. The certificate lets a freed
+    // block stay in the slot only on a nonzero return, so the caller nulls
+    // its slot then, through the same raw view, never reading it as a Box.
+    let mut out_receipts = Vec::new();
+    if let Some(out) = source.out_parameter() {
+        for &(lent, argument) in &out.lends {
+            let scope = match inputs.retention.get(lent, argument) {
+                Some(RetentionVerdict::NoRetain { certificate }) => {
+                    inputs
+                        .retention
+                        .verify_certificate(lent, argument, certificate)
+                        .map_err(|_| NativeHold::Missing("native-out-parameter-lend-retention"))?;
+                    "raw-boundary-t1-certificate"
+                }
+                _ => effects
+                    .certify_no_retention(lent, argument)
+                    .map_err(|_| NativeHold::Missing("native-out-parameter-lend-retention"))?
+                    .scope(),
+            };
+            out_receipts.push(format!(
+                "native-out-parameter-lend callee={} arg={argument} scope={scope}",
+                tcx.def_path_str(lent.to_def_id())
+            ));
+        }
+        let bridge = format!(
+            "::core::ptr::from_mut(&mut {name}).cast::<*mut {}>()",
+            source.element_spelling()
+        );
+        edits.push(BoxExprEdit {
+            span: out.call_span,
+            replacement: format!(
+                "{{ let __crat_rc = {}{bridge}{}; if __crat_rc != 0 {{ *{bridge} = ::core::ptr::null_mut(); }} __crat_rc }}",
+                out.before_argument, out.after_argument
+            ),
+            receipt: "native-out-parameter-call",
+        });
+        out_receipts.push(format!(
+            "native-out-parameter-constructor callee={} argument={} certificate=out-only-dereferenced;written-null-or-fresh-{};freed-only-before-a-nonzero-return",
+            tcx.def_path_str(out.callee),
+            out.index,
+            source.element()
+        ));
+        out_receipts.push(format!(
+            "native-out-parameter-null-after-free call={:?} slot-nulled-by-the-caller-on-a-nonzero-return",
+            out.call_span
+        ));
+    }
     // R412-2: an owner access that is the BASE of another family's slice
     // construction (`let mut src = ((**elevations.offset(i)).data).offset(…)`
     // with `src` decided a slice or cursor) sits inside that family's
@@ -1433,6 +1487,7 @@ fn derive_bundle(
         subject.local.as_u32(),
         subject.hir_id
     )];
+    receipts.extend(out_receipts);
     let payload = if field_payload_is_slice {
         format!("[{}]", source.element_spelling())
     } else {
@@ -1523,9 +1578,15 @@ fn derive_bundle(
         let [site] = matching.as_slice() else {
             return Err(NativeHold::Missing("native-lend-source-join"));
         };
-        if site.callee_may_yield_pointer && obligation.deallocator_events().is_none() {
-            return Err(NativeHold::Missing("native-pointer-yield"));
-        }
+        // R641-6 (4a; 078's wall (v)): a callee whose SIGNATURE could hand a
+        // pointer back (a pointer-carrying return, or `*mut` storage that can
+        // hold one) is no longer refused on the signature. The lend's
+        // no-retention proof below fails on exactly those channels for the
+        // lent argument — the T1 certificate counts `Return` / `OutputStorage`
+        // as retention, and the native trace holds an `Escape` for a returned
+        // or stored alias — so it discharges this check, receipted.
+        let yield_discharged =
+            site.callee_may_yield_pointer && obligation.deallocator_events().is_none();
         let emitted = formal::resolve(
             tcx,
             inputs.slots,
@@ -1561,10 +1622,18 @@ fn derive_bundle(
                 return Err(NativeHold::Identity);
             }
             receipts.push(format!("native-box-transfer {:?} callee={} argument={argument} original-C-free-events={:?} caller-after=dead",key,tcx.def_path_str(callee.to_def_id()),proof.events()));
-            format!(
-                "(::std::boxed::Box::into_raw({name}) as {})",
-                obligation.raw_argument_type()
-            )
+            if out_owner {
+                // R395-2's null rule: the empty option IS the null pointer.
+                format!(
+                    "({name}.map_or(::core::ptr::null_mut(), ::std::boxed::Box::into_raw) as {})",
+                    obligation.raw_argument_type()
+                )
+            } else {
+                format!(
+                    "(::std::boxed::Box::into_raw({name}) as {})",
+                    obligation.raw_argument_type()
+                )
+            }
         } else {
             let nonconsuming_scope =
                 formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
@@ -1591,7 +1660,32 @@ fn derive_bundle(
                 "native-noretention-proof {:?} arg={argument} scope={retention_scope}",
                 key
             ));
+            if yield_discharged {
+                receipts.push(format!(
+                    "native-pointer-yield-discharged {key:?} arg={argument} by={retention_scope}"
+                ));
+            }
             match (source.shape(), emitted.emitted(), emitted.terminal()) {
+                // R641-6: an optional owner opens at the view — a panic where
+                // C would dereference a null pointer.
+                (
+                    BoxShape::Sized,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Ref { mutable: true },
+                ) if out_owner => format!("{name}.as_deref_mut().unwrap()"),
+                (
+                    BoxShape::Sized,
+                    FormalForm::SharedReference,
+                    super::seam::Form::Ref { mutable: false },
+                ) if out_owner => format!("{name}.as_deref().unwrap()"),
+                (BoxShape::Sized, FormalForm::MutableRaw, super::seam::Form::Raw)
+                    if out_owner && raw_is_final(callee, argument) =>
+                {
+                    format!(
+                        "{name}.as_deref_mut().map_or(::core::ptr::null_mut(), ::core::ptr::from_mut)"
+                    )
+                }
+                _ if out_owner => return Err(NativeHold::FinalInterface),
                 (BoxShape::Slice, FormalForm::MutableRaw, super::seam::Form::Raw)
                     if raw_is_final(callee, argument) =>
                 {

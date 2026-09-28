@@ -32,6 +32,22 @@ pub(crate) struct Constructor<'tcx> {
     pub(crate) shape: BoxShape,
     pub(crate) nonempty: bool,
     pub(crate) edit: BoxExprEdit,
+    /// **R641-6 (4a)** — the owner is born by an out-parameter call, not by
+    /// its initializer (heman's `let mut ctx = 0 as *mut osn_context;
+    /// open_simplex_noise(seed, &mut ctx);`).
+    pub(crate) out_parameter: Option<OutParameter<'tcx>>,
+}
+
+/// The out-parameter call and the certificate's by-products.
+pub(crate) struct OutParameter<'tcx> {
+    /// `f(.., &mut root, ..)`, the call that writes the block.
+    pub(crate) call: &'tcx Expr<'tcx>,
+    /// The `&mut root` argument and its position.
+    pub(crate) argument: &'tcx Expr<'tcx>,
+    pub(crate) index: usize,
+    /// Local callees `*out` is lent to; the native stage proves each
+    /// non-retaining before the owner is delivered.
+    pub(crate) lends: Vec<(LocalDefId, usize)>,
 }
 
 /// The local a raw base spells directly (`y` in `(*y).left`).
@@ -250,7 +266,11 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                 replacement: String::new(),
                 receipt: "native-owner-moved-out-of-a-field",
             },
+            out_parameter: None,
         });
+    }
+    if let Some(constructor) = out_parameter(tcx, init, element)? {
+        return Ok(constructor);
     }
     let (zero, element_bits) = zero_value(tcx, element, pointer_bits, field_form)?;
     let element_spelling = spell_element(tcx, element);
@@ -354,6 +374,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                     replacement,
                     receipt: "native-malloc-zero-numeric-wrapping-count",
                 },
+                out_parameter: None,
             });
         } else if element_bits == 8 {
             // A byte-sized element: the byte count IS the element count
@@ -382,6 +403,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                     replacement,
                     receipt: "native-malloc-zero-byte-count",
                 },
+                out_parameter: None,
             });
         } else {
             let Some(peeled) = peeled else { return Err(SourceHold::ConstructorShape) };
@@ -436,6 +458,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                 replacement,
                 receipt: "native-malloc-zero-numeric",
             },
+            out_parameter: None,
         });
     }
     let [count_expression, size_expression] = arguments else {
@@ -512,8 +535,288 @@ pub(crate) fn derive_with_field_forms<'tcx>(
         },
         count,
         shape: BoxShape::Slice,
+        out_parameter: None,
         nonempty: matches!(count_expression.kind,ExprKind::Lit(lit) if matches!(lit.node,rustc_ast::LitKind::Int(value,_) if value.get()>0)),
     })
+}
+
+/// **R641-6 (4a, design (B))** — `let mut root = 0 as *mut T;` whose first
+/// later mention in its block is `f(.., &mut root, ..)`: the owner is born by
+/// that call. `Ok(None)` when the shape is not this; a held certificate once
+/// it is. The certificate reads `f`'s body: its out formal is only ever
+/// dereferenced (never copied, stored, returned or reassigned); `*out` is
+/// written only a null or a fresh `malloc` / `calloc` of exactly one `T`;
+/// `*out` is read only as the place `**out`, by `is_null`, or as an argument
+/// of a local callee (a lend the native stage proves non-retaining) or of
+/// libc `free`; and every `free(*out)` is followed at once by `return x;`
+/// inside `if x != 0 { .. }`, so no return of 0 leaves a freed block behind.
+/// The caller then nulls its slot whenever the call returns nonzero.
+fn out_parameter<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    init: &'tcx Expr<'tcx>,
+    element: Ty<'tcx>,
+) -> Result<Option<Constructor<'tcx>>, SourceHold> {
+    let mut value = init;
+    while let ExprKind::Cast(inner, _) = value.kind {
+        value = inner;
+    }
+    if !zero_literal(value) {
+        return Ok(None);
+    }
+    let Node::LetStmt(local) = tcx.parent_hir_node(init.hir_id) else { return Ok(None) };
+    let rustc_hir::PatKind::Binding(_, root, _, None) = local.pat.kind else { return Ok(None) };
+    let Node::Stmt(statement) = tcx.parent_hir_node(local.hir_id) else { return Ok(None) };
+    let Node::Block(block) = tcx.parent_hir_node(statement.hir_id) else { return Ok(None) };
+    let Some(at) = block
+        .stmts
+        .iter()
+        .position(|s| s.hir_id == statement.hir_id)
+    else {
+        return Ok(None);
+    };
+    let Some(next) = block.stmts[at + 1..].iter().find(|s| mentions(s, root)) else {
+        return Ok(None);
+    };
+    let call = match next.kind {
+        rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => match e.kind {
+            ExprKind::Assign(_, value, _) => value,
+            _ => e,
+        },
+        rustc_hir::StmtKind::Let(rustc_hir::LetStmt { init: Some(e), .. }) => e,
+        _ => return Ok(None),
+    };
+    let ExprKind::Call(callee, arguments) = call.kind else { return Ok(None) };
+    let lent: Vec<_> = arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            matches!(a.kind, ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, rustc_hir::Mutability::Mut, inner)
+                if base_local(inner) == Some(root))
+        })
+        .collect();
+    let [(index, argument)] = lent.as_slice() else { return Ok(None) };
+    if mention_count(next, root) != 1 {
+        return Err(SourceHold::Missing("native-out-parameter-root-named-twice"));
+    }
+    let did = definition(callee).ok_or(SourceHold::ConstructorIdentity)?;
+    let Some(callee) = did.as_local().filter(|local| {
+        matches!(tcx.def_kind(*local), rustc_hir::def::DefKind::Fn)
+            && !matches!(tcx.hir_node_by_def_id(*local), Node::ForeignItem(_))
+    }) else {
+        return Err(SourceHold::Missing("native-out-parameter-callee-not-local"));
+    };
+    let lends = out_parameter_certificate(tcx, callee, *index, element)?;
+    Ok(Some(Constructor {
+        allocation: call,
+        field_load: false,
+        allocator: did,
+        element,
+        element_spelling: spell_element(tcx, element),
+        count: "1".into(),
+        shape: BoxShape::Sized,
+        nonempty: true,
+        edit: BoxExprEdit {
+            span: init.span,
+            replacement: "None".into(),
+            receipt: "native-out-parameter-constructor",
+        },
+        out_parameter: Some(OutParameter {
+            call,
+            argument,
+            index: *index,
+            lends,
+        }),
+    }))
+}
+
+fn zero_literal(expression: &Expr<'_>) -> bool {
+    matches!(expression.kind, ExprKind::Lit(literal)
+        if matches!(literal.node, rustc_ast::LitKind::Int(value, _) if value.get() == 0))
+}
+
+fn mention_count(statement: &rustc_hir::Stmt<'_>, root: HirId) -> usize {
+    struct Count(HirId, usize);
+    impl<'tcx> Visitor<'tcx> for Count {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if base_local(expr) == Some(self.0) {
+                self.1 += 1;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut count = Count(root, 0);
+    count.visit_stmt(statement);
+    count.1
+}
+
+fn libc_free(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    did.as_local()
+        .is_some_and(|local| matches!(tcx.hir_node_by_def_id(local), Node::ForeignItem(_)))
+        && tcx
+            .codegen_fn_attrs(did)
+            .link_name
+            .unwrap_or_else(|| tcx.item_name(did))
+            .as_str()
+            == "free"
+}
+
+/// The callee half of [`out_parameter`]: every occurrence of the out formal,
+/// classified. Returns the lends of `*out` for the native stage to prove.
+fn out_parameter_certificate<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee: LocalDefId,
+    index: usize,
+    element: Ty<'tcx>,
+) -> Result<Vec<(LocalDefId, usize)>, SourceHold> {
+    const HOLD: SourceHold = SourceHold::Missing("native-out-parameter-certificate");
+    let body = tcx.hir_body_owned_by(callee);
+    let typeck = tcx.typeck(callee);
+    let param = body.params.get(index).ok_or(HOLD)?;
+    let rustc_hir::PatKind::Binding(_, out, _, None) = param.pat.kind else { return Err(HOLD) };
+    let signature = tcx.fn_sig(callee).skip_binder().skip_binder();
+    if !matches!(typeck.pat_ty(param.pat).kind(), TyKind::RawPtr(inner, rustc_hir::Mutability::Mut)
+        if matches!(inner.kind(), TyKind::RawPtr(pointee, rustc_hir::Mutability::Mut) if *pointee == element))
+        || !matches!(signature.output().kind(), TyKind::Int(_) | TyKind::Uint(_))
+    {
+        return Err(HOLD);
+    }
+    struct Uses<'tcx>(HirId, Vec<&'tcx Expr<'tcx>>);
+    impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if base_local(expr) == Some(self.0) {
+                self.1.push(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut uses = Uses(out, Vec::new());
+    uses.visit_body(body);
+    let mut lends = Vec::new();
+    for occurrence in uses.1 {
+        // Only `*out`, never the out pointer itself.
+        let Node::Expr(place) = tcx.parent_hir_node(occurrence.hir_id) else { return Err(HOLD) };
+        if !matches!(place.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+            return Err(HOLD);
+        }
+        let Node::Expr(parent) = tcx.parent_hir_node(place.hir_id) else { return Err(HOLD) };
+        match parent.kind {
+            // `*out = 0 as *mut T` / `*out = malloc(size_of::<T>()) as *mut T`.
+            ExprKind::Assign(lhs, rhs, _) if lhs.hir_id == place.hir_id => {
+                let mut stored = rhs;
+                while let ExprKind::Cast(inner, _) = stored.kind {
+                    stored = inner;
+                }
+                if !zero_literal(stored) {
+                    let fresh = derive(tcx, callee, rhs, element).map_err(|_| HOLD)?;
+                    if fresh.shape != BoxShape::Sized
+                        || fresh.count != "1"
+                        || fresh.field_load
+                        || fresh.out_parameter.is_some()
+                    {
+                        return Err(HOLD);
+                    }
+                }
+            }
+            // `**out`: the block's own contents — read or written through
+            // field / index projections, never borrowed (a reference into the
+            // block that outlived the call would alias the caller's Box).
+            ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
+                let mut contents = parent;
+                while let Node::Expr(up) = tcx.parent_hir_node(contents.hir_id)
+                    && matches!(up.kind, ExprKind::Field(base, _) | ExprKind::Index(base, _, _)
+                        if base.hir_id == contents.hir_id)
+                {
+                    contents = up;
+                }
+                let borrowed = match tcx.parent_hir_node(contents.hir_id) {
+                    Node::Expr(up) => matches!(up.kind, ExprKind::AddrOf(..)),
+                    _ => false,
+                } || typeck.expr_adjustments(contents).iter().any(|adjustment| {
+                    matches!(
+                        adjustment.kind,
+                        rustc_middle::ty::adjustment::Adjust::Borrow(_)
+                    )
+                });
+                if borrowed {
+                    return Err(HOLD);
+                }
+            }
+            // `(*out).is_null()`.
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if receiver.hir_id == place.hir_id
+                    && segment.ident.name.as_str() == "is_null"
+                    && typeck
+                        .type_dependent_def_id(parent.hir_id)
+                        .is_some_and(|did| tcx.crate_name(did.krate).as_str() == "core") => {}
+            // An argument, through pointer casts only.
+            ExprKind::Call(..) | ExprKind::Cast(..) => {
+                let mut argument = place;
+                let mut node = parent;
+                while let ExprKind::Cast(..) = node.kind {
+                    argument = node;
+                    let Node::Expr(up) = tcx.parent_hir_node(node.hir_id) else { return Err(HOLD) };
+                    node = up;
+                }
+                let ExprKind::Call(function, arguments) = node.kind else { return Err(HOLD) };
+                let position = arguments
+                    .iter()
+                    .position(|a| a.hir_id == argument.hir_id)
+                    .ok_or(HOLD)?;
+                let target = definition(function).ok_or(HOLD)?;
+                if libc_free(tcx, target) {
+                    free_returns_nonzero(tcx, node)?;
+                } else if let Some(local) = target.as_local().filter(|local| {
+                    matches!(tcx.def_kind(*local), rustc_hir::def::DefKind::Fn)
+                        && !matches!(tcx.hir_node_by_def_id(*local), Node::ForeignItem(_))
+                }) {
+                    lends.push((local, position));
+                } else {
+                    return Err(HOLD);
+                }
+            }
+            _ => return Err(HOLD),
+        }
+    }
+    Ok(lends)
+}
+
+/// `if x != 0 { .. free(*out); return x; }`: the free's statement is followed
+/// at once by `return x`, in the then-block of an `if` on `x != 0`, with no
+/// statement of that block assigning `x` before the free.
+fn free_returns_nonzero<'tcx>(tcx: TyCtxt<'tcx>, free: &'tcx Expr<'tcx>) -> Result<(), SourceHold> {
+    const HOLD: SourceHold =
+        SourceHold::Missing("native-out-parameter-free-without-nonzero-return");
+    let Node::Stmt(statement) = tcx.parent_hir_node(free.hir_id) else { return Err(HOLD) };
+    let Node::Block(block) = tcx.parent_hir_node(statement.hir_id) else { return Err(HOLD) };
+    let at = block
+        .stmts
+        .iter()
+        .position(|s| s.hir_id == statement.hir_id)
+        .ok_or(HOLD)?;
+    let returned = match block.stmts.get(at + 1).map(|s| s.kind) {
+        Some(rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e)) => e,
+        None => block.expr.ok_or(HOLD)?,
+        _ => return Err(HOLD),
+    };
+    let ExprKind::Ret(Some(value)) = returned.kind else { return Err(HOLD) };
+    let x = base_local(value).ok_or(HOLD)?;
+    if block.stmts[..at].iter().any(|s| mentions(s, x)) {
+        return Err(HOLD);
+    }
+    let Node::Expr(then) = tcx.parent_hir_node(block.hir_id) else { return Err(HOLD) };
+    let Node::Expr(conditional) = tcx.parent_hir_node(then.hir_id) else { return Err(HOLD) };
+    let ExprKind::If(mut condition, then_branch, _) = conditional.kind else { return Err(HOLD) };
+    if then_branch.hir_id != then.hir_id {
+        return Err(HOLD);
+    }
+    while let ExprKind::DropTemps(inner) = condition.kind {
+        condition = inner;
+    }
+    let ExprKind::Binary(operator, left, right) = condition.kind else { return Err(HOLD) };
+    let nonzero = operator.node == rustc_hir::BinOpKind::Ne
+        && ((base_local(left) == Some(x) && zero_literal(right))
+            || (base_local(right) == Some(x) && zero_literal(left)));
+    if nonzero { Ok(()) } else { Err(HOLD) }
 }
 
 fn peel_size_t<'tcx>(

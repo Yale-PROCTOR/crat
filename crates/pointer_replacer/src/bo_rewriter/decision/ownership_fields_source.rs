@@ -199,8 +199,27 @@ pub(crate) struct SourcePlan {
     allocation_local: u32,
     element_spelling: String,
     view_aliases: Vec<ViewAlias>,
+    /// R641-6 (4a): the owner is born by this out-parameter call.
+    out_parameter: Option<OutParameterPlan>,
+}
+
+/// **R641-6 (4a)** — the call `f(.., &mut root, ..)` that writes the owner's
+/// block, as source text around the `&mut root` argument the native stage
+/// replaces with the `Option<Box<T>>` layout bridge.
+#[derive(Clone, Debug)]
+pub(crate) struct OutParameterPlan {
+    pub(crate) call_span: Span,
+    pub(crate) before_argument: String,
+    pub(crate) after_argument: String,
+    pub(crate) callee: DefId,
+    pub(crate) index: usize,
+    pub(crate) lends: Vec<(LocalDefId, usize)>,
 }
 impl SourcePlan {
+    pub(crate) fn out_parameter(&self) -> Option<&OutParameterPlan> {
+        self.out_parameter.as_ref()
+    }
+
     pub(crate) fn view_aliases(&self) -> &[ViewAlias] {
         &self.view_aliases
     }
@@ -709,6 +728,29 @@ pub(crate) fn derive<'tcx>(
         *element,
         field_form,
     )?;
+    let source_map = tcx.sess.source_map();
+    let out_parameter = match &constructor.out_parameter {
+        Some(out) => {
+            let text = |lo, hi| {
+                source_map
+                    .span_to_snippet(Span::new(lo, hi, out.call.span.ctxt(), None))
+                    .map_err(|_| SourceHold::Missing("out-parameter-call-spelling"))
+            };
+            Some(OutParameterPlan {
+                call_span: out.call.span,
+                before_argument: text(out.call.span.lo(), out.argument.span.lo())?,
+                after_argument: text(out.argument.span.hi(), out.call.span.hi())?,
+                callee: constructor.allocator,
+                index: out.index,
+                lends: out.lends.clone(),
+            })
+        }
+        None => None,
+    };
+    let out_argument = constructor
+        .out_parameter
+        .as_ref()
+        .map(|out| (out.argument.hir_id, out.argument.span));
     // A depth-2 owner is admitted only as a pointer ARRAY (`Box<[*mut T]>`,
     // the count from the allocation); a single boxed pointer cell stays
     // outside the wave (BOX-N5).
@@ -767,9 +809,12 @@ pub(crate) fn derive<'tcx>(
     // (r457: a delivered form with no zero holds the literal). ht's
     // `ht_expand::new_entries`, filled only through a lend, is the shape.
     let zero_filled = tcx.item_name(constructor.allocator).as_str() == "calloc";
+    // R641-6: an out-parameter's block is filled by its callee, and the
+    // certificate is the whole account of what the callee writes there.
     if let TyKind::Adt(def, _) = element.kind()
         && !constructor.field_load
         && !zero_filled
+        && constructor.out_parameter.is_none()
     {
         let mut supplied = BTreeSet::new();
         let mut whole = false;
@@ -958,6 +1003,11 @@ pub(crate) fn derive<'tcx>(
     // (rule C, the native stage).
     for expression in &expressions.0 {
         let ExprKind::AddrOf(_, _, referent) = expression.kind else { continue };
+        // R641-6: the out-parameter call's `&mut root` is the owner's birth.
+        if out_argument.is_some_and(|(argument, _)| argument == expression.hir_id) {
+            covered.insert(referent.hir_id.local_id.as_u32());
+            continue;
+        }
         let root = addressed_root(referent);
         if !matches!(root.kind, ExprKind::Path(QPath::Resolved(_, path)) if matches!(path.res, Res::Local(_)))
             || root_path(root, binding)
@@ -1008,8 +1058,11 @@ pub(crate) fn derive<'tcx>(
     // the source text stays as it is and no edit is owed, so the walker's
     // boundary-less raw use is accounted (R431).
     let is_field_base = |hir: u32, span: Span| field_bases.contains(&(hir, span));
+    let is_out_argument =
+        |span: Span| out_argument.is_some_and(|(_, argument)| argument.contains(span));
     if uses.unsupported.is_some_and(|span| {
         !returns.iter().any(|r| r.span == span)
+            && !is_out_argument(span)
             && !is_store_operand(span)
             && !alias_receivers
                 .iter()
@@ -1022,6 +1075,7 @@ pub(crate) fn derive<'tcx>(
             !covered.contains(&u.hir_id.local_id.as_u32())
                 || (u.boundary_span.is_none()
                     && !is_alias_receiver(u.hir_id.local_id.as_u32(), u.span)
+                    && !is_out_argument(u.span)
                     && !is_store_operand(u.span)
                     && !is_field_base(u.hir_id.local_id.as_u32(), u.span))
         })
@@ -1301,11 +1355,17 @@ pub(crate) fn derive<'tcx>(
         let [call] = allocations.as_slice() else {
             return Err(SourceHold::ConstructorIdentity);
         };
-        let destination = call.destination.ok_or(SourceHold::ConstructorShape)?;
-        if !aliases.contains(&destination.as_u32()) {
-            return Err(SourceHold::ConstructorIdentity);
+        // R641-6: the out-parameter call's result is its return code; the
+        // block lands in the root itself, through `&mut root`.
+        if out_argument.is_some() {
+            Some((call.key, subject.local))
+        } else {
+            let destination = call.destination.ok_or(SourceHold::ConstructorShape)?;
+            if !aliases.contains(&destination.as_u32()) {
+                return Err(SourceHold::ConstructorIdentity);
+            }
+            Some((call.key, destination))
         }
-        Some((call.key, destination))
     };
     let allocator_destination = match allocation_call {
         Some((_, destination)) => destination,
@@ -1606,6 +1666,7 @@ pub(crate) fn derive<'tcx>(
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,
+        out_parameter,
     })
 }
 
