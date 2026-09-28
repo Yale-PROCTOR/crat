@@ -341,6 +341,8 @@ mod r233_shape_emission_tests;
 #[cfg(test)]
 mod r593_raw_expression_tests;
 #[cfg(test)]
+mod raw_field_null_tests;
+#[cfg(test)]
 mod raw_receiver_tests;
 #[cfg(test)]
 mod raw_twin_inventory_tests;
@@ -8254,6 +8256,8 @@ fn finish_decide<'tcx>(
             &withdrawn_fields,
         );
         decision::field_reference::lift_store_walls(tcx, &field_candidates, &mut slice_uses);
+        let raw_field_null =
+            decision::raw_field_null::derive(&program, &slots, &model, &field_candidates);
         let slice_uses = slice_uses;
         // **Row (vi), option (a) (R473-1)** — a MACRO, not a closure.
         //
@@ -8308,6 +8312,7 @@ fn finish_decide<'tcx>(
                     raw_boundary: $raw_boundary,
                     exposure: $exposure,
                     field_reference: Some(&field_candidates),
+                    raw_field_null: &raw_field_null,
                 }
             };
         }

@@ -101,6 +101,7 @@ pub(crate) mod pinned_local;
 mod pinned_local_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
+pub(crate) mod raw_field_null;
 pub(crate) mod raw_initializer;
 pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
@@ -1300,6 +1301,9 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// wave-6f: field transaction candidates — store-escape discharges, load
     /// permits and the stored form a converting field asks of its source.
     pub(crate) field_reference: Option<&'a field_reference::FieldCandidates>,
+    /// Wave-6o (relay 096): locals read from a raw field the program writes
+    /// the null literal into — see [`raw_field_null`].
+    pub(crate) raw_field_null: &'a raw_field_null::NullFieldReads,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -2157,6 +2161,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         raw_boundary,
         exposure,
         field_reference,
+        raw_field_null,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
     // R261-3, before every other rung: a subject whose own type reaches the
@@ -2351,7 +2356,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 .is_some_and(|uses| uses.null_assigned)
             // Wave-6o: a caller's null-literal argument is the parameter's
             // construction-site null literal.
-            || option_ops::param_receives_null_literal(facts, subject));
+            || option_ops::param_receives_null_literal(facts, subject)
+            // Wave-6o (relay 096): a read of a raw field the program writes
+            // null into carries that null literal one field away.
+            || raw_field_null.contains(&(subject.fn_did, subject.hir_id)));
     let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
