@@ -3080,6 +3080,30 @@ unsafe extern "C" fn alloc_value(mut n: usize) -> *mut value {
     }
     return val;
 }
+unsafe extern "C" fn short_value(mut n: usize) -> *mut value {
+    let mut val = calloc(1 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;
+    if val.is_null() {
+        return 0 as *mut value;
+    }
+    if n > 8 as usize {
+        free(val as *mut core::ffi::c_void);
+        return 0 as *mut value;
+    }
+    if n == 0 as usize {
+        return 0 as *mut value;
+    }
+    (*val).l = n;
+    return val;
+}
+unsafe extern "C" fn use_short(mut n: usize) -> usize {
+    let mut v = short_value(n);
+    if v.is_null() {
+        return 0 as usize;
+    }
+    let mut l = (*v).l;
+    free(v as *mut core::ffi::c_void);
+    return l;
+}
 unsafe extern "C" fn use_value(mut n: usize) -> usize {
     let mut v = alloc_value(n);
     if v.is_null() {
@@ -3147,6 +3171,8 @@ fn filled_in_place_frame() {
             ("lil_new::lil".to_owned(), SlotKind::Owning),
             ("use_value::v".to_owned(), SlotKind::Owning),
             ("repl::lil".to_owned(), SlotKind::Owning),
+            ("short_value::val".to_owned(), SlotKind::Owning),
+            ("use_short::v".to_owned(), SlotKind::Owning),
             ("two_values::pair".to_owned(), SlotKind::Owning),
             ("env_sized_value::small".to_owned(), SlotKind::Owning),
             ("take_two::p".to_owned(), SlotKind::Owning),
@@ -3346,4 +3372,25 @@ pub unsafe extern "C" fn newHolder() -> *mut holder {
         receipts.contains("return-certificate-struct-field:newHolder:owned-field"),
         "{context}"
     );
+}
+
+/// **R619-5 (1)** — a null return right after the owner's C `free` in its
+/// block (`free(val); return 0`) closes nothing: the free already dropped the
+/// owner, so it takes no `waiver-drop(scope-exit)` receipt. A LIVE null
+/// return (the generation still held, leaked by the input) keeps its receipt,
+/// even when another branch frees before its own return.
+#[test]
+fn w6a_r619_a_null_return_after_the_free_is_not_an_implicit_close() {
+    let out = filled_in_place_emitted("r619-receipts");
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let scope_exits = |callee: &str| {
+        receipts
+            .lines()
+            .filter(|line| {
+                line.starts_with(&format!("{callee}\t")) && line.contains("waiver-drop(scope-exit)")
+            })
+            .count()
+    };
+    assert_eq!(scope_exits("alloc_value"), 0, "{receipts}");
+    assert_eq!(scope_exits("short_value"), 1, "{receipts}");
 }

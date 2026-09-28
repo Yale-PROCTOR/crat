@@ -278,6 +278,38 @@ fn fields_held_by_value<'tcx>(
     out
 }
 
+/// **R619-5 (1)** — `ret` (a null return's operand) follows, in its innermost
+/// block, one of the owner's C frees (`free(val); return 0`): the free dropped
+/// the generation, so that return closes nothing.
+fn freed_before_in_its_block(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    frees: &[(Span, Span)],
+    ret: Span,
+) -> bool {
+    struct Blocks(Vec<Span>);
+    impl<'tcx> Visitor<'tcx> for Blocks {
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            self.0.push(block.span);
+            intravisit::walk_block(self, block);
+        }
+    }
+    let mut blocks = Blocks(Vec::new());
+    blocks.visit_body(tcx.hir_body_owned_by(callee));
+    let innermost = |span: Span| {
+        blocks
+            .0
+            .iter()
+            .filter(|block| block.contains(span))
+            .min_by_key(|block| block.hi() - block.lo())
+            .copied()
+    };
+    let Some(block) = innermost(ret) else { return false };
+    frees
+        .iter()
+        .any(|(call, _)| call.hi() <= ret.lo() && innermost(*call) == Some(block))
+}
+
 #[cfg(test)]
 pub(crate) fn fields_held_by_value_for_test<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -2485,6 +2517,9 @@ fn certify<'tcx, 's>(
     let mut kind: Option<SlotKind> = None;
     let mut dead_guard_receipts: Vec<String> = Vec::new();
     let mut null_returns = sources.nulls.clone();
+    // R619-5 (1): the null returns that follow the owner's C free in their
+    // block. They still return `None`; they close nothing.
+    let mut released_null_returns: Vec<Span> = Vec::new();
     let mut pointee_ty: Option<rustc_middle::ty::Ty<'tcx>> = None;
     let mut owned_fields: Vec<(LocalDefId, usize)> = Vec::new();
     if let Some((subject, plan)) = owner_parameter {
@@ -2941,6 +2976,11 @@ fn certify<'tcx, 's>(
                 }
             }
             null_returns.retain(|span| !uses.dead_null_returns.contains(span));
+            released_null_returns = null_returns
+                .iter()
+                .copied()
+                .filter(|span| freed_before_in_its_block(tcx, callee, &frees, *span))
+                .collect();
             dead_guard_receipts.extend(uses.dead_guards.iter().map(|span| {
                 format!(
                     "dead-alloc-guard site={}",
@@ -3402,8 +3442,12 @@ fn certify<'tcx, 's>(
     // return is a sink, which is true of every path that returns the owner
     // and of no path that returns null — so the site is receipted here, where
     // the live null returns are known (a dead null return, the one before the
-    // allocation, is already out of this set).
-    for span in &null_returns {
+    // allocation, is already out of this set; R619-5: so is one right after the
+    // owner's C free, which dropped it).
+    for span in null_returns
+        .iter()
+        .filter(|span| !released_null_returns.contains(span))
+    {
         certificate.receipts.push(format!(
             "waiver-drop(scope-exit) site={}",
             super::emitability::EmitabilityFacts::site(tcx, *span)
