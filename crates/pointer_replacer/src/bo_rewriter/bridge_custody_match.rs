@@ -4102,7 +4102,7 @@ fn twin_inline_raw_view<'a>(
 
 /// The caller's bindings read inside the emitted argument are the original argument's,
 /// one to one (closure-internal names belong to the closure's own owner and are not
-/// counted); an argument that reads no caller binding is no view of one.
+/// counted).
 fn argument_bindings_correspond(
     input: &BridgeCustodyInput<'_>,
     original: &Call,
@@ -4128,20 +4128,21 @@ fn argument_bindings_correspond(
         .collect::<BTreeSet<_>>();
     let pairs =
         |original: &Binding, emitted: &Binding| same_source_binding(input, original, emitted);
-    let originals = original_ids
-        .iter()
-        .filter_map(|id| input.original.bindings.get(*id))
-        .collect::<Vec<_>>();
-    let emitted = emitted_ids
-        .iter()
-        .filter_map(|id| input.emitted.bindings.get(*id))
-        .collect::<Vec<_>>();
-    !originals.is_empty()
-        && originals.len() == original_ids.len()
-        && emitted.len() == emitted_ids.len()
-        && originals
+    let (Some(originals), Some(emitted)) = (
+        original_ids
             .iter()
-            .all(|o| emitted.iter().filter(|e| pairs(o, e)).count() == 1)
+            .map(|id| input.original.bindings.get(*id))
+            .collect::<Option<Vec<_>>>(),
+        emitted_ids
+            .iter()
+            .map(|id| input.emitted.bindings.get(*id))
+            .collect::<Option<Vec<_>>>(),
+    ) else {
+        return false;
+    };
+    originals
+        .iter()
+        .all(|o| emitted.iter().filter(|e| pairs(o, e)).count() == 1)
         && emitted
             .iter()
             .all(|e| originals.iter().filter(|o| pairs(o, e)).count() == 1)

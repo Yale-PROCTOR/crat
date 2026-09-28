@@ -123,7 +123,8 @@ fn w6b_an_inline_view_at_the_callee_itself_still_owes_the_stamp() {
     );
 }
 
-/// The twin is followed only where the emitted tree declares it, in the callee's module.
+/// The twin is followed only where the emitted tree declares it, in the callee's module:
+/// a same-named twin in another module is another function, even beside the real one.
 #[test]
 fn w6b_an_undeclared_or_foreign_twin_is_not_followed() {
     missing(
@@ -131,7 +132,12 @@ fn w6b_an_undeclared_or_foreign_twin_is_not_followed() {
         BridgeKind::A5SiteProofT2Fallback,
         "no declared twin",
     );
-    let elsewhere = emitted_with("crate::src::other::__crat_raw_copy_int_value", VIEW, "").replace(
+    let elsewhere = emitted_with(
+        "crate::src::binn::other::__crat_raw_copy_int_value",
+        VIEW,
+        TWIN_DECL,
+    )
+    .replace(
         "}\n}\n",
         &format!("}}\npub mod other {{\n{TWIN_DECL}}}\n}}\n"),
     );
@@ -240,4 +246,26 @@ fn w6b_the_closure_form_view_matches_as_a_stamped_temporary() {
         "{report:#?}"
     );
     assert_eq!(report.rows[0].bindings.len(), 1, "{report:#?}");
+}
+
+/// The row reads ONE argument: a whole-call receipt names its own call and stays the
+/// stamp's.
+#[test]
+fn w6b_a_whole_call_receipt_is_not_read_through_the_twin() {
+    let mut expected = expectation(BridgeKind::A5SiteProofT2Fallback);
+    let lo = ORIGINAL.find("copy_int_value((*value).ptr").unwrap() as u32;
+    let hi = lo
+        + ORIGINAL[lo as usize..]
+            .find("0x61 as libc::c_int)")
+            .unwrap() as u32
+        + 20;
+    expected.anchor = SiteAnchor::Call {
+        span: ByteSpan { lo, hi },
+        argument_indices: vec![1],
+    };
+    let report = check(&emitted(), &[expected]);
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
 }
