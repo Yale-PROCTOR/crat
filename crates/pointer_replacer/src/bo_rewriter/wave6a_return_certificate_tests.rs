@@ -3394,3 +3394,300 @@ fn w6a_r619_a_null_return_after_the_free_is_not_an_implicit_close() {
     assert_eq!(scope_exits("alloc_value"), 0, "{receipts}");
     assert_eq!(scope_exits("short_value"), 1, "{receipts}");
 }
+
+/// lil's `lil_new` and its three receivers on lil's own shapes (relay
+/// wave-6a/123, ownership-fields 081 wall 4b): the `lil_t` alias, `_lil_t`'s
+/// 22 fields verbatim (the `[Option<fn>; 8]` callback array among them), the
+/// `1 as c_int as c_ulong` count, the lend before the return; and the ONE
+/// consumer every receiver ends in, `lil_free`, which tests its formal for
+/// null before freeing it (`if lil.is_null() { return; }`).
+const LIL_NEW: &str = r#"
+// w6a-r623-lil-new
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn calloc(_: u64, _: u64) -> *mut core::ffi::c_void;
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+    fn free(_: *mut core::ffi::c_void);
+}
+pub type size_t = u64;
+#[repr(C)]
+pub struct _lil_value_t {
+    pub l: size_t,
+    pub d: *mut i8,
+}
+pub type lil_value_t = *mut _lil_value_t;
+#[repr(C)]
+pub struct _lil_env_t {
+    pub parent: *mut _lil_env_t,
+    pub vars: size_t,
+}
+pub type lil_env_t = *mut _lil_env_t;
+pub type lil_callback_proc_t = Option<unsafe extern "C" fn() -> ()>;
+#[repr(C)]
+pub struct _lil_t {
+    pub code: *const i8,
+    pub rootcode: *const i8,
+    pub clen: size_t,
+    pub head: size_t,
+    pub ignoreeol: i32,
+    pub cmd: *mut *mut i8,
+    pub cmds: size_t,
+    pub syscmds: size_t,
+    pub catcher: *mut i8,
+    pub in_catcher: i32,
+    pub dollarprefix: *mut i8,
+    pub env: lil_env_t,
+    pub rootenv: lil_env_t,
+    pub downenv: lil_env_t,
+    pub empty: lil_value_t,
+    pub error: i32,
+    pub err_head: size_t,
+    pub err_msg: *mut i8,
+    pub callback: [lil_callback_proc_t; 8],
+    pub parse_depth: size_t,
+    pub data: *mut core::ffi::c_void,
+}
+pub type lil_t = *mut _lil_t;
+unsafe extern "C" fn lil_alloc_env(mut parent: lil_env_t) -> lil_env_t {
+    let mut env = calloc(1 as i32 as u64, ::std::mem::size_of::<_lil_env_t>() as u64) as lil_env_t;
+    (*env).parent = parent;
+    return env;
+}
+unsafe extern "C" fn lil_free_env(mut env: lil_env_t) {
+    free(env as *mut core::ffi::c_void);
+}
+unsafe extern "C" fn register_stdcmds(mut lil: lil_t) {
+    (*lil).cmds = 0 as size_t;
+    (*lil).syscmds = (*lil).cmds;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_new() -> lil_t {
+    let mut lil = calloc(
+        1 as i32 as u64,
+        ::std::mem::size_of::<_lil_t>() as u64,
+    ) as lil_t;
+    (*lil).env = lil_alloc_env(0 as lil_env_t);
+    (*lil).rootenv = (*lil).env;
+    register_stdcmds(lil);
+    return lil;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_free(mut lil: lil_t) {
+    if lil.is_null() {
+        return;
+    }
+    free((*lil).err_msg as *mut core::ffi::c_void);
+    while !((*lil).env).is_null() {
+        let mut next = (*(*lil).env).parent;
+        lil_free_env((*lil).env);
+        (*lil).env = next;
+    }
+    free((*lil).dollarprefix as *mut core::ffi::c_void);
+    free(lil as *mut core::ffi::c_void);
+}
+unsafe extern "C" fn repl() -> size_t {
+    let mut lil = lil_new();
+    let mut n = (*lil).cmds;
+    lil_free(lil);
+    return n;
+}
+unsafe extern "C" fn nonint() -> i32 {
+    let mut lil = lil_new();
+    let mut e = (*lil).error;
+    lil_free(lil);
+    return e;
+}
+unsafe extern "C" fn fnc_jaileval(mut lil: lil_t) -> size_t {
+    let mut sublil = lil_new();
+    let mut r = (*sublil).syscmds;
+    lil_free(sublil);
+    return r;
+}
+"#;
+
+fn lil_new_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = frame_locks();
+    super::test_model_override::set(
+        "w6a-r623-lil-new",
+        vec![
+            ("_lil_t".to_owned(), 11, SlotKind::Raw),
+            ("_lil_t".to_owned(), 12, SlotKind::Raw),
+        ],
+        vec![
+            ("lil_new::lil".to_owned(), SlotKind::Owning),
+            ("lil_free::lil".to_owned(), SlotKind::Owning),
+            ("repl::lil".to_owned(), SlotKind::Owning),
+            ("nonint::lil".to_owned(), SlotKind::Owning),
+            ("fnc_jaileval::sublil".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+/// `lil_free` spelled with the raw pointer instead of the `lil_t` alias.
+fn lil_new_raw_consumer() -> String {
+    let source = LIL_NEW.replace(
+        "pub unsafe extern \"C\" fn lil_free(mut lil: lil_t)",
+        "pub unsafe extern \"C\" fn lil_free(mut lil: *mut _lil_t)",
+    );
+    assert_ne!(source, LIL_NEW);
+    source
+}
+
+fn lil_new_context(out: &super::wave6a_allocation_tests::Emitted) -> (String, String) {
+    let receipts = format!(
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts, out.artifacts.box_param_receipts
+    );
+    let context = format!(
+        "{receipts}\nREVERTS\n{}\n{:#?}\n{}",
+        out.artifacts.final_reverts, out.degradations, out.source
+    );
+    (receipts, context)
+}
+
+/// **Relay wave-6a/123 (R636-4).** `lil_new`'s own wall, the struct literal,
+/// is `9479cf3fd`'s (a `calloc(1, size_of::<_lil_t>())` block filled in place
+/// needs no literal). What held its three receivers is their one consumer:
+/// `lil_free` tests its formal for null first, a use C1's collector had no
+/// form for. A `Box` is never null, so the owner walk renders the test
+/// `false`, and the receivers move into `lil_free`. Here `lil_free` is spelled
+/// with the raw pointer; the corpus spelling is the next test.
+#[test]
+fn w6a_r623_lil_new_and_its_three_receivers_move_into_a_null_testing_lil_free() {
+    let out = lil_new_emitted("r623-lil-new-raw", &lil_new_raw_consumer());
+    let (receipts, context) = lil_new_context(&out);
+    let text = compact(&out.source);
+    assert!(
+        receipts.contains("return-certificate callee=lil_new ")
+            && receipts.contains("source=filled-in-place")
+            && receipts.contains("receivers=3 [repl::lil,nonint::lil,fnc_jaileval::sublil]"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("box-param-chain callee=lil_free index=0 sink=free"),
+        "{context}"
+    );
+    assert!(
+        text.contains("letmutlil:Box<crate::_lil_t>=::std::boxed::Box::from_raw(calloc("),
+        "{context}"
+    );
+    assert!(
+        text.contains("fnlil_free(mutlil:Box<_lil_t>){iffalse{return;}"),
+        "{context}"
+    );
+    assert!(text.contains("drop(lil);}"), "{context}");
+    for subject in [
+        "lil_new::lil",
+        "lil_free::lil",
+        "repl::lil",
+        "nonint::lil",
+        "fnc_jaileval::sublil",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{context}"
+        );
+    }
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// The corpus spelling: `lil_free(mut lil: lil_t)`. The surface has no pointee
+/// span to put `Box<..>` on and no alias spelling for a Box, so the chain
+/// holds typed (`box-param-alias-formal`), the certificate withdraws on the
+/// transfer it cannot confirm, and nothing reverts — `lil_alloc_env`,
+/// certified on its own, still delivers.
+#[test]
+fn w6a_r623_lils_alias_spelled_consumer_holds_typed_and_reverts_nothing() {
+    let out = lil_new_emitted("r623-lil-new-alias", LIL_NEW);
+    let (receipts, context) = lil_new_context(&out);
+    assert!(
+        receipts.contains("lil_free::lil\theld\tbox-param-alias-formal:lil_free"),
+        "{context}"
+    );
+    // The receivers' transfer into `lil_free` is a consumer's now, so the
+    // certificate asks the chain to confirm it, and withdraws when it cannot.
+    assert!(
+        receipts.contains(
+            "lil_new::lil\theld\treturn-certificate-transfer-unconfirmed:lil_new:lil_free#0"
+        ),
+        "{context}"
+    );
+    assert!(
+        reason_of(&out.degradations, "repl::lil").is_some(),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate callee=lil_alloc_env ")
+            && !receipts.contains("return-certificate callee=lil_new "),
+        "{context}"
+    );
+    assert!(
+        !compact(&out.source).contains("from_mut(lil.as_mut())"),
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// Relay 123's controls on the delivering spelling, one violation each: a
+/// `malloc`'d `_lil_t` (no zero to discharge the literal with) and a `calloc`
+/// measured by another type keep `lil_new` held; a consumer that lends its
+/// formal away before the free is not a null-tested consumer (the walk admits
+/// no lend), and neither is one that re-seats it (`lil = 0 as *mut _lil_t;`
+/// — the certificate's walk passes an assignment TO its owner, which C1 does
+/// not render; only a null test is what the rule admits), so the receivers
+/// keep theirs. A field whose delivered form has no
+/// zero is `w6a_r615_a_delivered_field_withdraws_the_filled_in_place_certificate`.
+#[test]
+fn w6a_r623_lil_new_controls_hold() {
+    let raw = lil_new_raw_consumer();
+    let calloc_head = "let mut lil = calloc(\n        1 as i32 as u64,\n        ::std::mem::size_of::<_lil_t>() as u64,\n    ) as lil_t;";
+    assert!(raw.contains(calloc_head));
+    let malloced = raw.replace(
+        calloc_head,
+        "let mut lil = malloc(::std::mem::size_of::<_lil_t>() as u64) as lil_t;",
+    );
+    let resized = raw.replace(
+        "::std::mem::size_of::<_lil_t>() as u64,\n    ) as lil_t;",
+        "::std::mem::size_of::<_lil_env_t>() as u64,\n    ) as lil_t;",
+    );
+    let lent = raw.replace(
+        "    free((*lil).err_msg as *mut core::ffi::c_void);\n",
+        "    keep(lil);\n    free((*lil).err_msg as *mut core::ffi::c_void);\n",
+    ) + "static mut KEPT: *mut _lil_t = 0 as *mut _lil_t;\nunsafe extern \"C\" fn keep(mut p: *mut _lil_t) {\n    KEPT = p;\n}\n";
+    let reseated = raw.replace(
+        "    if lil.is_null() {\n        return;\n    }\n",
+        "    if (*lil).error != 0 as i32 {\n        lil = 0 as *mut _lil_t;\n    }\n",
+    );
+    assert_ne!(reseated, raw);
+    for (name, source, expected) in [
+        ("r623-malloced", malloced, "lil_new::lil\theld\t"),
+        ("r623-resized", resized, "lil_new::lil\theld\t"),
+        (
+            "r623-reseated",
+            reseated,
+            "lil_free::lil\theld\tbox-param-callee-use:lil_free:",
+        ),
+        (
+            "r623-lent",
+            lent,
+            "lil_free::lil\theld\tbox-param-callee-use:lil_free:unsupported:lil",
+        ),
+    ] {
+        let out = lil_new_emitted(name, &source);
+        let (receipts, context) = lil_new_context(&out);
+        assert!(receipts.contains(expected), "{name}\n{context}");
+        assert!(
+            !receipts.contains("box-param-chain callee=lil_free "),
+            "{name}\n{context}"
+        );
+        assert!(
+            reason_of(&out.degradations, "repl::lil").is_some(),
+            "{name}\n{context}"
+        );
+    }
+}

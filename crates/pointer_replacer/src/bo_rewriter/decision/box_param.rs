@@ -1076,7 +1076,9 @@ pub(crate) fn consuming_formals<'tcx>(
                 ([], None, Some(argument)) => argument,
                 _ => continue,
             };
-            if slice_uses_of(tcx, param, &[sink]).is_err() {
+            if slice_uses_of(tcx, param, &[sink]).is_err()
+                && null_tested_formal(tcx, param, &frees, BoxShape::Sized).is_none()
+            {
                 continue;
             }
             out.insert((param.fn_did.to_def_id(), hir_index));
@@ -1087,6 +1089,43 @@ pub(crate) fn consuming_formals<'tcx>(
         }
     }
     out
+}
+
+/// **R636-4 (relay wave-6a/123)** — a freeing formal its body tests for null
+/// first (`if lil.is_null() { return; }`, lil's `lil_free`): the guard C2Rust
+/// keeps for a `free` that tolerates null. The slice-use collector has no form
+/// for the test, but a `Box` is never null, so the certificate's owner walk
+/// renders it `false`. Admitted where that walk, allowed no lend and no
+/// transfer, finds only derefs, null tests and the one free — and at least one
+/// null test, the use this rule exists for. The owner's edits, or `None`.
+fn null_tested_formal(
+    tcx: TyCtxt<'_>,
+    param: &Subject,
+    frees: &[(Span, Span)],
+    shape: BoxShape,
+) -> Option<Vec<BoxExprEdit>> {
+    let [_] = frees else { return None };
+    let uses = super::return_certificate::owner_uses(
+        tcx,
+        param,
+        shape,
+        false,
+        false,
+        frees,
+        &|_, _| false,
+        &|_, _| false,
+        &|_| false,
+    )
+    .ok()?;
+    (uses.stores.is_empty()
+        && uses.transfers.is_empty()
+        && uses.returns.is_empty()
+        && uses.lends.is_empty()
+        && uses
+            .edits
+            .iter()
+            .any(|edit| edit.receipt == "return-certificate-null-test"))
+    .then_some(uses.edits)
 }
 
 /// How deep a parameter-to-parameter chain this rule follows (R450-8 rung 2).
@@ -1575,9 +1614,21 @@ pub(crate) fn derive<'tcx>(
                     .iter()
                     .any(|(callee, _, _)| *callee == param.fn_did.to_def_id())
             });
+        // R636-4: a use the collector cannot rewrite may be a null test the
+        // owner walk renders; its edits are taken once the chain's shape is
+        // known (below).
+        let mut null_tested = None;
         let (param_uses, deferred_use) = match slice_uses_of(tcx, param, &[sink]) {
             Ok(uses) => (uses, None),
             Err(form) if no_caller_export => (Vec::new(), Some(form)),
+            Err(form)
+                if store.is_none()
+                    && moved_on.is_none()
+                    && null_tested_formal(tcx, param, &frees, BoxShape::Sized).is_some() =>
+            {
+                null_tested = Some(form);
+                (Vec::new(), None)
+            }
             Err(form) => {
                 hold(
                     format!("box-param-callee-use:{callee_path}:{form}"),
@@ -2196,6 +2247,26 @@ pub(crate) fn derive<'tcx>(
             );
             continue;
         }
+        let null_test_edits = match &null_tested {
+            None => Vec::new(),
+            Some(form) => {
+                let shape = if slice {
+                    BoxShape::Slice
+                } else {
+                    BoxShape::Sized
+                };
+                match null_tested_formal(tcx, param, &frees, shape) {
+                    Some(edits) => edits,
+                    None => {
+                        hold(
+                            format!("box-param-callee-use:{callee_path}:{form}"),
+                            &mut out,
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
         let pointee_text = {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(param.fn_did)
@@ -2391,7 +2462,9 @@ pub(crate) fn derive<'tcx>(
                 }
             }
         } else {
-            param_edits
+            let mut edits = param_edits;
+            edits.extend(null_test_edits);
+            edits
         };
         let wrapped_members = optional_wraps.len();
         let mut param_edits = param_edits;
@@ -2406,6 +2479,18 @@ pub(crate) fn derive<'tcx>(
                 _ => continue,
             }
         };
+        // **R636-4 — a formal spelled through a pointer alias** (`mut lil:
+        // lil_t`, `lil_t = *mut _lil_t`) has no pointee span for the surface
+        // to put `Box<..>` on, and `declaration::emitted_type` spells only the
+        // borrowed forms: its declaration would stay raw under members that
+        // move a Box into it, the argument bridged as a lend and the block
+        // freed twice. So the chain holds typed until that rendering exists
+        // (the declaration family's). Asked last, so every other hold keeps its
+        // reason.
+        if param.decl_shape == super::DeclShape::Alias {
+            hold(format!("box-param-alias-formal:{callee_path}"), &mut out);
+            continue;
+        }
         let members: Vec<String> = member_plans
             .iter()
             .map(|(_, _, label, _)| label.clone())
