@@ -918,6 +918,48 @@ pub(crate) fn observe(
     }
 }
 
+/// **R619-6 — SC-2's per-site receipt, `entry-window:top-index`.** One row per
+/// parameter cursor that never moves and reads a `Top` index: the entry window
+/// is kept, and a C-valid negative index below it would panic (the accepted
+/// behaviour waiver of R608-1; premise register SC-2). A `Neg` or loaded index
+/// is held in `wrapper::build` before any plan exists, so it never reaches this
+/// table. Rows are the final decision table's; delivery is the join with the
+/// subject outcomes.
+pub(crate) fn entry_window_receipts(
+    tcx: TyCtxt<'_>,
+    sign: &super::super::sign_facts::SignFacts,
+    entries: &[(Subject, Decision)],
+) -> String {
+    let mut out = String::from("owner_fn\tsubject_key\tparameter\treceipt\n");
+    for (subject, decision) in entries {
+        // S3.0: an exhaustive match, so a new disposition is a compile error.
+        let parameter_cursor = match decision {
+            Decision::Cursor { plan, .. } => plan.wrapper && plan.parameter,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        // `Top` is the taint bit read as a verdict, never a lookup miss:
+        // `Some(true)` only, so an unanalyzed local is not counted as waived.
+        if parameter_cursor
+            && sign.verdict(subject.fn_did, subject.local) == Some(true)
+            && wrapper::never_moves(tcx, subject)
+        {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            out.push_str(&format!(
+                "{owner}\t{}\t{}\tentry-window:top-index\n",
+                subject.identity_key(&owner),
+                subject.param_name.as_deref().unwrap_or("-"),
+            ));
+        }
+    }
+    out
+}
+
 pub(super) fn is_cursor_reason(reason: &DegradeReason) -> bool {
     matches!(
         reason,

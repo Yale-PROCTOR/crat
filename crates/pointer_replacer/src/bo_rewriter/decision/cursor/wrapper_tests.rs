@@ -2396,6 +2396,22 @@ fn r609_control(input: &str, owner: &str, param: &str) {
         (None, true),
         "{owner}::{param} is a delivered parameter cursor the guard must not touch"
     );
+    // R619-6: and it carries SC-2's receipt, so the census counts it.
+    let receipts = utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        ctx.raw_boundary_artifacts.entry_window_receipts.clone()
+    })
+    .expect("receipts");
+    assert!(
+        receipts.lines().any(|row| {
+            let cells = row.split('\t').collect::<Vec<_>>();
+            cells.len() == 4
+                && cells[0].ends_with(owner)
+                && cells[2] == param
+                && cells[3] == "entry-window:top-index"
+        }),
+        "{owner}::{param} is a Top-index entry window and must be receipted: {receipts}"
+    );
 }
 
 #[test]
@@ -2501,4 +2517,33 @@ fn main() {
     }
     let source = emitted(input);
     compile(&source, Some(MAIN));
+}
+
+/// **R619-6 — SC-2's receipt.** One program with both shapes: the `Top`-index
+/// parameter cursor (`NextTableBitSize::count`, kept in the entry window, the
+/// accepted waiver) gets `entry-window:top-index`; the `Neg`-held row
+/// (`symbol_lists` read from `max_length = -1` down) is no cursor and gets none.
+#[test]
+fn slicecursor_the_top_index_entry_window_is_receipted_and_a_held_row_is_not() {
+    let input = format!(
+        "{R608_UNKNOWN_INDEX}\n{}",
+        R608_NEGATIVE_INDEX.replace("witness", "witness_negative")
+    );
+    let receipts = utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        ctx.raw_boundary_artifacts.entry_window_receipts.clone()
+    })
+    .unwrap();
+    let rows = receipts.lines().skip(1).collect::<Vec<_>>();
+    assert!(
+        rows.iter().any(|row| row.starts_with(
+            "next_table_bit_size\tnext_table_bit_size::count#1\tcount\tentry-window:top-index"
+        )),
+        "the Top-index parameter cursor is receipted: {receipts}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("max_code_length")),
+        "a Neg-held row is no cursor and carries no receipt: {receipts}"
+    );
+    assert_eq!(rows.len(), 1, "{receipts}");
 }

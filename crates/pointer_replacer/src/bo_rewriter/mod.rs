@@ -551,6 +551,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// 50-function closure partition). `eprintln` is not an observable channel in the
     /// census worker, so the collision is reported as a receipt row instead.
     pub(crate) counted_void_call_receipts: String,
+    /// R619-6 (slicecursor 080): SC-2's per-site receipt, one row per parameter
+    /// cursor that keeps the entry window over a `Top` index.
+    pub(crate) entry_window_receipts: String,
     /// **R459-3 (wave-6b 019 STOP 2) — the FIRST failing verify tree, per program.**
     ///
     /// The census keeps the post-revert tree and the receipts, never the source
@@ -9407,6 +9410,11 @@ fn finish_decide<'tcx>(
             first_failing_verify_tree: String::new(),
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
+            entry_window_receipts: decision::cursor_native::entry_window_receipts(
+                tcx,
+                &sign,
+                &table.entries,
+            ),
             box_param_receipts: table.box_params.receipts_tsv(),
             return_certificate_receipts: table.return_certificates.receipts_tsv()
                 + &decision::return_certificate::receiver_receipts_tsv(tcx, &table),

@@ -1774,27 +1774,27 @@ fn self_advancing_root(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> b
     if s.ptr_depth != 1 || !optional_degraded(decision) {
         return false;
     }
-    let (advances, other) = self_assignments(ctx, s);
+    let (advances, other) = self_assignments(ctx.tcx, s);
     advances > 0 && other == 0
 }
 
 /// `(assignments rooted at the subject, assignments from anything else)` over
 /// the subject's own body. A declaration initialiser is not an assignment.
-fn self_assignments(ctx: &Ctx<'_, '_>, s: &Subject) -> (usize, usize) {
-    struct Assigns<'a, 'tcx> {
-        ctx: &'a Ctx<'a, 'tcx>,
+fn self_assignments(tcx: ty::TyCtxt<'_>, s: &Subject) -> (usize, usize) {
+    struct Assigns<'tcx> {
+        tcx: ty::TyCtxt<'tcx>,
         owner: rustc_hir::def_id::LocalDefId,
         subject: hir::HirId,
         advances: usize,
         other: usize,
     }
-    impl<'v> Visitor<'v> for Assigns<'_, '_> {
+    impl<'v> Visitor<'v> for Assigns<'_> {
         fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
             if let hir::ExprKind::Assign(lhs, rhs, _) = e.kind
                 && local(lhs) == Some(self.subject)
             {
-                let rhs = peel_reborrow_idiom(self.ctx.tcx, self.owner, rhs);
-                if source_binding(self.ctx.tcx, self.owner, rhs) == Some(self.subject) {
+                let rhs = peel_reborrow_idiom(self.tcx, self.owner, rhs);
+                if source_binding(self.tcx, self.owner, rhs) == Some(self.subject) {
                     self.advances += 1;
                 } else {
                     self.other += 1;
@@ -1804,14 +1804,20 @@ fn self_assignments(ctx: &Ctx<'_, '_>, s: &Subject) -> (usize, usize) {
         }
     }
     let mut assigns = Assigns {
-        ctx,
+        tcx,
         owner: s.fn_did,
         subject: s.hir_id,
         advances: 0,
         other: 0,
     };
-    assigns.visit_body(ctx.tcx.hir_body_owned_by(s.fn_did));
+    assigns.visit_body(tcx.hir_body_owned_by(s.fn_did));
     (assigns.advances, assigns.other)
+}
+
+/// No assignment to the subject in its own body: the pointer it holds at entry
+/// is the one every use reads through.
+pub(super) fn never_moves(tcx: ty::TyCtxt<'_>, s: &Subject) -> bool {
+    self_assignments(tcx, s) == (0, 0)
 }
 /// **R497-3(c) — the RE-SEEDED walker.** `self_advancing_root` wants every
 /// assignment rooted at the subject; five corpus rows advance themselves and
@@ -1833,7 +1839,7 @@ fn re_seeded_walker(ctx: &Ctx<'_, '_>, s: &Subject, decision: &Decision) -> bool
     if ctx.sign.may_be_negative(s.fn_did, s.local) {
         return false;
     }
-    let (advances, other) = self_assignments(ctx, s);
+    let (advances, other) = self_assignments(ctx.tcx, s);
     advances > 0 && other == 1
 }
 
@@ -2096,7 +2102,7 @@ pub(super) fn build<'a>(
     // measurement; any other `Top` index is the delivered cursors' form and
     // stays.
     if parameter
-        && self_assignments(ctx, subject) == (0, 0)
+        && never_moves(ctx.tcx, subject)
         && let Some(hold) =
             super::negative_index::below_entry(ctx.tcx, subject.fn_did, subject.local)
     {
@@ -2200,7 +2206,7 @@ pub(super) fn build<'a>(
         local_bridges: vec![],
         ceded: 0,
         re_seeded: {
-            let (advances, other) = self_assignments(ctx, subject);
+            let (advances, other) = self_assignments(ctx.tcx, subject);
             advances > 0 && other == 1
         },
         re_seed_fabricated: false,

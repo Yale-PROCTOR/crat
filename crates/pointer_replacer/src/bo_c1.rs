@@ -12714,6 +12714,12 @@ mod run {
                 "counted-void-calls",
                 artifact.counted_void_call_receipts.as_str(),
             ),
+            // R619-6 (slicecursor 080): SC-2's per-site receipt, so the waiver
+            // count is census-measured.
+            (
+                "entry-window-receipt",
+                artifact.entry_window_receipts.as_str(),
+            ),
             ("retention", artifact.retention.as_str()),
             ("dispositions", artifact.dispositions.as_str()),
             ("subject-index", artifact.subjects.as_str()),
