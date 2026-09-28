@@ -320,6 +320,42 @@ fn bare_local(e: &Expr<'_>) -> Option<HirId> {
     }
 }
 
+/// **R608-1** — `block` is the arm of an `if` with no `else` (the other path
+/// carries the owner's `None` to the join; two creating arms would read as an
+/// overwrite to the linear simulation), and no loop lies between that `if` and
+/// the block that declares `binding` (a loop would run the arm again over a
+/// live generation, an overwrite the simulation never sees).
+fn branch_outside_loops(tcx: TyCtxt<'_>, block: HirId, binding: HirId) -> bool {
+    let Some(declared_in) = tcx
+        .hir_parent_iter(binding)
+        .find_map(|(id, node)| matches!(node, rustc_hir::Node::Block(_)).then_some(id))
+    else {
+        return false;
+    };
+    let mut ancestors = tcx.hir_parent_iter(block);
+    let (Some((_, rustc_hir::Node::Expr(arm))), Some((_, rustc_hir::Node::Expr(branch)))) =
+        (ancestors.next(), ancestors.next())
+    else {
+        return false;
+    };
+    if !matches!(arm.kind, ExprKind::Block(..))
+        || !matches!(branch.kind, ExprKind::If(_, then, None) if then.hir_id == arm.hir_id)
+    {
+        return false;
+    }
+    for (id, node) in ancestors {
+        if id == declared_in {
+            return true;
+        }
+        if let rustc_hir::Node::Expr(e) = node
+            && matches!(e.kind, ExprKind::Loop(..))
+        {
+            return false;
+        }
+    }
+    false
+}
+
 /// **R450-8 rung 3** — the statement hands a bare local to a LOCAL callee,
 /// `f(x);` or `return f(x);`. Only the shape is read here: which callee, at
 /// which index. Whether that callee CONSUMES the argument is the chain's
@@ -1144,7 +1180,17 @@ pub(crate) fn derive<'tcx>(
             // Every block the owner touches must leave it as it found it: a
             // branch that frees a generation must re-seat one (brotli's
             // ensure-capacity), and one that creates must release.
-            if let Some((_, (entry, exit))) = block_state.iter().find(|(_, (a, b))| a != b) {
+            //
+            // **R608-1** — except a block that CREATES the generation (dead on
+            // entry, live on exit) when it is an `else`-less `if` arm outside
+            // any loop up to the owner's declaration: the other path carries
+            // `None` to the join (a block dead on entry means an earlier null
+            // or release, so the owner is optional), and the simulation above
+            // has already proved the generation released before any exit
+            // (brotli's `literal_context_modes`).
+            if let Some((_, (entry, exit))) = block_state.iter().find(|(block, (a, b))| {
+                a != b && !(!*a && branch_outside_loops(tcx, **block, subject.hir_id))
+            }) {
                 hold(
                     &mut out,
                     format!("{IMPLICIT_CLOSE}:block-unbalanced:{entry}->{exit}"),

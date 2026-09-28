@@ -408,8 +408,10 @@ pub unsafe extern \"C\" fn cluster(mut m: *mut MemoryManager, mut n: usize, mut 
 /// **Build 2's generation state machine, one control per gate.** Each shape
 /// sits in its own function and names the exact receipt, so exactly one hold
 /// answers for exactly one gate: (1) a generation still live at the body's
-/// end, (2) a block that does not leave the owner as it found it — here the
-/// conditional allocation assigned inside the branch, (3) a read of the
+/// end, (2) a block that does not leave the owner as it found it — here a
+/// release inside a branch of the allocating block (the conditional
+/// allocation inside a branch, released after the join, is admitted since
+/// R608-1: `w6a_r608_*`), (3) a read of the
 /// owner after its release, (4) a second allocation over a live generation
 /// (R434-4 §2 admitted this and the admission is WITHDRAWN — report 019 §3),
 /// (5) a release before any generation exists, (6) the owner copied into a
@@ -428,9 +430,8 @@ pub unsafe extern \"C\" fn live_at_exit(mut m: *mut MemoryManager, n: usize, mut
     *split = *syms.offset(0 as isize);\n\
 }}\n\
 pub unsafe extern \"C\" fn unbalanced(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
-    let mut syms = 0 as *mut u32;\n\
-    if n > 4 as usize {{ syms = {alloc}; }}\n\
-    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    let mut syms = {alloc};\n\
+    if n > 4 as usize {{ BrotliFree(m, syms as *mut std::os::raw::c_void); syms = 0 as *mut u32; }}\n\
 }}\n\
 pub unsafe extern \"C\" fn read_after_release(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
     let mut syms = {alloc};\n\
@@ -1674,6 +1675,138 @@ fn w6a_r607_a_store_on_one_branch_keeps_its_hold() {
             "letmutnew_data=BrotliAllocate(m,n.wrapping_mul(::core::mem::size_of::<u8>()))as*mutu8;"
         ),
         "{}",
+        out.source
+    );
+}
+
+/// brotli's `BrotliBuildMetaBlock::literal_context_modes`: null-initialised,
+/// allocated only inside one `if`, lent after the join, freed unconditionally
+/// (`BrotliFree` of the null the other path carries is C's own no-op).
+const JOIN_OWNERS: &str = r#"
+pub unsafe extern "C" fn read_modes(mut modes: *const u32, n: usize) -> u32 {
+    if modes.is_null() {
+        return 0 as u32;
+    }
+    return *modes.offset(0 as isize);
+}
+pub unsafe extern "C" fn meta(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = if n > 0 as usize {
+            BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+        } else {
+            0 as *mut u32
+        };
+        let mut i = 0 as usize;
+        while i < n {
+            *modes.offset(i as isize) = 3 as u32;
+            i = i.wrapping_add(1);
+        }
+    }
+    *out = read_modes(modes, n);
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn in_a_loop(mut m: *mut MemoryManager, n: usize, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    let mut k = 0 as usize;
+    while k < n {
+        if k > 1 as usize {
+            modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+        }
+        k = k.wrapping_add(1);
+    }
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn both_arms(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    } else {
+        modes = BrotliAllocate(m, (2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn branch_frees(mut m: *mut MemoryManager, n: usize, flag: bool, other: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+    if other {
+        BrotliFree(m, modes as *mut std::os::raw::c_void);
+        modes = 0 as *mut u32;
+    }
+}
+pub unsafe extern "C" fn never_freed(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+}
+"#;
+
+/// **R608-1 (the 22nd owner)** — an optional owner created inside one `if`
+/// and released after the join is balanced AT the join: the other path
+/// carries `None`, the release takes both. Before, the creating branch read
+/// `contract-allocation:implicit-close:block-unbalanced:false->true`.
+#[test]
+fn w6a_r608_an_owner_created_in_one_branch_is_released_after_the_join() {
+    let out = emitted("r608-join", &format!("{PRELUDE}{JOIN_OWNERS}"));
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    assert!(receipts.contains("meta::modes\tadmitted\t"), "{context}");
+    assert_eq!(
+        reason_of(&out.degradations, "meta::modes"),
+        None,
+        "{context}"
+    );
+    for expected in [
+        "letmutmodes:Option<Box<[u32]>>=None;",
+        "modes=ifn>0asusize{Some(Box::from_raw(",
+        "BrotliFree(m,modes.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "modes=None;",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}`\n{context}");
+    }
+    assert!(!text.contains("drop("), "{context}");
+}
+
+/// Controls, one per condition of the refinement: a branch inside a LOOP may
+/// create again over a live generation (an overwrite the simulation never
+/// sees); an `if` whose two arms both create reads as an overwrite to the
+/// linear simulation; a branch that RELEASES (live on entry, dead on exit)
+/// leaves the other path's generation for Rust to close; and a generation created in a branch with no release
+/// after the join is live at exit. Each keeps its hold.
+#[test]
+fn w6a_r608_a_branch_in_a_loop_or_without_a_release_keeps_its_hold() {
+    let out = emitted("r608-join-controls", &format!("{PRELUDE}{JOIN_OWNERS}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    for owner in ["both_arms::modes", "branch_frees::modes"] {
+        assert!(
+            receipts.contains(&format!(
+                "{owner}\theld\tcontract-allocation:implicit-close:block-unbalanced"
+            )),
+            "{owner}\n{receipts}\n{}",
+            out.source
+        );
+    }
+    assert!(
+        receipts.contains(
+            "in_a_loop::modes\theld\tcontract-allocation:implicit-close:block-unbalanced"
+        ),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        receipts
+            .contains("never_freed::modes\theld\tcontract-allocation:implicit-close:live-at-exit"),
+        "{receipts}\n{}",
         out.source
     );
 }
