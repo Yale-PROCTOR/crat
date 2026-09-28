@@ -1567,9 +1567,10 @@ pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize
 /// graft its text would REPLACE the initializer before the seam pass and the
 /// raw-view / C-9 / receiver passes run, and a replaced subtree keeps none of
 /// the spans they are keyed on. This visitor runs after all of them,
-/// post-order, and wraps the node's already-rewritten text in the
-/// constructor's prefix and suffix. The
-/// node keeps its own span, so nothing keyed on it is disturbed. A key it never
+/// post-order, and wraps the already-rewritten node in the
+/// constructor's prefix and suffix, the node itself moved inside them. The
+/// node and its descendants keep their spans, so nothing keyed on them is
+/// disturbed. A key it never
 /// meets leaves the raw value under the slice declaration, which the verify
 /// loop reports as a type error for that class alone.
 struct ConstructionBracketVisitor<'a> {
@@ -1590,11 +1591,45 @@ impl MutVisitor for ConstructionBracketVisitor<'_> {
         if self.applied.contains(&key) {
             return;
         }
-        let inner = rustc_ast_pretty::pprust::expr_to_string(e);
-        if let Ok(parsed) = graft_expr(&format!("{open}{inner}{close}")) {
-            e.kind = parsed.kind;
+        // The constructor is parsed around a HOLE and the node itself is moved
+        // into it: every descendant keeps its span, so the passes keyed on
+        // them that run after this one (`wave5r_helper_path::qualify`'s callee
+        // spans) still find them. Codex review (wave-6l 055): a re-parse of
+        // the node's text left an imported helper call unqualified (E0425).
+        let Ok(mut wrapper) = graft_expr(&format!("{open}{BRACKET_HOLE}{close}")) else {
+            return;
+        };
+        let mut filler = BracketHoleFiller {
+            node: Some(e.clone()),
+        };
+        filler.visit_expr(&mut wrapper);
+        if filler.node.is_none() {
+            e.kind = wrapper.kind;
             self.applied.insert(key);
         }
+    }
+}
+
+/// The placeholder the bracket's constructor text is parsed around.
+const BRACKET_HOLE: &str = "__crat_construction_bracket_hole";
+
+/// Replaces the single `BRACKET_HOLE` path in a parsed constructor with the
+/// wrapped node; `node` is `None` afterwards exactly when the hole was found.
+struct BracketHoleFiller {
+    node: Option<rustc_ast::Expr>,
+}
+
+impl MutVisitor for BracketHoleFiller {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Path(None, path) = &e.kind
+            && let [segment] = path.segments.as_slice()
+            && segment.ident.name.as_str() == BRACKET_HOLE
+            && let Some(node) = self.node.take()
+        {
+            *e = node;
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
     }
 }
 

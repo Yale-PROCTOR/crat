@@ -975,3 +975,91 @@ fn w6l_nul_c9_a_runtime_byte_count_stays_unproved() {
     let length = contract_length(CONTROL_RUNTIME_BYTES, "src");
     assert!(!length.starts_with("Evidence"), "{length}");
 }
+
+/// C10 (Codex review, 055 round 2) — the wrapped call is an IMPORTED call of
+/// a surfaced helper (`start` is a fn-pointer value, so it keeps a raw outer
+/// and its callers call `__crat_safe_start`). The helper-path pass, which runs
+/// after the bracket, qualifies the call by its callee's span: the bracket
+/// must keep that span, or the call is E0425.
+const CONTROL_BRACKETED_IMPORTED_HELPER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn getenv(name: *const i8) -> *mut i8;
+}
+pub mod provider {
+    pub unsafe fn start(p: *const i32) -> *const i8 {
+        if *p == 0 {
+            return 0 as *const i8;
+        }
+        crate::getenv(b"HOME\0" as *const u8 as *const i8) as *const i8
+    }
+    pub fn install() {
+        let _callback: unsafe fn(*const i32) -> *const i8 = start;
+    }
+}
+pub mod consumer {
+    use crate::provider::start;
+    pub unsafe fn imported(p: *const i32) -> i32 {
+        let mut s = start(p);
+        let mut i: usize = 0;
+        while *s.offset(i as isize) != 0 {
+            i = i.wrapping_add(1);
+        }
+        i as i32
+    }
+}
+"#;
+
+fn emitted_with_exposure(input: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let emission = crate::bo_rewriter::emit_files(
+            tcx,
+            &table,
+            &Default::default(),
+            &ctx.retained_c9_plans,
+        )
+        .unwrap();
+        let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(
+            &emission.plan.held_classes(),
+            &Default::default(),
+            &table,
+        )
+        .unwrap();
+        crate::bo_rewriter::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .unwrap()
+        .0
+        .into_values()
+        .next()
+        .unwrap()
+    })
+    .unwrap()
+}
+
+#[test]
+fn w6l_nul_c10_a_bracketed_imported_helper_call_is_qualified() {
+    let source = emitted_with_exposure(CONTROL_BRACKETED_IMPORTED_HELPER);
+    let flat = flat(&source);
+    assert!(flat.contains("fn __crat_safe_start"), "{source}");
+    assert!(flat.contains("let mut s: &[i8] ="), "{source}");
+    assert!(
+        flat.contains("core::slice::from_raw_parts(crate::provider::__crat_safe_start(p),"),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
