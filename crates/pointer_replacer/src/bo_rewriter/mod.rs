@@ -112,6 +112,8 @@ mod pair_one_sided_field_tests;
 #[cfg(test)]
 mod pair_projection_recovery_tests;
 #[cfg(test)]
+mod pair_raw_borrow_tests;
+#[cfg(test)]
 mod pair_read_read_tests;
 #[cfg(test)]
 mod pair_shared_read_release_tests;

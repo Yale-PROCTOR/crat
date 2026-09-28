@@ -43,7 +43,7 @@ use std::cell::RefCell;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    BorrowKind, Expr, ExprKind, HirId, LangItem, PatKind, QPath, StmtKind, UnOp,
+    Expr, ExprKind, HirId, LangItem, PatKind, QPath, StmtKind, UnOp,
     def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     intravisit::{self, Visitor},
@@ -3350,13 +3350,14 @@ struct LocalCollector<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> LocalCollector<'a, 'tcx> {
-    /// R513-3: the PLACE an initializer takes the address of. `&mut (*s).br`
-    /// and `&(*s).br` both give `(*s).br`; anything else gives nothing, so a
+    /// R513-3: the PLACE an initializer takes the address of. `&mut (*s).br`,
+    /// `&(*s).br` and the raw `&raw mut (*s).br` all give `(*s).br`; anything
+    /// else gives nothing, so a
     /// binding initialized from a call, a cast of an integer or another
     /// pointer's VALUE records no prefix and folds nowhere.
     fn address_of_place(&self, rhs: &Expr<'_>) -> Option<PlacePath> {
         let (rhs, outer) = peel_casts_retyping(self.typeck, rhs);
-        let ExprKind::AddrOf(BorrowKind::Ref, _, operand) = &rhs.kind else {
+        let ExprKind::AddrOf(_, _, operand) = &rhs.kind else {
             return None;
         };
         let (operand, inner) = peel_casts_retyping(self.typeck, operand);
@@ -3691,7 +3692,9 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
                     }
                 }
             }
-            ExprKind::AddrOf(BorrowKind::Ref, _, operand) => {
+            // R624-1: a raw borrow (`&raw mut p`, `addr_of_mut!(p)`) takes the
+            // address exactly as `&mut p` does.
+            ExprKind::AddrOf(_, _, operand) => {
                 // `&mut p` / `&p` of the binding ITSELF (not of a place inside
                 // it): a pointer local can then be reassigned through the
                 // address, so its value is no longer a single provenance.
@@ -3807,8 +3810,10 @@ fn argument_provenance_peeled<'tcx>(
     expr: &Expr<'_>,
 ) -> (RootClass, Option<PlacePath>) {
     match &expr.kind {
-        // `&mut place` / `&place`: a view into the place's object.
-        ExprKind::AddrOf(BorrowKind::Ref, _, operand) => {
+        // `&mut place` / `&place`: a view into the place's object. R624-1: a
+        // raw borrow is the same view — and every other shape below hands an
+        // `AddrOf` back here, so a raw borrow left to them never returns.
+        ExprKind::AddrOf(_, _, operand) => {
             let (operand, cast) = peel_casts_retyping(typeck, operand);
             // `&mut *e` — a reborrow of whatever `e` addresses.
             if let ExprKind::Unary(UnOp::Deref, inner) = &operand.kind
@@ -3970,9 +3975,7 @@ fn derivation_base<'tcx>(typeck: &TypeckResults<'tcx>, expr: &Expr<'_>) -> Optio
     let expr = peel_casts(expr);
     match &expr.kind {
         ExprKind::Path(..) => resolved_local(expr),
-        ExprKind::AddrOf(BorrowKind::Ref, _, operand) => {
-            derivation_place_base(typeck, peel_casts(operand))
-        }
+        ExprKind::AddrOf(_, _, operand) => derivation_place_base(typeck, peel_casts(operand)),
         ExprKind::MethodCall(segment, receiver, method_args, _) => {
             let receiver = peel_casts(receiver);
             match segment.ident.name.as_str() {
