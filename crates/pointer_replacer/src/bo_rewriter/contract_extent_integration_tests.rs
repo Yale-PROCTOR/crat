@@ -1284,22 +1284,7 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
         ::utils::compilation::str_to_input(CE_V01_VOID_CAST_COUNTED_POSITION),
         |tcx| {
             let (_table, ctx) = super::decide_table_with_ctx(tcx)?;
-            let held =
-                super::decision::thin_extent::collect(tcx, &ctx.facts, |function, binding| {
-                    ctx.subjects
-                        .iter()
-                        .find(|subject| subject.fn_did == function && subject.hir_id == binding)
-                        .and_then(|subject| {
-                            ctx.slots
-                                .fn_local_slots
-                                .get(&function)?
-                                .slot_for_local_depth(subject.local, 0)
-                        })
-                        .is_some_and(|slot| {
-                            ctx.model.get(&super::SlotRef::Local(function, slot))
-                                == Some(&super::SlotKind::Raw)
-                        })
-                });
+            let held = super::decision::thin_extent::collect(tcx, &ctx.facts);
             Ok::<_, String>(
                 ctx.subjects
                     .iter()

@@ -97,16 +97,27 @@ pub(crate) enum AccessReason {
     /// a callee parameter that does (W-C9, fix-2 one call deeper: a thin
     /// caller bridged into the forwarder reads wide through a one-element
     /// claim exactly as it would at the accessing callee). Carries that
-    /// parameter's own detail.
-    Forwarded { into: String },
+    /// parameter's own detail, and whether the chain ends at a counted
+    /// foreign footprint (the one chain a cast hop may continue).
+    Forwarded { into: String, counted: bool },
 }
 
 impl AccessReason {
+    /// A counted foreign footprint, directly or at the end of a forwarding
+    /// chain.
+    fn counted(&self) -> bool {
+        match self {
+            Self::ForeignContract { .. } => true,
+            Self::Forwarded { counted, .. } => *counted,
+            Self::VoidPointee { .. } | Self::PointerArithmetic { .. } => false,
+        }
+    }
+
     fn key(&self) -> String {
         match self {
             Self::VoidPointee { cast_to } => format!("void-pointee-cast-to:{cast_to}"),
             Self::PointerArithmetic { op } => format!("pointer-arithmetic:{op}"),
-            Self::Forwarded { into } => format!("forwarded-into:{into}"),
+            Self::Forwarded { into, .. } => format!("forwarded-into:{into}"),
             Self::ForeignContract { at } => format!("foreign-contract:{at}"),
         }
     }
@@ -223,11 +234,18 @@ fn parameter_access(
         // evidence that the opaque address is accessed at some real width. A
         // `c_void` parameter that is only passed on or compared accesses
         // nothing and is not in scope.
-        let cast = facts.address_observations.iter().find(|fact| {
+        match facts.address_observations.iter().find(|fact| {
             fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
-        })?;
-        AccessReason::VoidPointee {
-            cast_to: cast.target_type.clone(),
+        }) {
+            Some(cast) => AccessReason::VoidPointee {
+                cast_to: cast.target_type.clone(),
+            },
+            // wave-6l (Codex 062 finding 2): handed UNCAST to a counted
+            // foreign position (`fill(d: *mut c_void) { memcpy(d, s, 16) }`),
+            // the footprint is the contract's, and no cast is needed to say so.
+            None => AccessReason::ForeignContract {
+                at: counted_foreign_footprint(facts, key)?,
+            },
         }
     } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
         uses.iter().find(|(op, span)| {
@@ -245,35 +263,44 @@ fn parameter_access(
             return None;
         }
         visited.push(key);
-        let into = facts
+        let handed = facts
             .call_args
             .iter()
             .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
             .filter(|(_, site)| site.caller == param.fn_did)
             .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
-            .filter(|(_, arg)| match arg.shape {
-                ArgShape::BareLocal(binding) => binding == param.hir_id,
-                // Guard mode: a cast of the parameter hands on the same address
-                // (brotli `Hash14(data)`: `BrotliUnalignedRead32(data as *const
-                // c_void)`, a four-byte read).
-                ArgShape::CastOfLocal { binding, .. } => guard && binding == param.hir_id,
-                _ => false,
-            })
-            .find_map(|(callee, arg)| {
-                let target = parameters.get(&(callee, arg.index))?;
-                parameter_access(
-                    tcx,
-                    target,
-                    facts,
-                    slice_uses,
-                    parameters,
-                    cursor_candidates,
-                    decided,
-                    visited,
-                    guard,
-                )
-            })?;
+            .filter(|(_, arg)| subject_denoting_root(arg.shape) == Some(param.hir_id))
+            .collect::<Vec<_>>();
+        let mut follow = |cast: bool| {
+            handed
+                .iter()
+                .filter(|(_, arg)| cast != matches!(arg.shape, ArgShape::BareLocal(_)))
+                .find_map(|(callee, arg)| {
+                    let target = parameters.get(&(*callee, arg.index))?;
+                    parameter_access(
+                        tcx,
+                        target,
+                        facts,
+                        slice_uses,
+                        parameters,
+                        cursor_candidates,
+                        decided,
+                        visited,
+                        guard,
+                    )
+                    // A cast of the parameter hands on the same address. In
+                    // main's guard mode (R622-1 / R628-2) every cast hop is
+                    // followed (brotli `Hash14(data)`:
+                    // `BrotliUnalignedRead32(data as *const c_void)`); outside
+                    // it, a cast hop continues only a counted-contract chain
+                    // (wave-6l, Codex 062 finding 3), as the NUL see-through
+                    // continues through casts. Bare arguments are tried first.
+                    .filter(|access| !cast || guard || access.reason.counted())
+                })
+        };
+        let into = follow(false).or_else(|| follow(true))?;
         AccessReason::Forwarded {
+            counted: into.reason.counted(),
             into: into.detail(),
         }
     };

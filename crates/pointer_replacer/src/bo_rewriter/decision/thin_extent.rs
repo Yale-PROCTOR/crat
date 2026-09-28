@@ -88,26 +88,22 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// fact. A counted footprint behind a local callee is
 /// `local_callee_extent`'s contract arm, not this set's.
 ///
-/// A parameter carries its walk to its callers only where its own form would
-/// be due to the walk, the reader chain's rule (#1b): not one the model calls
-/// `Raw` (BO's kind first, so a caller never takes a view its raw callee would
-/// not), and not one with pointer arithmetic of its own (`offset`: its extent
-/// is its own, and its callers are R365-2's and `local_callee_extent`'s).
-pub(crate) fn collect(
-    tcx: TyCtxt<'_>,
-    facts: &EmitabilityFacts,
-    model_raw: impl Fn(LocalDefId, HirId) -> bool,
-) -> FxHashSet<(LocalDefId, HirId)> {
+/// A parameter with pointer arithmetic of its own (`offset`) does not carry
+/// the walk to its callers: its extent is its own, and a thin caller of it is
+/// `local_callee_extent`'s (a raw callee: `pointer-arithmetic`) or main's
+/// one-element-into-wider guard's (a slice callee, R365-2). **A model-`Raw`
+/// callee does carry it** (Codex 062 finding 1): keeping the callee raw does
+/// not protect a caller that converts, and wave-4's CE-D06 emitted exactly
+/// that, `find(name: &mut i8)` into `find_local`'s `strcmp`.
+pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
     let carries = |(function, binding): (LocalDefId, HirId)| {
-        !model_raw(function, binding)
-            && !facts
-                .raw_only_uses
-                .get(&(function, binding))
-                .is_some_and(|uses| {
-                    uses.iter().any(|(op, _)| {
-                        super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
-                    })
-                })
+        !facts
+            .raw_only_uses
+            .get(&(function, binding))
+            .is_some_and(|uses| {
+                uses.iter()
+                    .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+            })
     };
     let mut out = FxHashSet::default();
     let mut walked = FxHashSet::default();
