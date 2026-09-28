@@ -185,6 +185,8 @@ mod wave6l_return_origin_tests;
 #[cfg(test)]
 mod wave6o_callee_frame_bounded_tests;
 #[cfg(test)]
+mod wave6o_opt_use_shapes_tests;
+#[cfg(test)]
 mod wave6o_owned_field_load_tests;
 pub(crate) mod wave6r_child_access;
 mod wave6r_option_reborrow;

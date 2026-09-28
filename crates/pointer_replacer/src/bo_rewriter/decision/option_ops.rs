@@ -23,6 +23,66 @@ use crate::bo_rewriter::mechanical_receipt::{
     MechanicalEvidence, MechanicalFamily, MechanicalTerminalReason, OptionPresentationReceiptPlan,
 };
 
+/// **R607-1 leg B (relay 092): a branch self-reassignment.** For
+/// `x = if c { A } else { x };` (either arm), the arm that is the subject itself
+/// keeps its Option value unchanged, and only the OTHER arm's tail needs the
+/// value adapter. Returns that other arm's tail expression when `branch_value`
+/// is the subject `binding` as the bare tail of one arm of an `if` that is the
+/// right-hand side of an assignment to the same `binding`.
+pub(super) fn self_branch_other<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    branch_value: &'tcx Expr<'tcx>,
+    binding: HirId,
+) -> Option<&'tcx Expr<'tcx>> {
+    let is_binding = |expression: &Expr<'_>| {
+        matches!(expression.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+            if path.res == Res::Local(binding))
+    };
+    if !is_binding(branch_value) {
+        return None;
+    }
+    let Node::Block(block) = tcx.parent_hir_node(branch_value.hir_id) else { return None };
+    if !block.stmts.is_empty() || block.expr.map(|tail| tail.hir_id) != Some(branch_value.hir_id) {
+        return None;
+    }
+    let Node::Expr(arm) = tcx.parent_hir_node(block.hir_id) else { return None };
+    if !matches!(arm.kind, ExprKind::Block(inner, _) if inner.hir_id == block.hir_id) {
+        return None;
+    }
+    let Node::Expr(branch) = tcx.parent_hir_node(arm.hir_id) else { return None };
+    let ExprKind::If(_, then, Some(otherwise)) = branch.kind else { return None };
+    let other = if then.hir_id == arm.hir_id {
+        otherwise
+    } else if otherwise.hir_id == arm.hir_id {
+        then
+    } else {
+        return None;
+    };
+    let Node::Expr(assign) = tcx.parent_hir_node(branch.hir_id) else { return None };
+    let ExprKind::Assign(lhs, rhs, _) = assign.kind else { return None };
+    if rhs.hir_id != branch.hir_id || !is_binding(lhs) {
+        return None;
+    }
+    let ExprKind::Block(other_block, _) = other.kind else { return None };
+    let tail = other_block.expr?;
+    (!is_binding(tail)).then_some(tail)
+}
+
+/// The same shape read from the assignment's right-hand side: the `if` whose
+/// one arm is `binding` itself. Returns the other arm's tail, the value the
+/// Option value planner renders in place of the whole right-hand side.
+pub(super) fn self_branch_value_of<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    rhs: &'tcx Expr<'tcx>,
+    binding: HirId,
+) -> Option<&'tcx Expr<'tcx>> {
+    let ExprKind::If(_, then, Some(otherwise)) = rhs.kind else { return None };
+    [then, otherwise].into_iter().find_map(|arm| {
+        let ExprKind::Block(block, _) = arm.kind else { return None };
+        self_branch_other(tcx, block.expr?, binding)
+    })
+}
+
 /// Defer only an explicit, bare return of a positively identified local.
 /// Final presentation and permission are checked by `plan_raw_returns`.
 pub(super) fn collect_raw_return(

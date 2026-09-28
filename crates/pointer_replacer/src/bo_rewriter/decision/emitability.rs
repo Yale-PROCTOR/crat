@@ -2182,6 +2182,19 @@ fn collect_opt_uses_with_family(
                 {
                     return; // the destination-owned RHS operation is above
                 }
+                // R607-1 leg B: the self arm of `x = if c { A } else { x };`
+                // keeps its Option value; the value planner renders the other
+                // arm (`option::plan_values`), so this use needs no edit.
+                if self.expanded
+                    && super::option_ops::self_branch_other(self.tcx, expr, hir_id).is_some()
+                {
+                    self.out.entry(key).or_default().sites.push(OptUseSite {
+                        hir_id: expr.hir_id,
+                        span: expr.span,
+                        operation: "self-branch-value",
+                    });
+                    return;
+                }
                 // A boundary on `(*p).field` owns the projected pointer value.
                 // Evaluating that value still requires opening the Option at
                 // `p`; leave its one native use edit beneath the outer adapter.

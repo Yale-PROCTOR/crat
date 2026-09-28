@@ -379,11 +379,15 @@ pub(crate) fn plan_values(
             values.push((*hir, *span, true));
         }
         if let Some(uses) = uses.get(&node) {
-            values.extend(
-                uses.assignments
-                    .iter()
-                    .map(|site| (site.rhs, site.span, false)),
-            );
+            // R607-1 leg B: `x = if c { A } else { x };` — the self arm keeps
+            // its value, so the value planned is the OTHER arm's tail, in place.
+            values.extend(uses.assignments.iter().map(|site| {
+                let rhs = tcx.hir_node(site.rhs).expect_expr();
+                match super::option_ops::self_branch_value_of(tcx, rhs, subject.hir_id) {
+                    Some(other) => (other.hir_id, other.span, false),
+                    None => (site.rhs, site.span, false),
+                }
+            }));
             for site in &uses.sites {
                 if matches!(
                     site.operation,
