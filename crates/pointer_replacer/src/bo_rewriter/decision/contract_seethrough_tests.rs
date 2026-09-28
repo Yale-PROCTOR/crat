@@ -92,6 +92,29 @@ fn w6l_seethrough_s1c_a_one_element_position_behind_the_wrapper_stays_thin() {
     );
 }
 
+/// S2 (item 2, the fixpoint) — the same NUL walk two local forwarders deep:
+/// `CopyStat` calls the program's own `my_stat`, which calls the wrapper.
+#[test]
+fn w6l_seethrough_s2_the_contract_is_followed_through_two_forwarders() {
+    let input = COPY_STAT
+        .replace(
+            "unsafe fn CopyStat(",
+            "unsafe fn my_stat(mut p: *const i8, mut b: *mut StatBuf) -> i32 {\n    stat(p, b)\n}\nunsafe fn CopyStat(",
+        )
+        .replace("if stat(input_path, &mut statbuf)", "if my_stat(input_path, &mut statbuf)");
+    assert_ne!(input, COPY_STAT, "the witness must change the fixture");
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("fn CopyStat(mut input_path: Option<&[i8]>, mut output_path: Option<&[i8]>)"),
+        "{flat}"
+    );
+    assert!(
+        crate::bo_rewriter::verify::type_checks_str(&source),
+        "{source}"
+    );
+}
+
 /// main 131 §6 finding 6, reduced: a thin caller handed to a local callee that
 /// hands its parameter on to a COUNTED foreign footprint; the control hands it
 /// to a NUL walk.
