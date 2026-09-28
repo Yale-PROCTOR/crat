@@ -409,6 +409,14 @@ struct ArgRecord {
     /// not offset-admitted field, and a store into `F` of the same object runs
     /// on every path from the caller's entry to this call.
     stored_since_entry: bool,
+    /// R628-7 (f′): this argument is a direct read `(*formal).F` of such a
+    /// field through a stable formal of the caller: `(formal index, F)`.
+    field_of_formal: Option<(usize, (DefId, Symbol))>,
+    /// R628-7 (f′): the admitted fields stored into this argument's pointee
+    /// place on every path from the caller's entry to this call.
+    stored_fields: Vec<(DefId, Symbol)>,
+    /// R628-7 (f′): the argument's place is rooted at a stable binding.
+    place_stable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -523,6 +531,8 @@ impl PairDisjointnessIndex {
         let fresh_fields = allocator_data_fields(tcx, &local_functions, &allocators);
         // R601-4 (G4): needs the admitted fields, so it is derived after them.
         let getters = field_getters(tcx, &local_functions, &allocators, &fresh_fields);
+        // R628-7 (f′): so do the must-store summaries.
+        let summaries = must_store_summaries(tcx, &local_functions, &fresh_fields);
         #[cfg(test)]
         if std::env::var_os("W6P_DUMP_FIELDS").is_some() {
             for (did, (position, (_, field))) in &getters {
@@ -579,6 +589,15 @@ impl PairDisjointnessIndex {
                 why: &why,
                 prefixes: &prefixes,
                 stable: &stable,
+                summaries: &summaries,
+                params: body
+                    .params
+                    .iter()
+                    .map(|param| match param.pat.kind {
+                        PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                        _ => None,
+                    })
+                    .collect(),
                 calls: Vec::new(),
             };
             collector.visit_body(body);
@@ -916,6 +935,74 @@ impl PairDisjointnessIndex {
             .position(|binding| *binding == id)
     }
 
+    /// R628-7 (f′): at every in-crate call of `function`, is field `key` of the
+    /// object handed to formal `q` stored since the caller's entry, with the
+    /// object handed to formal `p` existing at that entry — or, when both are
+    /// the caller's own formals passed through, the same one level up? An
+    /// EXPORTED function is refused: the embedder's calls are unseen, and
+    /// R462-1 speaks of two of an entry's parameters, not of one beside a
+    /// block held in another's field (report 054).
+    fn stored_before_call(
+        &self,
+        function: u32,
+        q: usize,
+        key: (DefId, Symbol),
+        p: usize,
+        depth: usize,
+        seen: &mut Vec<(u32, usize, usize)>,
+    ) -> bool {
+        if depth > 8 || seen.contains(&(function, q, p)) || self.exported.contains(&function) {
+            return false;
+        }
+        seen.push((function, q, p));
+        let mut callers = 0usize;
+        let mut every = true;
+        'sites: for ((caller, target), records) in &self.sites {
+            if *target != function {
+                continue;
+            }
+            for record in records {
+                let find = |index: usize| record.args.iter().find(|arg| arg.index == index);
+                let (Some(field), Some(other)) = (find(q), find(p)) else {
+                    every = false;
+                    break 'sites;
+                };
+                callers += 1;
+                if field.stored_fields.contains(&key)
+                    && matches!(other.class, RootClass::EntryStorage(_))
+                {
+                    continue;
+                }
+                // One level up: both arguments are the caller's own stable
+                // formals, the field side passed as itself.
+                let up_q = field
+                    .place
+                    .as_ref()
+                    .filter(|place| {
+                        field.place_stable && place.deref_root && place.projections.is_empty()
+                    })
+                    .and_then(|place| {
+                        self.param_bindings
+                            .get(caller)?
+                            .iter()
+                            .position(|binding| *binding == place.root)
+                    });
+                let (Some(up_q), Some(up_p)) = (up_q, self.formal_of(*caller, other.class)) else {
+                    every = false;
+                    break 'sites;
+                };
+                if up_q == up_p
+                    || !self.stored_before_call(*caller, up_q, key, up_p, depth + 1, seen)
+                {
+                    every = false;
+                    break 'sites;
+                }
+            }
+        }
+        seen.pop();
+        every && callers > 0
+    }
+
     /// Certify the argument pair `(left, right)` of the call `caller → callee`
     /// whose arguments sit at `left_span` / `right_span`. Every outcome is
     /// recorded in the ledger.
@@ -1095,6 +1182,20 @@ impl PairDisjointnessIndex {
         // object, so they are distinct allocations whatever their types.
         for (field, other) in [(a, b), (b, a)] {
             if field.stored_since_entry && matches!(other.class, RootClass::EntryStorage(_)) {
+                return Ok(CertificateKind::AllocationIdentity);
+            }
+        }
+        // R628-7 (f′), the same claim one call up: the field is read through
+        // this function's formal `q`, the other side is its formal `p`'s entry
+        // object, and at every in-crate call the field of the object handed to
+        // `q` was stored since THAT caller's entry while the object handed to
+        // `p` existed at it (or both are that caller's formals, one level up).
+        for (field, other) in [(a, b), (b, a)] {
+            if let Some((q, key)) = field.field_of_formal
+                && let Some(p) = self.formal_of(caller, other.class)
+                && q != p
+                && self.stored_before_call(caller, q, key, p, 0, &mut Vec::new())
+            {
                 return Ok(CertificateKind::AllocationIdentity);
             }
         }
@@ -3865,6 +3966,9 @@ struct CallCollector<'a, 'tcx> {
     prefixes: &'a FxHashMap<HirId, PlacePath>,
     /// R628-7: the bindings that name one storage for the whole body.
     stable: &'a FxHashSet<HirId>,
+    /// R628-7: the must-store summaries, and the caller's formals in order.
+    summaries: &'a FxHashMap<(DefId, usize), FxHashSet<(DefId, Symbol)>>,
+    params: Vec<Option<HirId>>,
     calls: Vec<(LocalDefId, SiteRecord)>,
 }
 
@@ -3875,6 +3979,15 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
             && let Some(local) = did.as_local()
             && self.locals.contains(&local)
         {
+            let facts = StoreFacts {
+                tcx: self.tcx,
+                typeck: self.typeck,
+                classes: self.classes,
+                fresh_fields: self.fresh_fields,
+                summaries: self.summaries,
+                stable: self.stable,
+            };
+            let before = facts.before(expr);
             let args = args
                 .iter()
                 .enumerate()
@@ -3899,7 +4012,7 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                     };
                     // R624-1 (f): only a read AT the call; a local carried from
                     // an earlier read may hold a block from before the store.
-                    let stored_since_entry = match (class, &peel_casts(arg).kind) {
+                    let read = match (class, &peel_casts(arg).kind) {
                         (
                             RootClass::FreshField {
                                 adt,
@@ -3908,23 +4021,34 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                                 ..
                             },
                             ExprKind::Field(object, _),
-                        ) => place_provenance(self.tcx, self.typeck, self.classes, object)
-                            .1
-                            // R628-7: a place rooted at a binding that moves
-                            // names other storage at the call than at the store.
-                            .filter(|base| self.stable.contains(&base.root))
-                            .is_some_and(|base| {
-                                field_stored_since_entry(
-                                    self.tcx,
-                                    self.typeck,
-                                    self.classes,
-                                    expr,
-                                    (adt, field),
-                                    &base,
-                                )
-                            }),
-                        _ => false,
+                        ) => facts
+                            .stable_place(
+                                place_provenance(self.tcx, self.typeck, self.classes, object).1,
+                            )
+                            .map(|base| ((adt, field), base)),
+                        _ => None,
                     };
+                    let stored_since_entry = read.as_ref().is_some_and(|(key, base)| {
+                        before.iter().any(|(stored, stored_key)| {
+                            stored_key == key && stored.same_place(base)
+                        })
+                    });
+                    let field_of_formal = read.as_ref().and_then(|(key, base)| {
+                        let formal = (base.deref_root && base.projections.is_empty())
+                            .then(|| self.params.iter().position(|p| *p == Some(base.root)))??;
+                        Some((formal, *key))
+                    });
+                    let pointee = facts.stable_place(place.clone());
+                    let stored_fields = pointee
+                        .as_ref()
+                        .map(|pointee| {
+                            before
+                                .iter()
+                                .filter(|(stored, _)| stored.same_place(pointee))
+                                .map(|(_, key)| *key)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     ArgRecord {
                         index,
                         span: arg.span,
@@ -3940,6 +4064,9 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                             ty::RawPtr(..) | ty::Ref(..)
                         ),
                         stored_since_entry,
+                        field_of_formal,
+                        stored_fields,
+                        place_stable: pointee.is_some(),
                     }
                 })
                 .collect();
@@ -4006,91 +4133,218 @@ fn stable_bindings<'tcx>(
     scan.bindings
 }
 
-/// R624-1 (f): does a store into field `key` of the place `base` run on every
-/// path from the caller's entry to `call`? Every EARLIER statement of every
-/// block enclosing the call lies on each such path — structured control flow:
-/// a `return`, `break` or `continue` only removes paths — so one of them
-/// storing that field is the witness. A store inside a loop or a branch, or
-/// after the call, is not.
-fn field_stored_since_entry<'tcx>(
+/// R628-7: what the index reads about stores into admitted fields. A store is
+/// `(place).F = v` with `F` admitted and not offset-admitted — `v` is null or an
+/// allocation by the admission — or a call to a local function whose summary
+/// stores `F` through the formal the place is handed to. Every place is rooted at
+/// a stable binding ([`stable_bindings`]).
+struct StoreFacts<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    typeck: &TypeckResults<'tcx>,
-    classes: &FxHashMap<HirId, RootClass>,
-    call: &Expr<'_>,
-    key: (DefId, Symbol),
-    base: &PlacePath,
-) -> bool {
-    for (_, node) in tcx.hir_parent_iter(call.hir_id) {
-        match node {
-            rustc_hir::Node::Block(block) => {
-                for stmt in block.stmts {
-                    if stmt.span.contains(call.span) {
-                        break;
-                    }
-                    if statement_stores_field(tcx, typeck, classes, stmt, key, base) {
-                        return true;
+    typeck: &'a TypeckResults<'tcx>,
+    classes: &'a FxHashMap<HirId, RootClass>,
+    fresh_fields: &'a FxHashMap<(DefId, Symbol), FreshFieldFact>,
+    summaries: &'a FxHashMap<(DefId, usize), FxHashSet<(DefId, Symbol)>>,
+    stable: &'a FxHashSet<HirId>,
+}
+
+type AdmittedStore = (PlacePath, (DefId, Symbol));
+
+impl StoreFacts<'_, '_> {
+    fn stable_place(&self, place: Option<PlacePath>) -> Option<PlacePath> {
+        place.filter(|place| self.stable.contains(&place.root))
+    }
+
+    /// The stores `expr` makes on every path that continues past it. `strict`:
+    /// a block's statements after one that may `return` do not count (a
+    /// summary's claim is every path to the RETURN); for dominance they do,
+    /// because an exit only removes paths to the call.
+    fn stores(&self, expr: &Expr<'_>, strict: bool) -> Vec<AdmittedStore> {
+        match &expr.kind {
+            ExprKind::Assign(place, _, _) => {
+                let ExprKind::Field(object, field) = &peel_casts(place).kind else {
+                    return Vec::new();
+                };
+                let Some(key) =
+                    data_field_key(self.tcx, self.typeck, object, field.name).filter(|key| {
+                        self.fresh_fields
+                            .get(key)
+                            .is_some_and(|fact| !fact.via_offset)
+                    })
+                else {
+                    return Vec::new();
+                };
+                self.stable_place(place_provenance(self.tcx, self.typeck, self.classes, object).1)
+                    .map(|place| vec![(place, key)])
+                    .unwrap_or_default()
+            }
+            ExprKind::Block(block, None) => self.block_stores(block, strict),
+            // Both arms run one of them: a store both make is made.
+            ExprKind::If(_, then, Some(otherwise)) => {
+                let (then, otherwise) = (self.stores(then, strict), self.stores(otherwise, strict));
+                then.into_iter()
+                    .filter(|(place, key)| {
+                        otherwise
+                            .iter()
+                            .any(|(other, other_key)| other_key == key && other.same_place(place))
+                    })
+                    .collect()
+            }
+            ExprKind::Call(callee, args) => {
+                let Some(did) = callee_def_id(callee) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for (index, arg) in args.iter().enumerate() {
+                    let Some(keys) = self.summaries.get(&(did, index)) else {
+                        continue;
+                    };
+                    if let Some(place) = self.stable_place(
+                        argument_provenance(self.tcx, self.typeck, self.classes, arg).1,
+                    ) {
+                        out.extend(keys.iter().map(|key| (place.clone(), *key)));
                     }
                 }
+                out
             }
-            rustc_hir::Node::Expr(expr) if matches!(expr.kind, ExprKind::Closure(..)) => {
-                return false;
-            }
-            rustc_hir::Node::Item(_)
-            | rustc_hir::Node::ImplItem(_)
-            | rustc_hir::Node::TraitItem(_) => return false,
-            _ => {}
+            _ => Vec::new(),
         }
     }
-    false
-}
 
-/// A statement that stores field `key` of the place `base`: the assignment, or a
-/// plain block (every statement of which runs) holding one.
-fn statement_stores_field<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    typeck: &TypeckResults<'tcx>,
-    classes: &FxHashMap<HirId, RootClass>,
-    stmt: &rustc_hir::Stmt<'_>,
-    key: (DefId, Symbol),
-    base: &PlacePath,
-) -> bool {
-    let (StmtKind::Semi(expr) | StmtKind::Expr(expr)) = stmt.kind else {
-        return false;
-    };
-    expression_stores_field(tcx, typeck, classes, expr, key, base)
-}
-
-fn expression_stores_field<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    typeck: &TypeckResults<'tcx>,
-    classes: &FxHashMap<HirId, RootClass>,
-    expr: &Expr<'_>,
-    key: (DefId, Symbol),
-    base: &PlacePath,
-) -> bool {
-    match &expr.kind {
-        ExprKind::Assign(place, _, _) => {
-            let ExprKind::Field(object, field) = &peel_casts(place).kind else {
-                return false;
-            };
-            // R628-7: the SAME place the argument reads, not only the same
-            // root object — `(*t).a.map` is not `(*t).b.map`.
-            data_field_key(tcx, typeck, object, field.name) == Some(key)
-                && place_provenance(tcx, typeck, classes, object)
-                    .1
-                    .is_some_and(|stored| stored.same_place(base))
+    fn block_stores<'b>(
+        &self,
+        block: &'b rustc_hir::Block<'b>,
+        strict: bool,
+    ) -> Vec<AdmittedStore> {
+        let mut out = Vec::new();
+        for stmt in block.stmts {
+            if let StmtKind::Semi(expr) | StmtKind::Expr(expr) = stmt.kind {
+                out.extend(self.stores(expr, strict));
+            }
+            if strict && may_return(stmt) {
+                return out;
+            }
         }
-        ExprKind::Block(block, None) => {
-            block
-                .stmts
+        if let Some(tail) = block.expr {
+            out.extend(self.stores(tail, strict));
+        }
+        out
+    }
+
+    /// R624-1 (f): the stores that run on every path from the function's entry
+    /// to `call`. Every EARLIER statement of every block enclosing the call lies
+    /// on each such path — structured control flow: a `return`, `break` or
+    /// `continue` only removes paths — so its stores are made before the call.
+    /// A store inside a loop or on one branch is not.
+    fn before(&self, call: &Expr<'_>) -> Vec<AdmittedStore> {
+        let mut out = Vec::new();
+        for (_, node) in self.tcx.hir_parent_iter(call.hir_id) {
+            match node {
+                rustc_hir::Node::Block(block) => {
+                    for stmt in block.stmts {
+                        if stmt.span.contains(call.span) {
+                            break;
+                        }
+                        if let StmtKind::Semi(expr) | StmtKind::Expr(expr) = stmt.kind {
+                            out.extend(self.stores(expr, false));
+                        }
+                    }
+                }
+                rustc_hir::Node::Expr(expr) if matches!(expr.kind, ExprKind::Closure(..)) => {
+                    return out;
+                }
+                rustc_hir::Node::Item(_)
+                | rustc_hir::Node::ImplItem(_)
+                | rustc_hir::Node::TraitItem(_) => return out,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Does the statement hold a `return` (outside closures)?
+fn may_return<'tcx>(stmt: &'tcx rustc_hir::Stmt<'tcx>) -> bool {
+    struct Find(bool);
+    impl<'tcx> Visitor<'tcx> for Find {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            match expr.kind {
+                ExprKind::Ret(_) => self.0 = true,
+                ExprKind::Closure(..) => {}
+                _ => intravisit::walk_expr(self, expr),
+            }
+        }
+    }
+    let mut find = Find(false);
+    find.visit_stmt(stmt);
+    find.0
+}
+
+/// R628-7: the admitted fields each local function stores through each of its
+/// pointer formals on EVERY path to its return — `(*formal).F = v`, or a call
+/// whose own summary stores `F` through the formal it is handed. The least
+/// fixpoint: a function starts storing nothing, so recursion adds nothing it
+/// has not shown.
+fn must_store_summaries<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &FxHashSet<LocalDefId>,
+    fresh_fields: &FxHashMap<(DefId, Symbol), FreshFieldFact>,
+) -> FxHashMap<(DefId, usize), FxHashSet<(DefId, Symbol)>> {
+    let bodies: Vec<_> = functions
+        .iter()
+        .filter_map(|&function| {
+            let body = tcx.hir_body(tcx.hir_node_by_def_id(function).body_id()?);
+            let typeck = tcx.typeck(function);
+            let params: Vec<Option<HirId>> = body
+                .params
                 .iter()
-                .any(|stmt| statement_stores_field(tcx, typeck, classes, stmt, key, base))
-                || block.expr.is_some_and(|tail| {
-                    expression_stores_field(tcx, typeck, classes, tail, key, base)
+                .map(|param| match param.pat.kind {
+                    PatKind::Binding(_, hir_id, ..) => Some(hir_id),
+                    _ => None,
                 })
+                .collect();
+            Some((
+                function.to_def_id(),
+                body,
+                typeck,
+                params,
+                stable_bindings(typeck, body),
+            ))
+        })
+        .collect();
+    let classes = FxHashMap::default();
+    let mut summaries: FxHashMap<(DefId, usize), FxHashSet<(DefId, Symbol)>> = FxHashMap::default();
+    for _ in 0..16 {
+        let mut grown = Vec::new();
+        for (did, body, typeck, params, stable) in &bodies {
+            let facts = StoreFacts {
+                tcx,
+                typeck,
+                classes: &classes,
+                fresh_fields,
+                summaries: &summaries,
+                stable,
+            };
+            for (place, key) in facts.stores(body.value, true) {
+                if !place.deref_root || !place.projections.is_empty() {
+                    continue;
+                }
+                if let Some(index) = params.iter().position(|param| *param == Some(place.root))
+                    && !summaries
+                        .get(&(*did, index))
+                        .is_some_and(|keys| keys.contains(&key))
+                {
+                    grown.push(((*did, index), key));
+                }
+            }
         }
-        _ => false,
+        if grown.is_empty() {
+            break;
+        }
+        for (formal, key) in grown {
+            summaries.entry(formal).or_default().insert(key);
+        }
     }
+    summaries
 }
 
 /// The provenance class and place path of one argument expression.

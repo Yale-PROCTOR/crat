@@ -139,8 +139,9 @@ pub unsafe fn Build(mut mb: *mut Split) {
 }
 "#;
 
-/// C7: `BrotliStoreMetaBlock`'s shape — the store is in a callee of the
-/// CALLER, not in this body (scope of the local form; report 053).
+/// W3 (R628-7 f′): `BrotliStoreMetaBlock`'s shape — the store is made by a
+/// callee of the CALLER (`Fill`, a must-store summary), before `Store` is
+/// called; `x` is the caller's entry object.
 const STORED_BY_THE_CALLERS_CALLEE: &str = r#"
 pub unsafe fn Fill(mut mb: *mut Split) {
     (*mb).map = malloc(16) as *mut u32;
@@ -183,6 +184,111 @@ pub unsafe fn Build(mut x: *mut u32, mut p: *mut Split) {
     (*p).map = malloc(16) as *mut u32;
     p = p.offset(1);
     Use2(x, (*p).map);
+}
+"#;
+
+/// The (f′) chain's shared part: `Store` reads `(*mb).map` beside its `x`.
+const STORE: &str = r#"
+pub unsafe fn Fill(mut mb: *mut Split) {
+    (*mb).map = malloc(16) as *mut u32;
+}
+pub unsafe fn Clear(mut mb: *mut Split) {
+    (*mb).map = 0 as *mut u32;
+}
+pub unsafe fn Store(mut x: *mut u32, mut mb: *mut Split) {
+    Use2(x, (*mb).map);
+}
+"#;
+
+/// W4: two levels — `Mid` passes its own formals through.
+const TWO_LEVELS: &str = r#"
+pub unsafe fn Mid(mut x: *mut u32, mut mb: *mut Split) {
+    Store(x, mb);
+}
+pub unsafe fn Write(mut x: *mut u32) {
+    let mut s = Split { map: 0 as *mut u32, view: 0 as *mut u32, n: 0 };
+    Fill(&mut s);
+    Mid(x, &mut s);
+}
+"#;
+
+/// W5: brotli's `InitMetaBlockSplit` — a NULL store is a store (the block is
+/// null or one allocated later), and a store both arms of an `if` make counts.
+const A_NULL_STORE_AND_BOTH_ARMS: &str = r#"
+pub unsafe fn Write(mut x: *mut u32, mut c: i32) {
+    let mut s = Split { map: 0 as *mut u32, view: 0 as *mut u32, n: 0 };
+    if c != 0 {
+        Fill(&mut s);
+    } else {
+        Clear(&mut s);
+    }
+    Store(x, &mut s);
+}
+"#;
+
+/// C11: `Store` is `#[no_mangle]`: an embedder's call is unseen.
+const EXPORTED: &str = r#"
+pub unsafe fn Fill(mut mb: *mut Split) {
+    (*mb).map = malloc(16) as *mut u32;
+}
+#[no_mangle]
+pub unsafe extern "C" fn Store(mut x: *mut u32, mut mb: *mut Split) {
+    Use2(x, (*mb).map);
+}
+pub unsafe fn Write(mut x: *mut u32) {
+    let mut s = Split { map: 0 as *mut u32, view: 0 as *mut u32, n: 0 };
+    Fill(&mut s);
+    Store(x, &mut s);
+}
+"#;
+
+/// C12: the callee stores on one branch only — no summary.
+const A_CALLEE_THAT_MAY_NOT_STORE: &str = r#"
+pub unsafe fn Maybe(mut mb: *mut Split) {
+    if (*mb).n > 0 {
+        (*mb).map = malloc(16) as *mut u32;
+    }
+}
+pub unsafe fn Store(mut x: *mut u32, mut mb: *mut Split) {
+    Use2(x, (*mb).map);
+}
+pub unsafe fn Write(mut x: *mut u32, mut mb: *mut Split) {
+    Maybe(mb);
+    Store(x, mb);
+}
+"#;
+
+/// C13: the callee may return before its store — no summary.
+const A_CALLEE_THAT_RETURNS_FIRST: &str = r#"
+pub unsafe fn Early(mut mb: *mut Split) {
+    if (*mb).n == 0 {
+        return;
+    }
+    (*mb).map = malloc(16) as *mut u32;
+}
+pub unsafe fn Store(mut x: *mut u32, mut mb: *mut Split) {
+    Use2(x, (*mb).map);
+}
+pub unsafe fn Write(mut x: *mut u32, mut mb: *mut Split) {
+    Early(mb);
+    Store(x, mb);
+}
+"#;
+
+/// C14: the caller fills AFTER handing the object on.
+const FILLED_AFTER_THE_CALL: &str = r#"
+pub unsafe fn Write(mut x: *mut u32, mut mb: *mut Split) {
+    Store(x, mb);
+    Fill(mb);
+}
+"#;
+
+/// C15: at the caller, the other side is not an entry object.
+const THE_CALLERS_OTHER_SIDE_UNKNOWN: &str = r#"
+pub unsafe fn Write(mut mb: *mut Split) {
+    Fill(mb);
+    let mut u = ext_u32();
+    Store(u, mb);
 }
 "#;
 
@@ -243,8 +349,12 @@ fn w6p_r624_f_an_unknown_other_side_is_refused() {
 }
 
 #[test]
-fn w6p_r624_f_a_store_in_the_callers_callee_is_out_of_the_local_form() {
-    refused(STORED_BY_THE_CALLERS_CALLEE, "Store");
+fn w6p_r628_fp_a_store_by_the_callers_callee_is_seen() {
+    assert_eq!(
+        verdict(&source(STORED_BY_THE_CALLERS_CALLEE), "Store", "Use2", 0, 1),
+        Ok(CertificateKind::AllocationIdentity),
+        "`Write` stores `s.map` through `Fill` before handing `&mut s` and its entry `x` to `Store`"
+    );
 }
 
 #[test]
@@ -260,4 +370,61 @@ fn w6p_r624_f_a_store_into_a_sibling_place_is_refused() {
 #[test]
 fn w6p_r624_f_a_base_that_moves_after_the_store_is_refused() {
     refused(THE_BASE_MOVES_AFTER_THE_STORE, "Build");
+}
+
+fn chain(extra: &str) -> String {
+    format!("{PRELUDE}{STORE}{extra}")
+}
+
+#[test]
+fn w6p_r628_fp_two_levels_up() {
+    assert_eq!(
+        verdict(&chain(TWO_LEVELS), "Store", "Use2", 0, 1),
+        Ok(CertificateKind::AllocationIdentity)
+    );
+}
+
+#[test]
+fn w6p_r628_fp_a_null_store_and_a_store_both_arms_make_count() {
+    assert_eq!(
+        verdict(&chain(A_NULL_STORE_AND_BOTH_ARMS), "Store", "Use2", 0, 1),
+        Ok(CertificateKind::AllocationIdentity)
+    );
+}
+
+#[test]
+fn w6p_r628_fp_an_exported_callee_is_refused() {
+    let verdict = verdict(&source(EXPORTED), "Store", "Use2", 0, 1);
+    assert!(
+        verdict.is_err(),
+        "an embedder's call to `Store` is unseen: got {verdict:?}"
+    );
+}
+
+#[test]
+fn w6p_r628_fp_a_callee_that_may_not_store_is_refused() {
+    refused(A_CALLEE_THAT_MAY_NOT_STORE, "Store");
+}
+
+#[test]
+fn w6p_r628_fp_a_callee_that_returns_before_its_store_is_refused() {
+    refused(A_CALLEE_THAT_RETURNS_FIRST, "Store");
+}
+
+#[test]
+fn w6p_r628_fp_a_store_after_the_hand_off_is_refused() {
+    let verdict = verdict(&chain(FILLED_AFTER_THE_CALL), "Store", "Use2", 0, 1);
+    assert!(verdict.is_err(), "got {verdict:?}");
+}
+
+#[test]
+fn w6p_r628_fp_a_callers_unknown_other_side_is_refused() {
+    let verdict = verdict(
+        &chain(THE_CALLERS_OTHER_SIDE_UNKNOWN),
+        "Store",
+        "Use2",
+        0,
+        1,
+    );
+    assert!(verdict.is_err(), "got {verdict:?}");
 }
