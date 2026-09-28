@@ -22,6 +22,50 @@ pub(crate) struct Inventory {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) uses: Vec<BindingUse>,
     pub(crate) issues: Vec<String>,
+    /// R605-2: per module (its path, `""` at the crate root), the type names its
+    /// own items bind. The pending-target check resolves a callee formal written as
+    /// a bare name through its module's binding (main 127).
+    #[serde(default)]
+    pub(crate) type_bindings: BTreeMap<String, BTreeMap<String, TypeBinding>>,
+    /// R605-2: every type parameter's name anywhere; such a name is never resolved.
+    #[serde(default)]
+    pub(crate) type_parameters: BTreeSet<String>,
+    /// R605-2: the paths that are modules all the way from the root, none under a
+    /// `cfg` -- the only scopes whose bindings resolve anything.
+    #[serde(default)]
+    pub(crate) modules: BTreeSet<String>,
+    /// R605-2: the functions declared directly in such a module (not nested in a
+    /// function, an impl, a closure or an expression), with no opaque attribute on
+    /// the function or any parameter.
+    #[serde(default)]
+    pub(crate) module_functions: BTreeSet<String>,
+    /// R605-2: the crate carries an attribute that is not inert (an attribute macro
+    /// can rewrite the whole crate), so no binding is resolved anywhere.
+    #[serde(default)]
+    pub(crate) crate_opaque: bool,
+    /// R605-2: the modules that invoke a macro at item level. An invocation expands in
+    /// its own module, so that module's bindings and functions are unknown; a
+    /// definition alone introduces nothing (the rewriter's slice-cursor support module
+    /// defines and invokes two, for `impl`s).
+    #[serde(default)]
+    pub(crate) opaque_modules: BTreeSet<String>,
+    /// R605-2: the path of every item that is not a module. A module whose path, or
+    /// any prefix of it, is also one (`fn host` beside `mod host`) gives its functions
+    /// an owner string a function nested in that item -- one a body macro can hide --
+    /// also spells.
+    #[serde(default)]
+    pub(crate) item_paths: BTreeSet<String>,
+}
+
+/// R605-2: what a module's own item binds a type name to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TypeBinding {
+    /// A generic-free `type` item: its type's text.
+    Alias(String),
+    /// An un-renamed `use` by a crate path: the imported item's path from the root.
+    Import(Vec<String>),
+    /// Anything else that binds the name, or two different bindings of it.
+    Unknown,
 }
 
 /// An exact lexical occurrence, not a semantic liveness or execution claim.
@@ -179,6 +223,8 @@ struct InventoryVisitor<'source> {
     start: u32,
     offsets: Vec<u32>,
     path: Vec<String>,
+    /// R605-2: for each `path` segment, whether it is an unconditional module.
+    path_modules: Vec<bool>,
     owner: Option<String>,
     scopes: Vec<LexicalScope>,
     invalidated: BTreeSet<usize>,
@@ -379,7 +425,105 @@ impl InventoryVisitor<'_> {
         parameters
     }
 
+    /// R605-2: record what this module item binds as a type name.
+    fn type_bindings(&mut self, module: &str, item: &ast::Item) {
+        let conditional = opaque(&item.attrs);
+        match &item.kind {
+            ast::ItemKind::TyAlias(alias) => {
+                let binding = match &alias.ty {
+                    Some(ty)
+                        if !conditional
+                            && alias.generics.params.is_empty()
+                            && alias.bounds.is_empty() =>
+                    {
+                        TypeBinding::Alias(rustc_ast_pretty::pprust::ty_to_string(ty))
+                    }
+                    _ => TypeBinding::Unknown,
+                };
+                self.bind_type(module, alias.ident, binding);
+            }
+            ast::ItemKind::Struct(..)
+            | ast::ItemKind::Enum(..)
+            | ast::ItemKind::Union(..)
+            | ast::ItemKind::Trait(..)
+            | ast::ItemKind::TraitAlias(..) => {
+                if let Some(ident) = item.kind.ident() {
+                    self.bind_type(module, ident, TypeBinding::Unknown);
+                }
+            }
+            ast::ItemKind::Use(tree) => self.use_bindings(module, tree, Vec::new(), conditional),
+            _ => {}
+        }
+    }
+
+    /// An un-renamed leaf imported by a crate path (`crate`, `self`, `super`)
+    /// records the path; a rename, any other path, or a leaf this cannot place is
+    /// `Unknown`. A glob binds nothing it can name, so it is not recorded.
+    fn use_bindings(
+        &mut self,
+        module: &str,
+        tree: &ast::UseTree,
+        mut prefix: Vec<String>,
+        conditional: bool,
+    ) {
+        prefix.extend(
+            tree.prefix
+                .segments
+                .iter()
+                .filter(|segment| segment.ident.name != rustc_span::kw::PathRoot)
+                .map(|segment| segment.ident.name.to_string()),
+        );
+        match &tree.kind {
+            ast::UseTreeKind::Simple(rename) => {
+                let binding = match (rename, crate_rooted(module, &prefix)) {
+                    (None, Some(path)) if !conditional => TypeBinding::Import(path),
+                    _ => TypeBinding::Unknown,
+                };
+                self.bind_type(module, tree.ident(), binding);
+            }
+            ast::UseTreeKind::Nested { items, .. } => {
+                for (inner, _) in items {
+                    self.use_bindings(module, inner, prefix.clone(), conditional);
+                }
+            }
+            ast::UseTreeKind::Glob => {}
+        }
+    }
+
+    fn bind_type(&mut self, module: &str, ident: rustc_span::symbol::Ident, binding: TypeBinding) {
+        self.inventory
+            .type_bindings
+            .entry(module.to_owned())
+            .or_default()
+            .entry(ident.name.to_string())
+            .and_modify(|seen| {
+                if *seen != binding {
+                    *seen = TypeBinding::Unknown;
+                }
+            })
+            .or_insert(binding);
+    }
+
     fn function(&mut self, function: &ast::Fn, span: Span) {
+        if self.path_modules[..self.path_modules.len().saturating_sub(1)]
+            .iter()
+            .all(|module| *module)
+            && !function
+                .sig
+                .decl
+                .inputs
+                .iter()
+                .any(|parameter| opaque(&parameter.attrs))
+        {
+            self.inventory.module_functions.insert(self.path.join("::"));
+        }
+        for param in &function.generics.params {
+            if matches!(param.kind, ast::GenericParamKind::Type { .. }) {
+                self.inventory
+                    .type_parameters
+                    .insert(param.ident.name.to_string());
+            }
+        }
         let previous_owner = self.owner.replace(self.path.join("::"));
         let previous_scopes = std::mem::take(&mut self.scopes);
         self.push_scope(span);
@@ -492,6 +636,7 @@ impl InventoryVisitor<'_> {
     fn isolated_expression(&mut self, expression: &ast::Expr, kind: &str) {
         let at = self.range(expression.span).lo;
         self.path.push(format!("{kind}@{at}"));
+        self.path_modules.push(false);
         let previous_owner = self.owner.replace(self.path.join("::"));
         let previous_scopes = std::mem::take(&mut self.scopes);
         self.push_scope(expression.span);
@@ -510,14 +655,28 @@ impl InventoryVisitor<'_> {
         self.scopes = previous_scopes;
         self.owner = previous_owner;
         self.path.pop();
+        self.path_modules.pop();
     }
 }
 
 impl<'ast> Visitor<'ast> for InventoryVisitor<'_> {
     fn visit_item(&mut self, item: &'ast ast::Item) {
+        // An item-level macro, or an item under an attribute that could expand (an
+        // attribute or derive macro can add items beside it, an `extern` block
+        // included), leaves its module unknown.
+        if matches!(item.kind, ast::ItemKind::MacCall(..)) || opaque(&item.attrs) {
+            self.inventory.opaque_modules.insert(self.path.join("::"));
+        }
         if matches!(item.kind, ast::ItemKind::ForeignMod(_)) {
             visit::walk_item(self, item);
             return;
+        }
+        // R605-2: only an item at module level in an unconditional module chain binds
+        // a module's type name (Codex: a function-local alias shares its path with a
+        // sibling module of the function's name).
+        if self.path_modules.iter().all(|module| *module) {
+            let module = self.path.join("::");
+            self.type_bindings(&module, item);
         }
         let at = self.range(item.span).lo;
         self.path.push(
@@ -526,8 +685,21 @@ impl<'ast> Visitor<'ast> for InventoryVisitor<'_> {
                 .map(|name| name.name.to_string())
                 .unwrap_or_else(|| format!("item@{at}")),
         );
+        self.path_modules
+            .push(matches!(item.kind, ast::ItemKind::Mod(..)) && !opaque(&item.attrs));
+        if !matches!(item.kind, ast::ItemKind::Mod(..)) {
+            self.inventory.item_paths.insert(self.path.join("::"));
+        }
+        if self.path_modules.iter().all(|module| *module) {
+            self.inventory.modules.insert(self.path.join("::"));
+        }
         if let ast::ItemKind::Fn(function) = &item.kind {
             self.function(function, item.span);
+            if opaque(&item.attrs) {
+                self.inventory
+                    .module_functions
+                    .remove(&self.path.join("::"));
+            }
         } else {
             let owner = self.owner.take();
             let scopes = std::mem::take(&mut self.scopes);
@@ -536,6 +708,16 @@ impl<'ast> Visitor<'ast> for InventoryVisitor<'_> {
             self.owner = owner;
         }
         self.path.pop();
+        self.path_modules.pop();
+    }
+
+    fn visit_generic_param(&mut self, param: &'ast ast::GenericParam) {
+        if matches!(param.kind, ast::GenericParamKind::Type { .. }) {
+            self.inventory
+                .type_parameters
+                .insert(param.ident.name.to_string());
+        }
+        visit::walk_generic_param(self, param);
     }
 
     fn visit_assoc_item(&mut self, item: &'ast ast::AssocItem, context: visit::AssocCtxt) {
@@ -546,19 +728,41 @@ impl<'ast> Visitor<'ast> for InventoryVisitor<'_> {
                 .map(|name| name.name.to_string())
                 .unwrap_or_else(|| format!("associated@{at}")),
         );
+        self.path_modules.push(false);
+        if let ast::AssocItemKind::Type(alias) = &item.kind {
+            let module = self.path[..self.path.len() - 1].join("::");
+            self.bind_type(&module, alias.ident, TypeBinding::Unknown);
+        }
         if let ast::AssocItemKind::Fn(function) = &item.kind {
             self.function(function, item.span);
         } else {
             visit::walk_assoc_item(self, item, context);
         }
         self.path.pop();
+        self.path_modules.pop();
     }
 
     fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+        if matches!(item.kind, ast::ForeignItemKind::MacCall(..)) || opaque(&item.attrs) {
+            self.inventory.opaque_modules.insert(self.path.join("::"));
+        }
+        if let ast::ForeignItemKind::TyAlias(alias) = &item.kind
+            && self.path_modules.iter().all(|module| *module)
+        {
+            let module = self.path.join("::");
+            self.bind_type(&module, alias.ident, TypeBinding::Unknown);
+        }
         if let ast::ForeignItemKind::Fn(function) = &item.kind {
             self.path.push(function.ident.name.to_string());
+            self.path_modules.push(false);
             self.function(function, item.span);
+            // R605-2: a foreign declaration's formals are never resolved (Codex: a
+            // disabled one can stand for a callee a macro defines).
+            self.inventory
+                .module_functions
+                .remove(&self.path.join("::"));
             self.path.pop();
+            self.path_modules.pop();
         }
     }
 
@@ -700,6 +904,72 @@ impl<'ast> Visitor<'ast> for InventoryVisitor<'_> {
     }
 }
 
+/// R605-2: whether an item carries an attribute that could change what it declares
+/// or whether it exists: anything but a single-segment built-in for documentation,
+/// lint levels or codegen hints (`cfg`, `cfg_attr`, attribute macros and every
+/// multi-segment path included -- a `clippy::` prefix can name an extern crate).
+/// Such an item proves no binding (Codex: a disabled alias certified a primitive
+/// formal; an attribute macro can rewrite an alias).
+fn opaque(attrs: &[ast::Attribute]) -> bool {
+    attrs.iter().any(|attr| !inert(attr, false))
+}
+
+/// An attribute that cannot change what is declared; at crate level `feature` too.
+fn inert(attr: &ast::Attribute, crate_level: bool) -> bool {
+    let ast::AttrKind::Normal(normal) = &attr.kind else {
+        return true;
+    };
+    match normal.item.path.segments.as_slice() {
+        [name] if crate_level && name.ident.name.as_str() == "feature" => true,
+        [name] => matches!(
+            name.ident.name.as_str(),
+            "doc"
+                | "allow"
+                | "warn"
+                | "deny"
+                | "forbid"
+                | "expect"
+                | "must_use"
+                | "inline"
+                | "cold"
+                | "no_mangle"
+                | "export_name"
+                | "link_name"
+                | "repr"
+                | "deprecated"
+                | "used"
+                | "track_caller"
+                | "automatically_derived"
+                | "link_section"
+                | "macro_use"
+        ),
+        _ => false,
+    }
+}
+
+/// R605-2: a `use` path from the crate root, or `None` unless it starts at
+/// `crate`, `self` or `super` (another crate, or a bare path this cannot place).
+fn crate_rooted(module: &str, path: &[String]) -> Option<Vec<String>> {
+    let mut rooted: Vec<String> = match path.first()?.as_str() {
+        "crate" => Vec::new(),
+        "self" | "super" if module.is_empty() => Vec::new(),
+        "self" | "super" => module.split("::").map(str::to_owned).collect(),
+        _ => return None,
+    };
+    let mut rest = path.iter();
+    if path[0] == "crate" || path[0] == "self" {
+        rest.next();
+    }
+    for segment in rest {
+        if segment == "super" {
+            rooted.pop()?;
+        } else {
+            rooted.push(segment.clone());
+        }
+    }
+    Some(rooted)
+}
+
 pub(crate) fn inventory_source(name: &str, source: &str) -> Result<Inventory, String> {
     rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
         let psess = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
@@ -734,6 +1004,7 @@ pub(crate) fn inventory_source(name: &str, source: &str) -> Result<Inventory, St
             start: file.start_pos.0,
             offsets,
             path: Vec::new(),
+            path_modules: Vec::new(),
             owner: None,
             scopes: Vec::new(),
             invalidated: BTreeSet::new(),
@@ -741,6 +1012,9 @@ pub(crate) fn inventory_source(name: &str, source: &str) -> Result<Inventory, St
             inventory: Inventory::default(),
             error: None,
         };
+        // R605-2: a crate attribute that is not inert (an attribute macro can rewrite
+        // the whole crate, Codex) leaves no binding resolvable.
+        visitor.inventory.crate_opaque = krate.attrs.iter().any(|attr| !inert(attr, true));
         visit::walk_crate(&mut visitor, &krate);
         if let Some(error) = visitor.error {
             return Err(error);

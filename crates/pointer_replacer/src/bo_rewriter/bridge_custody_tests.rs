@@ -2858,10 +2858,29 @@ fn r568_1_b_an_element_address_through_the_owner_view_is_the_original_element() 
 #[test]
 fn r605_2_a_pending_target_typed_through_a_raw_alias_is_raw() {
     use crate::bo_rewriter::bridge_custody_match::pending_target_check_for_test as check;
-    const EMITTED: &str = "mod metablock {
+    const EMITTED: &str = "#![allow(non_camel_case_types)]
+#![feature(extern_types)]
+mod slice_cursor {
+    macro_rules! impl_index {
+        () => {};
+    }
+    impl_index!();
+}
+mod metablock {
+    #[allow(non_camel_case_types)]
     pub type ContextLut = *const u8;
     pub type Count = usize;
     pub unsafe fn callee(lut: ContextLut, n: Count, written: *const u8) {}
+}
+mod histogram {
+    use crate::metablock::ContextLut;
+    pub unsafe fn imported(lut: ContextLut) {}
+}
+mod nested {
+    pub mod inner {
+        use super::super::metablock::ContextLut;
+        pub unsafe fn relative(lut: ContextLut) {}
+    }
 }
 ";
     assert_eq!(
@@ -2878,5 +2897,310 @@ fn r605_2_a_pending_target_typed_through_a_raw_alias_is_raw() {
         check(EMITTED, "metablock::callee", 2),
         Ok(()),
         "a written raw pointer"
+    );
+    assert_eq!(
+        check(EMITTED, "histogram::imported", 0),
+        Ok(()),
+        "imported by its crate path, as brotli's modules import ContextLut"
+    );
+    assert_eq!(
+        check(EMITTED, "nested::inner::relative", 0),
+        Ok(()),
+        "imported by a super-relative path"
+    );
+}
+
+/// **R605-2, the controls (Codex's two reviews of the first forms).** A callee formal
+/// resolves only through its own module's explicit binding; every formal below is
+/// not provably a raw pointer, so each fails closed as not raw.
+#[test]
+fn r605_2_a_formal_its_module_does_not_bind_to_a_raw_alias_is_not_raw() {
+    use crate::bo_rewriter::bridge_custody_match::pending_target_check_for_test as check;
+    const SHADOWED: &str = "extern crate std as dep;
+mod a {
+    pub type P = *const u8;
+    pub type u8 = *const ();
+}
+mod b {
+    pub struct P;
+    pub unsafe fn homonym(p: P) {}
+}
+mod c {
+    pub type Q = *const u8;
+    pub unsafe fn generic<Q>(q: Q) {}
+}
+mod e {
+    pub type R = usize;
+    pub unsafe fn other_alias(r: R) {}
+}
+mod f {
+    use super::a::P as S;
+    pub unsafe fn renamed(s: S) {}
+}
+mod i {
+    use libc::P;
+    pub unsafe fn external(t: P) {}
+}
+mod k {
+    pub unsafe fn primitive(x: u8) {}
+}
+mod l {
+    pub type CString = *const u8;
+}
+mod m {
+    use crate::dep::ffi::CString;
+    pub unsafe fn through_extern_crate(c: CString) {}
+}
+mod n {
+    pub use std::ffi::*;
+}
+mod o {
+    use crate::n::*;
+    pub unsafe fn globbed(c: CString) {}
+}
+mod q {
+    use crate::n::CString;
+    pub unsafe fn re_exported_by_glob(c: CString) {}
+}
+mod s {
+    pub unsafe fn unbound(p: P) {}
+}
+pub struct Hp;
+mod host {
+    pub type Hp = *const u8;
+}
+fn host() {
+    unsafe fn nested(h: Hp) {}
+}
+mod t {
+    #[cfg(any())]
+    pub type u16 = *const ();
+    pub unsafe fn cfg_disabled_alias(x: u16) {}
+}
+mod host2 {
+    pub unsafe fn callee(x: u8) {}
+}
+fn host2() {
+    type u8 = *const ();
+}
+type P9 = usize;
+fn host3() {
+    unsafe fn callee(p: P9) {}
+}
+mod host3 {
+    type P9 = *const ();
+    unsafe fn callee(p: P9) {}
+}
+mod w {
+    #[scalar]
+    pub type W = *const u8;
+    pub unsafe fn attribute_macro_alias(w: W) {}
+}
+mod x {
+    pub type X = *const u8;
+    #[rewrite]
+    pub unsafe fn attribute_macro_callee(x: X) {}
+}
+mod z {
+    #[clippy::scalar]
+    pub type Z = *const u8;
+    pub unsafe fn tool_prefixed(z: Z) {}
+}
+mod ffi {
+    pub type F = *const u8;
+    unsafe extern \"C\" {
+        #[cfg(any())]
+        pub fn foreign(f: F);
+    }
+}
+mod params {
+    pub type G = *const u8;
+    pub unsafe fn cfg_parameter(#[cfg(any())] g: G, n: usize) {}
+}
+";
+    let not_raw = Err("pending-target-is-not-raw".to_owned());
+    for (owner, why) in [
+        ("b::homonym", "a struct homonym of an alias"),
+        ("c::generic", "a generic parameter shadowing an alias"),
+        ("e::other_alias", "the module's own alias of a non-pointer"),
+        ("f::renamed", "a renamed import (fails closed)"),
+        ("i::external", "an import from another crate"),
+        (
+            "k::primitive",
+            "a primitive homonym of another module's alias",
+        ),
+        (
+            "m::through_extern_crate",
+            "a crate path through an extern crate",
+        ),
+        ("o::globbed", "a name only a glob brings"),
+        ("q::re_exported_by_glob", "an import of a glob re-export"),
+        ("s::unbound", "a name the module does not bind"),
+        (
+            "host::nested",
+            "a function nested in a function a module shares the name of",
+        ),
+        (
+            "t::cfg_disabled_alias",
+            "a cfg-disabled alias over a primitive",
+        ),
+        (
+            "host2::callee",
+            "a module sharing the name of a function whose body has an alias",
+        ),
+        ("host3::callee", "two declarations of one owner path"),
+        (
+            "w::attribute_macro_alias",
+            "an alias under an attribute macro",
+        ),
+        (
+            "x::attribute_macro_callee",
+            "a callee under an attribute macro",
+        ),
+        ("z::tool_prefixed", "a tool-prefixed attribute path"),
+        ("ffi::foreign", "a foreign declaration"),
+        (
+            "params::cfg_parameter",
+            "a formal a parameter cfg can remove",
+        ),
+    ] {
+        assert_eq!(check(SHADOWED, owner, 0), not_raw, "{why}");
+    }
+    // An item-level macro anywhere: the unexpanded items are not the compiled ones
+    // (a macro can make a homonym of the alias), so nothing resolves.
+    const MACROS: &str = "macro_rules! make_p {
+    () => {
+        pub struct P;
+    };
+}
+mod a {
+    pub type P = *const u8;
+    pub unsafe fn beside_a_macro(p: P) {}
+}
+mod r {
+    make_p!();
+    pub unsafe fn macro_generated(x: P) {}
+}
+mod r2 {
+    pub type Q = *const u8;
+    make_p!();
+}
+mod s2 {
+    use crate::r2::Q;
+    pub unsafe fn through_a_macro_module(q: Q) {}
+}
+macro_rules! make_callee {
+    () => {
+        fn callee(p: usize) {}
+    };
+}
+fn host4() {
+    make_callee!();
+}
+mod host4 {
+    pub type P = *const u8;
+    pub unsafe fn callee(p: P) {}
+}
+macro_rules! nest {
+    () => {
+        mod inner {
+            pub fn callee(p: usize) {}
+        }
+    };
+}
+fn host5() {
+    nest!();
+}
+mod host5 {
+    pub mod inner {
+        pub type P = *const u8;
+        pub unsafe fn callee(p: P) {}
+    }
+}
+";
+    assert_eq!(
+        check(MACROS, "r::macro_generated", 0),
+        not_raw,
+        "a macro-generated homonym"
+    );
+    assert_eq!(
+        check(MACROS, "a::beside_a_macro", 0),
+        Ok(()),
+        "a macro invoked in another module does not reach this one"
+    );
+    assert_eq!(
+        check(MACROS, "s2::through_a_macro_module", 0),
+        not_raw,
+        "an import through a module that invokes a macro"
+    );
+    assert_eq!(
+        check(MACROS, "host4::callee", 0),
+        not_raw,
+        "a module sharing its path with a function a body macro can nest a callee in"
+    );
+    assert_eq!(
+        check(MACROS, "host5::inner::callee", 0),
+        not_raw,
+        "a module under a path a body macro can nest a module in"
+    );
+    const ROOT_MACRO: &str = "macro_rules! make_host {
+    () => {
+        fn host6() {
+            fn callee(p: usize) {}
+        }
+    };
+}
+make_host!();
+mod host6 {
+    pub type P = *const u8;
+    pub unsafe fn callee(p: P) {}
+}
+";
+    assert_eq!(
+        check(ROOT_MACRO, "host6::callee", 0),
+        not_raw,
+        "a macro invoked in an ancestor module (the root) can make a homonym item"
+    );
+    const ATTRIBUTE_MACRO_SIBLING: &str = "#[macros::make_host]
+struct Trigger;
+mod host7 {
+    pub type P = *const u8;
+    pub unsafe fn callee(p: P) {}
+}
+";
+    assert_eq!(
+        check(ATTRIBUTE_MACRO_SIBLING, "host7::callee", 0),
+        not_raw,
+        "an attribute macro on a sibling item can make a homonym item"
+    );
+    // A module under `cfg` or an attribute macro: its own functions are never eligible
+    // (and, as an item of the root, it leaves the root unknown).
+    for (source, owner, why) in [
+        (
+            "#[cfg(any())]\nmod v {\n    pub type V = *const u8;\n    pub unsafe fn in_a_disabled_module(v: V) {}\n}\n",
+            "v::in_a_disabled_module",
+            "a function in a cfg-disabled module",
+        ),
+        (
+            "#[wrap]\nmod y {\n    pub type Y = *const u8;\n    pub unsafe fn in_an_attribute_macro_module(y: Y) {}\n}\n",
+            "y::in_an_attribute_macro_module",
+            "a module under an attribute macro",
+        ),
+        (
+            "#[macros::make_host]\nunsafe extern \"C\" {}\nmod host8 {\n    pub type P = *const u8;\n    pub unsafe fn callee(p: P) {}\n}\n",
+            "host8::callee",
+            "an extern block under an attribute macro",
+        ),
+    ] {
+        assert_eq!(check(source, owner, 0), not_raw, "{why}");
+    }
+    const CRATE_ATTRIBUTE: &str = "#![dep::scalar]
+pub type P = *const u8;
+pub unsafe fn callee(p: P) {}
+";
+    assert_eq!(
+        check(CRATE_ATTRIBUTE, "callee", 0),
+        not_raw,
+        "a crate-level attribute that is not inert"
     );
 }

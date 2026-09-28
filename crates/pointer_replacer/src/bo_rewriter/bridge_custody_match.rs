@@ -10,7 +10,7 @@ use rustc_span::edition::Edition;
 use serde::{Deserialize, Serialize};
 
 use super::bridge_custody_syntax::{
-    ArgumentForm, Binding, ByteSpan, Call, GeneratedKind, Inventory,
+    ArgumentForm, Binding, ByteSpan, Call, GeneratedKind, Inventory, TypeBinding,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2798,6 +2798,7 @@ fn optional_reference_payload(text: &str) -> MatchResult<Option<(bool, String)>>
 /// A pending bridge hands its value to the callee's formal as a raw pointer, so
 /// that formal must be raw in the emitted tree.
 fn pending_target_raw(
+    scopes: &[&Inventory],
     target: &super::bridge_custody_syntax::Function,
     index: usize,
 ) -> MatchResult<()> {
@@ -2805,10 +2806,89 @@ fn pending_target_raw(
         .parameters
         .get(index)
         .ok_or("pending-target-absent")?;
-    if !matches!(pointer_type(&parameter.type_text)?, PointerType::Raw(_)) {
+    if !matches!(
+        formal_pointer_type(scopes, &target.owner, &parameter.type_text)?,
+        PointerType::Raw(_)
+    ) {
         return Err("pending-target-is-not-raw".into());
     }
     Ok(())
+}
+
+/// R605-2: a callee formal written as the bare name of a type alias its module
+/// binds -- by its own `type` item, or by an un-renamed crate-path import of one --
+/// is classified by the alias's type, one level: brotli's `literal_context_lut:
+/// ContextLut` (`= *const uint8_t`) is raw. Only that explicit binding, the same in
+/// every inventory (emitted and original), resolves, and only for the one function of
+/// that owner, declared directly in a module chain with no `cfg` (Codex's reviews: a
+/// crate-wide name
+/// map certified homonyms; an owner path can name a sibling module; a disabled alias
+/// is not a binding). Anything else -- a primitive, a glob, a generic, a renamed or
+/// external import, a nested function, a name the module does not bind -- is
+/// classified as written, so it fails closed as not raw.
+fn formal_pointer_type(scopes: &[&Inventory], owner: &str, text: &str) -> MatchResult<PointerType> {
+    let parsed = parsed_type(text)?;
+    if let ast::TyKind::Path(None, path) = &parsed.kind
+        && let [segment] = path.segments.as_slice()
+        && segment.args.is_none()
+    {
+        let name = segment.ident.name.as_str();
+        let module = owner.rsplit_once("::").map_or("", |(module, _)| module);
+        let mut resolved = scopes.iter().map(|scope| {
+            let declarations = scope
+                .functions
+                .iter()
+                .filter(|function| function.owner == owner)
+                .count();
+            if scope.crate_opaque
+                || scope.opaque_modules.contains("")
+                || module_prefixes(module).any(|prefix| {
+                    scope.item_paths.contains(prefix) || scope.opaque_modules.contains(prefix)
+                })
+                || scope.type_parameters.contains(name)
+                || declarations != 1
+                || !scope.module_functions.contains(owner)
+            {
+                None
+            } else {
+                bound_alias(scope, module, name, 4)
+            }
+        });
+        if let Some(Some(first)) = resolved.next()
+            && resolved.all(|text| text.as_ref() == Some(&first))
+        {
+            return pointer_type(&first);
+        }
+    }
+    pointer_type(text)
+}
+
+/// Every segment-aligned prefix of a module path (`a`, `a::b`, `a::b::c`): a
+/// non-module item at any of them, or a macro invoked in any of them or at the root,
+/// can hide a nested callee of the same owner string (Codex: `fn host` whose body
+/// macro makes `mod inner`, beside `mod host::inner`; a root macro making `fn host`).
+fn module_prefixes(module: &str) -> impl Iterator<Item = &str> {
+    module
+        .match_indices("::")
+        .map(|(at, _)| &module[..at])
+        .chain((!module.is_empty()).then_some(module))
+}
+
+/// The alias a module binds `name` to, following crate-path imports.
+fn bound_alias(scope: &Inventory, module: &str, name: &str, depth: usize) -> Option<String> {
+    if (!module.is_empty() && !scope.modules.contains(module))
+        || scope.opaque_modules.contains(module)
+    {
+        return None;
+    }
+    match scope.type_bindings.get(module)?.get(name)? {
+        TypeBinding::Alias(text) => Some(text.clone()),
+        TypeBinding::Import(path) if depth > 0 => {
+            let (item, module) = path.split_last()?;
+            bound_alias(scope, &module.join("::"), item, depth - 1)
+        }
+        _ => None,
+    }
 }
 
 /// R605-2: the pending-target check on one emitted source, for the witness.
@@ -2825,7 +2905,7 @@ pub(crate) fn pending_target_check_for_test(
         .find(|function| function.owner == owner)
         .ok_or("owner-absent")?;
     rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
-        pending_target_raw(target, index)
+        pending_target_raw(&[&inventory], target, index)
     })
 }
 
@@ -2837,7 +2917,7 @@ fn pending_selected_argument(
     index: usize,
 ) -> MatchResult<Vec<BindingWitness>> {
     let target = target_owner(input, expected)?;
-    pending_target_raw(target, index)?;
+    pending_target_raw(&[input.emitted, input.original], target, index)?;
     if expected.pending_source.as_ref().is_some_and(|source| {
         matches!(
             &source.shape,
