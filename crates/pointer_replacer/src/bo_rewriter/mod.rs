@@ -118,6 +118,8 @@ mod pair_raw_borrow_tests;
 #[cfg(test)]
 mod pair_read_read_tests;
 #[cfg(test)]
+mod pair_root_class_tests;
+#[cfg(test)]
 mod pair_shared_read_release_tests;
 #[cfg(test)]
 mod pair_spine_tests;

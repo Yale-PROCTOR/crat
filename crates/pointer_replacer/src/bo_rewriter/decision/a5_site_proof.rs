@@ -296,7 +296,9 @@ impl A5SeamProofIndex {
             Ok(kind) => A5PeerProof {
                 verdict: A5SiteProofVerdict::Clear,
                 reason: kind.key(),
-                family: super::pair_disjointness::CERTIFICATE_FAMILY,
+                // R619-4: the family names each side's root class.
+                family: certificates
+                    .certificate_family(caller, callee, left, right, left_span, right_span),
                 location: audited.location,
                 left_site: audited.left_site,
                 right_site: audited.right_site,

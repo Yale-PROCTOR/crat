@@ -147,6 +147,43 @@ impl CertificateKind {
 
 pub(crate) const CERTIFICATE_FAMILY: &str = "pair-disjointness-certificate";
 
+/// R619-4: the certificate family with the root class of each side, in
+/// argument-index order — `entry` (a pointer parameter of the calling function
+/// or a place inside its pointee), `internal` (storage the program made: a
+/// fresh block, a stack object, a static, an admitted field's block) or
+/// `other` (no known root). Every certificate receipt carries one, so a
+/// `type-rule` certificate reads as entry / entry (counted under W4, R462-1),
+/// entry / internal or internal / internal.
+const CERTIFICATE_FAMILY_BY_ROOTS: [[&str; 3]; 3] = [
+    [
+        "pair-disjointness-certificate:roots=entry/entry",
+        "pair-disjointness-certificate:roots=entry/internal",
+        "pair-disjointness-certificate:roots=entry/other",
+    ],
+    [
+        "pair-disjointness-certificate:roots=internal/entry",
+        "pair-disjointness-certificate:roots=internal/internal",
+        "pair-disjointness-certificate:roots=internal/other",
+    ],
+    [
+        "pair-disjointness-certificate:roots=other/entry",
+        "pair-disjointness-certificate:roots=other/internal",
+        "pair-disjointness-certificate:roots=other/other",
+    ],
+];
+
+/// R619-4: a side's row in [`CERTIFICATE_FAMILY_BY_ROOTS`].
+fn root_side(class: RootClass) -> usize {
+    match class {
+        RootClass::EntryStorage(_) => 0,
+        RootClass::FreshAlloc(..)
+        | RootClass::StackObject(_)
+        | RootClass::Static(_)
+        | RootClass::FreshField { .. } => 1,
+        RootClass::Unknown => 2,
+    }
+}
+
 /// R486-2 (USER Decision C, 2026-09-21). Named so every site that rests on the
 /// assumption can be counted and, if it is ever withdrawn, found.
 pub(crate) const EXPORTED_ENTRY_STATIC_WAIVER: &str = "exported-entry-static-waiver";
@@ -883,7 +920,9 @@ impl PairDisjointnessIndex {
         outcome
     }
 
-    fn certify_inner(
+    /// The recorded call `caller → callee` holding both argument spans, and its
+    /// two argument records.
+    fn site_args(
         &self,
         caller: u32,
         callee: u32,
@@ -891,7 +930,7 @@ impl PairDisjointnessIndex {
         right: usize,
         left_span: Span,
         right_span: Span,
-    ) -> Result<CertificateKind, Unproved> {
+    ) -> Option<(&SiteRecord, &ArgRecord, &ArgRecord)> {
         let left_span = left_span.source_callsite();
         let right_span = right_span.source_callsite();
         let site = self
@@ -902,16 +941,47 @@ impl PairDisjointnessIndex {
             .find(|site| {
                 site.call_span.source_callsite().contains(left_span)
                     && site.call_span.source_callsite().contains(right_span)
-            })
-            .ok_or(Unproved::SiteUnresolved)?;
+            })?;
         let arg = |index: usize, span: Span| {
             site.args
                 .iter()
                 .find(|arg| arg.index == index && arg.span.source_callsite() == span)
         };
-        let (Some(a), Some(b)) = (arg(left, left_span), arg(right, right_span)) else {
-            return Err(Unproved::SiteUnresolved);
+        Some((site, arg(left, left_span)?, arg(right, right_span)?))
+    }
+
+    /// R619-4: the family a certificate at this pair is receipted under — the
+    /// root class of each side, lower argument index first. The bare family
+    /// when the call is not resolved.
+    pub(crate) fn certificate_family(
+        &self,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) -> &'static str {
+        let Some((_, a, b)) = self.site_args(caller, callee, left, right, left_span, right_span)
+        else {
+            return CERTIFICATE_FAMILY;
         };
+        let (low, high) = if a.index <= b.index { (a, b) } else { (b, a) };
+        CERTIFICATE_FAMILY_BY_ROOTS[root_side(low.class)][root_side(high.class)]
+    }
+
+    fn certify_inner(
+        &self,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) -> Result<CertificateKind, Unproved> {
+        let (site, a, b) = self
+            .site_args(caller, callee, left, right, left_span, right_span)
+            .ok_or(Unproved::SiteUnresolved)?;
         if self.immutable_formals.contains(&(callee, left))
             && self.immutable_formals.contains(&(callee, right))
         {
@@ -1040,6 +1110,39 @@ impl PairDisjointnessIndex {
         };
         let (left_span, right_span) = (span(left)?, span(right)?);
         self.certify(caller, callee, left, right, left_span, right_span)
+    }
+
+    /// R619-4: [`Self::certificate_family`] at the FIRST recorded call, for the
+    /// witnesses.
+    #[cfg(test)]
+    pub(crate) fn certificate_family_recorded(
+        &self,
+        caller: LocalDefId,
+        callee: LocalDefId,
+        left: usize,
+        right: usize,
+    ) -> &'static str {
+        let caller = caller.local_def_index.as_u32();
+        let callee = callee.local_def_index.as_u32();
+        let Some(site) = self
+            .sites
+            .get(&(caller, callee))
+            .and_then(|sites| sites.first())
+        else {
+            return CERTIFICATE_FAMILY;
+        };
+        let span = |index: usize| {
+            site.args
+                .iter()
+                .find(|arg| arg.index == index)
+                .map(|arg| arg.span)
+        };
+        match (span(left), span(right)) {
+            (Some(left_span), Some(right_span)) => {
+                self.certificate_family(caller, callee, left, right, left_span, right_span)
+            }
+            _ => CERTIFICATE_FAMILY,
+        }
     }
 
     #[allow(
