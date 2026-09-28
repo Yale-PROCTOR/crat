@@ -2079,6 +2079,17 @@ pub(super) fn build<'a>(
     {
         return Err(CursorHold::ScheduleMissing);
     }
+    // **R608-1 — the same window, read by index rather than by a move.** A
+    // parameter that never moves and is read at a definitely-negative offset
+    // reaches below the pointer it was handed, which this window cannot hold
+    // (brotli's `symbol_lists`, read from `max_length = -1` down). `Neg` only:
+    // a `Top` index is the delivered parameter cursors' form and stays.
+    if parameter
+        && self_assignments(ctx, subject) == (0, 0)
+        && super::negative_index::reads_below_entry(ctx.tcx, subject.fn_did, subject.local)
+    {
+        return Err(CursorHold::NegativeIndexBelowEntry);
+    }
     let name = emission::binding_name(ctx.tcx, subject)?;
     let init = ctx
         .constructions

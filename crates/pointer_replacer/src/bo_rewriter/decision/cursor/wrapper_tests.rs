@@ -2210,3 +2210,80 @@ fn slicecursor_the_bridged_argument_is_a_raw_view_and_the_comparison_is_not() {
         "the comparison left the cursor's address view: {source}"
     );
 }
+
+/// **R608-1 — the guard's shape, from brotli's `BrotliBuildHuffmanTable`.**
+/// `symbol_lists` is handed over 16 elements into its array and never moves;
+/// the scan starts at `max_length = -1` and walks down. A parameter cursor's
+/// window starts at the pointer it was handed, so the first read would panic
+/// where the input is correct. The index is definitely negative (`-1`, then
+/// `-1 - 1`, ...), which is what the guard reads — not the fused taint bit.
+const R608_NEGATIVE_INDEX: &str = r#"
+unsafe extern "C" fn max_code_length(mut symbol_lists: *const u16) -> i32 {
+    let mut max_length = -(1 as i32);
+    while *symbol_lists.offset(max_length as isize) as i32 == 0xffff as i32 {
+        max_length -= 1;
+    }
+    max_length += 15 as i32 + 1 as i32;
+    max_length
+}
+pub unsafe extern "C" fn witness(lists: &[u16]) -> i32 {
+    max_code_length(lists.as_ptr().offset(16))
+}
+"#;
+
+#[test]
+fn slicecursor_a_never_moving_parameter_with_a_negative_index_is_not_a_cursor() {
+    let dispositions = cursor_dispositions(R608_NEGATIVE_INDEX);
+    assert!(
+        dispositions.contains(&(
+            "max_code_length::symbol_lists".to_owned(),
+            "Err(NegativeIndexBelowEntry)".to_owned()
+        )),
+        "the entry window cannot hold a definitely-negative index: {dispositions:?}"
+    );
+    assert!(
+        !cursor_decisions(R608_NEGATIVE_INDEX)
+            .contains(&("max_code_length::symbol_lists".to_owned(), true)),
+        "the parameter must keep its raw form"
+    );
+    // The input's own behaviour survives: 16 lists below the handed-over
+    // pointer, three of them unused, so the scan stops at -3 and returns 13.
+    let source = emitted(R608_NEGATIVE_INDEX);
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut lists = vec![0u16; 16 + 1024]; for i in 14..16 { lists[i] = 0xffff; } assert_eq!(unsafe { witness(&lists) }, 13); }",
+        ),
+    );
+}
+
+/// **R608-1's control — a `Top` fixed base keeps the delivered form.** brotli's
+/// `NextTableBitSize::count` is one of the five parameter cursors batch 48
+/// delivers: it never moves and its index `len` is a signed parameter, so the
+/// taint bit is set but nothing says the index is negative. The guard must not
+/// fire here.
+const R608_UNKNOWN_INDEX: &str = r#"
+unsafe extern "C" fn next_table_bit_size(count: *const u16, mut len: i32, root_bits: i32) -> i32 {
+    let mut left = (1 as i32) << len - root_bits;
+    while len < 15 as i32 {
+        left -= *count.offset(len as isize) as i32;
+        if left <= 0 as i32 { break; }
+        len += 1;
+        left <<= 1 as i32;
+    }
+    len - root_bits
+}
+pub unsafe extern "C" fn witness(count: &[u16], len: i32) -> i32 {
+    next_table_bit_size(count.as_ptr(), len, 8)
+}
+"#;
+
+#[test]
+fn slicecursor_a_never_moving_parameter_with_an_unknown_index_stays_a_cursor() {
+    assert!(
+        cursor_decisions(R608_UNKNOWN_INDEX)
+            .contains(&("next_table_bit_size::count".to_owned(), true)),
+        "a Top index is not a negative one: {:?}",
+        cursor_dispositions(R608_UNKNOWN_INDEX)
+    );
+}

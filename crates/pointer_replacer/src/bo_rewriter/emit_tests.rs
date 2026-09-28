@@ -3952,13 +3952,14 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
         );
         assert_ne!(got, "<emitted>", "{label} must not emit");
     }
-    // R394-2 moves the signed-access neighbour into the wrapper family.
-    assert_r394_cursor(
-        "pub unsafe fn f(mut p: *mut i32, n: usize) -> *mut i32 { let _v = *p.offset(-1 as isize); core::ptr::null_mut() }",
-        "f",
-        "p",
-        true,
-        false,
+    // R394-2 moved the signed-access neighbour into the wrapper family; R608-1
+    // takes the DEFINITELY-negative half back out. `p` never moves and is read
+    // at `-1`, below the pointer its caller hands over, which a parameter
+    // cursor's window cannot hold, so the sign refusal stands.
+    assert_eq!(
+        reason_for("    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()"),
+        "slice-neg-or-unknown-offset",
+        "a never-moving parameter read below its entry is not a cursor (R608-1)"
     );
 }
 
@@ -3991,28 +3992,25 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
         reason_of(&got, "p", true)
     }
 
-    // R394-2: both Top and Neg now select the bounds-checked wrapper.
-    // The function keeps its historical name to preserve suite identity.
-    for (label, body) in [
-        (
-            "unbounded offset",
-            "    let _v = *p.offset(k);\n    core::ptr::null_mut()",
-        ),
-        (
-            "negative literal offset",
-            "    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()",
-        ),
-    ] {
-        let source = format!(
-            "pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{ {body} }}"
-        );
-        assert_r394_cursor(&source, "f", "p", true, false);
-        assert_eq!(
-            reason_for(body),
-            "<emitted>",
-            "{label}: R394 wrapper delivery"
-        );
-    }
+    // R394-2: a Top offset selects the bounds-checked wrapper. R608-1: a
+    // DEFINITELY-negative one on a parameter that never moves does not — the
+    // wrapper's window starts at the pointer the caller hands over, so the
+    // read below it would panic where the input was correct. The function
+    // keeps its historical name to preserve suite identity.
+    let body = "    let _v = *p.offset(k);\n    core::ptr::null_mut()";
+    let source =
+        format!("pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{ {body} }}");
+    assert_r394_cursor(&source, "f", "p", true, false);
+    assert_eq!(
+        reason_for(body),
+        "<emitted>",
+        "unbounded offset: R394 wrapper delivery"
+    );
+    assert_eq!(
+        reason_for("    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()"),
+        "slice-neg-or-unknown-offset",
+        "negative literal offset: refused below the entry (R608-1)"
+    );
 
     // POSITIVE HALF — the gate must NOT swallow the `-2` arm it is protecting.
     // `i` is `usize`, so every offset is provably non-negative and the slice

@@ -1408,7 +1408,11 @@ fn wave6s_option_slice_destination_refuses_a_backward_view() {
  }
 "#,
     );
-    assert!(source.contains("SliceCursor::new"), "{source}");
+    // R608-1 (slicecursor 077): `src` never moves and is read at `-2`, below
+    // the pointer its caller hands over, so it is no longer a parameter
+    // cursor (that window would panic on the first read). It keeps its raw
+    // form; the view below is still never a backward `Some(&src[..])`.
+    assert!(source.contains("mut src: *mut f32"), "{source}");
     let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(!flat.contains("Some(&(src)["), "{source}");
     assert!(!flat.contains("Some(&mut(src)["), "{source}");

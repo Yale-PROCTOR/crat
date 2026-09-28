@@ -18,6 +18,8 @@ mod delivered;
 mod emission;
 #[path = "cursor/foreign.rs"]
 pub(crate) mod foreign;
+#[path = "cursor/negative_index.rs"]
+mod negative_index;
 #[path = "cursor/wrapper.rs"]
 pub(crate) mod wrapper;
 #[path = "cursor/wrapper_ast.rs"]
@@ -112,6 +114,9 @@ pub(crate) enum CursorHold {
     RefMissing,
     ComponentAliasUnbuilt,
     BorrowedElementUnbuilt,
+    /// R608-1: a parameter that never moves and is read at a definitely
+    /// negative offset; its window would start at the pointer.
+    NegativeIndexBelowEntry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
