@@ -1188,8 +1188,17 @@ fn anchors(
         let mut pending = vec![owner];
         let mut seen = BTreeSet::new();
         let before = (requested.len(), restore.len());
+        // **R615-2 — roots first, v2.** Whether the walk reached a class the
+        // round is already retiring: a collision a root request covers, or a
+        // class requested on its own reason. The loss is then that root's, and
+        // the owner is not made a restore anchor this round (below).
+        let mut reached_root = false;
         while let Some(current) = pending.pop() {
-            if !seen.insert(current) || requested.contains_key(&current) {
+            if !seen.insert(current) {
+                continue;
+            }
+            if requested.contains_key(&current) {
+                reached_root |= current != owner && !waiting.contains(&current);
                 continue;
             }
             let Some(class) = candidate.plan.class_finalization.classes.get(&current) else {
@@ -1266,6 +1275,21 @@ fn anchors(
                         || (c.right_class == current && requested.contains_key(&c.left_class))
                 });
             if collision_covered {
+                reached_root |= candidate
+                    .plan
+                    .class_finalization
+                    .collisions
+                    .iter()
+                    .any(|c| {
+                        let partner = if c.left_class == current {
+                            Some(c.right_class)
+                        } else if c.right_class == current {
+                            Some(c.left_class)
+                        } else {
+                            None
+                        };
+                        partner.is_some_and(|p| requested.contains_key(&p) && !waiting.contains(&p))
+                    });
                 continue;
             }
             // Relay 045 §2 (wave-6o 018 STOP 1): the supersession is evaluated
@@ -1294,7 +1318,14 @@ fn anchors(
         // walk each other's held dependency and request nothing; the lost root
         // is then a restore anchor, not an `unrestored` failure.
         if (requested.len(), restore.len()) == before {
-            restore.insert(owner);
+            // R615-2: a loss the walk explains by a root this round retires
+            // waits; its restore, if still owed, is derived after the root.
+            // Otherwise the owner is a restore anchor (brotli's 2337 restored
+            // its nearest changed neighbours, the Stitch*, which 2440's
+            // collision with 1293 never involved).
+            if !reached_root {
+                restore.insert(owner);
+            }
         }
     }
     if root_seen {

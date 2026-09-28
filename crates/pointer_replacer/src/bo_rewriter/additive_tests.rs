@@ -943,3 +943,108 @@ fn r606_3_a_round_with_only_dependency_only_requests_issues_them() {
         );
     });
 }
+
+/// **R615-2 — roots first, v2: a restore root waits for the root its walk
+/// reaches.** `earlier_callee` already depended on `reference` at the prior
+/// stage. Now `slice` adds a site over `reference`'s own interval: a collision
+/// whose newer side (`slice`) is the round's root, and which holds `reference`
+/// too. `earlier_callee` is then held only through `reference`, loses its prior
+/// delivery, and its walk ends at `reference`, whose collision the root already
+/// covers. The walk explains the loss by a root this round retires, so
+/// `earlier_callee` is not made a restore anchor this round (brotli's 2337, held
+/// through 2440's collision with 1293, whose nearest-first restore withdrew the
+/// Stitch* the collision never involved). `caller`, a changed neighbour, is what
+/// that restore would reach.
+#[test]
+fn r615_2_a_restore_root_waits_for_the_root_its_walk_reaches() {
+    with_baseline(|baseline| {
+        let collided = owner(&baseline, "reference_value");
+        let newer = owner(&baseline, "slice_values");
+        let held = owner(&baseline, "callee_value");
+        let neighbour = owner(&baseline, "caller_value");
+        let mut inputs = class_inputs(&baseline);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == held)
+            .unwrap()
+            .depends_on
+            .push(collided);
+        let prior = candidate(&baseline, inputs);
+        assert!(prior.plan.class_finalization.classes[&held].is_ready());
+        let old_site = prior.plan.class_finalization.classes[&collided]
+            .sites
+            .iter()
+            .find(|site| site.edit_key != "-" && site.key.file != "-" && site.key.lo < site.key.hi)
+            .expect("prior applied text site")
+            .clone();
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == newer)
+            .unwrap()
+            .sites
+            .push(ClassSite::edit(
+                newer,
+                collided,
+                Arm::Surface,
+                &old_site.key.file,
+                old_site.key.lo,
+                old_site.key.hi,
+                "subject-use",
+            ));
+        // The neighbour changes a site of its own (no decision moves), so a
+        // restore from `held` would reach it.
+        let far = old_site.key.hi.saturating_add(10_000);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == neighbour)
+            .unwrap()
+            .sites
+            .push(ClassSite::edit(
+                neighbour,
+                neighbour,
+                Arm::Surface,
+                &old_site.key.file,
+                far,
+                far.saturating_add(1),
+                "subject-use",
+            ));
+        let candidate = candidate(&prior, inputs);
+        let classes = &candidate.plan.class_finalization.classes;
+        assert!(
+            classes[&held]
+                .hold_reasons()
+                .iter()
+                .all(|r| r.starts_with("dependency-class-held:")),
+            "held only through the collided class: {:?}",
+            classes[&held].hold_reasons()
+        );
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        let causes = rows
+            .iter()
+            .map(|w| format!("{} {} {}", w.owner.order_key(), w.cause, w.unresolved))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|w| !w.unresolved && w.owner == newer),
+            "the collision's newer side is the round's root: {causes:#?}"
+        );
+        let from_held = |cause: &str| {
+            cause.contains(&format!(
+                "restore-family-interface-path:[{}",
+                held.order_key()
+            )) || cause.contains(&format!(
+                "restore-family-unconnected-root:{}",
+                held.order_key()
+            ))
+        };
+        assert!(
+            !rows.iter().any(|w| from_held(&w.cause)),
+            "the dependency-held owner waits for the root instead of restoring: {causes:#?}"
+        );
+    });
+}
