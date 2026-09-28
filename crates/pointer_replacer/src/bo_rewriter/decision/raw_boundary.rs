@@ -3137,15 +3137,88 @@ fn collect_retention_facts<'tcx>(
         }
     }
 
-    let mut reachable = BTreeSet::from([root.as_u32()]);
-    loop {
-        let before = reachable.len();
-        for (source, destination, _) in &aliases {
-            if reachable.contains(&source.as_u32()) {
-                reachable.insert(destination.as_u32());
+    // **Fan-out 008 finding 11 (relay 096): copies OUT of a same-body
+    // container.** A store `container.f = source` into a stack local of this
+    // frame is the same-body frame-bounded arm's store. A later
+    // `copy = container.f` takes the stored pointer back out by a projection
+    // with no dereference, which the confinement does not see, so the copy
+    // could return, be stored or reach a retaining callee with the store still
+    // discharged. As in the callee-local arm (`container_pointer_field_reads`),
+    // every pointer-carrying read of such a container is an alias of what was
+    // stored into it, and the walk continues from the copy. A container whose
+    // carried fields are used in any other way refuses the same-body discharge.
+    let mut stored = Vec::new();
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else { continue };
+            if lhs.projection.is_empty()
+                || lhs.local == RETURN_PLACE
+                || lhs.local.as_usize() <= body.arg_count
+                || lhs
+                    .projection
+                    .iter()
+                    .any(|p| matches!(p, ProjectionElem::Deref))
+            {
+                continue;
+            }
+            if let Some(source) = transparent_operand(rhs).and_then(plain_operand_local) {
+                stored.push((source, lhs.local));
             }
         }
-        if reachable.len() == before {
+    }
+    let mut unconfined_containers = FxHashSet::default();
+    let mut read_containers = FxHashSet::default();
+    // Each copy's definition sites: a local whose EVERY definition is such a
+    // read holds one of the stored pointers the walk already follows, so it is
+    // not the multi-def imprecision below (heman `kmRay2IntersectBox`: the
+    // `if`-arm pair `next_point = points[0] / points[i + 1]`).
+    let mut container_copy_defs = FxHashMap::<Local, FxHashSet<Location>>::default();
+    let mut reachable = BTreeSet::from([root.as_u32()]);
+    loop {
+        loop {
+            let before = reachable.len();
+            for (source, destination, _) in &aliases {
+                if reachable.contains(&source.as_u32()) {
+                    reachable.insert(destination.as_u32());
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+        }
+        let edges = aliases.len();
+        for &(source, container) in &stored {
+            if !reachable.contains(&source.as_u32()) || !read_containers.insert(container) {
+                continue;
+            }
+            let Some(reads) = container_pointer_field_reads(tcx, body, container) else {
+                unconfined_containers.insert(container);
+                continue;
+            };
+            for (destination, at) in reads {
+                container_copy_defs
+                    .entry(destination)
+                    .or_insert_with(FxHashSet::default)
+                    .insert(at);
+                for &(from, _) in stored.iter().filter(|(_, c)| *c == container) {
+                    aliases.push((
+                        from,
+                        destination,
+                        retention_step(
+                            at,
+                            RetentionEventKind::Transparent,
+                            format!(
+                                "same-body-field-read _{}.._{}->_{}",
+                                from.as_u32(),
+                                container.as_u32(),
+                                destination.as_u32()
+                            ),
+                        ),
+                    ));
+                }
+            }
+        }
+        if aliases.len() == edges {
             break;
         }
     }
@@ -3246,7 +3319,13 @@ fn collect_retention_facts<'tcx>(
     }
 
     for local in body.local_decls.indices() {
-        if local != root && is_reachable(local) && definitions[local.index()] > 1 {
+        if local != root
+            && is_reachable(local)
+            && definitions[local.index()] > 1
+            && container_copy_defs
+                .get(&local)
+                .is_none_or(|defs| defs.len() < definitions[local.index()])
+        {
             facts
                 .unknowns
                 .entry(RetentionUnknownReason::MultiDef)
@@ -3398,6 +3477,7 @@ fn collect_retention_facts<'tcx>(
                         .projection
                         .iter()
                         .any(|p| matches!(p, ProjectionElem::Deref))
+                    && !unconfined_containers.contains(&storage_root)
                     && let Some(callees) = container_frame_confinement(body, storage_root)
                     // **R477-4a (main 060d).** Condition (1) is asked of the
                     // provenance chain's ROOT, not only of the stored operand:

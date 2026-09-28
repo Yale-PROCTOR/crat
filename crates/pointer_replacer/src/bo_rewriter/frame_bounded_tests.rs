@@ -445,3 +445,77 @@ fn wave6o_a_hand_off_to_a_multi_def_reader_that_stores_keeps_the_hold() {
     assert!(input.contains("KEPT = p;"), "fixture edit applied");
     assert_ne!(retention_row(&input, "parse", 0).0, "no-retain");
 }
+
+/// **Finding 11 of fan-out 008 (relay 096) — a copy OUT of the container.**
+/// The confinement follows the container and its addresses. `let kept =
+/// state.src;` reads the stored pointer out by a field projection with no
+/// dereference, and the copy then leaves the frame through a callee that
+/// keeps it. The hold must stand.
+#[test]
+fn wave6o_a_copy_out_of_the_container_to_a_retaining_callee_keeps_the_hold() {
+    let input = READER
+        .replace(
+            "pub unsafe fn parse",
+            "static mut KEPT: *const u8 = 0 as *const u8;\nunsafe fn stash(mut p: *const u8) { KEPT = p; }\npub unsafe fn parse",
+        )
+        .replace(
+            "    return read_one(&mut state);",
+            "    let mut r = read_one(&mut state);\n    let mut kept = state.src;\n    stash(kept);\n    return r;",
+        );
+    assert!(input.contains("stash(kept);"), "fixture edit applied");
+    assert_ne!(retention_row(&input, "parse", 0).0, "no-retain");
+}
+
+/// The same copy returned.
+#[test]
+fn wave6o_a_copy_out_of_the_container_returned_keeps_the_hold() {
+    let input = READER
+        .replace(
+            "-> i32 {\n    let mut state",
+            "-> *const u8 {\n    let mut state",
+        )
+        .replace(
+            "    if src.is_null() { return 0; }",
+            "    if src.is_null() { return 0 as *const u8; }",
+        )
+        .replace(
+            "    return read_one(&mut state);",
+            "    read_one(&mut state);\n    let mut kept = state.src;\n    return kept;",
+        );
+    assert!(input.contains("return kept;"), "fixture edit applied");
+    assert_ne!(retention_row(&input, "parse", 0).0, "no-retain");
+}
+
+/// Control: a copy used only by dereference in the frame stays confined, and
+/// the discharge stands.
+#[test]
+fn wave6o_a_copy_out_of_the_container_read_in_the_frame_discharges() {
+    let input = READER.replace(
+        "    return read_one(&mut state);",
+        "    let mut r = read_one(&mut state);\n    let mut kept = state.src;\n    return r + *kept as i32;",
+    );
+    assert!(input.contains("*kept as i32"), "fixture edit applied");
+    let (verdict, reason) = retention_row(&input, "parse", 0);
+    assert_eq!(verdict, "no-retain", "reason={reason}");
+}
+
+/// The corpus shape, heman `kmRay2IntersectBox` (the substrate's text): four
+/// parameters stored into a local array, read back as `points[i]` and as the
+/// `if`-arm pair `points[0]` / `points[i + 1]` (two definitions of one
+/// local), handed to a local callee that does not retain and dereferenced by
+/// value. The copies are followed, and each definition of the two-definition
+/// locals is a read of the container, so all four stores stay discharged.
+#[test]
+fn wave6o_heman_copies_out_of_the_point_array_are_followed_and_discharge() {
+    let input = include_str!("wave6f_fixture_heman_ray2.rs");
+    for argument in 1..=4 {
+        let (verdict, reason) = retention_row(input, "kmRay2IntersectBox", argument);
+        assert_eq!(verdict, "no-retain", "arg{argument}: {reason}");
+        assert!(
+            reason.starts_with(&format!(
+                "retention-discharged:frame-bounded(subject=arg{argument}, container=_15"
+            )),
+            "arg{argument}: {reason}"
+        );
+    }
+}
