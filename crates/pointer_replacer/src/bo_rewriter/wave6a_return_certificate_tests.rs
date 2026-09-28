@@ -3520,6 +3520,8 @@ fn lil_new_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::
             ("repl::lil".to_owned(), SlotKind::Owning),
             ("nonint::lil".to_owned(), SlotKind::Owning),
             ("fnc_jaileval::sublil".to_owned(), SlotKind::Owning),
+            ("release::l".to_owned(), SlotKind::Owning),
+            ("drop_one::lil".to_owned(), SlotKind::Owning),
         ],
     );
     let out = emitted(name, source);
@@ -3690,4 +3692,63 @@ fn w6a_r623_lil_new_controls_hold() {
             "{name}\n{context}"
         );
     }
+}
+
+/// A formal that hands its owner on to `lil_free` (R450-8 rung 2's move on),
+/// and a caller that hands it a fresh `lil_new` — `lil_new`'s ONLY receiver, so
+/// its certificate stands on the chain through `release` alone.
+const RELEASE: &str = r#"
+unsafe extern "C" fn release(mut l: *mut _lil_t) {
+    lil_free(l);
+}
+unsafe extern "C" fn drop_one() -> i32 {
+    let mut lil = lil_new();
+    let mut e = (*lil).error;
+    release(lil);
+    return e;
+}
+"#;
+
+/// **R636-4, from the review of `ef7aa6579`: a hand-on stands with the
+/// formal it hands into.** `release(l)`'s only sink is the move on into
+/// `lil_free`, so it is planned as a `Box` formal on the consumer set's word.
+/// Where `lil_free` then holds (its alias spelling), `release`'s `Box` would
+/// meet a raw formal, bridged as a lend and freed twice; so the hand-on
+/// withdraws with its transferee (`box-param-hand-on-unplanned`). Where
+/// `lil_free` is planned, `release` delivers.
+#[test]
+fn w6a_r623_a_formal_handed_on_stands_with_the_formal_it_hands_into() {
+    let base = &LIL_NEW[..LIL_NEW.find("unsafe extern \"C\" fn repl()").expect("repl")];
+    let out = lil_new_emitted("r623-hand-on-held", &format!("{base}{RELEASE}"));
+    let (receipts, context) = lil_new_context(&out);
+    let text = compact(&out.source);
+    assert!(
+        receipts.contains("lil_free::lil\theld\tbox-param-alias-formal:lil_free"),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("release::l\theld\tbox-param-hand-on-unplanned:release"),
+        "{context}"
+    );
+    assert!(!text.contains("fnrelease(mutl:Box<"), "{context}");
+    assert!(!text.contains(".as_mut())"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+
+    let raw = lil_new_raw_consumer();
+    let raw_base = &raw[..raw.find("unsafe extern \"C\" fn repl()").expect("repl")];
+    let out = lil_new_emitted("r623-hand-on-planned", &format!("{raw_base}{RELEASE}"));
+    let (_, context) = lil_new_context(&out);
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnrelease(mutl:Box<_lil_t>){lil_free(l);}"),
+        "{context}"
+    );
+    for subject in ["release::l", "drop_one::lil", "lil_free::lil"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{context}"
+        );
+    }
+    assert_eq!(out.reverted, 0, "{context}");
 }

@@ -98,9 +98,11 @@ pub(crate) struct Chains {
         FxHashMap<(LocalDefId, HirId), (String, String, Vec<(LocalDefId, usize)>)>,
     /// The member plans a chain inserted, withdrawn with it.
     pub(crate) chain_members: FxHashMap<(LocalDefId, HirId), Vec<(LocalDefId, HirId)>>,
-    /// **R620-3** — an exported store consumer's formal handed on to the
-    /// storing formal: it stands only while that formal is planned.
-    pub(crate) store_hand_ons: FxHashMap<(LocalDefId, HirId), (LocalDefId, HirId)>,
+    /// **R620-3 / R636-4** — a formal handed on (its sink the MOVE ON, R450-8
+    /// rung 2; R620-3's store consumer among them) → the formal it hands into:
+    /// it stands only while that formal is planned. A `Box` handed into a
+    /// formal left raw would be bridged as a lend and freed twice.
+    pub(crate) hand_ons: FxHashMap<(LocalDefId, HirId), (LocalDefId, HirId)>,
     /// **R620-3** — the store consumers' formals: their block is the outside
     /// caller's C string, so libc may free it.
     pub(crate) external_blocks: FxHashSet<(LocalDefId, HirId)>,
@@ -158,7 +160,7 @@ fn confirm_hand_ons(chains: &mut Chains) -> bool {
                 withdrawn.push((*formal, "box-param-chain-member-withdrawn"));
             }
         }
-        for (formal, transferee) in &chains.store_hand_ons {
+        for (formal, transferee) in &chains.hand_ons {
             if chains.plans.contains_key(formal) && !chains.plans.contains_key(transferee) {
                 withdrawn.push((*formal, "box-param-hand-on-unplanned"));
             }
@@ -2154,6 +2156,23 @@ pub(crate) fn derive<'tcx>(
                 .any(|s| s.freed_fields.contains(&field))
                 .then_some((subject.fn_did, subject.hir_id))
         });
+        // R636-4: the formal the move on hands the owner into, for every
+        // handed-on formal (the store consumer's `transferee` is one of them).
+        let hand_on_target = moved_on.and_then(|_| {
+            let (callee, index) = scan.calls.iter().find_map(|(callee, _, args)| {
+                let index = args
+                    .iter()
+                    .position(|a| a.map(|(hir, _)| hir) == Some(param.hir_id))?;
+                Some((*callee, index))
+            })?;
+            subjects
+                .iter()
+                .find(|s| {
+                    Some(s.fn_did) == callee.as_local()
+                        && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                })
+                .map(|s| (s.fn_did, s.hir_id))
+        });
         let store_consumer = consumer_waiver
             && frees.is_empty()
             && (c_freed_store.is_some() || transferee.is_some())
@@ -2578,8 +2597,8 @@ pub(crate) fn derive<'tcx>(
         );
         if store_consumer {
             out.external_blocks.insert(formal);
-            out.store_hand_ons.extend(transferee.map(|t| (formal, t)));
         }
+        out.hand_ons.extend(hand_on_target.map(|t| (formal, t)));
     }
     confirm_hand_ons(&mut out);
     out
