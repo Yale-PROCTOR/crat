@@ -938,10 +938,11 @@ impl PairDisjointnessIndex {
     /// R628-7 (f′): at every in-crate call of `function`, is field `key` of the
     /// object handed to formal `q` stored since the caller's entry, with the
     /// object handed to formal `p` existing at that entry — or, when both are
-    /// the caller's own formals passed through, the same one level up? An
-    /// EXPORTED function is refused: the embedder's calls are unseen, and
-    /// R462-1 speaks of two of an entry's parameters, not of one beside a
-    /// block held in another's field (report 054).
+    /// the caller's own formals passed through, the same one level up? At an
+    /// EXPORTED function the embedder's calls are unseen: R462-1's contract is
+    /// the entry's, and it covers that external edge whatever the other side's
+    /// root (R631-11), so the chain rests on the waiver there — its in-crate
+    /// callers must still hold, as in (e).
     fn stored_before_call(
         &self,
         function: u32,
@@ -950,11 +951,17 @@ impl PairDisjointnessIndex {
         p: usize,
         depth: usize,
         seen: &mut Vec<(u32, usize, usize)>,
-    ) -> bool {
-        if depth > 8 || seen.contains(&(function, q, p)) || self.exported.contains(&function) {
-            return false;
+    ) -> Option<PairSeparation> {
+        if depth > 8 || seen.contains(&(function, q, p)) {
+            return None;
         }
         seen.push((function, q, p));
+        let exported = self.exported.contains(&function);
+        let mut separation = if exported {
+            PairSeparation::Waived
+        } else {
+            PairSeparation::Proven
+        };
         let mut callers = 0usize;
         let mut every = true;
         'sites: for ((caller, target), records) in &self.sites {
@@ -989,16 +996,20 @@ impl PairDisjointnessIndex {
                     every = false;
                     break 'sites;
                 };
-                if up_q == up_p
-                    || !self.stored_before_call(*caller, up_q, key, up_p, depth + 1, seen)
+                match (up_q != up_p)
+                    .then(|| self.stored_before_call(*caller, up_q, key, up_p, depth + 1, seen))
+                    .flatten()
                 {
-                    every = false;
-                    break 'sites;
+                    Some(up) => separation = separation.join(up),
+                    None => {
+                        every = false;
+                        break 'sites;
+                    }
                 }
             }
         }
         seen.pop();
-        every && callers > 0
+        (every && (callers > 0 || exported)).then_some(separation)
     }
 
     /// Certify the argument pair `(left, right)` of the call `caller → callee`
@@ -1192,9 +1203,15 @@ impl PairDisjointnessIndex {
             if let Some((q, key)) = field.field_of_formal
                 && let Some(p) = self.formal_of(caller, other.class)
                 && q != p
-                && self.stored_before_call(caller, q, key, p, 0, &mut Vec::new())
             {
-                return Ok(CertificateKind::AllocationIdentity);
+                match self.stored_before_call(caller, q, key, p, 0, &mut Vec::new()) {
+                    Some(PairSeparation::Proven) => return Ok(CertificateKind::AllocationIdentity),
+                    // R631-11: the chain reached an exported entry, W4's edge.
+                    Some(PairSeparation::Waived) => {
+                        return Ok(CertificateKind::ExportedEntryWaiver);
+                    }
+                    None => {}
+                }
             }
         }
         // (e) R462-1, last: the callee's two parameters may be separable even

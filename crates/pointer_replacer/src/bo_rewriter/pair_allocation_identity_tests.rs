@@ -226,7 +226,9 @@ pub unsafe fn Write(mut x: *mut u32, mut c: i32) {
 }
 "#;
 
-/// C11: `Store` is `#[no_mangle]`: an embedder's call is unseen.
+/// W8 (R631-11, was C11): `Store` is `#[no_mangle]`. An embedder's call is
+/// unseen, and R462-1's exported-entry contract covers that external edge
+/// whatever the other side's root; the in-crate caller `Write` still stores.
 const EXPORTED: &str = r#"
 pub unsafe fn Fill(mut mb: *mut Split) {
     (*mb).map = malloc(16) as *mut u32;
@@ -239,6 +241,22 @@ pub unsafe fn Write(mut x: *mut u32) {
     let mut s = Split { map: 0 as *mut u32, view: 0 as *mut u32, n: 0 };
     Fill(&mut s);
     Store(x, &mut s);
+}
+"#;
+
+/// C17: `Store` is `#[no_mangle]`, but its in-crate caller hands `mb` on
+/// without storing the field: the waiver covers the embedder's calls, not this
+/// one.
+const EXPORTED_BUT_AN_IN_CRATE_CALLER_DOES_NOT_STORE: &str = r#"
+pub unsafe fn Fill(mut mb: *mut Split) {
+    (*mb).map = malloc(16) as *mut u32;
+}
+#[no_mangle]
+pub unsafe extern "C" fn Store(mut x: *mut u32, mut mb: *mut Split) {
+    Use2(x, (*mb).map);
+}
+pub unsafe fn Write(mut x: *mut u32, mut mb: *mut Split) {
+    Store(x, mb);
 }
 "#;
 
@@ -427,12 +445,17 @@ fn w6p_r628_fp_a_null_store_and_a_store_both_arms_make_count() {
 }
 
 #[test]
-fn w6p_r628_fp_an_exported_callee_is_refused() {
-    let verdict = verdict(&source(EXPORTED), "Store", "Use2", 0, 1);
-    assert!(
-        verdict.is_err(),
-        "an embedder's call to `Store` is unseen: got {verdict:?}"
+fn w6p_r631_fp_an_exported_callee_rests_on_the_exported_entry_waiver() {
+    assert_eq!(
+        verdict(&source(EXPORTED), "Store", "Use2", 0, 1),
+        Ok(CertificateKind::ExportedEntryWaiver),
+        "the embedder's calls are W4's; `Write`, the in-crate caller, stores first"
     );
+}
+
+#[test]
+fn w6p_r631_fp_an_exported_callees_in_crate_caller_must_still_store() {
+    refused(EXPORTED_BUT_AN_IN_CRATE_CALLER_DOES_NOT_STORE, "Store");
 }
 
 #[test]
