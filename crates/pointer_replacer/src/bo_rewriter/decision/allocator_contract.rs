@@ -410,6 +410,49 @@ fn contract_of(
     })
 }
 
+/// **R641-11 (a) — a null guard kept on the raw result.** libc's allocators
+/// return null on failure, where C's guard (`if x.is_null() { return 0; }`)
+/// takes a defined path; a `Box` built first would already be UB there. So
+/// the guard's test moves onto the allocator's result, before the `Box`
+/// exists — which is the same place only when the guard is the statement
+/// right after the one that allocates, in the same block. The guard's
+/// then-block text, or `None`.
+pub(crate) fn adjacent_null_guard(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    creation: Span,
+    guard: Span,
+) -> Option<String> {
+    struct Find {
+        creation: Span,
+        guard: Span,
+        then: Option<Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find {
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            for pair in block.stmts.windows(2) {
+                if pair[0].span.contains(self.creation)
+                    && let rustc_hir::StmtKind::Expr(e) | rustc_hir::StmtKind::Semi(e) =
+                        pair[1].kind
+                    && e.span == self.guard
+                    && let ExprKind::If(_, then, None) = e.kind
+                {
+                    self.then = Some(then.span);
+                }
+            }
+            intravisit::walk_block(self, block);
+        }
+    }
+    let mut find = Find {
+        creation,
+        guard,
+        then: None,
+    };
+    find.visit_body(tcx.hir_body_owned_by(function));
+    find.then
+        .and_then(|then| tcx.sess.source_map().span_to_snippet(then).ok())
+}
+
 /// The count of a contract allocation from its size argument: `n *
 /// size_of::<T>()` (either order, through casts) → `Slice` with count `n`;
 /// `size_of::<T>()` alone → `Sized`.
@@ -1135,6 +1178,33 @@ pub(crate) fn derive<'tcx>(
                 continue;
             }
 
+            // **R641-11 (a)**: under libc a non-optional owner's dead null
+            // guard is not dead — `malloc` returns null on failure — so each
+            // one is kept on the raw result, before the `Box` exists; one that
+            // is not right after its allocation cannot be moved there.
+            let mut kept_guards: Vec<(Span, String, Span)> = Vec::new();
+            if contract.id.starts_with("allocator-contract:libc") && !optional {
+                let mut apart = None;
+                for guard in &uses.dead_guards {
+                    match creations.iter().find_map(|(creation, _, _)| {
+                        adjacent_null_guard(tcx, function, *creation, *guard)
+                            .map(|then| (*creation, then))
+                    }) {
+                        Some((creation, then)) => kept_guards.push((creation, then, *guard)),
+                        None => {
+                            apart = Some(*guard);
+                            break;
+                        }
+                    }
+                }
+                if let Some(guard) = apart {
+                    hold(
+                        &mut out,
+                        format!("{USE}:null-guard-not-adjacent:{}", snippet(guard)),
+                    );
+                    continue;
+                }
+            }
             for edit in &uses.edits {
                 if !events
                     .iter()
@@ -1299,23 +1369,42 @@ pub(crate) fn derive<'tcx>(
                 // claim 4). Two zero-width insertions at the boundaries contain
                 // nothing: the bridge renders where it was planned, inside text
                 // this rule never claims.
-                let (open, close) = match (&a.shape, &a.count, a.nul_terminated) {
-                    (BoxShape::Sized, _, _) => ("Box::from_raw(".to_owned(), ")".to_owned()),
+                let kept = kept_guards
+                    .iter()
+                    .find(|(creation, _, _)| creation == span)
+                    .map(|(_, then, _)| then.as_str());
+                let (open, close) = match (&a.shape, &a.count, a.nul_terminated, kept) {
+                    (BoxShape::Sized, _, _, Some(then)) => (
+                        "{ let __crat_raw = ".to_owned(),
+                        format!("; if __crat_raw.is_null() {then} Box::from_raw(__crat_raw) }}"),
+                    ),
+                    (BoxShape::Sized, _, _, None) => ("Box::from_raw(".to_owned(), ")".to_owned()),
                     // The contract's postcondition: bind the block the
                     // allocator returned and measure IT. The count never
                     // mentions the allocator's arguments, so no other family's
                     // rendering of them can make it stale.
-                    (BoxShape::Slice, _, true) => (
+                    (BoxShape::Slice, _, true, kept) => (
                         "{ let __crat_alloc = ".to_owned(),
-                        "; Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc, \
-                         core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1))) }"
-                            .to_owned(),
+                        format!(
+                            "; {}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc, \
+                             core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1))) }}",
+                            kept.map_or_else(String::new, |then| format!(
+                                "if __crat_alloc.is_null() {then} "
+                            ))
+                        ),
                     ),
-                    (BoxShape::Slice, Some(count), false) => (
+                    (BoxShape::Slice, Some(count), false, Some(then)) => (
+                        "{ let __crat_raw = ".to_owned(),
+                        format!(
+                            "; if __crat_raw.is_null() {then} \
+                             Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw, ({count}) as usize)) }}"
+                        ),
+                    ),
+                    (BoxShape::Slice, Some(count), false, None) => (
                         "Box::from_raw(core::ptr::slice_from_raw_parts_mut(".to_owned(),
                         format!(", ({count}) as usize))"),
                     ),
-                    (BoxShape::Slice, None, false) => {
+                    (BoxShape::Slice, None, false, _) => {
                         unreachable!("a counted slice shape carries its count")
                     }
                 };
@@ -1376,6 +1465,12 @@ pub(crate) fn derive<'tcx>(
                 receipts.push(format!(
                     "allocator-contract site={}",
                     super::emitability::EmitabilityFacts::site(tcx, *call)
+                ));
+            }
+            for (_, _, guard) in &kept_guards {
+                receipts.push(format!(
+                    "null-guard-before-box site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *guard)
                 ));
             }
             for receipt in &receipts {

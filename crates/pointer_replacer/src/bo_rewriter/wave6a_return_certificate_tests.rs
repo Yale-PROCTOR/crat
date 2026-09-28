@@ -3177,6 +3177,8 @@ fn filled_in_place_frame() {
             ("env_sized_value::small".to_owned(), SlotKind::Owning),
             ("take_two::p".to_owned(), SlotKind::Owning),
             ("take_two::q".to_owned(), SlotKind::Owning),
+            ("alloc_one::val".to_owned(), SlotKind::Owning),
+            ("use_one::v".to_owned(), SlotKind::Owning),
         ],
     );
 }
@@ -3208,8 +3210,14 @@ fn w6a_r615_a_block_filled_in_place_is_a_certificate_source() {
             "{callee}\n{context}"
         );
     }
+    // R641-11 (a): `calloc` returns null on failure, so `alloc_value`'s guard
+    // is kept on the raw result before the `Box` exists: its return is live,
+    // the output's `None`.
     assert!(
-        text.contains("letmutval:Box<crate::value>=::std::boxed::Box::from_raw(calloc("),
+        text.contains("letmutval:Box<crate::value>={let__crat_raw=calloc(")
+            && text.contains(
+                ";if__crat_raw.is_null(){returnNone;}::std::boxed::Box::from_raw(__crat_raw)};{}"
+            ),
         "{context}"
     );
     assert!(
@@ -3751,4 +3759,92 @@ fn w6a_r623_a_formal_handed_on_stands_with_the_formal_it_hands_into() {
         );
     }
     assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// **R641-11 (a), the certificate side.** A filled-in-place owner is a C
+/// allocation (`Box::from_raw(calloc(..))`), so C's null guard cannot be read
+/// as dead the way `Box::new`'s is: it is kept on the raw result, and where it
+/// is not the statement right after the allocation it cannot be moved there,
+/// so the certificate holds.
+#[test]
+fn w6a_r641_a_filled_in_place_guard_not_next_to_its_allocation_holds() {
+    let source = FILLED_IN_PLACE.replace(
+        "    let mut val = calloc(1 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;\n    if val.is_null() {\n        return 0 as *mut value;\n    }\n    if n > 0 as usize {",
+        "    let mut val = calloc(1 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;\n    let mut m = n;\n    if val.is_null() {\n        return 0 as *mut value;\n    }\n    if m > 0 as usize {",
+    );
+    assert_ne!(source, FILLED_IN_PLACE);
+    let _frame = frame_locks();
+    filled_in_place_frame();
+    let out = emitted("r641-filled-apart", &source);
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("alloc_value::val\theld\treturn-certificate-allocation:alloc_value:null-guard-not-adjacent"),
+        "{receipts}\n{}",
+        out.source
+    );
+    // `alloc_value` keeps its raw surface (`short_value`, whose guard IS next
+    // to its allocation, still certifies).
+    let text = compact(&out.source);
+    assert!(
+        text.contains("fnalloc_value(mutn:usize)->*mutvalue{"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnshort_value(mutn:usize)->Option<Box<value>>{"),
+        "{}",
+        out.source
+    );
+}
+
+/// **R641-11 (a)**: a filled-in-place producer whose ONLY null return is its
+/// `calloc` guard. Kept on the raw result, that return is live, so the output
+/// is `Option<Box<T>>` (`None` on allocation failure, as C returns null) and
+/// the owner's return is `Some(val)`.
+#[test]
+fn w6a_r641_a_kept_calloc_guard_makes_the_output_optional() {
+    const ALLOC_ONE: &str = r#"
+unsafe extern "C" fn alloc_one() -> *mut value {
+    let mut val = calloc(1 as i32 as usize, ::core::mem::size_of::<value>()) as *mut value;
+    if val.is_null() {
+        return 0 as *mut value;
+    }
+    (*val).l = 1 as usize;
+    return val;
+}
+unsafe extern "C" fn use_one() -> usize {
+    let mut v = alloc_one();
+    if v.is_null() {
+        return 0 as usize;
+    }
+    let mut l = (*v).l;
+    free(v as *mut core::ffi::c_void);
+    return l;
+}
+"#;
+    let _frame = frame_locks();
+    filled_in_place_frame();
+    let out = emitted("r641-alloc-one", &format!("{FILLED_IN_PLACE}{ALLOC_ONE}"));
+    super::test_model_override::clear();
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let text = compact(&out.source);
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    assert_eq!(out.reverted, 0, "{context}");
+    assert!(
+        text.contains("fnalloc_one()->Option<Box<value>>{letmutval:Box<crate::value>={let__crat_raw=calloc(")
+            && text.contains(
+                ";if__crat_raw.is_null(){returnNone;}::std::boxed::Box::from_raw(__crat_raw)};{}(*val).l=1asusize;returnSome(val);}"
+            ),
+        "{context}"
+    );
+    assert!(
+        receipts.contains("return-certificate callee=alloc_one output=Option<Box<value>>"),
+        "{context}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "use_one::v"),
+        None,
+        "{context}"
+    );
 }

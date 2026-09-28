@@ -2516,6 +2516,9 @@ fn certify<'tcx, 's>(
     let mut source_receipt = String::from("calls");
     let mut kind: Option<SlotKind> = None;
     let mut dead_guard_receipts: Vec<String> = Vec::new();
+    // R641-11 (a): a filled-in-place owner's null guard, kept on the raw
+    // result: its return is a live `None`.
+    let mut relocated_guard = false;
     let mut null_returns = sources.nulls.clone();
     // R619-5 (1): the null returns that follow the owner's C free in their
     // block. They still return `None`; they close nothing.
@@ -2953,6 +2956,35 @@ fn certify<'tcx, 's>(
                 &|_| false,
             )
             .map_err(|form| hold(format!("return-certificate-owner-use:{callee_path}:{form}")))?;
+            // **R641-11 (a) — a filled-in-place owner is a C allocation.**
+            // `calloc` returns null on failure, so its guard is not dead the
+            // way `Box::new`'s is: it is kept on the raw result, before the
+            // `Box` exists (`allocator_contract::adjacent_null_guard`), and its
+            // return is a live `None`. One not right after the allocation
+            // cannot be moved there, so the certificate holds.
+            if receipt == "filled-in-place" && !uses.dead_guards.is_empty() {
+                let at = |r: &str| plan.expr_edits.iter().position(|e| e.receipt == r);
+                let (Some(open), Some(close)) = (
+                    at("return-certificate-filled-in-place"),
+                    at("return-certificate-filled-in-place-close"),
+                ) else {
+                    unreachable!("the filled-in-place source's two insertions")
+                };
+                let creation = plan.expr_edits[open].span.to(plan.expr_edits[close].span);
+                if uses.dead_guards.iter().any(|guard| {
+                    super::allocator_contract::adjacent_null_guard(tcx, callee, creation, *guard)
+                        .is_none()
+                }) {
+                    return Err(hold(format!(
+                        "return-certificate-allocation:{callee_path}:null-guard-not-adjacent"
+                    )));
+                }
+                plan.expr_edits[open].replacement = "{ let __crat_raw = ".to_owned();
+                plan.expr_edits[close].replacement =
+                    "; if __crat_raw.is_null() { return None; } ::std::boxed::Box::from_raw(__crat_raw) }"
+                        .to_owned();
+                relocated_guard = true;
+            }
             transfers.extend(uses.transfers.iter().map(|(d, i, _)| (*d, *i, key)));
             let deleted = plan.delete_statements.clone();
             let owner_edits: Vec<BoxExprEdit> = uses
@@ -2983,7 +3015,12 @@ fn certify<'tcx, 's>(
                 .collect();
             dead_guard_receipts.extend(uses.dead_guards.iter().map(|span| {
                 format!(
-                    "dead-alloc-guard site={}",
+                    "{} site={}",
+                    if relocated_guard {
+                        "null-guard-before-box"
+                    } else {
+                        "dead-alloc-guard"
+                    },
                     super::emitability::EmitabilityFacts::site(tcx, *span)
                 )
             }));
@@ -3036,7 +3073,8 @@ fn certify<'tcx, 's>(
             "return-certificate-shape:{callee_path}:sources-disagree"
         )));
     }
-    let optional_output = !null_returns.is_empty() || shapes.iter().any(|(_, o)| *o);
+    let optional_output =
+        !null_returns.is_empty() || shapes.iter().any(|(_, o)| *o) || relocated_guard;
     // Return edits: null → None; a non-optional source into an optional
     // output → Some(..).
     let mut return_edits: Vec<BoxExprEdit> = Vec::new();

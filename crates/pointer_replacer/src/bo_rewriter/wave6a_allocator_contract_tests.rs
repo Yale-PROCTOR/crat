@@ -697,11 +697,15 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
     );
     for expected in [
         // malloc: the byte count is `n * size_of::<T>()`, so the count is `n`.
-        "letmutbuf:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(malloc(",
+        // R641-11 (a): libc returns null on failure, so C's guard is kept on
+        // the raw result, before the `Box` exists; the guard itself is dead.
+        "letmutbuf:Box<[u32]>={let__crat_raw=malloc(",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw,((nasstd::os::raw::c_ulong))asusize))};{}",
         "buf[(0)asusize]=7asu32;",
         "free(Box::into_raw(buf)as*mutcore::ffi::c_void);",
         // calloc: the count is the element argument, the size the pointee's.
-        "letmutgrid:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(calloc(nasstd::os::raw::c_ulong,",
+        "letmutgrid:Box<[u32]>={let__crat_raw=calloc(nasstd::os::raw::c_ulong,",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw,",
         "free(Box::into_raw(grid)as*mutcore::ffi::c_void);",
         // strdup: the contract's postcondition, measured on the block itself —
         // the count never mentions `src`. The ARGUMENT's spelling is not this
@@ -709,7 +713,7 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
         // (`src.as_ptr()`, wave-6s 057) without touching the claim, so the
         // opening and the postcondition are asserted apart (R217-2(a)).
         "letmutdup:Box<[i8]>={let__crat_alloc=strdup(",
-        ");Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc,core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1)))};",
+        ");if__crat_alloc.is_null(){return0asi32;}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc,core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1)))};{}",
         "free(Box::into_raw(dup)as*mutcore::ffi::c_void);",
     ] {
         assert!(
@@ -735,6 +739,12 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
         receipts.contains("allocator-contract:libc/v1@2026-09-17"),
         "{receipts}"
     );
+    for subject in ["counted::buf", "zeroed::grid", "copied::dup"] {
+        assert!(
+            receipts.contains(&format!("{subject}\tadmitted\tnull-guard-before-box site=")),
+            "{subject}\n{receipts}"
+        );
+    }
     // CONTROL (R443-1): the one shape the System declaration does not cover.
     // libc guarantees alignment for any fundamental type; `System`'s dealloc of
     // an over-aligned layout is not `free`, so an over-aligned pointee keeps a
@@ -1888,4 +1898,84 @@ fn w6a_r608_an_element_kept_or_handed_to_an_unknown_callee_is_not_a_lend() {
             out.source
         );
     }
+}
+
+/// **R641-11 (a)** — urlparser's `url_parse` reduced: sized and counted
+/// `libc/v1` owners, each guarded (`if x.is_null() { return 0; }`) and moved
+/// into a raw field of the caller's record. `malloc` returns null on failure,
+/// where C returns 0 (defined), so the guard is kept on the raw result before
+/// `Box::from_raw` exists; the owners stay delivered. CONTROL: a guard that is
+/// not the statement right after its allocation cannot be moved there
+/// without reordering, so the owner yields.
+#[test]
+fn w6a_r641_a_libc_null_guard_is_kept_on_the_raw_result() {
+    const URL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct url_data_t {
+    pub host: *mut std::os::raw::c_char,
+    pub port: *mut std::os::raw::c_char,
+}
+pub unsafe extern "C" fn url_parse(mut n: usize, mut data: *mut url_data_t) -> i32 {
+    let mut host = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong)) as *mut std::os::raw::c_char;
+    if host.is_null() {
+        return 0 as i32;
+    }
+    *host.offset(0 as isize) = 0 as std::os::raw::c_char;
+    (*data).host = host;
+    let mut port = malloc(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong) as *mut std::os::raw::c_char;
+    if port.is_null() {
+        return 0 as i32;
+    }
+    *port = 0 as std::os::raw::c_char;
+    (*data).port = port;
+    return 1 as i32;
+}
+"#;
+    let out = emitted("r641-url", URL);
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    for expected in [
+        "letmuthost:Box<[i8]>={let__crat_raw=malloc(",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw,",
+        "letmutport:Box<i8>={let__crat_raw=malloc(",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(__crat_raw)};{}",
+        "(*data).port=Box::into_raw(port);",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{receipts}",
+            out.source
+        );
+    }
+    for subject in ["url_parse::host", "url_parse::port"] {
+        assert!(
+            receipts.contains(&format!("{subject}\tadmitted\tnull-guard-before-box site=")),
+            "{subject}\n{receipts}"
+        );
+    }
+
+    let apart = URL.replace(
+        "    if port.is_null() {\n        return 0 as i32;\n    }\n",
+        "    let mut seen = n;\n    if port.is_null() {\n        return 0 as i32;\n    }\n",
+    );
+    assert_ne!(apart, URL);
+    let out = emitted("r641-url-apart", &apart);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts
+            .contains("url_parse::port\tyielded\tcontract-allocation:use:null-guard-not-adjacent:"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("letmutport:Box<"),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
 }
