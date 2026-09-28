@@ -1165,8 +1165,17 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
         "{}",
         raw_boundary_artifacts.contract_candidate_declines
     );
-    assert!(!source.contains("&[i8]"), "{source}");
-    assert!(!source.contains("&mut [i8]"), "{source}");
+    // RE-PIN (wave-6l, R641 item 2; Codex 062 finding 1; was: no `&[i8]` /
+    // `&mut [i8]` in the source). At `be3884944` this emitted
+    // `fn find(name: &mut i8)` and handed that one-element reference to
+    // `find_local`, whose `strcmp` walks it: a NUL walk through a thin claim.
+    // A model-Raw callee keeps ITS parameter raw; it does not protect the
+    // caller that converts. The thin-extent set now reaches `find::name`
+    // through `find_local`'s walk, and R481's lift gives it the array's own
+    // extent. What this test protects is unchanged: no contract promotion
+    // is carried through the raw callee (`plans` empty, the declined line).
+    assert!(!source.contains("name: &mut i8"), "{source}");
+    assert!(!source.contains("name: &i8"), "{source}");
 }
 
 /// R408-1 (relay 028 §1): ruling B's adjacency arm licensed a VALUE as a slice

@@ -195,3 +195,63 @@ fn w6l_seethrough_f1c_a_nul_walk_is_not_a_counted_footprint() {
         "{map:#?}"
     );
 }
+
+/// Codex 062 (findings 2, 3): the counted footprint through a `c_void`
+/// wrapper that hands its parameter to `memcpy` uncast, and through a cast
+/// between two forwarders.
+const FOOTPRINT_HOPS: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn fill_raw(mut dst: *mut core::ffi::c_void, mut src: *const core::ffi::c_void) {
+    memcpy(dst, src, 16 as u64);
+}
+unsafe fn fill(mut dst: *mut u8, mut src: *const u8) {
+    memcpy(dst as *mut core::ffi::c_void, src as *const core::ffi::c_void, 16 as u64);
+}
+unsafe fn relay(mut dst: *mut u8, mut src: *const u8) {
+    fill(dst as *mut u8, src);
+}
+pub struct Pair {
+    pub a: *mut u8,
+    pub b: *const u8,
+    pub c: *mut u8,
+}
+pub unsafe fn caller(mut p: *mut Pair) {
+    let mut v = (*p).a;
+    fill_raw(v as *mut core::ffi::c_void, (*p).b as *const core::ffi::c_void);
+    let mut r = (*p).c;
+    relay(r, (*p).b);
+}
+"#;
+
+/// F2 (Codex 062 finding 2) — a `c_void` parameter handed uncast to a counted
+/// position: no cast names a width, and the footprint is still 16 bytes.
+#[test]
+fn w6l_seethrough_f2_a_void_wrapper_passes_the_counted_footprint_on() {
+    let map = access_map(FOOTPRINT_HOPS);
+    let row = map
+        .iter()
+        .find(|(label, _)| label == "caller::v")
+        .unwrap_or_else(|| panic!("caller::v is not held: {map:#?}"));
+    assert!(
+        row.1.ends_with("foreign-contract:memcpy:0:byte-count"),
+        "{map:#?}"
+    );
+}
+
+/// F3 (Codex 062 finding 3) — the counted footprint is followed through a
+/// cast between two forwarders, as the NUL see-through follows casts.
+#[test]
+fn w6l_seethrough_f3_the_counted_footprint_crosses_a_cast_between_forwarders() {
+    let map = access_map(FOOTPRINT_HOPS);
+    let row = map
+        .iter()
+        .find(|(label, _)| label == "caller::r")
+        .unwrap_or_else(|| panic!("caller::r is not held: {map:#?}"));
+    assert!(
+        row.1.ends_with("foreign-contract:memcpy:0:byte-count"),
+        "{map:#?}"
+    );
+}
