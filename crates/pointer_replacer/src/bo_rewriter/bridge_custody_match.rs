@@ -971,6 +971,23 @@ fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> boo
                         }
                         body = unparen(&cast.receiver);
                     }
+                    // **R636-1 — an optional REFERENCE's view, in closure form.**
+                    // `|value| core::ptr::from_mut(value)` is the same view as the
+                    // `map_or(null, core::ptr::from_mut)` accepted above; the Option
+                    // bridge spells it this way (binn's `pint`, batch 50). Exactly one
+                    // argument, and it is the closure's own parameter.
+                    if let ast::ExprKind::Call(project, projected) = &body.kind {
+                        let [projected] = projected.as_slice() else { return false };
+                        return matches!(
+                            path(project).as_deref(),
+                            Some(
+                                "core::ptr::from_ref"
+                                    | "core::ptr::from_mut"
+                                    | "std::ptr::from_ref"
+                                    | "std::ptr::from_mut"
+                            )
+                        ) && path(projected).as_deref() == Some(name.name.as_str());
+                    }
                     let ast::ExprKind::MethodCall(project) = &body.kind else {
                         return false;
                     };
@@ -3982,9 +3999,152 @@ fn match_receipt(
     }) {
         return Err("stamped-raw-temporary-has-no-exact-bound-call-use".into());
     }
+    if expected.kind == BridgeKind::A5SiteProofT2Fallback
+        && let SiteAnchor::Argument { argument_index, .. } = expected.anchor
+        && let Some((call, reason)) =
+            twin_inline_raw_view(input, expected, original, argument_index)
+    {
+        row.emitted_call = Some(call.span);
+        row.status = ReceiptStatus::MatchedRaw;
+        row.reason = reason;
+        return Ok(());
+    }
     row.status = ReceiptStatus::Missing;
     row.reason = "no-stamped-raw-view-or-matched-c9-at-original-site".into();
     Ok(())
+}
+
+/// **R636-1 — at a raw-twin call the A5 view is the argument itself.**
+///
+/// A counted-void call routed `RawTwin` renames the callee and keeps its arguments, so the
+/// A5 fallback plans no stamped temporary there (R496-1): the stamps would be dead lets.
+/// When a caller's safe value sits at such an argument, the caller's own bridge renders
+/// its raw view INLINE — binn's `pint` (batch 50: `Option<&mut c_int>`), passed as
+/// `pint.as_deref_mut().map_or(null_mut(), |value| from_mut(value).cast())` to
+/// `crate::src::binn::__crat_raw_copy_int_value` — and that expression is the T2 view the
+/// per-argument receipt claims. Before this arm the receipt read `Missing`.
+///
+/// Narrow, and only ever turning a `Missing` into a match (every refusal above still
+/// fires first): an A5 per-argument receipt; a call, in the caller, to the callee's twin
+/// as the emitted tree declares it in the callee's own module, spelled crate-rooted as
+/// the counted-void rename writes it; the twin's formal at the position is raw; the
+/// argument reads exactly its source bytes, is a raw view of the original argument by
+/// the relations in force and is not the original text (a zero-syntax twin site is
+/// R499-1's, not this arm's); its bindings are the original argument's, one to one; and
+/// exactly one call qualifies.
+fn twin_inline_raw_view<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    index: usize,
+) -> Option<(&'a Call, String)> {
+    let owner = mapped_owner(&expected.caller, input.context).ok()?;
+    let (module, name) = match expected.callee.rsplit_once("::") {
+        Some((module, name)) => (Some(module), name),
+        None => (None, expected.callee.as_str()),
+    };
+    let twin = super::decision::counted_void::raw_twin_name(name);
+    let twin_owner = match module {
+        Some(module) => format!("{module}::{twin}"),
+        None => twin.clone(),
+    };
+    let [declared] = input
+        .emitted
+        .functions
+        .iter()
+        .filter(|function| function.owner == twin_owner)
+        .collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if !matches!(
+        pointer_type(&declared.parameters.get(index)?.type_text).ok()?,
+        PointerType::Raw(_)
+    ) {
+        return None;
+    }
+    let spelling = expression_key(&*expression(&format!("crate::{twin_owner}")).ok()?);
+    let source = expression(&original.arguments.get(index)?.text).ok()?;
+    let mut matched = Vec::new();
+    for call in input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
+    {
+        let Ok(callee) = expression(&call.callee_text) else { continue };
+        let argument = &call.arguments[index];
+        if expression_key(&callee) != spelling
+            || input
+                .emitted_source
+                .get(argument.span.lo as usize..argument.span.hi as usize)
+                != Some(argument.text.as_str())
+        {
+            continue;
+        }
+        let Ok(view) = expression(&argument.text) else { continue };
+        if expression_key(&view) != expression_key(&source)
+            && raw_initializer_matches(&view, &source)
+            && argument_bindings_correspond(input, original, call, index)
+        {
+            matched.push(call);
+        }
+    }
+    let [call] = matched[..] else { return None };
+    Some((
+        call,
+        format!(
+            "twin-call-inline-raw-view:arg={index};twin={twin_owner};argument={}",
+            call.arguments[index].text
+        ),
+    ))
+}
+
+/// The caller's bindings read inside the emitted argument are the original argument's,
+/// one to one (closure-internal names belong to the closure's own owner and are not
+/// counted); an argument that reads no caller binding is no view of one.
+fn argument_bindings_correspond(
+    input: &BridgeCustodyInput<'_>,
+    original: &Call,
+    call: &Call,
+    index: usize,
+) -> bool {
+    let within = |owner: &str, span: ByteSpan, usage: &super::bridge_custody_syntax::BindingUse| {
+        usage.owner == owner && span.lo <= usage.span.lo && usage.span.hi <= span.hi
+    };
+    let original_ids = input
+        .original
+        .uses
+        .iter()
+        .filter(|usage| within(&original.owner, original.arguments[index].span, usage))
+        .map(|usage| usage.binding_id)
+        .collect::<BTreeSet<_>>();
+    let emitted_ids = input
+        .emitted
+        .uses
+        .iter()
+        .filter(|usage| within(&call.owner, call.arguments[index].span, usage))
+        .map(|usage| usage.binding_id)
+        .collect::<BTreeSet<_>>();
+    let pairs =
+        |original: &Binding, emitted: &Binding| same_source_binding(input, original, emitted);
+    let originals = original_ids
+        .iter()
+        .filter_map(|id| input.original.bindings.get(*id))
+        .collect::<Vec<_>>();
+    let emitted = emitted_ids
+        .iter()
+        .filter_map(|id| input.emitted.bindings.get(*id))
+        .collect::<Vec<_>>();
+    !originals.is_empty()
+        && originals.len() == original_ids.len()
+        && emitted.len() == emitted_ids.len()
+        && originals
+            .iter()
+            .all(|o| emitted.iter().filter(|e| pairs(o, e)).count() == 1)
+        && emitted
+            .iter()
+            .all(|e| originals.iter().filter(|o| pairs(o, e)).count() == 1)
 }
 
 fn generated_name(name: &str) -> bool {

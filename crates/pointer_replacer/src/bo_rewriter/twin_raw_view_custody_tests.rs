@@ -101,3 +101,143 @@ fn w6b_an_inline_raw_view_at_the_twin_call_carries_the_a5_receipt() {
         "the row names the twin call: {report:#?}"
     );
 }
+
+fn missing(output: &str, kind: BridgeKind, why: &str) {
+    let report = check(output, &[expectation(kind)]);
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{why}: {report:#?}"
+    );
+}
+
+const TWIN: &str = "crate::src::binn::__crat_raw_copy_int_value";
+
+/// At a call to the callee ITSELF the A5 fallback does plan its stamp, so an inline view
+/// there is a stamp that did not render — still `Missing`.
+#[test]
+fn w6b_an_inline_view_at_the_callee_itself_still_owes_the_stamp() {
+    missing(
+        &emitted_with("crate::src::binn::copy_int_value", VIEW, TWIN_DECL),
+        BridgeKind::A5SiteProofT2Fallback,
+        "only the twin renders the view inline",
+    );
+}
+
+/// The twin is followed only where the emitted tree declares it, in the callee's module.
+#[test]
+fn w6b_an_undeclared_or_foreign_twin_is_not_followed() {
+    missing(
+        &emitted_with(TWIN, VIEW, ""),
+        BridgeKind::A5SiteProofT2Fallback,
+        "no declared twin",
+    );
+    let elsewhere = emitted_with("crate::src::other::__crat_raw_copy_int_value", VIEW, "").replace(
+        "}\n}\n",
+        &format!("}}\npub mod other {{\n{TWIN_DECL}}}\n}}\n"),
+    );
+    missing(
+        &elsewhere,
+        BridgeKind::A5SiteProofT2Fallback,
+        "a twin of the same name in another module is another function",
+    );
+}
+
+/// The twin's formal at the position must be raw.
+#[test]
+fn w6b_a_twin_formal_that_is_not_raw_is_not_a_raw_view_target() {
+    missing(
+        &emitted_with(
+            TWIN,
+            VIEW,
+            &TWIN_DECL.replace(
+                "mut pdest: *mut libc::c_void",
+                "mut pdest: &mut libc::c_int",
+            ),
+        ),
+        BridgeKind::A5SiteProofT2Fallback,
+        "a reference formal takes no raw view",
+    );
+}
+
+/// The argument must be a raw VIEW of the original argument: a pointer that reads the
+/// subject but views something else, a closure that projects another name, a view of a
+/// shadowing binding, and the original text itself all refuse.
+#[test]
+fn w6b_only_a_view_of_the_original_argument_is_its_raw_view() {
+    for (argument, why) in [
+        (
+            "pint.as_deref_mut().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |value| core::ptr::null_mut())",
+            "reads pint, views nothing",
+        ),
+        (
+            "pint.as_deref_mut().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |value| core::ptr::from_mut(other).cast::<core::ffi::c_void>())",
+            "the closure projects another name",
+        ),
+        (
+            "pint as *mut libc::c_void",
+            "the original text is R499-1's zero-syntax site, not a view",
+        ),
+    ] {
+        missing(
+            &emitted_with(TWIN, argument, TWIN_DECL),
+            BridgeKind::A5SiteProofT2Fallback,
+            why,
+        );
+    }
+    let shadowed = emitted().replace(
+        "    return crate::src::binn::__crat_raw_copy_int_value(",
+        "    let mut pint: Option<&mut libc::c_int> = None;\n    return crate::src::binn::__crat_raw_copy_int_value(",
+    );
+    missing(
+        &shadowed,
+        BridgeKind::A5SiteProofT2Fallback,
+        "a view of a shadowing binding is not the original's",
+    );
+}
+
+/// The row is the A5 fallback's: the PAIR family renders its raw view at twin calls as
+/// anywhere else, so its receipt keeps asking for the stamp.
+#[test]
+fn w6b_a_pair_receipt_is_not_read_through_the_twin() {
+    missing(
+        &emitted(),
+        BridgeKind::PairT2RawView,
+        "PAIR stamps are not withdrawn",
+    );
+}
+
+/// Two twin calls that both qualify leave the correspondence open: refuse.
+#[test]
+fn w6b_two_qualifying_twin_calls_are_not_one_site() {
+    let twice = emitted().replace(
+        "    return crate::src::binn::__crat_raw_copy_int_value(",
+        &format!(
+            "    crate::src::binn::__crat_raw_copy_int_value((*value.unwrap()).ptr, {VIEW}, (*value.unwrap()).type_0, 0x61 as libc::c_int);\n    return crate::src::binn::__crat_raw_copy_int_value("
+        ),
+    );
+    missing(
+        &twice,
+        BridgeKind::A5SiteProofT2Fallback,
+        "ambiguous twin calls",
+    );
+}
+
+/// The closure form of an optional reference's view is the relation the ordinary stamp
+/// needs too: the same view, stamped at a call to the callee, matches.
+#[test]
+fn w6b_the_closure_form_view_matches_as_a_stamped_temporary() {
+    let lo = ORIGINAL.find("copy_int_value((*value).ptr").unwrap();
+    let stamped = emitted_with("copy_int_value", &format!("__crat_a5_raw_{lo}_1"), "").replace(
+        "    return copy_int_value(",
+        &format!(
+            "    let __crat_a5_raw_{lo}_1: *mut libc::c_void = {VIEW};\n    return copy_int_value("
+        ),
+    );
+    let report = check(&stamped, &[expectation(BridgeKind::A5SiteProofT2Fallback)]);
+    assert_eq!(
+        report.rows[0].status,
+        ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+    assert_eq!(report.rows[0].bindings.len(), 1, "{report:#?}");
+}
