@@ -110,6 +110,13 @@ pub(crate) enum CertificateKind {
     /// aliasing question Rust answers for us, so two shared borrows of one
     /// place are legal and there is nothing to prove.
     ReadReadShared,
+    /// R624-1 rule (f): one side is a direct read of an admitted field (not
+    /// offset-admitted) that was stored on every path since the calling
+    /// function's entry, so its block was allocated after that entry; the
+    /// other side's object existed AT that entry. An allocator never returns
+    /// storage overlapping a live object, so the two are distinct allocations
+    /// whatever their types — no P3 is needed.
+    AllocationIdentity,
 }
 
 impl CertificateKind {
@@ -127,6 +134,7 @@ impl CertificateKind {
                 "pair-disjoint:static-vs-entry"
             }
             Self::ReadReadShared => "pair-disjoint:read-read-shared",
+            Self::AllocationIdentity => "pair-disjoint:allocation-identity",
         }
     }
 
@@ -397,6 +405,10 @@ struct ArgRecord {
     /// asks about pointer positions, so the column's table filters on this.
     /// Probe-only; no rule reads it.
     is_pointer: bool,
+    /// R624-1 (f): this argument is a direct read `(b).F` of an admitted,
+    /// not offset-admitted field, and a store into `F` of the same object runs
+    /// on every path from the caller's entry to this call.
+    stored_since_entry: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1072,6 +1084,16 @@ impl PairDisjointnessIndex {
                 } else {
                     CertificateKind::StaticVsEntry(callers)
                 });
+            }
+        }
+        // R624-1 (f): allocation identity. The field's block was allocated
+        // after this function's entry (every store into an admitted field is an
+        // allocation, and one ran on every path here); the entry object existed
+        // at that entry. An allocator never returns storage overlapping a live
+        // object, so they are distinct allocations whatever their types.
+        for (field, other) in [(a, b), (b, a)] {
+            if field.stored_since_entry && matches!(other.class, RootClass::EntryStorage(_)) {
+                return Ok(CertificateKind::AllocationIdentity);
             }
         }
         // (e) R462-1, last: the callee's two parameters may be separable even
@@ -3871,6 +3893,28 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                     } else {
                         UnknownWhy::Known
                     };
+                    // R624-1 (f): only a read AT the call; a local carried from
+                    // an earlier read may hold a block from before the store.
+                    let stored_since_entry = match (class, &peel_casts(arg).kind) {
+                        (
+                            RootClass::FreshField {
+                                adt,
+                                field,
+                                base,
+                                via_offset: false,
+                                ..
+                            },
+                            ExprKind::Field(..),
+                        ) => field_stored_since_entry(
+                            self.tcx,
+                            self.typeck,
+                            self.classes,
+                            expr,
+                            (adt, field),
+                            base,
+                        ),
+                        _ => false,
+                    };
                     ArgRecord {
                         index,
                         span: arg.span,
@@ -3885,6 +3929,7 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                             self.typeck.expr_ty(arg).kind(),
                             ty::RawPtr(..) | ty::Ref(..)
                         ),
+                        stored_since_entry,
                     }
                 })
                 .collect();
@@ -3897,6 +3942,89 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
             ));
         }
         intravisit::walk_expr(self, expr);
+    }
+}
+
+/// R624-1 (f): does a store into field `key` of the object `base` run on every
+/// path from the caller's entry to `call`? Every EARLIER statement of every
+/// block enclosing the call lies on each such path — structured control flow:
+/// a `return`, `break` or `continue` only removes paths — so one of them
+/// storing that field is the witness. A store inside a loop or a branch, or
+/// after the call, is not.
+fn field_stored_since_entry<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    call: &Expr<'_>,
+    key: (DefId, Symbol),
+    base: HirId,
+) -> bool {
+    for (_, node) in tcx.hir_parent_iter(call.hir_id) {
+        match node {
+            rustc_hir::Node::Block(block) => {
+                for stmt in block.stmts {
+                    if stmt.span.contains(call.span) {
+                        break;
+                    }
+                    if statement_stores_field(tcx, typeck, classes, stmt, key, base) {
+                        return true;
+                    }
+                }
+            }
+            rustc_hir::Node::Expr(expr) if matches!(expr.kind, ExprKind::Closure(..)) => {
+                return false;
+            }
+            rustc_hir::Node::Item(_)
+            | rustc_hir::Node::ImplItem(_)
+            | rustc_hir::Node::TraitItem(_) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A statement that stores field `key` of `base`: the assignment itself, or a
+/// plain block (every statement of which runs) holding one.
+fn statement_stores_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    stmt: &rustc_hir::Stmt<'_>,
+    key: (DefId, Symbol),
+    base: HirId,
+) -> bool {
+    let (StmtKind::Semi(expr) | StmtKind::Expr(expr)) = stmt.kind else {
+        return false;
+    };
+    expression_stores_field(tcx, typeck, classes, expr, key, base)
+}
+
+fn expression_stores_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    classes: &FxHashMap<HirId, RootClass>,
+    expr: &Expr<'_>,
+    key: (DefId, Symbol),
+    base: HirId,
+) -> bool {
+    match &expr.kind {
+        ExprKind::Assign(place, _, _) => {
+            let ExprKind::Field(object, field) = &peel_casts(place).kind else {
+                return false;
+            };
+            data_field_key(tcx, typeck, object, field.name) == Some(key)
+                && place_provenance(tcx, typeck, classes, object).0.object_id() == Some(base)
+        }
+        ExprKind::Block(block, None) => {
+            block
+                .stmts
+                .iter()
+                .any(|stmt| statement_stores_field(tcx, typeck, classes, stmt, key, base))
+                || block.expr.is_some_and(|tail| {
+                    expression_stores_field(tcx, typeck, classes, tail, key, base)
+                })
+        }
+        _ => false,
     }
 }
 
