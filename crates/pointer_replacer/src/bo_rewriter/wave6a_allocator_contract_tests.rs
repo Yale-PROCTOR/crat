@@ -1589,3 +1589,91 @@ fn w6a_r557_the_element_address_classifier_names_owner_index_and_mutability() {
     );
     assert_eq!(find("histograms"), "histograms => None");
 }
+
+/// brotli's ensure-capacity shape (`RingBufferInitBuffer`,
+/// `InitBlockSplitter*`, `SplitByteVector*`, `EncodeData::new_commands`):
+/// the new buffer is allocated, the old one copied in and freed, and the new
+/// one STORED into the struct's raw field, which C frees later.
+const STORED_OWNERS: &str = r#"
+extern "C" {
+    fn memcpy(d: *mut std::os::raw::c_void, s: *const std::os::raw::c_void, n: usize) -> *mut std::os::raw::c_void;
+}
+#[repr(C)]
+pub struct RingBuffer {
+    pub cur_size_: u32,
+    pub data_: *mut u8,
+}
+pub unsafe extern "C" fn ring(mut m: *mut MemoryManager, buflen: u32, mut rb: *mut RingBuffer) {
+    let mut new_data = if (2 as u32).wrapping_add(buflen) as usize > 0 as usize {
+        BrotliAllocate(m, ((2 as u32).wrapping_add(buflen) as usize).wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8
+    } else { 0 as *mut u8 };
+    if !((*rb).data_).is_null() {
+        memcpy(new_data as *mut std::os::raw::c_void, (*rb).data_ as *const std::os::raw::c_void, (*rb).cur_size_ as usize);
+        BrotliFree(m, (*rb).data_ as *mut std::os::raw::c_void);
+        (*rb).data_ = 0 as *mut u8;
+    }
+    (*rb).data_ = new_data;
+    (*rb).cur_size_ = buflen;
+}
+pub unsafe extern "C" fn store_only(mut m: *mut MemoryManager, n: usize, mut rb: *mut RingBuffer) {
+    let mut new_data = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    (*rb).data_ = new_data;
+}
+pub unsafe extern "C" fn one_branch(mut m: *mut MemoryManager, n: usize, c: bool, mut rb: *mut RingBuffer) {
+    let mut new_data = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    if c { (*rb).data_ = new_data; }
+}
+"#;
+
+/// **R607-1 (relay 115 item 2)** — an owner STORED into a raw field moves out
+/// there: the store is the generation's release (`Box::into_raw`, the
+/// element pointer for a slice owner), and C frees the field later. Before,
+/// the store was never an event of the simulation, so every such owner read
+/// `contract-allocation:implicit-close:live-at-exit` (brotli's 21).
+#[test]
+fn w6a_r607_an_owner_stored_into_a_raw_field_moves_out_there() {
+    let out = emitted("r607-stored", &format!("{PRELUDE}{STORED_OWNERS}"));
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    for owner in ["ring::new_data", "store_only::new_data"] {
+        assert!(
+            receipts.contains(&format!("{owner}\tadmitted\t")),
+            "{context}"
+        );
+        assert_eq!(reason_of(&out.degradations, owner), None, "{context}");
+    }
+    for expected in [
+        "letmutnew_data:Option<Box<[u8]>>=",
+        "(*rb).data_=new_data.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutu8);",
+        "letmutnew_data:Box<[u8]>=Box::from_raw(",
+        "(*rb).data_=Box::into_raw(new_data)as*mutu8;",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}`\n{context}");
+    }
+    assert!(!text.contains("drop("), "{context}");
+    assert_eq!(receipts.matches("waiver-drop").count(), 0, "{context}");
+}
+
+/// Control: a store on ONE branch leaves the generation live on the other,
+/// where Rust would close it (R409-3) — the release counts in the store's
+/// own block, so the owner stays a typed hold.
+#[test]
+fn w6a_r607_a_store_on_one_branch_keeps_its_hold() {
+    let out = emitted("r607-one-branch", &format!("{PRELUDE}{STORED_OWNERS}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts.contains(
+            "one_branch::new_data\theld\tcontract-allocation:implicit-close:block-unbalanced"
+        ),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        compact(&out.source).contains(
+            "letmutnew_data=BrotliAllocate(m,n.wrapping_mul(::core::mem::size_of::<u8>()))as*mutu8;"
+        ),
+        "{}",
+        out.source
+    );
+}

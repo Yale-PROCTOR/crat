@@ -625,6 +625,20 @@ impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
                                 Role::Store
                             };
                             (hir, role)
+                        })
+                        // R607-1: the owner stored into a place that is not a
+                        // local (`(*rb).data_ = new_data`) moves out HERE, in
+                        // this block. The owner walk renders the store
+                        // (`Box::into_raw`, or refuses a non-raw place); the
+                        // simulation needs the release where it happens, or a
+                        // store on one branch would close the other.
+                        .or_else(|| {
+                            if matches!(lhs.kind, ExprKind::Path(_))
+                                || !matches!(rhs.kind, ExprKind::Path(_))
+                            {
+                                return None;
+                            }
+                            bare_local(rhs).map(|source| (source, Role::MoveOut))
                         }),
                     _ => None,
                 },

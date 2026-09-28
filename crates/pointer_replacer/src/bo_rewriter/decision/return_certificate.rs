@@ -1343,10 +1343,29 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     ));
                     return;
                 }
-                let replacement = if self.optional {
-                    format!("{name}.map_or(core::ptr::null_mut(), Box::into_raw)")
-                } else {
-                    format!("Box::into_raw({name})")
+                // A slice owner's raw pointer is fat; the place holds the
+                // element pointer (`Box::into_raw(x) as *mut u8`, R607-1).
+                let cast = match self.shape {
+                    BoxShape::Sized => String::new(),
+                    BoxShape::Slice => {
+                        match super::raw_boundary::raw_target_type(self.tcx, lhs_ty) {
+                            Some(target) => format!(" as {}", target.rendered),
+                            None => {
+                                self.refuse(format!(
+                                    "stored-into-unnamed-raw-place:{}",
+                                    self.snippet(parent.span)
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                };
+                let replacement = match (self.optional, cast.is_empty()) {
+                    (true, true) => format!("{name}.map_or(core::ptr::null_mut(), Box::into_raw)"),
+                    (true, false) => {
+                        format!("{name}.map_or(core::ptr::null_mut(), |b| Box::into_raw(b){cast})")
+                    }
+                    (false, _) => format!("Box::into_raw({name}){cast}"),
                 };
                 if let Ok(uses) = &mut self.out {
                     uses.stores.push(rhs.span);
