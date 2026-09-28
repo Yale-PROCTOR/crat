@@ -188,6 +188,38 @@ fn call_result_of_local_callee(constructions: &ConstructionFacts, subject: &Subj
     )
 }
 
+/// **(b′) wave-6l (R608-1): clause (b)'s premise is a CONVERTED return.**
+/// Where no family converts the callee's return — no borrowed-return permit of
+/// this lane, no receiver permit or receiver plan for this local, no Box return
+/// certificate — the call's value is the raw pointer the C code returned, and a
+/// sealed constructor over it is well typed. Its extent is the planner's own:
+/// evidence where the root states one, else §77's receipted fallback. Asked
+/// only where the eligibility exists: without it nothing says the return stays
+/// raw, and the refusal stands.
+///
+/// **R615-7:** the constructor is WRAPPED around the call
+/// (`SliceConstructionPlan::bracket`, applied after every other AST pass),
+/// never a replacement of its text — so every edit placed inside the call,
+/// by the plan or by a later AST pass, survives.
+fn callee_return_stays_raw(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let node = (subject.fn_did, subject.hir_id);
+    let Some(super::construction::CallResultTarget::DirectLocal(callee)) =
+        ctx.constructions.call_result_targets.get(&node)
+    else {
+        return false;
+    };
+    let Some(eligibility) = ctx.lifetime_eligibility else {
+        return false;
+    };
+    !eligibility.converts_return_of(*callee)
+        && eligibility.inferred_permit(node).is_none()
+        && eligibility.annotated_receiver_permit(node).is_none()
+        && !ctx.return_certificates.callees.contains_key(callee)
+        && ctx.return_receivers.is_none_or(|receivers| {
+            !receivers.plans.contains_key(&node) && !receivers.failures.contains_key(&node)
+        })
+}
+
 /// R397-6(b) / R398-1: a candidate that is an argument of a LOCAL callee sits
 /// on a shared interface — attempting it adds an interface edge that withdraws
 /// the callee's prior deliveries (the wall of report 001) — so it is declined
@@ -280,7 +312,8 @@ pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
     }
     let (argument, assigned) = local_callee_uses(ctx.tcx, subject);
     (call_result_of_local_callee(ctx.constructions, subject)
-            && !super::native_result_expression::bridges_local_callee_result(ctx, subject))
+            && !super::native_result_expression::bridges_local_callee_result(ctx, subject)
+            && !callee_return_stays_raw(ctx, subject))
             || argument
             // W6S-16 (R609-4): the assignment form yields where the callee's
             // return stays raw, no receiver plan exists and the body licenses

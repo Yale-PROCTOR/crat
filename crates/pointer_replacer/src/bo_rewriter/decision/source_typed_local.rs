@@ -498,6 +498,7 @@ pub(crate) fn construction(
             edition: 2018,
             requires_unsafe: false,
         },
+        bracket: None,
     })
 }
 

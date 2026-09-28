@@ -960,10 +960,16 @@ fn w6a_t1_caller_using_the_buffer_after_transfer_is_held() {
 }
 
 /// **Relay 007 §3a (wave-6s2 006).** A receiver of a LOCAL callee is the
-/// return-receiver family's: this rule never types it by a constructor —
-/// on batch 8's composition the return family converts `chunk_data`'s
-/// return to `&'a [u8]` and a `from_raw_parts` over it is E0308. Here (no
-/// return family) the receiver keeps its residual reason and its raw text.
+/// return-receiver family's where that family converts the callee's return:
+/// on batch 8's composition it converted `chunk_data`'s return to `&'a [u8]`,
+/// and a `from_raw_parts` over it is E0308.
+///
+/// **Re-pinned by R615-7 (wave-6l 055, rule (b′) with the bracket).** Here NO
+/// family converts `chunk_data`'s return (no permit, no receiver plan, no Box
+/// certificate): the call is the raw pointer C returned, so the sealed
+/// constructor is WRAPPED around it (the call's own text and edits untouched)
+/// and takes §77's receipted fallback. The E0308 premise is pinned where it
+/// holds by wave-6l's `w6l_nul_c3`.
 #[test]
 fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
     let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
@@ -971,14 +977,20 @@ fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
                pub unsafe fn reader(mut chunk: *mut u8) -> u8 { let mut d = chunk_data(chunk); return *d.offset(0 as i32 as isize); }\n";
     let out = emitted("receiver-of-local-callee", src);
     let text = compact(&out.source);
-    assert!(!text.contains("from_raw_parts"), "{}", out.source);
     assert!(
-        text.contains("letmutd=chunk_data(chunk);"),
+        text.contains("fnchunk_data(mutchunk:*mutu8)->*mutu8"),
+        "the callee's return is not converted: {}",
+        out.source
+    );
+    assert!(
+        text.contains(
+            "core::slice::from_raw_parts(chunk_data(chunk),crate::FALLBACK_SLICE_EXTENT)"
+        ),
         "{}",
         out.source
     );
     assert!(
-        reason_of(&out.degradations, "reader::d").is_some(),
+        reason_of(&out.degradations, "reader::d").is_none(),
         "{:#?}",
         out.degradations
     );

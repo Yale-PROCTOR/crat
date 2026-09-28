@@ -100,7 +100,7 @@ pub unsafe fn zrand(mut dev: u32) -> i32 {
 "#;
 
 /// urlparser `url_get_auth::protocol`: a local callee's RAW result, null-tested,
-/// read by `strlen` — held (see the pin below).
+/// read by `strlen`.
 const PROBE_CALL_RESULT_STRLEN: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut)]
 extern "C" {
@@ -216,8 +216,7 @@ pub unsafe fn print_error(mut p: *mut i8) {
 }
 "#;
 
-/// lil `lil_to_boolean::s`: a local callee's RAW result, indexed to the NUL —
-/// held (see the pin below).
+/// lil `lil_to_boolean::s`: a local callee's RAW result, indexed to the NUL.
 const PROBE_CALL_RESULT_SCAN: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut)]
 pub struct Value {
@@ -372,25 +371,99 @@ fn w6l_nul_w3_a_literal_only_binding_is_evidence_backed() {
     );
 }
 
-/// The two call-result receivers stay held (report 054): a sealed
-/// constructor over `callee(arg)` would replace the initializer's text and
-/// drop the argument's own boundary bridge (lil's `lil_to_string(val)` — `val`
-/// delivered, the formal raw — would be E0308 and revert `val`'s class), so
-/// clause (b) of the constructor refusal is left as it stands. Pinned so the
-/// composition build that opens them sees them move.
+/// W4 (R615-7) — a local callee's RAW result, null-tested and read by
+/// `strlen`: the receiver is the optional-slice constructor WRAPPED around the
+/// untouched call (a bracket of two insertions).
 #[test]
-fn w6l_nul_the_call_result_receivers_stay_held() {
-    for (fixture, name) in [
-        (PROBE_CALL_RESULT_STRLEN, "protocol"),
-        (PROBE_CALL_RESULT_SCAN, "s"),
-    ] {
-        let decisions = super::emit_tests::decisions_of(fixture);
-        assert_eq!(
-            reason(&decisions, name, false),
-            "return-not-adapted",
-            "{decisions:#?}"
-        );
+fn w6l_nul_w4_a_raw_call_result_takes_the_optional_slice_bracket() {
+    let decisions = super::emit_tests::decisions_of(PROBE_CALL_RESULT_STRLEN);
+    assert_eq!(
+        reason(&decisions, "protocol", false),
+        "<emitted>",
+        "{decisions:#?}"
+    );
+    let (source, _) = emitted_source(PROBE_CALL_RESULT_STRLEN);
+    assert!(
+        source.contains("let mut protocol: Option<&[i8]> ="),
+        "{source}"
+    );
+    assert!(source.contains("= get_protocol(url);"), "{source}");
+    assert!(
+        source.contains("core::slice::from_raw_parts(p,")
+            && source.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "{source}"
+    );
+    assert!(
+        source.contains("fn get_protocol(mut url: &i8) -> *mut i8"),
+        "{source}"
+    );
+}
+
+/// W5 (R615-7) — a local callee's RAW result, indexed to the NUL: a
+/// fallback slice wrapped around the call, indexed.
+#[test]
+fn w6l_nul_w5_an_indexed_raw_call_result_is_a_fallback_slice_bracket() {
+    let decisions = super::emit_tests::decisions_of(PROBE_CALL_RESULT_SCAN);
+    assert_eq!(
+        reason(&decisions, "s", false),
+        "<emitted>",
+        "{decisions:#?}"
+    );
+    let (source, _) = emitted_source(PROBE_CALL_RESULT_SCAN);
+    assert!(
+        source.contains("let mut s: &[i8] =")
+            && source.contains("core::slice::from_raw_parts(to_string(v),"),
+        "{source}"
+    );
+    assert!(source.contains("while s[i] != 0"), "{source}");
+}
+
+/// lil's `lil_to_boolean(val)`: `val` is delivered, `lil_to_string`'s formal
+/// stays raw (here: its address is read as an integer), so the ARGUMENT
+/// carries a bridge inside the receiver's initializer.
+const CONTROL_BRIDGED_ARGUMENT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+pub type text_t = *mut i8;
+#[no_mangle]
+pub unsafe extern "C" fn to_string(mut text: text_t) -> *const i8 {
+    return text as *const i8;
+}
+pub unsafe fn to_boolean(mut buf: *mut i8, mut n: usize) -> i32 {
+    *buf.offset(1 as isize) = 0;
+    let mut s = to_string(buf);
+    let mut i: usize = 0;
+    while *s.offset(i as isize) != 0 {
+        if *s.offset(i as isize) as i32 != '0' as i32 {
+            return 1;
+        }
+        i = i.wrapping_add(1);
     }
+    0
+}
+"#;
+
+/// C5 (R615-7, the relay's control) — the receiver is wrapped and the
+/// argument's own bridge (a seam: `buf.as_mut_ptr()` into the alias formal
+/// the rewriter leaves raw) survives inside it, and the crate type-checks.
+/// (Correction of wave-6l 054: a text replacement composes a SEAM planned in
+/// the table as well — its E0308 fixture failed without any constructor. The
+/// bracket additionally carries the edits the later AST passes place.)
+#[test]
+fn w6l_nul_c5_a_wrapped_receiver_keeps_the_argument_bridge() {
+    let (source, _) = emitted_source(CONTROL_BRIDGED_ARGUMENT);
+    assert!(
+        source.contains("fn to_string(mut text: text_t)"),
+        "{source}"
+    );
+    assert!(
+        source.contains("fn to_boolean(mut buf: &mut [i8]"),
+        "{source}"
+    );
+    assert!(source.contains("let mut s: &[i8] ="), "{source}");
+    assert!(
+        source.contains("to_string(buf.as_mut_ptr())"),
+        "the argument keeps its raw bridge inside the wrapped call: {source}"
+    );
 }
 
 /// The held one of the family, pinned so a later carrier build sees it move.
@@ -600,5 +673,34 @@ fn w6l_nul_c2_a_counted_companion_beats_the_fallback() {
         !promotions.1.contains("copy_n::src"),
         "the waiver's lift never sees a counted source: {}",
         promotions.1
+    );
+}
+
+const CONTROL_CONVERTED_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn make() -> *mut i8 {
+    let mut p = malloc(16) as *mut i8;
+    p
+}
+pub unsafe fn first() -> i8 {
+    let mut q = make();
+    let mut c = *q.offset(1);
+    free(q as *mut core::ffi::c_void);
+    c
+}
+"#;
+
+/// C3 — (b′) is exactly its premise: where a family DOES convert the callee's
+/// return (here a Box certificate), no constructor is built over the call.
+#[test]
+fn w6l_nul_c3_a_converted_return_is_never_constructed_over() {
+    let (source, _) = emitted_source(CONTROL_CONVERTED_RETURN);
+    assert!(
+        !source.contains("from_raw_parts(make()") && !source.contains("from_raw_parts_mut(make()"),
+        "{source}"
     );
 }

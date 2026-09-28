@@ -573,29 +573,24 @@ fn w6l_heman_emits_a_parameter_tied_return_and_the_caller_bindings() {
 }
 
 /// RED 4 — lil: the literal branch has no trackable origin (the summary marks
-/// the return `unknown`); no permit, the caller local stays
-/// `return-not-adapted` with the typed origin failure.
+/// the return `unknown`); no permit, and the callee earns no plan.
+///
+/// **Re-pinned by R615-7 (wave-6l 055, rule (b′) with the bracket).** With no
+/// permit the callee's return stays RAW, so the caller local — indexed to the
+/// NUL — is the sealed constructor's fallback slice WRAPPED around the raw
+/// call rather than a `return-not-adapted` hold. The origin failure is still
+/// recorded.
 #[test]
 fn w6l_lil_to_string_literal_branch_is_held_typed() {
     let observed = observe(LIL);
     let s = decision_of(&observed, "lil_to_boolean::s");
-    // R217-2(a) re-pin (batch-8 composition): wave-6a's sealed slice
-    // constructor now examines the walked call result first and names its
-    // own residue (`slice-local-construction`); on this lane's base the
-    // residue stays `return-not-adapted` with the origin failure. Either way
-    // the row is a typed hold and the callee earns no plan.
-    assert!(
-        s.contains("ReturnNotAdapted") || s.contains("SliceLocalConstruction"),
-        "{s}"
+    assert!(s.starts_with("Slice"), "{s}");
+    assert_eq!(
+        failure_of(&observed, "lil_to_boolean::s"),
+        Some(LifetimeFailure::OriginUnknown),
+        "{:?}",
+        observed.failures
     );
-    if s.contains("ReturnNotAdapted") {
-        assert_eq!(
-            failure_of(&observed, "lil_to_boolean::s"),
-            Some(LifetimeFailure::OriginUnknown),
-            "{:?}",
-            observed.failures
-        );
-    }
     assert!(
         !observed
             .plans

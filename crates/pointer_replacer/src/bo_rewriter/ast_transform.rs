@@ -1561,6 +1561,43 @@ pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize
     None
 }
 
+/// **wave-6l (R615-7): a slice construction WRAPPED around its initializer.**
+///
+/// A local callee's raw result is typed by a sealed constructor. As a use
+/// graft its text would REPLACE the initializer before the seam pass and the
+/// raw-view / C-9 / receiver passes run, and a replaced subtree keeps none of
+/// the spans they are keyed on. This visitor runs after all of them,
+/// post-order, and wraps the node's already-rewritten text in the
+/// constructor's prefix and suffix. The
+/// node keeps its own span, so nothing keyed on it is disturbed. A key it never
+/// meets leaves the raw value under the slice declaration, which the verify
+/// loop reports as a type error for that class alone.
+struct ConstructionBracketVisitor<'a> {
+    brackets: &'a FxHashMap<(u32, u32), (String, String)>,
+    applied: FxHashSet<(u32, u32)>,
+}
+
+impl MutVisitor for ConstructionBracketVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        rustc_ast::mut_visit::walk_expr(self, e);
+        if e.span.is_dummy() {
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        let Some((open, close)) = self.brackets.get(&key) else {
+            return;
+        };
+        if self.applied.contains(&key) {
+            return;
+        }
+        let inner = rustc_ast_pretty::pprust::expr_to_string(e);
+        if let Ok(parsed) = graft_expr(&format!("{open}{inner}{close}")) {
+            e.kind = parsed.kind;
+            self.applied.insert(key);
+        }
+    }
+}
+
 impl MutVisitor for UseGraftVisitor<'_> {
     fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
         let key = (e.span.lo().0, e.span.hi().0);
@@ -4674,6 +4711,7 @@ fn transform_with<'tcx>(
     }
     let box_fabricated = filtered.box_fabricated;
     let uses = filtered.uses;
+    let construction_brackets = filtered.construction_brackets;
     let statement_deletes = filtered.statement_deletes;
     let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
     // wave-6l: native-result views at the same node as a use graft compose
@@ -5100,6 +5138,13 @@ fn transform_with<'tcx>(
     )?;
     super::wave6r_option_reborrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     super::slice_forms_ast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    // wave-6l (R615-7): the slice constructions wrapped around a raw call
+    // result, LAST among the passes that may edit inside an initializer.
+    let mut brackets = ConstructionBracketVisitor {
+        brackets: &construction_brackets,
+        applied: FxHashSet::default(),
+    };
+    brackets.visit_crate(&mut krate);
     // R631-12: every argument-level edit is in place; the arm-(a) reads are
     // hoisted above their call's received reborrow.
     super::arg_order_hoist::apply(table, &mut krate, &mut guard);
@@ -5925,6 +5970,9 @@ pub(crate) struct FilteredInputs {
     pub use_key_collisions: usize,
     pub seam_key_collisions: usize,
     pub statement_deletes: FxHashSet<(u32, u32)>,
+    /// wave-6l (R615-7): slice constructions wrapped around their initializer
+    /// node, keyed by the initializer's span.
+    pub construction_brackets: FxHashMap<(u32, u32), (String, String)>,
     pub box_fabricated: usize,
     /// Selected unavailable alternatives must already have held their caller.
     /// A remaining failure is reported by transform_with, never silently lost.
@@ -5946,6 +5994,7 @@ pub(crate) fn filtered_inputs(
         use_key_collisions: 0,
         seam_key_collisions: 0,
         statement_deletes: FxHashSet::default(),
+        construction_brackets: FxHashMap::default(),
         box_fabricated: 0,
         callee_parameter_input_errors: Vec::new(),
     };
@@ -6177,12 +6226,25 @@ pub(crate) fn filtered_inputs(
             .replacement
             .as_ref()
             .expect("active slice construction has a replacement");
-        insert_counting(
-            &mut out.uses,
-            (plan.init_span.lo().0, plan.init_span.hi().0),
-            replacement.clone(),
-            &mut out.use_key_collisions,
-        );
+        match &plan.bracket {
+            // wave-6l (R615-7): the BRACKET form is not a use. It wraps the
+            // initializer node AFTER every pass that may edit inside it — the
+            // use pass, the seam pass (an argument's own raw bridge), the
+            // raw-view and receiver grafts — so the call renders with all of
+            // them (`ConstructionBracketVisitor`).
+            Some((open, close)) => {
+                out.construction_brackets.insert(
+                    (plan.init_span.lo().0, plan.init_span.hi().0),
+                    (open.clone(), close.clone()),
+                );
+            }
+            None => insert_counting(
+                &mut out.uses,
+                (plan.init_span.lo().0, plan.init_span.hi().0),
+                replacement.clone(),
+                &mut out.use_key_collisions,
+            ),
+        }
         out.box_fabricated += usize::from(plan.length.is_fallback());
     }
     let reverted_classes = reverts

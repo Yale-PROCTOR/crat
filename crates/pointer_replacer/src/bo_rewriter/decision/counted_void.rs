@@ -226,6 +226,7 @@ pub(crate) fn alias_construction<'tcx>(
             edition: 2018,
             requires_unsafe: false,
         },
+        bracket: None,
     })
 }
 

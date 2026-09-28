@@ -309,6 +309,15 @@ impl LifetimeEligibility {
                 .is_some_and(|reuse| reuse.slice)
     }
 
+    /// wave-6l (R608-1): does any return permit of this lane convert
+    /// `callee`'s return, in any form? A receiver of a callee no permit
+    /// converts reads the raw pointer the C code returned.
+    pub(crate) fn converts_return_of(&self, callee: LocalDefId) -> bool {
+        self.return_permits
+            .values()
+            .any(|permit| permit.function == callee)
+    }
+
     pub(crate) fn inferred_permit(&self, subject: NodeKey) -> Option<InferredLifetimePermit> {
         self.inferred_permits.get(&subject).copied()
     }

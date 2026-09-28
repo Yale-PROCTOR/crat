@@ -4648,10 +4648,10 @@ pub(crate) fn plan(
             (construction.replacement.as_ref(), located)
             && placement_failure.is_none()
         {
-            by_file.entry(file).or_default().push(Edit {
+            let edit = |lo: usize, hi: usize, replacement: String| Edit {
                 lo,
                 hi,
-                replacement: replacement.clone(),
+                replacement,
                 justification: Justification::SeamAdapter {
                     family: "slice-construction",
                     fabricated: extent.is_fallback(),
@@ -4663,7 +4663,18 @@ pub(crate) fn plan(
                 subject_id: subject_id.clone(),
                 required_arms: owner_arms.get(&owner).copied().unwrap_or_default().render(),
                 edit_kind: "slice-local-construction",
-            });
+            };
+            // wave-6l (R615-7): a bracket is two zero-width insertions at the
+            // initializer's boundaries, so the edits planned inside it render
+            // where they were planned (the AST pass wraps the re-rendered node).
+            let entry = by_file.entry(file).or_default();
+            match &construction.bracket {
+                Some((open, close)) => {
+                    entry.push(edit(lo, lo, open.clone()));
+                    entry.push(edit(hi, hi, close.clone()));
+                }
+                None => entry.push(edit(lo, hi, replacement.clone())),
+            }
         } else {
             unplaceable.push(Unplaceable {
                 owner_class: owner,

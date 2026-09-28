@@ -317,6 +317,13 @@ pub(crate) struct SliceConstructionPlan {
     pub(crate) length: SliceLengthPlan,
     pub(crate) composed_edit_spans: Vec<Span>,
     pub(crate) unsafe_context: UnsafeContextPresentation,
+    /// **wave-6l (R615-7): the construction as a BRACKET** — a prefix at the
+    /// initializer's opening boundary and a suffix at its closing one, the
+    /// initializer's own text left where it is (relay wave-6a/020 (ii)'s
+    /// form). A replacement of the whole initializer composes only the edits
+    /// the plan already holds for its span; an edit a later AST pass places
+    /// inside it (a raw view, a C-9 mark, a field wrap) would be dropped.
+    pub(crate) bracket: Option<(String, String)>,
 }
 
 /// wave-6l (R608-1): the byte length, NUL included, of a single
@@ -1484,6 +1491,25 @@ pub(crate) fn compose_initializer(
     Ok(composed)
 }
 
+/// wave-6l (R615-7): the local's initializer is a DIRECT call of a local
+/// callee whose return no family converts — no borrowed-return plan of the
+/// lifetime family, no Box return certificate — so its value is the raw
+/// pointer C returned. The decision-side twin is clause (b′) of
+/// `slice_local_construction::refuses`.
+fn raw_local_call_result(
+    table: &DecisionTable,
+    facts: &ConstructionFacts,
+    node: (LocalDefId, HirId),
+) -> bool {
+    matches!(facts.by_binding.get(&node), Some(Construction::CallResult))
+        && matches!(
+            facts.call_result_targets.get(&node),
+            Some(CallResultTarget::DirectLocal(callee))
+                if table.lifetime_plan.function(*callee).is_none()
+                    && !table.return_certificates.callees.contains_key(callee)
+        )
+}
+
 pub(crate) fn plan_slice_constructions(
     tcx: TyCtxt<'_>,
     table: &DecisionTable,
@@ -1659,6 +1685,7 @@ pub(crate) fn plan_slice_constructions(
                     edition: 2018,
                     requires_unsafe: false,
                 },
+                bracket: None,
             });
             continue;
         }
@@ -1708,9 +1735,31 @@ pub(crate) fn plan_slice_constructions(
                     wrapper_inserted: false,
                     ..unsafe_context
                 },
+                bracket: None,
             });
             continue;
         }
+        // wave-6l (R615-7): a local callee's RAW result — the call no family
+        // converts, which is what let the constructor refusal's clause (b)
+        // yield — is WRAPPED, never rewritten: the call and every edit
+        // planned inside it (an argument's own bridge) stay where they are.
+        let bracket = raw_local_call_result(table, facts, node).then(|| {
+            const HOLE: &str = "\u{0}";
+            let body = render_slice_constructor(
+                HOLE,
+                &element_type,
+                mutable,
+                nullable,
+                &length.expression,
+                true,
+                subject.local.as_u32(),
+            );
+            let wrapped = present_unsafe_text(body, enclosing_unsafe_fn);
+            let (open, close) = wrapped
+                .split_once(HOLE)
+                .expect("the constructor text carries its initializer once");
+            (open.to_owned(), close.to_owned())
+        });
         let rendered =
             // **A slice may never be built on a NULL base** (wave-4 report 053).
             // C2Rust writes `let mut p = 0 as *mut T;` for a C declaration, and
@@ -1766,6 +1815,13 @@ pub(crate) fn plan_slice_constructions(
                     present_unsafe_text(body, enclosing_unsafe_fn)
                 })
             };
+        let rendered = match &bracket {
+            Some((open, close)) => sm
+                .span_to_snippet(init_span)
+                .map(|text| format!("{open}{text}{close}"))
+                .map_err(|_| "raw call result initializer is unrenderable".to_owned()),
+            None => rendered,
+        };
         let mut inherited_length = length.clone();
         if !length.is_fallback()
             && let Some(name) = &subject.param_name
@@ -1794,8 +1850,15 @@ pub(crate) fn plan_slice_constructions(
                 .get(&node)
                 .map_or("unknown", Construction::key),
             length,
-            composed_edit_spans: composed_edits.into_iter().map(|(span, _)| span).collect(),
+            // A bracket composes nothing: the edits inside the initializer are
+            // applied where they were planned.
+            composed_edit_spans: if bracket.is_some() {
+                Vec::new()
+            } else {
+                composed_edits.into_iter().map(|(span, _)| span).collect()
+            },
             unsafe_context,
+            bracket,
         });
     }
     plans.sort_by_key(|plan| {
