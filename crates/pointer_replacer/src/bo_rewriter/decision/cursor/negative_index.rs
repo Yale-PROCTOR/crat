@@ -18,27 +18,54 @@
 //! fire. The run has no branch narrowing and no caller refinement: both only
 //! sharpen a value, so a `Neg` read here is still sound, and a value they would
 //! have sharpened to `Neg` reads `Top` — the guard can miss, never misfire.
+//!
+//! **R609-4 (c) — a loaded index, by measurement.** brotli's two
+//! `Process*CodeLength` rows read `symbol_lists` at a value LOADED from
+//! `next_symbol[…]` (set to `i - 16` in another function), which the lattice
+//! reads as `Top`. The second hold refuses an index that is, through copies and
+//! integer casts only, a load through a deref at every definition. It fires on
+//! `Top`, and is scoped by measurement: none of the five parameter cursors batch
+//! 48 delivers reads such an index (slicecursor 078; one control each pins it).
+//! A parameter, a constant, arithmetic, a call result, a partial write or an
+//! address-taken local anywhere on the chain answers no.
+//!
+//! **Its reads are the parameter's own**: the parameter and the compiler's
+//! temporaries that copy it, never a NAMED local copy. brotli's fragment core
+//! loops (`let base_ip = input; … base_ip.offset(*table.offset(hash))`) index a
+//! named peer by a table of stored positions, which are never below `input` — a
+//! `Top` that is correct, on the path this family is building. The `Neg` hold
+//! keeps the whole chain: a definite negative is below the entry through any
+//! copy.
 use rustc_hash::FxHashSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
-    mir::{Body, ConstOperand, Local, Location, Operand, PlaceElem, Rvalue, StatementKind},
+    mir::{
+        Body, CastKind, ConstOperand, Local, Location, Operand, PlaceElem, Rvalue, StatementKind,
+        TerminatorKind,
+    },
     ty::{self, TyCtxt},
 };
 use rustc_mir_dataflow::Analysis as _;
 
 use crate::analyses::offset_sign::sign::{AbsValue, Signedness};
 
-/// Does some offset of `subject` (or of a copy of it) read definitely below
-/// the pointer?
-pub(super) fn reads_below_entry(tcx: TyCtxt<'_>, function: LocalDefId, subject: Local) -> bool {
+/// Does some offset of `subject` (or of a copy of it) read below the pointer
+/// — definitely (`Neg`), or at an index loaded through a deref (R609-4 (c))?
+/// The definite answer wins when both apply.
+pub(super) fn below_entry(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    subject: Local,
+) -> Option<super::CursorHold> {
     if !tcx.is_mir_available(function.to_def_id()) {
-        return false;
+        return None;
     }
     let body = tcx
         .mir_drops_elaborated_and_const_checked(function)
         .borrow();
     let body: &Body<'_> = &body;
-    let chain = copies(body, subject);
+    let chain = copies(body, subject, true);
+    let own = copies(body, subject, false);
     let addr_takens = addr_takens(body);
     let mut cursor = Signedness {
         tcx,
@@ -49,9 +76,9 @@ pub(super) fn reads_below_entry(tcx: TyCtxt<'_>, function: LocalDefId, subject: 
     }
     .iterate_to_fixpoint(tcx, body, None)
     .into_results_cursor(body);
+    let mut loaded_index = false;
     for (block, data) in body.basic_blocks.iter_enumerated() {
-        let rustc_middle::mir::TerminatorKind::Call { func, args, .. } = &data.terminator().kind
-        else {
+        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
             continue;
         };
         let Some(constant) = func.constant() else { continue };
@@ -66,12 +93,10 @@ pub(super) fn reads_below_entry(tcx: TyCtxt<'_>, function: LocalDefId, subject: 
             _ => continue,
         };
         let [receiver, delta] = &args[..] else { continue };
-        if !receiver
-            .node
-            .place()
-            .and_then(|place| place.as_local())
-            .is_some_and(|local| chain.contains(&local))
-        {
+        let Some(receiver) = receiver.node.place().and_then(|place| place.as_local()) else {
+            continue;
+        };
+        if !chain.contains(&receiver) {
             continue;
         }
         cursor.seek_before_primary_effect(Location {
@@ -93,18 +118,83 @@ pub(super) fn reads_below_entry(tcx: TyCtxt<'_>, function: LocalDefId, subject: 
             matches!(value, AbsValue::Neg) || matches!(value, AbsValue::ConstI(c) if c < 0)
         };
         if below {
-            return true;
+            return Some(super::CursorHold::NegativeIndexBelowEntry);
+        }
+        loaded_index |=
+            !backward && own.contains(&receiver) && loaded(body, &delta.node, &addr_takens);
+    }
+    loaded_index.then_some(super::CursorHold::LoadedIndexBelowEntry)
+}
+
+/// Is this operand, through copies and integer casts only, a load through a
+/// deref at EVERY definition of every local on the way?
+fn loaded(body: &Body<'_>, operand: &Operand<'_>, addr_takens: &FxHashSet<Local>) -> bool {
+    let Some(start) = operand.place().and_then(|place| place.as_local()) else {
+        return false;
+    };
+    let mut stack = vec![start];
+    let mut seen = FxHashSet::default();
+    let mut load = false;
+    while let Some(local) = stack.pop() {
+        if !seen.insert(local) {
+            continue;
+        }
+        if local.index() <= body.arg_count || addr_takens.contains(&local) {
+            return false;
+        }
+        let mut defined = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(assignment) = &statement.kind else { continue };
+                if assignment.0.local != local {
+                    continue;
+                }
+                if assignment.0.as_local().is_none() {
+                    return false;
+                }
+                defined = true;
+                let place = match &assignment.1 {
+                    Rvalue::Use(operand) | Rvalue::Cast(CastKind::IntToInt, operand, _) => {
+                        match operand.place() {
+                            Some(place) => place,
+                            None => return false,
+                        }
+                    }
+                    Rvalue::CopyForDeref(place) => *place,
+                    _ => return false,
+                };
+                if place
+                    .projection
+                    .iter()
+                    .any(|e| matches!(e, PlaceElem::Deref))
+                {
+                    load = true;
+                } else if let Some(source) = place.as_local() {
+                    stack.push(source);
+                } else {
+                    return false;
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+                && destination.local == local
+            {
+                return false;
+            }
+        }
+        if !defined {
+            return false;
         }
     }
-    false
+    load
 }
 
 /// The subject and every local that holds the same pointer and nothing else:
 /// each of its assignments is a copy, a cast or the `&*p` reborrow idiom of
 /// the chain. A local that is ALSO assigned anything else (`p = c; … p =
 /// p.offset(1)`) is a walker of its own, not this pointer, and its reads are
-/// not the subject's.
-fn copies(body: &Body<'_>, start: Local) -> FxHashSet<Local> {
+/// not the subject's. `named: false` stops at a user variable: the
+/// compiler's temporaries only.
+fn copies(body: &Body<'_>, start: Local, named: bool) -> FxHashSet<Local> {
     let mut sources = rustc_hash::FxHashMap::<Local, Vec<Option<Local>>>::default();
     for data in body.basic_blocks.iter() {
         for statement in &data.statements {
@@ -122,18 +212,28 @@ fn copies(body: &Body<'_>, start: Local) -> FxHashSet<Local> {
             };
             sources.entry(destination).or_default().push(source);
         }
-        if let rustc_middle::mir::TerminatorKind::Call { destination, .. } = &data.terminator().kind
+        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
             && let Some(destination) = destination.as_local()
         {
             sources.entry(destination).or_default().push(None);
         }
     }
+    // A user variable carries a debug name; the compiler's temporaries do not.
+    let user_variables: FxHashSet<Local> = body
+        .var_debug_info
+        .iter()
+        .filter_map(|info| match info.value {
+            rustc_middle::mir::VarDebugInfoContents::Place(place) => place.as_local(),
+            rustc_middle::mir::VarDebugInfoContents::Const(_) => None,
+        })
+        .collect();
     let mut closure = FxHashSet::from_iter([start]);
     let mut changed = true;
     while changed {
         changed = false;
         for (destination, from) in &sources {
             if !closure.contains(destination)
+                && (named || !user_variables.contains(destination))
                 && from
                     .iter()
                     .all(|source| source.is_some_and(|source| closure.contains(&source)))

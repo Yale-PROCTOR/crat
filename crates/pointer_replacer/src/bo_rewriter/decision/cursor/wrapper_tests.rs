@@ -2287,3 +2287,154 @@ fn slicecursor_a_never_moving_parameter_with_an_unknown_index_stays_a_cursor() {
         cursor_dispositions(R608_UNKNOWN_INDEX)
     );
 }
+
+/// **R609-4 (c) — the guard's second shape, from brotli's
+/// `ProcessSingleCodeLength`.** `symbol_lists` is handed over 16 into its
+/// array and never moves; its index is LOADED (`next_symbol[code_len]`, set to
+/// `i - 16` elsewhere), so the sign lattice reads `Top` and the `Neg` guard
+/// cannot see it. A parameter cursor's window starts at the pointer, so the
+/// read below it would panic where the input is correct.
+const R609_LOADED_INDEX: &str = r#"
+unsafe extern "C" fn store_symbol(mut symbol_lists: *mut u16, next_symbol: &[i32],
+    mut code_len: u32, mut symbol: u16) {
+    let mut next: i32 = next_symbol[code_len as usize];
+    *symbol_lists.offset(next as isize) = symbol;
+}
+pub unsafe extern "C" fn witness(lists: &mut [u16], next: &[i32], code_len: u32, symbol: u16) {
+    store_symbol(lists.as_mut_ptr().offset(16), next, code_len, symbol)
+}
+"#;
+
+#[test]
+fn slicecursor_a_never_moving_parameter_with_a_loaded_index_is_not_a_cursor() {
+    let dispositions = cursor_dispositions(R609_LOADED_INDEX);
+    assert!(
+        dispositions.contains(&(
+            "store_symbol::symbol_lists".to_owned(),
+            "Err(LoadedIndexBelowEntry)".to_owned()
+        )),
+        "a loaded index is not provably at or above the entry: {dispositions:?}"
+    );
+    // The input's own behaviour survives: `next_symbol[3] = 3 - 16`, so the
+    // store lands 13 below the handed-over pointer, at index 3 of the lists.
+    let source = emitted(R609_LOADED_INDEX);
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut lists = vec![0u16; 16 + 1024]; let next: Vec<i32> = (0..16).map(|i| i - 16).collect(); unsafe { witness(&mut lists, &next, 3, 7); } assert_eq!(lists[3], 7); }",
+        ),
+    );
+}
+
+/// The below-entry hold and the planned form of one parameter, read from the
+/// corpus text itself (`testdata/r609-delivered-cursors/`, copied verbatim
+/// from rs-crown-derived with the declarations it needs).
+fn r609_row(input: &str, owner: &str, param: &str) -> (Option<String>, bool) {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| {
+                subject.param_name.as_deref() == Some(param)
+                    && tcx.item_name(subject.fn_did.to_def_id()).as_str() == owner
+            })
+            .unwrap_or_else(|| panic!("{owner}::{param} subject"));
+        let parameter_cursor = match decision {
+            Decision::Cursor { plan, .. } => plan.wrapper && plan.parameter,
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        (
+            super::negative_index::below_entry(tcx, subject.fn_did, subject.local)
+                .map(|hold| format!("{hold:?}")),
+            parameter_cursor,
+        )
+    })
+    .expect("r609 row")
+}
+
+/// **R609-4's controls — one per delivered parameter cursor.** Batch 48
+/// delivers these five as parameter cursors; each never moves and reads a
+/// `Top` index. The loaded-index hold fires on `Top`, so each is pinned on its
+/// own corpus text: no hold, and still a parameter cursor.
+fn r609_control(input: &str, owner: &str, param: &str) {
+    assert_eq!(
+        r609_row(input, owner, param),
+        (None, true),
+        "{owner}::{param} is a delivered parameter cursor the guard must not touch"
+    );
+}
+
+#[test]
+fn slicecursor_r609_control_next_table_bit_size_count() {
+    r609_control(
+        include_str!("../../testdata/r609-delivered-cursors/next_table_bit_size.rs"),
+        "NextTableBitSize",
+        "count",
+    );
+}
+
+#[test]
+fn slicecursor_r609_control_replicate_value_table() {
+    r609_control(
+        include_str!("../../testdata/r609-delivered-cursors/replicate_value.rs"),
+        "ReplicateValue",
+        "table",
+    );
+}
+
+/// `code_lengths[symbol]`: `symbol` is ALSO accumulated from loads
+/// (`symbol += *count.offset(bits)`), and reset to `18` before every read here.
+/// The hold follows every definition, so the arithmetic answers no.
+#[test]
+fn slicecursor_r609_control_build_code_lengths_huffman_table_code_lengths() {
+    r609_control(
+        include_str!("../../testdata/r609-delivered-cursors/code_lengths_huffman_table.rs"),
+        "BrotliBuildCodeLengthsHuffmanTable",
+        "code_lengths",
+    );
+}
+
+#[test]
+fn slicecursor_r609_control_transform_dictionary_word_dst() {
+    r609_control(
+        include_str!("../../testdata/r609-delivered-cursors/transform_dictionary_word.rs"),
+        "BrotliTransformDictionaryWord",
+        "dst",
+    );
+}
+
+#[test]
+fn slicecursor_r609_control_ends_in_bz2_name() {
+    r609_control(
+        include_str!("../../testdata/r609-delivered-cursors/ends_in_bz2.rs"),
+        "endsInBz2",
+        "name",
+    );
+}
+
+/// **The three negative rows, on their own corpus text.** Report 076's three:
+/// the two `Process*CodeLength` rows read a loaded index (R609-4 (c)), and
+/// `BrotliBuildHuffmanTable` a definitely negative one (R608-1). None may be
+/// a parameter cursor.
+#[test]
+fn slicecursor_r609_the_three_negative_rows_are_held() {
+    let input = include_str!("../../testdata/r609-delivered-cursors/negative_rows.rs");
+    for (owner, hold) in [
+        ("ProcessSingleCodeLength", "LoadedIndexBelowEntry"),
+        ("ProcessRepeatedCodeLength", "LoadedIndexBelowEntry"),
+        ("BrotliBuildHuffmanTable", "NegativeIndexBelowEntry"),
+    ] {
+        assert_eq!(
+            r609_row(input, owner, "symbol_lists"),
+            (Some(hold.to_owned()), false),
+            "{owner}::symbol_lists"
+        );
+    }
+}

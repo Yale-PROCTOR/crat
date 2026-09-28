@@ -117,6 +117,9 @@ pub(crate) enum CursorHold {
     /// R608-1: a parameter that never moves and is read at a definitely
     /// negative offset; its window would start at the pointer.
     NegativeIndexBelowEntry,
+    /// R609-4 (c): the same parameter read at an index loaded through a deref,
+    /// which the sign lattice reads as `Top`; scoped by measurement.
+    LoadedIndexBelowEntry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
