@@ -1810,3 +1810,109 @@ fn w6a_r608_a_branch_in_a_loop_or_without_a_release_keeps_its_hold() {
         out.source
     );
 }
+
+/// brotli's `ClearHistograms*` / `CopyLiteralsToByteArray` lends: the callee's
+/// formal hands an ELEMENT pointer on (`clear_one(array.offset(i))`,
+/// `memcpy(literals.offset(pos) as *mut c_void, ..)`).
+const ELEMENT_PASS_ON: &str = r#"
+extern "C" {
+    fn memcpy(d: *mut std::os::raw::c_void, s: *const std::os::raw::c_void, n: usize) -> *mut std::os::raw::c_void;
+    fn keep_elsewhere(p: *mut u32);
+}
+#[repr(C)]
+pub struct Keeper {
+    pub kept: *mut u32,
+}
+pub unsafe extern "C" fn clear_one(mut p: *mut u32) {
+    *p = 0 as u32;
+}
+pub unsafe extern "C" fn clear_all(mut array: *mut u32, n: usize) {
+    let mut i = 0 as usize;
+    while i < n {
+        clear_one(array.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+}
+pub unsafe extern "C" fn copy_into(mut literals: *mut u8, n: usize, mut src: *const u8) {
+    memcpy(literals.offset(1 as isize) as *mut std::os::raw::c_void, src as *const std::os::raw::c_void, n);
+}
+pub unsafe extern "C" fn keep_one(mut k: *mut Keeper, mut p: *mut u32) {
+    (*k).kept = p;
+}
+pub unsafe extern "C" fn keeps_an_element(mut array: *mut u32, mut k: *mut Keeper) {
+    keep_one(k, array.offset(1 as isize));
+}
+pub unsafe extern "C" fn hands_off_an_element(mut array: *mut u32) {
+    keep_elsewhere(array.offset(1 as isize));
+}
+pub unsafe extern "C" fn lends(mut m: *mut MemoryManager, n: usize, mut src: *const u8) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    clear_all(hist, n);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+    let mut literals = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    copy_into(literals, n, src);
+    BrotliFree(m, literals as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn kept(mut m: *mut MemoryManager, n: usize, mut k: *mut Keeper) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    keeps_an_element(hist, k);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn handed_off(mut m: *mut MemoryManager, n: usize) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    hands_off_an_element(hist);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+}
+"#;
+
+/// **R608-1 (the 8 held `call-argument-not-a-lend` rows)** — a callee's
+/// formal that hands an ELEMENT pointer on (`p.offset(e)` as a call
+/// argument) is a lend when the callee it reaches is: the same nested proof
+/// a bare pass-on takes (a local callee's body, or the contract table's
+/// no-retain borrow-view row for a foreign one). Before, only an `offset`
+/// directly under a deref counted, and both owners here read
+/// `contract-allocation:use:call-argument-not-a-lend`.
+#[test]
+fn w6a_r608_an_element_handed_to_a_lending_callee_is_a_lend() {
+    let out = emitted("r608-element-lend", &format!("{PRELUDE}{ELEMENT_PASS_ON}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    for owner in ["lends::hist", "lends::literals"] {
+        assert!(
+            receipts.contains(&format!("{owner}\tadmitted\t")),
+            "{context}"
+        );
+        assert_eq!(reason_of(&out.degradations, owner), None, "{context}");
+    }
+    let text = compact(&out.source);
+    assert!(
+        text.contains("letmuthist:Box<[u32]>=Box::from_raw("),
+        "{context}"
+    );
+    assert!(
+        text.contains("letmutliterals:Box<[u8]>=Box::from_raw("),
+        "{context}"
+    );
+    assert!(!text.contains("drop("), "{context}");
+}
+
+/// Controls: an element pointer that reaches a callee which KEEPS it (a
+/// store into a struct), and one handed to a foreign function with no
+/// no-retain row, are not lends — the owners keep their holds.
+#[test]
+fn w6a_r608_an_element_kept_or_handed_to_an_unknown_callee_is_not_a_lend() {
+    let out = emitted(
+        "r608-element-lend-controls",
+        &format!("{PRELUDE}{ELEMENT_PASS_ON}"),
+    );
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    for owner in ["kept::hist", "handed_off::hist"] {
+        assert!(
+            receipts.contains(&format!(
+                "{owner}\theld\tcontract-allocation:use:call-argument-not-a-lend"
+            )),
+            "{owner}\n{receipts}\n{}",
+            out.source
+        );
+    }
+}

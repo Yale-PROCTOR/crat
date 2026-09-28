@@ -938,6 +938,33 @@ struct LendWalk<'tcx> {
     nested: Vec<(DefId, usize)>,
 }
 
+impl LendWalk<'_> {
+    /// `element` (a `p.offset(e)`), under its casts, as an argument of a call
+    /// to a named function: that position, or `None`.
+    fn element_argument(&self, element: &Expr<'_>) -> Option<(DefId, usize)> {
+        let mut child = element.hir_id;
+        loop {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(child) else {
+                return None;
+            };
+            match &parent.kind {
+                ExprKind::Cast(..) => child = parent.hir_id,
+                ExprKind::Call(callee, args) => {
+                    let index = args.iter().position(|a| a.hir_id == child)?;
+                    let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else {
+                        return None;
+                    };
+                    let Res::Def(DefKind::Fn, did) = path.res else {
+                        return None;
+                    };
+                    return Some((did, index));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
 impl<'tcx> Visitor<'tcx> for LendWalk<'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
 
@@ -970,9 +997,17 @@ impl<'tcx> Visitor<'tcx> for LendWalk<'tcx> {
                             self.tcx.parent_hir_node(parent.hir_id),
                             rustc_hir::Node::Expr(g) if matches!(g.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
                         );
-                        if !(name == "is_null"
-                            || (matches!(name, "offset" | "add" | "wrapping_add") && under_deref))
-                        {
+                        let element = matches!(name, "offset" | "add" | "wrapping_add");
+                        if name == "is_null" || element && under_deref {
+                            // A read or write through the element: no escape.
+                        } else if element && let Some(pass_on) = self.element_argument(parent) {
+                            // **R608-1** — an ELEMENT pointer handed to a callee
+                            // (`clear_one(p.offset(i))`, `memcpy(p.offset(k) as
+                            // ..)`) is lent exactly as far as that callee's
+                            // position is: the same nested proof a bare pass-on
+                            // takes, resolved by the caller.
+                            self.nested.push(pass_on);
+                        } else {
                             self.ok = false;
                         }
                     }
