@@ -790,6 +790,41 @@ fn w6l_nul_w8_an_element_width_local_callee_row_takes_the_optional_slice() {
     assert!(row.contains("\topt-slice\tfallback\t"), "{row}");
 }
 
+/// C12 (R631-3) — a width the walk cannot state keeps the hold: the callee
+/// binds `p as *const u32` to a local and reads four bytes through it, beside
+/// an element-width `u8` read. The bound local is not followed, so the width
+/// is unstated, not the one read that is.
+const PROBE_BOUND_WIDER_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn ReadBound(p: *const core::ffi::c_void) -> u32 {
+    let q = p as *const u32;
+    (*(p as *const u8) as u32).wrapping_add(*q)
+}
+unsafe fn Hash4(data: *const u8) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let h = ReadBound(data as *const core::ffi::c_void);
+    return h.wrapping_add(*data as u32);
+}
+pub struct Ctx {
+    pub data: *const u8,
+}
+pub unsafe fn caller(mut ctx: *mut Ctx) -> u32 {
+    Hash4((*ctx).data)
+}
+"#;
+
+#[test]
+fn w6l_nul_c12_an_unstated_callee_width_keeps_the_hold() {
+    let decisions = super::emit_tests::decisions_of(PROBE_BOUND_WIDER_LOCAL_CALLEE);
+    assert_eq!(
+        reason(&decisions, "data", true),
+        "held:local-callee-access-extent",
+        "{decisions:#?}"
+    );
+}
+
 const CONTROL_ONE_ELEMENT_LOCAL: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case)]
 unsafe fn read_one(p: *const u32) -> u32 {
