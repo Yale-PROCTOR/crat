@@ -204,6 +204,10 @@ pub(crate) enum Unproved {
     /// which is wave-6k's shared-read consumer's (charter (d)); this lane
     /// leaves it untouched so that consumer's receipts stay identical.
     ReadReadPeers,
+    /// R619-4: the type rule would certify the pair, but one side is `entry`
+    /// storage and the other program-internal, and no later rule separated
+    /// them.
+    EntryBesideInternal,
 }
 
 impl Unproved {
@@ -223,6 +227,7 @@ impl Unproved {
             Self::TypeUnresolved => "pair-disjointness-unproved:type-unresolved",
             Self::RootsUnknown => "pair-disjointness-unproved:roots-unknown",
             Self::ReadReadPeers => "pair-disjointness-unproved:read-read-peers",
+            Self::EntryBesideInternal => "pair-disjointness-unproved:entry-beside-internal",
         }
     }
 }
@@ -1026,7 +1031,14 @@ impl PairDisjointnessIndex {
             .type_rule
             .get(&key)
             .map_or(Err(Unproved::TypeUnresolved), |row| row.verdict);
-        if type_verdict.is_ok() {
+        // R619-4 (Erratum 9a (i)): storage that entered through a pointer
+        // parameter may be an exported entry's, which the effective-type
+        // premise does not cover, and beside program-internal storage no waiver
+        // covers the pair either. So the type rule yields there and the rules
+        // below decide. Entry beside entry keeps it (its receipt's root
+        // classes count it under W4, R462-1); internal beside internal is P3's.
+        let yields = matches!((root_side(a.class), root_side(b.class)), (0, 1) | (1, 0));
+        if type_verdict.is_ok() && !yields {
             return Ok(CertificateKind::TypeRule);
         }
         // R550-2: a divergence at two members of one union is remembered, so the
@@ -1078,7 +1090,8 @@ impl PairDisjointnessIndex {
         Err(match type_verdict {
             Err(Unproved::TypeUnresolved) => Unproved::RootsUnknown,
             Err(why) => why,
-            Ok(()) => unreachable!("an accepted type rule returned above"),
+            // Only a yielded type rule reaches here accepted.
+            Ok(()) => Unproved::EntryBesideInternal,
         })
     }
 

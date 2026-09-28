@@ -130,6 +130,8 @@ mod pair_static_literal_store_tests;
 #[cfg(test)]
 mod pair_static_root_tests;
 #[cfg(test)]
+mod pair_type_rule_yield_tests;
+#[cfg(test)]
 mod pair_view_of_formal_tests;
 pub(crate) mod plan;
 #[cfg(test)]
