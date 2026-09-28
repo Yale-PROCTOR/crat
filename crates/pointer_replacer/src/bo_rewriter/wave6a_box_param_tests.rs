@@ -628,10 +628,13 @@ pub struct slot {{ pub key: *mut i8, pub value: i32 }}
 }
 
 /// **The leak-parity line of W6A-C2.** A store into a field the input's own C
-/// `free` releases would hand a Rust-allocated block to libc: refused with
-/// `box-param-store-c-free:<callee>:<field>` (the composition where that
-/// field is an owned `Box` field — wave-6f's W6F-3 — is where the store
-/// becomes a move and the drop is theirs).
+/// `free` releases hands a Rust-allocated block to libc. Under R448-1 (B′)
+/// every emitted crate declares the system allocator, whose blocks libc may
+/// free (R620-3 (a)), so the refusal
+/// `box-param-store-c-free:<callee>:<field>` stands only where the crate's
+/// allocator is ANOTHER one: here a user type that forwards to `System` (the
+/// composition where that field is an owned `Box` field — wave-6f's W6F-3 —
+/// is where the store becomes a move and the drop is theirs).
 #[test]
 fn w6a_c2_store_into_a_c_freed_field_is_refused() {
     const FREED: &str = r#"
@@ -649,7 +652,10 @@ pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
     (*slots.offset(index as isize)).key = 0 as *mut i8;
 }
 "#;
-    let out = emitted("boxparam-store-cfree", &with_prelude(FREED));
+    let out = emitted(
+        "boxparam-store-cfree",
+        &with_prelude(&format!("{FREED}{CUSTOM_ALLOCATOR}")),
+    );
     let src = compact(&out.source);
     assert!(!src.contains("Box<[i8]>"), "{}", out.source);
     assert!(
@@ -2374,8 +2380,12 @@ fn w6a_r561_5_input_form_caller_weakens_the_same_place_twice() {
     );
 }
 
-/// The emitted crate's allocator is the system's (R443-1): the declaration
-/// relay wave-6a/120 gates the `store-c-free` lift on.
+/// A user allocator that forwards to `System` is still not `System` (R619-8):
+/// the refusal's remaining case once (B′) declares the system's everywhere.
+const CUSTOM_ALLOCATOR: &str = "\nstruct A;\nunsafe impl std::alloc::GlobalAlloc for A {\n    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 { std::alloc::GlobalAlloc::alloc(&std::alloc::System, l) }\n    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, p, l) }\n}\n#[global_allocator]\nstatic GLOBAL: A = A;\n";
+
+/// The emitted crate's allocator is the system's (R443-1), declared by the
+/// input itself; (B′) declares the same one where the input declares none.
 const SYSTEM_ALLOCATOR: &str =
     "\n#[global_allocator]\nstatic GLOBAL: std::alloc::System = std::alloc::System;\n";
 
@@ -2387,9 +2397,11 @@ const SYSTEM_ALLOCATOR: &str =
 /// and each member's block must be a real one: `vec![0; 0]` is a dangling
 /// pointer that libc's `free` would be handed, so an ordinary allocation
 /// lifts only on a positive literal count that every cast preserves.
-/// Controls, one violation each: no declaration, a declared allocator that is
-/// not `System`, that allocator beside an unrelated `System` static, a literal
-/// a narrowing cast zeroes, a count the program computes.
+/// Under R448-1 (B′) an input that declares no allocator is emitted with the
+/// system's, so it lifts too. Controls, one violation each: a declared
+/// allocator that is not `System`, that allocator beside an unrelated
+/// `System` static, a literal a narrowing cast zeroes, a count the program
+/// computes.
 #[test]
 fn w6a_r620_a_c_freed_store_lifts_under_the_declared_system_allocator() {
     const FREED: &str = r#"
@@ -2433,9 +2445,24 @@ pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
         "{receipts}"
     );
 
-    let custom = format!(
-        "{FREED}\nstruct A;\nunsafe impl std::alloc::GlobalAlloc for A {{\n    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {{ std::alloc::GlobalAlloc::alloc(&std::alloc::System, l) }}\n    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {{ std::alloc::GlobalAlloc::dealloc(&std::alloc::System, p, l) }}\n}}\n#[global_allocator]\nstatic GLOBAL: A = A;\n"
+    // R448-1 (B′): an input that declares no allocator is emitted with the
+    // system's, so it lifts exactly as the declared one does.
+    let out = emitted("r620-store-cfree-undeclared", &with_prelude(FREED));
+    let receipts = &out.artifacts.box_param_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    assert!(
+        compact(&out.source).contains("mutkey:Box<[i8]>)"),
+        "{}\n{receipts}",
+        out.source
     );
+    assert!(
+        receipts.contains(
+            "box-param-store-c-free-lift callee=slot_set index=2 field=slot::key allocator=System"
+        ),
+        "{receipts}"
+    );
+
+    let custom = format!("{FREED}{CUSTOM_ALLOCATOR}");
     // A custom allocator IS the global one; an unrelated `System` static
     // beside it does not make the crate's allocator the system's.
     let beside = custom.replace(
@@ -2452,11 +2479,6 @@ pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
     );
     assert_ne!(computed, declared);
     for (name, source, reason) in [
-        (
-            "r620-store-cfree-undeclared",
-            FREED.to_owned(),
-            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key",
-        ),
         (
             "r620-store-cfree-custom",
             custom,
@@ -2637,8 +2659,8 @@ fn w6a_r620_an_exported_store_consumer_takes_the_owning_form() {
     );
 }
 
-/// R620-3's controls, one violation each: without the allocator declaration
-/// the store stays refused; a field the program never frees is not the
+/// R620-3's controls, one violation each: under another allocator the store
+/// stays refused; a field the program never frees is not the
 /// ruled shape (R534's own store control, `ht_park`, is that one); a formal
 /// tested for null before it is measured may be null, so it is not a
 /// non-null C string. Outside the extension nothing supersedes the model,
@@ -2668,8 +2690,8 @@ fn w6a_r620_the_store_extension_holds_outside_its_shape() {
     assert!(two_sinks.contains("keep(str);") && two_sinks.contains("KEPT = s;"));
     for (name, source, reason) in [
         (
-            "r620-exported-store-undeclared",
-            EXPORTED_STORE.to_owned(),
+            "r620-exported-store-custom-allocator",
+            format!("{EXPORTED_STORE}{CUSTOM_ALLOCATOR}"),
             "box-param-store-c-free:buffer_new_with_string_length:buffer_t::alloc",
         ),
         (

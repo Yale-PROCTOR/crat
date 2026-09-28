@@ -1172,44 +1172,15 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
 
 /// **R620-3 (a) — the emitted crate's allocator is the system's** (R443-1):
 /// then a block Rust allocates is a `malloc` block, and a C `free` of it is
-/// defined — on Linux, where `System` IS libc's allocator (the contract
-/// `ownership_fields_native::c_free_allocator_compatible` pins). Read from the
-/// crate, whose items the emission keeps; R443-2's (B′) appends the same
-/// declaration to every emitted crate root, and at its composition this reads
-/// that emission too. `#[global_allocator]` is a builtin macro, gone before
-/// HIR; what it leaves is the `__rust_alloc` shim naming the selected static,
-/// so the allocator is the static THAT shim reads — never merely some
-/// `System` static in the crate. No shim, or another static: not `System`.
+/// defined. **Composed with R448-1 (B′)**, which appends
+/// `#[global_allocator] static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` to
+/// every emitted crate with a surviving edit (a crate with none has no Box): a
+/// crate graph that declares no allocator of its own is emitted with exactly
+/// that one, and a crate that declares one keeps it. So the question is the
+/// pinned Linux System / libc-free contract itself — no user allocator in the
+/// graph except a local `System` (R619-8), std present, Linux.
 pub(crate) fn emitted_allocator_is_system(tcx: TyCtxt<'_>) -> bool {
-    struct Statics(Vec<DefId>);
-    impl<'tcx> Visitor<'tcx> for Statics {
-        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
-            if let ExprKind::Path(QPath::Resolved(_, path)) = &e.kind
-                && let Res::Def(DefKind::Static { .. }, did) = path.res
-            {
-                self.0.push(did);
-            }
-            intravisit::walk_expr(self, e);
-        }
-    }
-    tcx.sess.target.os == "linux"
-        && tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
-        && tcx.hir_crate_items(()).definitions().any(|did| {
-            if !matches!(tcx.def_kind(did), DefKind::Fn)
-                || tcx
-                    .opt_item_name(did.to_def_id())
-                    .is_none_or(|n| n.as_str() != "__rust_alloc")
-            {
-                return false;
-            }
-            let Some(body_id) = tcx.hir_node_by_def_id(did).body_id() else { return false };
-            let mut statics = Statics(Vec::new());
-            statics.visit_expr(tcx.hir_body(body_id).value);
-            statics.0.dedup();
-            matches!(statics.0.as_slice(), [global]
-                if matches!(tcx.type_of(*global).instantiate_identity().kind(),
-                    TyKind::Adt(adt, _) if tcx.def_path_str(adt.did()) == "std::alloc::System"))
-        })
+    super::ownership_fields_native::c_free_allocator_compatible(tcx)
 }
 
 /// A positive integer literal that every one of its casts preserves
