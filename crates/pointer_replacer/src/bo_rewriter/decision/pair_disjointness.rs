@@ -1447,6 +1447,8 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     // it. Two DIFFERENT admitted fields are two different allocations. The same
     // field on both sides is the same block, and an unrelated root is refused:
     // a pointer taken out of the field after the allocation is that same block.
+    // A stack object or a static is the exception (R631-11): no allocator
+    // returns either.
     match (a, b) {
         (
             RootClass::FreshField {
@@ -1493,8 +1495,15 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
                     && !other_via_offset
                     && !(same_base_only && other_same_base_only))
                     .then(|| kind(freshness.join(other_freshness))),
-                _ => (other.object_id() == Some(base))
-                    .then(|| kind(freshness.join(other.freshness()))),
+                // R631-11: every store into an admitted field is an allocation
+                // or null, and an allocator never returns a stack object or a
+                // static, so the field's block is neither — no store needed.
+                // An entry object may be the block itself, and a fresh local
+                // may be the one the field was admitted through; both stay
+                // refused here.
+                _ => (other.object_id() == Some(base)
+                    || matches!(other, RootClass::StackObject(_) | RootClass::Static(_)))
+                .then(|| kind(freshness.join(other.freshness()))),
             };
         }
         _ => {}

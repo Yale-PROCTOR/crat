@@ -79,10 +79,13 @@ pub unsafe fn Caller() {
 }
 "#;
 
-/// C1: internal / internal — a static beside an admitted field's block.
+/// C1: internal / internal — a fresh local beside an admitted field's block.
+/// (A static there is a root certificate since R631-11, so it would not reach
+/// the type rule.)
 const INTERNAL_BESIDE_INTERNAL: &str = r#"
 pub unsafe fn II(mut q: *mut Q) {
-    Put(&mut GA, (*q).bs);
+    let mut a = malloc(4) as *mut A;
+    Put(a, (*q).bs);
 }
 "#;
 

@@ -324,7 +324,9 @@ pub unsafe fn Write() {
 
 /// W7: the local form beside a stack object. Its address is taken twice, so
 /// R466-5's fresh-stack certificate (address first taken at the call) does not
-/// answer first.
+/// answer first. Since R631-11 the root clause does — an admitted field's block
+/// is no stack object, store or not — so (f)'s own stack case is reached only
+/// one call up, through (f′) (W6).
 const A_STACK_OBJECT_LOCALLY: &str = r#"
 pub unsafe fn Build(mut mb: *mut Split) {
     let mut local: u32 = 0;
@@ -498,7 +500,7 @@ fn w6p_r628_fp_a_stack_object_at_the_caller_is_not_an_allocation() {
 fn w6p_r628_f_a_stack_object_is_not_an_allocation() {
     assert_eq!(
         verdict(&source(A_STACK_OBJECT_LOCALLY), "Build", "Use2", 0, 1),
-        Ok(CertificateKind::AllocationIdentity)
+        Ok(CertificateKind::DistinctRoots)
     );
 }
 

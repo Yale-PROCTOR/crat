@@ -112,6 +112,8 @@ mod pair_field_origin_tests;
 #[cfg(test)]
 mod pair_fresh_field_tests;
 #[cfg(test)]
+mod pair_heap_vs_stack_tests;
+#[cfg(test)]
 mod pair_one_sided_field_tests;
 #[cfg(test)]
 mod pair_projection_recovery_tests;
