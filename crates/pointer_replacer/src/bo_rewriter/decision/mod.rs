@@ -57,6 +57,7 @@ mod counted_void_handle;
 mod counted_void_loop;
 mod counted_void_read;
 mod counted_void_store;
+pub(crate) mod cstring_receiver;
 pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;

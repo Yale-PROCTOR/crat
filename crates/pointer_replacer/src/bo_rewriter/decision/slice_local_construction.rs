@@ -193,7 +193,11 @@ fn call_result_of_local_callee(constructions: &ConstructionFacts, subject: &Subj
 /// the callee's prior deliveries (the wall of report 001) — so it is declined
 /// up front and keeps its typed hold. (The same predicate wave-6k's rule
 /// carries; here so that this rule declines it too.)
-fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+/// `(argument, assigned)`: the subject is an argument of a local callee
+/// (clause (c)), and it is assigned a local callee's result (clause (b)'s
+/// assignment form). Kept apart so the assignment form alone can yield
+/// (W6S-16).
+fn local_callee_uses(tcx: TyCtxt<'_>, subject: &Subject) -> (bool, bool) {
     use rustc_hir::{
         ExprKind, QPath,
         def::{DefKind, Res},
@@ -204,6 +208,7 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
         typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
         binding: HirId,
         found: bool,
+        assigned: bool,
     }
     impl<'tcx> Visitor<'tcx> for Find<'tcx> {
         fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
@@ -242,7 +247,7 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
                     && def_id.is_local()
                     && self.tcx.is_mir_available(def_id)
                 {
-                    self.found = true;
+                    self.assigned = true;
                 }
             }
             rustc_hir::intravisit::walk_expr(self, expr);
@@ -253,9 +258,10 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
         typeck: tcx.typeck(subject.fn_did),
         binding: subject.hir_id,
         found: false,
+        assigned: false,
     };
     find.visit_body(tcx.hir_body_owned_by(subject.fn_did));
-    find.found
+    (find.found, find.assigned)
 }
 
 /// **The refusal every constructor-typing rule shares** (this lane's W6A-B1
@@ -269,11 +275,17 @@ fn argument_of_local_callee(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
 /// interface, R397-6(b)). `decide_one` asks this BEFORE either rule and
 /// before the receiver arms, so a matching receiver plan still delivers.
 pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
-    matches!(subject.kind, SubjectKind::Local)
-        && subject.ty_span.is_none()
-        && ((call_result_of_local_callee(ctx.constructions, subject)
+    if !matches!(subject.kind, SubjectKind::Local) || subject.ty_span.is_some() {
+        return false;
+    }
+    let (argument, assigned) = local_callee_uses(ctx.tcx, subject);
+    (call_result_of_local_callee(ctx.constructions, subject)
             && !super::native_result_expression::bridges_local_callee_result(ctx, subject))
-            || argument_of_local_callee(ctx.tcx, subject)
+            || argument
+            // W6S-16 (R609-4): the assignment form yields where the callee's
+            // return stays raw, no receiver plan exists and the body licenses
+            // the string's own extent — no converted return to mistype.
+            || (assigned && !super::cstring_receiver::admits(ctx, subject))
             || (root_is_a_reference_candidate(ctx, subject)
                 && !field_decay_reborrows(ctx, subject))
             // (d) R445-2: the subject is an exact suffix view of an owner this
@@ -284,7 +296,7 @@ pub(crate) fn refuses(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
             // costs nothing where no Box is coming: that rule permits only
             // while the owner's candidate exists, which is the same fact the
             // native producer's R442 exemption reads.
-            || super::source_typed_local::permits(ctx, subject))
+            || super::source_typed_local::permits(ctx, subject)
 }
 
 /// **(e) wave-6f's W6F-5′ reborrow stands (a) aside** (R456-6). Clause (a)

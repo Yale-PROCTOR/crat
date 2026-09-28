@@ -287,6 +287,8 @@ mod native_return_replay_tests;
 #[cfg(test)]
 mod nested_use_tests;
 #[cfg(test)]
+mod nullinit_receiver_tests;
+#[cfg(test)]
 mod one_span_one_arm_tests;
 #[cfg(test)]
 mod option_call_dependency_tests;

@@ -122,9 +122,12 @@ fn w5c_pinned_local_lil_rows_reach_their_own_gates() {
     use super::DegradeReason;
     let table = decisions(&fixture());
     for label in ["fnc_if::r", "fnc_charat::str"] {
+        // W6S-16 (R609-4): `fnc_charat::str` now DELIVERS (a C-string
+        // receiver, `Option<&[i8]>`); the pin's claim — no longer gated by its
+        // owner's fn-pointer pin — holds either way.
         let reason = reason(decision(&table, label));
         assert!(
-            reason.is_some_and(|reason| !matches!(reason, DegradeReason::CallSiteNotAdapted)),
+            reason.is_none_or(|reason| !matches!(reason, DegradeReason::CallSiteNotAdapted)),
             "{label}: {:?}",
             decision(&table, label)
         );

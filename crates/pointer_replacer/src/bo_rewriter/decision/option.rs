@@ -613,6 +613,74 @@ pub(crate) fn plan_values(
             } else if slice && initializer && found == seam::Form::Raw {
                 adapter = "owned-item2-nullable-slice-construction".to_owned();
                 None
+            } else if slice
+                && found == seam::Form::Raw
+                && !initializer
+                && super::cstring_receiver::admitted_on(tcx, table, subject)
+            {
+                // W6S-16 (R609-4): a C-string receiver's value is the call
+                // bound once, sliced over the string and its terminator — the
+                // extent the body's own libc string call licenses (R491-7),
+                // never the fallback.
+                let element = table
+                    .declaration_pointees
+                    .get(&node)
+                    .map(|ty| ty.pointee.clone())
+                    .or_else(|| {
+                        subject
+                            .pointee_span
+                            .and_then(|span| tcx.sess.source_map().span_to_snippet(span).ok())
+                    })
+                    .unwrap_or_else(|| "i8".to_owned());
+                // The call's text with its nested edits composed, each
+                // parenthesized for textual splicing.
+                let sm = tcx.sess.source_map();
+                let nested = composed
+                    .iter()
+                    .map(|(span, replacement)| {
+                        let original = sm.span_to_snippet(*span).unwrap_or_default();
+                        (
+                            *span,
+                            super::cstring_receiver::parenthesize_receiver(&original, replacement),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match construction::compose_initializer(
+                    view_span,
+                    &sm.span_to_snippet(view_span).unwrap_or_default(),
+                    &nested,
+                ) {
+                    Ok(call) => {
+                        evidence.extent = MechanicalExtent::Evidence(
+                            super::cstring_receiver::EVIDENCE.to_owned(),
+                        );
+                        adapter = "nullable-c-string-assignment".to_owned();
+                        Some(super::cstring_receiver::render_value(
+                            &call,
+                            &element,
+                            unsafe_fn,
+                            subject.local.as_u32(),
+                        ))
+                    }
+                    Err(why) => {
+                        reason = Some(MechanicalTerminalReason::CompositionCrossingUnhoistable(
+                            why,
+                        ));
+                        None
+                    }
+                }
+            } else if slice
+                && found == seam::Form::Raw
+                && !initializer
+                && super::cstring_receiver::licensed_receiver(tcx, subject)
+            {
+                // W6S-16: a C-string receiver the arm above does not admit (a
+                // callee's return was converted after the decision) is held,
+                // never given the fallback extent.
+                reason = Some(MechanicalTerminalReason::EvidenceMissing(
+                    "c-string-receiver-return-converted".to_owned(),
+                ));
+                None
             } else if slice && found == seam::Form::Raw {
                 let element = subject
                     .pointee_span
