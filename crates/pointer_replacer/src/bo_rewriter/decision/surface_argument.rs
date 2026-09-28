@@ -105,6 +105,9 @@ pub(crate) fn delivered_element(region: &super::void_region::Region) -> Option<&
         // for a shape this rule had never seen; it is not the right answer.
         super::void_region::Shape::WidthWrite => Some("u8"),
         super::void_region::Shape::ByteView => None,
+        // R609-4: a scalar formal delivered as its bytes.
+        super::void_region::Shape::ScalarBytes => Some("u8"),
+        super::void_region::Shape::ScalarBytesRawView => None,
     }
 }
 

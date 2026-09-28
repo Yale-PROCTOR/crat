@@ -4790,6 +4790,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                 if matches!(expected, Form::Raw) && !raw_boundary_observation {
                     continue;
                 }
+                // wave-6b (R609-4): at a byte-region formal an `&mut x as ..`
+                // cast is read WHOLE — text and subtree alike.
+                let whole_cast = matches!(arg.shape, ArgShape::AddrOfCast { .. })
+                    && param_key
+                        .get(&(*callee, arg.index))
+                        .and_then(|k| table.void_region.get(k))
+                        .is_some_and(|region| {
+                            region.shape == super::void_region::Shape::ScalarBytes
+                        });
                 // The third element is the span `text` is read from — carried
                 // out of this match rather than reconstructed below, because
                 // the two cast shapes read the OPERAND's snippet while every
@@ -4827,6 +4836,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                             false,
                         )
                     }
+                    // wave-6b (R609-4): a byte-region formal takes the WHOLE
+                    // cast as its raw pointer (`&mut x as *mut c_int as *mut
+                    // T`), never the typed borrow inside it.
+                    ArgShape::AddrOfCast { .. } if whole_cast => (
+                        Form::Raw,
+                        sm.span_to_snippet(arg.span).ok(),
+                        true,
+                        true,
+                        false,
+                    ),
                     ArgShape::AddrOfCast { mutable, inner } => (
                         Form::Ref { mutable },
                         sm.span_to_snippet(inner).ok(),
@@ -4878,9 +4897,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // The two reads are kept in step by CONSTRUCTION: `text` is
                 // the snippet of exactly this span, so a shape whose operand
                 // moves moves both or neither.
-                let Some(text_span) = text_span_of(arg.shape, arg.span)
-                    .map(|span| super::array_start::text_span(arg, span))
-                else {
+                let Some(text_span) = (if whole_cast {
+                    Some(arg.span)
+                } else {
+                    text_span_of(arg.shape, arg.span)
+                })
+                .map(|span| super::array_start::text_span(arg, span)) else {
                     // Unreachable — the shapes with no nameable operand are
                     // blocked above. Fail-closed rather than defaulting to
                     // `arg.span`, which would hand the AST layer a subtree the
@@ -5341,6 +5363,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                             field_tied_params.contains(&pos.index),
                             region,
                         )
+                        // wave-6b (R609-4 (a)): a byte-region write side whose
+                        // read-side peer stayed raw because the pair is not
+                        // proven disjoint AT THIS CALL is receipted T2 here.
+                        .map(|candidate| {
+                            candidate.map(|mut candidate| {
+                                if region.is_some_and(|region| {
+                                    region.shape == super::void_region::Shape::ScalarBytes
+                                }) && super::void_region::pair_unproven_at(
+                                    table,
+                                    *callee,
+                                    pos.index,
+                                    site,
+                                    a5_site_proofs,
+                                ) {
+                                    candidate.retention = BridgeRetentionTier::T2;
+                                    candidate.waiver_id = Some(
+                                        crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID
+                                            .to_owned(),
+                                    );
+                                }
+                                candidate
+                            })
+                        })
                     },
                 );
                 // Only a place of the caller's OWN object (`&mut local.f`, no

@@ -2270,6 +2270,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // wave-6b: a void parameter whose body REINTERPRETS the buffer at a proven
     // region (accessor chain, width reader) is a byte slice over that region.
     let region = void_region::active(ctx, subject);
+    // R609-4 (a): the read side of two byte-region formals that are not proven
+    // disjoint at some call stays raw; its write-side peer keeps the region.
+    if void_region::pair_raw_view(ctx, subject) {
+        return degrade(subject, decl_site, DegradeReason::PairRawView);
+    }
     if counted.is_none()
         && region.is_none()
         && void_pointee.contains(&(subject.fn_did, subject.hir_id))

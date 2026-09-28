@@ -7641,10 +7641,11 @@ fn finish_decide<'tcx>(
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
-    let void_region = decision::void_region::collect(
+    let mut void_region = decision::void_region::collect(
         tcx,
         &subjects,
         &facts.referenced,
+        &facts.call_args,
         &mut declaration_pointees,
     );
     let void_region_receivers =
@@ -7926,6 +7927,15 @@ fn finish_decide<'tcx>(
     } else {
         a5_site_proofs
     };
+    // wave-6b (R609-4 (a)): two byte-region formals of one call are paired on
+    // the same proofs; an unproven pair keeps its read side raw.
+    decision::void_region::pair_gate(
+        &mut void_region,
+        &subjects,
+        &facts.call_args,
+        &a5_site_proofs,
+        &mut declaration_pointees,
+    );
     let exposure_seed = decision::exposure::ExposureSeed::derive(
         &program,
         &run_config.configured_exposure,

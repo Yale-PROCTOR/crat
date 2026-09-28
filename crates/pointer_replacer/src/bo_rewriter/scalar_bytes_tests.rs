@@ -274,25 +274,33 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
     );
     let (source, _) = emitted(COPY_BE);
     let c = compact(&source);
+    // The count names the RESOLVED scalar, as W6B-6's views always have.
     for (function, width) in [
-        ("copy_be16", "u16_0"),
-        ("copy_be32", "u32_0"),
-        ("copy_be64", "u64_0"),
+        ("copy_be16", "u16"),
+        ("copy_be32", "u32"),
+        ("copy_be64", "u64"),
     ] {
         assert!(
             c.contains(&format!("fn{function}(mutpdest:&mut[u8],")),
             "{function}: the written formal is a byte region: {source}"
         );
         assert!(
-            c.contains(&format!("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(pdest.as_mut_ptr()aslibc::c_uchar,core::mem::size_of::<{width}>())"))
-                || c.contains(&format!("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(pdest.as_mut_ptr()as*mutlibc::c_uchar,core::mem::size_of::<{width}>())")),
+            c.contains(&format!("letmutdest:&mut[u8]=core::slice::from_raw_parts_mut(pdest.as_mut_ptr()as*mutlibc::c_uchar,core::mem::size_of::<{width}>())")),
             "{function}: the byte view is a child of the formal's region: {source}"
         );
-        assert!(
-            c.contains("letmutsource:&[u8]=core::slice::from_raw_parts("),
-            "{function}: the read view delivers: {source}"
-        );
     }
+    // The read views deliver: two as byte slices, and `copy_be64`'s, whose
+    // index is the loop's `7 - i`, as the cursor family's safe form.
+    assert_eq!(
+        c.matches("letmutsource:&[u8]=core::slice::from_raw_parts(")
+            .count(),
+        2,
+        "{source}"
+    );
+    assert!(
+        c.contains("crate::slice_cursor::SliceCursor::from_raw_parts(psourceas*mutlibc::c_uchar"),
+        "{source}"
+    );
     assert!(
         c.contains("copy_be32(core::slice::from_raw_parts_mut(((pas*mutu32_0)as*mutu8),4)"),
         "a byte cursor is bridged as exactly four bytes, no typed reference: {source}"
@@ -305,9 +313,17 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
         ),
         "an integer local's address is bridged as its four bytes: {source}"
     );
-    assert!(
-        !source.contains("FALLBACK_SLICE_EXTENT"),
-        "the extent is the scalar's size, never fabricated: {source}"
+    // Nothing this rule builds fabricates an extent. The one fallback in the
+    // file is the CURSOR family's constructor for `copy_be64::source`, which
+    // this fixture's sign analysis sends there (`7 - i` is unknown) and the
+    // corpus decides `slice` at batch 48; it is not a byte-region form.
+    assert_eq!(
+        c.matches("crate::FALLBACK_SLICE_EXTENT").count(),
+        c.matches(
+            "SliceCursor::from_raw_parts(psourceas*mutlibc::c_uchar,crate::FALLBACK_SLICE_EXTENT)"
+        )
+        .count(),
+        "the byte regions' extents are the scalar's size, never fabricated: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
@@ -339,45 +355,82 @@ fn w6b_byte_region_formals_run_identically() {
     assert_eq!(original, run_binary(&with_libc(&source)));
 }
 
-/// R609-4 (a): at a site the pair family cannot prove disjoint, the READ side
-/// stays raw (`pair-raw-view`) and the WRITE side converts, its bridge at that
-/// site receipted T2 under the named waiver. Here one call passes the SAME
-/// cursor twice (`copy_be32(p, p)`), which is certainly not disjoint.
+/// R609-4 (a): at a call the pair proofs do not clear, the READ side stays raw
+/// (`pair-raw-view`) and the WRITE side converts, its bridge at that call
+/// receipted T2 under the named waiver. The fixture's own two such calls are
+/// the corpus's shapes: `put_value16`'s cursor beside the void payload
+/// (AddValue:1029) and `get_value64`'s union field beside a cursor
+/// (GetValue:1432). `copy_be32`'s calls are certified, and stay T1.
 #[test]
 fn w6b_an_unproven_byte_region_pair_keeps_the_read_side_raw() {
+    let rows = decisions(COPY_BE);
+    for function in ["copy_be16", "copy_be64"] {
+        assert!(
+            is_slice(decision(&rows, function, "pdest"), true),
+            "{function}: the written side converts: {:?}",
+            decision(&rows, function, "pdest")
+        );
+        assert!(
+            is_pair_raw_view(decision(&rows, function, "psource")),
+            "{function}: the read side of an unproven pair stays raw: {:?}",
+            decision(&rows, function, "psource")
+        );
+    }
+    let (source, events) = emitted(COPY_BE);
+    let c = compact(&source);
+    for (function, width) in [("copy_be16", "u16"), ("copy_be64", "u64")] {
+        assert!(
+            c.contains(&format!(
+                "fn{function}(mutpdest:&mut[u8],mutpsource:*mut{width}_0)"
+            )),
+            "{function}: {source}"
+        );
+    }
+    let region_bridges = events
+        .iter()
+        .filter(|(kind, _, _)| kind.starts_with("c-raw-slice"))
+        .collect::<Vec<_>>();
+    let t2 = region_bridges
+        .iter()
+        .filter(|(_, tier, waiver)| {
+            *tier == super::bridge_receipt::BridgeRetentionTier::T2
+                && waiver.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+        })
+        .count();
+    assert!(
+        t2 >= 2,
+        "the two unproven calls' write-side bridges carry the T2 receipt: {events:#?}"
+    );
+    assert!(
+        region_bridges
+            .iter()
+            .any(|(_, tier, _)| *tier == super::bridge_receipt::BridgeRetentionTier::T1),
+        "a certified call's bridges stay T1: {events:#?}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// A call passing ONE root at two positions (`copy_be32(p, p)`) is the
+/// aliased-storage twin's; the callee keeps its hold rather than grafting a
+/// view the twin would duplicate.
+#[test]
+fn w6b_a_same_root_call_keeps_the_hold() {
     let input = format!(
         "{COPY_BE}\npub unsafe fn swap_in_place(mut item: *mut binn) {{ let mut p = (*item).pbuf as *mut libc::c_uchar; copy_be32(p as *mut u32_0, p as *mut u32_0); }}\n"
     );
     let rows = decisions(&input);
+    for name in ["pdest", "psource"] {
+        assert!(
+            !matches!(decision(&rows, "copy_be32", name), Decision::Slice { .. }),
+            "copy_be32::{name} is not a byte region: {:?}",
+            decision(&rows, "copy_be32", name)
+        );
+    }
     assert!(
-        is_slice(decision(&rows, "copy_be32", "pdest"), true),
-        "the written side converts: {:?}",
-        decision(&rows, "copy_be32", "pdest")
+        is_slice(decision(&rows, "copy_be16", "pdest"), true),
+        "the other callees are unaffected: {:?}",
+        decision(&rows, "copy_be16", "pdest")
     );
-    assert!(
-        is_pair_raw_view(decision(&rows, "copy_be32", "psource")),
-        "the read side of an unproven pair stays raw: {:?}",
-        decision(&rows, "copy_be32", "psource")
-    );
-    let (source, events) = emitted(&input);
-    let c = compact(&source);
-    assert!(
-        c.contains("fncopy_be32(mutpdest:&mut[u8],mutpsource:*mutu32_0)"),
-        "{source}"
-    );
-    assert!(
-        c.contains("letmutsource:&[u8]=core::slice::from_raw_parts(psourceas*mutlibc::c_uchar,core::mem::size_of::<u32_0>())"),
-        "the read view is built from the raw formal, as before: {source}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|(kind, tier, waiver)| kind.contains("region")
-                && *tier == super::bridge_receipt::BridgeRetentionTier::T2
-                && waiver.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)),
-        "the unproven site's write-side bridge carries the T2 receipt: {events:#?}"
-    );
-    assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
 /// An `&mut b` caller can take the typed reference, and does: the byte region

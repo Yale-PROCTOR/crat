@@ -79,6 +79,17 @@ pub(crate) enum Shape {
     /// 009 / R416-7; binn `copy_be64::source`). The local is the subject; the
     /// parameter keeps its own form.
     ByteView,
+    /// The FORMAL of a byte view, when every caller reaches it through a cast
+    /// (R609-4; binn `copy_be32::pdest`): `&mut [u8]` / `&[u8]` of exactly
+    /// `size_of::<T>()`, built at each call from the caller's own pointer. A
+    /// typed `&mut T` over a byte cursor would be a misaligned reference, which
+    /// is why the C code reaches the scalar through bytes in the first place.
+    ScalarBytes,
+    /// The READ side of two [`Shape::ScalarBytes`] formals of one callee whose
+    /// arguments are not proven disjoint at some call (R609-4 (a)): it stays
+    /// raw (`pair-raw-view`), and the write side's bridge at that call is
+    /// receipted T2. Never a region any code path renders.
+    ScalarBytesRawView,
 }
 
 impl Shape {
@@ -88,6 +99,8 @@ impl Shape {
             Self::WidthRead => "width-read",
             Self::WidthWrite => "width-write",
             Self::ByteView => "byte-view",
+            Self::ScalarBytes => "scalar-bytes",
+            Self::ScalarBytesRawView => "scalar-bytes-raw-view",
         }
     }
 }
@@ -340,6 +353,8 @@ struct ByteView {
     size: u64,
     initializer: HirId,
     initializer_span: Span,
+    /// The parameter's own path inside the initializer's cast.
+    parameter_span: Span,
 }
 
 /// Count the body's path uses of one local binding.
@@ -417,6 +432,7 @@ fn read_byte_view<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<ByteView
         size,
         initializer: initializer.hir_id,
         initializer_span: initializer.span,
+        parameter_span: base.span,
     })
 }
 
@@ -568,6 +584,7 @@ pub(crate) fn collect(
     tcx: TyCtxt<'_>,
     subjects: &[Subject],
     referenced: &FxHashMap<LocalDefId, Vec<(super::emitability::RefKind, Span)>>,
+    call_args: &FxHashMap<LocalDefId, Vec<super::emitability::CallSite>>,
     pointees: &mut DeclarationPointees,
 ) -> Contracts {
     let mut chains: FxHashMap<LocalDefId, (Key, Chain)> = FxHashMap::default();
@@ -664,7 +681,9 @@ pub(crate) fn collect(
         }
         let len_bytes = match chain.shape {
             // A chain is read from a parameter's body; a byte view is a local's.
-            Shape::ByteView => unreachable!("a chain never reads as a byte view"),
+            Shape::ByteView | Shape::ScalarBytes | Shape::ScalarBytesRawView => {
+                unreachable!("a chain never reads as a byte view")
+            }
             Shape::WidthRead | Shape::WidthWrite => Some(chain.element_size),
             Shape::Accessor => absolute
                 .iter()
@@ -677,7 +696,9 @@ pub(crate) fn collect(
         let name = &chain.param_name;
         let element = &chain.element;
         let replacement = match chain.shape {
-            Shape::ByteView => unreachable!("a chain never reads as a byte view"),
+            Shape::ByteView | Shape::ScalarBytes | Shape::ScalarBytesRawView => {
+                unreachable!("a chain never reads as a byte view")
+            }
             // The whole assignment becomes a checked copy of the value's own
             // bytes into the region — same width, same order, no pointer.
             Shape::WidthWrite => {
@@ -757,8 +778,240 @@ pub(crate) fn collect(
                 replaced: view.initializer_span,
             },
         );
+        // R609-4: the view's FORMAL is itself a byte region of the scalar's
+        // size when every caller reaches it through a cast — the positions
+        // co-conversion blocks, because a typed reference over a byte cursor
+        // would be misaligned. A caller passing `&mut x` keeps the typed form.
+        let Some(formal) = subjects.iter().find(|s| {
+            s.fn_did == subject.fn_did
+                && s.hir_id == view.parameter
+                && s.ptr_depth == 1
+                && matches!(s.kind, SubjectKind::Param { .. })
+        }) else {
+            continue;
+        };
+        let SubjectKind::Param { hir_index } = formal.kind else { continue };
+        let key = (formal.fn_did, formal.hir_id);
+        if out.contains_key(&key) || !every_caller_casts(call_args, formal.fn_did, hir_index) {
+            continue;
+        }
+        let Some(name) = formal.param_name.clone() else { continue };
+        let Some(span) = formal.ty_span else { continue };
+        let Ok(original_alias) = tcx.sess.source_map().span_to_snippet(span) else { continue };
+        let Node::Pat(pat) = tcx.hir_node(formal.hir_id) else { continue };
+        let accessor = if formal.mutable {
+            "as_mut_ptr"
+        } else {
+            "as_ptr"
+        };
+        pointees.insert(
+            key,
+            ResolvedPointee {
+                original_alias,
+                input_type: super::declaration::pointee_source(
+                    tcx,
+                    tcx.typeck(formal.fn_did).pat_ty(pat),
+                ),
+                pointee: "u8".to_owned(),
+            },
+        );
+        out.insert(
+            key,
+            Region {
+                shape: Shape::ScalarBytes,
+                inner: None,
+                offset_bytes: 0,
+                len_bytes: Some(view.size),
+                element: "u8".to_owned(),
+                element_size: 1,
+                mutable: formal.mutable,
+                uses: vec![UseEdit {
+                    span: view.parameter_span,
+                    replacement: format!("{name}.{accessor}()"),
+                    bridge_kind: "scalar-bytes-formal",
+                }],
+                replaced: view.parameter_span,
+            },
+        );
     }
     out
+}
+
+/// Every direct call passes this position a raw-typed CAST (`p as *mut T`,
+/// `&mut x as *mut c_int as *mut T`, any other cast or raw expression), and
+/// there is at least one call. An `&mut x` or a bare binding could carry a
+/// typed reference, and a null literal carries no bytes at all.
+fn every_caller_casts(
+    call_args: &FxHashMap<LocalDefId, Vec<super::emitability::CallSite>>,
+    callee: LocalDefId,
+    index: usize,
+) -> bool {
+    use super::emitability::ArgShape;
+    let Some(sites) = call_args.get(&callee).filter(|sites| !sites.is_empty()) else {
+        return false;
+    };
+    // A call passing ONE root at two positions is the aliased-storage twin's
+    // (the callee is cloned raw for it), and a byte view grafted in the
+    // original would meet the twin's copy of the same node. That callee keeps
+    // its hold.
+    let aliased = sites.iter().any(|site| {
+        site.args.iter().enumerate().any(|(i, a)| {
+            a.shape.place_root().is_some_and(|root| {
+                site.args[i + 1..]
+                    .iter()
+                    .any(|b| b.shape.place_root() == Some(root))
+            })
+        })
+    });
+    if aliased {
+        return false;
+    }
+    sites.iter().all(|site| {
+        site.args.iter().any(|arg| {
+            arg.index == index
+                && matches!(
+                    arg.shape,
+                    ArgShape::CastOfLocal { .. }
+                        | ArgShape::AddrOfCast { .. }
+                        | ArgShape::Cast { .. }
+                        | ArgShape::RawExpr { .. }
+                )
+        })
+    })
+}
+
+/// **R609-4 (a) — two byte-region formals of one call, not proven disjoint.**
+///
+/// A callee with two [`Shape::ScalarBytes`] formals would form a `&mut [u8]` and
+/// a `&[u8]` at every call, and co-conversion's pair logic never sees them (it
+/// pairs `Ref`-decided positions only). So the pair is asked here, of the same
+/// A5 site proofs and pair certificates that logic reads: at any call where the
+/// two arguments are not `Clear`, the READ side stays raw
+/// ([`Shape::ScalarBytesRawView`] → `pair-raw-view`) and the write side keeps
+/// its region, receipted T2 at that call by the seam. Two WRITE sides that do
+/// not prove disjoint keep the lower position. To a fixpoint: a side that
+/// stays raw no longer pairs.
+pub(crate) fn pair_gate(
+    contracts: &mut Contracts,
+    subjects: &[Subject],
+    call_args: &FxHashMap<LocalDefId, Vec<super::emitability::CallSite>>,
+    proofs: &super::a5_site_proof::A5SeamProofIndex,
+    pointees: &mut DeclarationPointees,
+) {
+    let index_of = |key: &Key| {
+        subjects.iter().find_map(|s| match s.kind {
+            SubjectKind::Param { hir_index } if (s.fn_did, s.hir_id) == *key => Some(hir_index),
+            _ => None,
+        })
+    };
+    loop {
+        let mut withdrawn: Option<Key> = None;
+        'callees: for (callee, sites) in call_args {
+            let mut regions: Vec<(usize, Key, bool)> = contracts
+                .iter()
+                .filter(|((owner, _), region)| {
+                    owner == callee && region.shape == Shape::ScalarBytes
+                })
+                .filter_map(|(key, region)| Some((index_of(key)?, *key, region.mutable)))
+                .collect();
+            if regions.len() < 2 {
+                continue;
+            }
+            regions.sort_by_key(|(index, _, _)| *index);
+            for site in sites {
+                for (i, a) in regions.iter().enumerate() {
+                    for b in &regions[i + 1..] {
+                        if !a.2 && !b.2 {
+                            continue;
+                        }
+                        let (Some(left), Some(right)) = (
+                            site.args.iter().find(|arg| arg.index == a.0),
+                            site.args.iter().find(|arg| arg.index == b.0),
+                        ) else {
+                            continue;
+                        };
+                        let proof = proofs.lookup(
+                            site.caller.local_def_index.as_u32(),
+                            callee.local_def_index.as_u32(),
+                            a.0,
+                            b.0,
+                            left.span,
+                            right.span,
+                        );
+                        if proof.verdict == super::a5_site_proof::A5SiteProofVerdict::Clear {
+                            continue;
+                        }
+                        // The read side stays raw; of two writes, the later.
+                        withdrawn = Some(if !b.2 {
+                            b.1
+                        } else if !a.2 {
+                            a.1
+                        } else {
+                            b.1
+                        });
+                        break 'callees;
+                    }
+                }
+            }
+        }
+        let Some(key) = withdrawn else { break };
+        if let Some(region) = contracts.get_mut(&key) {
+            region.shape = Shape::ScalarBytesRawView;
+            region.uses.clear();
+        }
+        pointees.remove(&key);
+    }
+}
+
+/// Is this byte-region WRITE position bridged at `site` beside a read side that
+/// stayed raw because the pair is not proven disjoint THERE? The seam receipts
+/// that bridge T2 (R609-4 (a)); at a call whose pair is `Clear` the raw peer
+/// provably does not alias, and the bridge stays T1.
+pub(crate) fn pair_unproven_at(
+    table: &super::DecisionTable,
+    callee: LocalDefId,
+    index: usize,
+    site: &super::emitability::CallSite,
+    proofs: &super::a5_site_proof::A5SeamProofIndex,
+) -> bool {
+    let Some(own) = site.args.iter().find(|arg| arg.index == index) else { return false };
+    site.args.iter().any(|peer| {
+        peer.index != index
+            && table.entries.iter().any(|(s, _)| {
+                s.fn_did == callee
+                    && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == peer.index)
+                    && table
+                        .void_region
+                        .get(&(s.fn_did, s.hir_id))
+                        .is_some_and(|region| region.shape == Shape::ScalarBytesRawView)
+            })
+            && proofs
+                .lookup(
+                    site.caller.local_def_index.as_u32(),
+                    callee.local_def_index.as_u32(),
+                    index.min(peer.index),
+                    index.max(peer.index),
+                    if index < peer.index {
+                        own.span
+                    } else {
+                        peer.span
+                    },
+                    if index < peer.index {
+                        peer.span
+                    } else {
+                        own.span
+                    },
+                )
+                .verdict
+                != super::a5_site_proof::A5SiteProofVerdict::Clear
+    })
+}
+
+/// The READ side of an unproven byte-region pair: it stays raw.
+pub(crate) fn pair_raw_view(ctx: &super::Ctx<'_, '_>, subject: &Subject) -> bool {
+    ctx.void_region
+        .get(&(subject.fn_did, subject.hir_id))
+        .is_some_and(|region| region.shape == Shape::ScalarBytesRawView)
 }
 
 /// The body rewrites, installed over whatever the slice-use walk recorded for
@@ -766,7 +1019,7 @@ pub(crate) fn collect(
 /// view keeps the walk's rewrites: its uses are ordinary indexing.
 pub(crate) fn install(contracts: &Contracts, uses: &mut FxHashMap<Key, SliceUses>) {
     for (key, region) in contracts {
-        if region.shape == Shape::ByteView {
+        if matches!(region.shape, Shape::ByteView | Shape::ScalarBytesRawView) {
             continue;
         }
         uses.insert(
@@ -788,6 +1041,7 @@ pub(crate) fn active<'a>(ctx: &super::Ctx<'a, '_>, subject: &Subject) -> Option<
             .enabled(subject.fn_did, FamilyStage::SliceUse))
     .then(|| ctx.void_region.get(&(subject.fn_did, subject.hir_id)))
     .flatten()
+    .filter(|region| region.shape != Shape::ScalarBytesRawView)
 }
 
 /// Is this reference to `referenced` inside another accessor's region rewrite?
@@ -949,8 +1203,14 @@ pub(crate) fn retention(
     use crate::bo_rewriter::bridge_receipt::BridgeRetentionTier;
     match region.shape {
         // A byte view is a local's own reborrow; a width read or write calls
-        // nothing and keeps nothing.
-        Shape::WidthRead | Shape::WidthWrite | Shape::ByteView => (BridgeRetentionTier::T1, None),
+        // nothing and keeps nothing; a scalar's bytes are read or written in
+        // place. (A byte-region write side beside an unproven raw peer is
+        // receipted T2 per site, by the seam: `pair_unproven_at`.)
+        Shape::WidthRead
+        | Shape::WidthWrite
+        | Shape::ByteView
+        | Shape::ScalarBytes
+        | Shape::ScalarBytesRawView => (BridgeRetentionTier::T1, None),
         Shape::Accessor => (
             BridgeRetentionTier::T2,
             Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
