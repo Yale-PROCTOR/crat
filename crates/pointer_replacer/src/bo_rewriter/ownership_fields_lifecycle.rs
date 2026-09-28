@@ -172,3 +172,88 @@ pub fn implicit_close(
         })
     }
 }
+
+/// R622-3 (Extension X §5.2) — why the old value of an owning place is `None`
+/// at a store, so the store's implicit close has depth 0. The compiler-side
+/// derivation lives in `decision::ownership_fields_store_close`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoneWitness {
+    /// The stored value's own evaluation moves the place out first:
+    /// `p.f = callee(p.f.take(), ..)`.
+    TakenInValue,
+    /// An earlier statement of the same block moved the place out, and no
+    /// statement between names the base.
+    TakenBefore,
+    /// The base is a fresh allocation whose literal wrote `None` there, and no
+    /// statement between writes the place or names the base otherwise.
+    FreshLiteral,
+}
+
+pub const DEPTH_WITNESS_NONE: &str = "depth-witness(none)";
+pub const WAIVER_LEAK_RECURSIVE: &str = "waiver-leak(recursive-drop)";
+
+/// The close a store into an owning place makes (overwrite; X §5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreClose {
+    /// The payload is not recursive: addendum 101's overwrite drop.
+    Drop,
+    /// Recursive, and the old value is `None`: the store renders unchanged.
+    Witnessed(NoneWitness),
+    /// Recursive and unwitnessed: the old value is deliberately leaked.
+    Leak,
+}
+
+impl StoreClose {
+    /// `None` for [`StoreClose::Drop`], whose receipt is the caller's
+    /// `waiver-drop(overwrite)`.
+    pub fn receipt(self) -> Option<&'static str> {
+        match self {
+            Self::Drop => None,
+            Self::Witnessed(_) => Some(DEPTH_WITNESS_NONE),
+            Self::Leak => Some(WAIVER_LEAK_RECURSIVE),
+        }
+    }
+
+    /// The store `place = value` as emitted: unchanged (`None`), or, for a
+    /// leak, the old value moved out and forgotten.
+    pub fn render(self, place: &str, value: &str) -> Option<String> {
+        match self {
+            Self::Drop | Self::Witnessed(_) => None,
+            Self::Leak => Some(format!(
+                "::std::mem::forget(::std::mem::replace(&mut {place}, {value}))"
+            )),
+        }
+    }
+}
+
+/// `owning` maps each type to the pointee types of its owning fields (an
+/// absent type has none). The payload is recursive when a cycle of owning
+/// edges is reachable from it; only such a payload needs `witness`.
+pub fn store_close(
+    payload: OwnerId,
+    owning: &BTreeMap<OwnerId, Vec<OwnerId>>,
+    witness: Option<NoneWitness>,
+) -> StoreClose {
+    let mut graph = BTreeMap::new();
+    let mut pending = vec![payload];
+    while let Some(node) = pending.pop() {
+        if graph.contains_key(&node) {
+            continue;
+        }
+        let children = owning.get(&node).cloned().unwrap_or_default();
+        pending.extend(children.iter().copied());
+        graph.insert(
+            node,
+            if children.is_empty() {
+                DropShape::Leaf
+            } else {
+                DropShape::Fields(children)
+            },
+        );
+    }
+    match (recursive(payload, &graph), witness) {
+        (Ok(false), _) => StoreClose::Drop,
+        (Ok(true), Some(witness)) => StoreClose::Witnessed(witness),
+        (Ok(true), None) | (Err(_), _) => StoreClose::Leak,
+    }
+}
