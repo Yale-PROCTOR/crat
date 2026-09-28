@@ -77,8 +77,7 @@ fn w6l_mask_m1_a_read_past_a_masked_index_by_a_runtime_length_is_held() {
             .collect();
         assert_eq!(held.len(), 4, "{rows:#?}");
         assert!(
-            held.iter()
-                .all(|r| r == "held:masked-index-runtime-length"),
+            held.iter().all(|r| r == "held:masked-index-runtime-length"),
             "{rows:#?}"
         );
     }
@@ -165,10 +164,14 @@ pub unsafe fn Other(n: usize, s: *mut State, g: usize) -> i32 {
 /// receipted fallback, never an empty slice.
 #[test]
 fn w6l_mask_z1_an_only_zero_companion_is_not_licensed() {
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(ZERO_ROOT)).unwrap();
+    let source =
+        crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(ZERO_ROOT)).unwrap();
     let flat = flat(&source);
     assert!(!flat.contains("(gap) as usize"), "{flat}");
-    assert!(crate::bo_rewriter::verify::type_checks_str(&source), "{source}");
+    assert!(
+        crate::bo_rewriter::verify::type_checks_str(&source),
+        "{source}"
+    );
 }
 
 /// Z2 (iv) — the literal `0` spelled at the call is not licensed either.
@@ -186,14 +189,59 @@ fn w6l_mask_z2_a_literal_zero_companion_is_not_licensed() {
 /// Zc (iv) — the control: a companion that is not only `0` keeps its licence.
 #[test]
 fn w6l_mask_zc_a_companion_that_may_be_nonzero_stays_licensed() {
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(ZERO_ROOT)).unwrap();
+    let source =
+        crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(ZERO_ROOT)).unwrap();
     assert!(flat(&source).contains("(g) as usize"), "{source}");
 }
 
+/// Zc2 (iv)'s control — a local initialized `0` and later assigned a runtime
+/// value may be non-zero: its licence stands.
 #[test]
-fn w6l_mask_probe() {
-    for (name, input) in [("ring", fixture(RING)), ("zero", fixture(ZERO_ROOT))] {
-        eprintln!("== {name} {:#?}", crate::bo_rewriter::emit_tests::decisions_of(&input));
-        eprintln!("{}", crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap());
-    }
+fn w6l_mask_zc2_a_zero_initialized_local_assigned_later_stays_licensed() {
+    let input = fixture(&ZERO_ROOT.replace(
+        "    let mut gap = 0 as usize;\n    Iterate(n, gap, (*s).dc)",
+        "    let mut gap = 0 as usize;\n    if n > 3 {\n        gap = n;\n    }\n    Iterate(n, gap, (*s).dc)",
+    ));
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(flat(&source).contains("(gap) as usize"), "{source}");
+}
+
+/// Zc3 (iv)'s control — a borrowed local may be written through the borrow:
+/// its licence stands.
+#[test]
+fn w6l_mask_zc3_a_borrowed_zero_local_stays_licensed() {
+    let input = fixture(&ZERO_ROOT.replace(
+        "    let mut gap = 0 as usize;\n    Iterate(n, gap, (*s).dc)",
+        "    let mut gap = 0 as usize;\n    Widen(&mut gap, n);\n    Iterate(n, gap, (*s).dc)",
+    ).replace(
+        "pub unsafe fn Other(",
+        "unsafe fn Widen(g: *mut usize, n: usize) {\n    *g = n;\n}\npub unsafe fn Other(",
+    ));
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    assert!(flat(&source).contains("(gap) as usize"), "{source}");
+}
+
+/// M2 — the runtime-length read inside a closure the function runs is the
+/// function's read.
+#[test]
+fn w6l_mask_m2_a_read_in_a_closure_is_held() {
+    let input = fixture(
+        r###"
+unsafe fn Reader(data: *const u8, ix: usize, mask: usize, len: usize) -> u8 {
+    let at = ix & mask;
+    let read = |k: usize| *data.offset(at.wrapping_add(k) as isize);
+    read(len)
+}
+pub unsafe fn run(n: usize) -> u8 {
+    let buf: [u8; 4096] = [7; 4096];
+    Reader(buf.as_ptr(), n, 4095, 3)
+}
+"###,
+    );
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(&input);
+    assert_eq!(
+        reason(&rows, "data"),
+        "held:masked-index-runtime-length",
+        "{rows:#?}"
+    );
 }

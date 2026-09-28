@@ -5593,6 +5593,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                         (
                             companion
                                 .and_then(|i| site.args.iter().find(|argument| argument.index == i))
+                                // R631-4 (iv): a companion only ever `0` names no
+                                // extent; the root takes the receipted fallback.
+                                .filter(|argument| {
+                                    !super::masked_runtime::always_zero(
+                                        tcx,
+                                        site.caller,
+                                        argument.span,
+                                    )
+                                })
                                 .and_then(|argument| sm.span_to_snippet(argument.span).ok())
                                 .filter(|text| licensed_spelling(text))
                                 .map(|text| masked_len_text(text, masked)),

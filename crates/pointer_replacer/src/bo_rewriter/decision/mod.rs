@@ -75,6 +75,9 @@ pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod local_callee_extent;
+pub(crate) mod masked_runtime;
+#[cfg(test)]
+mod masked_runtime_tests;
 pub(crate) mod mixed_boundary;
 #[cfg(test)]
 mod mixed_boundary_tests;
@@ -110,8 +113,6 @@ pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
 #[cfg(test)]
 mod reader_chain_tests;
-#[cfg(test)]
-mod masked_runtime_tests;
 pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
@@ -658,6 +659,14 @@ pub(crate) enum DegradeReason {
         access: Box<local_callee_extent::LocalCalleeAccess>,
         count: Option<thin_counted::Hold>,
     },
+    /// R631-4 (wave-6l relay 061). The parameter is read past a masked index
+    /// by a length known only at run time (brotli's ring-buffer readers,
+    /// `data[(ix & mask) + len]`): no companion at the signature carries the
+    /// buffer's true length, so any slice built here panics where C reads on.
+    /// `reader` is the chain from the parameter's function to the reader.
+    MaskedIndexRuntimeLength {
+        reader: String,
+    },
     /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
     /// extent, so no reference form of it can carry the provenance its callee
     /// accesses through. Held at any depth.
@@ -920,6 +929,7 @@ impl DegradeReason {
             DegradeReason::ThinExtent => "held:thin-extent",
             DegradeReason::PendingSiblingOverlap => "pending-sibling-overlap",
             DegradeReason::LocalCalleeAccessExtent { .. } => "held:local-callee-access-extent",
+            DegradeReason::MaskedIndexRuntimeLength { .. } => "held:masked-index-runtime-length",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::ReturnNotAdapted => "return-not-adapted",
@@ -962,6 +972,7 @@ impl DegradeReason {
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
             }
+            DegradeReason::MaskedIndexRuntimeLength { reader } => reader.clone(),
             _ => "-".to_owned(),
         }
     }
@@ -2246,6 +2257,23 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && let Some(plan) = ctx.box_params.plans.get(&(subject.fn_did, subject.hir_id))
     {
         return Decision::Box(plan.clone());
+    }
+
+    // R631-4 (wave-6l): a parameter read past a masked index by a runtime
+    // length stays raw under its typed hold — a slice built on any companion
+    // at this signature panics where C reads on (R544-6: not yield).
+    if let SubjectKind::Param { hir_index } = subject.kind
+        && matches!(
+            model.get(&SlotRef::Local(subject.fn_did, slot_id)),
+            Some(SlotKind::Ref)
+        )
+        && let Some(reader) = masked_runtime::held(tcx, subject.fn_did, hir_index)
+    {
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::MaskedIndexRuntimeLength { reader },
+        );
     }
 
     // BO's kind first: it is the authority on WHETHER a reference is sound.
