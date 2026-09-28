@@ -413,7 +413,7 @@ pub unsafe extern \"C\" fn cluster(mut m: *mut MemoryManager, mut n: usize, mut 
 /// allocation inside a branch, released after the join, is admitted since
 /// R608-1: `w6a_r608_*`), (3) a read of the
 /// owner after its release, (4) a second allocation over a live generation
-/// (R434-4 §2 admitted this and the admission is WITHDRAWN — report 019 §3),
+/// (refused: R619-5 (3), P5),
 /// (5) a release before any generation exists, (6) the owner copied into a
 /// local that is not itself a contract owner — a second owner this rule
 /// cannot follow.
@@ -496,19 +496,14 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
             out.degradations
         );
     }
-    // (4) The re-seat over a live generation: ADMITTED (R434-4 §2 under
-    // R443-1), whose implicit close is well-defined because the emitted crate
-    // declares the System allocator — report 020's probe measured the same
-    // fixture UB without the declaration and clean with it. The control keeps
-    // the shape and asserts the waiver's receipt.
+    // (4) The re-seat over a live generation: REFUSED (R619-5 (3), P5 — a
+    // contract allocation never meets a Rust drop; R434-4 §2's admission
+    // rested on an allocator declaration never emitted).
     assert!(
-        receipts.contains("reseat_over_live::syms\tadmitted\twaiver-drop(overwrite) site="),
+        receipts.contains("reseat_over_live::syms\theld\tcontract-allocation:overwrite:"),
         "{receipts}"
     );
-    assert!(
-        !receipts.contains("reseat_over_live::syms\theld\t"),
-        "{receipts}"
-    );
+    assert!(!receipts.contains("waiver-drop(overwrite)"), "{receipts}");
     // (7) A local assigned from something that is not a contract owner is
     // not a generation at all: the rule leaves it alone — no receipt, no
     // degradation. Every program with a contract in it holds locals like
@@ -524,12 +519,11 @@ pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n:
         "{:#?}",
         out.degradations
     );
-    // Exactly ONE function of this fixture delivers: `reseat_over_live`, under
-    // §2's waiver. Every other gate's owner keeps its typed hold, which the
-    // per-subject assertions above already name.
+    // No function of this fixture delivers: every gate's owner keeps its
+    // typed hold, which the per-subject assertions above already name.
     assert_eq!(
         compact(&out.source).matches("Box<[u32]>").count(),
-        1,
+        0,
         "{}",
         out.source
     );
@@ -778,15 +772,12 @@ fn w6a_ac_the_libc_row_owns_malloc_calloc_and_strdup_locals() {
     );
 }
 
-/// **The overwrite of a live unique owner** (R434-4 §2, withdrawn on Miri's
-/// evidence in report 019 and RE-ADMITTED under R443-1): `dup = strdup(src)`
-/// over a generation the owner still holds. The input LEAKS the first block;
-/// the emitted program closes it with Rust's ordinary overwrite drop, which
-/// is what the leak-parity waiver licenses (addendum 101) — and which is
-/// well-defined because the emitted crate declares the System allocator, so
-/// Rust's deallocation IS the contract's `free` (report 020's probe: the same
-/// fixture is UB without the declaration and `ok r=0` with it, leaking 0 where
-/// the input leaks 1). The site carries `waiver-drop(overwrite)`.
+/// **The overwrite of a live unique owner is REFUSED** (R619-5 (3), P5: a
+/// contract allocation never meets a Rust drop). `dup = strdup(src)` over a
+/// generation the owner still holds: the input LEAKS the first block, and the
+/// emitted program would close it with Rust's overwrite drop — admitted once
+/// (R434-4 §2 under R443-1) on an allocator declaration that was never
+/// emitted (fan-out 008 items 7 / 16). The owner keeps the typed hold.
 ///
 /// Uniqueness is not assumed: a copy into another local, an unproven lend or
 /// an unbridged cast each refuse the subject before the simulation runs.
@@ -812,46 +803,20 @@ pub unsafe extern "C" fn twice(mut src: *const std::os::raw::c_char) -> i32 {
 "#;
 
 #[test]
-fn w6a_ac_an_overwrite_of_a_live_owner_takes_the_leak_parity_waiver() {
+fn w6a_ac_an_overwrite_of_a_live_owner_is_refused() {
     let out = emitted("ac-overwrite", OVERWRITTEN_OWNER);
-    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
-        std::fs::write(path, &out.source).expect("dump");
-    }
-    let text = compact(&out.source);
     let receipts = &out.artifacts.allocator_contract_receipts;
-    assert_eq!(
-        out.reverted, 0,
-        "{}\n{:#?}\n{receipts}",
-        out.source, out.degradations
-    );
-    assert_eq!(
-        reason_of(&out.degradations, "twice::dup"),
-        None,
-        "{:#?}\n{receipts}",
-        out.degradations
-    );
-    for expected in [
-        // The argument's spelling is a composition's (wave-6s 057's
-        // `src.as_ptr()`); the generation and its waiver are this rule's.
-        "letmutdup:Option<Box<[i8]>>=Some({let__crat_alloc=strdup(",
-        "ifdup.is_none(){return0asi32;}",
-        // The overwrite itself: a new generation assigned over a live one.
-        "dup=Some({let__crat_alloc=strdup(",
-        "free(dup.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutcore::ffi::c_void));",
-    ] {
-        assert!(
-            text.contains(expected),
-            "missing `{expected}`\n{}\n{receipts}",
-            out.source
-        );
-    }
-    // One overwritten generation, one waiver receipt.
-    assert_eq!(
-        receipts.matches("waiver-drop(overwrite) site=").count(),
-        1,
+    assert!(
+        receipts.contains("twice::dup\tyielded\tcontract-allocation:overwrite:")
+            || receipts.contains("twice::dup\theld\tcontract-allocation:overwrite:"),
         "{receipts}"
     );
-    assert!(receipts.contains("generations=2"), "{receipts}");
+    assert!(!receipts.contains("waiver-drop(overwrite)"), "{receipts}");
+    assert!(
+        compact(&out.source).contains("letmutdup=strdup("),
+        "{}\n{receipts}",
+        out.source
+    );
 }
 
 /// **The optional owner lent at a LOCAL callee's raw formal** (relay
@@ -1788,7 +1753,14 @@ fn w6a_r608_an_owner_created_in_one_branch_is_released_after_the_join() {
 fn w6a_r608_a_branch_in_a_loop_or_without_a_release_keeps_its_hold() {
     let out = emitted("r608-join-controls", &format!("{PRELUDE}{JOIN_OWNERS}"));
     let receipts = &out.artifacts.allocator_contract_receipts;
-    for owner in ["both_arms::modes", "branch_frees::modes"] {
+    // Two creating arms are an overwrite of a live generation to the linear
+    // simulation: refused (R619-5 (3), P5).
+    assert!(
+        receipts.contains("both_arms::modes\theld\tcontract-allocation:overwrite:"),
+        "both_arms::modes\n{receipts}\n{}",
+        out.source
+    );
+    for owner in ["branch_frees::modes"] {
         assert!(
             receipts.contains(&format!(
                 "{owner}\theld\tcontract-allocation:implicit-close:block-unbalanced"

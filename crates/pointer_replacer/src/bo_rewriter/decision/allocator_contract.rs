@@ -320,11 +320,11 @@ fn bare_local(e: &Expr<'_>) -> Option<HirId> {
     }
 }
 
-/// **R608-1** — `block` is the arm of an `if` with no `else` (the other path
-/// carries the owner's `None` to the join; two creating arms would read as an
-/// overwrite to the linear simulation), and no loop lies between that `if` and
-/// the block that declares `binding` (a loop would run the arm again over a
-/// live generation, an overwrite the simulation never sees).
+/// **R608-1** — `block` is an arm of an `if` (the other path carries the
+/// owner's `None` to the join; two creating arms are an overwrite, which the
+/// simulation refuses, R619-5 (3)), and no loop lies between that `if` and the
+/// block that declares `binding` (a loop would run the arm again over a live
+/// generation, an overwrite the simulation never sees).
 fn branch_outside_loops(tcx: TyCtxt<'_>, block: HirId, binding: HirId) -> bool {
     let Some(declared_in) = tcx
         .hir_parent_iter(binding)
@@ -338,9 +338,7 @@ fn branch_outside_loops(tcx: TyCtxt<'_>, block: HirId, binding: HirId) -> bool {
     else {
         return false;
     };
-    if !matches!(arm.kind, ExprKind::Block(..))
-        || !matches!(branch.kind, ExprKind::If(_, then, None) if then.hir_id == arm.hir_id)
-    {
+    if !matches!(arm.kind, ExprKind::Block(..)) || !matches!(branch.kind, ExprKind::If(..)) {
         return false;
     }
     for (id, node) in ancestors {
@@ -1153,29 +1151,20 @@ pub(crate) fn derive<'tcx>(
             events.sort_by_key(|(span, _, _, _)| (span.lo(), span.hi()));
             // The simulation: Dead → Create → Live → Release → Dead.
             let mut live = false;
-            let mut overwrites: Vec<Span> = Vec::new();
             let mut block_state: FxHashMap<HirId, (bool, bool)> = FxHashMap::default();
             let mut sequence_error = None;
             for (span, block, event, role) in &events {
                 let entry = block_state.entry(*block).or_insert((live, live));
                 match event {
-                    // **The overwrite of a live unique owner** (R434-4 §2,
-                    // re-admitted under R443-1). The input leaks the generation
-                    // this assignment replaces; the emitted program closes it
-                    // with Rust's ordinary overwrite drop. Report 019 measured
-                    // that close as UB — `deallocating … C heap memory using
-                    // Rust heap deallocation operation` — and report 020's
-                    // probe measured the fix: with the emitted crate declaring
-                    // `#[global_allocator] … System`, Rust's deallocation IS
-                    // the contract's `free`, Miri accepts the drop, and the
-                    // emitted program leaks 0 where the input leaks 1. The one
-                    // shape the declaration does not cover is an over-aligned
-                    // pointee, which the gate below holds.
-                    //
-                    // Uniqueness is not assumed: a copy into another local, an
-                    // unproven lend or an unbridged cast each refuse the
-                    // subject before the simulation runs.
-                    Event::Create if live => overwrites.push(*span),
+                    // **The overwrite of a live owner is refused** (R619-5 (3),
+                    // P5: a contract allocation never meets a Rust drop). The
+                    // input leaks the generation this assignment replaces; the
+                    // emitted program would close it with Rust's overwrite drop,
+                    // which R434-4 §2 once admitted under R443-1's allocator
+                    // declaration (never emitted; fan-out 008 items 7 / 16).
+                    Event::Create if live => {
+                        sequence_error = Some(format!("{OVERWRITE}:{}", snippet(*span)));
+                    }
                     Event::Create => live = true,
                     Event::Release if !live => {
                         sequence_error = Some(format!(
@@ -1211,8 +1200,8 @@ pub(crate) fn derive<'tcx>(
             // ensure-capacity), and one that creates must release.
             //
             // **R608-1** — except a block that CREATES the generation (dead on
-            // entry, live on exit) when it is an `else`-less `if` arm outside
-            // any loop up to the owner's declaration: the other path carries
+            // entry, live on exit) when it is an `if` arm outside any loop up
+            // to the owner's declaration: the other path carries
             // `None` to the join (a block dead on entry means an earlier null
             // or release, so the owner is optional), and the simulation above
             // has already proved the generation released before any exit
@@ -1389,12 +1378,6 @@ pub(crate) fn derive<'tcx>(
                     super::emitability::EmitabilityFacts::site(tcx, *call)
                 ));
             }
-            for span in &overwrites {
-                receipts.push(format!(
-                    "waiver-drop(overwrite) site={}",
-                    super::emitability::EmitabilityFacts::site(tcx, *span)
-                ));
-            }
             for receipt in &receipts {
                 out.admitted.push((label.clone(), receipt.clone()));
             }
@@ -1428,7 +1411,7 @@ pub(crate) fn derive<'tcx>(
                     fabricated_extent: false,
                     pointee_override: None,
                     inferred_binding: subject.ty_span.is_none(),
-                    overwrite_spans: overwrites.clone(),
+                    overwrite_spans: Vec::new(),
                     retained_sink: true,
                     implicit_scope_close: false,
                 },
