@@ -7740,7 +7740,26 @@ fn finish_decide<'tcx>(
     // the region bridge's node instead of the call.
     counted_void.retain(|key, _| !void_region.contains_key(key));
     let original_body_adapters = facts.body_adapters.clone();
-    let thin_extent_subjects = decision::thin_extent::collect(tcx, &facts);
+    let thin_extent_subjects = {
+        let locals: rustc_hash::FxHashMap<_, _> = subjects
+            .iter()
+            .map(|subject| ((subject.fn_did, subject.hir_id), subject.local))
+            .collect();
+        decision::thin_extent::collect(tcx, &facts, |function, binding| {
+            locals.get(&(function, binding)).is_some_and(|&local| {
+                slots
+                    .fn_local_slots
+                    .get(&function)
+                    .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                    .is_some_and(|slot| {
+                        matches!(
+                            model.get(&SlotRef::Local(function, slot)),
+                            Some(SlotKind::Raw)
+                        )
+                    })
+            })
+        })
+    };
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.

@@ -1275,7 +1275,22 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
         ::utils::compilation::str_to_input(CE_V01_VOID_CAST_COUNTED_POSITION),
         |tcx| {
             let (_table, ctx) = super::decide_table_with_ctx(tcx)?;
-            let held = super::decision::thin_extent::collect(tcx, &ctx.facts);
+            let held =
+                super::decision::thin_extent::collect(tcx, &ctx.facts, |function, binding| {
+                    ctx.subjects
+                        .iter()
+                        .find(|subject| subject.fn_did == function && subject.hir_id == binding)
+                        .and_then(|subject| {
+                            ctx.slots
+                                .fn_local_slots
+                                .get(&function)?
+                                .slot_for_local_depth(subject.local, 0)
+                        })
+                        .is_some_and(|slot| {
+                            ctx.model.get(&super::SlotRef::Local(function, slot))
+                                == Some(&super::SlotKind::Raw)
+                        })
+                });
             Ok::<_, String>(
                 ctx.subjects
                     .iter()
@@ -1287,15 +1302,7 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
     )
     .expect("CE-V01 fixture compiles")
     .expect("CE-V01 decision table");
-    // wave-6l R641 (re-pin, annotated): `top::x` is handed bare to
-    // `save_file::buffer`, which reaches the counted position, so the
-    // thin-extent set follows the parameter one call up and holds it too —
-    // a thin `&u8` there would reach `fwrite`'s counted footprint.
-    assert_eq!(
-        held,
-        vec!["save_file::buffer".to_owned(), "top::x".to_owned()],
-        "{held:?}"
-    );
+    assert_eq!(held, vec!["save_file::buffer".to_owned()], "{held:?}");
     // (b) End to end: #1b's `fwrite` rider promotes the position with its
     // caller's chain; nothing thin reaches the void cast.
     let source = emitted(CE_V01_VOID_CAST_COUNTED_POSITION);
@@ -1490,7 +1497,20 @@ fn ce_m05_a_size_of_another_type_keeps_the_multi_element_extent() {
         .iter()
         .find(|(name, is_param, _)| name == "st" && *is_param)
         .expect("CE-M05 `st` subject");
-    assert_eq!(st.2, "held:thin-extent", "{decisions:#?}");
+    // RE-PIN (wave-6l, R641 item 5; was `held:thin-extent`). The caller `p`,
+    // handed to `clear`, is now held at the callee's counted footprint
+    // (`local_callee_extent`'s contract arm), so `st`'s caller no longer
+    // arrives thin and R481's lift takes `st` as the fallback slice. What this
+    // test protects is unchanged: `st` never takes the thin form.
+    let p = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "p" && *is_param)
+        .expect("CE-M05 `p` subject");
+    assert_eq!(p.2, "held:local-callee-access-extent", "{decisions:#?}");
+    assert_eq!(st.2, "<emitted>", "{decisions:#?}");
+    let output = emitted(source);
+    assert!(output.contains("st: &mut [Stat]"), "{output}");
+    assert!(!output.contains("st: &mut Stat"), "{output}");
 }
 
 /// R410-9 (b): the counted-literal shape (wave-6k 010's 8 string-literal

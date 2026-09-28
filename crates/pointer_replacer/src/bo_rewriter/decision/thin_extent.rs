@@ -79,14 +79,38 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// Subjects that reach such a position. A subject in this set may not take a
 /// THIN reference form.
 ///
-/// **wave-6l (R641): directly, or through a local callee's parameter.** A
-/// subject handed, bare or under casts, to a local callee parameter that is
-/// itself in the set reaches the same position one call deeper: brotli's
-/// `CopyStat(input_path)` calls C2Rust's local copy of glibc's inline
-/// `stat(p, b) { __xstat(1, p, b) }`, and the NUL walk is `__xstat`'s. Followed
-/// to a fixpoint, so a chain of such forwarders is one fact.
-pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
+/// **wave-6l (R641): a NUL walk directly, or through a local callee's
+/// parameter.** A subject handed, bare or under casts, to a local callee
+/// parameter that reaches a NUL-terminated position reaches the same walk one
+/// call deeper: brotli's `CopyStat(input_path)` calls C2Rust's local copy of
+/// glibc's inline `stat(p, b) { __xstat(1, p, b) }`, and the NUL walk is
+/// `__xstat`'s. Followed to a fixpoint, so a chain of such forwarders is one
+/// fact. A counted footprint behind a local callee is
+/// `local_callee_extent`'s contract arm, not this set's.
+///
+/// A parameter carries its walk to its callers only where its own form would
+/// be due to the walk, the reader chain's rule (#1b): not one the model calls
+/// `Raw` (BO's kind first, so a caller never takes a view its raw callee would
+/// not), and not one with pointer arithmetic of its own (`offset`: its extent
+/// is its own, and its callers are R365-2's and `local_callee_extent`'s).
+pub(crate) fn collect(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    model_raw: impl Fn(LocalDefId, HirId) -> bool,
+) -> FxHashSet<(LocalDefId, HirId)> {
+    let carries = |(function, binding): (LocalDefId, HirId)| {
+        !model_raw(function, binding)
+            && !facts
+                .raw_only_uses
+                .get(&(function, binding))
+                .is_some_and(|uses| {
+                    uses.iter().any(|(op, _)| {
+                        super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+                    })
+                })
+    };
     let mut out = FxHashSet::default();
+    let mut walked = FxHashSet::default();
     for fact in &facts.foreign_call_args {
         if !position_consumes_many_elements(&fact.callee, fact.argument_index, &fact.target)
             || byte_count_is_one_element(fact)
@@ -95,6 +119,14 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
         }
         if let Some(root) = fact.direct_subject_root() {
             out.insert((fact.caller, root));
+            if classify_contract(&fact.callee, fact.argument_index, &fact.target).is_ok_and(
+                |contract| {
+                    contract.extent == super::raw_boundary_contracts::ArgumentExtent::NulTerminated
+                },
+            ) && carries((fact.caller, root))
+            {
+                walked.insert((fact.caller, root));
+            }
         }
     }
     loop {
@@ -114,8 +146,11 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
                     let Some(param) = params.get(arg.index) else {
                         continue;
                     };
-                    if out.contains(&(*callee, param.pat.hir_id)) {
-                        grew |= out.insert((site.caller, root));
+                    if walked.contains(&(*callee, param.pat.hir_id)) {
+                        out.insert((site.caller, root));
+                        if carries((site.caller, root)) {
+                            grew |= walked.insert((site.caller, root));
+                        }
                     }
                 }
             }
