@@ -915,6 +915,62 @@ pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table
     assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
 }
 
+/// **W6S-17 — a pointee in a nested module, and the hold that stays.** A
+/// consuming formal spelled `shell::cell_t` (`= *mut hidden::cell`, the
+/// corpus's module-nested shape): where `hidden` is public the formal delivers
+/// `Box<crate::shell::hidden::cell>`; where it is private to `shell`, the
+/// owner cannot name the pointee, so there is nothing to spell `Box<..>` over
+/// and the chain holds typed (`box-param-alias-formal`) — the formal left raw
+/// under a `Box` member would be bridged as a lend and freed twice.
+#[test]
+fn w6s17_an_alias_formal_spells_a_nested_pointee_and_holds_an_unnameable_one() {
+    const SOURCE: &str = r#"
+pub mod shell {
+    pub mod hidden {
+        #[repr(C)]
+        pub struct cell { pub v: i32 }
+    }
+    pub type cell_t = *mut hidden::cell;
+    pub type cell_size = hidden::cell;
+}
+unsafe extern "C" fn consume(mut p: shell::cell_t) {
+    (*p).v += 1 as i32;
+    free(p as *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn producer() -> i32 {
+    let mut p = malloc(::std::mem::size_of::<shell::cell_size>()) as shell::cell_t;
+    (*p).v = 7 as i32;
+    let mut v = (*p).v;
+    consume(p);
+    return v;
+}
+"#;
+    let out = emitted("w6s17-nested", &format!("{PRELUDE}{SOURCE}"));
+    let src = compact(&out.source);
+    let receipts = out.artifacts.box_param_receipts.clone();
+    assert!(
+        src.contains("fnconsume(mutp:Box<crate::shell::hidden::cell>){")
+            && receipts.contains("box-param-chain callee=consume index=0 sink=free"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+
+    let hidden = SOURCE.replace("    pub mod hidden {", "    mod hidden {");
+    assert_ne!(hidden, SOURCE);
+    let out = emitted("w6s17-unnameable", &format!("{PRELUDE}{hidden}"));
+    let src = compact(&out.source);
+    let receipts = out.artifacts.box_param_receipts.clone();
+    assert!(
+        receipts.contains("consume::p\theld\tbox-param-alias-formal:consume"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(!src.contains("fnconsume(mutp:Box<"), "{}", out.source);
+    assert!(!src.contains("as_mut())"), "{}", out.source);
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+}
+
 /// **R517-9 — the callee-less exported producer.** ht's `ht_create` with a
 /// lending third signature (`ht_length`, the corpus's `ht_get` / `ht_set`):
 /// the closure holds, nothing in the program receives the result, and the

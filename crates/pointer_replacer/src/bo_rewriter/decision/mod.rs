@@ -1424,6 +1424,13 @@ pub(crate) fn decide_with_raw_fallbacks(
             needed.then_some((subject.fn_did, subject.hir_id))
         })
         .collect();
+    // W6S-17: a Box chain's formal spelled through a pointer alias is the
+    // chain's declaration at every family stage.
+    let alias_formals: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|subject| box_param::alias_formal(ctx.box_params, subject))
+        .map(|subject| (subject.fn_did, subject.hir_id))
+        .collect();
     DecisionTable {
         counted_void: ctx.counted_void.clone(),
         flexible_tails: ctx.flexible_tails.clone(),
@@ -1454,8 +1461,7 @@ pub(crate) fn decide_with_raw_fallbacks(
             .filter(|(node, _)| {
                 ctx.family_policy
                     .enabled_for(**node, FamilyStage::Declaration)
-                    // W6S-17: a Box chain's formal is the chain's declaration.
-                    || box_param::planned_formal(ctx.box_params, **node)
+                    || alias_formals.contains(*node)
             })
             .map(|(node, pointee)| (*node, pointee.clone()))
             .collect(),

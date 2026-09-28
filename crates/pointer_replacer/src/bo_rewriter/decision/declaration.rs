@@ -159,7 +159,16 @@ pub(crate) fn pointee_source<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
 /// `Box<[T]>` / `Option<..>`, over the alias's resolved pointee (or the plan's
 /// pointee override) instead of a pointee span. `None` for any other form.
 pub(crate) fn box_formal_type(decision: &Decision, pointee: &str) -> Option<String> {
-    let Decision::Box(plan) = decision else { return None };
+    let plan = match decision {
+        Decision::Box(plan) => plan,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::Opt { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Degraded(_) => return None,
+    };
     let pointee = plan
         .pointee_override
         .map_or(pointee, |element| element.source_name());

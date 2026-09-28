@@ -115,7 +115,7 @@ pub(crate) struct Chains {
 /// not the declaration family's: the members move a `Box` into it from the
 /// first family stage on, and a formal left raw under them is bridged as a
 /// lend and freed twice.
-pub(crate) fn planned_formal(chains: &Chains, node: (LocalDefId, HirId)) -> bool {
+fn planned_formal(chains: &Chains, node: (LocalDefId, HirId)) -> bool {
     chains.formal_labels.contains_key(&node) && chains.plans.contains_key(&node)
 }
 
