@@ -704,3 +704,115 @@ fn w6l_nul_c3_a_converted_return_is_never_constructed_over() {
         "{source}"
     );
 }
+
+const PROBE_WIDE_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn BrotliUnalignedRead32(p: *const core::ffi::c_void) -> u32 {
+    *(p as *const u32)
+}
+unsafe fn Hash14(data: *const u8) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let h = BrotliUnalignedRead32(data as *const core::ffi::c_void);
+    return h.wrapping_add(*data as u32);
+}
+pub struct Ctx {
+    pub data: *const u8,
+}
+pub unsafe fn caller(mut ctx: *mut Ctx) -> u32 {
+    Hash14((*ctx).data)
+}
+"#;
+
+/// C11 (R631-3, wave-6l relay 061) — the wide access keeps its hold: the
+/// callee reads four bytes (`*(p as *const u32)`) through a one-`u8` subject,
+/// so the nullable twin may not release it (the R416-5 class). Formerly W8,
+/// which asserted the lift; the ruling is the reverse.
+#[test]
+fn w6l_nul_c11_a_wider_local_callee_access_keeps_the_hold() {
+    let decisions = super::emit_tests::decisions_of(PROBE_WIDE_LOCAL_CALLEE);
+    assert_eq!(
+        reason(&decisions, "data", true),
+        "held:local-callee-access-extent",
+        "{decisions:#?}"
+    );
+    let (_, artifacts) = emitted_source(PROBE_WIDE_LOCAL_CALLEE);
+    assert!(
+        !artifacts.licensed_lifts.contains("\topt-slice\t"),
+        "{}",
+        artifacts.licensed_lifts
+    );
+}
+
+/// The same caller at a callee that reads the subject only at its element's
+/// own width: both reads are `u8`, one element apart.
+const PROBE_ELEMENT_WIDTH_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn ReadPair(p: *const core::ffi::c_void) -> u32 {
+    (*(p as *const u8) as u32).wrapping_add(*(p as *const u8).offset(1) as u32)
+}
+unsafe fn Hash2(data: *const u8) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    let h = ReadPair(data as *const core::ffi::c_void);
+    return h.wrapping_add(*data as u32);
+}
+pub struct Ctx {
+    pub data: *const u8,
+}
+pub unsafe fn caller(mut ctx: *mut Ctx) -> u32 {
+    Hash2((*ctx).data)
+}
+"#;
+
+/// W8 (R615-7, STOP 4 of 054; re-cut under R631-3) — a null-tested subject
+/// held at a LOCAL callee that accesses it at the element's own width takes
+/// the optional slice under the same receipt (`opt-slice`, `fallback`), its
+/// raw struct-field caller adapted with a null test.
+#[test]
+fn w6l_nul_w8_an_element_width_local_callee_row_takes_the_optional_slice() {
+    let decisions = super::emit_tests::decisions_of(PROBE_ELEMENT_WIDTH_LOCAL_CALLEE);
+    assert_eq!(
+        reason(&decisions, "data", true),
+        "<emitted>",
+        "{decisions:#?}"
+    );
+    let (source, artifacts) = emitted_source(PROBE_ELEMENT_WIDTH_LOCAL_CALLEE);
+    assert!(source.contains("fn Hash2(data: Option<&[u8]>)"), "{source}");
+    assert!(
+        source.contains("__crat_call_adapter_ptr.is_null()")
+            && source.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "{source}"
+    );
+    let row = lift_row(&artifacts.licensed_lifts, "Hash2::data");
+    assert!(row.contains("\topt-slice\tfallback\t"), "{row}");
+}
+
+const CONTROL_ONE_ELEMENT_LOCAL: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+unsafe fn read_one(p: *const u32) -> u32 {
+    *p
+}
+pub unsafe fn look(value: *const u32) -> u32 {
+    if value.is_null() {
+        return 0;
+    }
+    read_one(value)
+}
+"#;
+
+/// C6 (R615-7) — the local-callee twin of C1: a null-tested subject handed to
+/// a local callee that reads ONE element is no access-extent row and keeps the
+/// thin optional; no lift receipt.
+#[test]
+fn w6l_nul_c6_a_one_element_local_callee_keeps_the_thin_optional() {
+    let (source, artifacts) = emitted_source(CONTROL_ONE_ELEMENT_LOCAL);
+    assert!(!source.contains("value: Option<&[u32]>"), "{source}");
+    assert!(
+        !artifacts.licensed_lifts.contains("look::value"),
+        "{}",
+        artifacts.licensed_lifts
+    );
+}

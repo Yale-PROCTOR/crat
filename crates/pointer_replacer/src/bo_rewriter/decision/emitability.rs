@@ -768,7 +768,7 @@ fn constant_byte_count<'tcx>(
 }
 
 /// A sized type's layout size in bytes; `None` for anything without one.
-fn type_size<'tcx>(
+pub(crate) fn type_size<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: rustc_hir::def_id::LocalDefId,
     ty: rustc_middle::ty::Ty<'tcx>,

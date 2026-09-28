@@ -579,6 +579,193 @@ fn reaches_a_mut_foreign_position(ctx: &Ctx<'_, '_>, node: (LocalDefId, HirId)) 
 /// extent is never taken where a proven one exists. Two things stay refused:
 /// a caller already fat (it carries its own extent), and the one-element
 /// `from_ref` form R416-5 names, whose panic is certain rather than possible.
+/// **R631-3 (wave-6l relay 061): the callee accesses the subject at its
+/// element's own width, and at no other.** Every use of the callee parameter
+/// is followed up through casts and pointer arithmetic to the access it
+/// reaches; the width of an access is its pointer's pointee, where it is
+/// dereferenced (or read / written). A bare forwarding into a local callee is
+/// followed into that callee. `is_null`, `offset_from` and comparisons access
+/// nothing. Anything else — the pointer stored, bound, returned, handed on
+/// after arithmetic or a cast, or a width that is not a sized type — is a width
+/// this cannot state, and the hold stays. binn's `copy_int_value` writes
+/// `pdest` as `i8`, `i16`, `i32` and `i64` by its tag: a caller's `i16` or
+/// `i32` is never every one of those, so its hold stays (wave-6b's
+/// `w6b_a_width_the_call_does_not_select_keeps_the_hold`).
+fn access_width_is_the_element(
+    ctx: &Ctx<'_, '_>,
+    subject: &Subject,
+    access: &super::local_callee_extent::LocalCalleeAccess,
+) -> bool {
+    let tcx = ctx.tcx;
+    let rustc_middle::ty::TyKind::RawPtr(element, _) =
+        tcx.typeck(subject.fn_did).node_type(subject.hir_id).kind()
+    else {
+        return false;
+    };
+    let Some(element) = super::emitability::type_size(tcx, subject.fn_did, *element) else {
+        return false;
+    };
+    let mut widths = Vec::new();
+    access_widths(
+        tcx,
+        access.callee_id,
+        access.parameter_index,
+        &mut widths,
+        &mut Vec::new(),
+    ) && !widths.is_empty()
+        && widths.iter().all(|width| *width == element)
+}
+
+/// The widths `function` accesses its `parameter` at, into `out`; `false` when
+/// some use's width cannot be stated.
+fn access_widths(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    function: LocalDefId,
+    parameter: usize,
+    out: &mut Vec<u64>,
+    visited: &mut Vec<(LocalDefId, usize)>,
+) -> bool {
+    use rustc_hir::{
+        ExprKind, Node,
+        intravisit::{self, Visitor},
+    };
+    if visited.contains(&(function, parameter)) {
+        return true;
+    }
+    visited.push((function, parameter));
+    let body = tcx.hir_body_owned_by(function);
+    let Some(param) = body.params.get(parameter) else {
+        return false;
+    };
+    struct Uses<'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        function: LocalDefId,
+        binding: HirId,
+        widths: Vec<u64>,
+        forwards: Vec<(LocalDefId, usize)>,
+        unknown: bool,
+    }
+    impl<'tcx> Uses<'tcx> {
+        fn width_of(&self, pointer: &rustc_hir::Expr<'_>) -> Option<u64> {
+            let typeck = self.tcx.typeck(self.function);
+            match typeck.expr_ty(pointer).kind() {
+                rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                    super::emitability::type_size(self.tcx, self.function, *pointee)
+                }
+                _ => None,
+            }
+        }
+
+        fn classify(&mut self, use_expr: &'tcx rustc_hir::Expr<'tcx>) {
+            let mut current = use_expr;
+            let mut derived = false;
+            loop {
+                let Node::Expr(parent) = self.tcx.parent_hir_node(current.hir_id) else {
+                    self.unknown = true;
+                    return;
+                };
+                match parent.kind {
+                    ExprKind::Cast(..) | ExprKind::DropTemps(..) => {
+                        derived = true;
+                        current = parent;
+                    }
+                    ExprKind::MethodCall(segment, receiver, _, _)
+                        if receiver.hir_id == current.hir_id =>
+                    {
+                        match segment.ident.name.as_str() {
+                            "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add"
+                            | "wrapping_sub" | "cast" | "cast_mut" | "cast_const" => {
+                                derived = true;
+                                current = parent;
+                            }
+                            "read" | "read_unaligned" | "write" | "write_unaligned" => {
+                                match self.width_of(current) {
+                                    Some(width) => self.widths.push(width),
+                                    None => self.unknown = true,
+                                }
+                                return;
+                            }
+                            "is_null" | "offset_from" => return,
+                            _ => {
+                                self.unknown = true;
+                                return;
+                            }
+                        }
+                    }
+                    ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
+                        match self.width_of(current) {
+                            Some(width) => self.widths.push(width),
+                            None => self.unknown = true,
+                        }
+                        return;
+                    }
+                    ExprKind::Binary(op, _, _)
+                        if matches!(
+                            op.node,
+                            rustc_hir::BinOpKind::Eq
+                                | rustc_hir::BinOpKind::Ne
+                                | rustc_hir::BinOpKind::Lt
+                                | rustc_hir::BinOpKind::Le
+                                | rustc_hir::BinOpKind::Gt
+                                | rustc_hir::BinOpKind::Ge
+                        ) =>
+                    {
+                        return;
+                    }
+                    ExprKind::Call(callee, args) if !derived => {
+                        let local = match self.tcx.typeck(self.function).expr_ty(callee).kind() {
+                            rustc_middle::ty::TyKind::FnDef(definition, _) => {
+                                definition.as_local().filter(|local| {
+                                    self.tcx.hir_node_by_def_id(*local).body_id().is_some()
+                                })
+                            }
+                            _ => None,
+                        };
+                        match (
+                            local,
+                            args.iter().position(|arg| arg.hir_id == current.hir_id),
+                        ) {
+                            (Some(local), Some(index)) => self.forwards.push((local, index)),
+                            _ => self.unknown = true,
+                        }
+                        return;
+                    }
+                    _ => {
+                        self.unknown = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+            {
+                self.classify(e);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut uses = Uses {
+        tcx,
+        function,
+        binding: param.pat.hir_id,
+        widths: Vec::new(),
+        forwards: Vec::new(),
+        unknown: false,
+    };
+    uses.visit_body(body);
+    if uses.unknown {
+        return false;
+    }
+    out.extend(uses.widths);
+    uses.forwards
+        .into_iter()
+        .all(|(callee, index)| access_widths(tcx, callee, index, out, visited))
+}
+
 pub(crate) fn promote_fallback(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
@@ -625,7 +812,11 @@ pub(crate) fn promote_fallback(
                             );
                             return None;
                         }
-                        (access.callee.clone(), Some(access.parameter_index))
+                        (
+                            access.callee.clone(),
+                            Some(access.parameter_index),
+                            access_width_is_the_element(ctx, subject, access),
+                        )
                     }
                     DegradeReason::ThinExtent => {
                         // R483-3(b): the mutability half, asked of the position
@@ -635,7 +826,7 @@ pub(crate) fn promote_fallback(
                         {
                             return None;
                         }
-                        ("thin-extent".to_owned(), None)
+                        ("thin-extent".to_owned(), None, true)
                     }
                     _ => return None,
                 },
@@ -654,10 +845,13 @@ pub(crate) fn promote_fallback(
             // delivered in a form carrying an extent", and the `Degraded` filter
             // above is exactly that test.
             let node = (subject.fn_did, subject.hir_id);
-            // R608-1 is a ruling about NUL-contract positions: the nullable
-            // twin is taken for thin-extent rows only, never for a
-            // local-callee access row.
-            let nullable = named.0 == "thin-extent"
+            // R608-1 took the nullable twin for thin-extent rows; R615-7
+            // (STOP 4 of wave-6l 054) widens it to the local-callee access
+            // rows this same waiver lifts, under the same controls and receipt
+            // — and R631-3 only where the callee accesses the subject at the
+            // element's own width (`named.2`): an optional slice of `i16`
+            // handed to a writer of four bytes is the R416-5 class.
+            let nullable = named.2
                 && !slice_uses_supported(ctx, node)
                 && nullable_slice_supported(ctx, subject);
             if !slice_uses_supported(ctx, node) && !nullable {
