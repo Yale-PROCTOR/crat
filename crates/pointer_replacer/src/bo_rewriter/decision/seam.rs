@@ -201,6 +201,10 @@ pub(crate) enum LenEvidence {
     /// exact count argument (`memcpy(dest, src, n)`: `n` for BOTH pointers),
     /// so the companion is that argument, not the adjacent one.
     Contract,
+    /// **R625** — no companion, but the argument points at element 0 of a
+    /// `[T; N]` of its own pointee type: the length is `N`, the array's
+    /// (`emitability::array_extent`).
+    ArrayType,
 }
 
 impl LenEvidence {
@@ -211,6 +215,7 @@ impl LenEvidence {
             LenEvidence::Elsewhere => "len-elsewhere",
             LenEvidence::None => "len-absent",
             LenEvidence::Contract => "len-contract",
+            LenEvidence::ArrayType => "len-array-type",
         }
     }
 }
@@ -5246,7 +5251,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         LenEvidence::Following => Some(pos.index + 1),
                         LenEvidence::Preceding => pos.index.checked_sub(1),
                         LenEvidence::Contract => contract_companion,
-                        LenEvidence::Elsewhere | LenEvidence::None => None,
+                        LenEvidence::Elsewhere | LenEvidence::None | LenEvidence::ArrayType => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -5323,6 +5328,30 @@ pub(crate) fn synthesize_with_raw_boundary(
                     }
                 } else {
                     (None, false, None)
+                };
+                // R625: a raw pointer to element 0 of a `[T; N]`, passed where no
+                // companion, contract, region or C string names a length, is
+                // bounded by the array itself: `N`, not the fabricated extent.
+                let (len_text, len_evidence) = match len_text {
+                    None if pos.found == Form::Raw
+                        && matches!(
+                            pos.expected,
+                            Form::Slice { .. } | Form::Opt { slice: true, .. }
+                        ) =>
+                    {
+                        match site
+                            .args
+                            .iter()
+                            .find(|argument| argument.index == pos.index)
+                            .and_then(|argument| argument.array_extent)
+                        {
+                            Some(elements) => {
+                                (Some(elements.to_string()), Some(LenEvidence::ArrayType))
+                            }
+                            None => (None, len_evidence),
+                        }
+                    }
+                    text => (text, len_evidence),
                 };
                 let owner_view = pos
                     .root

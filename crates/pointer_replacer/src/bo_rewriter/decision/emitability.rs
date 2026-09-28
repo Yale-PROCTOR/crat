@@ -263,6 +263,10 @@ pub(crate) struct Arg {
     /// declared array; the seam's overlap gate then reads the array place's
     /// visibility instead of treating the raw spelling as blind.
     pub array_start_blind: Option<bool>,
+    /// **R625** — the argument points at element 0 of a `[T; N]` whose `T` is
+    /// the argument's own pointee: `N` elements from the pointer are the
+    /// array. See [`array_extent`].
+    pub array_extent: Option<u64>,
     /// Exact syntactic place identity after peeling address/cast wrappers.
     /// Distinct field projections remain distinct even when `place_root` is
     /// the same aggregate local.
@@ -808,6 +812,71 @@ fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) 
     }
     let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else { return None };
     length.try_to_target_usize(tcx)
+}
+
+/// **R625 — the extent a fixed-size array gives a pointer to its element 0.**
+/// `X.as_ptr()` / `X.as_mut_ptr()`, optionally `.offset(0)` / `.add(0)` on
+/// that, optionally under `&*` / `&mut *` or casts that keep the pointee, with
+/// `X: [T; N]` (through references) and `T` the argument's own pointee: the
+/// `N` elements from the pointer are exactly the array, so a slice of them is
+/// the object's bounds. A cast that changes the pointee (`[u32; 4]` read as
+/// bytes) is refused, as is any start other than a literal 0.
+pub(crate) fn array_extent<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    expr: &Expr<'_>,
+) -> Option<u64> {
+    let typeck = tcx.typeck(owner);
+    let pointee = |ty: rustc_middle::ty::Ty<'tcx>| -> Option<rustc_middle::ty::Ty<'tcx>> {
+        match ty.kind() {
+            rustc_middle::ty::TyKind::RawPtr(inner, _)
+            | rustc_middle::ty::TyKind::Ref(_, inner, _) => Some(*inner),
+            _ => None,
+        }
+    };
+    let target = pointee(typeck.expr_ty(expr))?;
+    let zero = |e: &Expr<'_>| {
+        let mut e = e;
+        while let ExprKind::Cast(inner, _) = e.kind {
+            e = inner;
+        }
+        matches!(e.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0))
+    };
+    let mut e = expr;
+    loop {
+        match e.kind {
+            // A cast that keeps the pointee (mutability only) is transparent.
+            ExprKind::Cast(inner, _)
+                if pointee(typeck.expr_ty(inner)).is_some_and(|t| t == target) =>
+            {
+                e = inner
+            }
+            ExprKind::AddrOf(_, _, inner) => match inner.kind {
+                ExprKind::Unary(rustc_hir::UnOp::Deref, place) => e = place,
+                _ => return None,
+            },
+            ExprKind::MethodCall(segment, receiver, [offset], _)
+                if matches!(segment.ident.name.as_str(), "offset" | "add") && zero(offset) =>
+            {
+                e = receiver
+            }
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if matches!(segment.ident.name.as_str(), "as_ptr" | "as_mut_ptr") =>
+            {
+                let mut ty = typeck.expr_ty(receiver);
+                while let rustc_middle::ty::TyKind::Ref(_, inner, _) = ty.kind() {
+                    ty = *inner;
+                }
+                // Every step above keeps the pointee, so the array's element
+                // is the argument's pointee.
+                let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else {
+                    return None;
+                };
+                return length.try_to_target_usize(tcx);
+            }
+            _ => return None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1366,6 +1435,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             array_start_blind: array_start
                                                 .as_ref()
                                                 .map(|s| s.blind),
+                                            array_extent: array_extent(self.tcx, self.fn_did, arg),
                                             place_identity: Self::exact_place_identity(arg),
                                             address_root_local: address_root_facts(typeck, arg).0,
                                             address_root_raw_pointer: address_root_facts(

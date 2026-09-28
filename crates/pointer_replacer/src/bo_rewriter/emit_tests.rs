@@ -14720,3 +14720,98 @@ fn custody_decision_descriptor_preserves_full_safe_form() {
     assert!(super::terminal_application(&boxed, true).is_some());
     assert!(super::terminal_application(&boxed, false).is_none());
 }
+
+/// **R625 (relay 125) — a pointer into a fixed-size array names its own
+/// extent.** bzip2's `BZ2_hbCreateDecodeTables(&mut (*s).limit[t][0], ...)` and
+/// brotli's `BrotliBuildHuffmanTable(.., (*h).code_length_histo.as_mut_ptr())`
+/// pass element 0 of a `[T; N]` into a slice formal with no count companion; the
+/// seam's C arm rendered `FALLBACK_SLICE_EXTENT` though the array type IS the
+/// extent. The witness: each such argument gets `N` as `len-array-type`. The
+/// controls: a pointer-typed field, an array read through a cast that changes
+/// the element type, and a start one element in stay at the fallback.
+#[test]
+fn r625_an_array_element_zero_argument_takes_the_array_length() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         #[repr(C)] pub struct S {{ pub limit: [[i32; 8]; 2], pub histo: [u16; 16], pub words: [u32; 4], pub ptr: *mut i32 }}\n\
+         pub unsafe fn tables(limit: *mut i32, len: i32) -> i32 {{ *limit.offset(0) = len; *limit.offset(1) = len; *limit.offset(2) }}\n\
+         pub unsafe fn counts(count: *mut u16) -> u16 {{ *count.offset(0) += 1; *count.offset(3) }}\n\
+         pub unsafe fn bytes(b: *mut u8) -> u8 {{ *b.offset(0) = 1; *b.offset(5) }}\n\
+         pub unsafe fn caller(s: *mut S, t: usize) -> i32 {{\n\
+         \x20   let _next = s.offset(1);\n\
+         \x20   tables(&mut *(*s).limit[t].as_mut_ptr().offset(0), 3)\n\
+         \x20       + counts((*s).histo.as_mut_ptr()) as i32\n\
+         }}\n\
+         pub unsafe fn control(s: *mut S, t: usize) -> i32 {{\n\
+         \x20   let _next = s.offset(1);\n\
+         \x20   tables((*s).ptr, 5) + bytes((*s).words.as_mut_ptr() as *mut u8) as i32\n\
+         \x20       + tables((*s).limit[t].as_mut_ptr().offset(1), 6)\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    let placed = |callee: &str, caller: &str| {
+        seams
+            .lines()
+            .filter(|l| {
+                let f = l.split('\t').collect::<Vec<_>>();
+                f.first() == Some(&"placed")
+                    && f.get(1) == Some(&callee)
+                    && f.get(6) == Some(&caller)
+            })
+            .map(|l| l.split('\t').nth(4).unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        placed("tables", "caller"),
+        ["len-array-type"],
+        "element 0 of a `[i32; 8]` row takes the array's length:\n{seams}"
+    );
+    assert_eq!(placed("counts", "caller"), ["len-array-type"], "{seams}");
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "tables(core::slice::from_raw_parts_mut(s[0].limit[t].as_mut_ptr(), (8) as usize)"
+        ) && flat.contains(
+            "counts(core::slice::from_raw_parts_mut(s[0].histo.as_mut_ptr(), (16) as usize))"
+        ),
+        "the length is the array's:\n{emitted}"
+    );
+    assert_eq!(
+        flat.matches("FALLBACK_SLICE_EXTENT)").count(),
+        3,
+        "the controls keep the fallback:\n{emitted}"
+    );
+    // Controls: no array behind the pointer, and an element type the cast changed.
+    assert_eq!(
+        placed("tables", "control"),
+        ["len-fabricated", "len-fabricated"],
+        "{seams}"
+    );
+    assert_eq!(placed("bytes", "control"), ["len-fabricated"], "{seams}");
+    // One element in is not the array's start: it does not take the length.
+    assert!(!flat.contains("offset(1), (8) as usize"), "{emitted}");
+}
+
+/// **R625, bzip2's shape.** `copyFileName(inName.as_mut_ptr(), ..)` over a
+/// `static mut inName: [Char; 1034]`, where the callee writes `to[1024]`: the
+/// fallback's 1024 elements end one short of that write, so the slice panics on
+/// every call; the static's own type gives 1034.
+#[test]
+fn r625_a_static_array_argument_takes_the_array_length() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub static mut NAME: [i8; 1034] = [0; 1034];\n\
+         pub unsafe fn copy_name(to: *mut i8) {{ *to.offset(0) = 1; *to.offset(1024) = 0; }}\n\
+         pub unsafe fn caller() {{ copy_name(NAME.as_mut_ptr()); }}\n"
+    );
+    let emitted = e_adapt_source(&src);
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "copy_name(core::slice::from_raw_parts_mut(NAME.as_mut_ptr(), (1034) as usize))"
+        ),
+        "the static's length:\n{emitted}"
+    );
+    assert!(!flat.contains("FALLBACK_SLICE_EXTENT)"), "{emitted}");
+}

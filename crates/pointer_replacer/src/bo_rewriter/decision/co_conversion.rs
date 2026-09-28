@@ -2135,6 +2135,7 @@ mod a5_cast_role_tests {
                         adapter_operand_mutability: Some(RawMutability::Const),
                         initialized_array_elements: None,
                         array_start_blind: None,
+                        array_extent: None,
                         place_identity: None,
                         address_root_local: false,
                         address_root_raw_pointer: false,
