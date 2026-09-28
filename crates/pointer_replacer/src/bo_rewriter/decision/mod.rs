@@ -110,6 +110,8 @@ pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
 #[cfg(test)]
 mod reader_chain_tests;
+#[cfg(test)]
+mod masked_runtime_tests;
 pub(crate) mod receiver_input;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
