@@ -2386,9 +2386,10 @@ const SYSTEM_ALLOCATOR: &str =
 /// block is a `malloc`/`calloc` block. So the lift reads that declaration,
 /// and each member's block must be a real one: `vec![0; 0]` is a dangling
 /// pointer that libc's `free` would be handed, so an ordinary allocation
-/// lifts only on a positive literal count. Controls, one violation each: no
-/// declaration, a declared allocator that is not `System`, a count the
-/// program computes.
+/// lifts only on a positive literal count that every cast preserves.
+/// Controls, one violation each: no declaration, a declared allocator that is
+/// not `System`, that allocator beside an unrelated `System` static, a literal
+/// a narrowing cast zeroes, a count the program computes.
 #[test]
 fn w6a_r620_a_c_freed_store_lifts_under_the_declared_system_allocator() {
     const FREED: &str = r#"
@@ -2435,6 +2436,16 @@ pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
     let custom = format!(
         "{FREED}\nstruct A;\nunsafe impl std::alloc::GlobalAlloc for A {{\n    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {{ std::alloc::GlobalAlloc::alloc(&std::alloc::System, l) }}\n    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {{ std::alloc::GlobalAlloc::dealloc(&std::alloc::System, p, l) }}\n}}\n#[global_allocator]\nstatic GLOBAL: A = A;\n"
     );
+    // A custom allocator IS the global one; an unrelated `System` static
+    // beside it does not make the crate's allocator the system's.
+    let beside = custom.replace(
+        "#[global_allocator]\nstatic GLOBAL: A = A;\n",
+        "#[global_allocator]\nstatic GLOBAL: A = A;\nstatic UNRELATED: std::alloc::System = std::alloc::System;\n",
+    );
+    assert_ne!(beside, custom);
+    // A literal that a narrowing cast turns into zero (`256 as u8`).
+    let narrowed = declared.replace("calloc(8 as usize,", "calloc((256 as i32 as u8) as usize,");
+    assert_ne!(narrowed, declared);
     let computed = declared.replace(
         "pub unsafe extern \"C\" fn table_put(mut slots: *mut slot, mut index: usize) {\n    let mut key = calloc(8 as usize,",
         "pub unsafe extern \"C\" fn table_put(mut slots: *mut slot, mut index: usize, mut n: usize) {\n    let mut key = calloc(n,",
@@ -2450,6 +2461,16 @@ pub unsafe extern "C" fn table_clear(mut slots: *mut slot, mut index: usize) {
             "r620-store-cfree-custom",
             custom,
             "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key",
+        ),
+        (
+            "r620-store-cfree-custom-beside-system",
+            beside,
+            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key",
+        ),
+        (
+            "r620-store-cfree-narrowed",
+            narrowed,
+            "slot_set::key\theld\tbox-param-store-c-free:slot_set:slot::key:member-block:table_put::key",
         ),
         (
             "r620-store-cfree-computed",

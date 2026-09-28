@@ -1172,29 +1172,68 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
 
 /// **R620-3 (a) — the emitted crate's allocator is the system's** (R443-1):
 /// then a block Rust allocates is a `malloc` block, and a C `free` of it is
-/// defined. Read from the crate, whose items the emission keeps; R443-2's
-/// (B′) appends the same declaration to every emitted crate root, and at its
-/// composition this reads that emission too. The declaration is found by its
-/// static's type (the attribute is the builtin macro's, consumed at
-/// expansion): a crate declaring another allocator BESIDE an unrelated
-/// `System` static would read as `System` — the corpus declares none.
+/// defined — on Linux, where `System` IS libc's allocator (the contract
+/// `ownership_fields_native::c_free_allocator_compatible` pins). Read from the
+/// crate, whose items the emission keeps; R443-2's (B′) appends the same
+/// declaration to every emitted crate root, and at its composition this reads
+/// that emission too. `#[global_allocator]` is a builtin macro, gone before
+/// HIR; what it leaves is the `__rust_alloc` shim naming the selected static,
+/// so the allocator is the static THAT shim reads — never merely some
+/// `System` static in the crate. No shim, or another static: not `System`.
 pub(crate) fn emitted_allocator_is_system(tcx: TyCtxt<'_>) -> bool {
-    tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+    struct Statics(Vec<DefId>);
+    impl<'tcx> Visitor<'tcx> for Statics {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &e.kind
+                && let Res::Def(DefKind::Static { .. }, did) = path.res
+            {
+                self.0.push(did);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    tcx.sess.target.os == "linux"
+        && tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
         && tcx.hir_crate_items(()).definitions().any(|did| {
-            matches!(tcx.def_kind(did), DefKind::Static { .. })
-                && matches!(tcx.type_of(did).instantiate_identity().kind(),
-                    TyKind::Adt(adt, _) if tcx.def_path_str(adt.did()) == "std::alloc::System")
+            if !matches!(tcx.def_kind(did), DefKind::Fn)
+                || tcx
+                    .opt_item_name(did.to_def_id())
+                    .is_none_or(|n| n.as_str() != "__rust_alloc")
+            {
+                return false;
+            }
+            let Some(body_id) = tcx.hir_node_by_def_id(did).body_id() else { return false };
+            let mut statics = Statics(Vec::new());
+            statics.visit_expr(tcx.hir_body(body_id).value);
+            statics.0.dedup();
+            matches!(statics.0.as_slice(), [global]
+                if matches!(tcx.type_of(*global).instantiate_identity().kind(),
+                    TyKind::Adt(adt, _) if tcx.def_path_str(adt.did()) == "std::alloc::System"))
         })
 }
 
-/// A positive integer literal under its casts (`8 as usize`).
+/// A positive integer literal that every one of its casts preserves
+/// (`8 as usize`, `1 as libc::c_int as libc::c_ulong`): a narrowing cast can
+/// zero it (`256 as u8`), and an unknown target type is not read.
 fn positive_literal(text: &str) -> bool {
-    let head = text.trim().trim_start_matches('(');
-    let head = head.split(" as ").next().unwrap_or_default();
-    head.trim()
-        .trim_end_matches(')')
-        .parse::<u128>()
-        .is_ok_and(|n| n > 0)
+    let flat: String = text.chars().filter(|c| *c != '(' && *c != ')').collect();
+    let mut parts = flat.split(" as ").map(str::trim);
+    let Some(Ok(value)) = parts.next().map(str::parse::<u128>) else { return false };
+    value > 0
+        && parts.all(|target| {
+            let max: u128 = match target.rsplit("::").next().unwrap_or(target) {
+                "i8" | "c_char" | "c_schar" => i8::MAX as u128,
+                "u8" | "c_uchar" => u8::MAX as u128,
+                "i16" | "c_short" => i16::MAX as u128,
+                "u16" | "c_ushort" => u16::MAX as u128,
+                "i32" | "c_int" => i32::MAX as u128,
+                "u32" | "c_uint" => u32::MAX as u128,
+                "i64" | "isize" | "c_long" | "c_longlong" => i64::MAX as u128,
+                "u64" | "usize" | "c_ulong" | "c_ulonglong" | "size_t" => u64::MAX as u128,
+                _ => return false,
+            };
+            value <= max
+        })
 }
 
 /// **R620-3** — the body's FIRST act measures the formal as a C string
