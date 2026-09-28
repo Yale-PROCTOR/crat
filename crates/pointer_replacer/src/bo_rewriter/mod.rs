@@ -385,6 +385,8 @@ mod slice_use_inventory_tests;
 #[cfg(test)]
 mod thin_extent_tests;
 #[cfg(test)]
+mod twin_raw_view_custody_tests;
+#[cfg(test)]
 mod void_pointee_tests;
 #[cfg(test)]
 mod void_region_tests;
