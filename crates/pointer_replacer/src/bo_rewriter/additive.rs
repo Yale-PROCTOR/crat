@@ -810,7 +810,7 @@ pub(crate) fn withdrawals(
     }
     let related_graph = related_graph(candidate);
     let enabled = |owner: SignatureClassId| policy.enabled(owner.local_def_id(), policy.stage);
-    let anchors = anchors(prior, candidate, policy, soundness, &enabled);
+    let (anchors, waiting_for_a_root) = anchors(prior, candidate, policy, soundness, &enabled);
 
     // R397-6(a): resolve each anchor to the candidates that moved. A direct
     // anchor excludes its own moved candidates, narrowed to those its terminal
@@ -822,10 +822,12 @@ pub(crate) fn withdrawals(
     let mut requested =
         BTreeMap::<SignatureClassId, (String, Vec<HirId>, Option<SignatureClassId>)>::new();
     let mut unresolved_rows = BTreeMap::<SignatureClassId, String>::new();
+    let retired_any = std::cell::Cell::new(false);
     let mut request = |owner: SignatureClassId,
                        cause: String,
                        subjects: Vec<HirId>,
                        anchor: Option<SignatureClassId>| {
+        retired_any.set(true);
         requested.entry(owner).or_insert((cause, subjects, anchor));
     };
     let mut unresolved = |anchor: SignatureClassId, cause: String| {
@@ -837,7 +839,18 @@ pub(crate) fn withdrawals(
             anchor.order_key()
         )
     };
-    for (anchor, (cause, kind)) in &anchors {
+    // **R645-4 — v3's strict progress.** The owners that wait for a root their
+    // walks reached restore after all when the round retires nothing else:
+    // decided once, when every other anchor has run, and then all of them.
+    let restore_anchor = ("lost-prior-delivery".to_owned(), Anchor::Restore);
+    let late = std::iter::once(()).flat_map(|()| {
+        let nothing_retired = !retired_any.get();
+        waiting_for_a_root
+            .iter()
+            .filter(move |_| nothing_retired)
+            .map(|owner| (owner, &restore_anchor))
+    });
+    for (anchor, (cause, kind)) in anchors.iter().chain(late) {
         match kind {
             Anchor::Direct(sites) => {
                 let mut own = moved(prior, candidate, policy, *anchor);
@@ -1027,14 +1040,18 @@ pub(crate) fn withdrawals(
 
 /// The R220 generator, unchanged in what it observes: which owners carry a new
 /// terminal, and which prior deliveries are lost with no transaction of their
-/// own left to withdraw. Scoping is `withdrawals`' job.
+/// own left to withdraw. Scoping is `withdrawals`' job. Beside the anchors, the
+/// owners whose loss waits for a root their walk reached (R645-4).
 fn anchors(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
     policy: &FamilyPolicy,
     soundness: &[SoundnessWithdrawal],
     enabled: &impl Fn(SignatureClassId) -> bool,
-) -> BTreeMap<SignatureClassId, (String, Anchor)> {
+) -> (
+    BTreeMap<SignatureClassId, (String, Anchor)>,
+    BTreeSet<SignatureClassId>,
+) {
     let protected = losses(prior, candidate, soundness)
         .into_iter()
         .map(|s| SignatureClassId::of(s.fn_did))
@@ -1068,6 +1085,7 @@ fn anchors(
     // issues them all, so strict progress stands.
     let mut root_seen = false;
     let mut waiting = BTreeSet::<SignatureClassId>::new();
+    let mut wait_for_root = BTreeSet::<SignatureClassId>::new();
     // Exact predecessor edit identity (including replacement digest) establishes
     // age. Generated A5/C sites keep the stage that introduced the transaction;
     // their generic bridge-kind strings do not establish precedence.
@@ -1193,6 +1211,13 @@ fn anchors(
         // class requested on its own reason. The loss is then that root's, and
         // the owner is not made a restore anchor this round (below).
         let mut reached_root = false;
+        // **R645-4 — roots first, v3.** Whether the walk reached a class held on
+        // its OWN reason (not only `dependency-class-held:*`): a root whether or
+        // not the round has requested it yet. v2's question depends on walk
+        // order — the first walk to reach brotli's 2440 (held on its collision
+        // with 1293) made it a restore anchor, and every later `Stitch*` walk
+        // then found nothing to add and restored its own neighbours.
+        let mut reached_own_root = false;
         while let Some(current) = pending.pop() {
             if !seen.insert(current) {
                 continue;
@@ -1262,6 +1287,18 @@ fn anchors(
                 continue;
             }
             if !held_dependencies.is_empty() {
+                reached_own_root |= held_dependencies.iter().any(|dependency| {
+                    candidate
+                        .plan
+                        .class_finalization
+                        .classes
+                        .get(dependency)
+                        .is_some_and(|held| {
+                            held.hold_reasons()
+                                .iter()
+                                .any(|reason| !reason.starts_with("dependency-class-held:"))
+                        })
+                });
                 pending.extend(held_dependencies);
                 continue;
             }
@@ -1323,7 +1360,11 @@ fn anchors(
             // Otherwise the owner is a restore anchor (brotli's 2337 restored
             // its nearest changed neighbours, the Stitch*, which 2440's
             // collision with 1293 never involved).
-            if !reached_root {
+            // R645-4: a loss the walk explains by an own-reason root waits in
+            // any walk order; `withdrawals` restores it if nothing else retires.
+            if reached_own_root && !reached_root {
+                wait_for_root.insert(owner);
+            } else if !reached_root {
                 restore.insert(owner);
             }
         }
@@ -1338,7 +1379,7 @@ fn anchors(
             .entry(owner)
             .or_insert(("lost-prior-delivery".to_owned(), Anchor::Restore));
     }
-    requested
+    (requested, wait_for_root)
 }
 
 pub(crate) fn select_uses<T: Clone>(

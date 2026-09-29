@@ -1048,3 +1048,164 @@ fn r615_2_a_restore_root_waits_for_the_root_its_walk_reaches() {
         );
     });
 }
+
+/// The v3 fixture: `earlier_callee` and `slice` depended on `reference` at the
+/// prior stage; now `reference` is held on `root_reason`. `earlier_callee`
+/// changes a site of its own next to `reference` (its decision moves only when
+/// `neighbour_moves`), and `caller` changes a site that ties it to `slice` alone,
+/// with a moved decision. Returns every row as `(owner, cause, unresolved)` and
+/// the four classes.
+fn v3_rows(
+    root_reason: impl Fn(&[SignatureClassId; 4]) -> String + Sync,
+    neighbour_moves: bool,
+) -> (Vec<(SignatureClassId, String, bool)>, [SignatureClassId; 4]) {
+    let mut out = None;
+    with_baseline(|baseline| {
+        let classes = [
+            owner(&baseline, "callee_value"),
+            owner(&baseline, "reference_value"),
+            owner(&baseline, "slice_values"),
+            owner(&baseline, "caller_value"),
+        ];
+        let [first, root, later, far] = classes;
+        assert!(first < root && root < later, "the walks run in this order");
+        let mut inputs = class_inputs(&baseline);
+        for dependent in [first, later] {
+            inputs
+                .iter_mut()
+                .find(|input| input.id == dependent)
+                .unwrap()
+                .depends_on
+                .push(root);
+        }
+        let prior = candidate(&baseline, inputs);
+        for class in classes {
+            assert!(prior.plan.class_finalization.classes[&class].is_ready());
+        }
+        let text = prior
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .flat_map(|class| class.sites.iter())
+            .find(|site| site.edit_key != "-" && site.key.file != "-" && site.key.lo < site.key.hi)
+            .expect("prior applied text site")
+            .clone();
+        let at = |offset: u32| text.key.hi.saturating_add(offset);
+        let mut inputs = class_inputs(&prior);
+        let input = |inputs: &mut Vec<ClassInput>, id| {
+            inputs.iter_mut().position(|input| input.id == id).unwrap()
+        };
+        let i = input(&mut inputs, root);
+        inputs[i].block_reasons.push(root_reason(&classes));
+        let i = input(&mut inputs, first);
+        inputs[i].sites.push(ClassSite::edit(
+            first,
+            first,
+            Arm::Surface,
+            &text.key.file,
+            at(10_000),
+            at(10_001),
+            "subject-use",
+        ));
+        let i = input(&mut inputs, far);
+        inputs[i].sites.push(ClassSite::edit(
+            far,
+            later,
+            Arm::Surface,
+            &text.key.file,
+            at(20_000),
+            at(20_001),
+            "subject-use",
+        ));
+        let mut candidate = candidate(&prior, inputs);
+        for (subject, decided) in &mut candidate.table.entries {
+            let class = SignatureClassId::of(subject.fn_did);
+            if class == far || (neighbour_moves && class == first) {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        assert!(!candidate.plan.class_finalization.classes[&later].is_ready());
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        out = Some((
+            rows.into_iter()
+                .map(|w| (w.owner, w.cause, w.unresolved))
+                .collect::<Vec<_>>(),
+            classes,
+        ));
+    });
+    out.expect("the fixture ran")
+}
+
+/// Whether `rows` carry a restore anchored at `anchor`.
+fn restores_from(rows: &[(SignatureClassId, String, bool)], anchor: SignatureClassId) -> bool {
+    rows.iter().any(|(_, cause, _)| {
+        cause.contains(&format!(
+            "restore-family-interface-path:[{}",
+            anchor.order_key()
+        )) || cause.contains(&format!(
+            "restore-family-unconnected-root:{}",
+            anchor.order_key()
+        ))
+    })
+}
+
+/// **R645-4 — roots first, v3: a walk that reaches a class held on its own
+/// reason has reached a root, in any walk order.** `reference` is held on its
+/// own collision, which no request of the round names. `earlier_callee`'s walk
+/// reaches it first and makes it a restore anchor; `slice`'s walk reaches it
+/// after that, adds nothing, and under v2 (which asks only whether the round
+/// has REQUESTED the class) is made a restore anchor itself. Brotli's
+/// `StitchToPreviousBlockH*`: the first walk to reach 2440 (held on its
+/// collision with 1293) made it a restore anchor (`anchor=2440:[2440, 1297]` in
+/// 094's record), and every later `Stitch*` walk then restored its own nearest
+/// neighbours, the nineteen `StoreH*` / `InitOrStitch` rows.
+#[test]
+fn r645_4_a_walk_that_reaches_an_own_reason_root_waits_for_it_in_any_order() {
+    let (rows, [first, root, later, _]) =
+        v3_rows(|_| "cross-class-interval-collision".to_owned(), true);
+    assert!(
+        restores_from(&rows, root) && !restores_from(&rows, first),
+        "the root is the round's restore anchor: {rows:#?}"
+    );
+    assert!(
+        !restores_from(&rows, later),
+        "the later walk waits for the root it reached: {rows:#?}"
+    );
+}
+
+/// **R645-4 control — a class held on another's reason is not a root.** The
+/// same walks, with `reference` held only on a dependency's reason: `slice`'s
+/// walk reaches no root, so it restores as under v2.
+#[test]
+fn r645_4_a_walk_that_reaches_only_another_s_hold_still_restores() {
+    let (rows, [_, _, later, _]) = v3_rows(
+        |classes| format!("dependency-class-held:{}", classes[3].order_key()),
+        true,
+    );
+    assert!(
+        restores_from(&rows, later),
+        "no root was reached, so the owner restores: {rows:#?}"
+    );
+}
+
+/// **R645-4 control — strict progress.** The root's restore finds only a
+/// changed neighbour with no moved decision, so the round would retire nothing:
+/// the owner that waited for the root restores in the same round.
+#[test]
+fn r645_4_a_waiting_owner_restores_when_the_round_retires_nothing_else() {
+    let (rows, [_, _, later, _]) = v3_rows(|_| "cross-class-interval-collision".to_owned(), false);
+    assert!(
+        restores_from(&rows, later) && rows.iter().any(|(_, _, unresolved)| !unresolved),
+        "the waiting owner restores and the round retires something: {rows:#?}"
+    );
+}
