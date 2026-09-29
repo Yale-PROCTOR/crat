@@ -253,3 +253,80 @@ fn w6l_extent_c3_controls_are_refused() {
     .collect::<Vec<_>>();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Relay 067 (R669-3(c)) — the runtime harness's positive witness, ht's
+/// `ht_set_entry(entries, capacity, ..)`: every index is `hash & (capacity −
+/// 1)`, stepped by one and wrapped to 0 at `capacity`, so `capacity` is the
+/// extent. At 52 both call sites build the slice with the fallback extent,
+/// and the harness's 466,550-word input panics at index 131,072 (`capacity`
+/// is 1,048,576 there).
+const HT: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+    fn strdup(s: *const i8) -> *mut i8;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct ht_entry {
+    pub key: *const i8,
+    pub value: *mut core::ffi::c_void,
+}
+unsafe fn hash_key(mut key: *const i8) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    let mut p = key;
+    while *p != 0 {
+        hash ^= *p as u8 as u64;
+        hash = hash.wrapping_mul(1099511628211);
+        p = p.offset(1);
+    }
+    hash
+}
+pub unsafe extern "C" fn ht_set_entry(mut entries: *mut ht_entry, mut capacity: u64, mut key: *const i8, mut value: *mut core::ffi::c_void, mut plength: *mut u64) -> *const i8 {
+    let mut hash = hash_key(key);
+    let mut index = hash & capacity.wrapping_sub(1 as i32 as u64);
+    while !((*entries.offset(index as isize)).key).is_null() {
+        if strcmp(key, (*entries.offset(index as isize)).key) == 0 as i32 {
+            (*entries.offset(index as isize)).value = value;
+            return (*entries.offset(index as isize)).key;
+        }
+        index = index.wrapping_add(1);
+        if index >= capacity {
+            index = 0 as i32 as u64;
+        }
+    }
+    if !plength.is_null() {
+        key = strdup(key);
+        if key.is_null() {
+            return 0 as *const i8;
+        }
+        *plength = (*plength).wrapping_add(1);
+    }
+    (*entries.offset(index as isize)).key = key as *mut i8;
+    (*entries.offset(index as isize)).value = value;
+    return key;
+}
+pub unsafe fn masked_by_another(mut p: *const u8, mut n: u64, mut m: u64, mut h: u64) -> u8 {
+    *p.offset((h & m.wrapping_sub(1 as i32 as u64)) as isize)
+}
+pub unsafe fn masked_by_two_less(mut p: *const u8, mut n: u64, mut h: u64) -> u8 {
+    *p.offset((h & n.wrapping_sub(2 as i32 as u64)) as isize)
+}
+"#;
+
+/// The mask premise (relay 067): `x & (n − 1)` is below the length `n`,
+/// taken where `n` is nonzero wherever the callee reads (at `n = 0` the C
+/// mask is all ones). ht's own sites pass 16 and doublings of it.
+#[test]
+fn w6l_extent_ht_set_entry_is_bounded_by_its_capacity() {
+    assert_eq!(prove(HT, "ht_set_entry", 0, 1), Ok(()));
+}
+
+/// Its controls: a mask by ANOTHER integer's `− 1`, and a mask by `n − 2`,
+/// are not the length's premise.
+#[test]
+fn w6l_extent_masks_other_than_the_length_are_refused() {
+    for function in ["masked_by_another", "masked_by_two_less"] {
+        assert!(prove(HT, function, 0, 1).is_err(), "{function}");
+    }
+}
