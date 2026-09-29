@@ -69,6 +69,9 @@ pub(crate) mod element_extent;
 pub(crate) mod emitability;
 pub(crate) mod exported_pair;
 pub(crate) mod exposure;
+pub(crate) mod extent_proof;
+#[cfg(test)]
+mod extent_proof_tests;
 pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod interface;
