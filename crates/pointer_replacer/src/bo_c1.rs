@@ -724,6 +724,17 @@ impl RawBoundarySubjectTally {
     }
 }
 
+/// **R674 §2 (51r)** — the retained sibling-coverage sidecar against the replayed
+/// export's own gap records. The census writes its gaps and does not fail on a
+/// ruled one (R304-2: the row is recorded either way), so re-aggregation asks the
+/// same thing of the ledger it replays: the sidecar's records are the export's,
+/// count and text. Requiring zero (the 09-08 rule) refused every ledger with a
+/// recorded gap whatever the replay showed (batch 51: buffer 1, libtree 1,
+/// brotli 7).
+fn retained_coverage_gaps_match(sidecar: &serde_json::Value, retained: &[String]) -> bool {
+    sidecar["count"] == retained.len() && sidecar["typed_records"] == serde_json::json!(retained)
+}
+
 fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Path) -> report::Row {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -883,7 +894,10 @@ fn raw_boundary_reaggregate_custody(row: report::Row, directory: &std::path::Pat
             || sidecars["delivery-custody"]["comparison"]["issues"]
                 .as_array()
                 .is_none_or(|issues| !issues.is_empty())
-            || sidecars["sibling-coverage-gaps"]["count"] != 0
+            || !retained_coverage_gaps_match(
+                &sidecars["sibling-coverage-gaps"],
+                &retained.export.coverage_gap_records,
+            )
             || sidecars["pending-sibling-overlap"]["descriptors"]
                 != serde_json::to_value(&retained.export.pending)
                     .map_err(|error| error.to_string())?
@@ -29023,6 +29037,28 @@ fn r738_1_delivery_custody_replay() {
     for issue in &report.issues {
         println!("  issue {issue}");
     }
+}
+
+/// **R674 §2 (51r)** — a retained ledger with recorded coverage gaps replays when
+/// the replayed export records the same gaps; a changed or missing gap refuses.
+#[test]
+fn r674_51r_recorded_coverage_gaps_replay_when_the_export_records_them() {
+    let gaps = vec!["gap-a".to_owned(), "gap-b".to_owned()];
+    let sidecar = serde_json::json!({"count": 2, "typed_records": ["gap-a", "gap-b"]});
+    assert!(retained_coverage_gaps_match(&sidecar, &gaps));
+    assert!(retained_coverage_gaps_match(
+        &serde_json::json!({"count": 0, "typed_records": []}),
+        &[]
+    ));
+    assert!(!retained_coverage_gaps_match(&sidecar, &gaps[..1]));
+    assert!(!retained_coverage_gaps_match(
+        &serde_json::json!({"count": 2, "typed_records": ["gap-a", "gap-c"]}),
+        &gaps
+    ));
+    assert!(!retained_coverage_gaps_match(
+        &serde_json::json!({"count": 0, "typed_records": []}),
+        &gaps
+    ));
 }
 
 /// **R674-6 (iii-b)** — heman's `convex_hull#258` at batch 52: an owner-view row
