@@ -316,6 +316,7 @@ fn parameter_access(
         }
     } else if let Some(op) = copies_of(tcx, key)
         .into_iter()
+        .filter(|copy| same_pointee(tcx, key.0, key.1, *copy))
         .find_map(|copy| extent_leaving_op(tcx, (key.0, copy), facts, guard))
     {
         AccessReason::PointerArithmetic { op: op.clone() }
@@ -565,6 +566,24 @@ fn copies_of(tcx: TyCtxt<'_>, (function, binding): (LocalDefId, HirId)) -> Vec<H
         at += 1;
     }
     members
+}
+
+/// **Relay 065 (the corpus probe on binn) — a step counts in the parameter's
+/// own elements.** A copy under a cast to another pointee (`let dest = pdest
+/// as *mut u8`) steps in ITS elements, bytes of the parameter's one element
+/// in binn's `copy_be32` (wave-6b's byte views), so the arithmetic arm reads
+/// only copies with the parameter's own pointee type. The counted arm is in
+/// bytes and reads them all.
+fn same_pointee(tcx: TyCtxt<'_>, function: LocalDefId, parameter: HirId, copy: HirId) -> bool {
+    if copy == parameter {
+        return true;
+    }
+    let typeck = tcx.typeck(function);
+    let pointee = |id: HirId| match typeck.node_type_opt(id)?.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
+        _ => None,
+    };
+    pointee(parameter).is_some_and(|p| pointee(copy) == Some(p))
 }
 
 /// [`counted_foreign_footprint`] over the parameter and its copies, joined.
