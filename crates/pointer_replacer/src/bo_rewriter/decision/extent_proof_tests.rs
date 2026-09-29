@@ -216,7 +216,10 @@ fn w6l_extent_c3_dominated_index() {
 fn w6l_extent_c3_controls_are_refused() {
     let wrong = [
         ("c3_short_circuit", "access-unproven:upper"),
-        ("c3_truncating", "access-unproven:upper"),
+        // (B5: `i as isize` keeps its value only when `i` is bounded by `n`,
+        // and a truncated guard bounds nothing, so the offset has no lower
+        // bound either.)
+        ("c3_truncating", "access-unproven:lower"),
         ("c3_address_taken", "companion-written"),
         ("c3_off_by_one", "access-unproven:upper"),
         ("c3_negative", "access-unproven:lower"),

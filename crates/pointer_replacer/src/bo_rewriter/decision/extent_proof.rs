@@ -370,6 +370,8 @@ struct Analysis<'a, 'tcx> {
     /// Tracked locals (integers and pointers, not address-taken) and their
     /// matrix variable; variable 0 is zero.
     vars: FxHashMap<Local, usize>,
+    /// The local of each variable (index `var − 1`).
+    var_locals: Vec<Local>,
     address_taken: FxHashSet<Local>,
     assigned: FxHashSet<Local>,
 }
@@ -397,6 +399,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             }
         }
         let mut vars = FxHashMap::default();
+        let mut var_locals = Vec::new();
         for (local, decl) in body.local_decls.iter_enumerated() {
             if address_taken.contains(&local) {
                 continue;
@@ -404,6 +407,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             if decl.ty.is_integral() || pointee(decl.ty).is_some() {
                 let next = vars.len() + 1;
                 vars.insert(local, next);
+                var_locals.push(local);
             }
         }
         Analysis {
@@ -413,6 +417,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             n,
             element,
             vars,
+            var_locals,
             address_taken,
             assigned,
         }
@@ -605,6 +610,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => {
                 if let Some(local) = place.as_local() {
+                    // A pointer's variable is its offset from `p` only while
+                    // it is `Derived` (the relay 066 review's B4).
+                    if pointee(self.body.local_decls[local].ty).is_some()
+                        && state.derivation(local) != Derivation::Derived
+                    {
+                        return None;
+                    }
                     return self.var(local).map(Term::Var);
                 }
                 // `move (t.0)` of an overflow-checked step.
@@ -719,6 +731,20 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 span,
             });
         }
+        // The relay 066 review's B2: `&q` of a derived pointer lets any
+        // callee or later load read through it.
+        if let Rvalue::Ref(_, _, borrowed) | Rvalue::RawPtr(_, borrowed) = rvalue
+            && !borrowed
+                .projection
+                .iter()
+                .any(|elem| matches!(elem, ProjectionElem::Deref))
+            && state.derivation(borrowed.local) != Derivation::Other
+        {
+            refuse(Refusal {
+                reason: "address-of-a-derived-pointer".to_owned(),
+                span,
+            });
+        }
         let x_var = self.var(x);
         // The new value, computed against the state BEFORE x is overwritten.
         enum New {
@@ -822,6 +848,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             }
             _ => New::Unknown,
         };
+        // The relay 066 review's B1: an unsigned step that may wrap is not
+        // exact.
+        let new = match new {
+            New::Term(term, c) if !self.step_exact(state, x, term, c) => New::Unknown,
+            other => other,
+        };
         // Overwrite x: its old facts go first (the new value was computed
         // above, against the old state).
         match new {
@@ -842,7 +874,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             New::Pointer(src, derivation) => {
                 let src_var = self.var(src);
                 self.kill(state, x);
-                if let (Some(x_var), Some(src_var)) = (x_var, src_var)
+                if derivation == Derivation::Derived
+                    && let (Some(x_var), Some(src_var)) = (x_var, src_var)
                     && x_var != src_var
                 {
                     state.dbm.assign(x_var, src_var, 0);
@@ -882,8 +915,57 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             Term::Var(v) => state.dbm.get(0, v) <= 0,
         };
         match (from.1, to.1) {
-            (false, false) | (true, true) | (false, true) => to.0 >= from.0,
+            (false, false) | (true, true) => to.0 >= from.0,
+            // Unsigned into signed: wider always; the same width only for a
+            // value bounded by the length (the relay 066 review's B5: `u32
+            // as i32` of `0xFFFF_FFFF` is -1).
+            (false, true) => {
+                to.0 > from.0
+                    || (to.0 == from.0
+                        && match term {
+                            Term::Const(k) => k >= 0,
+                            Term::Var(v) => {
+                                let n = self.var(self.n).expect("the companion is tracked");
+                                state.dbm.get(v, n) <= 0
+                            }
+                        })
+            }
             (true, false) => to.0 >= from.0 && non_negative,
+        }
+    }
+
+    /// Is `x := term + c` exact? A signed step is (C's signed overflow is UB,
+    /// §28). An unsigned one only when it provably does not wrap: `− c` needs
+    /// `term ≥ c`, and `+ c` needs a bound `term ≤ z − c` on a variable `z`
+    /// no wider than x, or a constant upper bound with room for `c` (the relay
+    /// 066 review's B1: `n.wrapping_sub(1)` at `n = 0`).
+    fn step_exact(&self, state: &State, x: Local, term: Term, c: i64) -> bool {
+        let Some((bits, signed)) = int_shape(self.body.local_decls[x].ty) else {
+            return true;
+        };
+        if signed {
+            return true;
+        }
+        let max: i128 = if bits >= 64 {
+            i128::MAX
+        } else {
+            (1i128 << bits) - 1
+        };
+        match term {
+            Term::Const(k) => (k as i128 + c as i128) >= 0 && (k as i128 + c as i128) <= max,
+            Term::Var(_) if c == 0 => true,
+            Term::Var(y) if c < 0 => state.dbm.get(0, y) <= c,
+            Term::Var(y) => {
+                let upper = state.dbm.get(y, 0);
+                (upper < INF && upper as i128 + c as i128 <= max)
+                    || self.var_locals.iter().enumerate().any(|(index, local)| {
+                        let z = index + 1;
+                        z != y
+                            && state.dbm.get(y, z) <= -c
+                            && int_shape(self.body.local_decls[*local].ty)
+                                .is_some_and(|(width, _)| width <= bits)
+                    })
+            }
         }
     }
 
@@ -921,13 +1003,22 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
         let name = callee
             .map(|def| self.tcx.item_name(def).to_string())
             .unwrap_or_default();
+        // The relay 066 review's B3: the INHERENT raw-pointer and integer
+        // methods, not any callee that shares their names.
+        let path = callee
+            .map(|def| self.tcx.def_path_str(def))
+            .unwrap_or_default();
+        let raw_pointer_method =
+            path.contains("ptr::const_ptr::<impl") || path.contains("ptr::mut_ptr::<impl");
+        let integer_method = path.contains("num::<impl");
         let dest = destination.as_local();
         let receiver = args.first().and_then(|arg| operand_local(&arg.node));
-        let pointer_step = matches!(
-            name.as_str(),
-            "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
-        ) && receiver
-            .is_some_and(|local| pointee(self.body.local_decls[local].ty).is_some());
+        let pointer_step = raw_pointer_method
+            && matches!(
+                name.as_str(),
+                "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
+            )
+            && receiver.is_some_and(|local| pointee(self.body.local_decls[local].ty).is_some());
         if pointer_step && args.len() == 2 {
             let receiver = receiver.expect("a pointer step has a receiver");
             let derivation = state.derivation(receiver);
@@ -950,7 +1041,10 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 return;
             }
             state.derivation.insert(dest, derivation);
-            let (Some(dest_var), Some(src_var)) = (self.var(dest), src_var) else {
+            // A tainted receiver's step keeps no offset (B4).
+            let (Some(dest_var), Some(src_var), Derivation::Derived) =
+                (self.var(dest), src_var, derivation)
+            else {
                 return;
             };
             match (step, backwards) {
@@ -973,7 +1067,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             return;
         }
         // Integer steps by a constant.
-        if matches!(name.as_str(), "wrapping_add" | "wrapping_sub")
+        if integer_method
+            && matches!(name.as_str(), "wrapping_add" | "wrapping_sub")
             && args.len() == 2
             && let Some(dest) = dest
             && let Some(dest_var) = self.var(dest)
@@ -985,11 +1080,16 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             );
             let sign = if name == "wrapping_add" { 1 } else { -1 };
             self.kill(state, dest);
+            let old = state.clone();
             match (left, right) {
-                (Some(term), Some(Term::Const(c))) => {
+                (Some(term), Some(Term::Const(c)))
+                    if self.step_exact(&old, dest, term, sign * c) =>
+                {
                     self.assign_term(state, dest_var, term, sign * c)
                 }
-                (Some(Term::Const(c)), Some(term)) if sign == 1 => {
+                (Some(Term::Const(c)), Some(term))
+                    if sign == 1 && self.step_exact(&old, dest, term, c) =>
+                {
                     self.assign_term(state, dest_var, term, c)
                 }
                 _ => {}
@@ -1000,7 +1100,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             return;
         }
         // `q.is_null()` reads nothing and keeps nothing.
-        if name == "is_null"
+        if raw_pointer_method
+            && name == "is_null"
             && args.len() == 1
             && receiver.is_some_and(|local| pointee(self.body.local_decls[local].ty).is_some())
         {
