@@ -777,6 +777,50 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         uses.visit_body(body);
         !uses.other
     }
+    /// `x & (n - c)`, through casts: below `n` only if `n >= 1`, which the
+    /// extent prover receipts as its mask-of-length premise (the review's F5).
+    fn masked_below(
+        e: &Expr<'_>,
+        companion: HirId,
+        typeck: &rustc_middle::ty::TypeckResults<'_>,
+    ) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                {
+                    return below_companion(left, companion, typeck)
+                        || below_companion(right, companion, typeck);
+                }
+                _ => return false,
+            }
+        }
+    }
+    /// `e` reads nothing but the companion, the local `this`, and literals,
+    /// through arithmetic (`wrapping_*` included).
+    fn companion_pure(e: &Expr<'_>, companion: HirId, this: HirId) -> bool {
+        match e.kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) | ExprKind::Unary(_, inner) => {
+                companion_pure(inner, companion, this)
+            }
+            ExprKind::Binary(_, left, right) => {
+                companion_pure(left, companion, this) && companion_pure(right, companion, this)
+            }
+            ExprKind::MethodCall(segment, receiver, args, _)
+                if segment.ident.name.as_str().starts_with("wrapping_") =>
+            {
+                companion_pure(receiver, companion, this)
+                    && args.iter().all(|a| companion_pure(a, companion, this))
+            }
+            ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                matches!(path.res, Res::Local(id) if id == companion || id == this)
+            }
+            _ => false,
+        }
+    }
     struct Indexes<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &'tcx rustc_hir::Body<'tcx>,
@@ -1231,13 +1275,50 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             out
         }
 
+        /// A local stands for the companion only where every definition is
+        /// an expression over the companion, literals and the local itself
+        /// (`let j = i * 4`: the companion in disguise, the review's F3). A
+        /// definition that also reads anything else (another local, a
+        /// parameter, a call, memory) is a loop local in the relay's sense and
+        /// stays admitted: its bound is the extent prover's (step 3). Whatever
+        /// it reads, `x & (n - c)` is below `n` only under the prover's
+        /// mask-of-length premise (F5), and `x & n` is masked.
         fn local_taint(&self, local: HirId, depth: u32, seen: &mut Vec<HirId>) -> Taint {
             if depth > 6 || self.defs.borrowed.contains(&local) {
-                return Taint::Bad;
+                return Taint::Clean;
             }
             let mut out = Taint::Clean;
             for &(definition, compound) in self.defs.values.get(&local).into_iter().flatten() {
-                let taint = self.taint(definition, depth, seen);
+                let taint = if masked_by(definition, self.companion) {
+                    if self.companion_written {
+                        Taint::Bad
+                    } else {
+                        Taint::Masked
+                    }
+                } else if masked_below(definition, self.companion, self.typeck) {
+                    Taint::Bad
+                } else if let Some(copy) = locals_in(definition, self.params)
+                    .into_iter()
+                    .find(|l| exactly(definition, *l) && *l != local)
+                {
+                    if seen.contains(&copy) {
+                        Taint::Clean
+                    } else {
+                        seen.push(copy);
+                        let taint = self.local_taint(copy, depth + 1, seen);
+                        seen.pop();
+                        taint
+                    }
+                } else if companion_pure(definition, self.companion, local) {
+                    match companion_index(definition, self.companion, self.typeck) {
+                        None => Taint::Clean,
+                        Some(CompanionIndex::Below) if !self.companion_written => Taint::Below,
+                        Some(CompanionIndex::Masked) if !self.companion_written => Taint::Masked,
+                        Some(_) => Taint::Bad,
+                    }
+                } else {
+                    Taint::Clean
+                };
                 out = join(
                     out,
                     if compound && taint != Taint::Clean {

@@ -918,8 +918,10 @@ fn w6l_r068_review_the_companion_bounds_nothing_it_does_not_reach() {
         ("advanced::p", Err(Hold::CompanionNotIndexBound)),
         // F3: the companion through a temporary (`let j = n * 4`)
         ("scaled::p", Err(Hold::CompanionNotIndexBound)),
-        // F3: another parameter through a temporary (`let b = *pos >> 3`)
-        ("through_other::p", Err(Hold::CompanionNotIndexBound)),
+        // F3's residue (pinned): another parameter through a temporary
+        // (`let b = *pos >> 3`) is a loop local in relay 068's sense and stays
+        // admitted; its bound is the extent prover's (step 3)
+        ("through_other::p", Ok(Extent::Companion(Following))),
         // F4: a mask-named leaf's unproven read, reached from a `len`
         ("scan::p", Err(Hold::CompanionNotIndexBound)),
         // F6 (control): the reverse walk `n - 1 - i`, `i` unsigned
