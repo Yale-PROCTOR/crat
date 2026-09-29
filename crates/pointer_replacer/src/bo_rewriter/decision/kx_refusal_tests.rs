@@ -425,3 +425,44 @@ fn w6l_mk14_a_masked_address_handed_on_is_not_a_proof() {
         "{edits:#?}"
     );
 }
+
+/// MK15 (relay 066, R666-2 STOP 1) — a NO-OP mask: brotli's
+/// `BrotliCompressBufferQuality10` passes `let mask = !0 >> 1` over a flat
+/// input. The callee's masking proof holds (MK4's shape), but `mask + 1` is a
+/// §77 claim founded on a ring buffer of `mask + 1` elements, and a constant
+/// mask says nothing about any buffer (`!0 >> 1` renders 2^63, past
+/// `from_raw_parts`' `isize::MAX`). The seam refuses it under
+/// `no-op-mask:<argument>`. MK15c — a ring mask computed from a formal keeps
+/// `mask + 1`.
+#[test]
+fn w6l_mk15_mk15c_a_constant_mask_is_refused_a_ring_mask_is_not() {
+    let no_op = MASK_PROVEN.replace(
+        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+        "    let mut mask = !(0 as i32 as usize) >> 1 as i32;\n    FindAllMatchesH10(ringbuffer, mask, n)",
+    );
+    assert_ne!(no_op, MASK_PROVEN, "the constant mask is in");
+    let edits = edits(&no_op);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("no-op-mask:mask")),
+        "{edits:#?}"
+    );
+    assert!(
+        !edits
+            .iter()
+            .any(|(_, extent)| extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+    let ring = MASK_PROVEN.replace(
+        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+        "    let mut mask = (1 as usize) << ringbuffer_mask;\n    mask = mask.wrapping_sub(1);\n    FindAllMatchesH10(ringbuffer, mask, n)",
+    );
+    let ring_edits = self::edits(&ring);
+    assert!(
+        ring_edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("MaskPlusOne")),
+        "{ring_edits:#?}"
+    );
+}
