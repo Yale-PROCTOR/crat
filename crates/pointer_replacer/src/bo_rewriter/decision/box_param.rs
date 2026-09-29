@@ -1476,6 +1476,25 @@ pub(crate) fn derive<'tcx>(
                         .insert((param.fn_did, param.hir_id), (param.label.clone(), reason));
                     continue;
                 }
+                // **R645-12 (a)** — the chain's alias hold below, asked of the
+                // re-seat too: a formal whose alias's pointee the owner cannot
+                // name has no `Box` spelling, and planned it would stay raw
+                // while its callers move the owned field out as a `Box`. The
+                // certificate that read it as an owner re-derives without it
+                // (`unseated_owner_parameters`).
+                Reseat::Planned(..)
+                    if param.decl_shape == super::DeclShape::Alias
+                        && !declaration_pointees.contains_key(&(param.fn_did, param.hir_id)) =>
+                {
+                    out.holds.insert(
+                        (param.fn_did, param.hir_id),
+                        (
+                            param.label.clone(),
+                            format!("box-param-alias-formal:{callee_path}"),
+                        ),
+                    );
+                    continue;
+                }
                 Reseat::Planned(plan, fields, transfers) => {
                     out.receipts.push(format!(
                         "box-param-reseat callee={callee_path} index={hir_index} fields={}{}",

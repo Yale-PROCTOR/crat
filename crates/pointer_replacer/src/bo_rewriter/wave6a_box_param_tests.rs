@@ -2308,6 +2308,125 @@ fn w6a_r536_a_reseat_over_raw_fields_is_withdrawn() {
     assert_eq!(out.reverted, 0, "{}", out.source);
 }
 
+/// **R645-12 (a), wave-6s 091 STOP 2 — a re-seat formal spelled through a
+/// pointer alias.** `insert` consumes and returns a node spelled
+/// `tree::node_t` (`= *mut hidden::node`, the corpus's module-nested shape),
+/// and its one caller re-seats an owned field of ANOTHER struct,
+/// `(*h).a = insert((*h).a, key)` (a struct an alias mentions holds its own
+/// fields, `field-transaction-incomplete:type-alias`, so bst's self-referential
+/// `node` never gets this far). Where `hidden` is public the re-seat delivers
+/// over the alias's resolved pointee (W6S-17); where it is private to `tree`
+/// the owner cannot name the pointee, so the re-seat holds typed
+/// (`box-param-alias-formal`), as a chain's formal does, and the owned field
+/// crosses the raw formal by value. Planned instead, the formal is degraded
+/// under a caller that moves the field out as a `Box`: the emitted crate
+/// fails (E0603 on the spelled pointee, E0308 at the move) and its classes
+/// revert.
+const RESEAT_ALIAS: &str = r#"
+// w6a-r645-reseat-alias-frame
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub mod tree {
+    pub mod hidden {
+        #[repr(C)]
+        pub struct node {
+            pub key: i32,
+        }
+    }
+    #[repr(C)]
+    pub struct holder {
+        pub a: *mut hidden::node,
+        pub n: i32,
+    }
+    pub type node_t = *mut hidden::node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn insert(mut node: tree::node_t, mut key: i32) -> tree::node_t {
+    if node.is_null() {
+        return 0 as tree::node_t;
+    }
+    (*node).key = key;
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn put(mut h: *mut tree::holder, mut key: i32) {
+    (*h).a = insert((*h).a, key);
+}
+"#;
+
+fn reseat_alias(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set_with_contract(
+        "w6a-r645-reseat-alias-frame",
+        vec![("holder".to_owned(), 0, SlotKind::Owning)],
+        vec![("insert::node".to_owned(), SlotKind::Owning)],
+        Vec::new(),
+    );
+    let out = emitted(name, source);
+    super::test_model_override::clear();
+    out
+}
+
+#[test]
+fn w6a_r645_a_reseat_formal_spelled_through_an_alias_holds_an_unnameable_pointee() {
+    let out = reseat_alias("r645-reseat-alias", RESEAT_ALIAS);
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    let context = format!(
+        "{receipts}\n{}\n{}\n{:#?}",
+        out.source, out.artifacts.field_transactions, out.degradations
+    );
+    assert!(
+        receipts.contains("box-param-reseat callee=insert index=0 fields=1"),
+        "{context}"
+    );
+    assert!(
+        src.contains("fninsert(mutnode:Option<Box<crate::tree::hidden::node>>,"),
+        "{context}"
+    );
+    assert!(src.contains(".a.take()"), "{context}");
+    assert_eq!(
+        reason_of(&out.degradations, "insert::node"),
+        None,
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+
+    let hidden = RESEAT_ALIAS.replace("    pub mod hidden {", "    mod hidden {");
+    assert_ne!(hidden, RESEAT_ALIAS);
+    let out = reseat_alias("r645-reseat-alias-unnameable", &hidden);
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.box_param_receipts;
+    let context = format!(
+        "{receipts}\n{}\n{}\n{:#?}",
+        out.source, out.artifacts.field_transactions, out.degradations
+    );
+    assert!(
+        receipts.contains("insert::node\theld\tbox-param-alias-formal:insert"),
+        "{context}"
+    );
+    assert!(
+        !receipts.contains("box-param-reseat callee=insert "),
+        "{context}"
+    );
+    // The formal stays raw, and the owned field crosses it by value: out
+    // through `Box::into_raw`, back through `from_raw` (wave-6f's raw move).
+    assert!(
+        src.contains("fninsert(mutnode:tree::node_t,mutkey:i32)->tree::node_t{"),
+        "{context}"
+    );
+    assert!(
+        src.contains("insert((*h).a.take().map_or(core::ptr::null_mut(),Box::into_raw),key)"),
+        "{context}"
+    );
+    assert!(!src.contains("as_mut())"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
 /// quadtree's `test_tree`, reduced: an optional Box owner (`tree_new` may
 /// return null) whose raw field `root` is passed to a callee that decides
 /// `&mut`. Since joint (d) (R555-1) the owner view is the OWNER's, so
