@@ -1581,6 +1581,15 @@ struct ConstructionBracketVisitor<'a> {
     next_id: u32,
 }
 
+/// The first fresh `NodeId` for the bracket's wrappers.
+fn first_fresh_node_id(
+    tree_max: u32,
+    _guard: &Composition,
+    _others: impl Iterator<Item = NodeId>,
+) -> u32 {
+    tree_max + 1
+}
+
 /// The largest assigned `NodeId` in a crate (`DUMMY_NODE_ID` aside).
 struct MaxNodeId(u32);
 
@@ -3449,6 +3458,19 @@ mod tests {
                 assert_ne!(e.id, rustc_ast::DUMMY_NODE_ID, "and a real one");
             },
         )
+    }
+
+    /// Relay 066 review (A4) — the fresh ids start above every id still
+    /// referenced: the tree's, and the ids a pass claimed or a map keys on even
+    /// where the node was since replaced (a use graft replaces `e.kind`, and
+    /// the dropped children's ids stay in `guard.claimed` and the capture
+    /// maps).
+    #[test]
+    fn w6l_bracket_fresh_ids_start_above_every_referenced_id() {
+        let mut guard = Composition::default();
+        assert!(guard.claim(NodeId::from_u32(900), rustc_span::DUMMY_SP, "use"));
+        let fresh = first_fresh_node_id(40, &guard, std::iter::once(NodeId::from_u32(500)));
+        assert!(fresh > 900, "{fresh}");
     }
 
     #[test]

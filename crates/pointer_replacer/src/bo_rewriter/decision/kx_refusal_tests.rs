@@ -466,3 +466,48 @@ fn w6l_mk15_mk15c_a_constant_mask_is_refused_a_ring_mask_is_not() {
         "{ring_edits:#?}"
     );
 }
+
+/// MK16 / MK17 / MK18 (relay 066 review, A1) — the no-op mask the seam must see
+/// beyond a local initialized at the call:
+/// - MK16: through the caller's FORMAL (brotli Quality10's `mask` reaches
+///   inner seams as `ringbuffer_mask`): `Mid(addr, mask, n)` builds the slice
+///   with its formal `mask`, and `Top` passes `!0 >> 1`;
+/// - MK17: C89's declare-then-assign (`let mut mask = 0; mask = !0 >> 1;`);
+/// - MK18: a constant path (`usize::MAX >> 1`).
+#[test]
+fn w6l_mk16_mk17_mk18_a_no_op_mask_through_a_formal_an_assignment_or_a_path() {
+    let mid = MASK_PROVEN.replace(
+        "pub unsafe fn Create(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> u32 {\n    let mut ringbuffer = addr as *const u8;\n    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)\n}",
+        "unsafe fn Mid(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> u32 {\n    let mut ringbuffer = addr as *const u8;\n    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)\n}\npub unsafe fn Top(mut addr: usize, mut n: usize) -> u32 {\n    Mid(addr, !(0 as i32 as usize) >> 1 as i32, n)\n}",
+    );
+    assert_ne!(mid, MASK_PROVEN, "Mid and Top are in");
+    let mid_edits = self::edits(&mid);
+    assert!(
+        mid_edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("no-op-mask:ringbuffer_mask")),
+        "MK16: {mid_edits:#?}"
+    );
+    for (label, local) in [
+        (
+            "MK17",
+            "    let mut mask: usize = 0 as i32 as usize;\n    mask = !(0 as i32 as usize) >> 1 as i32;\n",
+        ),
+        (
+            "MK18",
+            "    let mut mask: usize = usize::MAX >> 1 as i32;\n",
+        ),
+    ] {
+        let input = MASK_PROVEN.replace(
+            "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+            &format!("{local}    FindAllMatchesH10(ringbuffer, mask, n)"),
+        );
+        let edits = self::edits(&input);
+        assert!(
+            edits.iter().any(|(replacement, extent)| replacement
+                .contains("from_raw_parts(ringbuffer,")
+                && extent.contains("no-op-mask:mask")),
+            "{label}: {edits:#?}"
+        );
+    }
+}
