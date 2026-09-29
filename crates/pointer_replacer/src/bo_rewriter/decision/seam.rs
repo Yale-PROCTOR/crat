@@ -324,8 +324,9 @@ pub(crate) enum SeamLen {
     PositionalSibling { text: String, param: String },
     /// **wave-6l relay 063 (R645-5).** The fabricated extent where a companion
     /// was REFUSED: the KX list (`kx-list:<subject>`), an argument only ever
-    /// `0` (`only-zero`), or a mask offered as a count (`mask-as-count:<arg>`).
-    /// Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
+    /// `0` (`only-zero`), a mask offered as a count (`mask-as-count:<arg>`),
+    /// or the masked arm's `mask + 1` of a constant mask (`no-op-mask:<arg>`,
+    /// relay 066). Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
     /// receipt names the refusal: `fallback(extent-refused:<reason>)`.
     Refused(String),
 }
@@ -5636,7 +5637,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                         //  * (R631-4 (iv)) a companion only ever `0`;
                         //  * (item 6) a mask as a count, on the adjacency arms
                         //    (R477-6's masked arm licenses `mask + 1` on its
-                        //    own proof, and a contract's count is the count).
+                        //    own proof, and a contract's count is the count);
+                        //  * (relay 066) the masked arm's `mask + 1` of a
+                        //    constant (no-op) mask.
                         let adjacency = arm != LenEvidence::Contract;
                         let kx = param_key
                             .get(&(*callee, pos.index))
@@ -5667,6 +5670,20 @@ pub(crate) fn synthesize_with_raw_boundary(
                             {
                                 Some(format!(
                                     "mask-as-count:{}",
+                                    sm.span_to_snippet(argument.span).unwrap_or_default()
+                                ))
+                            } else if masked
+                                && super::masked_runtime::constant_mask(
+                                    tcx,
+                                    site.caller,
+                                    argument.span,
+                                )
+                            {
+                                // Relay 066 (R666-2): R477-6's `mask + 1`
+                                // holds for a ring buffer, not a constant
+                                // (no-op) mask such as `!0 >> 1`.
+                                Some(format!(
+                                    "no-op-mask:{}",
                                     sm.span_to_snippet(argument.span).unwrap_or_default()
                                 ))
                             } else {

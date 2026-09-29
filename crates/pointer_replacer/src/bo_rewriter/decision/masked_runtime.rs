@@ -353,6 +353,42 @@ pub(crate) fn mask_operand(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span
     }
 }
 
+/// **Relay 066 (R666-2, STOP 1) — a NO-OP mask.** The argument at `span` is a
+/// constant expression, directly or through never-reassigned, never-borrowed
+/// locals: literals under casts, `!` / `-`, and binary operations of
+/// constants. brotli's `BrotliCompressBufferQuality10` passes `let mask = !0
+/// >> 1` over a flat input. R477-6's `mask + 1` is a §77 claim founded on the
+/// masking proof, and it holds for a ring buffer of `mask + 1` elements. A
+/// constant mask names no buffer, and `!0 >> 1` renders 2^63, past
+/// `from_raw_parts`' `isize::MAX`. The seam refuses it.
+pub(crate) fn constant_mask(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span::Span) -> bool {
+    fn constant_expression<'tcx>(
+        definitions: &Definitions<'tcx>,
+        e: &Expr<'tcx>,
+        depth: u32,
+    ) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let e = definitions.resolve(e);
+        match e.kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::Unary(rustc_hir::UnOp::Not | rustc_hir::UnOp::Neg, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => constant_expression(definitions, inner, depth + 1),
+            ExprKind::Binary(_, left, right) => {
+                constant_expression(definitions, left, depth + 1)
+                    && constant_expression(definitions, right, depth + 1)
+            }
+            _ => false,
+        }
+    }
+    let Some((body, argument)) = argument_at(tcx, caller, span) else {
+        return false;
+    };
+    constant_expression(&Definitions::of(tcx, body), argument, 0)
+}
+
 fn local_callee(tcx: TyCtxt<'_>, owner: LocalDefId, callee: &Expr<'_>) -> Option<LocalDefId> {
     match tcx.typeck(owner).expr_ty(callee).kind() {
         TyKind::FnDef(definition, _) => definition
