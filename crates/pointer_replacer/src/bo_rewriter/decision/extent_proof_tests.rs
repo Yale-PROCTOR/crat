@@ -344,3 +344,143 @@ fn w6l_extent_masks_other_than_the_length_are_refused() {
         assert!(prove(HT, function, 0, 1).is_err(), "{function}");
     }
 }
+
+/// The seam's edits `(replacement, extent receipt)` for one fixture.
+fn seam_edits(input: &str) -> Vec<(String, String)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).expect("decisions");
+        table
+            .seams
+            .edits
+            .iter()
+            .map(|edit| {
+                (
+                    edit.replacement
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    format!("{:?}", edit.bridge.extent),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiles")
+}
+
+/// ht's two call sites, as the corpus has them (`ht_expand`'s fresh
+/// `new_entries` / `new_capacity`, and `ht_set`'s `(*table).entries` /
+/// `(*table).capacity`).
+const HT_CALLERS: &str = r####"#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+    fn strdup(s: *const i8) -> *mut i8;
+    fn calloc(n: u64, size: u64) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct ht_entry {
+    pub key: *const i8,
+    pub value: *mut core::ffi::c_void,
+}
+#[repr(C)]
+pub struct ht {
+    pub entries: *mut ht_entry,
+    pub capacity: u64,
+    pub length: u64,
+}
+unsafe fn hash_key(mut key: *const i8) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    let mut p = key;
+    while *p != 0 {
+        hash ^= *p as u8 as u64;
+        hash = hash.wrapping_mul(1099511628211);
+        p = p.offset(1);
+    }
+    hash
+}
+unsafe extern "C" fn ht_set_entry(mut entries: *mut ht_entry, mut capacity: u64, mut key: *const i8, mut value: *mut core::ffi::c_void, mut plength: *mut u64) -> *const i8 {
+    let mut hash = hash_key(key);
+    let mut index = hash & capacity.wrapping_sub(1 as i32 as u64);
+    while !((*entries.offset(index as isize)).key).is_null() {
+        if strcmp(key, (*entries.offset(index as isize)).key) == 0 as i32 {
+            (*entries.offset(index as isize)).value = value;
+            return (*entries.offset(index as isize)).key;
+        }
+        index = index.wrapping_add(1);
+        if index >= capacity {
+            index = 0 as i32 as u64;
+        }
+    }
+    if !plength.is_null() {
+        key = strdup(key);
+        if key.is_null() {
+            return 0 as *const i8;
+        }
+        *plength = (*plength).wrapping_add(1);
+    }
+    (*entries.offset(index as isize)).key = key as *mut i8;
+    (*entries.offset(index as isize)).value = value;
+    return key;
+}
+unsafe extern "C" fn ht_expand(mut table: *mut ht) -> bool {
+    let mut new_capacity = ((*table).capacity).wrapping_mul(2 as i32 as u64);
+    if new_capacity < (*table).capacity {
+        return 0 as i32 != 0;
+    }
+    let mut new_entries = calloc(new_capacity, ::std::mem::size_of::<ht_entry>() as u64) as *mut ht_entry;
+    if new_entries.is_null() {
+        return 0 as i32 != 0;
+    }
+    let mut i = 0 as i32 as u64;
+    while i < (*table).capacity {
+        let mut entry = *((*table).entries).offset(i as isize);
+        if !(entry.key).is_null() {
+            ht_set_entry(new_entries, new_capacity, entry.key, entry.value, 0 as *mut u64);
+        }
+        i = i.wrapping_add(1);
+    }
+    free((*table).entries as *mut core::ffi::c_void);
+    (*table).entries = new_entries;
+    (*table).capacity = new_capacity;
+    return 1 as i32 != 0;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_set(mut table: *mut ht, mut key: *const i8, mut value: *mut core::ffi::c_void) -> *const i8 {
+    if value.is_null() {
+        return 0 as *const i8;
+    }
+    if (*table).length >= ((*table).capacity).wrapping_div(2 as i32 as u64) {
+        if !ht_expand(table) {
+            return 0 as *const i8;
+        }
+    }
+    return ht_set_entry((*table).entries, (*table).capacity, key, value, &mut (*table).length);
+}
+"####;
+
+/// Relay 067's positive witness at the seam: the extent prover licenses the
+/// sibling `capacity` where no other producer did, so both call sites build
+/// the slice with the caller's capacity, receipted `extent-proof`, and the
+/// fallback extent leaves (the runtime harness's panic at 131,072).
+#[test]
+fn w6l_extent_ht_call_sites_take_the_capacity() {
+    let edits = seam_edits(HT_CALLERS);
+    for (base, length) in [
+        ("new_entries", "(new_capacity) as usize"),
+        ("(*table).entries", "((*table).capacity) as usize"),
+    ] {
+        assert!(
+            edits.iter().any(|(replacement, extent)| replacement
+                .contains(&format!("from_raw_parts_mut({base}, {length})"))
+                && extent.contains("extent-proof:mask-of-length")),
+            "{base}: {edits:#?}"
+        );
+    }
+    assert!(
+        !edits
+            .iter()
+            .any(|(replacement, _)| replacement.contains("FALLBACK_SLICE_EXTENT")),
+        "{edits:#?}"
+    );
+}
