@@ -136,10 +136,24 @@ fn w6l_mk1_a_mask_is_not_taken_as_a_count() {
     );
 }
 
-/// MKc — the control: the same call with a count that is not a mask keeps it.
+/// `MASK_AS_COUNT` with a callee the integer really bounds (a loop to it).
+/// The original callee reads `((cur_ix - 1) & n) + 4`, past `n`: under relay
+/// 068's licence the reader chain refuses it before the seam sees a count, so
+/// the controls below that ask the SEAM's question use this one.
+fn mask_as_count_bounded() -> String {
+    let input = MASK_AS_COUNT.replace(
+        "    let mut prev_ix = cur_ix.wrapping_sub(1);\n    prev_ix &= ring_buffer_mask;\n    prev_ix = prev_ix.wrapping_add(4);\n    *data.offset(prev_ix as isize) as u32\n",
+        "    let mut i: usize = 0;\n    let mut s: u32 = 0;\n    while i < ring_buffer_mask {\n        s = s.wrapping_add(*data.offset(i as isize) as u32);\n        i = i.wrapping_add(1);\n    }\n    s\n",
+    );
+    assert_ne!(input, MASK_AS_COUNT, "the bounded callee is in");
+    input
+}
+
+/// MKc — the control: the same call with a count that is not a mask keeps it
+/// (re-pinned by relay 068 onto `mask_as_count_bounded`).
 #[test]
 fn w6l_mkc_a_count_that_is_not_a_mask_stays_licensed() {
-    let input = MASK_AS_COUNT
+    let input = mask_as_count_bounded()
         .replace("ring_buffer_mask", "ring_buffer_len")
         .replace("ringbuffer_mask", "ringbuffer_len");
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
@@ -178,14 +192,17 @@ pub unsafe fn Top(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> 
 }
 
 /// MK2 (the review's L3) — a mask reached through a plain alias
-/// (`let m = ringbuffer_mask;`) is still a mask.
+/// (`let m = ringbuffer_mask;`) is still a mask (re-pinned by relay 068 onto
+/// `mask_as_count_bounded`).
 #[test]
 fn w6l_mk2_a_mask_through_an_alias_is_not_a_count() {
     // The callee's formal is renamed so only the caller's alias names the mask.
-    let input = MASK_AS_COUNT.replace("ring_buffer_mask", "window").replace(
-        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
-        "    let mut m = ringbuffer_mask;\n    FindAllMatchesH10(ringbuffer, m, n)",
-    );
+    let input = mask_as_count_bounded()
+        .replace("ring_buffer_mask", "window")
+        .replace(
+            "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+            "    let mut m = ringbuffer_mask;\n    FindAllMatchesH10(ringbuffer, m, n)",
+        );
     let edits = edits(&input);
     assert!(
         edits.iter().any(|(replacement, extent)| replacement

@@ -936,6 +936,11 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                     .retain(|_, cond| !mentions(cond.left) && !mentions(cond.right));
                 state.checked.retain(|_, (term, _)| !mentions(*term));
                 state.dbm.assign(y, y, c);
+                // The relay 068 review's F7: `m += 1` over `m = n - 1` is no
+                // longer the length minus one.
+                if c != 0 {
+                    state.length_minus_one.remove(&x);
+                }
             }
             New::Term(term, c) => {
                 self.kill(state, x);

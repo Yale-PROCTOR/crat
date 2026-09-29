@@ -116,6 +116,93 @@ fn param_index(tcx: TyCtxt<'_>, function: LocalDefId, binding: rustc_hir::HirId)
         .position(|p| p.pat.hir_id == binding)
 }
 
+/// The relay 068 review (F2 / F3): every local's definitions in one body (the
+/// `let` initializer, each plain assignment, each compound assignment's
+/// operand) and the locals borrowed mutably or captured. A parameter's entry
+/// means it is written.
+struct Defs<'tcx> {
+    values: rustc_hash::FxHashMap<HirId, Vec<(&'tcx Expr<'tcx>, bool)>>,
+    borrowed: rustc_hash::FxHashSet<HirId>,
+}
+
+impl<'tcx> Defs<'tcx> {
+    fn of(tcx: TyCtxt<'tcx>, function: LocalDefId) -> Self {
+        struct Collect<'tcx> {
+            tcx: TyCtxt<'tcx>,
+            defs: Defs<'tcx>,
+        }
+        fn local(e: &Expr<'_>) -> Option<HirId> {
+            let mut e = e;
+            loop {
+                match e.kind {
+                    ExprKind::DropTemps(inner) => e = inner,
+                    ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                        return match path.res {
+                            Res::Local(id) => Some(id),
+                            _ => None,
+                        };
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        impl<'tcx> Visitor<'tcx> for Collect<'tcx> {
+            fn visit_local(&mut self, let_: &'tcx rustc_hir::LetStmt<'tcx>) {
+                if let rustc_hir::PatKind::Binding(mode, id, ..) = let_.pat.kind {
+                    if let Some(init) = let_.init {
+                        self.defs.values.entry(id).or_default().push((init, false));
+                    }
+                    if matches!(mode.0, rustc_hir::ByRef::Yes(_)) {
+                        self.defs.borrowed.insert(id);
+                    }
+                }
+                intravisit::walk_local(self, let_);
+            }
+
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                match e.kind {
+                    ExprKind::Assign(lhs, rhs, _) => {
+                        if let Some(id) = local(lhs) {
+                            self.defs.values.entry(id).or_default().push((rhs, false));
+                        }
+                    }
+                    ExprKind::AssignOp(_, lhs, rhs) => {
+                        if let Some(id) = local(lhs) {
+                            self.defs.values.entry(id).or_default().push((rhs, true));
+                        }
+                    }
+                    ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, place) => {
+                        if let Some(id) = local(place) {
+                            self.defs.borrowed.insert(id);
+                        }
+                    }
+                    ExprKind::Closure(closure) => {
+                        if let Some(upvars) = self.tcx.upvars_mentioned(closure.def_id) {
+                            self.defs.borrowed.extend(upvars.keys().copied());
+                        }
+                    }
+                    _ => {}
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut collect = Collect {
+            tcx,
+            defs: Defs {
+                values: Default::default(),
+                borrowed: Default::default(),
+            },
+        };
+        collect.visit_body(tcx.hir_body_owned_by(function));
+        collect.defs
+    }
+
+    /// A parameter (or a local) written after entry, or borrowed mutably.
+    fn written(&self, id: HirId) -> bool {
+        self.values.contains_key(&id) || self.borrowed.contains(&id)
+    }
+}
+
 /// Relay 068 (R674): the call at `call` in `caller` passes `binding` (through
 /// casts) as its `index`-th argument.
 fn argument_names(
@@ -182,6 +269,12 @@ fn forwards_into_fat(
     unrelated: &mut bool,
 ) -> Result<(), Hold> {
     let mut forwarded = false;
+    // The relay 068 review's F2: a pointer written before it is handed on is
+    // not the caller's pointer, and a companion written is not the caller's
+    // count.
+    let defs = Defs::of(tcx, function);
+    let binding_written = defs.written(binding);
+    let companion = companion.filter(|c| !defs.written(*c));
     for (&callee, calls) in &facts.call_args {
         for call in calls.iter().filter(|call| call.caller == function) {
             for arg in &call.args {
@@ -203,6 +296,7 @@ fn forwards_into_fat(
                 let passed = companion
                     .zip(callee_companion)
                     .is_some_and(|(c, k)| argument_names(tcx, function, call.span, k, c));
+                let passed = passed && !binding_written;
                 let local = Local::from_usize(arg.index + 1);
                 if fat.is_array(callee, local) {
                     if !passed {
@@ -392,13 +486,17 @@ pub(crate) fn prove(
     }
     let mut accessed = Vec::new();
     let mut unrelated = false;
-    let own_companion = match super::seam::length_evidence(tcx, subject.fn_did, hir_index) {
+    let own_param = match super::seam::length_evidence(tcx, subject.fn_did, hir_index) {
         super::seam::LenEvidence::Following => hir_index.checked_add(1),
         super::seam::LenEvidence::Preceding => hir_index.checked_sub(1),
         _ => None,
     }
-    .and_then(|k| tcx.hir_body_owned_by(subject.fn_did).params.get(k))
-    .map(|p| p.pat.hir_id);
+    .and_then(|k| tcx.hir_body_owned_by(subject.fn_did).params.get(k));
+    let own_companion = own_param.map(|p| p.pat.hir_id);
+    let own_companion_name = own_param.and_then(|p| match p.pat.kind {
+        rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.name.to_string()),
+        _ => None,
+    });
     forwards_into_fat(
         tcx,
         subject.fn_did,
@@ -448,6 +546,9 @@ pub(crate) fn prove(
             if unrelated {
                 return Err(Hold::CompanionNotIndexBound);
             }
+            let own_mask_named = own_companion_name
+                .as_deref()
+                .is_some_and(super::masked_runtime::mask_named);
             // Relay 068 (R674) (A): the subject's own reads are checked too,
             // against its own companion — the extent is that companion
             // (lodepng's `getPixelColorRGBA8` reads `in_0[i]` itself).
@@ -458,7 +559,10 @@ pub(crate) fn prove(
                 match index_bound_by_companion(tcx, callee, parameter) {
                     IndexBound::No => return Err(Hold::CompanionNotIndexBound),
                     IndexBound::MaskedByCompanion => masked = true,
-                    IndexBound::ByCompanion => {}
+                    IndexBound::MaskUnproven if !own_mask_named => {
+                        return Err(Hold::CompanionNotIndexBound);
+                    }
+                    IndexBound::MaskUnproven | IndexBound::ByCompanion => {}
                 }
             }
             Ok(Proof {
@@ -515,6 +619,10 @@ pub(crate) enum IndexBound {
     /// the companion (`ix & mask`), so it is bounded whatever it names, and the
     /// extent that covers all of them is `companion + 1`.
     MaskedByCompanion,
+    /// The relay 068 review's F4: a mask-named companion whose in-place proof
+    /// failed. The seam refuses it as a count only where the chain's own
+    /// companion is mask-named; reached from a `len`, it is not bounded.
+    MaskUnproven,
 }
 
 fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> IndexBound {
@@ -552,11 +660,134 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         Below,
         Unbounded,
     }
+    /// How an index (or a local's definition) stands to the companion: the
+    /// relay 068 review's F3 follows an index's locals to their definitions.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Taint {
+        /// Names neither the companion nor another parameter: a loop local, a
+        /// field, a literal (the relay: these stay admitted).
+        Clean,
+        /// Below the companion (`n - c`, `n - 1 - i`).
+        Below,
+        /// Masked by it (`ix & n`): `n + 1`.
+        Masked,
+        /// Anything else that names the companion or another parameter.
+        Bad,
+    }
+    fn join(a: Taint, b: Taint) -> Taint {
+        match (a, b) {
+            (Taint::Bad, _) | (_, Taint::Bad) => Taint::Bad,
+            (Taint::Masked, _) | (_, Taint::Masked) => Taint::Masked,
+            (Taint::Below, _) | (_, Taint::Below) => Taint::Below,
+            _ => Taint::Clean,
+        }
+    }
+    /// The non-parameter locals `e` names.
+    fn locals_in(e: &Expr<'_>, params: &[HirId]) -> Vec<HirId> {
+        struct Locals<'a> {
+            params: &'a [HirId],
+            found: Vec<HirId>,
+        }
+        impl<'tcx> Visitor<'tcx> for Locals<'_> {
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                    && let Res::Local(id) = path.res
+                    && !self.params.contains(&id)
+                    && !self.found.contains(&id)
+                {
+                    self.found.push(id);
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut locals = Locals {
+            params,
+            found: Vec::new(),
+        };
+        locals.visit_expr(e);
+        locals.found
+    }
+    /// `e` is exactly the local `id`, through casts.
+    fn exactly(e: &Expr<'_>, id: HirId) -> bool {
+        is_binding(e, id)
+    }
+    /// **The relay 068 review's F1.** `let end = p.offset(n)` whose `end` is
+    /// only ever compared (or measured with `offset_from`), never read, never
+    /// reassigned: one past the last element, and it reads none.
+    fn end_pointer_let<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        body: &'tcx rustc_hir::Body<'tcx>,
+        defs: &Defs<'tcx>,
+        e: &'tcx Expr<'tcx>,
+    ) -> bool {
+        let rustc_hir::Node::LetStmt(let_) = tcx.parent_hir_node(e.hir_id) else {
+            return false;
+        };
+        let (Some(init), rustc_hir::PatKind::Binding(_, end, ..)) = (let_.init, let_.pat.kind)
+        else {
+            return false;
+        };
+        if init.hir_id != e.hir_id
+            || defs.borrowed.contains(&end)
+            || defs.values.get(&end).map_or(0, |v| v.len()) != 1
+        {
+            return false;
+        }
+        struct Uses<'tcx> {
+            tcx: TyCtxt<'tcx>,
+            end: HirId,
+            other: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = e.kind
+                    && path.res == Res::Local(self.end)
+                {
+                    let compared = match self.tcx.parent_hir_node(e.hir_id) {
+                        rustc_hir::Node::Expr(Expr {
+                            kind: ExprKind::Binary(op, ..),
+                            ..
+                        }) => matches!(
+                            op.node,
+                            rustc_hir::BinOpKind::Lt
+                                | rustc_hir::BinOpKind::Le
+                                | rustc_hir::BinOpKind::Gt
+                                | rustc_hir::BinOpKind::Ge
+                                | rustc_hir::BinOpKind::Eq
+                                | rustc_hir::BinOpKind::Ne
+                        ),
+                        rustc_hir::Node::Expr(Expr {
+                            kind: ExprKind::MethodCall(segment, ..),
+                            ..
+                        }) => segment.ident.name.as_str() == "offset_from",
+                        _ => false,
+                    };
+                    if !compared {
+                        self.other = true;
+                    }
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let mut uses = Uses {
+            tcx,
+            end,
+            other: false,
+        };
+        uses.visit_body(body);
+        !uses.other
+    }
     struct Indexes<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &'tcx rustc_hir::Body<'tcx>,
         binding: HirId,
         others: &'a [HirId],
+        params: &'a [HirId],
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        defs: &'a Defs<'tcx>,
+        /// The review's F2: the companion is written in the body, so an index
+        /// naming it is not bounded by the caller's argument.
+        companion_written: bool,
         companion: HirId,
         bound: bool,
         masked: bool,
@@ -667,55 +898,73 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     /// `getPixelColorRGBA8(.., in_0, i, ..)`, whose `i` is the read position.
     /// `None` where the index does not name it; a mask-named companion keeps
     /// its in-place proof below.
-    fn companion_index(e: &Expr<'_>, companion: HirId) -> Option<CompanionIndex> {
+    fn companion_index(
+        e: &Expr<'_>,
+        companion: HirId,
+        typeck: &rustc_middle::ty::TypeckResults<'_>,
+    ) -> Option<CompanionIndex> {
         if !names(e, &[companion]) {
             return None;
         }
         Some(if masked_by(e, companion) {
             CompanionIndex::Masked
-        } else if below_companion(e, companion) {
+        } else if below_companion(e, companion, typeck) {
             CompanionIndex::Below
         } else {
             CompanionIndex::Unbounded
         })
     }
-    /// `companion - c` or `(ix & (companion - c))`, through casts, for a
-    /// literal `c >= 1` (`-` or `wrapping_sub`).
-    fn below_companion(e: &Expr<'_>, companion: HirId) -> bool {
-        let minus_constant = |e: &Expr<'_>| {
+    /// `companion - c`, through casts, for a literal `c >= 1`, and any further
+    /// unsigned subtraction (`n - 1 - i`, the reverse walk: the review's F6):
+    /// below the companion in a UB-free input. `ix & (companion - c)` is NOT
+    /// here (the review's F5): at `companion = 0` it is all ones, and only the
+    /// extent prover's receipted mask-of-length premise bounds it.
+    fn below_companion(
+        e: &Expr<'_>,
+        companion: HirId,
+        typeck: &rustc_middle::ty::TypeckResults<'_>,
+    ) -> bool {
+        fn chain(
+            e: &Expr<'_>,
+            companion: HirId,
+            typeck: &rustc_middle::ty::TypeckResults<'_>,
+        ) -> Option<bool> {
             let mut e = e;
             loop {
                 match e.kind {
                     ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
-                    ExprKind::Binary(op, left, right)
-                        if matches!(op.node, rustc_hir::BinOpKind::Sub) =>
-                    {
-                        return is_binding(left, companion) && positive_literal(right);
-                    }
-                    ExprKind::MethodCall(segment, receiver, [argument], _)
-                        if segment.ident.name.as_str() == "wrapping_sub" =>
-                    {
-                        return is_binding(receiver, companion) && positive_literal(argument);
-                    }
-                    _ => return false,
+                    _ => break,
                 }
             }
-        };
-        if minus_constant(e) {
-            return true;
-        }
-        let mut e = e;
-        loop {
-            match e.kind {
-                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+            if is_binding(e, companion) {
+                return Some(false);
+            }
+            let (left, right) = match e.kind {
                 ExprKind::Binary(op, left, right)
-                    if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                    if matches!(op.node, rustc_hir::BinOpKind::Sub) =>
                 {
-                    return minus_constant(left) || minus_constant(right);
+                    (left, right)
                 }
-                _ => return false,
+                ExprKind::MethodCall(segment, receiver, [argument], _)
+                    if segment.ident.name.as_str() == "wrapping_sub" =>
+                {
+                    (receiver, argument)
+                }
+                _ => return None,
+            };
+            let literal = chain(left, companion, typeck)?;
+            if positive_literal(right) {
+                Some(true)
+            } else if matches!(
+                typeck.expr_ty(right).kind(),
+                rustc_middle::ty::TyKind::Uint(_)
+            ) {
+                Some(literal)
+            } else {
+                None
             }
         }
+        chain(e, companion, typeck) == Some(true)
     }
     fn positive_literal(e: &Expr<'_>) -> bool {
         let mut e = e;
@@ -946,6 +1195,78 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         }
         false
     }
+    impl<'tcx> Indexes<'_, 'tcx> {
+        fn taint(&self, e: &'tcx Expr<'tcx>, depth: u32, seen: &mut Vec<HirId>) -> Taint {
+            if masked_by(e, self.companion) {
+                return if self.companion_written {
+                    Taint::Bad
+                } else {
+                    Taint::Masked
+                };
+            }
+            if names(e, self.others) {
+                return Taint::Bad;
+            }
+            match companion_index(e, self.companion, self.typeck) {
+                Some(CompanionIndex::Below) if !self.companion_written => return Taint::Below,
+                Some(_) => return Taint::Bad,
+                None => {}
+            }
+            let mut out = Taint::Clean;
+            for local in locals_in(e, self.params) {
+                if seen.contains(&local) {
+                    continue;
+                }
+                seen.push(local);
+                let taint = self.local_taint(local, depth + 1, seen);
+                seen.pop();
+                out = match taint {
+                    Taint::Clean => out,
+                    // A tainted local stands for its bound only as the
+                    // whole index; `at + 1` over `at <= n` reads past it.
+                    taint if exactly(e, local) => join(out, taint),
+                    _ => Taint::Bad,
+                };
+            }
+            out
+        }
+
+        fn local_taint(&self, local: HirId, depth: u32, seen: &mut Vec<HirId>) -> Taint {
+            if depth > 6 || self.defs.borrowed.contains(&local) {
+                return Taint::Bad;
+            }
+            let mut out = Taint::Clean;
+            for &(definition, compound) in self.defs.values.get(&local).into_iter().flatten() {
+                let taint = self.taint(definition, depth, seen);
+                out = join(
+                    out,
+                    if compound && taint != Taint::Clean {
+                        Taint::Bad
+                    } else {
+                        taint
+                    },
+                );
+            }
+            out
+        }
+
+        /// An index that names no other parameter, under a companion that is
+        /// not mask-named (relay 068 and its review).
+        fn classify(&mut self, e: &'tcx Expr<'tcx>, index: &'tcx Expr<'tcx>, offset: bool) {
+            if offset
+                && is_binding(index, self.companion)
+                && !self.companion_written
+                && end_pointer_let(self.tcx, self.body, self.defs, e)
+            {
+                return;
+            }
+            match self.taint(index, 0, &mut Vec::new()) {
+                Taint::Clean | Taint::Below => {}
+                Taint::Masked => self.masked = true,
+                Taint::Bad => self.bound = false,
+            }
+        }
+    }
     impl<'tcx> Visitor<'tcx> for Indexes<'_, 'tcx> {
         fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
             match e.kind {
@@ -955,34 +1276,18 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         && is_binding(receiver, self.binding) =>
                 {
                     if names(index, self.others) {
-                        if masked_by(index, self.companion) {
+                        if masked_by(index, self.companion) && !self.companion_written {
                             self.masked = true;
                         } else {
                             self.bound = false;
                         }
-                    } else if let Some(verdict) = companion_index(index, self.companion)
-                        && !self.mask_formal
-                    {
-                        match verdict {
-                            CompanionIndex::Masked => self.masked = true,
-                            CompanionIndex::Below => {}
-                            // The end pointer `p.offset(n)`, not read where it
-                            // stands (brotli's `ShannonEntropy`:
-                            // `population_end`), addresses one past the last
-                            // element and reads none.
-                            CompanionIndex::Unbounded
-                                if segment.ident.name.as_str() == "offset"
-                                    && is_binding(index, self.companion)
-                                    && !matches!(
-                                        self.tcx.parent_hir_node(e.hir_id),
-                                        rustc_hir::Node::Expr(Expr {
-                                            kind: ExprKind::Unary(rustc_hir::UnOp::Deref, _),
-                                            ..
-                                        })
-                                    ) => {}
-                            CompanionIndex::Unbounded => self.bound = false,
-                        }
-                    } else if self.mask_formal {
+                    } else if !self.mask_formal {
+                        // Relay 068 and its review: the companion itself only
+                        // masked or below, a local through its definitions,
+                        // and the end pointer `let end = p.offset(n)`.
+                        let offset = segment.ident.name.as_str() == "offset";
+                        self.classify(e, index, offset);
+                    } else {
                         if !read_in_place(self.tcx, e) {
                             // A masked address handed on, or read wide through
                             // a cast, reads past `mask` (relay 065, the final
@@ -1000,20 +1305,14 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                 }
                 ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
                     if names(index, self.others) {
-                        if masked_by(index, self.companion) {
+                        if masked_by(index, self.companion) && !self.companion_written {
                             self.masked = true;
                         } else {
                             self.bound = false;
                         }
-                    } else if let Some(verdict) = companion_index(index, self.companion)
-                        && !self.mask_formal
-                    {
-                        match verdict {
-                            CompanionIndex::Masked => self.masked = true,
-                            CompanionIndex::Below => {}
-                            CompanionIndex::Unbounded => self.bound = false,
-                        }
-                    } else if self.mask_formal {
+                    } else if !self.mask_formal {
+                        self.classify(e, index, false);
+                    } else {
                         if !read_in_place(self.tcx, e) {
                             // A masked address handed on, or read wide through
                             // a cast, reads past `mask` (relay 065, the final
@@ -1034,11 +1333,17 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             intravisit::walk_expr(self, e);
         }
     }
+    let params: Vec<HirId> = body.params.iter().map(|p| p.pat.hir_id).collect();
+    let defs = Defs::of(tcx, function);
     let mut visitor = Indexes {
         tcx,
         body,
         binding,
         others: &others,
+        params: &params,
+        typeck: tcx.typeck(function),
+        companion_written: defs.written(companion),
+        defs: &defs,
         companion,
         bound: true,
         masked: false,
@@ -1053,6 +1358,7 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     ) {
         (false, _) => IndexBound::No,
         (true, true) => IndexBound::MaskedByCompanion,
+        (true, false) if mask_formal && visitor.unproven => IndexBound::MaskUnproven,
         (true, false) => IndexBound::ByCompanion,
     }
 }
