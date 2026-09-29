@@ -490,13 +490,17 @@ fn forwarded(
         return None;
     }
     visited.push(key);
+    let copies = copies_of(tcx, key);
     let handed = facts
         .call_args
         .iter()
         .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
         .filter(|(_, site)| site.caller == param.fn_did)
         .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
-        .filter(|(_, arg)| subject_denoting_root(arg.shape) == Some(param.hir_id))
+        // Relay 065 review (finding 1): the parameter or any of its copies
+        // (`let y = x; w(y)`), so a caller whose callee walks past its thin
+        // argument only through a copy is still held here.
+        .filter(|(_, arg)| subject_denoting_root(arg.shape).is_some_and(|root| copies.contains(&root)))
         .collect::<Vec<_>>();
     let mut accesses = Vec::new();
     // Bare arguments first, so the detail names what it named before.
@@ -1075,7 +1079,23 @@ pub(crate) fn collect(
             }
         }
     }
-    out
+    // Relay 065 review (finding 1): a held copy holds its source, as the
+    // thin-extent set's copy walk does: `let y = x; w(y)` holds `x` with `y`.
+    let copies = super::thin_extent::copy_edges(tcx);
+    loop {
+        let mut grew = false;
+        for &(function, copy, source) in &copies {
+            if !out.contains_key(&(function, source))
+                && let Some(access) = out.get(&(function, copy)).cloned()
+            {
+                out.insert((function, source), access);
+                grew = true;
+            }
+        }
+        if !grew {
+            return out;
+        }
+    }
 }
 
 /// **R622-1 / R628-2 (R416-5) — the callee parameters accessed past their
@@ -1116,7 +1136,9 @@ pub(crate) fn accessed_past_one_element(
                 // wave-6l (relay 064 review, finding 1): a LITERAL byte
                 // footprint is past one element only against an element. A
                 // sized formal's own pointee stands in for it; a `c_void`
-                // formal's is each caller's, which this set does not carry, so
+                // formal's (its IMMEDIATE pointee; `*mut *mut c_void` has a
+                // sized element, the review's finding 7) is each caller's,
+                // which this set does not carry, so
                 // it is left out, as main's guard left every uncast `c_void`
                 // formal out (the per-caller comparison is
                 // `LocalCalleeAccess::past_one_element_of`, report 063 STOP 2).
@@ -1125,11 +1147,7 @@ pub(crate) fn accessed_past_one_element(
                 };
                 let ty = tcx.typeck(parameter.fn_did).pat_ty(pattern);
                 match access.footprint_bytes {
-                    Some(FootprintBytes::Literal(_))
-                        if has_void_pointee(tcx, ty, VOID_POINTEE_DEPTH) =>
-                    {
-                        false
-                    }
+                    Some(FootprintBytes::Literal(_)) if has_void_pointee(tcx, ty, 1) => false,
                     _ => access.past_one_element_of(caller_element_bytes(
                         tcx,
                         parameter.fn_did,

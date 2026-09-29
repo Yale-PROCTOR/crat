@@ -182,7 +182,7 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
 /// every arm of an `if` / `match` / block that yields one (C2Rust's ternary).
 /// Every body owner is its own function, closures included, as the facts
 /// key them.
-fn copy_edges(tcx: TyCtxt<'_>) -> Vec<(LocalDefId, HirId, HirId)> {
+pub(super) fn copy_edges(tcx: TyCtxt<'_>) -> Vec<(LocalDefId, HirId, HirId)> {
     copy_edges_of(tcx, tcx.hir_body_owners())
 }
 
