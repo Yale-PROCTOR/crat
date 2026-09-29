@@ -183,6 +183,22 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
 /// Every body owner is its own function, closures included, as the facts
 /// key them.
 fn copy_edges(tcx: TyCtxt<'_>) -> Vec<(LocalDefId, HirId, HirId)> {
+    copy_edges_of(tcx, tcx.hir_body_owners())
+}
+
+/// The copy edges of one body, `(copy, source)` (relay 065: the local callee
+/// hold reads a parameter's copies).
+pub(super) fn copy_edges_in(tcx: TyCtxt<'_>, function: LocalDefId) -> Vec<(HirId, HirId)> {
+    copy_edges_of(tcx, std::iter::once(function))
+        .into_iter()
+        .map(|(_, copy, source)| (copy, source))
+        .collect()
+}
+
+fn copy_edges_of(
+    tcx: TyCtxt<'_>,
+    owners: impl Iterator<Item = LocalDefId>,
+) -> Vec<(LocalDefId, HirId, HirId)> {
     use rustc_hir::{
         Expr, ExprKind, LetStmt, PatKind, QPath,
         def::Res,
@@ -257,7 +273,7 @@ fn copy_edges(tcx: TyCtxt<'_>) -> Vec<(LocalDefId, HirId, HirId)> {
         function: rustc_hir::def_id::CRATE_DEF_ID,
         edges: Vec::new(),
     };
-    for owner in tcx.hir_body_owners() {
+    for owner in owners {
         copies.function = owner;
         copies.visit_body(tcx.hir_body_owned_by(owner));
     }

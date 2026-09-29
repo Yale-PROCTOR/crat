@@ -281,7 +281,7 @@ fn parameter_access(
             // HIGH, a first-found 4-byte site releasing an `i32` caller that a
             // 64-byte site then writes.
             None => {
-                let direct = counted_foreign_footprint(facts, key);
+                let direct = counted_footprint_of_copies(tcx, facts, key);
                 let onward = forwarded(
                     tcx,
                     param,
@@ -314,9 +314,12 @@ fn parameter_access(
                 }
             }
         }
-    } else if let Some(op) = extent_leaving_op(tcx, key, facts, guard) {
+    } else if let Some(op) = copies_of(tcx, key)
+        .into_iter()
+        .find_map(|copy| extent_leaving_op(tcx, (key.0, copy), facts, guard))
+    {
         AccessReason::PointerArithmetic { op: op.clone() }
-    } else if let Some((at, _)) = counted_foreign_footprint(facts, key) {
+    } else if let Some((at, _)) = counted_footprint_of_copies(tcx, facts, key) {
         AccessReason::ForeignContract { at }
     } else {
         // No access of its own: the callee parameters it is handed to that
@@ -536,6 +539,40 @@ fn forwarded(
                 join(joined, access.footprint_bytes)
             }),
     })
+}
+
+/// **Relay 065 (R653-1, STOP 2) — a copy of the parameter accesses as the
+/// parameter.** The parameter, then every local of the same body it is
+/// copied into (`let q = p;`, `q = p;`, under casts, each arm of C2Rust's
+/// ternary; transitively), by `thin_extent`'s copy edges. The two arms below
+/// read them all: `let q = p; q[5]` is the parameter's arithmetic, and
+/// `buf = buffer; memcpy(.., buf, 16)` is its counted footprint. The extent
+/// analysis subsumes this later.
+fn copies_of(tcx: TyCtxt<'_>, (function, binding): (LocalDefId, HirId)) -> Vec<HirId> {
+    let edges = super::thin_extent::copy_edges_in(tcx, function);
+    let mut members = vec![binding];
+    let mut at = 0;
+    while let Some(&source) = members.get(at) {
+        for &(copy, from) in &edges {
+            if from == source && !members.contains(&copy) {
+                members.push(copy);
+            }
+        }
+        at += 1;
+    }
+    members
+}
+
+/// [`counted_foreign_footprint`] over the parameter and its copies, joined.
+fn counted_footprint_of_copies(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    key: (LocalDefId, HirId),
+) -> Option<(String, FootprintBytes)> {
+    copies_of(tcx, key)
+        .into_iter()
+        .filter_map(|copy| counted_foreign_footprint(facts, (key.0, copy)))
+        .reduce(|(at, joined), (_, bytes)| (at, join(Some(joined), Some(bytes)).unwrap_or(bytes)))
 }
 
 /// **wave-6l (R641, main 131 §6 finding 6) — the contract arm.** The foreign
