@@ -913,3 +913,22 @@ pub unsafe fn widener(mut b: *mut u8) -> u32 {
         assert!(map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
     }
 }
+
+/// K2g (relay 065; fault H34 was inert) — a widening copy stepped by a
+/// NON-literal: the literal rule does not reach it, so only the size rule
+/// (a copy as wide as or wider than the element counts) holds `widener_n::b`.
+#[test]
+fn w6l_seethrough_k2g_a_widening_copy_stepped_at_runtime() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe fn widen_n(mut p: *mut u8, mut n: usize) -> u32 {
+    let mut q = p as *mut u32;
+    *q.offset(n as isize)
+}
+pub unsafe fn widener_n(mut b: *mut u8, mut n: usize) -> u32 {
+    widen_n(b, n)
+}
+"#;
+    let map = access_map(input);
+    assert!(map.iter().any(|(l, _)| l == "widener_n::b"), "{map:#?}");
+}
