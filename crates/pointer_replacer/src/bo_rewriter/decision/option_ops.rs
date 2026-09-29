@@ -572,6 +572,36 @@ pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Su
     })
 }
 
+/// Wave-6o (relay 113, R674-7 (2)): an EXPORTED entry's formal handed on
+/// unchanged (a bare path) to a local callee whose own body null-tests that
+/// formal is nullable by that test — the evidence sits one call down. The
+/// entry's callers outside the program are not seen, and the callee is written
+/// to receive the null they may pass (binn's `binn_list_add(NULL, ..)` →
+/// `binn_list_add_raw`'s `item == NULL`). An unexported function's callers are
+/// all in the program, so their actuals stay the evidence there.
+pub(super) fn exported_param_handed_to_null_tested_formal(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    subject: &Subject,
+) -> bool {
+    let SubjectKind::Param { .. } = subject.kind else { return false };
+    if !super::exported_pair::exported(tcx, subject.fn_did) {
+        return false;
+    }
+    facts.call_args.iter().any(|(callee, sites)| {
+        sites.iter().filter(|site| site.caller == subject.fn_did).any(|site| {
+            site.args.iter().any(|arg| {
+                matches!(arg.shape, ArgShape::BareLocal(binding) if binding == subject.hir_id)
+                    && tcx
+                        .hir_maybe_body_owned_by(*callee)
+                        .and_then(|body| body.params.get(arg.index))
+                        .and_then(|param| facts.raw_only_uses.get(&(*callee, param.pat.hir_id)))
+                        .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+            })
+        })
+    })
+}
+
 /// `&*e` / `&mut *e` (under casts) where `e` is RAW-typed: the address of one
 /// element of an unknown allocation. A slice built from it by `from_ref` is
 /// one element long; see `plan_values`.
