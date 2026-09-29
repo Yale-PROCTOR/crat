@@ -317,6 +317,8 @@ mod option_forward_nullability_tests;
 #[cfg(test)]
 mod option_null_arg_tests;
 #[cfg(test)]
+mod option_exported_null_handoff_tests;
+#[cfg(test)]
 mod option_ops_tests;
 #[cfg(test)]
 mod option_pending_sibling_tests;
