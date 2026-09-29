@@ -116,17 +116,70 @@ fn param_index(tcx: TyCtxt<'_>, function: LocalDefId, binding: rustc_hir::HirId)
         .position(|p| p.pat.hir_id == binding)
 }
 
+/// Relay 068 (R674): the call at `call` in `caller` passes `binding` (through
+/// casts) as its `index`-th argument.
+fn argument_names(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    call: rustc_span::Span,
+    index: usize,
+    binding: rustc_hir::HirId,
+) -> bool {
+    struct Find<'tcx> {
+        call: rustc_span::Span,
+        index: usize,
+        found: Option<&'tcx Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.call {
+                self.found = match e.kind {
+                    ExprKind::Call(_, args) => args.get(self.index),
+                    ExprKind::MethodCall(_, receiver, args, _) => match self.index {
+                        0 => Some(receiver),
+                        k => args.get(k - 1),
+                    },
+                    _ => None,
+                };
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut find = Find {
+        call,
+        index,
+        found: None,
+    };
+    find.visit_body(tcx.hir_body_owned_by(caller));
+    let mut e = match find.found {
+        Some(e) => e,
+        None => return false,
+    };
+    loop {
+        match e.kind {
+            ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+            ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                return path.res == Res::Local(binding);
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Every position `(function, parameter)` is forwarded into is a fat callee
 /// parameter, or a parameter that itself only forwards into fat ones (a
 /// forwarder chain); at least one forwarding exists, and a cycle is not fat.
+#[allow(clippy::too_many_arguments)]
 fn forwards_into_fat(
     tcx: TyCtxt<'_>,
     function: LocalDefId,
     binding: rustc_hir::HirId,
+    companion: Option<rustc_hir::HirId>,
     facts: &EmitabilityFacts,
     fat: &FatFacts,
     visited: &mut Vec<(LocalDefId, usize)>,
     accessed: &mut Vec<(LocalDefId, usize)>,
+    unrelated: &mut bool,
 ) -> Result<(), Hold> {
     let mut forwarded = false;
     for (&callee, calls) in &facts.call_args {
@@ -137,8 +190,24 @@ fn forwards_into_fat(
                     continue;
                 }
                 forwarded = true;
+                // Relay 068 (R674) (B): the callee's index test is checked
+                // against ITS companion, which bounds the chain's only where
+                // the call passes the chain's companion there
+                // (`readBitsFromReversedStream(&j, in_0, bitdepth)` does not
+                // pass lodepng's `i`).
+                let callee_companion = match super::seam::length_evidence(tcx, callee, arg.index) {
+                    super::seam::LenEvidence::Following => arg.index.checked_add(1),
+                    super::seam::LenEvidence::Preceding => arg.index.checked_sub(1),
+                    _ => None,
+                };
+                let passed = companion
+                    .zip(callee_companion)
+                    .is_some_and(|(c, k)| argument_names(tcx, function, call.span, k, c));
                 let local = Local::from_usize(arg.index + 1);
                 if fat.is_array(callee, local) {
+                    if !passed {
+                        *unrelated = true;
+                    }
                     if !accessed.contains(&(callee, arg.index)) {
                         accessed.push((callee, arg.index));
                     }
@@ -148,8 +217,18 @@ fn forwards_into_fat(
                     return Err(Hold::CalleeNotFat);
                 }
                 visited.push((callee, arg.index));
-                let param = tcx.hir_body_owned_by(callee).params[arg.index].pat.hir_id;
-                forwards_into_fat(tcx, callee, param, facts, fat, visited, accessed)?;
+                let params = tcx.hir_body_owned_by(callee).params;
+                let param = params[arg.index].pat.hir_id;
+                let next = if passed {
+                    callee_companion
+                        .and_then(|k| params.get(k))
+                        .map(|p| p.pat.hir_id)
+                } else {
+                    None
+                };
+                forwards_into_fat(
+                    tcx, callee, param, next, facts, fat, visited, accessed, unrelated,
+                )?;
             }
         }
     }
@@ -312,14 +391,24 @@ pub(crate) fn prove(
         return Err(Hold::OutsideScope);
     }
     let mut accessed = Vec::new();
+    let mut unrelated = false;
+    let own_companion = match super::seam::length_evidence(tcx, subject.fn_did, hir_index) {
+        super::seam::LenEvidence::Following => hir_index.checked_add(1),
+        super::seam::LenEvidence::Preceding => hir_index.checked_sub(1),
+        _ => None,
+    }
+    .and_then(|k| tcx.hir_body_owned_by(subject.fn_did).params.get(k))
+    .map(|p| p.pat.hir_id);
     forwards_into_fat(
         tcx,
         subject.fn_did,
         subject.hir_id,
+        own_companion,
         facts,
         fat,
         &mut vec![(subject.fn_did, hir_index)],
         &mut accessed,
+        &mut unrelated,
     )?;
     let mut members = Vec::new();
     match supplied(tcx, subject.fn_did, hir_index, facts, fat, &mut members) {
@@ -356,8 +445,16 @@ pub(crate) fn prove(
             // BOUNDS the accessing callee's indexes. Checked at every
             // position the chain reaches, so the evidence the seam licenses
             // (`Extent::companion_index`) is the evidence checked here.
+            if unrelated {
+                return Err(Hold::CompanionNotIndexBound);
+            }
+            // Relay 068 (R674) (A): the subject's own reads are checked too,
+            // against its own companion — the extent is that companion
+            // (lodepng's `getPixelColorRGBA8` reads `in_0[i]` itself).
             let mut masked = false;
-            for &(callee, parameter) in &accessed {
+            for &(callee, parameter) in
+                std::iter::once(&(subject.fn_did, hir_index)).chain(&accessed)
+            {
                 match index_bound_by_companion(tcx, callee, parameter) {
                     IndexBound::No => return Err(Hold::CompanionNotIndexBound),
                     IndexBound::MaskedByCompanion => masked = true,
@@ -402,7 +499,8 @@ pub(crate) fn enabled_proof(
 /// expression naming any parameter of the accessing function other than its
 /// own companion refuses; locals, fields and literals are fine (they are
 /// bounded by the callee's own loop, which the extent is what it is checked
-/// against).
+/// against). An index naming the companion ITSELF is bounded by it only
+/// masked (relay 068: `companion_index`).
 /// How the accessing callee's indexes stand to the companion beside the
 /// pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +547,11 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         .filter(|id| *id != binding && *id != companion)
         .collect();
 
+    enum CompanionIndex {
+        Masked,
+        Below,
+        Unbounded,
+    }
     struct Indexes<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &'tcx rustc_hir::Body<'tcx>,
@@ -549,6 +652,78 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                     if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
                 {
                     return is_binding(left, companion) || is_binding(right, companion);
+                }
+                _ => return false,
+            }
+        }
+    }
+    /// **Relay 068 (R674).** An index that names the companion itself is
+    /// bounded by it only in the masked form: `ix & companion` (the masked
+    /// arm, `companion + 1`), or below it — `ix & (companion - 1)` (ht's
+    /// `hash & (capacity - 1)`) or `companion - c` (the last element, which a
+    /// UB-free input reads only when `companion >= c`, §28). `in_0[i]`,
+    /// `in_0[i * 4 + k]`, `i + 1`,
+    /// `i << 2` read at or past the companion: lodepng's
+    /// `getPixelColorRGBA8(.., in_0, i, ..)`, whose `i` is the read position.
+    /// `None` where the index does not name it; a mask-named companion keeps
+    /// its in-place proof below.
+    fn companion_index(e: &Expr<'_>, companion: HirId) -> Option<CompanionIndex> {
+        if !names(e, &[companion]) {
+            return None;
+        }
+        Some(if masked_by(e, companion) {
+            CompanionIndex::Masked
+        } else if below_companion(e, companion) {
+            CompanionIndex::Below
+        } else {
+            CompanionIndex::Unbounded
+        })
+    }
+    /// `companion - c` or `(ix & (companion - c))`, through casts, for a
+    /// literal `c >= 1` (`-` or `wrapping_sub`).
+    fn below_companion(e: &Expr<'_>, companion: HirId) -> bool {
+        let minus_constant = |e: &Expr<'_>| {
+            let mut e = e;
+            loop {
+                match e.kind {
+                    ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                    ExprKind::Binary(op, left, right)
+                        if matches!(op.node, rustc_hir::BinOpKind::Sub) =>
+                    {
+                        return is_binding(left, companion) && positive_literal(right);
+                    }
+                    ExprKind::MethodCall(segment, receiver, [argument], _)
+                        if segment.ident.name.as_str() == "wrapping_sub" =>
+                    {
+                        return is_binding(receiver, companion) && positive_literal(argument);
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        if minus_constant(e) {
+            return true;
+        }
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                {
+                    return minus_constant(left) || minus_constant(right);
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn positive_literal(e: &Expr<'_>) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Lit(lit) => {
+                    return matches!(lit.node, rustc_ast::LitKind::Int(n, _) if n.get() >= 1);
                 }
                 _ => return false,
             }
@@ -785,6 +960,28 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         } else {
                             self.bound = false;
                         }
+                    } else if let Some(verdict) = companion_index(index, self.companion)
+                        && !self.mask_formal
+                    {
+                        match verdict {
+                            CompanionIndex::Masked => self.masked = true,
+                            CompanionIndex::Below => {}
+                            // The end pointer `p.offset(n)`, not read where it
+                            // stands (brotli's `ShannonEntropy`:
+                            // `population_end`), addresses one past the last
+                            // element and reads none.
+                            CompanionIndex::Unbounded
+                                if segment.ident.name.as_str() == "offset"
+                                    && is_binding(index, self.companion)
+                                    && !matches!(
+                                        self.tcx.parent_hir_node(e.hir_id),
+                                        rustc_hir::Node::Expr(Expr {
+                                            kind: ExprKind::Unary(rustc_hir::UnOp::Deref, _),
+                                            ..
+                                        })
+                                    ) => {}
+                            CompanionIndex::Unbounded => self.bound = false,
+                        }
                     } else if self.mask_formal {
                         if !read_in_place(self.tcx, e) {
                             // A masked address handed on, or read wide through
@@ -807,6 +1004,14 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                             self.masked = true;
                         } else {
                             self.bound = false;
+                        }
+                    } else if let Some(verdict) = companion_index(index, self.companion)
+                        && !self.mask_formal
+                    {
+                        match verdict {
+                            CompanionIndex::Masked => self.masked = true,
+                            CompanionIndex::Below => {}
+                            CompanionIndex::Unbounded => self.bound = false,
                         }
                     } else if self.mask_formal {
                         if !read_in_place(self.tcx, e) {

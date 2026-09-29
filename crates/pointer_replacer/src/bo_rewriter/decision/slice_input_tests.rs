@@ -163,12 +163,17 @@ fn w5c_slice_input_forwarders_are_supplied_from_the_slice_root() {
     assert_eq!(proof_of(&proofs, "StoreRangeH2::data"), &Ok(2));
     assert_eq!(proof_of(&proofs, "StoreH2::data"), &Err(Hold::CalleeNotFat));
     // `run::buf` is a slice by its own arithmetic; as a forwarder it is not
-    // supplied (`entry` passes `buf.as_ptr()`) but carries its companion `n`
-    // (R418-1).
-    assert_eq!(proof_of(&proofs, "run::buf"), &Ok(1));
+    // supplied (`entry` passes `buf.as_ptr()`). Its companion `n` is NOT the
+    // extent (relay 068 (B), re-pinned from R418-1's `Ok(1)`): `run` hands
+    // `buf` on as `StitchToPreviousBlockH2(.., buf, 4095)`, whose reads are
+    // bounded by the mask it is passed (to `mask + 3`), not by `n`.
+    assert_eq!(
+        proof_of(&proofs, "run::buf"),
+        &Err(Hold::CompanionNotIndexBound)
+    );
     assert_eq!(
         extent_of(&input_extents(&fixture()), "run::buf"),
-        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+        &Err(Hold::CompanionNotIndexBound)
     );
     assert_eq!(
         extent_of(&input_extents(&fixture()), "StoreRangeH2::data"),
