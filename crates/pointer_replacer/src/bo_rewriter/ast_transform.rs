@@ -3392,6 +3392,46 @@ mod tests {
     ///
     /// *Mutation-tested:* making `claim` return `true` unconditionally — the
     /// shape a "just let it through" fix would take — fails both assertions.
+    /// **Relay 066 (R666-2, STOP 2) — the bracket's outer wrapper takes a FRESH
+    /// `NodeId`.** The constructor wraps the node and moves it into its hole;
+    /// the moved node keeps its id (the passes after this one key on it), and
+    /// the wrapper, which keeps the span, must not share it: the hoist
+    /// (wave-5d, after the bracket) claims by id and otherwise saw one node
+    /// twice.
+    #[test]
+    fn w6l_bracket_outer_wrapper_takes_a_fresh_node_id() {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || {
+                // `graft_expr` normalizes spans to `DUMMY_SP`; the bracket keys on
+                // real ones, so the node is parsed with its spans kept.
+                let mut e = ::utils::ast::parse_expr("f(x)".to_owned());
+                e.id = NodeId::from_u32(40);
+                let key = (e.span.lo().0, e.span.hi().0);
+                let mut table = FxHashMap::default();
+                table.insert(key, ("wrap(".to_owned(), ")".to_owned()));
+                let mut brackets = ConstructionBracketVisitor {
+                    brackets: &table,
+                    applied: FxHashSet::default(),
+                };
+                brackets.visit_expr(&mut e);
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the wrapper is a call: {e:?}");
+                };
+                assert_eq!(
+                    args[0].id,
+                    NodeId::from_u32(40),
+                    "the moved node keeps its id"
+                );
+                assert_eq!(args[0].span, e.span, "and the wrapper keeps the span");
+                assert_ne!(e.id, args[0].id, "the wrapper's id is fresh");
+                assert_ne!(e.id, rustc_ast::DUMMY_NODE_ID, "and a real one");
+            },
+        )
+    }
+
     #[test]
     fn two_transforms_may_not_claim_one_node() {
         let mut g = Composition::default();
