@@ -546,3 +546,22 @@ fn w6l_mk19_a_runtime_mask_assigned_after_declaration_keeps_mask_plus_one() {
         "{edits:#?}"
     );
 }
+
+/// MK20 (fault M18f's control) — a mask computed by a call is not a constant
+/// (`constant_expression` reads a literal, a constant path or a local whose
+/// every definition is one): the ring mask keeps `mask + 1`.
+#[test]
+fn w6l_mk20_a_mask_computed_by_a_call_keeps_mask_plus_one() {
+    let input = MASK_PROVEN.replace(
+        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+        "    let mut mask: usize = ringbuffer_mask.wrapping_add(0 as i32 as usize);\n    FindAllMatchesH10(ringbuffer, mask, n)",
+    );
+    assert_ne!(input, MASK_PROVEN, "the computed mask is in");
+    let edits = self::edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+}
