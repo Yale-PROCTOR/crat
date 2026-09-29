@@ -512,6 +512,32 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             }
         }
     }
+    /// **Relay 065 — a read of ONE element, in place.** The offset (or index)
+    /// at `e` is dereferenced where it stands, `*data.offset(i)` or
+    /// `data[i]`, and the place is not borrowed: `&*data.offset(i)` handed
+    /// to a callee, or `*(data.offset(i) as *const u32)`, reads past the
+    /// element, so a masked index there bounds nothing the length must cover.
+    fn read_in_place<'tcx>(tcx: TyCtxt<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+        let place = match e.kind {
+            ExprKind::Index(..) => e,
+            _ => match tcx.parent_hir_node(e.hir_id) {
+                rustc_hir::Node::Expr(
+                    deref @ Expr {
+                        kind: ExprKind::Unary(rustc_hir::UnOp::Deref, _),
+                        ..
+                    },
+                ) => deref,
+                _ => return false,
+            },
+        };
+        !matches!(
+            tcx.parent_hir_node(place.hir_id),
+            rustc_hir::Node::Expr(Expr {
+                kind: ExprKind::AddrOf(..),
+                ..
+            })
+        )
+    }
     /// `(v & companion)` exactly, nothing added (relay 065, the third review's
     /// B-2).
     fn pure_inline_mask(e: &Expr<'_>, companion: HirId) -> bool {
@@ -760,7 +786,12 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                             self.bound = false;
                         }
                     } else if self.mask_formal {
-                        if masked_local(self.tcx, self.body, index, self.companion) {
+                        if !read_in_place(self.tcx, e) {
+                            // A masked address handed on, or read wide through
+                            // a cast, reads past `mask` (relay 065, the final
+                            // probe on `FindLongestMatchHROLLING_FAST`).
+                            self.unproven = true;
+                        } else if masked_local(self.tcx, self.body, index, self.companion) {
                             self.local_masked = true;
                         } else if !pure_inline_mask(index, self.companion) {
                             // (the third review's B-2) `data[(v & mask)]` is
@@ -778,7 +809,12 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                             self.bound = false;
                         }
                     } else if self.mask_formal {
-                        if masked_local(self.tcx, self.body, index, self.companion) {
+                        if !read_in_place(self.tcx, e) {
+                            // A masked address handed on, or read wide through
+                            // a cast, reads past `mask` (relay 065, the final
+                            // probe on `FindLongestMatchHROLLING_FAST`).
+                            self.unproven = true;
+                        } else if masked_local(self.tcx, self.body, index, self.companion) {
                             self.local_masked = true;
                         } else if !pure_inline_mask(index, self.companion) {
                             // (the third review's B-2) `data[(v & mask)]` is
