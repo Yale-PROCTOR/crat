@@ -13055,6 +13055,20 @@ mod run {
             } else {
                 "unchanged"
             };
+            // R660-1 (relay 213): the boxed slice and the nullable slice are
+            // first-class census forms; the family stays `box` / `slice`.
+            let emitted_form = if realized {
+                super::refined_emitted_form(
+                    emitted_form,
+                    artifact
+                        .custody_expectations
+                        .iter()
+                        .find(|expectation| expectation.subject_key == subject_key)
+                        .map(|expectation| &expectation.expected_form),
+                )
+            } else {
+                emitted_form
+            };
             // R641-2 (5): the subject's own decision is `degraded`; the tree
             // carries the declaration the owner's surviving edit wrote.
             let emitted_form = if owner_view {
@@ -26499,6 +26513,43 @@ fn r760_1_the_allocator_line_reads_the_declaration_against_the_patch() {
 /// `class_id` is `local-def-index:N`, the same order key). A program with any
 /// `atom` revert attributes nothing: an atom names no class this join can
 /// read, so the rule fails closed there.
+/// **R660-1 (relay 213)** — a realized row's `emitted_form`, refined by the decided
+/// delivery form: `Box<[T]>` is `box-slice`, `Option<Box<[T]>>` `opt-box-slice`, and
+/// `Option<&[T]>` / `Option<&mut [T]>` `opt-slice`. Every other form keeps the
+/// decision's key, and the family column is not touched, so the census gate's
+/// family comparison is unaffected.
+fn refined_emitted_form<'a>(
+    decision: &'a str,
+    form: Option<&crate::bo_rewriter::DeliveryForm>,
+) -> &'a str {
+    use crate::bo_rewriter::DeliveryForm;
+    match (decision, form) {
+        (
+            "box",
+            Some(DeliveryForm::Owning {
+                slice: true,
+                optional: false,
+            }),
+        ) => "box-slice",
+        (
+            "box",
+            Some(DeliveryForm::Owning {
+                slice: true,
+                optional: true,
+            }),
+        ) => "opt-box-slice",
+        (
+            "optional",
+            Some(DeliveryForm::Borrowed {
+                optional: true,
+                slice: true,
+                ..
+            }),
+        ) => "opt-slice",
+        _ => decision,
+    }
+}
+
 /// **R675 (wave-6p 058 STOP 1; R462-1)** — the exported entries of an emitted tree
 /// whose signature carries two or more same-pointee reference formals with an
 /// `&mut` among them: `(entry, pointee, formals)` rows. A reference formal is `&T`,
@@ -29159,6 +29210,48 @@ fn r738_1_delivery_custody_replay() {
     for issue in &report.issues {
         println!("  issue {issue}");
     }
+}
+
+/// **R660-1 (relay 213)** — one witness per new census form, and the forms that
+/// keep their key.
+#[test]
+fn r660_1_the_boxed_and_nullable_slices_are_census_forms() {
+    use crate::bo_rewriter::DeliveryForm;
+    let owning = |slice, optional| DeliveryForm::Owning { slice, optional };
+    let borrowed = |optional, slice| DeliveryForm::Borrowed {
+        mutable: true,
+        optional,
+        slice,
+    };
+    assert_eq!(
+        refined_emitted_form("box", Some(&owning(true, false))),
+        "box-slice"
+    );
+    assert_eq!(
+        refined_emitted_form("box", Some(&owning(true, true))),
+        "opt-box-slice"
+    );
+    assert_eq!(
+        refined_emitted_form("optional", Some(&borrowed(true, true))),
+        "opt-slice"
+    );
+    assert_eq!(
+        refined_emitted_form("box", Some(&owning(false, false))),
+        "box"
+    );
+    assert_eq!(
+        refined_emitted_form("box", Some(&owning(false, true))),
+        "box"
+    );
+    assert_eq!(
+        refined_emitted_form("optional", Some(&borrowed(true, false))),
+        "optional"
+    );
+    assert_eq!(
+        refined_emitted_form("slice", Some(&borrowed(false, true))),
+        "slice"
+    );
+    assert_eq!(refined_emitted_form("box", None), "box");
 }
 
 /// **R675 (wave-6p 058 STOP 1)** — the R462-1 surface shape: an exported entry
