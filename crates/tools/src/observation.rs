@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::{
-    CallableCorrespondence, CurrentObservationItem, ExtendedReplacementOutput,
+    CallableCorrespondence, CurrentObservationItem, ExtendedReplacementOutput, SourceStub,
     printf::{eligible_printf_statement, parse_print_macro_statement, supported_printf_call},
     skeleton::is_supported_two_argument_main_0,
 };
@@ -40,6 +40,8 @@ pub struct ReplacementObservationMetadata {
     pub accepted_correspondence: Vec<CallableCorrespondence>,
     pub new_correspondence: Vec<CallableCorrespondence>,
     pub current_items: Vec<CurrentObservationItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_stubs: Option<Vec<SourceStub>>,
 }
 
 impl ReplacementObservationMetadata {
@@ -57,7 +59,21 @@ impl ReplacementObservationMetadata {
             accepted_correspondence: output.accepted_correspondence.clone(),
             new_correspondence: output.new_correspondence.clone(),
             current_items: output.current_items.clone(),
+            source_stubs: None,
         }
+    }
+
+    pub fn from_additive_output(
+        output: &ExtendedReplacementOutput,
+        candidate: &[u8],
+        statement_pairs: &[u8],
+        observation_source: &[u8],
+    ) -> Self {
+        let mut metadata =
+            Self::from_output(output, candidate, statement_pairs, observation_source);
+        metadata.schema_version = 2;
+        metadata.source_stubs = Some(output.source_stubs.clone());
+        metadata
     }
 }
 
@@ -497,7 +513,7 @@ fn extract_observations_with_printf_recovery(
     metadata: &ReplacementObservationMetadata,
     printf_recovery_failure: PrintfRecoveryFailure,
 ) -> Result<ObservationDocument, ObservationError> {
-    if metadata.schema_version != OBSERVATION_SCHEMA_VERSION {
+    if !matches!(metadata.schema_version, 1 | 2) {
         return Err(ObservationError {
             code: "unsupported_schema_version",
             message: format!("unsupported schema_version {}", metadata.schema_version),
@@ -1590,6 +1606,38 @@ fn callable_correspondence(
         Ok(())
     }
     let mut result = HashMap::new();
+    if metadata.schema_version == 2 {
+        let implementations = metadata
+            .accepted_correspondence
+            .iter()
+            .chain(&metadata.new_correspondence)
+            .map(|record| record.implementation_path.as_str())
+            .chain(
+                metadata
+                    .current_items
+                    .iter()
+                    .map(|item| item.source_copy_path.as_str()),
+            )
+            .collect::<HashSet<_>>();
+        let declared = metadata
+            .source_stubs
+            .iter()
+            .flatten()
+            .map(|stub| stub.path.as_str())
+            .collect::<HashSet<_>>();
+        for path in functions.keys().filter(|path| {
+            path.split("::")
+                .last()
+                .is_some_and(|name| name.starts_with("__proctor_source_stub_"))
+        }) {
+            if !implementations.contains(path.as_str()) && !declared.contains(path.as_str()) {
+                return Err(ObservationError {
+                    code: "dangling_correspondence",
+                    message: format!("source stub `{path}` has no correspondence"),
+                });
+            }
+        }
+    }
     for record in metadata
         .accepted_correspondence
         .iter()
@@ -1638,6 +1686,18 @@ fn callable_correspondence(
             source.def_id.to_def_id(),
             current.item_id,
             &current.source_copy_path,
+        )?;
+    }
+    for stub in metadata.source_stubs.iter().flatten() {
+        let function = functions.get(&stub.path).ok_or_else(|| ObservationError {
+            code: "dangling_correspondence",
+            message: format!("source stub `{}` is absent", stub.path),
+        })?;
+        insert(
+            &mut result,
+            function.def_id.to_def_id(),
+            stub.item_id,
+            &stub.path,
         )?;
     }
     Ok(result)
@@ -4422,15 +4482,22 @@ pub fn replacement_metadata_from_json(
     let value: ReplacementObservationMetadata =
         serde_json::from_str(input).map_err(|error| ObservationError {
             code: "malformed_metadata",
-            message: format!(
-                "replacement observation metadata is not valid schema-version-1 JSON: {error}"
-            ),
+            message: format!("replacement observation metadata is not valid JSON: {error}"),
         })?;
-    if value.schema_version != OBSERVATION_SCHEMA_VERSION {
+    let raw: serde_json::Value = serde_json::from_str(input).expect("typed metadata parsed");
+    let source_stubs_present = raw.get("source_stubs").is_some();
+    if !matches!(value.schema_version, 1 | 2) {
         return Err(ObservationError {
             code: "unsupported_schema_version",
             message: format!("unsupported schema_version {}", value.schema_version),
         });
+    }
+    if (value.schema_version == 1 && source_stubs_present)
+        || (value.schema_version == 2 && value.source_stubs.is_none())
+    {
+        return Err(metadata_error(
+            "source_stubs must be present only in version 2 metadata",
+        ));
     }
     for digest in [
         &value.candidate_sha256,
@@ -4565,6 +4632,74 @@ fn validate_replacement_metadata(
             .or_default()
             .push((&current.source_copy_path, current.item_id));
     }
+    if let Some(stubs) = &value.source_stubs {
+        if value
+            .accepted_correspondence
+            .iter()
+            .chain(&value.new_correspondence)
+            .any(|record| record.wrapper_path.is_some())
+            || value
+                .current_items
+                .iter()
+                .any(|current| current.wrapper_path.is_some())
+        {
+            return Err(metadata_error(
+                "version 2 metadata cannot contain wrapper paths",
+            ));
+        }
+        let accepted = value
+            .accepted_correspondence
+            .iter()
+            .map(|record| (record.item_id, record.logical_path.as_str()))
+            .collect::<HashMap<_, _>>();
+        let mut previous = None;
+        for stub in stubs {
+            if previous.is_some_and(|id| id >= stub.item_id) {
+                return Err(metadata_error(
+                    "metadata source_stubs are not strictly ordered by item_id",
+                ));
+            }
+            previous = Some(stub.item_id);
+            let logical_path = accepted.get(&stub.item_id).ok_or_else(|| {
+                metadata_error(format!(
+                    "metadata source stub has unknown accepted item_id {}",
+                    stub.item_id
+                ))
+            })?;
+            if !canonical_metadata_path(&stub.path) {
+                return Err(metadata_error(format!(
+                    "metadata source stub path `{}` is not canonical",
+                    stub.path
+                )));
+            }
+            let (module, name) = logical_path.rsplit_once("::").unwrap_or(("", logical_path));
+            let (stub_module, stub_name) = stub
+                .path
+                .rsplit_once("::")
+                .unwrap_or(("", stub.path.as_str()));
+            let base = format!(
+                "__proctor_source_stub_{}",
+                name.strip_prefix("r#").unwrap_or(name)
+            );
+            if stub_module != module
+                || (stub_name != base
+                    && !stub_name
+                        .strip_prefix(&format!("{base}_"))
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        }))
+            {
+                return Err(metadata_error(format!(
+                    "metadata source stub path `{}` does not match accepted function `{logical_path}`",
+                    stub.path
+                )));
+            }
+            categories
+                .entry("source_stub_path")
+                .or_default()
+                .push((&stub.path, stub.item_id));
+        }
+    }
     if value.new_correspondence.len() != value.current_items.len() {
         return Err(metadata_error(
             "metadata current_items and new_correspondence lengths differ",
@@ -4592,6 +4727,7 @@ fn validate_replacement_metadata(
         "implementation_path",
         "wrapper_path",
         "source_copy_path",
+        "source_stub_path",
     ] {
         let mut seen = HashSet::new();
         for &(path, item_id) in categories.get(category).into_iter().flatten() {
@@ -4810,6 +4946,7 @@ mod tests {
     ) -> ReplacementObservationMetadata {
         ReplacementObservationMetadata {
             schema_version: 1,
+            source_stubs: None,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(source.as_bytes()),
@@ -5783,6 +5920,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
     fn metadata_paths_use_canonical_rust_identifier_segments() {
         let mut metadata = ReplacementObservationMetadata {
             schema_version: 1,
+            source_stubs: None,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(b""),
@@ -5837,6 +5975,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
         }
         let base = ReplacementObservationMetadata {
             schema_version: 1,
+            source_stubs: None,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(b""),
@@ -5944,6 +6083,7 @@ unsafe fn target(mut pointer: Option<&i32>) -> i32 {
 "#;
         let metadata = ReplacementObservationMetadata {
             schema_version: 1,
+            source_stubs: None,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(source.as_bytes()),
@@ -8836,6 +8976,7 @@ unsafe fn target(mut pointer: &[i32]) -> i32 {
 "#;
         let metadata = ReplacementObservationMetadata {
             schema_version: 1,
+            source_stubs: None,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: String::new(),
