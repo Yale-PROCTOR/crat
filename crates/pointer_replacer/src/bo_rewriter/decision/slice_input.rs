@@ -430,6 +430,14 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         super::seam::LenEvidence::Preceding => parameter.checked_sub(1),
         _ => None,
     };
+    // Relay 065 review (finding 6): the in-place proof below is for a MASK,
+    // so it reads only a companion whose formal is mask-named.
+    let mask_formal = companion
+        .and_then(|index| body.params.get(index))
+        .is_some_and(|p| {
+            matches!(p.pat.kind, rustc_hir::PatKind::Binding(_, _, ident, _)
+                if super::masked_runtime::mask_named(ident.name.as_str()))
+        });
     let companion = companion.and_then(|index| body.params.get(index).map(|p| p.pat.hir_id));
     let Some(companion) = companion else {
         return IndexBound::No;
@@ -449,6 +457,10 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         companion: HirId,
         bound: bool,
         masked: bool,
+        /// Relay 065: a mask-named companion's reads, in place.
+        mask_formal: bool,
+        local_masked: bool,
+        unproven: bool,
     }
     fn names(e: &Expr<'_>, others: &[HirId]) -> bool {
         struct Names<'a> {
@@ -529,8 +541,13 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     /// companion`, `let v = e & companion`). Nothing writes it between that
     /// write and the read, nor anywhere in the statement that holds the read,
     /// since a loop's later write reaches its next read. Its address is never
-    /// taken mutably. Straight-line and syntactic: anything else is not a
-    /// proof, and a mask offered as a count is refused (relay 063 item 6).
+    /// taken mutably (nor captured by a closure, nor bound `ref mut`), and the
+    /// companion is never written in the body: the value the read sees is
+    /// bounded by the caller's argument. Straight-line and syntactic:
+    /// anything else is not a proof, and a mask offered as a count is refused
+    /// (relay 063 item 6). The verdict is the FUNCTION's: one read of the
+    /// parameter that is neither masked nor names another parameter fails it
+    /// (the review's finding 3; `at` beside `at + 3`).
     fn masked_local<'tcx>(
         tcx: TyCtxt<'tcx>,
         body: &'tcx rustc_hir::Body<'tcx>,
@@ -549,13 +566,27 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             }
         };
         /// The writes to `local` in one subtree, and whether one borrows it
-        /// mutably.
-        struct Writes {
+        /// mutably (`&mut`, a closure's capture, a `ref mut` binding).
+        struct Writes<'tcx> {
+            tcx: TyCtxt<'tcx>,
             local: HirId,
             count: usize,
             borrowed: bool,
         }
-        impl<'tcx> Visitor<'tcx> for Writes {
+        fn ref_mut(pat: &rustc_hir::Pat<'_>) -> bool {
+            let mut found = false;
+            pat.walk_always(|p| {
+                if let rustc_hir::PatKind::Binding(
+                    rustc_hir::BindingMode(rustc_hir::ByRef::Yes(rustc_hir::Mutability::Mut), _),
+                    ..,
+                ) = p.kind
+                {
+                    found = true;
+                }
+            });
+            found
+        }
+        impl<'tcx> Visitor<'tcx> for Writes<'tcx> {
             fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
                 match e.kind {
                     ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _)
@@ -568,9 +599,35 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                     {
                         self.borrowed = true
                     }
+                    ExprKind::Closure(closure)
+                        if self
+                            .tcx
+                            .upvars_mentioned(closure.def_id)
+                            .is_some_and(|upvars| upvars.contains_key(&self.local)) =>
+                    {
+                        self.borrowed = true
+                    }
+                    ExprKind::Match(scrutinee, arms, _)
+                        if is_binding(scrutinee, self.local)
+                            && arms.iter().any(|arm| ref_mut(arm.pat)) =>
+                    {
+                        self.borrowed = true
+                    }
+                    ExprKind::Let(let_)
+                        if is_binding(let_.init, self.local) && ref_mut(let_.pat) =>
+                    {
+                        self.borrowed = true
+                    }
                     _ => {}
                 }
                 intravisit::walk_expr(self, e);
+            }
+
+            fn visit_local(&mut self, let_: &'tcx rustc_hir::LetStmt<'tcx>) {
+                if let_.init.is_some_and(|init| is_binding(init, self.local)) && ref_mut(let_.pat) {
+                    self.borrowed = true;
+                }
+                intravisit::walk_local(self, let_);
             }
 
             fn visit_pat(&mut self, p: &'tcx rustc_hir::Pat<'tcx>) {
@@ -582,8 +639,9 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                 intravisit::walk_pat(self, p);
             }
         }
-        let writes = |visit: &dyn Fn(&mut Writes)| {
+        let writes = |visit: &dyn Fn(&mut Writes<'tcx>)| {
             let mut writes = Writes {
+                tcx,
                 local,
                 count: 0,
                 borrowed: false,
@@ -592,6 +650,18 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             writes
         };
         if writes(&|w| w.visit_body(body)).borrowed {
+            return false;
+        }
+        // The companion is the caller's argument only while nothing in the
+        // body writes it (the review's finding 5).
+        let mut companion_writes = Writes {
+            tcx,
+            local: companion,
+            count: 0,
+            borrowed: false,
+        };
+        companion_writes.visit_expr(body.value);
+        if companion_writes.count != 0 || companion_writes.borrowed {
             return false;
         }
         let stmt_writes = |stmt: &'tcx rustc_hir::Stmt<'tcx>| writes(&|w| w.visit_stmt(stmt)).count;
@@ -673,8 +743,12 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         } else {
                             self.bound = false;
                         }
-                    } else if masked_local(self.tcx, self.body, index, self.companion) {
-                        self.masked = true;
+                    } else if self.mask_formal {
+                        if masked_local(self.tcx, self.body, index, self.companion) {
+                            self.local_masked = true;
+                        } else {
+                            self.unproven = true;
+                        }
                     }
                 }
                 ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
@@ -684,8 +758,12 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         } else {
                             self.bound = false;
                         }
-                    } else if masked_local(self.tcx, self.body, index, self.companion) {
-                        self.masked = true;
+                    } else if self.mask_formal {
+                        if masked_local(self.tcx, self.body, index, self.companion) {
+                            self.local_masked = true;
+                        } else {
+                            self.unproven = true;
+                        }
                     }
                 }
                 _ => {}
@@ -701,9 +779,15 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         companion,
         bound: true,
         masked: false,
+        mask_formal,
+        local_masked: false,
+        unproven: false,
     };
     visitor.visit_body(body);
-    match (visitor.bound, visitor.masked) {
+    match (
+        visitor.bound,
+        visitor.masked || (visitor.local_masked && !visitor.unproven),
+    ) {
         (false, _) => IndexBound::No,
         (true, true) => IndexBound::MaskedByCompanion,
         (true, false) => IndexBound::ByCompanion,
