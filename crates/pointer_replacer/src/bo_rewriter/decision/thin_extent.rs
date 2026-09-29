@@ -96,14 +96,25 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// not protect a caller that converts, and wave-4's CE-D06 emitted exactly
 /// that, `find(name: &mut i8)` into `find_local`'s `strcmp`.
 pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
+    // The arithmetic gate is a PARAMETER's: its thin callers are the local
+    // callee hold's. A LOCAL copy that steps (`q = q.offset(1)`) before the
+    // walk carries it on to its source (the line A review).
     let carries = |(function, binding): (LocalDefId, HirId)| {
-        !facts
-            .raw_only_uses
-            .get(&(function, binding))
-            .is_some_and(|uses| {
-                uses.iter()
-                    .any(|(op, _)| super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
-            })
+        let parameter = tcx.hir_node_by_def_id(function).body_id().is_some_and(|_| {
+            tcx.hir_body_owned_by(function)
+                .params
+                .iter()
+                .any(|param| param.pat.hir_id == binding)
+        });
+        !parameter
+            || !facts
+                .raw_only_uses
+                .get(&(function, binding))
+                .is_some_and(|uses| {
+                    uses.iter().any(|(op, _)| {
+                        super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+                    })
+                })
     };
     let mut out = FxHashSet::default();
     let mut walked = FxHashSet::default();
@@ -171,66 +182,88 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
 }
 
 /// `(function, copy, source)` for every `let copy = source;` and
-/// `copy = source;` in the program, the source a bare local under casts.
+/// `copy = source;` in the program: the source a bare local under casts, or
+/// every arm of an `if` / `match` / block that yields one (C2Rust's ternary).
+/// Every body owner is its own function, closures included, as the facts
+/// key them.
 fn copy_edges(tcx: TyCtxt<'_>) -> Vec<(LocalDefId, HirId, HirId)> {
     use rustc_hir::{
         Expr, ExprKind, LetStmt, PatKind, QPath,
-        def::{DefKind, Res},
+        def::Res,
         intravisit::{self, Visitor},
     };
-    fn local_of(mut e: &Expr<'_>) -> Option<HirId> {
+    fn sources(mut e: &Expr<'_>, out: &mut Vec<HirId>) {
         while let ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) = e.kind {
             e = inner;
         }
         match e.kind {
-            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
-                Res::Local(id) => Some(id),
-                _ => None,
-            },
-            _ => None,
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Local(id) = path.res {
+                    out.push(id);
+                }
+            }
+            ExprKind::If(_, then, otherwise) => {
+                sources(then, out);
+                if let Some(otherwise) = otherwise {
+                    sources(otherwise, out);
+                }
+            }
+            ExprKind::Match(_, arms, _) => {
+                for arm in arms {
+                    sources(arm.body, out);
+                }
+            }
+            ExprKind::Block(block, _) => {
+                if let Some(tail) = block.expr {
+                    sources(tail, out);
+                }
+            }
+            _ => {}
         }
     }
-    struct Copies<'tcx> {
-        tcx: TyCtxt<'tcx>,
+    fn local_of(e: &Expr<'_>) -> Option<HirId> {
+        let mut found = Vec::new();
+        sources(e, &mut found);
+        (found.len() == 1).then(|| found[0])
+    }
+    struct Copies {
         function: LocalDefId,
         edges: Vec<(LocalDefId, HirId, HirId)>,
     }
-    impl<'tcx> Visitor<'tcx> for Copies<'tcx> {
-        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
-
-        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-            self.tcx
-        }
-
+    impl<'tcx> Visitor<'tcx> for Copies {
         fn visit_local(&mut self, local: &'tcx LetStmt<'tcx>) {
             if let PatKind::Binding(_, copy, _, None) = local.pat.kind
-                && let Some(source) = local.init.and_then(local_of)
+                && let Some(init) = local.init
             {
-                self.edges.push((self.function, copy, source));
+                let mut found = Vec::new();
+                sources(init, &mut found);
+                for source in found {
+                    self.edges.push((self.function, copy, source));
+                }
             }
             intravisit::walk_local(self, local);
         }
 
         fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
             if let ExprKind::Assign(left, right, _) = e.kind
-                && let (Some(copy), Some(source)) = (local_of(left), local_of(right))
+                && let Some(copy) = local_of(left)
             {
-                self.edges.push((self.function, copy, source));
+                let mut found = Vec::new();
+                sources(right, &mut found);
+                for source in found {
+                    self.edges.push((self.function, copy, source));
+                }
             }
             intravisit::walk_expr(self, e);
         }
     }
     let mut copies = Copies {
-        tcx,
         function: rustc_hir::def_id::CRATE_DEF_ID,
         edges: Vec::new(),
     };
-    for function in tcx.hir_body_owners() {
-        if tcx.def_kind(function) != DefKind::Fn {
-            continue;
-        }
-        copies.function = function;
-        copies.visit_body(tcx.hir_body_owned_by(function));
+    for owner in tcx.hir_body_owners() {
+        copies.function = owner;
+        copies.visit_body(tcx.hir_body_owned_by(owner));
     }
     copies.edges
 }

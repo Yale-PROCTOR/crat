@@ -273,10 +273,44 @@ fn parameter_access(
             // UNCAST to a counted foreign position
             // (`fill(d: *mut c_void) { memcpy(d, s, 16) }`), the footprint is
             // the contract's, carried in bytes for each caller to compare.
+            //
+            // The footprint is JOINED over every counted site of the parameter
+            // and every callee parameter it is handed on to (a `c_void`
+            // forwarder into a `c_void` writer included): the line A review's
+            // HIGH, a first-found 4-byte site releasing an `i32` caller that a
+            // 64-byte site then writes.
             None => {
-                let (at, bytes) = counted_foreign_footprint(facts, key)?;
-                footprint_bytes = Some(bytes);
-                AccessReason::ForeignContract { at }
+                let direct = counted_foreign_footprint(facts, key);
+                let onward = forwarded(
+                    tcx,
+                    param,
+                    facts,
+                    slice_uses,
+                    parameters,
+                    cursor_candidates,
+                    decided,
+                    visited,
+                    guard,
+                );
+                match (direct, onward) {
+                    (None, None) => return None,
+                    (Some((at, bytes)), None) => {
+                        footprint_bytes = Some(bytes);
+                        AccessReason::ForeignContract { at }
+                    }
+                    (direct, Some(onward)) => {
+                        footprint_bytes = direct.as_ref().map_or(onward.footprint, |(_, bytes)| {
+                            join(Some(*bytes), onward.footprint)
+                        });
+                        match direct {
+                            Some((at, _)) => AccessReason::ForeignContract { at },
+                            None => AccessReason::Forwarded {
+                                counted: onward.counted,
+                                into: onward.into,
+                            },
+                        }
+                    }
+                }
             }
         }
     } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
@@ -289,52 +323,23 @@ fn parameter_access(
     } else if let Some((at, _)) = counted_foreign_footprint(facts, key) {
         AccessReason::ForeignContract { at }
     } else {
-        // No access of its own: the first callee parameter it is handed to,
-        // bare, that accesses wide (a cycle accesses nothing).
-        if visited.contains(&key) {
-            return None;
-        }
-        visited.push(key);
-        let handed = facts
-            .call_args
-            .iter()
-            .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
-            .filter(|(_, site)| site.caller == param.fn_did)
-            .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
-            .filter(|(_, arg)| subject_denoting_root(arg.shape) == Some(param.hir_id))
-            .collect::<Vec<_>>();
-        let mut follow = |cast: bool| {
-            handed
-                .iter()
-                .filter(|(_, arg)| cast != matches!(arg.shape, ArgShape::BareLocal(_)))
-                .find_map(|(callee, arg)| {
-                    let target = parameters.get(&(*callee, arg.index))?;
-                    parameter_access(
-                        tcx,
-                        target,
-                        facts,
-                        slice_uses,
-                        parameters,
-                        cursor_candidates,
-                        decided,
-                        visited,
-                        guard,
-                    )
-                    // A cast of the parameter hands on the same address. In
-                    // main's guard mode (R622-1 / R628-2) every cast hop is
-                    // followed (brotli `Hash14(data)`:
-                    // `BrotliUnalignedRead32(data as *const c_void)`); outside
-                    // it, a cast hop continues only a counted-contract chain
-                    // (wave-6l, Codex 062 finding 3), as the NUL see-through
-                    // continues through casts. Bare arguments are tried first.
-                    .filter(|access| !cast || guard || access.reason.counted())
-                })
-        };
-        let into = follow(false).or_else(|| follow(true))?;
-        footprint_bytes = into.footprint_bytes;
+        // No access of its own: the callee parameters it is handed to that
+        // access wide (a cycle accesses nothing), joined.
+        let onward = forwarded(
+            tcx,
+            param,
+            facts,
+            slice_uses,
+            parameters,
+            cursor_candidates,
+            decided,
+            visited,
+            guard,
+        )?;
+        footprint_bytes = onward.footprint;
         AccessReason::Forwarded {
-            counted: into.reason.counted(),
-            into: into.detail(),
+            counted: onward.counted,
+            into: onward.into,
         }
     };
     let access = match ty.kind() {
@@ -414,6 +419,155 @@ fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::S
     )
 }
 
+/// The callee parameters a parameter is handed on to, joined: the first
+/// access's detail names the chain, `counted` holds if any access ends at a
+/// counted contract, and the footprint is the join of all of theirs.
+struct Onward {
+    into: String,
+    counted: bool,
+    footprint: Option<FootprintBytes>,
+}
+
+/// A footprint join: `None` (past one element for every caller) absorbs,
+/// `Runtime` absorbs a literal, and two literals take the larger.
+fn join(a: Option<FootprintBytes>, b: Option<FootprintBytes>) -> Option<FootprintBytes> {
+    match (a?, b?) {
+        (FootprintBytes::Literal(a), FootprintBytes::Literal(b)) => {
+            Some(FootprintBytes::Literal(a.max(b)))
+        }
+        _ => Some(FootprintBytes::Runtime),
+    }
+}
+
+/// Every callee parameter `param` is handed to that accesses past one element:
+/// bare arguments, and cast hops (in main's guard mode, every one; outside it,
+/// those that end at a counted contract, Codex 062 finding 3). All of them, not the first: a caller's hold is released only
+/// when EVERY access fits its element.
+#[allow(clippy::too_many_arguments)]
+fn forwarded(
+    tcx: TyCtxt<'_>,
+    param: &Subject,
+    facts: &EmitabilityFacts,
+    slice_uses: &FxHashMap<(LocalDefId, HirId), SliceUses>,
+    parameters: &FxHashMap<(LocalDefId, usize), &Subject>,
+    cursor_candidates: &CursorCandidates,
+    decided: Option<&DecidedForms>,
+    visited: &mut Vec<(LocalDefId, HirId)>,
+    guard: bool,
+) -> Option<Onward> {
+    let key = (param.fn_did, param.hir_id);
+    if visited.contains(&key) {
+        return None;
+    }
+    visited.push(key);
+    let handed = facts
+        .call_args
+        .iter()
+        .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
+        .filter(|(_, site)| site.caller == param.fn_did)
+        .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
+        .filter(|(_, arg)| subject_denoting_root(arg.shape) == Some(param.hir_id))
+        .collect::<Vec<_>>();
+    let mut accesses = Vec::new();
+    // Bare arguments first, so the detail names what it named before.
+    for cast in [false, true] {
+        for (callee, arg) in &handed {
+            if cast == matches!(arg.shape, ArgShape::BareLocal(_)) {
+                continue;
+            }
+            let Some(target) = parameters.get(&(*callee, arg.index)) else {
+                continue;
+            };
+            // A cast of the parameter hands on the same address. In main's
+            // guard mode (R622-1 / R628-2) every cast hop is followed (brotli
+            // `Hash14(data)`: `BrotliUnalignedRead32(data as *const c_void)`);
+            // outside it, a cast hop continues only a counted-contract chain.
+            if let Some(access) = parameter_access(
+                tcx,
+                target,
+                facts,
+                slice_uses,
+                parameters,
+                cursor_candidates,
+                decided,
+                visited,
+                guard,
+            ) && (!cast || guard || access.reason.counted())
+            {
+                accesses.push(access);
+            }
+        }
+    }
+    let first = accesses.first()?;
+    Some(Onward {
+        into: first.detail(),
+        counted: accesses.iter().any(|access| access.reason.counted()),
+        footprint: accesses
+            .iter()
+            .skip(1)
+            .fold(first.footprint_bytes, |joined, access| {
+                join(joined, access.footprint_bytes)
+            }),
+    })
+}
+
+/// **wave-6l (R641, main 131 §6 finding 6) — the contract arm.** The foreign
+/// positions this parameter reaches, bare or under casts, whose pinned
+/// contract writes or reads a COUNTED or unbounded footprint past one element,
+/// JOINED (relay 063): `symbol:index:extent` names the first, and the byte
+/// footprint is the largest, or `Runtime` if any is not a constant. A byte count that spells the pointee's own size is
+/// one element and is not one (`thin_extent::byte_count_is_one_element`), and
+/// a NUL-terminated read is left to the thin-extent set (the `strlen` control).
+fn counted_foreign_footprint(
+    facts: &EmitabilityFacts,
+    (function, binding): (LocalDefId, HirId),
+) -> Option<(String, FootprintBytes)> {
+    use super::raw_boundary_contracts::{ArgumentExtent, classify_contract};
+    // Every site, joined (the line A review): the first site found is not the
+    // widest. A non-bare argument (`d.offset(4)`) is not measured from the
+    // parameter's base, so its count is `Runtime`.
+    let mut found: Option<(String, FootprintBytes)> = None;
+    for fact in &facts.foreign_call_args {
+        if fact.caller != function || fact.direct_subject_root() != Some(binding) {
+            continue;
+        }
+        let Ok(contract) = classify_contract(&fact.callee, fact.argument_index, &fact.target)
+        else {
+            continue;
+        };
+        if !matches!(
+            contract.extent,
+            ArgumentExtent::ByteCount
+                | ArgumentExtent::ElementCount
+                | ArgumentExtent::UnboundedWrite
+        ) || super::thin_extent::byte_count_is_one_element(fact)
+        {
+            continue;
+        }
+        let bytes = if matches!(fact.shape, "bare-local" | "cast-of-local") {
+            fact.contract_count
+                .as_ref()
+                .and_then(|count| count.constant_bytes)
+                .map_or(FootprintBytes::Runtime, FootprintBytes::Literal)
+        } else {
+            FootprintBytes::Runtime
+        };
+        found = Some(match found {
+            None => (
+                format!(
+                    "{}:{}:{}",
+                    fact.callee.symbol,
+                    fact.argument_index,
+                    contract.extent.key()
+                ),
+                bytes,
+            ),
+            Some((at, joined)) => (at, join(Some(joined), Some(bytes)).unwrap_or(bytes)),
+        });
+    }
+    found
+}
+
 /// **R491-7 — a local callee that reads a C STRING.**
 ///
 /// `is_float(p)` and `print_colon_delimited_paths(start)` walk their parameter
@@ -430,45 +584,6 @@ fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::S
 /// - [`Fallback`](NulWalk::Fallback) — the walk can stop before the NUL, so
 ///   `strlen` at the caller could read bytes the input never reads. The §77
 ///   fallback extent with its receipt is what that takes.
-/// **wave-6l (R641, main 131 §6 finding 6) — the contract arm.** The first
-/// foreign position this parameter reaches, bare or under casts, whose pinned
-/// contract writes or reads a COUNTED or unbounded footprint past one element:
-/// `symbol:index:extent`. A byte count that spells the pointee's own size is
-/// one element and is not one (`thin_extent::byte_count_is_one_element`), and
-/// a NUL-terminated read is left to the thin-extent set (the `strlen` control).
-fn counted_foreign_footprint(
-    facts: &EmitabilityFacts,
-    (function, binding): (LocalDefId, HirId),
-) -> Option<(String, FootprintBytes)> {
-    use super::raw_boundary_contracts::{ArgumentExtent, classify_contract};
-    facts.foreign_call_args.iter().find_map(|fact| {
-        if fact.caller != function || fact.direct_subject_root() != Some(binding) {
-            return None;
-        }
-        let contract = classify_contract(&fact.callee, fact.argument_index, &fact.target).ok()?;
-        (matches!(
-            contract.extent,
-            ArgumentExtent::ByteCount
-                | ArgumentExtent::ElementCount
-                | ArgumentExtent::UnboundedWrite
-        ) && !super::thin_extent::byte_count_is_one_element(fact))
-        .then(|| {
-            (
-                format!(
-                    "{}:{}:{}",
-                    fact.callee.symbol,
-                    fact.argument_index,
-                    contract.extent.key()
-                ),
-                fact.contract_count
-                    .as_ref()
-                    .and_then(|count| count.constant_bytes)
-                    .map_or(FootprintBytes::Runtime, FootprintBytes::Literal),
-            )
-        })
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NulWalk {
     Exact,
