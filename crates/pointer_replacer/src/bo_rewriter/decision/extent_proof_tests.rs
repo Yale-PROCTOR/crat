@@ -8,6 +8,7 @@ fn prove(input: &str, function: &str, pointer: usize, length: usize) -> Result<(
             .find(|did| tcx.item_name(did.to_def_id()).as_str() == function)
             .expect("the function");
         super::extent_proof::prove_parameter_extent(tcx, did, pointer, length)
+            .map(|_| ())
             .map_err(|refusal| refusal.reason)
     })
     .expect("fixture compiles")
@@ -319,7 +320,20 @@ pub unsafe fn masked_by_two_less(mut p: *const u8, mut n: u64, mut h: u64) -> u8
 /// mask is all ones). ht's own sites pass 16 and doublings of it.
 #[test]
 fn w6l_extent_ht_set_entry_is_bounded_by_its_capacity() {
-    assert_eq!(prove(HT, "ht_set_entry", 0, 1), Ok(()));
+    let premises = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(HT),
+        |tcx| {
+            let did = tcx
+                .hir_body_owners()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == "ht_set_entry")
+                .expect("the function");
+            super::extent_proof::prove_parameter_extent(tcx, did, 0, 1)
+                .map(|proof| proof.premises)
+                .map_err(|refusal| refusal.reason)
+        },
+    )
+    .expect("fixture compiles");
+    assert_eq!(premises, Ok(vec!["mask-of-length"]));
 }
 
 /// Its controls: a mask by ANOTHER integer's `− 1`, and a mask by `n − 2`,

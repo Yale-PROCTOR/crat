@@ -47,6 +47,13 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 
+/// A proof: the premises it rests on beyond §28 (relay 067: `mask-of-length`,
+/// `x & (n − 1)` below `n` wherever the callee reads, `n` being nonzero there).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Proof {
+    pub premises: Vec<&'static str>,
+}
+
 /// Why a proof failed: the first refusing access or operation, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Refusal {
@@ -65,7 +72,7 @@ pub(crate) fn prove_parameter_extent(
     function: LocalDefId,
     pointer: usize,
     length: usize,
-) -> Result<(), Refusal> {
+) -> Result<Proof, Refusal> {
     let refuse = |reason: &str| Refusal {
         reason: reason.to_owned(),
         span: tcx.def_span(function),
@@ -291,6 +298,11 @@ struct State {
     /// `t = AddWithOverflow(y, c)`: field 0 of `t` is `y + c` (an
     /// overflow-checked build).
     checked: FxHashMap<Local, (Term, i64)>,
+    /// Locals holding the length minus one, `n.wrapping_sub(1)` (relay 067),
+    /// wrapped or not: a mask by one of them is `mask-of-length`'s.
+    length_minus_one: FxHashSet<Local>,
+    /// The premises applied on the way here.
+    premises: std::collections::BTreeSet<&'static str>,
 }
 
 impl State {
@@ -332,6 +344,12 @@ impl State {
             derivation,
             conds,
             checked,
+            length_minus_one: self
+                .length_minus_one
+                .intersection(&other.length_minus_one)
+                .copied()
+                .collect(),
+            premises: self.premises.union(&other.premises).copied().collect(),
         }
     }
 
@@ -354,6 +372,8 @@ impl State {
                 .checked
                 .iter()
                 .all(|(local, value)| self.checked.get(local) == Some(value))
+            && other.length_minus_one.is_subset(&self.length_minus_one)
+            && self.premises.is_subset(&other.premises)
     }
 }
 
@@ -374,6 +394,9 @@ struct Analysis<'a, 'tcx> {
     var_locals: Vec<Local>,
     address_taken: FxHashSet<Local>,
     assigned: FxHashSet<Local>,
+    /// The premises the proven accesses rest on (the final pass only).
+    used: std::cell::RefCell<std::collections::BTreeSet<&'static str>>,
+    checking: std::cell::Cell<bool>,
 }
 
 impl<'a, 'tcx> Analysis<'a, 'tcx> {
@@ -420,6 +443,8 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             var_locals,
             address_taken,
             assigned,
+            used: Default::default(),
+            checking: std::cell::Cell::new(false),
         }
     }
 
@@ -448,11 +473,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             derivation,
             conds: FxHashMap::default(),
             checked: FxHashMap::default(),
+            length_minus_one: FxHashSet::default(),
+            premises: Default::default(),
         }
     }
 
     /// The fixpoint, then one checking pass over the converged states.
-    fn run(&self) -> Result<(), Refusal> {
+    fn run(&self) -> Result<Proof, Refusal> {
         let blocks = self.body.basic_blocks.len();
         let mut entry: Vec<Option<State>> = vec![None; blocks];
         let mut visits = vec![0usize; blocks];
@@ -492,6 +519,7 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             }
         }
         let mut refusal = None;
+        self.checking.set(true);
         for (index, state) in entry.iter().enumerate() {
             let Some(state) = state.clone() else { continue };
             self.transfer_block(BasicBlock::from_usize(index), state, &mut |r| {
@@ -501,7 +529,12 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 break;
             }
         }
-        refusal.map_or(Ok(()), Err)
+        match refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(Proof {
+                premises: self.used.borrow().iter().copied().collect(),
+            }),
+        }
     }
 
     /// One block: the statements, then the terminator's edges with their
@@ -603,6 +636,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             state.checked.remove(&local);
         }
         state.derivation.remove(&local);
+        state.length_minus_one.remove(&local);
+    }
+
+    /// Is `v` the companion, or an exact copy of it?
+    fn companion_copy(&self, state: &State, v: usize) -> bool {
+        let n = self.var(self.n).expect("the companion is tracked");
+        v == n || (state.dbm.get(v, n) == 0 && state.dbm.get(n, v) == 0)
     }
 
     /// The value an integer operand has, as a matrix term.
@@ -616,6 +656,15 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                         && state.derivation(local) != Derivation::Derived
                     {
                         return None;
+                    }
+                    // An integer the facts pin is its constant (C2Rust's
+                    // `1 as libc::c_int as libc::c_ulong` is a runtime cast in
+                    // MIR, relay 067's ht).
+                    if self.body.local_decls[local].ty.is_integral()
+                        && let Some(var) = self.var(local)
+                        && let Some(k) = state.dbm.exact(var)
+                    {
+                        return Some(Term::Const(k));
                     }
                     return self.var(local).map(Term::Var);
                 }
@@ -752,8 +801,24 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             Pointer(Local, Derivation),
             Cond(Cond),
             Checked(Term, i64),
+            /// `a & b` on unsigned integers, and whether either operand is the
+            /// length minus one.
+            BitAnd(Option<Term>, Option<Term>, bool),
             Unknown,
         }
+        // Relay 067: `n − 1` of the length, or a copy of such a local.
+        let minus_one = match rvalue {
+            Rvalue::BinaryOp(BinOp::Sub | BinOp::SubUnchecked, box (left, right)) => {
+                matches!(
+                    (self.term(state, left), self.term(state, right)),
+                    (Some(Term::Var(v)), Some(Term::Const(1))) if self.companion_copy(state, v)
+                )
+            }
+            Rvalue::Use(operand) => {
+                operand_local(operand).is_some_and(|local| state.length_minus_one.contains(&local))
+            }
+            _ => false,
+        };
         let new = match rvalue {
             Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _)
                 if pointee(x_ty).is_some() =>
@@ -833,6 +898,13 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                         (Some(term), Some(Term::Const(c))) => New::Checked(term, -c),
                         _ => New::Unknown,
                     },
+                    BinOp::BitAnd if self.unsigned(x) => {
+                        let mask = |operand: &Operand<'tcx>| {
+                            operand_local(operand)
+                                .is_some_and(|local| state.length_minus_one.contains(&local))
+                        };
+                        New::BitAnd(l, r, mask(left) || mask(right))
+                    }
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
                         match (l, r) {
                             (Some(left), Some(right)) => New::Cond(Cond {
@@ -890,7 +962,28 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                 self.kill(state, x);
                 state.checked.insert(x, (term, c));
             }
+            New::BitAnd(l, r, premise) => {
+                self.kill(state, x);
+                if let Some(x_var) = x_var {
+                    // Unsigned: `a & b` is at most each operand.
+                    for term in [l, r].into_iter().flatten() {
+                        match term {
+                            Term::Var(v) => state.dbm.constrain(x_var, v, 0),
+                            Term::Const(k) if k >= 0 => state.dbm.constrain(x_var, 0, k),
+                            Term::Const(_) => {}
+                        }
+                    }
+                    if premise {
+                        let n = self.var(self.n).expect("the companion is tracked");
+                        state.dbm.constrain(x_var, n, -1);
+                        state.premises.insert("mask-of-length");
+                    }
+                }
+            }
             New::Unknown => self.kill(state, x),
+        }
+        if minus_one {
+            state.length_minus_one.insert(x);
         }
         if let Some(x_var) = x_var
             && self.unsigned(x)
@@ -1081,6 +1174,11 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             let sign = if name == "wrapping_add" { 1 } else { -1 };
             self.kill(state, dest);
             let old = state.clone();
+            let minus_one = sign == -1
+                && matches!(
+                    (left, right),
+                    (Some(Term::Var(v)), Some(Term::Const(1))) if self.companion_copy(&old, v)
+                );
             match (left, right) {
                 (Some(term), Some(Term::Const(c)))
                     if self.step_exact(&old, dest, term, sign * c) =>
@@ -1096,6 +1194,9 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             }
             if self.unsigned(dest) {
                 state.dbm.constrain(0, dest_var, 0);
+            }
+            if minus_one {
+                state.length_minus_one.insert(dest);
             }
             return;
         }
@@ -1170,6 +1271,10 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
                         ),
                         span,
                     });
+                } else if self.checking.get() {
+                    self.used
+                        .borrow_mut()
+                        .extend(state.premises.iter().copied());
                 }
             }
         }
