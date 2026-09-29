@@ -910,6 +910,85 @@ fn r619_3_a_receiver_live_at_an_early_exit_is_receipted() {
     );
 }
 
+/// **R645-12 (b), wave-6o 085 STOP 1 — the corpus's four, on its full
+/// shape.** quadtree's `split_node_` allocates FOUR children before it stores
+/// any: at `ne`'s, `sw`'s and `se`'s null returns the children allocated so far
+/// still own (C leaks them, the emitted `Option<Box>` drops them), so `nw`,
+/// `ne` and `sw` each carry an exit-path receipt and `se`, stored before every
+/// exit it reaches, carries none. `test_node`'s `node` is a receiver with no
+/// sink at all (lent to `quadtree_node_isleaf`, never freed): its plan's own
+/// `waiver-drop(scope-exit)`, published under `test_node`. Exactly X's four
+/// (085 §2.1), under the functions whose drops X counts. Built by main's
+/// R619-3 (2) (`live_at_an_exit`, `receiver_receipts_tsv`); this pins it on
+/// the corpus's four-child shape.
+#[test]
+fn w6a_r645_b_quadtrees_four_receiver_closes_are_receipted() {
+    let source = QUADTREE_CHAIN
+        .replace(
+            "    pub nw: *mut quadtree_node,\n",
+            "    pub nw: *mut quadtree_node,\n    pub sw: *mut quadtree_node,\n    pub se: *mut quadtree_node,\n",
+        )
+        .replace(
+            "    (*node).nw = 0 as *mut quadtree_node;\n",
+            "    (*node).nw = 0 as *mut quadtree_node;\n    (*node).sw = 0 as *mut quadtree_node;\n    (*node).se = 0 as *mut quadtree_node;\n",
+        )
+        .replace(
+            "    let mut ne = 0 as *mut quadtree_node;\n",
+            "    let mut ne = 0 as *mut quadtree_node;\n    let mut sw = 0 as *mut quadtree_node;\n    let mut se = 0 as *mut quadtree_node;\n",
+        )
+        .replace(
+            "    (*node).nw = nw;\n    (*node).ne = ne;\n",
+            "    sw = quadtree_node_with_bounds(hw, hw * 2 as i32 as f64);\n    if sw.is_null() {\n        return 0 as i32;\n    }\n    se = quadtree_node_with_bounds(hw * 2 as i32 as f64, hw * 2 as i32 as f64);\n    if se.is_null() {\n        return 0 as i32;\n    }\n    (*node).nw = nw;\n    (*node).ne = ne;\n    (*node).sw = sw;\n    (*node).se = se;\n",
+        )
+        + r#"
+pub unsafe extern "C" fn quadtree_node_isleaf(mut node: *mut quadtree_node) -> i32 {
+    return ((*node).key).is_null() as i32;
+}
+unsafe extern "C" fn test_node() {
+    let mut node = quadtree_node_new();
+    if quadtree_node_isleaf(node) == 0 as i32 {
+        return;
+    }
+}
+"#;
+    assert_eq!(source.matches("se = quadtree_node_with_bounds").count(), 1);
+    assert_eq!(source.matches("pub se: *mut quadtree_node").count(), 1);
+    let out = emitted("r645-quadtree-four-closes", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let receiver_rows = receipts
+        .lines()
+        .filter(|line| line.contains("\treceiver\t"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receiver_rows,
+        [
+            // The fixture's own `driver` never frees its `tree` either.
+            "driver\treceiver\twaiver-drop(scope-exit)",
+            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=ne",
+            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=nw",
+            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=sw",
+            "test_node\treceiver\twaiver-drop(scope-exit)",
+        ],
+        "{receipts}\n{}",
+        out.source
+    );
+    for subject in [
+        "split_node_::nw",
+        "split_node_::ne",
+        "split_node_::sw",
+        "split_node_::se",
+        "test_node::node",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}: {receipts}\n{:#?}",
+            out.degradations
+        );
+    }
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+}
+
 /// **R619-3 (2), a loop body's scope exit.** `it` is a `let` receiver inside a
 /// loop: on the odd-id `continue` its scope ends before the store, so the
 /// emitted owner is dropped there with no `return` anywhere on the path. Its
