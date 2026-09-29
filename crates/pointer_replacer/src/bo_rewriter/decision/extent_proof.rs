@@ -999,6 +999,16 @@ impl<'a, 'tcx> Analysis<'a, 'tcx> {
             }
             return;
         }
+        // `q.is_null()` reads nothing and keeps nothing.
+        if name == "is_null"
+            && args.len() == 1
+            && receiver.is_some_and(|local| pointee(self.body.local_decls[local].ty).is_some())
+        {
+            if let Some(dest) = dest {
+                self.kill(state, dest);
+            }
+            return;
+        }
         // Any other call: a derived pointer handed to it escapes the domain.
         for arg in args {
             if operand_local(&arg.node)
