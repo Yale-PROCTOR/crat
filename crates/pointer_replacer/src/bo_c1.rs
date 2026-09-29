@@ -403,10 +403,30 @@ fn raw_boundary_delivery_custody(
             ));
             continue;
         }
+        let owner_view = expected.expected_form == crate::bo_rewriter::DeliveryForm::OwnerView;
         let Some(source_file) = expected
             .source_file
             .as_deref()
             .filter(|file| sources.contains_key(*file))
+            .or_else(|| {
+                // R674-6 (iii-b): an owner-view row names no file of its own;
+                // the one file that declares its binding in its owner is it.
+                owner_view
+                    .then(|| {
+                        let files = report
+                            .declarations
+                            .iter()
+                            .filter(|(_, row)| {
+                                row.owner == expected.emitted_owner
+                                    && row.binding == expected.binding
+                                    && row.parameter_index == expected.parameter_index
+                            })
+                            .map(|(file, _)| file.as_str())
+                            .collect::<std::collections::BTreeSet<_>>();
+                        (files.len() == 1).then(|| *files.iter().next().expect("one file"))
+                    })
+                    .flatten()
+            })
         else {
             report.issues.push(format!(
                 "delivery-custody:unmapped-source-file:{}:source={:?}",
@@ -474,7 +494,7 @@ fn raw_boundary_delivery_custody(
                 .ok_or("inferred-type")
                 .and_then(raw_boundary_custody_observed_form);
             match observed_form {
-                Ok(Some(form)) if form == expected.expected_form => {
+                Ok(Some(form)) if form == expected.expected_form || owner_view => {
                     if let Some(previous) = claimed.insert(index, expected.subject_key.clone()) {
                         report.delivered_by_tree.remove(&previous);
                         report.issues.push(format!(
@@ -12973,6 +12993,8 @@ mod run {
         let owner_view_written =
             super::owner_view_subjects(&artifact.edit_keys, &artifact.final_reverts);
         let mut owner_view_receipts = String::from("subject_key\towner_fn\tfamily\treceipt\n");
+        // R674-6 (iii-b): each owner-view row is expected in the tree too.
+        let mut custody_expectations = artifact.custody_expectations.clone();
         let mut realized_model_raw = 0usize;
         let mut tally = super::RawBoundarySubjectTally::default();
         let mut delivered_by_ledger = BTreeSet::new();
@@ -12996,6 +13018,11 @@ mod run {
                 delivery = super::RawBoundarySubjectDelivery::Realized;
                 owner_view_receipts.push_str(&format!(
                     "{subject_key}\t{owner_fn}\t{family}\trealized-by-owner-view\n"
+                ));
+                custody_expectations.push(super::owner_view_expectation(
+                    subject_key,
+                    owner_fn,
+                    subject.get("arg_index").map(String::as_str),
                 ));
             }
             if delivery == super::RawBoundarySubjectDelivery::Realized {
@@ -13064,7 +13091,7 @@ mod run {
         });
         let mut custody = super::raw_boundary_delivery_custody_for_outcome(
             program_outcome,
-            &artifact.custody_expectations,
+            &custody_expectations,
             &delivered_by_ledger,
             custody_sources.as_ref(),
             &reverted_functions,
@@ -26424,6 +26451,33 @@ fn r760_1_the_allocator_line_reads_the_declaration_against_the_patch() {
 /// `class_id` is `local-def-index:N`, the same order key). A program with any
 /// `atom` revert attributes nothing: an atom names no class this join can
 /// read, so the rule fails closed there.
+/// **R674-6 (iii-b)** — the delivery expectation of an owner-view row: its
+/// declaration, found by owner and binding (and position, for a parameter),
+/// must carry a safe form in the emitted tree. Without it the ledger counts a
+/// row the tree side never looks at, and the custody comparison reads
+/// `identity-mismatch:ledger-only` (batch 52's heman `convex_hull#258`).
+fn owner_view_expectation(
+    subject_key: &str,
+    owner_fn: &str,
+    arg_index: Option<&str>,
+) -> crate::bo_rewriter::DeliveryExpectation {
+    let binding = subject_key
+        .rsplit_once("::")
+        .map_or(subject_key, |(_, name)| name)
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    crate::bo_rewriter::DeliveryExpectation {
+        subject_key: subject_key.to_owned(),
+        owner_fn: owner_fn.to_owned(),
+        emitted_owner: owner_fn.to_owned(),
+        source_file: None,
+        binding: binding.to_owned(),
+        parameter_index: arg_index.and_then(|index| index.parse().ok()),
+        expected_form: crate::bo_rewriter::DeliveryForm::OwnerView,
+    }
+}
+
 fn owner_view_subjects(edit_keys: &str, final_reverts: &str) -> std::collections::BTreeSet<String> {
     let mut reverted_classes = std::collections::BTreeSet::new();
     for line in final_reverts.lines().skip(1) {
@@ -28969,6 +29023,31 @@ fn r738_1_delivery_custody_replay() {
     for issue in &report.issues {
         println!("  issue {issue}");
     }
+}
+
+/// **R674-6 (iii-b)** — heman's `convex_hull#258` at batch 52: an owner-view row
+/// the ledger delivers is observed in the tree when its declaration carries a
+/// safe form, and is an issue when it does not.
+#[test]
+fn r674_iii_b_an_owner_view_row_is_observed_by_the_tree_side() {
+    let key = "horizon_scan::convex_hull#258";
+    let expectation = owner_view_expectation(key, "horizon_scan", Some("-"));
+    assert_eq!(expectation.binding, "convex_hull");
+    assert_eq!(expectation.parameter_index, None);
+    let safe = "fn horizon_scan() { let mut convex_hull: &mut [u32] = todo!(); }";
+    let report = r219_custody_observe(&[expectation.clone()], &[key], safe, &[]);
+    assert!(report.issues.is_empty(), "{report:?}");
+    assert!(report.delivered_by_tree.contains(key), "{report:?}");
+    let raw = "fn horizon_scan() { let mut convex_hull: *mut u32 = todo!(); }";
+    let report = r219_custody_observe(&[expectation], &[key], raw, &[]);
+    assert!(report.delivered_by_tree.is_empty(), "{report:?}");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("identity-mismatch:ledger-only")),
+        "{report:?}"
+    );
 }
 
 #[test]

@@ -679,6 +679,11 @@ pub(crate) enum DeliveryForm {
         optional: bool,
         slice: bool,
     },
+    /// **R674-6 (iii-b)** — a subject the ledger delivers by OWNER VIEW (R622-1
+    /// (1)): degraded on its own, its declaration typed safe by another plan's
+    /// surviving edit. It has no decided form, so the tree side confirms the
+    /// one thing the ledger claims: the declaration carries a safe form.
+    OwnerView,
 }
 
 fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
