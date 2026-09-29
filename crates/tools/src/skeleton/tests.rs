@@ -4761,8 +4761,7 @@ fn same_module_pointer_targets_supersede_crate_qualified_skeleton_oracles() {
 #[test]
 fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() {
     use crate::{
-        ExpectedFunction, ReplacementItem, ReplacementRequest, ValidationRequest, replace_items,
-        validate,
+        ExpectedFunction, ReplacementItem, ReplacementRequest, ValidationRequest, validate,
     };
 
     let tree = type_spelling_source("tree");
@@ -4885,10 +4884,6 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
         serde_json::from_str::<serde_json::Value>(&replacement_json).unwrap()["schema_version"],
         1
     );
-    run_compiler_on_str(tree, |tcx| {
-        replace_items(tree, &replacement_request, tcx).unwrap()
-    })
-    .unwrap();
 }
 
 #[test]
@@ -5290,13 +5285,14 @@ fn ordinary_pointer_rewriter_and_decisions_are_unchanged() {
 }
 
 #[test]
-fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
+fn generated_local_name_validates_adds_and_compiles_in_original_module() {
     use crate::{
         ExpectedFunction, ReplacementItem, ReplacementRequest, ValidationRequest,
-        normalize_target_safety, replace_items, validate,
+        add_functions_with_observations, make_initial_source, normalize_target_safety, validate,
     };
 
     let normalized = normalize_target_safety(type_spelling_source("motivating")).unwrap();
+    let initial = make_initial_source(&normalized).unwrap();
     let replaced = run_compiler_on_str(&normalized, |tcx| {
         let records = make_skeletons(&normalized, tcx).unwrap();
         let record = function(&records, "src::lib::cb_remove_gamma_rgb");
@@ -5368,8 +5364,9 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
                 .contains("\"code\": \"local_type_mismatch\""),
             "{contrast:?}"
         );
-        replace_items(
+        add_functions_with_observations(
             &normalized,
+            &initial,
             &ReplacementRequest {
                 accepted_correspondence: vec![],
                 schema_version: 1,
@@ -5384,6 +5381,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
             tcx,
         )
         .unwrap()
+        .replacement
     })
     .unwrap()
     .source;

@@ -45,35 +45,22 @@ pub struct ReplacementObservationMetadata {
 }
 
 impl ReplacementObservationMetadata {
-    pub fn from_output(
-        output: &ExtendedReplacementOutput,
-        candidate: &[u8],
-        statement_pairs: &[u8],
-        observation_source: &[u8],
-    ) -> Self {
-        Self {
-            schema_version: OBSERVATION_SCHEMA_VERSION,
-            candidate_sha256: sha256_hex(candidate),
-            statement_pairs_sha256: sha256_hex(statement_pairs),
-            observation_source_sha256: sha256_hex(observation_source),
-            accepted_correspondence: output.accepted_correspondence.clone(),
-            new_correspondence: output.new_correspondence.clone(),
-            current_items: output.current_items.clone(),
-            source_stubs: None,
-        }
-    }
-
     pub fn from_additive_output(
         output: &ExtendedReplacementOutput,
         candidate: &[u8],
         statement_pairs: &[u8],
         observation_source: &[u8],
     ) -> Self {
-        let mut metadata =
-            Self::from_output(output, candidate, statement_pairs, observation_source);
-        metadata.schema_version = 2;
-        metadata.source_stubs = Some(output.source_stubs.clone());
-        metadata
+        Self {
+            schema_version: 2,
+            candidate_sha256: sha256_hex(candidate),
+            statement_pairs_sha256: sha256_hex(statement_pairs),
+            observation_source_sha256: sha256_hex(observation_source),
+            accepted_correspondence: output.accepted_correspondence.clone(),
+            new_correspondence: output.new_correspondence.clone(),
+            current_items: output.current_items.clone(),
+            source_stubs: Some(output.source_stubs.clone()),
+        }
     }
 }
 
