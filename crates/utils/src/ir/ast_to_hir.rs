@@ -6,6 +6,18 @@ use rustc_hir::{self as hir, HirId, def::Res};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Ident, Span, def_id::LocalDefId};
 
+fn use_tree_node_count(tree: &UseTree) -> usize {
+    match &tree.kind {
+        UseTreeKind::Nested { items, .. } => {
+            1 + items
+                .iter()
+                .map(|(child, _)| use_tree_node_count(child))
+                .sum::<usize>()
+        }
+        UseTreeKind::Simple(..) | UseTreeKind::Glob => 1,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AstToHir {
     pub global_map: NodeMap<LocalDefId>,
@@ -59,6 +71,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
         expanded: bool,
     ) {
         let mut i = 0;
+        let mut remaining_nested_uses = 0;
         for hitem in hitems {
             if !expanded {
                 let hitem = self.tcx.hir_item(*hitem);
@@ -70,8 +83,27 @@ impl<'tcx> AstToHirMapper<'tcx> {
                     continue;
                 }
             }
-            let item = items[i].as_mut();
             let hitem = self.tcx.hir_item(*hitem);
+            if remaining_nested_uses > 0 {
+                assert!(matches!(hitem.kind, hir::ItemKind::Use(..)));
+                remaining_nested_uses -= 1;
+                if remaining_nested_uses == 0 {
+                    i += 1;
+                }
+                continue;
+            }
+            let item = items[i].as_mut();
+            if let ItemKind::Use(tree) = &item.kind
+                && matches!(tree.kind, UseTreeKind::Nested { .. })
+            {
+                // A grouped import lowers to a list stem and one HIR item per nested tree.
+                assert!(matches!(hitem.kind, hir::ItemKind::Use(..)));
+                remaining_nested_uses = use_tree_node_count(tree) - 1;
+                if remaining_nested_uses == 0 {
+                    i += 1;
+                }
+                continue;
+            }
             self.map_item_to_item(item, hitem, expanded);
             i += 1;
         }
