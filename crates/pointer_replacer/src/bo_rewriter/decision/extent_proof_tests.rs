@@ -484,3 +484,65 @@ fn w6l_extent_ht_call_sites_take_the_capacity() {
         "{edits:#?}"
     );
 }
+
+/// Relay 067's NEGATIVE witness (a landed-tree runtime defect at 51 and 52):
+/// lodepng's `lodepng_convert` builds `from_raw_parts(in_0, (i) as usize)` for
+/// `getPixelColorRGBA8(.., in_0, i, mode)`, whose body reads `in_0[i]` (and
+/// `in_0[i * 4 + k]`): the loop index taken as the extent, an empty slice at
+/// `i = 0`, and the harness's `the len is 0 but the index is 0`.
+const LODEPNG_PIXEL: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+mod src {
+    pub mod lodepng {
+        #[repr(C)]
+        pub struct LodePNGColorMode {
+            pub colortype: u32,
+            pub bitdepth: u32,
+        }
+        pub unsafe extern "C" fn getPixelColorRGBA8(mut r: *mut u8, mut g: *mut u8, mut b: *mut u8, mut a: *mut u8, mut in_0: *const u8, mut i: u64, mut mode: *const LodePNGColorMode) {
+            if (*mode).bitdepth == 8 as i32 as u32 {
+                *b = *in_0.offset(i as isize);
+                *g = *b;
+                *r = *g;
+                *a = 255 as i32 as u8;
+            } else {
+                *r = *in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(0 as i32 as u64) as isize);
+                *g = *in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(1 as i32 as u64) as isize);
+                *b = *in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(2 as i32 as u64) as isize);
+                *a = *in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(3 as i32 as u64) as isize);
+            }
+        }
+        pub unsafe fn lodepng_convert(mut out: *mut u8, mut in_0: *const u8, mut numpixels: u64, mut mode: *const LodePNGColorMode) {
+            let mut i: u64 = 0 as i32 as u64;
+            while i < numpixels {
+                let mut r_0: u8 = 0;
+                let mut g_0: u8 = 0;
+                let mut b_0: u8 = 0;
+                let mut a_0: u8 = 0;
+                getPixelColorRGBA8(&mut r_0, &mut g_0, &mut b_0, &mut a_0, in_0, i, mode);
+                *out.offset(i as isize) = r_0;
+                i = i.wrapping_add(1);
+            }
+        }
+    }
+}
+"#;
+
+/// The negative witness: the index is never the extent. The prover refuses
+/// `(in_0, i)` (the read at `i` is not below `i`), and the seam, where the
+/// reader chain's old licence named `i`, takes the KX list's refusal
+/// (build B) and the fallback, never `(i) as usize`.
+#[test]
+fn w6l_extent_lodepng_the_pixel_index_is_not_the_extent() {
+    assert_eq!(
+        prove(LODEPNG_PIXEL, "getPixelColorRGBA8", 4, 5),
+        Err("access-unproven:upper".to_owned())
+    );
+    let edits = seam_edits(LODEPNG_PIXEL);
+    assert!(
+        !edits
+            .iter()
+            .any(|(replacement, _)| replacement.contains("(i) as usize")),
+        "{edits:#?}"
+    );
+}
