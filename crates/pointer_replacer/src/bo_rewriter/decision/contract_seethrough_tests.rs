@@ -665,3 +665,35 @@ pub unsafe fn h(mut y: *const i8) -> u64 {
         assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
     }
 }
+
+/// G3 (relay 064; fault H22 was inert) — a SIZED formal's literal footprint
+/// is compared with its own pointee: `put(p: *mut i32)` hands `p` to a 4-byte
+/// writer and is not in the guard's set, `put64` hands it to a 64-byte one and
+/// is.
+#[test]
+fn w6l_seethrough_g3_a_sized_formals_literal_footprint_is_compared_with_its_element() {
+    let set = guard_set(
+        r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn memset(d: *mut core::ffi::c_void, c: i32, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn clear4(mut d: *mut core::ffi::c_void) {
+    memset(d, 0, 4 as u64);
+}
+unsafe fn clear64(mut d: *mut core::ffi::c_void) {
+    memset(d, 0, 64 as u64);
+}
+unsafe fn put(mut p: *mut i32) {
+    clear4(p as *mut core::ffi::c_void);
+}
+unsafe fn put64(mut p: *mut i32) {
+    clear64(p as *mut core::ffi::c_void);
+}
+"#,
+    );
+    assert!(set.iter().any(|name| name == "put64:0"), "{set:?}");
+    for name in ["put:0", "clear4:0", "clear64:0"] {
+        assert!(!set.iter().any(|n| n == name), "{name}: {set:?}");
+    }
+}
