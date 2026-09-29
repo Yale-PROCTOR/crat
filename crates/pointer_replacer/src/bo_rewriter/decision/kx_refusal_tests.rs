@@ -290,3 +290,21 @@ fn w6l_mk7_a_mutably_borrowed_index_is_not_a_proof() {
         "{edits:#?}"
     );
 }
+
+/// MK8 (relay 065, STOP 1) — a constant added to the masked local reads past
+/// `mask`, so `mask + 1` does not cover it: not proven, the refusal stands.
+#[test]
+fn w6l_mk8_a_constant_past_the_masked_local_is_not_a_proof() {
+    let input = MASK_PROVEN.replace(
+        "*data.offset(prev_ix as isize)",
+        "*data.offset((prev_ix + 1) as isize)",
+    );
+    assert_ne!(input, MASK_PROVEN, "the constant is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}
