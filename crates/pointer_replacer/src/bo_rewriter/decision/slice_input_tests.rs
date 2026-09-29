@@ -529,3 +529,271 @@ fn w5c_slice_input_a_mask_by_another_parameter_is_still_refused() {
         &Err(Hold::CompanionNotIndexBound)
     );
 }
+
+/// **Relay 068 (R674) — lodepng's pixel reader, spelled off the KX list.**
+/// `getPixelColorRGBA8(r, .., in_0, i, mode)` reads `in_0[i]` and
+/// `in_0[i * 4 + k]` ITSELF: the integer beside the pointer is the read
+/// position, and every read is at or past it. The reader chain checked only
+/// the callees `in_0` is forwarded to (here `sum_bytes(in_0, i)`, whose loop is
+/// bounded), never the subject's own reads, and took `i` as the extent
+/// (`from_raw_parts(in_0, (i) as usize)`, an empty slice at `i = 0`). The
+/// caller hands a thin root, so no caller supplies the slice.
+const PIXEL: &str = r###"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+#[repr(C)]
+pub struct Mode {
+    pub bitdepth: u32,
+}
+unsafe fn sum_bytes(mut data: *const u8, mut n: u64) -> u32 {
+    let mut k: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while k < n {
+        s = s.wrapping_add(*data.offset(k as isize) as u32);
+        k = k.wrapping_add(1);
+    }
+    s
+}
+unsafe fn pixel_rgba8(mut r: *mut u8, mut in_0: *const u8, mut i: u64, mut mode: *const Mode) {
+    if (*mode).bitdepth == 8 as i32 as u32 {
+        *r = *in_0.offset(i as isize);
+    } else if (*mode).bitdepth == 16 as i32 as u32 {
+        *r = *in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(3 as i32 as u64) as isize);
+    } else {
+        *r = sum_bytes(in_0, i) as u8;
+    }
+}
+pub unsafe fn convert(mut out: *mut u8, mut numpixels: u64, mut mode: *const Mode) {
+    let x: u8 = 0;
+    let in_0: *const u8 = &x;
+    let mut i: u64 = 0 as i32 as u64;
+    while i < numpixels {
+        let mut r_0: u8 = 0;
+        pixel_rgba8(&mut r_0, in_0, i, mode);
+        *out.offset(i as isize) = r_0;
+        i = i.wrapping_add(1);
+    }
+}
+"###;
+
+/// (A) The subject's own reads are checked against its own companion: an
+/// index naming it is bounded only in the masked form. `i`, `i * 4 + 3`,
+/// `i + 1`, `i << 2` and `i - 0` refuse: each is read where it stands. Control:
+/// the same reads at a literal keep the companion.
+#[test]
+fn w6l_r068_an_index_naming_the_companion_unmasked_refuses() {
+    use super::{seam::LenEvidence::Following, slice_input::Hold};
+    let wide = "i.wrapping_mul(4 as i32 as u64).wrapping_add(3 as i32 as u64)";
+    let mut mismatches = Vec::new();
+    for (label, bitdepth8, other, want) in [
+        ("i and i*4+3", "i", wide, Err(Hold::CompanionNotIndexBound)),
+        ("i alone", "i", "i", Err(Hold::CompanionNotIndexBound)),
+        (
+            "i+1 alone",
+            "i.wrapping_add(1 as i32 as u64)",
+            "i.wrapping_add(1 as i32 as u64)",
+            Err(Hold::CompanionNotIndexBound),
+        ),
+        (
+            "i<<2 alone",
+            "(i << 2 as i32)",
+            "(i << 2 as i32)",
+            Err(Hold::CompanionNotIndexBound),
+        ),
+        (
+            "i-0 alone",
+            "i.wrapping_sub(0 as i32 as u64)",
+            "i.wrapping_sub(0 as i32 as u64)",
+            Err(Hold::CompanionNotIndexBound),
+        ),
+        (
+            "control: a literal",
+            "0 as i32 as u64",
+            "0 as i32 as u64",
+            Ok(Extent::Companion(Following)),
+        ),
+    ] {
+        let input = PIXEL
+            .replace(
+                "*in_0.offset(i as isize)",
+                &format!("*in_0.offset({bitdepth8} as isize)"),
+            )
+            .replace(
+                &format!("*in_0.offset({wide} as isize)"),
+                &format!("*in_0.offset({other} as isize)"),
+            );
+        let got = extent_of(&input_extents(&input), "pixel_rgba8::in_0").clone();
+        if got != want {
+            mismatches.push(format!("{label}: {got:?} (want {want:?})"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// (B) lodepng's real chain: `getPixelColorRGBA8` hands `in_0` to
+/// `readBitsFromReversedStream(&j, in_0, bitdepth)`, whose companion is
+/// `nbits`, not `i`: the callee's bound says nothing about `i`. (The five
+/// brotli KX rows live at 52 are this shape: `EvaluateNode(.., gap)` hands
+/// `starting_dist_cache` to `ComputeDistanceCache(pos, ..)`.) A forwarding that
+/// does not pass the subject's companion as the callee's own refuses; the
+/// control passes it.
+#[test]
+fn w6l_r068_a_forwarding_that_drops_the_companion_refuses() {
+    use super::{seam::LenEvidence::Following, slice_input::Hold};
+    let own_local = PIXEL
+        .replace(
+            "*in_0.offset(i as isize)",
+            "*in_0.offset(0 as i32 as isize)",
+        )
+        .replace(
+            "*in_0.offset(i.wrapping_mul(4 as i32 as u64).wrapping_add(3 as i32 as u64) as isize)",
+            "*in_0.offset(0 as i32 as isize)",
+        );
+    let dropped = own_local.replace(
+        "sum_bytes(in_0, i)",
+        "sum_bytes(in_0, (*mode).bitdepth as u64)",
+    );
+    assert_ne!(dropped, own_local, "the dropped companion is in");
+    let mut mismatches = Vec::new();
+    for (label, input, want) in [
+        (
+            "bitdepth passed",
+            dropped,
+            Err(Hold::CompanionNotIndexBound),
+        ),
+        (
+            "control: i passed",
+            own_local,
+            Ok(Extent::Companion(Following)),
+        ),
+    ] {
+        let got = extent_of(&input_extents(&input), "pixel_rgba8::in_0").clone();
+        if got != want {
+            mismatches.push(format!("{label}: {got:?} (want {want:?})"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// ht's `ht_set_entry(entries, capacity, ..)`, whose indexes are
+/// `hash & (capacity - 1)` and a probing local, behind a forwarder.
+const HT_SET: &str = r###"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+unsafe fn ht_set_entry(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
+    let mut hash = key.wrapping_mul(0x9e3779b97f4a7c15 as u64);
+    let mut index = hash & capacity.wrapping_sub(1 as i32 as u64);
+    while *entries.offset(index as isize) != 0 as i32 as u64 {
+        index = index.wrapping_add(1);
+        if index >= capacity {
+            index = 0 as i32 as u64;
+        }
+    }
+    *entries.offset(index as isize) = key;
+}
+unsafe fn ht_set(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
+    ht_set_entry(entries, capacity, key);
+}
+pub unsafe fn ht_put(mut n: u64, mut key: u64) {
+    let mut x: u64 = 0;
+    let entries: *mut u64 = &mut x;
+    ht_set(entries, n, key);
+}
+"###;
+
+/// Controls: the relay's positive shapes stay the companion's.
+/// - ht as written: a probing LOCAL (`index`) the test already admits;
+/// - `entries[capacity - 1]`, the last element, is below it;
+/// - ht inline: `entries[hash & (capacity - 1)]` names the companion masked
+///   below it (`<= capacity - 1`), so the companion is the extent;
+/// - `entries[hash & capacity]` names it masked AT it (`<= capacity`): the
+///   masked arm's `capacity + 1`.
+#[test]
+fn w6l_r068_the_masked_forms_keep_the_companion() {
+    use super::seam::LenEvidence::Following;
+    let with_read = |read: &str| {
+        let input = HT_SET.replace(
+            "    *entries.offset(index as isize) = key;\n",
+            &format!("    *entries.offset({read} as isize) = key;\n"),
+        );
+        assert_ne!(input, HT_SET, "{read} is in");
+        input
+    };
+    let mut mismatches = Vec::new();
+    for (label, input, want) in [
+        (
+            "probing local",
+            HT_SET.to_owned(),
+            Ok(Extent::Companion(Following)),
+        ),
+        (
+            "the last element capacity - 1",
+            with_read("capacity.wrapping_sub(1 as i32 as u64)"),
+            Ok(Extent::Companion(Following)),
+        ),
+        (
+            "inline hash & (capacity - 1)",
+            with_read("(hash & capacity.wrapping_sub(1 as i32 as u64))"),
+            Ok(Extent::Companion(Following)),
+        ),
+        (
+            "inline hash & capacity",
+            with_read("(hash & capacity)"),
+            Ok(Extent::CompanionMask(Following)),
+        ),
+    ] {
+        let got = extent_of(&input_extents(&input), "ht_set::entries").clone();
+        if got != want {
+            mismatches.push(format!("{label}: {got:?} (want {want:?})"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// brotli's `BitsEntropy(population, size)` → `ShannonEntropy(population, size,
+/// total)` (the 17 `BitsEntropy` constructions 52 licenses with `size`): the
+/// only use naming the companion is the END pointer
+/// `population.offset(size)`, compared and never read, so `size` stays the
+/// extent.
+const SHANNON: &str = r###"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+unsafe fn ShannonEntropy(mut population: *const u32, mut size: usize, mut total: *mut usize) -> f64 {
+    let mut sum: usize = 0;
+    let mut population_end = population.offset(size as isize);
+    while population < population_end {
+        let fresh0 = population;
+        population = population.offset(1);
+        sum = sum.wrapping_add(*fresh0 as usize);
+    }
+    *total = sum;
+    sum as f64
+}
+unsafe fn BitsEntropy(mut population: *const u32, mut size: usize) -> f64 {
+    let mut total: usize = 0;
+    ShannonEntropy(population, size, &mut total)
+}
+pub unsafe fn entry(mut n: usize) -> f64 {
+    let x: u32 = 0;
+    let population: *const u32 = &x;
+    BitsEntropy(population, n)
+}
+"###;
+
+/// The end pointer is not a read: `size` stays the extent; the same pointer
+/// dereferenced (`*population.offset(size)`) is a read at the companion and
+/// refuses.
+#[test]
+fn w6l_r068_the_end_pointer_is_not_a_read() {
+    use super::{seam::LenEvidence::Following, slice_input::Hold};
+    assert_eq!(
+        extent_of(&input_extents(SHANNON), "BitsEntropy::population"),
+        &Ok(Extent::Companion(Following))
+    );
+    let read = SHANNON.replace(
+        "    *total = sum;\n",
+        "    *total = sum.wrapping_add(*population.offset(size as isize) as usize);\n",
+    );
+    assert_ne!(read, SHANNON, "the read at the companion is in");
+    assert_eq!(
+        extent_of(&input_extents(&read), "BitsEntropy::population"),
+        &Err(Hold::CompanionNotIndexBound)
+    );
+}
