@@ -72,6 +72,7 @@ pub(crate) mod interface;
 pub(crate) mod io_domain;
 #[cfg(test)]
 mod kx_refusal_tests;
+pub(crate) mod kx_refusals;
 pub(crate) mod licensed_lift;
 pub(crate) mod lifetime;
 #[cfg(test)]
@@ -1152,6 +1153,10 @@ pub(crate) struct DecisionTable {
     /// width at that index, and the allocation, which the signature does not
     /// carry).
     pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    /// **wave-6l relay 063 (R645-5 item 2).** The reader chain's licences the
+    /// KX list refuses (`kx_refusals::KX_LIST`), keyed as
+    /// `slice_input_companions`, with the row the receipt names.
+    pub(crate) kx_refused: FxHashMap<(LocalDefId, rustc_hir::HirId), String>,
     /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
     /// with the EXACT extent licensed — the walk reaches the NUL on every path,
     /// or the pointer is handed to a libc string function whose contract
@@ -1507,6 +1512,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
+        kx_refused: Default::default(),
         nul_exact_parameters: Default::default(),
         wide_access_parameters: Default::default(),
         nul_exact_callers: Default::default(),
@@ -3202,6 +3208,7 @@ mod self_consistency_tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),

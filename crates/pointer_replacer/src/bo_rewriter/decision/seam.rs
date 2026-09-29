@@ -316,6 +316,12 @@ pub(crate) enum SeamLen {
     /// extents under §77 exactly as the 1024 fallback is counted. The
     /// parameter's name rides along so the receipt can name what was guessed.
     PositionalSibling { text: String, param: String },
+    /// **wave-6l relay 063 (R645-5).** The fabricated extent where a companion
+    /// was REFUSED: the KX list (`kx-list:<subject>`), an argument only ever
+    /// `0` (`only-zero`), or a mask offered as a count (`mask-as-count:<arg>`).
+    /// Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
+    /// receipt names the refusal: `fallback(extent-refused:<reason>)`.
+    Refused(String),
 }
 
 impl SeamLen {
@@ -326,7 +332,7 @@ impl SeamLen {
         match self {
             SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
             SeamLen::PositionalSibling { text, .. } => text,
-            SeamLen::Fabricated => FABRICATED_LEN_PATH,
+            SeamLen::Fabricated | SeamLen::Refused(_) => FABRICATED_LEN_PATH,
         }
     }
 
@@ -335,7 +341,10 @@ impl SeamLen {
     pub(crate) fn is_fabricated(&self) -> bool {
         matches!(
             self,
-            SeamLen::Fabricated | SeamLen::MaskDerived(_) | SeamLen::PositionalSibling { .. }
+            SeamLen::Fabricated
+                | SeamLen::Refused(_)
+                | SeamLen::MaskDerived(_)
+                | SeamLen::PositionalSibling { .. }
         )
     }
 
@@ -1453,7 +1462,7 @@ impl GlueSpec {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
             Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
             Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",
-            Some(SeamLen::Fabricated) => "fallback-1024",
+            Some(SeamLen::Fabricated) | Some(SeamLen::Refused(_)) => "fallback-1024",
             None => "-",
         }
     }
@@ -1766,7 +1775,7 @@ impl GlueSpec {
                     // `usize`, and casting it would make a fabricated site
                     // textually indistinguishable from a licensed one whose
                     // companion happened to be a path.
-                    SeamLen::Fabricated => {
+                    SeamLen::Fabricated | SeamLen::Refused(_) => {
                         format!("core::slice::{ctor}({base}, {FABRICATED_LEN_PATH})")
                     }
                 };
@@ -3568,6 +3577,7 @@ pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
         // R500-8: the text is the caller's own argument, the receipt is a fallback.
         Some(SeamLen::PositionalSibling { .. }) => BridgeExtentKind::Fallback,
         Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
+        Some(SeamLen::Refused(reason)) => BridgeExtentKind::Refused(reason.clone()),
         None => BridgeExtentKind::None,
     }
 }
@@ -5401,6 +5411,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                     Some(Ok((_, route))) => Some((contract, *route)),
                     _ => None,
                 });
+                // wave-6l relay 063: why a companion was refused, for the
+                // fallback's receipt (`fallback(extent-refused:<reason>)`).
+                let mut refused: Option<String> = None;
                 let (len_text, len_masked, len_evidence) = if let Some(Ok((count, _))) = counted_len
                 {
                     // wave-6v2 (R457-5): the header path's count IS the ruled
@@ -5590,18 +5603,34 @@ pub(crate) fn synthesize_with_raw_boundary(
                         // same value in every caller's scope.
                         (Some(elements.to_owned()), false, Some(arm))
                     } else {
+                        let argument = companion
+                            .and_then(|i| site.args.iter().find(|argument| argument.index == i));
+                        // R631-4 (iv): a companion only ever `0` names no
+                        // extent. Relay 063 (item 6): a mask is not a count, on
+                        // the following-argument arm (R477-6's masked arm
+                        // licenses `mask + 1` on its own proof). Either way the
+                        // root takes the receipted fallback.
+                        refused = argument.and_then(|argument| {
+                            if super::masked_runtime::always_zero(tcx, site.caller, argument.span) {
+                                Some("only-zero".to_owned())
+                            } else if !masked
+                                && super::masked_runtime::mask_operand(
+                                    tcx,
+                                    site.caller,
+                                    argument.span,
+                                )
+                            {
+                                Some(format!(
+                                    "mask-as-count:{}",
+                                    sm.span_to_snippet(argument.span).unwrap_or_default()
+                                ))
+                            } else {
+                                None
+                            }
+                        });
                         (
-                            companion
-                                .and_then(|i| site.args.iter().find(|argument| argument.index == i))
-                                // R631-4 (iv): a companion only ever `0` names no
-                                // extent; the root takes the receipted fallback.
-                                .filter(|argument| {
-                                    !super::masked_runtime::always_zero(
-                                        tcx,
-                                        site.caller,
-                                        argument.span,
-                                    )
-                                })
+                            argument
+                                .filter(|_| refused.is_none())
                                 .and_then(|argument| sm.span_to_snippet(argument.span).ok())
                                 .filter(|text| licensed_spelling(text))
                                 .map(|text| masked_len_text(text, masked)),
@@ -5612,6 +5641,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     (None, false, None)
                 };
+                // Relay 063 (item 2): the reader chain's licence the KX list
+                // refused (`kx_refused`, set where the licences are read).
+                let refused = refused.or_else(|| {
+                    param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.kx_refused.get(key))
+                        .map(|row| format!("kx-list:{row}"))
+                });
                 // R625: a raw pointer to element 0 of a `[T; N]`, passed where no
                 // companion, contract, region or C string names a length, is
                 // bounded by the array itself: `N`, not the fabricated extent.
@@ -5727,6 +5764,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                                         crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID
                                             .to_owned(),
                                     );
+                                }
+                                // Relay 063: the fallback a refusal caused says so.
+                                if let Some(reason) = &refused
+                                    && candidate.spec.len == Some(SeamLen::Fabricated)
+                                {
+                                    candidate.spec.len = Some(SeamLen::Refused(reason.clone()));
                                 }
                                 candidate
                             })

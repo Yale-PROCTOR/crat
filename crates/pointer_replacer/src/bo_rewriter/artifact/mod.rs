@@ -249,6 +249,7 @@ mod tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),

@@ -8747,6 +8747,7 @@ fn finish_decide<'tcx>(
         // R425-3: the reader chain's own companion, for the seam's count
         // evidence (`count_companions`). Read from the settled table so the
         // index the seam licenses is the one the chain proved.
+        let mut kx_refused = rustc_hash::FxHashMap::default();
         let slice_input_extents = table
             .entries
             .iter()
@@ -8756,6 +8757,12 @@ fn finish_decide<'tcx>(
                 };
                 let proof = decision::slice_input::prove(tcx, subject, &facts, &fat).ok()?;
                 let companion = proof.extent.companion_index(hir_index)?;
+                // wave-6l relay 063 (R645-5 item 2): a licence the KX list
+                // names was never the extent; the seam refuses it.
+                if let Some(row) = decision::kx_refusals::listed(tcx, subject) {
+                    kx_refused.insert((subject.fn_did, subject.hir_id), row);
+                    return None;
+                }
                 Some((
                     (subject.fn_did, subject.hir_id),
                     (companion, proof.extent.is_mask()),
@@ -8773,6 +8780,7 @@ fn finish_decide<'tcx>(
             .into_iter()
             .map(|(key, (companion, _))| (key, companion))
             .collect();
+        table.kx_refused = kx_refused;
 
         // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
         // `decide_one`, which is handed one subject at a time. Runs here, over the

@@ -633,7 +633,7 @@ pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc
             expr(rustc_ast::ExprKind::Paren(P(parsed))),
             P(usize_ty()),
         )),
-        SeamLen::Fabricated => P(parsed),
+        SeamLen::Fabricated | SeamLen::Refused(_) => P(parsed),
     }
 }
 

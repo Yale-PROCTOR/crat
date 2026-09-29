@@ -81,6 +81,10 @@ pub(crate) enum BridgeExtentKind {
     /// because the mask bounds the callee's INDEXES and neither its read width
     /// nor the allocation.
     MaskPlusOne(String),
+    /// **wave-6l relay 063.** The fallback extent where a companion was
+    /// refused; the reason names the refusal (`kx-list:<subject>`,
+    /// `only-zero`, `mask-as-count:<argument>`).
+    Refused(String),
 }
 
 impl BridgeExtentKind {
@@ -96,6 +100,7 @@ impl BridgeExtentKind {
             Self::MaskPlusOne(source) => {
                 format!("fallback(mask+1@addendum-77:{source})")
             }
+            Self::Refused(reason) => format!("fallback(extent-refused:{reason})"),
         }
     }
 }

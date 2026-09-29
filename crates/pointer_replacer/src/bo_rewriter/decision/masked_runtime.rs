@@ -245,10 +245,12 @@ fn local_of(e: &Expr<'_>) -> Option<HirId> {
     }
 }
 
-/// **(iv)** — the call argument at `span` in `caller` is the literal `0`, or a
-/// local whose `let` initializer is `0`, every assignment to which stores `0`,
-/// and which is never borrowed. Such a companion names no extent.
-pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span::Span) -> bool {
+/// The argument expression at `span` in `caller`'s body, with that body.
+fn argument_at<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    span: rustc_span::Span,
+) -> Option<(&'tcx rustc_hir::Body<'tcx>, &'tcx Expr<'tcx>)> {
     struct Find<'tcx> {
         tcx: TyCtxt<'tcx>,
         span: rustc_span::Span,
@@ -269,9 +271,7 @@ pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span:
             intravisit::walk_expr(self, e);
         }
     }
-    if tcx.hir_node_by_def_id(caller).body_id().is_none() {
-        return false;
-    }
+    tcx.hir_node_by_def_id(caller).body_id()?;
     let body = tcx.hir_body_owned_by(caller);
     let mut find = Find {
         tcx,
@@ -279,7 +279,14 @@ pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span:
         found: None,
     };
     find.visit_body(body);
-    let Some(argument) = find.found else {
+    find.found.map(|argument| (body, argument))
+}
+
+/// **(iv)** — the call argument at `span` in `caller` is the literal `0`, or a
+/// local whose `let` initializer is `0`, every assignment to which stores `0`,
+/// and which is never borrowed. Such a companion names no extent.
+pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span::Span) -> bool {
+    let Some((body, argument)) = argument_at(tcx, caller, span) else {
         return false;
     };
     if zero_literal(argument) {
@@ -294,6 +301,47 @@ pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span:
         .get(&id)
         .is_some_and(|init| zero_literal(init))
         && !definitions.nonzero.contains(&id)
+}
+
+/// **wave-6l relay 063 (item 6; wave-5d 096 STOP 3) — a mask is not a count.**
+/// The argument at `span` is an operand named `mask` or `*_mask` (a local, a
+/// parameter or a field; C's trailing `_` allowed), or a local defined once
+/// from one by `x & m`, `m + 1` or `m.wrapping_add(1)`. A mask is the buffer's
+/// size − 1, and a ring-buffer reader reads past it.
+pub(crate) fn mask_operand(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span::Span) -> bool {
+    let Some((body, argument)) = argument_at(tcx, caller, span) else {
+        return false;
+    };
+    let named = |e: &Expr<'_>| {
+        let name = match peel(e).kind {
+            ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                Res::Local(id) => tcx.hir_name(id),
+                _ => return false,
+            },
+            ExprKind::Field(_, ident) => ident.name,
+            _ => return false,
+        };
+        let name = name.as_str().trim_end_matches('_');
+        name == "mask" || name.ends_with("_mask")
+    };
+    if named(argument) {
+        return true;
+    }
+    let definitions = Definitions::of(tcx, body);
+    let derived = definitions.resolve(argument);
+    match derived.kind {
+        ExprKind::Binary(op, left, right) => match op.node {
+            rustc_hir::BinOpKind::BitAnd => named(left) || named(right),
+            rustc_hir::BinOpKind::Add => {
+                (named(left) && constant(right)) || (named(right) && constant(left))
+            }
+            _ => false,
+        },
+        ExprKind::MethodCall(segment, receiver, [argument], _) => {
+            segment.ident.name.as_str() == "wrapping_add" && named(receiver) && constant(argument)
+        }
+        _ => false,
+    }
 }
 
 fn local_callee(tcx: TyCtxt<'_>, owner: LocalDefId, callee: &Expr<'_>) -> Option<LocalDefId> {
