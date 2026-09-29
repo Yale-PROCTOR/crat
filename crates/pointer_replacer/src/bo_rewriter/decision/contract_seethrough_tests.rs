@@ -476,8 +476,11 @@ unsafe fn pick(mut p: *const i8, mut r: *const i8, mut c: bool) -> u64 {
     let mut q = if c { p } else { r };
     strlen(q)
 }
-pub unsafe fn top(mut s: *const i8, mut t: *const i8) -> u64 {
-    walk(s).wrapping_add(pick(s, t, true))
+pub unsafe fn top(mut s: *const i8) -> u64 {
+    walk(s)
+}
+pub unsafe fn top2(mut s: *const i8, mut t: *const i8) -> u64 {
+    pick(s, t, true)
 }
 "#;
 
@@ -488,7 +491,9 @@ pub unsafe fn top(mut s: *const i8, mut t: *const i8) -> u64 {
 #[test]
 fn w6l_seethrough_c2_c3_an_arithmetic_copy_and_a_ternary_carry_the_walk() {
     let held = held(COPIES_MORE);
-    for label in ["walk::p", "pick::p", "pick::r", "top::s", "top::t"] {
+    for label in [
+        "walk::p", "top::s", "pick::p", "pick::r", "top2::s", "top2::t",
+    ] {
         assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
     }
 }
@@ -523,4 +528,44 @@ fn w6l_seethrough_g1_the_guard_reaches_the_foreign_contract_arm() {
     .expect("decision table");
     assert!(set.iter().any(|name| name == "fill:0"), "{set:?}");
     assert!(!set.iter().any(|name| name == "measure:0"), "{set:?}");
+}
+
+/// X1 (relay 064; fault H6 was inert on 52's head, where main's guard holds the
+/// same thin caller as `local-callee-access-extent`) — the arithmetic gate: a
+/// PARAMETER that offsets itself does not carry its NUL walk to its callers
+/// in the thin-extent set; the parameter itself is held.
+#[test]
+fn w6l_seethrough_x1_an_offsetting_parameter_does_not_carry_the_walk() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn target(mut p: *mut i8) -> u64 {
+    *p.offset(1) += 1;
+    strlen(p)
+}
+pub unsafe fn caller(mut q: *mut i8) -> u64 {
+    target(q)
+}
+"#;
+    let held = held(input);
+    assert!(held.iter().any(|l| l == "target::p"), "{held:?}");
+    assert!(!held.iter().any(|l| l == "caller::q"), "{held:?}");
+}
+
+/// V4′ (relay 064; fault H15 was inert: which target the forwarding walk meets
+/// first follows the hash order) — V4 with the two writers declared in the
+/// other order, so a first-found rule fails one of the pair.
+#[test]
+fn w6l_seethrough_v4_the_forwarder_join_in_either_order() {
+    let swapped = FOOTPRINT_JOIN.replace(
+        "unsafe fn clear4(mut d: *mut core::ffi::c_void) {\n    memset(d, 0, 4 as u64);\n}\nunsafe fn fill64(mut d: *mut u8) {\n    memset(d as *mut core::ffi::c_void, 0, 64 as u64);\n}",
+        "unsafe fn fill64(mut d: *mut u8) {\n    memset(d as *mut core::ffi::c_void, 0, 64 as u64);\n}\nunsafe fn clear4(mut d: *mut core::ffi::c_void) {\n    memset(d, 0, 4 as u64);\n}",
+    );
+    assert_ne!(swapped, FOOTPRINT_JOIN, "the swap applies");
+    for input in [FOOTPRINT_JOIN.to_owned(), swapped] {
+        let map = access_map(&input);
+        assert!(map.iter().any(|(l, _)| l == "caller::fwd"), "{map:#?}");
+    }
 }
