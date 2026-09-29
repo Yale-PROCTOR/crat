@@ -872,3 +872,44 @@ pub unsafe fn save(mut out: *mut u32, mut v: *mut u32) {
     let set = guard_set(input);
     assert!(!set.iter().any(|n| n.starts_with("copy_be32:")), "{set:?}");
 }
+
+/// K2d / K2e / K2f (relay 065, the third review's A-1) — the copies the
+/// narrowing rule must NOT drop: a same-size cast (`c_char` → `u8`) walking
+/// on, a narrowing copy with a literal step past the element (`d[7]` of a
+/// `u32`), and a widening copy (`u8` → `u32`) stepping one. Each thin caller
+/// is held.
+#[test]
+fn w6l_seethrough_k2d_k2e_k2f_cast_copies_that_step_past_the_element() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe fn scan(mut s: *const i8) -> u64 {
+    let mut u = s as *const u8;
+    let mut n: u64 = 0;
+    while *u.offset(n as isize) as i32 != 0 as i32 {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+unsafe fn wipe8(mut pdest: *mut u32) {
+    let mut d = pdest as *mut u8;
+    *d.offset(7 as i32 as isize) = 0 as u8;
+}
+unsafe fn widen(mut p: *mut u8) -> u32 {
+    let mut q = p as *mut u32;
+    *q.offset(1 as i32 as isize)
+}
+pub unsafe fn scanner(mut a: *const i8) -> u64 {
+    scan(a)
+}
+pub unsafe fn wiper(mut w: *mut u32) {
+    wipe8(w);
+}
+pub unsafe fn widener(mut b: *mut u8) -> u32 {
+    widen(b)
+}
+"#;
+    let map = access_map(input);
+    for label in ["scanner::a", "wiper::w", "widener::b"] {
+        assert!(map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
+    }
+}
