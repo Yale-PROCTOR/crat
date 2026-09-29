@@ -174,6 +174,15 @@ pub unsafe fn c3_same_width_sign(mut p: *const u8, mut n: i32, mut u: u32) -> u8
     }
     0 as u8
 }
+unsafe fn is_null(mut q: *const u8) -> bool {
+    *q.offset(500 as isize) as i32 == 0 as i32
+}
+pub unsafe fn c3_named_is_null(mut p: *const u8, mut n: usize) -> u8 {
+    if n > 0 as usize && !is_null(p) {
+        return *p;
+    }
+    0 as u8
+}
 pub unsafe fn c3_off_by_one(mut p: *const u8, mut n: usize) -> u32 {
     let mut s: u32 = 0;
     let mut i: usize = 0;
@@ -232,6 +241,7 @@ fn w6l_extent_c3_controls_are_refused() {
         ("c3_address_of_copy", "address-of-a-derived-pointer"),
         ("c3_reborrowed_copy", "address-of-a-derived-pointer"),
         ("c3_named_add", "handed-to:add"),
+        ("c3_named_is_null", "handed-to:is_null"),
         ("c3_tainted_compare", "access-unproven:upper"),
         ("c3_same_width_sign", "access-unproven:lower"),
     ]
