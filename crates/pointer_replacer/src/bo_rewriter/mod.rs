@@ -8239,6 +8239,12 @@ fn finish_decide<'tcx>(
     > = rustc_hash::FxHashMap::default();
     let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
     let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
+    // wave-6l relay 067: the extent prover's verdicts, once per
+    // (function, parameter, companion) across the iterations.
+    let mut extent_proofs: rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, usize, usize),
+        Option<decision::extent_proof::Proof>,
+    > = rustc_hash::FxHashMap::default();
     let a5_role_bound = facts
         .call_args
         .values()
@@ -8807,6 +8813,45 @@ fn finish_decide<'tcx>(
         table.slice_input_companions = slice_input_extents
             .into_iter()
             .map(|(key, (companion, _))| (key, companion))
+            .collect();
+        // wave-6l relay 067 (the extent build's first case): a delivered slice
+        // parameter no other producer licenses takes its adjacent integer when
+        // the extent prover shows that integer bounds every access (ht's
+        // `ht_set_entry(entries, capacity)`).
+        table.extent_proof_companions = table
+            .entries
+            .iter()
+            .filter_map(|(subject, decision)| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                if !matches!(decision, decision::Decision::Slice { .. }) {
+                    return None;
+                }
+                let key = (subject.fn_did, subject.hir_id);
+                if table.slice_input_companions.contains_key(&key) {
+                    return None;
+                }
+                let companion =
+                    match decision::seam::length_evidence(tcx, subject.fn_did, hir_index) {
+                        decision::seam::LenEvidence::Following => hir_index + 1,
+                        decision::seam::LenEvidence::Preceding => hir_index.checked_sub(1)?,
+                        _ => return None,
+                    };
+                let proof = extent_proofs
+                    .entry((subject.fn_did, hir_index, companion))
+                    .or_insert_with(|| {
+                        decision::extent_proof::prove_parameter_extent(
+                            tcx,
+                            subject.fn_did,
+                            hir_index,
+                            companion,
+                        )
+                        .ok()
+                    })
+                    .clone()?;
+                Some((key, (companion, proof.premises)))
+            })
             .collect();
         // wave-6l relay 063 (R645-5 item 2): the parameters the KX list names.
         // The seam refuses their adjacency licence whatever produced it.

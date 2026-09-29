@@ -628,6 +628,8 @@ pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc
     match seam_len {
         SeamLen::Licensed(_)
         | SeamLen::MaskDerived(_)
+        // wave-6l relay 067: a proven companion is a licensed one.
+        | SeamLen::Proven { .. }
         // R500-8: rendered as the companion it is; the receipt carries the guess.
         | SeamLen::PositionalSibling { .. } => expr(rustc_ast::ExprKind::Cast(
             expr(rustc_ast::ExprKind::Paren(P(parsed))),

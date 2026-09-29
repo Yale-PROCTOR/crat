@@ -329,6 +329,11 @@ pub(crate) enum SeamLen {
     /// relay 066). Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
     /// receipt names the refusal: `fallback(extent-refused:<reason>)`.
     Refused(String),
+    /// **wave-6l relay 067.** A companion the EXTENT PROVER licensed
+    /// (`extent_proof::prove_parameter_extent`), rendered as a licensed one;
+    /// the receipt names the proof and its premises:
+    /// `evidence(extent-proof:<premises>:<text>)`.
+    Proven { text: String, premises: String },
 }
 
 impl SeamLen {
@@ -338,7 +343,7 @@ impl SeamLen {
     pub(crate) fn text(&self) -> &str {
         match self {
             SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
-            SeamLen::PositionalSibling { text, .. } => text,
+            SeamLen::PositionalSibling { text, .. } | SeamLen::Proven { text, .. } => text,
             SeamLen::Fabricated | SeamLen::Refused(_) => FABRICATED_LEN_PATH,
         }
     }
@@ -1467,6 +1472,7 @@ impl GlueSpec {
     pub(crate) fn extent_arm_key(&self) -> &'static str {
         match self.len.as_ref() {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
+            Some(SeamLen::Proven { .. }) => "evidence-backed:extent-proof",
             Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
             Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",
             Some(SeamLen::Fabricated) | Some(SeamLen::Refused(_)) => "fallback-1024",
@@ -1773,6 +1779,7 @@ impl GlueSpec {
                     // way; only the receipt tells them apart.
                     SeamLen::Licensed(len)
                     | SeamLen::MaskDerived(len)
+                    | SeamLen::Proven { text: len, .. }
                     // R500-8: a positional count is a call-site expression too;
                     // only the receipt tells it from a licensed one.
                     | SeamLen::PositionalSibling { text: len, .. } => {
@@ -3580,6 +3587,9 @@ pub(crate) fn receipt_arm(expected: Form, found: Form) -> &'static str {
 pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
     match spec.len.as_ref() {
         Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
+        Some(SeamLen::Proven { text, premises }) => {
+            BridgeExtentKind::Evidence(format!("extent-proof:{premises}:{text}"))
+        }
         Some(SeamLen::MaskDerived(source)) => BridgeExtentKind::MaskPlusOne(source.clone()),
         // R500-8: the text is the caller's own argument, the receipt is a fallback.
         Some(SeamLen::PositionalSibling { .. }) => BridgeExtentKind::Fallback,
@@ -5436,6 +5446,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // wave-6l relay 063: why a companion was refused, for the
                 // fallback's receipt (`fallback(extent-refused:<reason>)`).
                 let mut refused: Option<String> = None;
+                // wave-6l relay 067: a companion only the extent prover
+                // licensed, with its premises, for the receipt.
+                let mut proven: Option<String> = None;
                 let (len_text, len_masked, len_evidence) = if let Some(Ok((count, _))) = counted_len
                 {
                     // wave-6v2 (R457-5): the header path's count IS the ruled
@@ -5542,6 +5555,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                             companions.push(*companion);
                             companions
                         });
+                    // wave-6l relay 067: the extent prover's companion, where
+                    // no producer above licensed it.
+                    let extent_proven = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.extent_proof_companions.get(key))
+                        .filter(|(companion, _)| !count_companions.contains(companion))
+                        .cloned();
+                    let count_companions = match &extent_proven {
+                        Some((companion, _)) => {
+                            let mut companions = count_companions.clone();
+                            companions.push(*companion);
+                            companions
+                        }
+                        None => count_companions,
+                    };
                     let arm = if contract_count.is_some() {
                         LenEvidence::Contract
                     } else {
@@ -5691,6 +5719,20 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 None
                             }
                         });
+                        if refused.is_none() && !masked {
+                            proven = extent_proven
+                                .as_ref()
+                                .filter(|(proven_companion, _)| {
+                                    Some(*proven_companion) == companion
+                                })
+                                .map(|(_, premises)| {
+                                    if premises.is_empty() {
+                                        "none".to_owned()
+                                    } else {
+                                        premises.join("+")
+                                    }
+                                });
+                        }
                         (
                             argument
                                 .filter(|_| refused.is_none())
@@ -5711,6 +5753,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                         && candidate.spec.len == Some(SeamLen::Fabricated)
                     {
                         candidate.spec.len = Some(SeamLen::Refused(reason.clone()));
+                    }
+                    // wave-6l relay 067: the extent prover's licence says so.
+                    if let Some(premises) = &proven
+                        && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                    {
+                        candidate.spec.len = Some(SeamLen::Proven {
+                            text,
+                            premises: premises.clone(),
+                        });
                     }
                     candidate
                 };

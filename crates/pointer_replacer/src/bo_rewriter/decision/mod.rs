@@ -1159,6 +1159,13 @@ pub(crate) struct DecisionTable {
     /// width at that index, and the allocation, which the signature does not
     /// carry).
     pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    /// **wave-6l relay 067 — the extent prover's companions.** A delivered
+    /// slice parameter no other producer licenses, whose adjacent integer the
+    /// prover shows bounds every access
+    /// (`extent_proof::prove_parameter_extent`), keyed as
+    /// `slice_input_companions`, with the premises the proof rests on.
+    pub(crate) extent_proof_companions:
+        rustc_hash::FxHashMap<(LocalDefId, rustc_hir::HirId), (usize, Vec<&'static str>)>,
     /// **wave-6l relay 063 (R645-5 item 2).** The parameters the KX list names
     /// (`kx_refusals::KX_LIST`), keyed as `slice_input_companions`, with the row
     /// the receipt names. The seam refuses their adjacency licence.
@@ -1518,6 +1525,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         field_transactions: Default::default(),
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
+        extent_proof_companions: Default::default(),
         kx_refused: Default::default(),
         nul_exact_parameters: Default::default(),
         wide_access_parameters: Default::default(),
@@ -3242,6 +3250,7 @@ mod self_consistency_tests {
             field_transactions: Default::default(),
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
+            extent_proof_companions: Default::default(),
             kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
