@@ -844,6 +844,12 @@ fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) 
 /// `N` elements from the pointer are exactly the array, so a slice of them is
 /// the object's bounds. A cast that changes the pointee (`[u32; 4]` read as
 /// bytes) is refused, as is any start other than a literal 0.
+///
+/// **R645-4:** a byte-string literal is a `&[u8; N]` too (the one literal
+/// typed a reference to an array). Its C2Rust spelling
+/// `b"…\0" as *const u8 as *const c_char` ends at a one-byte pointee, so the
+/// argument's `N` elements are the literal's `N` bytes; a wider pointee is
+/// refused.
 pub(crate) fn array_extent<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
@@ -858,6 +864,13 @@ pub(crate) fn array_extent<'tcx>(
         }
     };
     let target = pointee(typeck.expr_ty(expr))?;
+    let one_byte = |ty: rustc_middle::ty::Ty<'tcx>| {
+        matches!(
+            ty.kind(),
+            rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::U8)
+                | rustc_middle::ty::TyKind::Int(rustc_middle::ty::IntTy::I8)
+        )
+    };
     let zero = |e: &Expr<'_>| {
         let mut e = e;
         while let ExprKind::Cast(inner, _) = e.kind {
@@ -893,6 +906,19 @@ pub(crate) fn array_extent<'tcx>(
                 // Every step above keeps the pointee, so the array's element
                 // is the argument's pointee.
                 let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else {
+                    return None;
+                };
+                return length.try_to_target_usize(tcx);
+            }
+            // R645-4: a byte string read through casts as one-byte elements.
+            ExprKind::Cast(..) if one_byte(target) => {
+                let mut inner = e;
+                while let ExprKind::Cast(next, _) = inner.kind {
+                    inner = next;
+                }
+                let ExprKind::Lit(_) = inner.kind else { return None };
+                let array = pointee(typeck.expr_ty(inner))?;
+                let rustc_middle::ty::TyKind::Array(_, length) = array.kind() else {
                     return None;
                 };
                 return length.try_to_target_usize(tcx);

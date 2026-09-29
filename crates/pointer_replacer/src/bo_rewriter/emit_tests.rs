@@ -14890,3 +14890,72 @@ fn r625_a_static_array_argument_takes_the_array_length() {
     );
     assert!(!flat.contains("FALLBACK_SLICE_EXTENT)"), "{emitted}");
 }
+
+/// **R645-4 (relay 133) — a byte-string literal names its own extent.** A
+/// `b"…\0"` is a `&[u8; N]`; buffer's `test_buffer_append` passes
+/// `b"Hello World\0" as *const u8 as *const c_char as *mut c_char` and lil's
+/// `lil_new` `b"set \0" as *const u8 as *const c_char` into slice formals with
+/// no count companion, and the seam's C arm rendered `FALLBACK_SLICE_EXTENT`.
+/// Read as one-byte elements, the literal is `N` of them, so each takes `N` as
+/// `len-array-type`. The controls stay at the fallback: a non-literal base
+/// beside it, a literal read through a cast to a wider pointee, and a `[u32; 4]`
+/// read as bytes.
+#[test]
+fn r645_4_a_byte_string_literal_takes_its_own_length() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub struct Buf {{ pub data: *mut i8 }}\n\
+         pub static mut WORDS: [u32; 4] = [0; 4];\n\
+         pub unsafe fn equal(a: *mut i8, b: *mut i8) -> i32 {{ (*a.offset(0) == *b.offset(0) && *a.offset(1) == *b.offset(1)) as i32 }}\n\
+         pub unsafe fn strclone(s: *const i8) -> i8 {{ *s.offset(0) + *s.offset(1) }}\n\
+         pub unsafe fn words(w: *const u32) -> u32 {{ *w.offset(0) + *w.offset(1) }}\n\
+         pub unsafe fn bytes(b: *const u8) -> u8 {{ *b.offset(0) + *b.offset(5) }}\n\
+         pub unsafe fn caller(buf: *mut Buf) -> i32 {{\n\
+         \x20   let _next = buf.offset(1);\n\
+         \x20   equal(b\"Hello World\\0\" as *const u8 as *const i8 as *mut i8, (*buf).data)\n\
+         \x20       + strclone(b\"set \\0\" as *const u8 as *const i8) as i32\n\
+         }}\n\
+         pub unsafe fn control() -> u32 {{\n\
+         \x20   words(b\"abcdefgh\" as *const u8 as *const u32)\n\
+         \x20       + bytes(&raw const WORDS as *const u8) as u32\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    let placed = |callee: &str, caller: &str| {
+        seams
+            .lines()
+            .filter(|l| {
+                let f = l.split('\t').collect::<Vec<_>>();
+                f.first() == Some(&"placed")
+                    && f.get(1) == Some(&callee)
+                    && f.get(6) == Some(&caller)
+            })
+            .map(|l| l.split('\t').nth(4).unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        placed("equal", "caller"),
+        ["len-array-type", "len-fabricated"],
+        "the literal takes its length, the field beside it does not:\n{seams}"
+    );
+    assert_eq!(placed("strclone", "caller"), ["len-array-type"], "{seams}");
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "equal(core::slice::from_raw_parts(b\"Hello World\\0\" as *const u8 as *const i8 as *mut i8, (12) as usize)"
+        ) && flat.contains(
+            "strclone(core::slice::from_raw_parts(b\"set \\0\" as *const u8 as *const i8, (5) as usize))"
+        ),
+        "the length is the literal's:\n{emitted}"
+    );
+    // Controls: bytes read as `u32` are not `N` elements, and a `[u32; 4]`
+    // read as bytes is not 4.
+    assert_eq!(placed("words", "control"), ["len-fabricated"], "{seams}");
+    assert_eq!(placed("bytes", "control"), ["len-fabricated"], "{seams}");
+    assert_eq!(
+        flat.matches("FALLBACK_SLICE_EXTENT)").count(),
+        3,
+        "the controls keep the fallback:\n{emitted}"
+    );
+}
