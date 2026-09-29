@@ -770,3 +770,16 @@ fn w6l_seethrough_k2_k2c_the_arithmetic_arm_through_a_copy() {
     assert!(map.iter().any(|(l, _)| l == "stepper::a"), "{map:#?}");
     assert!(!map.iter().any(|(l, _)| l == "firster::b"), "{map:#?}");
 }
+
+/// K3 (relay 065, STOP 2) — the copies are followed transitively: `let q =
+/// p; let r = q; memcpy(.., r, 16)` holds `hopper::h`.
+#[test]
+fn w6l_seethrough_k3_a_copy_of_a_copy() {
+    let input = HOLD_COPIES.replace(
+        "pub unsafe fn top2(",
+        "unsafe fn hop2(mut p: *const u8, mut d: *mut u8) {\n    let mut q = p;\n    let mut r = q;\n    memcpy(d as *mut core::ffi::c_void, r as *const core::ffi::c_void, 16 as u64);\n}\npub unsafe fn hopper(mut h: *const u8, mut o: *mut u8) {\n    hop2(h, o);\n}\npub unsafe fn top2(",
+    );
+    assert_ne!(input, HOLD_COPIES, "the hop is in");
+    let map = access_map(&input);
+    assert!(map.iter().any(|(l, _)| l == "hopper::h"), "{map:#?}");
+}
