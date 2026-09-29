@@ -168,6 +168,23 @@ pub unsafe fn c3_tainted_compare(mut p: *const u8, mut n: usize, mut q: *const u
     }
     0 as u8
 }
+pub unsafe fn c3_unchecked_sub(mut p: *const u8, mut n: usize, mut i: usize) -> u8 {
+    if i < n {
+        let mut j = i - 1;
+        return *p.offset(j as isize);
+    }
+    0 as u8
+}
+pub unsafe fn c3_tainted_units(mut p: *const u8, mut n: usize, mut j: usize) -> u8 {
+    let mut w = (p as *const u32).add(1 as usize) as *const u8;
+    if j < n && n >= 2 as usize {
+        let mut q = p.offset(j as isize);
+        if q < w {
+            return *p.offset((j + 1) as isize);
+        }
+    }
+    0 as u8
+}
 pub unsafe fn c3_same_width_sign(mut p: *const u8, mut n: i32, mut u: u32) -> u8 {
     let mut k = u as i32;
     if k < n {
@@ -245,6 +262,11 @@ fn w6l_extent_c3_controls_are_refused() {
         ("c3_named_is_null", "handed-to:is_null"),
         ("c3_tainted_compare", "access-unproven:upper"),
         ("c3_same_width_sign", "access-unproven:lower"),
+        // Report 064's inert X10 / X13: an unchecked `i - 1` (the statement
+        // path, not `wrapping_sub`'s call) wraps at `i = 0`; a tainted `u32`
+        // step compared in byte units (`q < w` is `j < 4`, not `j < 1`).
+        ("c3_unchecked_sub", "access-unproven:lower"),
+        ("c3_tainted_units", "access-unproven:upper"),
     ]
     .into_iter()
     .filter_map(|(function, reason)| {
@@ -557,6 +579,13 @@ pub unsafe fn bumped(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
     m += 1;
     *entries.offset((key & m) as isize) = key;
 }
+pub unsafe fn bumped_bounded(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
+    if capacity <= 1024 as i32 as u64 {
+        let mut m = capacity.wrapping_sub(1 as i32 as u64);
+        m += 1;
+        *entries.offset((key & m) as isize) = key;
+    }
+}
 pub unsafe fn kept(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
     let mut m = capacity.wrapping_sub(1 as i32 as u64);
     *entries.offset((key & m) as isize) = key;
@@ -566,5 +595,10 @@ pub unsafe fn kept(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
 #[test]
 fn w6l_r068_review_f7_a_bumped_mask_is_not_the_length_minus_one() {
     assert!(prove(BUMPED, "bumped", 0, 1).is_err(), "bumped");
+    // Bounded, `m += 1` is an exact step (B1), so only F7's fix drops it.
+    assert!(
+        prove(BUMPED, "bumped_bounded", 0, 1).is_err(),
+        "bumped_bounded"
+    );
     assert_eq!(prove(BUMPED, "kept", 0, 1), Ok(()), "the control");
 }
