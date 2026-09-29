@@ -104,6 +104,7 @@ const MASK_AS_COUNT: &str = r###"
 unsafe extern "C" fn StoreAndFindMatchesH10(mut data: *const u8, mut ring_buffer_mask: usize, mut cur_ix: usize) -> u32 {
     let mut prev_ix = cur_ix.wrapping_sub(1);
     prev_ix &= ring_buffer_mask;
+    prev_ix = prev_ix.wrapping_add(4);
     *data.offset(prev_ix as isize) as u32
 }
 unsafe extern "C" fn FindAllMatchesH10(mut data: *const u8, mut ring_buffer_mask: usize, mut cur_ix: usize) -> u32 {
@@ -116,7 +117,9 @@ pub unsafe fn Create(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) 
 "###;
 
 /// MK1 (item 6) — a mask is not a count: the root takes the fallback, and the
-/// receipt says why.
+/// receipt says why. Relay 065: the callee's masking is NOT provable here (the
+/// index is re-assigned, `prev_ix + 4`, after the `&=`), so R477-6's masked arm
+/// does not take it first (MK4 is the proven shape).
 #[test]
 fn w6l_mk1_a_mask_is_not_taken_as_a_count() {
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(MASK_AS_COUNT).unwrap();
@@ -202,6 +205,65 @@ fn w6l_mk3_a_count_handed_to_a_mask_formal_is_refused() {
         edits.iter().any(|(replacement, extent)| replacement
             .contains("from_raw_parts(ringbuffer,")
             && extent.contains("mask-as-count:window")),
+        "{edits:#?}"
+    );
+}
+
+/// Relay 065 (R653-1, STOP 1): MK1's shape as 062 had it, the index masked in
+/// place by the formal (`prev_ix &= ring_buffer_mask`) and read unchanged.
+const MASK_PROVEN: &str = r###"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case, unused_unsafe)]
+unsafe extern "C" fn StoreAndFindMatchesH10(mut data: *const u8, mut ring_buffer_mask: usize, mut cur_ix: usize) -> u32 {
+    let mut prev_ix = cur_ix.wrapping_sub(1);
+    prev_ix &= ring_buffer_mask;
+    *data.offset(prev_ix as isize) as u32
+}
+unsafe extern "C" fn FindAllMatchesH10(mut data: *const u8, mut ring_buffer_mask: usize, mut cur_ix: usize) -> u32 {
+    StoreAndFindMatchesH10(data, ring_buffer_mask, cur_ix)
+}
+pub unsafe fn Create(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> u32 {
+    let mut ringbuffer = addr as *const u8;
+    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)
+}
+"###;
+
+/// MK4 (relay 065, STOP 1) — a mask offered as a count goes to R477-6's masked
+/// arm FIRST: the callee's index is masked by that same operand (`prev_ix &=
+/// ring_buffer_mask`, read unchanged), so the arm's own proof holds and the
+/// length is `mask + 1`, evidence-backed, not the fallback.
+#[test]
+fn w6l_mk4_a_proven_mask_takes_mask_plus_one() {
+    let edits = edits(MASK_PROVEN);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && replacement.contains("ringbuffer_mask")
+            && extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+    assert!(
+        !edits
+            .iter()
+            .any(|(_, extent)| extent.contains("mask-as-count")),
+        "{edits:#?}"
+    );
+}
+
+/// MK6 (relay 065, STOP 1) — the masking must reach the read: a write to the
+/// index AFTER the read, inside the loop that holds it, reaches the next
+/// iteration's read, so the proof fails and the refusal stands.
+#[test]
+fn w6l_mk6_a_loop_write_after_the_read_is_not_a_proof() {
+    let input = MASK_PROVEN.replace(
+        "    let mut prev_ix = cur_ix.wrapping_sub(1);\n    prev_ix &= ring_buffer_mask;\n    *data.offset(prev_ix as isize) as u32\n",
+        "    let mut prev_ix = cur_ix & ring_buffer_mask;\n    let mut sum = 0u32;\n    while sum < 8 {\n        sum = sum.wrapping_add(*data.offset(prev_ix as isize) as u32);\n        prev_ix = prev_ix.wrapping_add(1);\n    }\n    sum\n",
+    );
+    assert_ne!(input, MASK_PROVEN, "the loop replaces the body");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
         "{edits:#?}"
     );
 }
