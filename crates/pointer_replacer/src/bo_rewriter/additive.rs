@@ -839,9 +839,12 @@ pub(crate) fn withdrawals(
             anchor.order_key()
         )
     };
-    // **R645-4 — v3's strict progress.** The owners that wait for a root their
+    // **R650-4 — v3's strict progress.** The owners that wait for a root their
     // walks reached restore after all when the round retires nothing else:
     // decided once, when every other anchor has run, and then all of them.
+    // v1's "a round with no root issues them all", applied to v3. Without it
+    // a round of unresolved rows would accept the waiting owners' losses
+    // unrecorded, and a round with no rows fails on `preservation_error`.
     let restore_anchor = ("lost-prior-delivery".to_owned(), Anchor::Restore);
     let late = std::iter::once(()).flat_map(|()| {
         let nothing_retired = !retired_any.get();
