@@ -69,6 +69,21 @@ pub unsafe fn c3_address_taken(mut p: *const u8, mut n: usize) -> u32 {
     }
     s
 }
+pub unsafe fn c3_negative(mut p: *const u8, mut n: usize) -> u8 {
+    if n > 0 as usize {
+        return *p.offset(-(1 as i32) as isize);
+    }
+    0 as u8
+}
+pub unsafe fn c3_signed_negative(mut p: *const u8, mut n: i32) -> u32 {
+    let mut s: u32 = 0;
+    let mut i: i32 = -(1 as i32);
+    while i < n {
+        s = s.wrapping_add(*p.offset(i as isize) as u32);
+        i += 1;
+    }
+    s
+}
 pub unsafe fn c3_off_by_one(mut p: *const u8, mut n: usize) -> u32 {
     let mut s: u32 = 0;
     let mut i: usize = 0;
@@ -95,15 +110,22 @@ fn w6l_extent_c3_dominated_index() {
 /// - the read precedes its guard (`*p.add(i) != 0 && i < n`);
 /// - the guard is on a truncated copy (`(i as u8 as usize) < n`);
 /// - the companion is written through its address between guard and read;
-/// - `i <= n` reads `p[n]`.
+/// - `i <= n` reads `p[n]`;
+/// - `p[-1]`, and a signed index that starts at `-1`, read before `p`.
 #[test]
 fn w6l_extent_c3_controls_are_refused() {
-    for function in [
-        "c3_short_circuit",
-        "c3_truncating",
-        "c3_address_taken",
-        "c3_off_by_one",
+    for (function, reason) in [
+        ("c3_short_circuit", "access-unproven:upper"),
+        ("c3_truncating", "access-unproven:upper"),
+        ("c3_address_taken", "companion-written"),
+        ("c3_off_by_one", "access-unproven:upper"),
+        ("c3_negative", "access-unproven:lower"),
+        ("c3_signed_negative", "access-unproven:lower"),
     ] {
-        assert!(prove(C3, function, 0, 1).is_err(), "{function}");
+        assert_eq!(
+            prove(C3, function, 0, 1),
+            Err(reason.to_owned()),
+            "{function}"
+        );
     }
 }
