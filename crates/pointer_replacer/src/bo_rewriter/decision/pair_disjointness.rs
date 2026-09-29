@@ -135,8 +135,11 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
-            Self::StaticVsEntry(_) | Self::StaticVsEntryWaived(_) => {
-                "pair-disjoint:static-vs-entry"
+            Self::StaticVsEntry(_) => "pair-disjoint:static-vs-entry",
+            // R672-4: the waiver is in the census key, so its sites are counted
+            // there and not only in the lane's ledger.
+            Self::StaticVsEntryWaived(_) => {
+                "pair-disjoint:static-vs-entry:exported-entry-static-waiver"
             }
             Self::ReadReadShared => "pair-disjoint:read-read-shared",
             Self::AllocationIdentity => "pair-disjoint:allocation-identity",
@@ -153,7 +156,7 @@ impl CertificateKind {
             Self::StaticVsEntry(callers) => format!("{}:callers={callers}", self.key()),
             Self::StaticVsEntryWaived(callers) => format!(
                 "{}:callers={callers}:{}",
-                self.key(),
+                Self::StaticVsEntry(callers).key(),
                 EXPORTED_ENTRY_STATIC_WAIVER
             ),
             _ => self.key().to_owned(),
