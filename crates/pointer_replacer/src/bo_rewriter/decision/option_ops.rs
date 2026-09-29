@@ -579,13 +579,47 @@ pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Su
 /// to receive the null they may pass (binn's `binn_list_add(NULL, ..)` →
 /// `binn_list_add_raw`'s `item == NULL`). An unexported function's callers are
 /// all in the program, so their actuals stay the evidence there.
+/// Does `function`'s own body dereference `binding` (`*x`, `(*x).f`)? An
+/// entry that does is not written to receive NULL: a NULL actual is already
+/// the input's UB there (§28), so a callee's null test is no evidence for it.
+fn entry_dereferences(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirId) -> bool {
+    struct Derefs {
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Derefs {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Unary(rustc_hir::UnOp::Deref, mut base) = e.kind {
+                while let ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) = base.kind {
+                    base = inner;
+                }
+                if matches!(base.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                    if path.res == Res::Local(self.binding))
+                {
+                    self.found = true;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(function) else { return true };
+    let mut v = Derefs {
+        binding,
+        found: false,
+    };
+    v.visit_expr(body.value);
+    v.found
+}
+
 pub(super) fn exported_param_handed_to_null_tested_formal(
     tcx: TyCtxt<'_>,
     facts: &EmitabilityFacts,
     subject: &Subject,
 ) -> bool {
     let SubjectKind::Param { .. } = subject.kind else { return false };
-    if !super::exported_pair::exported(tcx, subject.fn_did) {
+    if !super::exported_pair::exported(tcx, subject.fn_did)
+        || entry_dereferences(tcx, subject.fn_did, subject.hir_id)
+    {
         return false;
     }
     facts.call_args.iter().any(|(callee, sites)| {
