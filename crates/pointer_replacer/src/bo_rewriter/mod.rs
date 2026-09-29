@@ -8825,8 +8825,15 @@ fn finish_decide<'tcx>(
                 let decision::SubjectKind::Param { hir_index } = subject.kind else {
                     return None;
                 };
-                if !matches!(decision, decision::Decision::Slice { .. }) {
-                    return None;
+                match decision {
+                    decision::Decision::Slice { .. } => {}
+                    decision::Decision::Cursor { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => return None,
                 }
                 let key = (subject.fn_did, subject.hir_id);
                 if table.slice_input_companions.contains_key(&key) {
