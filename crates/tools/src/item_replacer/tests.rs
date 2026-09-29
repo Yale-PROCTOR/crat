@@ -222,6 +222,556 @@ fn replace_extended(
     .unwrap()
 }
 
+fn add(
+    analysis: &str,
+    partial: &str,
+    request: &ReplacementRequest,
+) -> Result<ExtendedReplacementOutput, ReplacementError> {
+    run_compiler_on_str(analysis, |tcx| {
+        add_functions_with_observations(analysis, partial, request, tcx)
+    })
+    .unwrap()
+}
+
+fn finalize(
+    analysis: &str,
+    partial: &str,
+    api: &[&str],
+) -> Result<FinalizedProject, ReplacementError> {
+    run_compiler_on_str(analysis, |tcx| {
+        finalize_additive_source(
+            analysis,
+            partial,
+            "library",
+            &api.iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+            tcx,
+        )
+    })
+    .unwrap()
+}
+
+#[test]
+fn initial_projection_keeps_context_and_omits_all_free_functions() {
+    let source = r#"#![allow(dead_code)]
+use core::ffi::c_int;
+const BASE: c_int = 3;
+mod inner { pub struct Cell { pub value: c_int } pub unsafe fn leaf() {} mod deep { pub fn main() {} } }
+pub fn main() {}
+"#;
+    let initial = make_initial_source(source).unwrap();
+    let compact = compact(&initial);
+    assert!(compact.contains("#![allow(dead_code)]"));
+    assert!(compact.contains("use core::ffi::c_int"));
+    assert!(compact.contains("const BASE: c_int = 3"));
+    assert!(compact.contains("mod inner"));
+    assert!(compact.contains("pub struct Cell"));
+    assert!(compact.contains("mod deep"));
+    assert!(!compact.contains("fn leaf"));
+    assert!(!compact.contains("fn main"));
+    compile(&initial);
+}
+
+#[test]
+fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
+    let analysis = r#"mod inner {
+    pub unsafe fn leaf(p: *mut i32) -> i32 { *p }
+    pub unsafe fn caller(p: *mut i32) -> i32 { leaf(p) }
+}"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let first = add(
+        analysis,
+        &initial,
+        &request(
+            "inner::leaf",
+            "leaf",
+            "unsafe fn leaf(p: Box<[i32]>) -> i32 { #[proctor(0)] p[0] }",
+        ),
+    )
+    .unwrap();
+    assert!(first.replacement.source.contains("Box<[i32]>"));
+    assert!(!first.replacement.source.contains("__proctor_wrapper"));
+    assert!(!first.replacement.source.contains("fn caller"));
+    assert!(first.source_stubs.is_empty());
+    compile(&first.replacement.source);
+    let mut second_request = request(
+        "inner::caller",
+        "caller",
+        "unsafe fn caller(p: Box<[i32]>) -> i32 { #[proctor(0)] leaf(p) }",
+    );
+    second_request.items[0].id = 8;
+    second_request.accepted_correspondence = first.new_correspondence.clone();
+    let second = add(analysis, &first.replacement.source, &second_request).unwrap();
+    assert_eq!(
+        second.source_stubs,
+        vec![SourceStub {
+            item_id: 7,
+            path: "inner::__proctor_source_stub_leaf".to_owned()
+        }]
+    );
+    assert!(
+        second
+            .observation_source
+            .contains("pub(crate) unsafe fn __proctor_source_stub_leaf")
+    );
+    assert!(!second.replacement.source.contains("source_stub"));
+    assert!(!second.replacement.source.contains("__proctor_wrapper"));
+    compile(&second.replacement.source);
+    compile(&second.observation_source);
+    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+        &second,
+        second.replacement.source.as_bytes(),
+        b"pairs",
+        second.observation_source.as_bytes(),
+    );
+    let parsed =
+        crate::replacement_metadata_from_json(&serde_json::to_string(&metadata).unwrap()).unwrap();
+    assert_eq!(parsed.source_stubs.unwrap(), second.source_stubs);
+    let legacy = crate::ReplacementObservationMetadata::from_output(
+        &second,
+        second.replacement.source.as_bytes(),
+        b"pairs",
+        second.observation_source.as_bytes(),
+    );
+    assert_eq!(
+        crate::replacement_metadata_from_json(&serde_json::to_string(&legacy).unwrap())
+            .unwrap()
+            .schema_version,
+        1
+    );
+    let mut legacy_with_null = serde_json::to_value(&legacy).unwrap();
+    legacy_with_null["source_stubs"] = serde_json::Value::Null;
+    assert_eq!(
+        crate::replacement_metadata_from_json(&legacy_with_null.to_string())
+            .unwrap_err()
+            .code,
+        "malformed_metadata"
+    );
+    let mut future = metadata.clone();
+    future.schema_version = 3;
+    assert_eq!(
+        crate::replacement_metadata_from_json(&serde_json::to_string(&future).unwrap())
+            .unwrap_err()
+            .code,
+        "unsupported_schema_version"
+    );
+    let duplicate_version = format!(
+        "{{\"schema_version\":999,{}",
+        &serde_json::to_string(&metadata).unwrap()[1..]
+    );
+    let duplicate_error = crate::replacement_metadata_from_json(&duplicate_version).unwrap_err();
+    assert_eq!(duplicate_error.code, "malformed_metadata");
+    assert!(duplicate_error.message.contains("duplicate field"));
+    crate::observation::extract_observations_from_source(&second.observation_source, &metadata)
+        .unwrap();
+    let mut missing = metadata.clone();
+    missing.source_stubs = Some(vec![]);
+    assert_eq!(
+        crate::observation::extract_observations_from_source(&second.observation_source, &missing)
+            .unwrap_err()
+            .code,
+        "dangling_correspondence"
+    );
+    let mut wrong = metadata.clone();
+    wrong.source_stubs.as_mut().unwrap()[0].path =
+        "elsewhere::__proctor_source_stub_leaf".to_owned();
+    assert_eq!(
+        crate::replacement_metadata_from_json(&serde_json::to_string(&wrong).unwrap())
+            .unwrap_err()
+            .code,
+        "malformed_metadata"
+    );
+    let mut unknown = metadata.clone();
+    unknown.source_stubs.as_mut().unwrap()[0].item_id = 8;
+    assert_eq!(
+        crate::replacement_metadata_from_json(&serde_json::to_string(&unknown).unwrap())
+            .unwrap_err()
+            .code,
+        "malformed_metadata"
+    );
+    let finalized = finalize(analysis, &second.replacement.source, &[]).unwrap();
+    assert!(finalized.wrappers.is_empty());
+    let error = finalize(analysis, &second.replacement.source, &["leaf"]).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::UnsupportedConversion);
+}
+
+#[test]
+fn finalization_wraps_only_changed_api_in_source_order() {
+    let analysis = r#"#[no_mangle] pub unsafe extern "C" fn first(p: *const i32) -> i32 { *p }
+pub unsafe fn middle(p: *const i32) -> i32 { *p }
+#[export_name = "public_last"] pub unsafe extern "C" fn last(p: *const i32) -> i32 { *p }
+pub fn main() {}"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let mut partial = initial;
+    for (id, name) in [(1, "first"), (2, "middle"), (3, "last")] {
+        let mut item = request(
+            name,
+            name,
+            &format!("unsafe fn {name}(p: &i32) -> i32 {{ #[proctor(0)] *p }}"),
+        );
+        item.items[0].id = id;
+        item.accepted_correspondence = (1..id)
+            .map(|previous| {
+                let path = ["first", "middle", "last"][(previous - 1) as usize].to_owned();
+                CallableCorrespondence {
+                    item_id: previous,
+                    logical_path: path.clone(),
+                    implementation_path: path,
+                    wrapper_path: None,
+                }
+            })
+            .collect();
+        partial = add(analysis, &partial, &item).unwrap().replacement.source;
+        compile(&partial);
+    }
+    let final_result = finalize(analysis, &partial, &["public_last", "first"]).unwrap();
+    assert_eq!(
+        final_result
+            .wrappers
+            .iter()
+            .map(|item| item.wrapped.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "last"]
+    );
+    let source = compact(&final_result.source);
+    assert!(source.contains("fn main"));
+    assert!(source.contains("fn __proctor_wrapper_first"));
+    assert!(source.contains("fn __proctor_wrapper_last"));
+    assert!(!source.contains("fn __proctor_wrapper_middle"));
+    compile(&final_result.source);
+}
+
+#[test]
+fn additive_cross_module_recursive_group_uses_visible_source_copies() {
+    let analysis = r#"mod a { pub unsafe fn even(n: u32) -> bool { if n == 0 { true } else { crate::b::odd(n - 1) } } }
+mod b { pub unsafe fn odd(n: u32) -> bool { if n == 0 { false } else { crate::a::even(n - 1) } } }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let request = request_with_items(
+        vec![
+            replacement_item(1, "a::even", "even"),
+            replacement_item(2, "b::odd", "odd"),
+        ],
+        r#"unsafe fn even(n: u32) -> bool { #[proctor(0)] if n == 0 { true } else { crate::b::odd(n - 1) } }
+unsafe fn odd(n: u32) -> bool { #[proctor(0)] if n == 0 { false } else { crate::a::even(n - 1) } }"#,
+    );
+    let output = add(analysis, &initial, &request).unwrap();
+    assert!(output.source_stubs.is_empty());
+    assert!(
+        output
+            .observation_source
+            .contains("pub(crate) unsafe fn __proctor_source_even")
+    );
+    assert!(
+        output
+            .observation_source
+            .contains("pub(crate) unsafe fn __proctor_source_odd")
+    );
+    assert!(
+        output
+            .observation_source
+            .contains("crate::b::__proctor_source_odd"),
+        "{}",
+        output.observation_source
+    );
+    assert!(
+        output
+            .observation_source
+            .contains("crate::a::__proctor_source_even")
+    );
+    compile(&output.replacement.source);
+    compile(&output.observation_source);
+}
+
+#[test]
+fn additive_rejects_wrong_path_and_repeated_installation() {
+    let analysis = "mod a { pub unsafe fn f() {} } mod b { pub unsafe fn f() {} }";
+    let initial = make_initial_source(analysis).unwrap();
+    let error = add(
+        analysis,
+        &initial,
+        &request("c::f", "f", "unsafe fn f() {}"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::TargetResolution);
+    let first = add(
+        analysis,
+        &initial,
+        &request("a::f", "f", "unsafe fn f() {}"),
+    )
+    .unwrap();
+    let error = add(
+        analysis,
+        &first.replacement.source,
+        &request("a::f", "f", "unsafe fn f() {}"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::TargetResolution);
+    assert!(!first.replacement.source.contains("mod b { pub unsafe fn f"));
+}
+
+#[test]
+fn additive_macro_hidden_old_call_is_rejected() {
+    let analysis = r#"pub unsafe fn leaf(p: *mut i32) -> i32 { *p }
+macro_rules! old_call { ($p:expr) => { leaf($p) }; }
+pub unsafe fn caller(p: *mut i32) -> i32 { old_call!(p) }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let first = add(
+        analysis,
+        &initial,
+        &request(
+            "leaf",
+            "leaf",
+            "unsafe fn leaf(p: &mut i32) -> i32 { #[proctor(0)] *p }",
+        ),
+    )
+    .unwrap();
+    let mut next = request(
+        "caller",
+        "caller",
+        "unsafe fn caller(p: &mut i32) -> i32 { #[proctor(0)] *p }",
+    );
+    next.items[0].id = 8;
+    next.accepted_correspondence = first.new_correspondence;
+    let error = add(analysis, &first.replacement.source, &next).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::UnsupportedCallRewrite);
+    assert!(error.message.contains("macro token input"));
+}
+
+#[test]
+fn observation_accepts_real_functions_with_stub_like_names() {
+    let analysis = r#"pub unsafe fn __proctor_source_stub_leaf(p: i32) -> i32 { p }
+pub unsafe fn __proctor_source_stub_caller(p: i32) -> i32 { __proctor_source_stub_leaf(p) }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let first = add(
+        analysis,
+        &initial,
+        &request(
+            "__proctor_source_stub_leaf",
+            "__proctor_source_stub_leaf",
+            "unsafe fn __proctor_source_stub_leaf(p: i32) -> i32 { #[proctor(0)] p }",
+        ),
+    )
+    .unwrap();
+    let mut next = request(
+        "__proctor_source_stub_caller",
+        "__proctor_source_stub_caller",
+        "unsafe fn __proctor_source_stub_caller(p: i32) -> i32 { #[proctor(0)] __proctor_source_stub_leaf(p) }",
+    );
+    next.items[0].id = 8;
+    next.accepted_correspondence = first.new_correspondence;
+    let second = add(analysis, &first.replacement.source, &next).unwrap();
+    assert!(second.source_stubs.is_empty());
+    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+        &second,
+        second.replacement.source.as_bytes(),
+        b"pairs",
+        second.observation_source.as_bytes(),
+    );
+    crate::observation::extract_observations_from_source(&second.observation_source, &metadata)
+        .unwrap();
+}
+
+#[test]
+fn stub_allocation_does_not_depend_on_correspondence_order() {
+    let analysis = r#"pub unsafe fn first(p: *mut i32) -> i32 { *p }
+pub unsafe fn second(p: *mut i32) -> i32 { *p }
+pub unsafe fn caller(p: *mut i32, q: *mut i32) -> i32 { first(p) + second(q) }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let mut first_request = request(
+        "first",
+        "first",
+        "unsafe fn first(p: &mut i32) -> i32 { #[proctor(0)] *p }",
+    );
+    first_request.items[0].id = 2;
+    let first = add(analysis, &initial, &first_request).unwrap();
+    let mut second_request = request(
+        "second",
+        "second",
+        "unsafe fn second(p: &mut i32) -> i32 { #[proctor(0)] *p }",
+    );
+    second_request.items[0].id = 1;
+    second_request.accepted_correspondence = first.new_correspondence.clone();
+    let second = add(analysis, &first.replacement.source, &second_request).unwrap();
+    let mut caller = request(
+        "caller",
+        "caller",
+        "unsafe fn caller(p: &mut i32, q: &mut i32) -> i32 { #[proctor(0)] first(p) + second(q) }",
+    );
+    caller.items[0].id = 3;
+    caller.accepted_correspondence = second_request.accepted_correspondence;
+    caller
+        .accepted_correspondence
+        .extend(second.new_correspondence);
+    let forward = add(analysis, &second.replacement.source, &caller).unwrap();
+    caller.accepted_correspondence.reverse();
+    let reverse = add(analysis, &second.replacement.source, &caller).unwrap();
+    assert_eq!(forward.observation_source, reverse.observation_source);
+    assert_eq!(forward.source_stubs, reverse.source_stubs);
+    assert_eq!(
+        forward
+            .source_stubs
+            .iter()
+            .map(|stub| stub.item_id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[test]
+fn finalization_restores_original_main_and_fixed_two_argument_main() {
+    let raw = "pub fn r#main() {}";
+    let raw_initial = make_initial_source(raw).unwrap();
+    assert!(!raw_initial.contains("fn r#main"));
+    let raw_final = finalize(raw, &raw_initial, &[]).unwrap();
+    assert!(raw_final.source.contains("fn main"));
+
+    let zero = "pub unsafe fn main_0() -> i32 { 0 } pub fn main() { unsafe { std::process::exit(main_0()) } }";
+    let zero_initial = make_initial_source(zero).unwrap();
+    let zero_added = add(
+        zero,
+        &zero_initial,
+        &request(
+            "main_0",
+            "main_0",
+            "unsafe fn main_0() -> i32 { #[proctor(0)] 0 }",
+        ),
+    )
+    .unwrap();
+    let zero_final = finalize(zero, &zero_added.replacement.source, &[]).unwrap();
+    assert!(compact(&zero_final.source).contains("std::process::exit(main_0())"));
+    compile(&zero_final.source);
+
+    let two = "pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 { 0 } pub fn main() {}";
+    let two_initial = make_initial_source(two).unwrap();
+    let two_added = add(
+        two,
+        &two_initial,
+        &request(
+            "main_0",
+            "main_0",
+            "unsafe fn main_0(argc: i32, argv: &mut [&mut [i8]]) -> i32 { #[proctor(0)] 0 }",
+        ),
+    )
+    .unwrap();
+    let two_final = finalize(two, &two_added.replacement.source, &[]).unwrap();
+    assert!(
+        two_final
+            .source
+            .contains("command_line_arg_slices.as_mut_slice()")
+    );
+    assert!(two_final.wrappers.is_empty());
+    compile(&two_final.source);
+}
+
+#[test]
+fn finalization_requires_sibling_main_only_for_two_argument_main_0() {
+    let source = "pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 { 0 }";
+    let transformed = request(
+        "main_0",
+        "main_0",
+        "unsafe fn main_0(argc: i32, argv: &mut [&mut [i8]]) -> i32 { #[proctor(0)] 0 }",
+    );
+    let initial = make_initial_source(source).unwrap();
+    let added = add(source, &initial, &transformed).unwrap();
+    let previous = replace(source, &transformed).unwrap_err();
+    let error = finalize(source, &added.replacement.source, &[]).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::RewriteFailure);
+    assert_eq!(error.kind, previous.kind);
+    assert_eq!(error.message, previous.message);
+    assert_eq!(
+        error.message,
+        "two-argument `main_0` requires exactly one sibling `main`, found 0"
+    );
+
+    let zero = "pub unsafe fn main_0() -> i32 { 0 }";
+    let zero_initial = make_initial_source(zero).unwrap();
+    let zero_added = add(
+        zero,
+        &zero_initial,
+        &request(
+            "main_0",
+            "main_0",
+            "unsafe fn main_0() -> i32 { #[proctor(0)] 0 }",
+        ),
+    )
+    .unwrap();
+    let zero_final = finalize(zero, &zero_added.replacement.source, &[]).unwrap();
+    assert!(!zero_final.source.contains("fn main()"));
+    compile(&zero_final.source);
+}
+
+#[test]
+fn finalization_selects_all_same_named_functions_and_deduplicates_api_entries() {
+    let analysis = r#"mod a { pub unsafe fn work(p: *const i32) -> i32 { *p } }
+mod b { pub unsafe fn work(p: *const i32) -> i32 { *p } }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let first = add(
+        analysis,
+        &initial,
+        &request(
+            "a::work",
+            "work",
+            "unsafe fn work(p: &i32) -> i32 { #[proctor(0)] *p }",
+        ),
+    )
+    .unwrap();
+    let mut second_request = request(
+        "b::work",
+        "work",
+        "unsafe fn work(p: &i32) -> i32 { #[proctor(0)] *p }",
+    );
+    second_request.items[0].id = 8;
+    second_request.accepted_correspondence = first.new_correspondence;
+    let second = add(analysis, &first.replacement.source, &second_request).unwrap();
+    let final_result = finalize(analysis, &second.replacement.source, &["work", "work"]).unwrap();
+    assert_eq!(
+        final_result.wrappers,
+        vec![
+            FinalWrapper {
+                wrapped: "a::work".to_owned(),
+                wrapper: "a::__proctor_wrapper_work".to_owned()
+            },
+            FinalWrapper {
+                wrapped: "b::work".to_owned(),
+                wrapper: "b::__proctor_wrapper_work".to_owned()
+            },
+        ]
+    );
+    compile(&final_result.source);
+    let error = finalize(analysis, &second.replacement.source, &["missing"]).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::TargetResolution);
+    assert!(error.message.contains("missing"));
+}
+
+#[test]
+fn finalization_deduplicates_rust_and_export_names_for_one_function() {
+    let analysis = r#"#[export_name = "public_work"] pub unsafe extern "C" fn work(p: *const i32) -> i32 { *p }"#;
+    let initial = make_initial_source(analysis).unwrap();
+    let added = add(
+        analysis,
+        &initial,
+        &request(
+            "work",
+            "work",
+            "unsafe fn work(p: &i32) -> i32 { #[proctor(0)] *p }",
+        ),
+    )
+    .unwrap();
+    let final_result = finalize(
+        analysis,
+        &added.replacement.source,
+        &["work", "public_work", "work"],
+    )
+    .unwrap();
+    assert_eq!(final_result.wrappers.len(), 1);
+    assert_eq!(
+        count(&final_result.source, "export_name = \"public_work\""),
+        1
+    );
+    compile(&final_result.source);
+}
+
 #[test]
 fn print_arguments_are_defended_without_validator() {
     let source = "unsafe fn f() {}";

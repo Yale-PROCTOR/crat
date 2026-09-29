@@ -21,6 +21,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    MakeInitial {
+        #[arg(long)]
+        output: PathBuf,
+        input: PathBuf,
+    },
     MakeSkeleton {
         #[arg(long)]
         output: PathBuf,
@@ -51,6 +56,32 @@ enum Command {
         #[arg(long)]
         observation_metadata_output: PathBuf,
         current_project: PathBuf,
+    },
+    AddFunctions {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        current_project: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        statement_pairs_output: PathBuf,
+        #[arg(long)]
+        observation_source_output: PathBuf,
+        #[arg(long)]
+        observation_metadata_output: PathBuf,
+        input: PathBuf,
+    },
+    FinalizeProject {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        current_project: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        manifest_output: PathBuf,
+        input: PathBuf,
     },
     ExtractObservations {
         #[arg(long)]
@@ -91,6 +122,75 @@ fn serialize_replacement_outputs(
         statements: &output.statement_pairs,
     })?;
     Ok((output.source.clone(), sidecar))
+}
+
+fn replacement_failure(error: tools::ReplacementError) -> ! {
+    fail(
+        match error.kind {
+            tools::ReplacementErrorKind::InvalidRequest => "invalid_request",
+            tools::ReplacementErrorKind::InvalidTransformation => "invalid_transformation",
+            tools::ReplacementErrorKind::TargetResolution => "target_resolution",
+            tools::ReplacementErrorKind::UnsupportedConversion => "unsupported_conversion",
+            tools::ReplacementErrorKind::UnsupportedCallRewrite => "unsupported_call_rewrite",
+            tools::ReplacementErrorKind::RewriteFailure => "rewrite_failure",
+        },
+        error.message,
+    )
+}
+
+fn manifest_for_finalization(
+    input: &str,
+) -> Result<(toml_edit::DocumentMut, String, Vec<String>), String> {
+    let document = input
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("invalid project manifest: {error}"))?;
+    let target_kind = document
+        .get("target_kind")
+        .and_then(toml_edit::Item::as_str)
+        .ok_or("project manifest has no string target_kind")?
+        .to_owned();
+    let api = document
+        .get("api_functions")
+        .and_then(toml_edit::Item::as_array)
+        .ok_or("project manifest has no api_functions array")?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or("project manifest API entry must be a string")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if document
+        .get("target_name")
+        .and_then(toml_edit::Item::as_str)
+        .is_none()
+    {
+        return Err("project manifest has no string target_name".to_owned());
+    }
+    if !document
+        .get("wrappers")
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|items| items.is_empty())
+    {
+        return Err("project manifest must contain an empty wrappers array".to_owned());
+    }
+    Ok((document, target_kind, api))
+}
+
+fn updated_manifest(
+    mut document: toml_edit::DocumentMut,
+    wrappers: &[tools::FinalWrapper],
+) -> String {
+    let array = document["wrappers"]
+        .as_array_mut()
+        .expect("manifest validation checked wrappers");
+    for wrapper in wrappers {
+        let mut entry = toml_edit::InlineTable::new();
+        entry.insert("wrapped", toml_edit::Value::from(wrapper.wrapped.clone()));
+        entry.insert("wrapper", toml_edit::Value::from(wrapper.wrapper.clone()));
+        array.push(toml_edit::Value::InlineTable(entry));
+    }
+    document.to_string()
 }
 
 fn validate_replace_output_paths(paths: &[&Path]) -> Result<(), String> {
@@ -136,6 +236,44 @@ fn validate_output_input_paths(outputs: &[&Path], inputs: &[&Path]) -> Result<()
                     input.display()
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn path_within_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn validate_outputs_outside_projects(outputs: &[&Path], projects: &[&Path]) -> Result<(), String> {
+    let roots = projects
+        .iter()
+        .map(|project| {
+            std::fs::canonicalize(project).map_err(|error| {
+                format!("failed to resolve project {}: {error}", project.display())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for output in outputs {
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let parent = std::fs::canonicalize(parent).map_err(|error| {
+            format!(
+                "failed to resolve output parent {}: {error}",
+                parent.display()
+            )
+        })?;
+        let name = output
+            .file_name()
+            .ok_or_else(|| format!("output path has no file name: {}", output.display()))?;
+        let publication_path = parent.join(name);
+        let resolved_target = resolved_path(output)?;
+        if roots.iter().any(|root| {
+            path_within_root(&publication_path, root) || path_within_root(&resolved_target, root)
+        }) {
+            return Err(format!(
+                "output {} is inside an input project",
+                output.display()
+            ));
         }
     }
     Ok(())
@@ -351,6 +489,23 @@ fn publish_files(files: &[(&Path, &[u8])]) -> Result<(), String> {
 
 fn main() {
     match Args::parse().command {
+        Command::MakeInitial { output, input } => {
+            let source_path = input.join(
+                utils::find_lib_path(&input).unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            validate_output_input_paths(&[&output], &[&source_path])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            validate_outputs_outside_projects(&[&output], &[&input])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let source = std::fs::read_to_string(&source_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let initial = tools::make_initial_source(&source)
+                .unwrap_or_else(|error| replacement_failure(error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, initial.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
         Command::MakeSkeleton {
             output,
             rules,
@@ -480,6 +635,125 @@ fn main() {
                 (&statement_pairs_output, sidecar.as_bytes()),
                 (&observation_source_output, observation_source.as_bytes()),
                 (&observation_metadata_output, metadata.as_bytes()),
+            ])
+            .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::AddFunctions {
+            request,
+            current_project,
+            output,
+            statement_pairs_output,
+            observation_source_output,
+            observation_metadata_output,
+            input,
+        } => {
+            let analysis_path = input.join(
+                utils::find_lib_path(&input).unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            let partial_path = current_project.join(
+                utils::find_lib_path(&current_project)
+                    .unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            validate_output_input_paths(
+                &[
+                    &output,
+                    &statement_pairs_output,
+                    &observation_source_output,
+                    &observation_metadata_output,
+                ],
+                &[&request, &analysis_path, &partial_path],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            validate_outputs_outside_projects(
+                &[
+                    &output,
+                    &statement_pairs_output,
+                    &observation_source_output,
+                    &observation_metadata_output,
+                ],
+                &[&input, &current_project],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            prepare_publish_destinations(&[
+                &output,
+                &statement_pairs_output,
+                &observation_source_output,
+                &observation_metadata_output,
+            ])
+            .unwrap_or_else(|error| fail("output_io", error));
+            let request_text =
+                std::fs::read_to_string(&request).unwrap_or_else(|error| fail("request_io", error));
+            let request = tools::replacement_request_from_json(&request_text)
+                .unwrap_or_else(|error| replacement_failure(error));
+            let source = std::fs::read_to_string(&analysis_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let partial = std::fs::read_to_string(&partial_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let addition = run_compiler_on_path(&analysis_path, move |tcx| {
+                tools::add_functions_with_observations(&source, &partial, &request, tcx)
+            })
+            .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
+            .unwrap_or_else(|error| replacement_failure(error));
+            let (candidate, pairs) = serialize_replacement_outputs(&addition.replacement).unwrap();
+            let observation = &addition.observation_source;
+            let metadata = tools::ReplacementObservationMetadata::from_additive_output(
+                &addition,
+                candidate.as_bytes(),
+                pairs.as_bytes(),
+                observation.as_bytes(),
+            );
+            let metadata = serde_json::to_string_pretty(&metadata).unwrap();
+            publish_files(&[
+                (&output, candidate.as_bytes()),
+                (&statement_pairs_output, pairs.as_bytes()),
+                (&observation_source_output, observation.as_bytes()),
+                (&observation_metadata_output, metadata.as_bytes()),
+            ])
+            .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::FinalizeProject {
+            manifest,
+            current_project,
+            output,
+            manifest_output,
+            input,
+        } => {
+            let analysis_path = input.join(
+                utils::find_lib_path(&input).unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            let partial_path = current_project.join(
+                utils::find_lib_path(&current_project)
+                    .unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            validate_output_input_paths(
+                &[&output, &manifest_output],
+                &[&manifest, &analysis_path, &partial_path],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            validate_outputs_outside_projects(
+                &[&output, &manifest_output],
+                &[&input, &current_project],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            prepare_publish_destinations(&[&output, &manifest_output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            let manifest_text = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|error| fail("manifest_io", error));
+            let (document, target_kind, api) = manifest_for_finalization(&manifest_text)
+                .unwrap_or_else(|error| fail("invalid_manifest", error));
+            let source = std::fs::read_to_string(&analysis_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let partial = std::fs::read_to_string(&partial_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let finalized = run_compiler_on_path(&analysis_path, move |tcx| {
+                tools::finalize_additive_source(&source, &partial, &target_kind, &api, tcx)
+            })
+            .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
+            .unwrap_or_else(|error| replacement_failure(error));
+            let manifest_text = updated_manifest(document, &finalized.wrappers);
+            publish_files(&[
+                (&output, finalized.source.as_bytes()),
+                (&manifest_output, manifest_text.as_bytes()),
             ])
             .unwrap_or_else(|error| fail("output_io", error));
         }
