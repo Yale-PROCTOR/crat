@@ -84,6 +84,22 @@ pub unsafe fn c3_signed_negative(mut p: *const u8, mut n: i32) -> u32 {
     }
     s
 }
+unsafe fn consume(mut q: *const u8) -> u8 {
+    *q.offset(5 as isize)
+}
+pub unsafe fn c3_handed(mut p: *const u8, mut n: usize) -> u8 {
+    if n > 0 as usize {
+        return consume(p);
+    }
+    0 as u8
+}
+pub unsafe fn c3_wide_cast(mut p: *const u8, mut n: usize) -> u32 {
+    let mut q = p as *const u32;
+    if n > 0 as usize {
+        return *q;
+    }
+    0 as u32
+}
 pub unsafe fn c3_off_by_one(mut p: *const u8, mut n: usize) -> u32 {
     let mut s: u32 = 0;
     let mut i: usize = 0;
@@ -111,7 +127,9 @@ fn w6l_extent_c3_dominated_index() {
 /// - the guard is on a truncated copy (`(i as u8 as usize) < n`);
 /// - the companion is written through its address between guard and read;
 /// - `i <= n` reads `p[n]`;
-/// - `p[-1]`, and a signed index that starts at `-1`, read before `p`.
+/// - `p[-1]`, and a signed index that starts at `-1`, read before `p`;
+/// - `p` handed to a callee (step 3's summaries);
+/// - `p` read as a `u32` with only `n >= 1` byte (step 2's C7).
 #[test]
 fn w6l_extent_c3_controls_are_refused() {
     for (function, reason) in [
@@ -121,6 +139,8 @@ fn w6l_extent_c3_controls_are_refused() {
         ("c3_off_by_one", "access-unproven:upper"),
         ("c3_negative", "access-unproven:lower"),
         ("c3_signed_negative", "access-unproven:lower"),
+        ("c3_handed", "handed-to:consume"),
+        ("c3_wide_cast", "access-through-a-cast-or-merged-pointer"),
     ] {
         assert_eq!(
             prove(C3, function, 0, 1),
