@@ -135,9 +135,37 @@ pub(crate) struct LocalCalleeAccess {
     /// have mis-described them.
     pub access: &'static str,
     pub reason: AccessReason,
+    /// **wave-6l relay 063 (R645-5 item 4).** The byte footprint of an UNCAST
+    /// `c_void` parameter's counted contract position, directly or at the end
+    /// of a forwarding chain; `None` everywhere else. Whether a footprint
+    /// passes one element is the CALLER's question (a 4-byte `memset` is one
+    /// `i32` and four `u8`s), so the callee-side classification carries the
+    /// bytes and each caller compares them with its own element
+    /// ([`past_one_element_of`](Self::past_one_element_of)) — this module's
+    /// hold per call site, and main's glue guard per adapter.
+    pub(crate) footprint_bytes: Option<FootprintBytes>,
+}
+
+/// An uncast `c_void` footprint: the contract's constant byte count, or ⊤.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FootprintBytes {
+    Literal(u64),
+    /// A runtime count (or one this walk cannot state exactly).
+    Runtime,
 }
 
 impl LocalCalleeAccess {
+    /// Does this access pass one element of a caller whose pointee is
+    /// `element` bytes? Only an uncast `c_void` footprint depends on the
+    /// caller; every other reason already passes one element. An unknown
+    /// element passes.
+    pub(crate) fn past_one_element_of(&self, element: Option<u64>) -> bool {
+        match self.footprint_bytes {
+            None | Some(FootprintBytes::Runtime) => true,
+            Some(FootprintBytes::Literal(bytes)) => element.is_none_or(|element| bytes > element),
+        }
+    }
+
     /// `callee:parameter:access:reason` — the four things R365-1 requires.
     pub(crate) fn detail(&self) -> String {
         format!(
@@ -228,17 +256,28 @@ fn parameter_access(
     }
     let ty = tcx.typeck(param.fn_did).pat_ty(pattern);
     let key = (param.fn_did, param.hir_id);
+    let mut footprint_bytes = None;
     let reason = if has_void_pointee(tcx, ty, VOID_POINTEE_DEPTH) {
         // A `c_void` parameter is held on its own account by R271-1; what puts
         // the CALLER in this class is the cast that follows, which is the
         // evidence that the opaque address is accessed at some real width. A
         // `c_void` parameter that is only passed on or compared accesses
         // nothing and is not in scope.
-        let cast = facts.address_observations.iter().find(|fact| {
+        match facts.address_observations.iter().find(|fact| {
             fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
-        })?;
-        AccessReason::VoidPointee {
-            cast_to: cast.target_type.clone(),
+        }) {
+            Some(cast) => AccessReason::VoidPointee {
+                cast_to: cast.target_type.clone(),
+            },
+            // wave-6l relay 063 (R645-5 item 4; Codex 062 finding 2): handed
+            // UNCAST to a counted foreign position
+            // (`fill(d: *mut c_void) { memcpy(d, s, 16) }`), the footprint is
+            // the contract's, carried in bytes for each caller to compare.
+            None => {
+                let (at, bytes) = counted_foreign_footprint(facts, key)?;
+                footprint_bytes = Some(bytes);
+                AccessReason::ForeignContract { at }
+            }
         }
     } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
         uses.iter().find(|(op, span)| {
@@ -247,7 +286,7 @@ fn parameter_access(
         })
     }) {
         AccessReason::PointerArithmetic { op: op.clone() }
-    } else if let Some(at) = counted_foreign_footprint(facts, key) {
+    } else if let Some((at, _)) = counted_foreign_footprint(facts, key) {
         AccessReason::ForeignContract { at }
     } else {
         // No access of its own: the first callee parameter it is handed to,
@@ -292,6 +331,7 @@ fn parameter_access(
                 })
         };
         let into = follow(false).or_else(|| follow(true))?;
+        footprint_bytes = into.footprint_bytes;
         AccessReason::Forwarded {
             counted: into.reason.counted(),
             into: into.detail(),
@@ -314,6 +354,7 @@ fn parameter_access(
             .unwrap_or_else(|| "<unnamed>".to_owned()),
         access,
         reason,
+        footprint_bytes,
     })
 }
 
@@ -398,7 +439,7 @@ fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::S
 fn counted_foreign_footprint(
     facts: &EmitabilityFacts,
     (function, binding): (LocalDefId, HirId),
-) -> Option<String> {
+) -> Option<(String, FootprintBytes)> {
     use super::raw_boundary_contracts::{ArgumentExtent, classify_contract};
     facts.foreign_call_args.iter().find_map(|fact| {
         if fact.caller != function || fact.direct_subject_root() != Some(binding) {
@@ -412,11 +453,17 @@ fn counted_foreign_footprint(
                 | ArgumentExtent::UnboundedWrite
         ) && !super::thin_extent::byte_count_is_one_element(fact))
         .then(|| {
-            format!(
-                "{}:{}:{}",
-                fact.callee.symbol,
-                fact.argument_index,
-                contract.extent.key()
+            (
+                format!(
+                    "{}:{}:{}",
+                    fact.callee.symbol,
+                    fact.argument_index,
+                    contract.extent.key()
+                ),
+                fact.contract_count
+                    .as_ref()
+                    .and_then(|count| count.constant_bytes)
+                    .map_or(FootprintBytes::Runtime, FootprintBytes::Literal),
             )
         })
     })
@@ -838,6 +885,11 @@ pub(crate) fn collect(
                     {
                         continue;
                     }
+                    // wave-6l relay 063 (R645-5 item 4): an uncast `c_void`
+                    // footprint is compared with THIS caller's element.
+                    if !access.past_one_element_of(caller_element_bytes(tcx, site.caller, root)) {
+                        continue;
+                    }
                     out.entry((site.caller, root))
                         .or_insert_with(|| access.clone());
                 }
@@ -885,6 +937,15 @@ pub(crate) fn accessed_past_one_element(
         })
         .map(|(key, _)| *key)
         .collect()
+}
+
+/// The byte size of the caller's own pointee at `root`, when it has one.
+fn caller_element_bytes(tcx: TyCtxt<'_>, caller: LocalDefId, root: HirId) -> Option<u64> {
+    let ty = tcx.typeck(caller).node_type_opt(root)?;
+    let (TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)) = ty.kind() else {
+        return None;
+    };
+    super::emitability::type_size(tcx, caller, *pointee)
 }
 
 /// **R485-4(b) — the second pass, as a function.** Re-collects the holds with

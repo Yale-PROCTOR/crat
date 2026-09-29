@@ -364,3 +364,19 @@ fn w6l_seethrough_v1c_an_uncast_void_footprint_of_one_element_is_kept() {
         "{map:#?}"
     );
 }
+
+/// V2c (item 4) — the footprint rides a forwarding chain: an `i32` caller of a
+/// forwarder into the 4-byte `memset` is still one element, kept.
+#[test]
+fn w6l_seethrough_v2c_the_footprint_is_carried_through_a_forwarder() {
+    let input = VOID_FOOTPRINT.replace(
+        "pub struct S {",
+        "unsafe fn relay32(mut p: *mut i32) {\n    clear4(p as *mut core::ffi::c_void);\n}\npub unsafe fn outer(mut w: *mut i32) {\n    relay32(w);\n}\npub struct S {",
+    );
+    let map = access_map(&input);
+    assert!(
+        !map.iter()
+            .any(|(label, _)| label == "outer::w" || label == "relay32::p"),
+        "{map:#?}"
+    );
+}
