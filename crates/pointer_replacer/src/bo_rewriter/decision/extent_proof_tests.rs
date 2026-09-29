@@ -118,6 +118,62 @@ pub unsafe fn c3_wide_cast(mut p: *const u8, mut n: usize) -> u32 {
     }
     0 as u32
 }
+pub unsafe fn c3_wrapping_sub(mut p: *const u8, mut n: usize) -> u8 {
+    let mut i: usize = 0;
+    if i < n.wrapping_sub(1) {
+        return *p.offset(i as isize);
+    }
+    0 as u8
+}
+pub unsafe fn c3_countdown(mut p: *const u8, mut n: usize) -> u8 {
+    let mut i: usize = n;
+    loop {
+        let fresh = i;
+        i = i.wrapping_sub(1);
+        if !(fresh > 0 as usize) {
+            break;
+        }
+    }
+    *p.offset(n as isize)
+}
+unsafe fn parse(mut s: *mut *const u8) -> u8 {
+    *(*s).offset(500 as isize)
+}
+pub unsafe fn c3_address_of_copy(mut p: *const u8, mut n: usize) -> u8 {
+    let mut s = p;
+    parse(&mut s)
+}
+pub unsafe fn c3_reborrowed_copy(mut p: *const u8, mut n: usize) -> u8 {
+    let mut q = p.offset(100 as isize);
+    let mut r = &mut q;
+    **r
+}
+unsafe fn add(mut q: *const u8, mut k: usize) -> *const u8 {
+    let mut first = *q.offset(500 as isize);
+    q
+}
+pub unsafe fn c3_named_add(mut p: *const u8, mut n: usize) -> u8 {
+    if n > 0 as usize {
+        let mut q = add(p, 0 as usize);
+        return *q;
+    }
+    0 as u8
+}
+pub unsafe fn c3_tainted_compare(mut p: *const u8, mut n: usize, mut q: *const u8) -> u8 {
+    let mut w = (p as *const u32).add(1 as usize) as *const u8;
+    let mut r = p;
+    if n >= 1 as usize && r < w {
+        return *r.offset(3 as isize);
+    }
+    0 as u8
+}
+pub unsafe fn c3_same_width_sign(mut p: *const u8, mut n: i32, mut u: u32) -> u8 {
+    let mut k = u as i32;
+    if k < n {
+        return *p.offset(k as isize);
+    }
+    0 as u8
+}
 pub unsafe fn c3_off_by_one(mut p: *const u8, mut n: usize) -> u32 {
     let mut s: u32 = 0;
     let mut i: usize = 0;
@@ -151,10 +207,14 @@ fn w6l_extent_c3_dominated_index() {
 /// - `i <= n` reads `p[n]`;
 /// - `p[-1]`, and a signed index that starts at `-1`, read before `p`;
 /// - `p` handed to a callee (step 3's summaries);
-/// - `p` read as a `u32` with only `n >= 1` byte (step 2's C7).
+/// - `p` read as a `u32` with only `n >= 1` byte (step 2's C7);
+/// - (relay 066 review) an unsigned `n - 1` that wraps at `n = 0`; a
+///   countdown loop whose exit edge must not vanish; a derived copy whose
+///   address is taken; a local helper named `add`; a comparison against a
+///   pointer cast to another width; a same-width `u32 as i32`.
 #[test]
 fn w6l_extent_c3_controls_are_refused() {
-    for (function, reason) in [
+    let wrong = [
         ("c3_short_circuit", "access-unproven:upper"),
         ("c3_truncating", "access-unproven:upper"),
         ("c3_address_taken", "companion-written"),
@@ -163,11 +223,20 @@ fn w6l_extent_c3_controls_are_refused() {
         ("c3_signed_negative", "access-unproven:lower"),
         ("c3_handed", "handed-to:consume"),
         ("c3_wide_cast", "access-through-a-cast-or-merged-pointer"),
-    ] {
-        assert_eq!(
-            prove(C3, function, 0, 1),
-            Err(reason.to_owned()),
-            "{function}"
-        );
-    }
+        // The relay 066 review (B1-B5):
+        ("c3_wrapping_sub", "access-unproven:upper"),
+        ("c3_countdown", "access-unproven:upper"),
+        ("c3_address_of_copy", "address-of-a-derived-pointer"),
+        ("c3_reborrowed_copy", "address-of-a-derived-pointer"),
+        ("c3_named_add", "handed-to:add"),
+        ("c3_tainted_compare", "access-unproven:upper"),
+        ("c3_same_width_sign", "access-unproven:lower"),
+    ]
+    .into_iter()
+    .filter_map(|(function, reason)| {
+        let got = prove(C3, function, 0, 1);
+        (got != Err(reason.to_owned())).then(|| format!("{function}: {got:?}, want {reason}"))
+    })
+    .collect::<Vec<_>>();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
