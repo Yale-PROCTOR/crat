@@ -308,3 +308,75 @@ fn w6l_mk8_a_constant_past_the_masked_local_is_not_a_proof() {
         "{edits:#?}"
     );
 }
+
+/// MK9 (relay 065 review, finding 3) — the proof is the function's, not one
+/// read's: `data[prev_ix]` beside `data[prev_ix + 3]` reads past `mask`, so
+/// the masked arm does not take it and the refusal stands.
+#[test]
+fn w6l_mk9_one_unproven_read_fails_the_function() {
+    let input = MASK_PROVEN.replace(
+        "    *data.offset(prev_ix as isize) as u32\n",
+        "    (*data.offset(prev_ix as isize) as u32)\n        .wrapping_add(*data.offset((prev_ix + 3) as isize) as u32)\n",
+    );
+    assert_ne!(input, MASK_PROVEN, "the second read is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}
+
+/// MK10 (relay 065 review, finding 6) — the in-place proof is for a MASK: a
+/// companion whose formal is not mask-named (`window`) is a count, and
+/// `v & window` does not make it `window + 1`.
+#[test]
+fn w6l_mk10_a_count_formal_is_not_made_a_mask() {
+    let input = MASK_PROVEN
+        .replace("ring_buffer_mask", "window")
+        .replace("ringbuffer_mask", "ringbuffer_window");
+    let edits = edits(&input);
+    assert!(
+        !edits
+            .iter()
+            .any(|(_, extent)| extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+}
+
+/// MK11 (relay 065 review, finding 5) — the companion re-assigned in the
+/// callee is not the caller's argument: not proven, the refusal stands.
+#[test]
+fn w6l_mk11_a_reassigned_companion_is_not_a_proof() {
+    let input = MASK_PROVEN.replace(
+        "    prev_ix &= ring_buffer_mask;\n",
+        "    ring_buffer_mask = ring_buffer_mask.wrapping_mul(2).wrapping_add(1);\n    prev_ix &= ring_buffer_mask;\n",
+    );
+    assert_ne!(input, MASK_PROVEN, "the re-assignment is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}
+
+/// MK12 (relay 065 review, finding 5) — a closure that captures the index may
+/// write it: not proven, the refusal stands.
+#[test]
+fn w6l_mk12_a_captured_index_is_not_a_proof() {
+    let input = MASK_PROVEN.replace(
+        "    prev_ix &= ring_buffer_mask;\n",
+        "    prev_ix &= ring_buffer_mask;\n    let mut bump = || prev_ix = prev_ix.wrapping_add(4);\n    bump();\n",
+    );
+    assert_ne!(input, MASK_PROVEN, "the closure is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}
