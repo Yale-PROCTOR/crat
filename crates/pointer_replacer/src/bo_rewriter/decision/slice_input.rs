@@ -512,6 +512,22 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             }
         }
     }
+    /// `(v & companion)` exactly, nothing added (relay 065, the third review's
+    /// B-2).
+    fn pure_inline_mask(e: &Expr<'_>, companion: HirId) -> bool {
+        let mut e = e;
+        loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Binary(op, left, right)
+                    if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                {
+                    return is_binding(left, companion) || is_binding(right, companion);
+                }
+                _ => return false,
+            }
+        }
+    }
     fn constant(e: &Expr<'_>) -> bool {
         let mut e = e;
         loop {
@@ -746,7 +762,10 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                     } else if self.mask_formal {
                         if masked_local(self.tcx, self.body, index, self.companion) {
                             self.local_masked = true;
-                        } else {
+                        } else if !pure_inline_mask(index, self.companion) {
+                            // (the third review's B-2) `data[(v & mask)]` is
+                            // proven in place too; it neither makes nor unmakes
+                            // the in-place verdict.
                             self.unproven = true;
                         }
                     }
@@ -761,7 +780,10 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                     } else if self.mask_formal {
                         if masked_local(self.tcx, self.body, index, self.companion) {
                             self.local_masked = true;
-                        } else {
+                        } else if !pure_inline_mask(index, self.companion) {
+                            // (the third review's B-2) `data[(v & mask)]` is
+                            // proven in place too; it neither makes nor unmakes
+                            // the in-place verdict.
                             self.unproven = true;
                         }
                     }
