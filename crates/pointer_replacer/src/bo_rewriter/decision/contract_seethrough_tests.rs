@@ -492,3 +492,35 @@ fn w6l_seethrough_c2_c3_an_arithmetic_copy_and_a_ternary_carry_the_walk() {
         assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
     }
 }
+
+/// G1 (relay 064, R650-5 item 1) — the surviving path: main's R416-5 guard
+/// reads `local_callee_extent::accessed_past_one_element` (guard mode), and a
+/// counted FOREIGN contract position behind a local callee reaches it only
+/// through `AccessReason::ForeignContract` (`fill(dst) { memcpy(dst as *mut
+/// c_void, .., 16) }`). Guard mode follows cast hops into LOCAL callees; no
+/// other arm sees a foreign counted position. The NUL walk (`measure`) is not
+/// this set's (the thin-extent set's, item 2).
+#[test]
+fn w6l_seethrough_g1_the_guard_reaches_the_foreign_contract_arm() {
+    let set = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(FOOTPRINT),
+        |tcx| {
+            let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx)?;
+            let set = super::local_callee_extent::accessed_past_one_element(
+                tcx,
+                &ctx.subjects,
+                &ctx.facts,
+            );
+            let mut names = set
+                .iter()
+                .map(|(function, index)| format!("{}:{index}", tcx.item_name(function.to_def_id())))
+                .collect::<Vec<_>>();
+            names.sort();
+            Ok::<_, String>(names)
+        },
+    )
+    .expect("fixture compiles")
+    .expect("decision table");
+    assert!(set.iter().any(|name| name == "fill:0"), "{set:?}");
+    assert!(!set.iter().any(|name| name == "measure:0"), "{set:?}");
+}
