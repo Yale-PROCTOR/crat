@@ -511,3 +511,21 @@ fn w6l_mk16_mk17_mk18_a_no_op_mask_through_a_formal_an_assignment_or_a_path() {
         );
     }
 }
+
+/// MK19 (relay 066 review, A1's control) — declare-then-assign with a RUNTIME
+/// value is not a constant: the ring mask keeps `mask + 1`.
+#[test]
+fn w6l_mk19_a_runtime_mask_assigned_after_declaration_keeps_mask_plus_one() {
+    let input = MASK_PROVEN.replace(
+        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+        "    let mut mask: usize = 0 as i32 as usize;\n    mask = ringbuffer_mask;\n    FindAllMatchesH10(ringbuffer, mask, n)",
+    );
+    assert_ne!(input, MASK_PROVEN, "the assignment is in");
+    let edits = self::edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+}
