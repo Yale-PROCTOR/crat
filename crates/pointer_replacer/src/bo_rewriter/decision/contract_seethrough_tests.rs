@@ -842,3 +842,33 @@ unsafe fn clearpp(mut pp: *mut *mut core::ffi::c_void) {
     );
     assert!(set.iter().any(|name| name == "clearpp:0"), "{set:?}");
 }
+
+/// K2b (relay 065; the corpus probe on binn) — a copy under a cast to a
+/// NARROWER element is a byte view of the parameter's element, not a step
+/// past it: binn's `copy_be32(pdest: *mut u32, ..) { let dest = pdest as *mut
+/// u8; dest[0..3] = .. }` stays out of the hold and the guard (wave-6b's
+/// delivered byte views, report 008), while a same-type copy that steps is
+/// held (K2).
+#[test]
+fn w6l_seethrough_k2b_a_narrowing_cast_copy_is_a_byte_view() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+unsafe fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    let mut source = psource as *mut u8;
+    let mut dest = pdest as *mut u8;
+    *dest.offset(0 as i32 as isize) = *source.offset(3 as i32 as isize);
+    *dest.offset(1 as i32 as isize) = *source.offset(2 as i32 as isize);
+    *dest.offset(2 as i32 as isize) = *source.offset(1 as i32 as isize);
+    *dest.offset(3 as i32 as isize) = *source.offset(0 as i32 as isize);
+}
+pub unsafe fn save(mut out: *mut u32, mut v: *mut u32) {
+    copy_be32(out, v);
+}
+"#;
+    let map = access_map(input);
+    for label in ["save::out", "save::v"] {
+        assert!(!map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
+    }
+    let set = guard_set(input);
+    assert!(!set.iter().any(|n| n.starts_with("copy_be32:")), "{set:?}");
+}
