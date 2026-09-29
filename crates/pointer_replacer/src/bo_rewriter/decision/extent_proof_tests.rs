@@ -546,3 +546,25 @@ fn w6l_extent_lodepng_the_pixel_index_is_not_the_extent() {
         "{edits:#?}"
     );
 }
+
+/// The relay 068 review's F7: `length_minus_one` survives a self-increment.
+/// `m = capacity - 1; m += 1` makes `m == capacity`, and `key & m` may equal
+/// `capacity`: the mask-of-length premise no longer bounds it.
+const BUMPED: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+pub unsafe fn bumped(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
+    let mut m = capacity.wrapping_sub(1 as i32 as u64);
+    m += 1;
+    *entries.offset((key & m) as isize) = key;
+}
+pub unsafe fn kept(mut entries: *mut u64, mut capacity: u64, mut key: u64) {
+    let mut m = capacity.wrapping_sub(1 as i32 as u64);
+    *entries.offset((key & m) as isize) = key;
+}
+"#;
+
+#[test]
+fn w6l_r068_review_f7_a_bumped_mask_is_not_the_length_minus_one() {
+    assert!(prove(BUMPED, "bumped", 0, 1).is_err(), "bumped");
+    assert_eq!(prove(BUMPED, "kept", 0, 1), Ok(()), "the control");
+}

@@ -704,44 +704,54 @@ pub unsafe fn ht_put(mut n: u64, mut key: u64) {
 }
 "###;
 
-/// Controls: the relay's positive shapes stay the companion's.
-/// - ht as written: a probing LOCAL (`index`) the test already admits;
+/// The relay's shapes, after the review (F3 / F5):
+/// - ht as written: the probing local `index` is defined `hash & (capacity -
+///   1)`, which is below `capacity` only under the mask-of-length premise:
+///   refused here, proven by the extent prover with the premise receipted;
 /// - `entries[capacity - 1]`, the last element, is below it;
-/// - ht inline: `entries[hash & (capacity - 1)]` names the companion masked
-///   below it (`<= capacity - 1`), so the companion is the extent;
+/// - ht inline: `entries[hash & (capacity - 1)]`: the same premise, refused;
 /// - `entries[hash & capacity]` names it masked AT it (`<= capacity`): the
 ///   masked arm's `capacity + 1`.
 #[test]
 fn w6l_r068_the_masked_forms_keep_the_companion() {
     use super::seam::LenEvidence::Following;
-    let with_read = |read: &str| {
-        let input = HT_SET.replace(
+    // The single read alone, without the probing loop.
+    let alone = |read: &str| {
+        let start = HT_SET.find("    let mut index").expect("the probing loop");
+        let end = HT_SET
+            .find("    *entries.offset(index as isize) = key;")
+            .expect("the store");
+        let input = format!("{}{}", &HT_SET[..start], &HT_SET[end..]).replace(
             "    *entries.offset(index as isize) = key;\n",
             &format!("    *entries.offset({read} as isize) = key;\n"),
         );
-        assert_ne!(input, HT_SET, "{read} is in");
+        assert!(!input.contains("let mut index"), "{read}: the loop is out");
         input
     };
     let mut mismatches = Vec::new();
     for (label, input, want) in [
+        // The relay 068 review's F5 / F3: `hash & (capacity - 1)` is below
+        // `capacity` only under the mask-of-length premise (`capacity = 0`
+        // makes it all ones), which the extent prover receipts and this test
+        // cannot: ht leaves the reader chain for the prover (relay 067).
         (
             "probing local",
             HT_SET.to_owned(),
-            Ok(Extent::Companion(Following)),
+            Err(super::slice_input::Hold::CompanionNotIndexBound),
         ),
         (
             "the last element capacity - 1",
-            with_read("capacity.wrapping_sub(1 as i32 as u64)"),
+            alone("capacity.wrapping_sub(1 as i32 as u64)"),
             Ok(Extent::Companion(Following)),
         ),
         (
             "inline hash & (capacity - 1)",
-            with_read("(hash & capacity.wrapping_sub(1 as i32 as u64))"),
-            Ok(Extent::Companion(Following)),
+            alone("(hash & capacity.wrapping_sub(1 as i32 as u64))"),
+            Err(super::slice_input::Hold::CompanionNotIndexBound),
         ),
         (
             "inline hash & capacity",
-            with_read("(hash & capacity)"),
+            alone("(hash & capacity)"),
             Ok(Extent::CompanionMask(Following)),
         ),
     ] {
@@ -801,4 +811,156 @@ fn w6l_r068_the_end_pointer_is_not_a_read() {
         extent_of(&input_extents(&read), "BitsEntropy::population"),
         &Err(Hold::CompanionNotIndexBound)
     );
+}
+
+/// The relay 068 review's witnesses (F1-F4, F6), each over a thin root so the
+/// companion is the only candidate. `sum_bytes(data, n)` is a leaf bounded by
+/// its own loop.
+const REVIEW: &str = r###"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types)]
+unsafe fn sum_bytes(mut data: *const u8, mut n: u64) -> u32 {
+    let mut k: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while k < n {
+        s = s.wrapping_add(*data.offset(k as isize) as u32);
+        k = k.wrapping_add(1);
+    }
+    s
+}
+unsafe fn rows(mut p: *const u8, mut w: u64, mut h: u64) -> u32 {
+    let mut y: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while y < h {
+        s = s.wrapping_add(sum_bytes(p, w));
+        p = p.offset(w as isize);
+        y = y.wrapping_add(1);
+    }
+    s
+}
+unsafe fn doubled(mut p: *const u8, mut n: u64) -> u32 {
+    n = n.wrapping_mul(2 as i32 as u64);
+    sum_bytes(p, n)
+}
+unsafe fn last_after_bump(mut data: *const u8, mut n: u64) -> u32 {
+    n = n.wrapping_add(4 as i32 as u64);
+    *data.offset(n.wrapping_sub(1 as i32 as u64) as isize) as u32
+}
+unsafe fn bumped_leaf(mut p: *const u8, mut n: u64) -> u32 {
+    last_after_bump(p, n)
+}
+unsafe fn advanced(mut p: *const u8, mut n: u64) -> u32 {
+    p = p.offset(8 as i32 as isize);
+    sum_bytes(p, n)
+}
+unsafe fn scaled_leaf(mut data: *const u8, mut n: u64) -> u32 {
+    let mut j = n.wrapping_mul(4 as i32 as u64);
+    *data.offset(j as isize) as u32
+}
+unsafe fn scaled(mut p: *const u8, mut n: u64) -> u32 {
+    scaled_leaf(p, n)
+}
+unsafe fn other_leaf(mut data: *const u8, mut n: u64, mut pos: *const u64) -> u32 {
+    let mut b = *pos >> 3 as i32;
+    *data.offset(b as isize) as u32
+}
+unsafe fn through_other(mut p: *const u8, mut n: u64, mut pos: *const u64) -> u32 {
+    other_leaf(p, n, pos)
+}
+unsafe fn ring_read(mut data: *const u8, mut ring_mask: u64) -> u32 {
+    *data.offset(ring_mask as isize) as u32
+}
+unsafe fn scan(mut p: *const u8, mut len: u64) -> u32 {
+    ring_read(p, len)
+}
+unsafe fn reverse_leaf(mut data: *const u8, mut n: u64) -> u32 {
+    let mut i: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while i < n {
+        s = s.wrapping_add(*data.offset(n.wrapping_sub(1 as i32 as u64).wrapping_sub(i) as isize) as u32);
+        i = i.wrapping_add(1);
+    }
+    s
+}
+unsafe fn reverse(mut p: *const u8, mut n: u64) -> u32 {
+    reverse_leaf(p, n)
+}
+unsafe fn plain(mut p: *const u8, mut n: u64) -> u32 {
+    sum_bytes(p, n)
+}
+pub unsafe fn entry(mut n: u64, mut pos: *const u64) -> u32 {
+    let x: u8 = 0;
+    let p: *const u8 = &x;
+    rows(p, n, n)
+        .wrapping_add(doubled(p, n))
+        .wrapping_add(bumped_leaf(p, n))
+        .wrapping_add(advanced(p, n))
+        .wrapping_add(scaled(p, n))
+        .wrapping_add(through_other(p, n, pos))
+        .wrapping_add(scan(p, n))
+        .wrapping_add(reverse(p, n))
+        .wrapping_add(plain(p, n))
+}
+"###;
+
+#[test]
+fn w6l_r068_review_the_companion_bounds_nothing_it_does_not_reach() {
+    use super::{seam::LenEvidence::Following, slice_input::Hold};
+    let extents = input_extents(REVIEW);
+    let mut mismatches = Vec::new();
+    for (label, want) in [
+        // F1 / F2: the pointer advanced by the companion is not an end pointer
+        ("rows::p", Err(Hold::CompanionNotIndexBound)),
+        // F2: the companion written before it is handed on
+        ("doubled::p", Err(Hold::CompanionNotIndexBound)),
+        // F2: the leaf writes its companion, then reads `n - 1`
+        ("bumped_leaf::p", Err(Hold::CompanionNotIndexBound)),
+        // F2: the pointer advanced before it is handed on
+        ("advanced::p", Err(Hold::CompanionNotIndexBound)),
+        // F3: the companion through a temporary (`let j = n * 4`)
+        ("scaled::p", Err(Hold::CompanionNotIndexBound)),
+        // F3: another parameter through a temporary (`let b = *pos >> 3`)
+        ("through_other::p", Err(Hold::CompanionNotIndexBound)),
+        // F4: a mask-named leaf's unproven read, reached from a `len`
+        ("scan::p", Err(Hold::CompanionNotIndexBound)),
+        // F6 (control): the reverse walk `n - 1 - i`, `i` unsigned
+        ("reverse::p", Ok(Extent::Companion(Following))),
+        // control
+        ("plain::p", Ok(Extent::Companion(Following))),
+    ] {
+        let got = extent_of(&extents, label).clone();
+        if got != want {
+            mismatches.push(format!("{label}: {got:?} (want {want:?})"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// F1: an end pointer read through a cast is a read at the companion.
+#[test]
+fn w6l_r068_review_f1_an_end_pointer_read_through_a_cast_refuses() {
+    use super::slice_input::Hold;
+    let through_let = SHANNON.replace(
+        "    *total = sum;\n",
+        "    *total = sum.wrapping_add(*(population_end as *const u8) as usize);\n",
+    );
+    assert_ne!(
+        through_let, SHANNON,
+        "the read through the end pointer is in"
+    );
+    let in_place = SHANNON.replace(
+        "    *total = sum;\n",
+        "    *total = sum.wrapping_add(*(population.offset(size as isize) as *const u8) as usize);\n",
+    );
+    assert_ne!(in_place, SHANNON, "the cast read is in");
+    let mut mismatches = Vec::new();
+    for (label, input) in [
+        ("through the let", through_let),
+        ("cast in place", in_place),
+    ] {
+        let got = extent_of(&input_extents(&input), "BitsEntropy::population").clone();
+        if got != Err(Hold::CompanionNotIndexBound) {
+            mismatches.push(format!("{label}: {got:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
