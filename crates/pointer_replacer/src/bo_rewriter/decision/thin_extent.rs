@@ -88,17 +88,20 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// fact. A counted footprint behind a local callee is
 /// `local_callee_extent`'s contract arm, not this set's.
 ///
-/// A parameter with pointer arithmetic of its own (`offset`) does not carry
-/// the walk to its callers: its extent is its own, and a thin caller of it is
-/// `local_callee_extent`'s (a raw callee: `pointer-arithmetic`) or main's
+/// A parameter with pointer arithmetic of its own (`offset`, `add`, … but
+/// not C's `p[0]` in place) does not carry the walk to its callers: its extent
+/// is its own, and a thin caller of it is `local_callee_extent`'s (a raw
+/// callee: `pointer-arithmetic`, the same test) or main's
 /// one-element-into-wider guard's (a slice callee, R365-2). **A model-`Raw`
 /// callee does carry it** (Codex 062 finding 1): keeping the callee raw does
 /// not protect a caller that converts, and wave-4's CE-D06 emitted exactly
 /// that, `find(name: &mut i8)` into `find_local`'s `strcmp`.
 pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
     // The arithmetic gate is a PARAMETER's: its thin callers are the local
-    // callee hold's. A LOCAL copy that steps (`q = q.offset(1)`) before the
-    // walk carries it on to its source (the line A review).
+    // callee hold's, so the gate is that hold's own arithmetic test (relay 064
+    // review: C's `p[0]` in place carries the walk, as the hold exempts it). A
+    // LOCAL copy that steps (`q = q.offset(1)`) before the walk carries it on
+    // to its source (the line A review).
     let carries = |(function, binding): (LocalDefId, HirId)| {
         let parameter = tcx.hir_node_by_def_id(function).body_id().is_some_and(|_| {
             tcx.hir_body_owned_by(function)
@@ -107,14 +110,7 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
                 .any(|param| param.pat.hir_id == binding)
         });
         !parameter
-            || !facts
-                .raw_only_uses
-                .get(&(function, binding))
-                .is_some_and(|uses| {
-                    uses.iter().any(|(op, _)| {
-                        super::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
-                    })
-                })
+            || !super::local_callee_extent::leaves_its_extent(tcx, (function, binding), facts)
     };
     let mut out = FxHashSet::default();
     let mut walked = FxHashSet::default();

@@ -260,9 +260,10 @@ fn parameter_access(
     let reason = if has_void_pointee(tcx, ty, VOID_POINTEE_DEPTH) {
         // A `c_void` parameter is held on its own account by R271-1; what puts
         // the CALLER in this class is the cast that follows, which is the
-        // evidence that the opaque address is accessed at some real width. A
-        // `c_void` parameter that is only passed on or compared accesses
-        // nothing and is not in scope.
+        // evidence that the opaque address is accessed at some real width, or
+        // (wave-6l, below) an uncast counted footprint, or a hand-on to a
+        // parameter that is accessed. A `c_void` parameter that is only
+        // compared accesses nothing and is not in scope.
         match facts.address_observations.iter().find(|fact| {
             fact.op == "ptr-cast" && fact.operands.iter().any(|operand| operand.node == key)
         }) {
@@ -313,12 +314,7 @@ fn parameter_access(
                 }
             }
         }
-    } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
-        uses.iter().find(|(op, span)| {
-            EXTENT_LEAVING_OPS.contains(&op.as_str())
-                && !(guard && element_zero_in_place(tcx, param.fn_did, *span))
-        })
-    }) {
+    } else if let Some(op) = extent_leaving_op(tcx, key, facts, guard) {
         AccessReason::PointerArithmetic { op: op.clone() }
     } else if let Some((at, _)) = counted_foreign_footprint(facts, key) {
         AccessReason::ForeignContract { at }
@@ -361,6 +357,37 @@ fn parameter_access(
         reason,
         footprint_bytes,
     })
+}
+
+/// The arithmetic arm's test: a use of the binding at `key` that leaves its
+/// first element (in guard mode, C's `p[0]` in place does not, R641-2).
+fn extent_leaving_op<'a>(
+    tcx: TyCtxt<'_>,
+    key: (LocalDefId, HirId),
+    facts: &'a EmitabilityFacts,
+    guard: bool,
+) -> Option<&'a String> {
+    facts.raw_only_uses.get(&key).and_then(|uses| {
+        uses.iter()
+            .find(|(op, span)| {
+                EXTENT_LEAVING_OPS.contains(&op.as_str())
+                    && !(guard && element_zero_in_place(tcx, key.0, *span))
+            })
+            .map(|(op, _)| op)
+    })
+}
+
+/// **wave-6l (relay 064 review, finding 2) — the NUL walk's arithmetic gate
+/// is this arm's test, in guard mode:** a parameter that leaves its first
+/// element has its thin callers held here as `pointer-arithmetic`, and one
+/// that does not (C's `if (!s[0])` preamble) carries the walk on, so no
+/// caller falls between the two sets.
+pub(super) fn leaves_its_extent(
+    tcx: TyCtxt<'_>,
+    key: (LocalDefId, HirId),
+    facts: &EmitabilityFacts,
+) -> bool {
+    extent_leaving_op(tcx, key, facts, true).is_some()
 }
 
 /// **R641-2 — C's `p[0]` stays within the first element.** The arithmetic use
@@ -1048,7 +1075,31 @@ pub(crate) fn accessed_past_one_element(
                 &mut vec![],
                 true,
             )
-            .is_some()
+            .is_some_and(|access| {
+                // wave-6l (relay 064 review, finding 1): a LITERAL byte
+                // footprint is past one element only against an element. A
+                // sized formal's own pointee stands in for it; a `c_void`
+                // formal's is each caller's, which this set does not carry, so
+                // it is left out, as main's guard left every uncast `c_void`
+                // formal out (the per-caller comparison is
+                // `LocalCalleeAccess::past_one_element_of`, report 063 STOP 2).
+                let Node::Pat(pattern) = tcx.hir_node(parameter.hir_id) else {
+                    return true;
+                };
+                let ty = tcx.typeck(parameter.fn_did).pat_ty(pattern);
+                match access.footprint_bytes {
+                    Some(FootprintBytes::Literal(_))
+                        if has_void_pointee(tcx, ty, VOID_POINTEE_DEPTH) =>
+                    {
+                        false
+                    }
+                    _ => access.past_one_element_of(caller_element_bytes(
+                        tcx,
+                        parameter.fn_did,
+                        parameter.hir_id,
+                    )),
+                }
+            })
         })
         .map(|(key, _)| *key)
         .collect()
