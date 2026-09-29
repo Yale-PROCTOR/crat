@@ -1582,12 +1582,23 @@ struct ConstructionBracketVisitor<'a> {
 }
 
 /// The first fresh `NodeId` for the bracket's wrappers.
+/// Above every id still referenced: the tree's, those the guard holds claims
+/// on, and the capture maps' (relay 066 review, A4: a use graft replaces
+/// `e.kind`, and the dropped children's ids stay in both).
 fn first_fresh_node_id(
     tree_max: u32,
-    _guard: &Composition,
-    _others: impl Iterator<Item = NodeId>,
+    guard: &Composition,
+    others: impl Iterator<Item = NodeId>,
 ) -> u32 {
-    tree_max + 1
+    guard
+        .claimed
+        .keys()
+        .copied()
+        .chain(others)
+        .filter(|id| *id != rustc_ast::DUMMY_NODE_ID)
+        .map(|id| id.as_u32())
+        .fold(tree_max, u32::max)
+        + 1
 }
 
 /// The largest assigned `NodeId` in a crate (`DUMMY_NODE_ID` aside).
@@ -5261,7 +5272,26 @@ fn transform_with<'tcx>(
     let mut brackets = ConstructionBracketVisitor {
         brackets: &construction_brackets,
         applied: FxHashSet::default(),
-        next_id: max_id.0 + 1,
+        next_id: first_fresh_node_id(
+            max_id.0,
+            &guard,
+            capture
+                .map
+                .local_map
+                .items()
+                .map(|(id, _)| id.as_u32())
+                .into_sorted_stable_ord()
+                .into_iter()
+                .chain(
+                    capture
+                        .map
+                        .global_map
+                        .items()
+                        .map(|(id, _)| id.as_u32())
+                        .into_sorted_stable_ord(),
+                )
+                .map(NodeId::from_u32),
+        ),
     };
     brackets.visit_crate(&mut krate);
     // R631-12: every argument-level edit is in place; the arm-(a) reads are

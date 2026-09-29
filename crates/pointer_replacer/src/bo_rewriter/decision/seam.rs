@@ -5675,6 +5675,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             } else if masked
                                 && super::masked_runtime::constant_mask(
                                     tcx,
+                                    facts,
                                     site.caller,
                                     argument.span,
                                 )

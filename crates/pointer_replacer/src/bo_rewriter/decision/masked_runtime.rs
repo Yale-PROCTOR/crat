@@ -354,39 +354,123 @@ pub(crate) fn mask_operand(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span
 }
 
 /// **Relay 066 (R666-2, STOP 1) — a NO-OP mask.** The argument at `span` is a
-/// constant expression, directly or through never-reassigned, never-borrowed
-/// locals: literals under casts, `!` / `-`, and binary operations of
-/// constants. brotli's `BrotliCompressBufferQuality10` passes `let mask = !0
-/// >> 1` over a flat input. R477-6's `mask + 1` is a §77 claim founded on the
-/// masking proof, and it holds for a ring buffer of `mask + 1` elements. A
-/// constant mask names no buffer, and `!0 >> 1` renders 2^63, past
-/// `from_raw_parts`' `isize::MAX`. The seam refuses it.
-pub(crate) fn constant_mask(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span::Span) -> bool {
-    fn constant_expression<'tcx>(
-        definitions: &Definitions<'tcx>,
-        e: &Expr<'tcx>,
-        depth: u32,
-    ) -> bool {
-        if depth > 16 {
-            return false;
-        }
-        let e = definitions.resolve(e);
-        match e.kind {
-            ExprKind::Lit(_) => true,
-            ExprKind::Unary(rustc_hir::UnOp::Not | rustc_hir::UnOp::Neg, inner)
-            | ExprKind::Cast(inner, _)
-            | ExprKind::DropTemps(inner) => constant_expression(definitions, inner, depth + 1),
-            ExprKind::Binary(_, left, right) => {
-                constant_expression(definitions, left, depth + 1)
-                    && constant_expression(definitions, right, depth + 1)
-            }
-            _ => false,
-        }
+/// constant expression: literals under casts, `!` / `-`, binary operations of
+/// constants, constant items and associated constants (`usize::MAX`). It may
+/// be reached through a local every definition of which is constant (its `let`
+/// and every plain assignment, C89's declare-then-assign; a compound
+/// assignment or a borrow is an unknown write), or through the caller's
+/// never-written FORMAL, when any call site passes a constant there (the
+/// relay 066 review's A1: brotli Quality10's `mask` reaches inner seams as
+/// `ringbuffer_mask`). brotli's `BrotliCompressBufferQuality10` passes `let
+/// mask = !0 >> 1` over a flat input. R477-6's `mask + 1` is a §77 claim
+/// founded on the masking proof, and it holds for a ring buffer of
+/// `mask + 1` elements. A constant mask names no buffer, and `!0 >> 1`
+/// renders 2^63, past `from_raw_parts`' `isize::MAX`. The seam refuses it.
+pub(crate) fn constant_mask(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    caller: LocalDefId,
+    span: rustc_span::Span,
+) -> bool {
+    constant_mask_at(tcx, facts, caller, span, 0)
+}
+
+fn constant_mask_at(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    caller: LocalDefId,
+    span: rustc_span::Span,
+    depth: u32,
+) -> bool {
+    if depth > 6 {
+        return false;
     }
     let Some((body, argument)) = argument_at(tcx, caller, span) else {
         return false;
     };
-    constant_expression(&Definitions::of(tcx, body), argument, 0)
+    let definitions = Definitions::of(tcx, body);
+    if constant_expression(tcx, caller, &definitions, argument, 0) {
+        return true;
+    }
+    // Through the caller's never-written formal: any call site that passes a
+    // constant there.
+    let Some(id) = local_of(argument) else {
+        return false;
+    };
+    let Some(index) = body.params.iter().position(|param| param.pat.hir_id == id) else {
+        return false;
+    };
+    if definitions.assigned.contains(&id) {
+        return false;
+    }
+    facts.call_args.get(&caller).is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site.args
+                .iter()
+                .find(|arg| arg.index == index)
+                .is_some_and(|arg| constant_mask_at(tcx, facts, site.caller, arg.span, depth + 1))
+        })
+    })
+}
+
+/// A constant expression in `owner`'s body (see [`constant_mask`]).
+fn constant_expression<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    definitions: &Definitions<'tcx>,
+    e: &Expr<'tcx>,
+    depth: u32,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    match e.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Unary(rustc_hir::UnOp::Not | rustc_hir::UnOp::Neg, inner)
+        | ExprKind::Cast(inner, _)
+        | ExprKind::DropTemps(inner) => {
+            constant_expression(tcx, owner, definitions, inner, depth + 1)
+        }
+        ExprKind::Binary(_, left, right) => {
+            constant_expression(tcx, owner, definitions, left, depth + 1)
+                && constant_expression(tcx, owner, definitions, right, depth + 1)
+        }
+        ExprKind::Path(ref qpath) => {
+            let res = tcx.typeck(owner).qpath_res(qpath, e.hir_id);
+            match res {
+                Res::Def(
+                    rustc_hir::def::DefKind::Const | rustc_hir::def::DefKind::AssocConst,
+                    _,
+                ) => true,
+                Res::Local(id) => {
+                    // Every definition constant: the `let` and each plain
+                    // assignment; a compound assignment or a borrow is not.
+                    if definitions.unknown_writes.contains(&id) {
+                        return false;
+                    }
+                    let mut defs = definitions
+                        .initializer
+                        .get(&id)
+                        .into_iter()
+                        .copied()
+                        .chain(
+                            definitions
+                                .assignments
+                                .get(&id)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        )
+                        .peekable();
+                    defs.peek().is_some()
+                        && defs
+                            .all(|def| constant_expression(tcx, owner, definitions, def, depth + 1))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn local_callee(tcx: TyCtxt<'_>, owner: LocalDefId, callee: &Expr<'_>) -> Option<LocalDefId> {
@@ -404,6 +488,11 @@ struct Definitions<'tcx> {
     initializer: rustc_hash::FxHashMap<HirId, &'tcx Expr<'tcx>>,
     assigned: rustc_hash::FxHashSet<HirId>,
     nonzero: rustc_hash::FxHashSet<HirId>,
+    /// Every plain assignment's value, per local (relay 066: C89's
+    /// declare-then-assign).
+    assignments: rustc_hash::FxHashMap<HirId, Vec<&'tcx Expr<'tcx>>>,
+    /// Locals written by a compound assignment or through a borrow.
+    unknown_writes: rustc_hash::FxHashSet<HirId>,
 }
 
 impl<'tcx> Definitions<'tcx> {
@@ -430,6 +519,7 @@ impl<'tcx> Definitions<'tcx> {
                     && let Some(id) = local_of(lhs)
                 {
                     self.1.assigned.insert(id);
+                    self.1.assignments.entry(id).or_default().push(rhs);
                     if !zero_literal(rhs) && !preserves_zero(id, rhs) {
                         self.1.nonzero.insert(id);
                     }
@@ -439,6 +529,7 @@ impl<'tcx> Definitions<'tcx> {
                     && let Some(id) = local_of(lhs)
                 {
                     self.1.assigned.insert(id);
+                    self.1.unknown_writes.insert(id);
                     if !zero_preserving_op(op.node, rhs) {
                         self.1.nonzero.insert(id);
                     }
@@ -448,6 +539,7 @@ impl<'tcx> Definitions<'tcx> {
                     && let Some(id) = local_of(place)
                 {
                     self.1.assigned.insert(id);
+                    self.1.unknown_writes.insert(id);
                     self.1.nonzero.insert(id);
                 }
                 intravisit::walk_expr(self, e);
@@ -459,6 +551,8 @@ impl<'tcx> Definitions<'tcx> {
                 initializer: Default::default(),
                 assigned: Default::default(),
                 nonzero: Default::default(),
+                assignments: Default::default(),
+                unknown_writes: Default::default(),
             },
         );
         collect.visit_body(body);
