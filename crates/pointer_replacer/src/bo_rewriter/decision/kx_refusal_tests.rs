@@ -399,3 +399,29 @@ fn w6l_mk13_an_inline_local_mask_beside_the_in_place_one_keeps_mask_plus_one() {
         "{edits:#?}"
     );
 }
+
+/// MK14 (relay 065; the final probe on brotli's `FindLongestMatchHROLLING_FAST`)
+/// — a masked read proves one element only IN PLACE: `&*data.offset(prev_ix)`
+/// handed to a callee that reads on (`FindMatchLengthWithLimit`), or a wide
+/// read through a cast, reads past `mask`, so the in-place proof fails and
+/// the refusal stands.
+#[test]
+fn w6l_mk14_a_masked_address_handed_on_is_not_a_proof() {
+    let input = MASK_PROVEN
+        .replace(
+            "    *data.offset(prev_ix as isize) as u32\n",
+            "    peek4(&*data.offset(prev_ix as isize))\n",
+        )
+        .replace(
+            "unsafe extern \"C\" fn FindAllMatchesH10",
+            "unsafe fn peek4(mut p: *const u8) -> u32 {\n    *(p as *const u32)\n}\nunsafe extern \"C\" fn FindAllMatchesH10",
+        );
+    assert!(input.contains("peek4(&*data"), "the hand-on is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}
