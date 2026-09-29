@@ -380,3 +380,22 @@ fn w6l_mk12_a_captured_index_is_not_a_proof() {
         "{edits:#?}"
     );
 }
+
+/// MK13 (relay 065, the third review's B-2) — an inline pure mask of a local
+/// (`data[(v & mask)]`) beside the in-place one is a proven read, not an
+/// unproven one: the function keeps `mask + 1`.
+#[test]
+fn w6l_mk13_an_inline_local_mask_beside_the_in_place_one_keeps_mask_plus_one() {
+    let input = MASK_PROVEN.replace(
+        "    *data.offset(prev_ix as isize) as u32\n",
+        "    let mut next_ix = cur_ix.wrapping_add(2);\n    (*data.offset(prev_ix as isize) as u32)\n        .wrapping_add(*data.offset((next_ix & ring_buffer_mask) as isize) as u32)\n",
+    );
+    assert_ne!(input, MASK_PROVEN, "the inline read is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+}
