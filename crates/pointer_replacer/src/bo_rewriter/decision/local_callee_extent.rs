@@ -316,7 +316,7 @@ fn parameter_access(
         }
     } else if let Some(op) = copies_of(tcx, key)
         .into_iter()
-        .filter(|copy| same_pointee(tcx, key.0, key.1, *copy))
+        .filter(|copy| steps_in_parameter_elements(tcx, facts, key.0, key.1, *copy))
         .find_map(|copy| extent_leaving_op(tcx, (key.0, copy), facts, guard))
     {
         AccessReason::PointerArithmetic { op: op.clone() }
@@ -568,13 +568,23 @@ fn copies_of(tcx: TyCtxt<'_>, (function, binding): (LocalDefId, HirId)) -> Vec<H
     members
 }
 
-/// **Relay 065 (the corpus probe on binn) — a step counts in the parameter's
-/// own elements.** A copy under a cast to another pointee (`let dest = pdest
-/// as *mut u8`) steps in ITS elements, bytes of the parameter's one element
-/// in binn's `copy_be32` (wave-6b's byte views), so the arithmetic arm reads
-/// only copies with the parameter's own pointee type. The counted arm is in
-/// bytes and reads them all.
-fn same_pointee(tcx: TyCtxt<'_>, function: LocalDefId, parameter: HirId, copy: HirId) -> bool {
+/// **Relay 065 (the corpus probe on binn; the third review's A-1) — does a
+/// copy's step leave the PARAMETER's element?** A copy of the parameter's own
+/// pointee size or wider steps past it with any extent-leaving op (`c_char` →
+/// `u8`, `u8` → `u32`). A NARROWER copy (`let dest = pdest as *mut u8` of a
+/// `*mut u32`: binn's `copy_be32`, wave-6b's byte views) stays inside it while
+/// every step is a non-negative literal `k` with `(k + 1) · size(copy) <=
+/// size(param)`. A literal past that, a negative one, or a `sub` counts. A
+/// narrower copy stepped by a non-literal (`d[i]`) does not: bounding `i` is
+/// the loop's, which is the extent analysis's (report 063, residual). The
+/// counted arm is in bytes and reads every copy.
+fn steps_in_parameter_elements(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    function: LocalDefId,
+    parameter: HirId,
+    copy: HirId,
+) -> bool {
     if copy == parameter {
         return true;
     }
@@ -583,7 +593,85 @@ fn same_pointee(tcx: TyCtxt<'_>, function: LocalDefId, parameter: HirId, copy: H
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
         _ => None,
     };
-    pointee(parameter).is_some_and(|p| pointee(copy) == Some(p))
+    let (Some(of_parameter), Some(of_copy)) = (pointee(parameter), pointee(copy)) else {
+        return true;
+    };
+    if of_parameter == of_copy {
+        return true;
+    }
+    let size = |ty| super::emitability::type_size(tcx, function, ty);
+    let (Some(element), Some(step)) = (size(of_parameter), size(of_copy)) else {
+        return true;
+    };
+    if step >= element {
+        return true;
+    }
+    facts
+        .raw_only_uses
+        .get(&(function, copy))
+        .is_some_and(|uses| {
+            uses.iter().any(|(op, span)| {
+                EXTENT_LEAVING_OPS.contains(&op.as_str())
+                    && match (op.as_str(), literal_step(tcx, function, *span)) {
+                        ("sub" | "wrapping_sub", Some(k)) => k != 0,
+                        (_, Some(k)) => {
+                            k < 0 || (k as u128 + 1).saturating_mul(step as u128) > element as u128
+                        }
+                        (_, None) => false,
+                    }
+            })
+        })
+}
+
+/// The literal step of the extent-leaving method call at `span` (`offset(7 as
+/// i32 as isize)` → 7, `offset(-(1 as isize))` → -1), if it is one.
+fn literal_step(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::Span) -> Option<i128> {
+    use rustc_hir::intravisit::Visitor;
+
+    struct At<'tcx> {
+        span: rustc_span::Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for At<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none()
+                && expr.span == self.span
+                && matches!(expr.kind, rustc_hir::ExprKind::MethodCall(..))
+            {
+                self.found = Some(expr);
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    fn literal(mut e: &rustc_hir::Expr<'_>) -> Option<i128> {
+        loop {
+            match e.kind {
+                rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) => {
+                    e = inner
+                }
+                rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Neg, inner) => {
+                    return literal(inner).map(|k| -k);
+                }
+                rustc_hir::ExprKind::Lit(lit) => {
+                    return match lit.node {
+                        rustc_ast::LitKind::Int(v, _) => i128::try_from(v.get()).ok(),
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+    }
+    if !tcx.hir_body_owners().any(|did| did == owner) {
+        return None;
+    }
+    let body = tcx.hir_body_owned_by(owner);
+    let mut at = At { span, found: None };
+    at.visit_body(&body);
+    let rustc_hir::ExprKind::MethodCall(_, _, [step], _) = at.found?.kind else {
+        return None;
+    };
+    literal(step)
 }
 
 /// [`counted_foreign_footprint`] over the parameter and its copies, joined.
