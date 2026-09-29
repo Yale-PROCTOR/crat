@@ -188,18 +188,22 @@ fn w5c_slice_input_unsupplied_caller_adapts_with_the_companion() {
         "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
         "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
     );
+    // wave-6l relay 065 (R653-1, STOP 1): `StoreH2` reads `data` at `at`,
+    // a local masked by `mask` and read unchanged, so R477-6's masked arm
+    // proves `mask + 1` (`CompanionMask`); before, only an inline `ix & mask`
+    // was read as masked.
     assert_eq!(
         extent_of(
             &input_extents(&input),
             "StitchToPreviousBlockH2::ringbuffer"
         ),
-        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+        &Ok(Extent::CompanionMask(super::seam::LenEvidence::Following))
     );
     // …and `StoreRangeH2::data`, no longer supplied through `ringbuffer`,
     // stands on its own companion `mask`.
     assert_eq!(
         extent_of(&input_extents(&input), "StoreRangeH2::data"),
-        &Ok(Extent::Companion(super::seam::LenEvidence::Following))
+        &Ok(Extent::CompanionMask(super::seam::LenEvidence::Following))
     );
     let no_companion = input
         .replace(
@@ -405,15 +409,26 @@ fn w5c_slice_input_a_masked_index_is_bounded_by_its_mask() {
     );
 }
 
-/// **Control (i)** — the same chain with the index bound the ordinary way (the
-/// lane's own `CHAIN`, whose masked index is bound to a local): the extent is
-/// the companion itself, with no `+ 1`. One rule, two arms, and the arms are
-/// told apart by the spelling that decides them.
+/// **Control (i)** — the same chain with the index NOT masked by the
+/// companion: the extent is the companion itself, with no `+ 1`. One rule,
+/// two arms, and the arms are told apart by the masking. (wave-6l relay 065:
+/// this control read `CHAIN`'s `let at = (ix & mask) as isize` as unmasked;
+/// a local masked by the companion and read unchanged is now the masked arm's,
+/// so the control drops the mask.)
 #[test]
 fn w5c_slice_input_an_unmasked_companion_keeps_its_own_length() {
-    let unsupplied = fixture().replace(
-        "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
-        "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
+    let unsupplied = fixture()
+        .replace(
+            "    StitchToPreviousBlockH2(self_0, n, n, buf, 4095);",
+            "    let x: u8 = acc as u8;\n    let p: *const u8 = &x;\n    StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
+        )
+        .replace(
+            "    let at = (ix & mask) as isize;",
+            "    let at = ix as isize;",
+        );
+    assert!(
+        unsupplied.contains("let at = ix as isize;"),
+        "the control drops the mask"
     );
     assert_eq!(
         extent_of(&input_extents(&unsupplied), "StoreRangeH2::data"),

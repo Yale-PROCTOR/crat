@@ -267,3 +267,26 @@ fn w6l_mk6_a_loop_write_after_the_read_is_not_a_proof() {
         "{edits:#?}"
     );
 }
+
+/// MK7 (relay 065, STOP 1) — a mask whose index is borrowed mutably between the
+/// `&=` and the read is not proven: the borrow may write it.
+#[test]
+fn w6l_mk7_a_mutably_borrowed_index_is_not_a_proof() {
+    let input = MASK_PROVEN
+        .replace(
+            "    prev_ix &= ring_buffer_mask;\n    *data",
+            "    prev_ix &= ring_buffer_mask;\n    bump(&mut prev_ix);\n    *data",
+        )
+        .replace(
+            "unsafe extern \"C\" fn FindAllMatchesH10",
+            "unsafe fn bump(mut p: *mut usize) {\n    *p = (*p).wrapping_add(4);\n}\nunsafe extern \"C\" fn FindAllMatchesH10",
+        );
+    assert!(input.contains("bump(&mut prev_ix)"), "the borrow is in");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:ringbuffer_mask")),
+        "{edits:#?}"
+    );
+}

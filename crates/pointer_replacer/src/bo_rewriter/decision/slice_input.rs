@@ -442,12 +442,13 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         .collect();
 
     struct Indexes<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        body: &'tcx rustc_hir::Body<'tcx>,
         binding: HirId,
         others: &'a [HirId],
         companion: HirId,
         bound: bool,
         masked: bool,
-        _marker: std::marker::PhantomData<&'tcx ()>,
     }
     fn names(e: &Expr<'_>, others: &[HirId]) -> bool {
         struct Names<'a> {
@@ -521,6 +522,143 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
             }
         }
     }
+    /// **Relay 065 (R653-1, STOP 1) — a local index masked in place.**
+    /// `prev_ix &= ring_buffer_mask; data[prev_ix]`: the index is exactly a
+    /// local (no constant added: `mask + 1` covers `<= mask` and nothing
+    /// more) whose LAST write before the read masks it by the companion (`v &= companion`, `v = e &
+    /// companion`, `let v = e & companion`). Nothing writes it between that
+    /// write and the read, nor anywhere in the statement that holds the read,
+    /// since a loop's later write reaches its next read. Its address is never
+    /// taken mutably. Straight-line and syntactic: anything else is not a
+    /// proof, and a mask offered as a count is refused (relay 063 item 6).
+    fn masked_local<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        body: &'tcx rustc_hir::Body<'tcx>,
+        index: &'tcx Expr<'tcx>,
+        companion: HirId,
+    ) -> bool {
+        let mut e = index;
+        let local = loop {
+            match e.kind {
+                ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                    Res::Local(local) if local != companion => break local,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        };
+        /// The writes to `local` in one subtree, and whether one borrows it
+        /// mutably.
+        struct Writes {
+            local: HirId,
+            count: usize,
+            borrowed: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Writes {
+            fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+                match e.kind {
+                    ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _)
+                        if is_binding(lhs, self.local) =>
+                    {
+                        self.count += 1
+                    }
+                    ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, place)
+                        if is_binding(place, self.local) =>
+                    {
+                        self.borrowed = true
+                    }
+                    _ => {}
+                }
+                intravisit::walk_expr(self, e);
+            }
+
+            fn visit_pat(&mut self, p: &'tcx rustc_hir::Pat<'tcx>) {
+                if let rustc_hir::PatKind::Binding(_, id, ..) = p.kind
+                    && id == self.local
+                {
+                    self.count += 1;
+                }
+                intravisit::walk_pat(self, p);
+            }
+        }
+        let writes = |visit: &dyn Fn(&mut Writes)| {
+            let mut writes = Writes {
+                local,
+                count: 0,
+                borrowed: false,
+            };
+            visit(&mut writes);
+            writes
+        };
+        if writes(&|w| w.visit_body(body)).borrowed {
+            return false;
+        }
+        let stmt_writes = |stmt: &'tcx rustc_hir::Stmt<'tcx>| writes(&|w| w.visit_stmt(stmt)).count;
+        // `x & companion`, nothing added.
+        let pure_mask = |e: &Expr<'_>| {
+            let mut e = e;
+            loop {
+                match e.kind {
+                    ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => e = inner,
+                    ExprKind::Binary(op, left, right)
+                        if matches!(op.node, rustc_hir::BinOpKind::BitAnd) =>
+                    {
+                        return is_binding(left, companion) || is_binding(right, companion);
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        let masks = |stmt: &'tcx rustc_hir::Stmt<'tcx>| match stmt.kind {
+            rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => match e.kind {
+                ExprKind::AssignOp(op, lhs, rhs) => {
+                    matches!(op.node, rustc_hir::AssignOpKind::BitAndAssign)
+                        && is_binding(lhs, local)
+                        && is_binding(rhs, companion)
+                }
+                ExprKind::Assign(lhs, rhs, _) => is_binding(lhs, local) && pure_mask(rhs),
+                _ => false,
+            },
+            rustc_hir::StmtKind::Let(let_) => {
+                matches!(let_.pat.kind, rustc_hir::PatKind::Binding(_, id, ..) if id == local)
+                    && let_.init.is_some_and(|init| pure_mask(init))
+            }
+            _ => false,
+        };
+        let mut child = index.hir_id;
+        for (id, node) in tcx.hir_parent_iter(index.hir_id) {
+            match node {
+                rustc_hir::Node::Block(block) => {
+                    let (before, holding) =
+                        if let Some(k) = block.stmts.iter().position(|stmt| stmt.hir_id == child) {
+                            (&block.stmts[..k], stmt_writes(&block.stmts[k]))
+                        } else if block.expr.is_some_and(|tail| tail.hir_id == child) {
+                            let tail = block.expr.expect("the tail");
+                            (block.stmts, writes(&|w| w.visit_expr(tail)).count)
+                        } else {
+                            return false;
+                        };
+                    if holding != 0 {
+                        return false;
+                    }
+                    if let Some(last) = before.iter().rev().find(|stmt| stmt_writes(stmt) != 0) {
+                        return stmt_writes(last) == 1 && masks(last);
+                    }
+                }
+                rustc_hir::Node::Expr(Expr {
+                    kind: ExprKind::Closure(..),
+                    ..
+                })
+                | rustc_hir::Node::Item(_)
+                | rustc_hir::Node::ImplItem(_)
+                | rustc_hir::Node::TraitItem(_) => return false,
+                _ => {}
+            }
+            child = id;
+        }
+        false
+    }
     impl<'tcx> Visitor<'tcx> for Indexes<'_, 'tcx> {
         fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
             match e.kind {
@@ -535,6 +673,8 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         } else {
                             self.bound = false;
                         }
+                    } else if masked_local(self.tcx, self.body, index, self.companion) {
+                        self.masked = true;
                     }
                 }
                 ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
@@ -544,6 +684,8 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         } else {
                             self.bound = false;
                         }
+                    } else if masked_local(self.tcx, self.body, index, self.companion) {
+                        self.masked = true;
                     }
                 }
                 _ => {}
@@ -552,12 +694,13 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
         }
     }
     let mut visitor = Indexes {
+        tcx,
+        body,
         binding,
         others: &others,
         companion,
         bound: true,
         masked: false,
-        _marker: std::marker::PhantomData,
     };
     visitor.visit_body(body);
     match (visitor.bound, visitor.masked) {
