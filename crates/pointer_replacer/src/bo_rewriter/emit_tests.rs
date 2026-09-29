@@ -6056,13 +6056,16 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
 
 /// E-ADAPT-N4 — fallback identity is inseparable from its receipt and name.
 ///
+/// R677-6: `sum` branches, so its accesses prove no extent and the fallback
+/// is still the length this pins.
+///
 /// wave-6s (report 007): the raw expression is kept raw by a signed delta
 /// (R394-2); a forward one would deliver the suffix view with no fallback.
 #[test]
 fn e_adapt_n4_fallback_name_and_receipt_are_one_production_fact() {
     let src = format!(
         "{E_ADAPT_PRE}\
-         pub unsafe fn sum(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
+         pub unsafe fn sum(p: *const i32) -> i32 {{ if *p.offset(0) > 0 {{ *p.offset(1) }} else {{ 0 }} }}\n\
          pub unsafe fn caller(p: *const i32, k: isize) -> i32 {{ sum(p.offset(k)) }}\n"
     );
     let seams = e_adapt_seams(&src);
@@ -6587,6 +6590,17 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
 const E3_CLEAR_RAW: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
     extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
     pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+    pub unsafe fn caller() {\n\
+        let left = malloc(8) as *mut i32;\n\
+        let right = malloc(8) as *mut i32;\n\
+        target(left.offset(0), right.offset(0));\n\
+    }\n";
+
+/// R677-6: [`E3_CLEAR_RAW`] with a `target` that branches, so its accesses
+/// prove no extent: the fallback stays the only length (E-ADAPT-W3-N7).
+const E3_CLEAR_RAW_BRANCHED: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { if *a > 0 { *a += 1; } *b += 1; }\n\
     pub unsafe fn caller() {\n\
         let left = malloc(8) as *mut i32;\n\
         let right = malloc(8) as *mut i32;\n\
@@ -11302,7 +11316,7 @@ fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
 /// and the receipt carries the fabricated arm.
 #[test]
 fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
-    let attempt = e3_attempt(E3_CLEAR_RAW, true, true);
+    let attempt = e3_attempt(E3_CLEAR_RAW_BRANCHED, true, true);
     let len_arm = receipt_column(&attempt.receipt, "len_arm");
     let placed = attempt
         .receipt
@@ -14965,6 +14979,55 @@ fn r674_9_a_parameter_used_otherwise_proves_no_extent() {
     .expect("fixture compiles");
 }
 
+/// **R677-6 (relay 141) — a bare raw argument takes the callee's proven
+/// extent too.** lodepng's `lodepng_read32bitInt(chunk)`: a raw pointer into a
+/// slice formal where no companion, contract, region, C string or array names a
+/// length took `FALLBACK_SLICE_EXTENT` (a §77 row). The callee's straight-line
+/// body reads exactly elements `0..4` on every call, so the raw arm takes `4`,
+/// receipted `len-callee-access`. The control: a callee that loops over its
+/// count proves nothing, and keeps the fallback.
+#[test]
+fn r677_6_a_raw_argument_takes_the_callee_s_straight_line_extent() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn read32(buffer: *const u8) -> u32 {{\n\
+         \x20   return (*buffer.offset(0 as i32 as isize) as u32) << 24\n\
+         \x20       | *buffer.offset(3 as i32 as isize) as u32;\n\
+         }}\n\
+         pub unsafe fn tree(data: *const u32, length: usize) -> u32 {{\n\
+         \x20   let mut i = length;\n\
+         \x20   let mut s = 0u32;\n\
+         \x20   while i != 0 {{ i = i.wrapping_sub(1); s = s.wrapping_add(*data.offset(i as isize)); }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn caller(in_0: *mut u8, histogram: *mut u32) -> u32 {{\n\
+         \x20   let _address = in_0 as usize;\n\
+         \x20   let _histogram = histogram as usize;\n\
+         \x20   read32(in_0) + read32(in_0.offset(4 as i32 as isize)) + tree(histogram, 64)\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert_eq!(
+        r674_placed(&seams, "read32", "caller"),
+        ["len-callee-access", "len-callee-access"],
+        "{seams}"
+    );
+    assert_eq!(
+        r674_placed(&seams, "tree", "caller"),
+        ["len-fabricated"],
+        "a loop proves nothing:\n{seams}"
+    );
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("read32(core::slice::from_raw_parts(in_0, (4) as usize))")
+            && flat.contains(
+                "read32(core::slice::from_raw_parts(in_0.offset(4 as i32 as isize), (4) as usize))"
+            ),
+        "the callee's own extent, not the fallback:\n{emitted}"
+    );
+}
+
 /// **R625 (relay 125) — a pointer into a fixed-size array names its own
 /// extent.** bzip2's `BZ2_hbCreateDecodeTables(&mut (*s).limit[t][0], ...)` and
 /// brotli's `BrotliBuildHuffmanTable(.., (*h).code_length_histo.as_mut_ptr())`
@@ -15021,18 +15084,15 @@ fn r625_an_array_element_zero_argument_takes_the_array_length() {
         ),
         "the length is the array's:\n{emitted}"
     );
-    assert_eq!(
-        flat.matches("FALLBACK_SLICE_EXTENT)").count(),
-        3,
-        "the controls keep the fallback:\n{emitted}"
-    );
-    // Controls: no array behind the pointer, and an element type the cast changed.
+    // Controls: no array behind the pointer, and an element type the cast
+    // changed, do not take an array's length. (R677-6: `tables` and `bytes`
+    // are straight-line, so they take their own accesses' extent instead.)
     assert_eq!(
         placed("tables", "control"),
-        ["len-fabricated", "len-fabricated"],
+        ["len-callee-access", "len-callee-access"],
         "{seams}"
     );
-    assert_eq!(placed("bytes", "control"), ["len-fabricated"], "{seams}");
+    assert_eq!(placed("bytes", "control"), ["len-callee-access"], "{seams}");
     // One element in is not the array's start: it does not take the length.
     assert!(!flat.contains("offset(1), (8) as usize"), "{emitted}");
 }

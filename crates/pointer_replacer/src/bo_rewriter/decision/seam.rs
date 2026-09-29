@@ -227,9 +227,10 @@ pub(crate) enum LenEvidence {
     /// `[T; N]` of its own pointee type: the length is `N`, the array's
     /// (`emitability::array_extent`).
     ArrayType,
-    /// **R674-9** — no companion, but the callee's own straight-line body
-    /// reads or writes exactly elements `0..N` of the parameter on every call
-    /// (`element_extent::constant_access_extent`): the length is `N`.
+    /// **R674-9 / R677-6** — no companion (nor array), but the callee's own
+    /// straight-line body reads or writes exactly elements `0..N` of the
+    /// parameter on every call (`element_extent::constant_access_extent`): the
+    /// length is `N`, for an element address and a raw argument alike.
     CalleeAccess,
 }
 
@@ -5699,7 +5700,17 @@ pub(crate) fn synthesize_with_raw_boundary(
                             Some(elements) => {
                                 (Some(elements.to_string()), Some(LenEvidence::ArrayType))
                             }
-                            None => (None, len_evidence),
+                            // **R677-6** — nor an array: the callee's own
+                            // straight-line accesses, where they prove one
+                            // (`element_extent`), rather than the fabricated extent.
+                            None => match super::element_extent::constant_access_extent(
+                                tcx, *callee, pos.index,
+                            ) {
+                                Some(elements) => {
+                                    (Some(elements.to_string()), Some(LenEvidence::CalleeAccess))
+                                }
+                                None => (None, len_evidence),
+                            },
                         }
                     }
                     text => (text, len_evidence),
