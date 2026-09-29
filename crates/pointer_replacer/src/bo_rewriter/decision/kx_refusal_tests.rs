@@ -178,7 +178,8 @@ pub unsafe fn Top(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> 
 /// (`let m = ringbuffer_mask;`) is still a mask.
 #[test]
 fn w6l_mk2_a_mask_through_an_alias_is_not_a_count() {
-    let input = MASK_AS_COUNT.replace(
+    // The callee's formal is renamed so only the caller's alias names the mask.
+    let input = MASK_AS_COUNT.replace("ring_buffer_mask", "window").replace(
         "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
         "    let mut m = ringbuffer_mask;\n    FindAllMatchesH10(ringbuffer, m, n)",
     );
