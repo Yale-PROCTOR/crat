@@ -93,3 +93,21 @@ fn wave6o_unexported_formal_handed_to_a_null_testing_callee_stays_plain() {
         "an unexported formal's nullability is its callers' evidence: {decision:?} {reason}"
     );
 }
+
+/// The control on the entry's own use (the wave-6k closure fixture's `grand`):
+/// an entry that dereferences the formal itself is not written to receive
+/// NULL — a NULL actual is already the input's UB there (§28) — so the
+/// callee's test one call down is no evidence for it.
+#[test]
+fn wave6o_exported_formal_dereferenced_by_the_entry_stays_plain() {
+    let input = INPUT.replace(
+        "if value < 0 as i32 { return 0 as i32; }",
+        "if value < 0 as i32 { return 0 as i32; }\n    (*list).count = 0 as i32;",
+    );
+    assert!(verify::type_checks_str(&input));
+    let (decision, reason) = decision_and_reason(&input, "binn_list_add", "list");
+    assert!(
+        matches!(decision, Decision::Ref { .. }),
+        "the entry's own dereference rules NULL out: {decision:?} {reason}"
+    );
+}
