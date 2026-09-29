@@ -380,3 +380,115 @@ fn w6l_seethrough_v2c_the_footprint_is_carried_through_a_forwarder() {
         "{map:#?}"
     );
 }
+
+/// The line A review (relay 063): the footprint is JOINED over every counted
+/// site and every forwarding target, never the first one found.
+const FOOTPRINT_JOIN: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn memset(d: *mut core::ffi::c_void, c: i32, n: u64) -> *mut core::ffi::c_void;
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn clear4(mut d: *mut core::ffi::c_void) {
+    memset(d, 0, 4 as u64);
+}
+unsafe fn fill64(mut d: *mut u8) {
+    memset(d as *mut core::ffi::c_void, 0, 64 as u64);
+}
+unsafe fn both(mut d: *mut core::ffi::c_void, mut s: *const core::ffi::c_void) {
+    memset(d, 0, 4 as u64);
+    memcpy(d, s, 64 as u64);
+}
+unsafe fn relay(mut p: *mut i32) {
+    clear4(p as *mut core::ffi::c_void);
+    fill64(p as *mut u8);
+}
+unsafe fn zero(mut q: *mut core::ffi::c_void, mut n: u64) {
+    memset(q, 0, n);
+}
+unsafe fn wipe(mut p: *mut core::ffi::c_void) {
+    zero(p, 64 as u64);
+}
+unsafe fn clear_n(mut d: *mut core::ffi::c_void, mut n: u64) {
+    memset(d, 0, n);
+}
+unsafe fn clear_at(mut d: *mut core::ffi::c_void) {
+    memset(d.offset(4), 0, 4 as u64);
+}
+pub struct S {
+    pub a: *mut i32,
+    pub b: *mut i32,
+    pub c: *mut i32,
+    pub d: *mut i32,
+    pub e: *mut i32,
+    pub s: *const u8,
+}
+pub unsafe fn caller(mut s: *mut S, mut n: u64) {
+    let mut two = (*s).a;
+    both(two as *mut core::ffi::c_void, (*s).s as *const core::ffi::c_void);
+    let mut fwd = (*s).b;
+    relay(fwd);
+    let mut vv = (*s).c;
+    wipe(vv as *mut core::ffi::c_void);
+    let mut rt = (*s).d;
+    clear_n(rt as *mut core::ffi::c_void, n);
+    let mut off = (*s).e;
+    clear_at(off as *mut core::ffi::c_void);
+}
+"#;
+
+/// V3 — two counted sites at one `c_void` parameter (4 and 64 bytes): the
+/// footprint is 64, and an `i32` caller is held. V4 — a forwarder into a
+/// 4-byte and a 64-byte writer holds its `i32` caller. V5 — a `c_void`
+/// forwarder into a `c_void` writer with a runtime count holds. V6 — a
+/// runtime count holds an `i32` caller. V7 — a count at `d.offset(4)` is not
+/// measured from the base: held.
+#[test]
+fn w6l_seethrough_v3_v7_the_footprint_is_joined_and_holds_where_it_passes() {
+    let map = access_map(FOOTPRINT_JOIN);
+    for label in [
+        "caller::two",
+        "caller::fwd",
+        "caller::vv",
+        "caller::rt",
+        "caller::off",
+    ] {
+        assert!(
+            map.iter().any(|(l, _)| l == label),
+            "{label} is not held: {map:#?}"
+        );
+    }
+}
+
+/// Relay 063 review (line A): the copy walk through a copy that does its own
+/// arithmetic, and through C2Rust's ternary.
+const COPIES_MORE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn walk(mut p: *const i8) -> u64 {
+    let mut q = p;
+    q = q.offset(1);
+    strlen(q)
+}
+unsafe fn pick(mut p: *const i8, mut r: *const i8, mut c: bool) -> u64 {
+    let mut q = if c { p } else { r };
+    strlen(q)
+}
+pub unsafe fn top(mut s: *const i8, mut t: *const i8) -> u64 {
+    walk(s).wrapping_add(pick(s, t, true))
+}
+"#;
+
+/// C2 — a copy that steps (`q = q.offset(1)`) before the NUL walk: the
+/// arithmetic gate is a PARAMETER's (its callers are the local callee's
+/// hold's), not a local copy's, so `walk::p` and its caller are held. C3 — a
+/// ternary copy holds both sources.
+#[test]
+fn w6l_seethrough_c2_c3_an_arithmetic_copy_and_a_ternary_carry_the_walk() {
+    let held = held(COPIES_MORE);
+    for label in ["walk::p", "pick::p", "pick::r", "top::s", "top::t"] {
+        assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
+}
