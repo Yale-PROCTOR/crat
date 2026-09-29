@@ -70,6 +70,8 @@ pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
+#[cfg(test)]
+mod kx_refusal_tests;
 pub(crate) mod licensed_lift;
 pub(crate) mod lifetime;
 #[cfg(test)]
