@@ -697,3 +697,76 @@ unsafe fn put64(mut p: *mut i32) {
         assert!(!set.iter().any(|n| n == name), "{name}: {set:?}");
     }
 }
+
+/// Relay 065 (R653-1, STOP 2): the copy edges extend `local_callee_extent`'s
+/// two arms, the counted footprint and the pointer arithmetic.
+const HOLD_COPIES: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn pick(mut d: *mut u8, mut p: *const u8, mut r: *const u8, mut c: bool) {
+    let mut q = if c { p } else { r };
+    memcpy(d as *mut core::ffi::c_void, q as *const core::ffi::c_void, 16 as u64);
+}
+unsafe fn pick_one(mut d: *mut u8, mut p: *const u8, mut r: *const u8, mut c: bool) {
+    let mut q = if c { p } else { r };
+    memcpy(
+        d as *mut core::ffi::c_void,
+        q as *const core::ffi::c_void,
+        ::core::mem::size_of::<u8>() as u64,
+    );
+}
+unsafe fn load(mut buffer: *const u8, mut dst: *mut u8) {
+    let mut buf: *const u8 = 0 as *const u8;
+    buf = buffer;
+    memcpy(dst as *mut core::ffi::c_void, buf as *const core::ffi::c_void, 16 as u64);
+}
+unsafe fn step(mut p: *const u8) -> u8 {
+    let mut q = p;
+    *q.offset(5 as i32 as isize)
+}
+unsafe fn first(mut p: *const u8) -> u8 {
+    let mut q = p;
+    *q.offset(0 as i32 as isize)
+}
+pub unsafe fn top2(mut d: *mut u8, mut s: *const u8, mut t: *const u8) {
+    pick(d, s, t, true);
+}
+pub unsafe fn top2_one(mut d: *mut u8, mut s: *const u8, mut t: *const u8) {
+    pick_one(d, s, t, true);
+}
+pub unsafe fn loader(mut src: *const u8, mut out: *mut u8) {
+    load(src, out);
+}
+pub unsafe fn stepper(mut a: *const u8) -> u8 {
+    step(a)
+}
+pub unsafe fn firster(mut b: *const u8) -> u8 {
+    first(b)
+}
+"#;
+
+/// K1 (relay 065, STOP 2) — the counted arm through a copy: `top2`'s `s` and
+/// `t` reach `memcpy`'s 16 bytes through `pick`'s ternary `q`, and `loader`'s
+/// `src` through `load`'s `buf = buffer`. K1c — the same through a
+/// one-element count (`size_of::<u8>()`) holds neither.
+#[test]
+fn w6l_seethrough_k1_k1c_the_counted_arm_through_a_copy() {
+    let map = access_map(HOLD_COPIES);
+    for label in ["top2::s", "top2::t", "loader::src"] {
+        assert!(map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
+    }
+    for label in ["top2_one::s", "top2_one::t"] {
+        assert!(!map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
+    }
+}
+
+/// K2 (relay 065, STOP 2) — the arithmetic arm through a copy: `let q = p;
+/// q[5]` holds `stepper::a`. K2c — `q[0]` in place (R641-2) holds nothing.
+#[test]
+fn w6l_seethrough_k2_k2c_the_arithmetic_arm_through_a_copy() {
+    let map = access_map(HOLD_COPIES);
+    assert!(map.iter().any(|(l, _)| l == "stepper::a"), "{map:#?}");
+    assert!(!map.iter().any(|(l, _)| l == "firster::b"), "{map:#?}");
+}
