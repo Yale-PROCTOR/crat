@@ -42,6 +42,12 @@ pub unsafe fn c3_chain(mut p: *mut u8, mut n: usize, mut j: usize) {
         }
     }
 }
+pub unsafe fn c3_guarded_return(mut p: *const u8, mut n: usize, mut i: usize) -> u8 {
+    if i >= n {
+        return 0 as u8;
+    }
+    *p.offset(i as isize)
+}
 pub unsafe fn c3_short_circuit(mut p: *const u8, mut n: usize) -> usize {
     let mut i: usize = 0;
     while *p.offset(i as isize) as i32 != 0 && i < n {
@@ -119,6 +125,8 @@ fn w6l_extent_c3_dominated_index() {
     assert_eq!(prove(C3, "c3", 0, 1), Ok(()));
     assert_eq!(prove(C3, "c3_int", 0, 1), Ok(()));
     assert_eq!(prove(C3, "c3_chain", 0, 1), Ok(()));
+    // The read sits on the comparison's FALSE edge (`if i >= n { return }`).
+    assert_eq!(prove(C3, "c3_guarded_return", 0, 1), Ok(()));
 }
 
 /// C3's controls (Codex 058 findings 2, 4, 5) and the off-by-one: each is
