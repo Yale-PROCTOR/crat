@@ -44,19 +44,6 @@ enum Command {
         output: PathBuf,
         input: PathBuf,
     },
-    Replace {
-        #[arg(long)]
-        request: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-        #[arg(long)]
-        statement_pairs_output: PathBuf,
-        #[arg(long)]
-        observation_source_output: PathBuf,
-        #[arg(long)]
-        observation_metadata_output: PathBuf,
-        current_project: PathBuf,
-    },
     AddFunctions {
         #[arg(long)]
         request: PathBuf,
@@ -130,7 +117,6 @@ fn replacement_failure(error: tools::ReplacementError) -> ! {
             tools::ReplacementErrorKind::InvalidRequest => "invalid_request",
             tools::ReplacementErrorKind::InvalidTransformation => "invalid_transformation",
             tools::ReplacementErrorKind::TargetResolution => "target_resolution",
-            tools::ReplacementErrorKind::UnsupportedConversion => "unsupported_conversion",
             tools::ReplacementErrorKind::UnsupportedCallRewrite => "unsupported_call_rewrite",
             tools::ReplacementErrorKind::RewriteFailure => "rewrite_failure",
         },
@@ -138,9 +124,7 @@ fn replacement_failure(error: tools::ReplacementError) -> ! {
     )
 }
 
-fn manifest_for_finalization(
-    input: &str,
-) -> Result<(toml_edit::DocumentMut, String, Vec<String>), String> {
+fn manifest_for_finalization(input: &str) -> Result<(String, Vec<String>), String> {
     let document = input
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format!("invalid project manifest: {error}"))?;
@@ -174,23 +158,7 @@ fn manifest_for_finalization(
     {
         return Err("project manifest must contain an empty wrappers array".to_owned());
     }
-    Ok((document, target_kind, api))
-}
-
-fn updated_manifest(
-    mut document: toml_edit::DocumentMut,
-    wrappers: &[tools::FinalWrapper],
-) -> String {
-    let array = document["wrappers"]
-        .as_array_mut()
-        .expect("manifest validation checked wrappers");
-    for wrapper in wrappers {
-        let mut entry = toml_edit::InlineTable::new();
-        entry.insert("wrapped", toml_edit::Value::from(wrapper.wrapped.clone()));
-        entry.insert("wrapper", toml_edit::Value::from(wrapper.wrapper.clone()));
-        array.push(toml_edit::Value::InlineTable(entry));
-    }
-    document.to_string()
+    Ok((target_kind, api))
 }
 
 fn validate_replace_output_paths(paths: &[&Path]) -> Result<(), String> {
@@ -554,90 +522,6 @@ fn main() {
             });
             std::fs::write(output, normalized).unwrap();
         }
-        Command::Replace {
-            request,
-            output,
-            statement_pairs_output,
-            observation_source_output,
-            observation_metadata_output,
-            current_project,
-        } => {
-            validate_replace_output_paths(&[
-                &output,
-                &statement_pairs_output,
-                &observation_source_output,
-                &observation_metadata_output,
-            ])
-            .unwrap_or_else(|error| fail("output_path_collision", error));
-            prepare_publish_destinations(&[
-                &output,
-                &statement_pairs_output,
-                &observation_source_output,
-                &observation_metadata_output,
-            ])
-            .unwrap_or_else(|error| fail("output_io", error));
-            let request_text =
-                std::fs::read_to_string(request).unwrap_or_else(|error| fail("request_io", error));
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request_text)
-                && value.get("schema_version") != Some(&serde_json::Value::from(1))
-            {
-                let observed = value
-                    .get("schema_version")
-                    .map_or_else(|| "missing".to_owned(), serde_json::Value::to_string);
-                fail(
-                    "unsupported_schema_version",
-                    format!("unsupported schema_version {observed}"),
-                );
-            }
-            let request = tools::replacement_request_from_json(&request_text)
-                .unwrap_or_else(|error| fail("invalid_request", error.message));
-            let lib_path = utils::find_lib_path(&current_project).unwrap_or_else(|error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            });
-            let source_path = current_project.join(lib_path);
-            let source = std::fs::read_to_string(&source_path).unwrap();
-            let compiler_source = source.clone();
-            let replaced = run_compiler_on_path(&source_path, move |tcx| {
-                tools::replace_items_with_observations(&compiler_source, &request, tcx)
-            })
-            .unwrap_or_else(|_| fail("compiler_failure", "current project failed to compile"))
-            .unwrap_or_else(|error| {
-                fail(
-                    match error.kind {
-                        tools::ReplacementErrorKind::InvalidRequest => "invalid_request",
-                        tools::ReplacementErrorKind::InvalidTransformation => {
-                            "invalid_transformation"
-                        }
-                        tools::ReplacementErrorKind::TargetResolution => "target_resolution",
-                        tools::ReplacementErrorKind::UnsupportedConversion => {
-                            "unsupported_conversion"
-                        }
-                        tools::ReplacementErrorKind::UnsupportedCallRewrite => {
-                            "unsupported_call_rewrite"
-                        }
-                        tools::ReplacementErrorKind::RewriteFailure => "rewrite_failure",
-                    },
-                    error.message,
-                );
-            });
-            let (source, sidecar) = serialize_replacement_outputs(&replaced.replacement).unwrap();
-            let observation_source = replaced.observation_source.clone();
-            let metadata = tools::ReplacementObservationMetadata::from_output(
-                &replaced,
-                source.as_bytes(),
-                sidecar.as_bytes(),
-                observation_source.as_bytes(),
-            );
-            let metadata = serde_json::to_string_pretty(&metadata).unwrap();
-            publish_files(&[
-                (&output, source.as_bytes()),
-                (&statement_pairs_output, sidecar.as_bytes()),
-                (&observation_source_output, observation_source.as_bytes()),
-                (&observation_metadata_output, metadata.as_bytes()),
-            ])
-            .unwrap_or_else(|error| fail("output_io", error));
-        }
         Command::AddFunctions {
             request,
             current_project,
@@ -739,7 +623,7 @@ fn main() {
                 .unwrap_or_else(|error| fail("output_io", error));
             let manifest_text = std::fs::read_to_string(&manifest)
                 .unwrap_or_else(|error| fail("manifest_io", error));
-            let (document, target_kind, api) = manifest_for_finalization(&manifest_text)
+            let (target_kind, api) = manifest_for_finalization(&manifest_text)
                 .unwrap_or_else(|error| fail("invalid_manifest", error));
             let source = std::fs::read_to_string(&analysis_path)
                 .unwrap_or_else(|error| fail("source_io", error));
@@ -750,7 +634,6 @@ fn main() {
             })
             .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
             .unwrap_or_else(|error| replacement_failure(error));
-            let manifest_text = updated_manifest(document, &finalized.wrappers);
             publish_files(&[
                 (&output, finalized.source.as_bytes()),
                 (&manifest_output, manifest_text.as_bytes()),

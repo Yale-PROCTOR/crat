@@ -4,10 +4,9 @@ use std::{
 };
 
 use rustc_ast::{
-    AngleBracketedArg, AttrKind, Attribute, BindingMode, BlockCheckMode, ByRef, Crate, Expr,
-    ExprKind, Extern, FnRetTy, GenericArg, GenericArgs, GenericParamKind, Item, ItemKind,
-    LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
-    VisibilityKind,
+    AttrKind, Attribute, BindingMode, BlockCheckMode, ByRef, Crate, Expr, ExprKind, Extern,
+    FnRetTy, GenericParamKind, Item, ItemKind, LocalKind, NodeId, Pat, PatKind, Safety, Stmt,
+    StmtKind, Ty, TyKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -91,15 +90,8 @@ pub struct SourceStub {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalWrapper {
-    pub wrapped: String,
-    pub wrapper: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizedProject {
     pub source: String,
-    pub wrappers: Vec<FinalWrapper>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +118,6 @@ pub enum ReplacementErrorKind {
     InvalidRequest,
     InvalidTransformation,
     TargetResolution,
-    UnsupportedConversion,
     UnsupportedCallRewrite,
     RewriteFailure,
 }
@@ -187,18 +178,6 @@ fn function_at_path<'a>(items: &'a [P<Item>], path: &[String]) -> Option<&'a P<I
     function_at_path(children, rest)
 }
 
-fn function_at_path_mut<'a>(items: &'a mut [P<Item>], path: &[String]) -> Option<&'a mut P<Item>> {
-    let (first, rest) = path.split_first()?;
-    if rest.is_empty() {
-        return items.iter_mut().find(|item| matches!(&item.kind, ItemKind::Fn(function) if function.ident.to_string() == *first));
-    }
-    let item = items.iter_mut().find(|item| matches!(&item.kind, ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(..)) if ident.to_string() == *first))?;
-    let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &mut item.kind else {
-        return None;
-    };
-    function_at_path_mut(children, rest)
-}
-
 fn insert_item_at_path(
     items: &mut ThinVec<P<Item>>,
     module_path: &[String],
@@ -224,194 +203,6 @@ fn insert_item_at_path(
         items.push(item);
         Ok(())
     }
-}
-
-pub fn replace_items(
-    source: &str,
-    request: &ReplacementRequest,
-    tcx: TyCtxt<'_>,
-) -> Result<ReplacementOutput, ReplacementError> {
-    replace_items_with_observations(source, request, tcx).map(|output| output.replacement)
-}
-
-pub fn replace_items_with_observations(
-    source: &str,
-    request: &ReplacementRequest,
-    tcx: TyCtxt<'_>,
-) -> Result<ExtendedReplacementOutput, ReplacementError> {
-    validate_request(request)?;
-    let (transformations, statement_pairs) = prepare_transformations(request)?;
-    let mut surface = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
-    let ast_to_hir = map_surface_to_hir(&mut surface, tcx)?;
-
-    let mut current_functions = vec![];
-    let mut occupied = HashMap::new();
-    collect_current_functions(
-        &surface.items,
-        &ast_to_hir.global_map,
-        &mut vec![],
-        &mut current_functions,
-        &mut occupied,
-    )?;
-
-    let mut plans = vec![];
-    let mut reserved = occupied;
-    for requested in &request.items {
-        let matches = current_functions
-            .iter()
-            .filter(|function| function.path == requested.path)
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(item_error(
-                ReplacementErrorKind::TargetResolution,
-                requested,
-                if matches.is_empty() {
-                    format!(
-                        "current source contains no free function at path `{}`",
-                        requested.path
-                    )
-                } else {
-                    format!(
-                        "current source contains multiple free functions at path `{}`",
-                        requested.path
-                    )
-                },
-            ));
-        }
-        let current = matches[0];
-        validate_current_target(current, requested)?;
-        let transformation = transformations
-            .get(&requested.name)
-            .expect("request validation established the function set");
-        let ItemKind::Fn(box current_fn) = &current.item.kind else { unreachable!() };
-        let ItemKind::Fn(box transformed_fn) = &transformation.kind else { unreachable!() };
-        validate_transformed_header(current_fn, transformed_fn, requested)?;
-
-        let executable_arity = (current_fn.ident.name.as_str() == "main_0")
-            .then_some(current_fn.sig.decl.inputs.len());
-        let source_types = signature_types(current_fn);
-        let target_types = signature_types(transformed_fn);
-        let needs_wrapper = source_types != target_types && executable_arity != Some(2);
-
-        let wrapper_name = if needs_wrapper {
-            Some(allocate_wrapper_name(current, &mut reserved, requested))
-        } else {
-            None
-        };
-        let wrapper = wrapper_name
-            .as_ref()
-            .map(|name| build_wrapper(current, transformed_fn, requested, name))
-            .transpose()?;
-        let observation_implementation =
-            compose_implementation(&current.item, transformation, needs_wrapper, requested)?;
-        let mut implementation = observation_implementation.clone();
-        let ItemKind::Fn(box implementation_fn) = &mut implementation.kind else { unreachable!() };
-        ProctorLabelRemover.visit_block(
-            implementation_fn
-                .body
-                .as_mut()
-                .expect("composed implementations always have a body"),
-        );
-
-        let main_node = if executable_arity == Some(2) {
-            Some(find_sibling_main(
-                &current_functions,
-                &current.module_path,
-                requested,
-            )?)
-        } else {
-            None
-        };
-        plans.push(ReplacementPlan {
-            requested: requested.clone(),
-            current_node: current.item.id,
-            current_def_id: current.def_id,
-            implementation,
-            observation_implementation,
-            wrapper,
-            wrapper_path: wrapper_name.map(|name| {
-                absolute_item_path(&current.module_path, &name)
-                    .strip_prefix("crate::")
-                    .unwrap_or(&name)
-                    .to_owned()
-            }),
-            source_copy_name: String::new(),
-            source_copy_path: String::new(),
-            main_node,
-        });
-    }
-
-    // Candidate wrapper allocation is deliberately complete before observation-only
-    // source-copy names reserve anything in the module namespace.
-    for plan in &mut plans {
-        let current = current_functions
-            .iter()
-            .find(|function| function.item.id == plan.current_node)
-            .expect("replacement plans originate in current functions");
-        let name = allocate_generated_name(current, &mut reserved, "__proctor_source");
-        plan.source_copy_path = absolute_item_path(&current.module_path, &name)
-            .strip_prefix("crate::")
-            .unwrap_or(&name)
-            .to_owned();
-        plan.source_copy_name = name;
-    }
-
-    validate_macro_call_rewrites(&surface, &ast_to_hir, &plans, &current_functions, tcx)?;
-    let rewrites = collect_call_rewrites(&surface, &ast_to_hir, &plans, tcx)?;
-
-    let mut observation_surface = surface.clone();
-    validate_source_copy_macro_rewrites(
-        &observation_surface,
-        &ast_to_hir,
-        &plans,
-        &current_functions,
-        tcx,
-    )?;
-    let source_copy_rewrites =
-        collect_source_copy_call_rewrites(&observation_surface, &ast_to_hir, &plans, tcx);
-    CallRewriter {
-        rewrites: source_copy_rewrites,
-    }
-    .visit_crate(&mut observation_surface);
-    apply_observation_replacements(&mut observation_surface.items, &plans)?;
-
-    let mut call_rewriter = CallRewriter { rewrites };
-    call_rewriter.visit_crate(&mut surface);
-    apply_replacements(&mut surface.items, &plans)?;
-    let new_correspondence: Vec<CallableCorrespondence> = plans
-        .iter()
-        .map(|plan| CallableCorrespondence {
-            item_id: plan.requested.id,
-            logical_path: plan.requested.path.clone(),
-            implementation_path: plan.requested.path.clone(),
-            wrapper_path: plan.wrapper_path.clone(),
-        })
-        .collect();
-    let mut combined_correspondence = request.accepted_correspondence.clone();
-    combined_correspondence.extend(new_correspondence.iter().cloned());
-    validate_correspondence(&combined_correspondence)?;
-    let current_items = plans
-        .iter()
-        .map(|plan| CurrentObservationItem {
-            item_id: plan.requested.id,
-            logical_path: plan.requested.path.clone(),
-            source_copy_path: plan.source_copy_path.clone(),
-            implementation_path: plan.requested.path.clone(),
-            wrapper_path: plan.wrapper_path.clone(),
-            transform_labels: plan.requested.view.transform_labels(),
-        })
-        .collect();
-    Ok(ExtendedReplacementOutput {
-        replacement: ReplacementOutput {
-            source: pprust::crate_to_string_for_macros(&surface),
-            statement_pairs,
-        },
-        observation_source: pprust::crate_to_string_for_macros(&observation_surface),
-        accepted_correspondence: request.accepted_correspondence.clone(),
-        new_correspondence,
-        current_items,
-        source_stubs: vec![],
-    })
 }
 
 pub fn add_functions_with_observations(
@@ -560,7 +351,7 @@ pub fn add_functions_with_observations(
             unreachable!()
         };
         validate_transformed_header(current_fn, transformed_fn, requested)?;
-        let labeled = compose_implementation(&current.item, transformation, false, requested)?;
+        let labeled = compose_implementation(&current.item, transformation, requested)?;
         let mut implementation = labeled.clone();
         let ItemKind::Fn(box implementation_fn) = &mut implementation.kind else { unreachable!() };
         ProctorLabelRemover.visit_block(implementation_fn.body.as_mut().unwrap());
@@ -570,15 +361,11 @@ pub fn add_functions_with_observations(
             .to_owned();
         plans.push(ReplacementPlan {
             requested: requested.clone(),
-            current_node: current.item.id,
             current_def_id: current.def_id,
             implementation,
             observation_implementation: labeled,
-            wrapper: None,
-            wrapper_path: None,
             source_copy_name,
             source_copy_path,
-            main_node: None,
         });
     }
 
@@ -891,79 +678,21 @@ pub fn finalize_additive_source(
             ));
         }
     }
-    let mut matched = HashSet::new();
-    let mut wrappers = vec![];
-    let mut reserved = occupied;
     for api in api_functions {
-        let entries = functions
-            .iter()
-            .filter(|function| {
-                let ItemKind::Fn(box body) = &function.item.kind else { unreachable!() };
-                body.ident.name.as_str() == api
-                    || function.item.attrs.iter().any(|attr| {
-                        attr.has_name(sym::export_name)
-                            && attr.value_str().is_some_and(|name| name.as_str() == api)
-                    })
-            })
-            .collect::<Vec<_>>();
-        if entries.is_empty() {
+        let matched = functions.iter().any(|function| {
+            let ItemKind::Fn(box body) = &function.item.kind else { unreachable!() };
+            body.ident.name.as_str() == api
+                || function.item.attrs.iter().any(|attr| {
+                    attr.has_name(sym::export_name)
+                        && attr.value_str().is_some_and(|name| name.as_str() == api)
+                })
+        });
+        if !matched {
             return Err(global_error(
                 ReplacementErrorKind::TargetResolution,
                 format!("API function `{api}` did not match any source function"),
             ));
         }
-        for current in entries {
-            matched.insert(current.def_id);
-        }
-    }
-    for current in &functions {
-        if !matched.contains(&current.def_id) {
-            continue;
-        }
-        let path = current
-            .path
-            .split("::")
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let target =
-            function_at_path(&partial.items, &path).expect("complete accepted set was checked");
-        let (ItemKind::Fn(box source_fn), ItemKind::Fn(box target_fn)) =
-            (&current.item.kind, &target.kind)
-        else {
-            unreachable!()
-        };
-        if signature_types(source_fn) == signature_types(target_fn) {
-            continue;
-        }
-        let requested = ReplacementItem {
-            id: 0,
-            path: current.path.clone(),
-            name: source_fn.ident.to_string(),
-            view: SkeletonView {
-                skeleton: String::new(),
-                needs_transformation: false,
-                statement_dispositions: vec![],
-                statement_pair_metadata: vec![],
-            },
-        };
-        validate_current_target(current, &requested)?;
-        validate_transformed_header(source_fn, target_fn, &requested)?;
-        let wrapper_name = allocate_wrapper_name(current, &mut reserved, &requested);
-        let wrapper = build_wrapper(current, target_fn, &requested, &wrapper_name)?;
-        let implementation = function_at_path_mut(&mut partial.items, &path)
-            .expect("complete accepted set was checked");
-        let ItemKind::Fn(box function) = &mut implementation.kind else { unreachable!() };
-        function.sig.header.ext = Extern::None;
-        implementation
-            .attrs
-            .retain(|attr| !is_export_attribute(attr));
-        insert_item_at_path(&mut partial.items, &current.module_path, wrapper)?;
-        wrappers.push(FinalWrapper {
-            wrapped: current.path.clone(),
-            wrapper: absolute_item_path(&current.module_path, &wrapper_name)
-                .trim_start_matches("crate::")
-                .to_owned(),
-        });
     }
     for current in functions
         .iter()
@@ -981,7 +710,6 @@ pub fn finalize_additive_source(
     }
     Ok(FinalizedProject {
         source: pprust::crate_to_string_for_macros(&partial),
-        wrappers,
     })
 }
 
@@ -1143,15 +871,11 @@ struct CurrentFunction {
 
 struct ReplacementPlan {
     requested: ReplacementItem,
-    current_node: NodeId,
     current_def_id: LocalDefId,
     implementation: P<Item>,
     observation_implementation: P<Item>,
-    wrapper: Option<P<Item>>,
-    wrapper_path: Option<String>,
     source_copy_name: String,
     source_copy_path: String,
-    main_node: Option<NodeId>,
 }
 
 fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError> {
@@ -2003,13 +1727,6 @@ fn validate_transformed_header(
     Ok(())
 }
 
-fn simple_parameter_name(parameter: &rustc_ast::Param) -> Option<String> {
-    let PatKind::Ident(BindingMode(ByRef::No, _), ident, None) = &parameter.pat.kind else {
-        return None;
-    };
-    Some(ident.to_string())
-}
-
 #[derive(PartialEq, Eq)]
 enum SimpleParameterPattern {
     Identifier(String),
@@ -2049,27 +1766,6 @@ fn signature_types(function: &rustc_ast::Fn) -> Vec<String> {
         .collect()
 }
 
-fn allocate_wrapper_name(
-    current: &CurrentFunction,
-    occupied: &mut HashMap<Vec<String>, HashSet<String>>,
-    requested: &ReplacementItem,
-) -> String {
-    let ItemKind::Fn(box function) = &current.item.kind else { unreachable!() };
-    let base = format!("__proctor_wrapper_{}", function.ident.name.as_str());
-    let names = occupied.entry(current.module_path.clone()).or_default();
-    for suffix in 0usize.. {
-        let candidate = if suffix == 0 {
-            base.clone()
-        } else {
-            format!("{base}_{}", suffix - 1)
-        };
-        if names.insert(candidate.clone()) {
-            return candidate;
-        }
-    }
-    unreachable!("wrapper name space is infinite for {}", requested.path)
-}
-
 fn allocate_generated_name(
     current: &CurrentFunction,
     occupied: &mut HashMap<Vec<String>, HashSet<String>>,
@@ -2091,38 +1787,9 @@ fn allocate_generated_name(
     unreachable!("generated name space is infinite")
 }
 
-fn find_sibling_main(
-    functions: &[CurrentFunction],
-    module_path: &[String],
-    requested: &ReplacementItem,
-) -> Result<NodeId, ReplacementError> {
-    let matches = functions
-        .iter()
-        .filter(|function| {
-            function.module_path == module_path
-                && matches!(
-                    &function.item.kind,
-                    ItemKind::Fn(function) if function.ident.name.as_str() == "main"
-                )
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(item_error(
-            ReplacementErrorKind::RewriteFailure,
-            requested,
-            format!(
-                "two-argument `main_0` requires exactly one sibling `main`, found {}",
-                matches.len()
-            ),
-        ));
-    }
-    Ok(matches[0].item.id)
-}
-
 fn compose_implementation(
     current: &P<Item>,
     transformed: &P<Item>,
-    needs_wrapper: bool,
     requested: &ReplacementItem,
 ) -> Result<P<Item>, ReplacementError> {
     let mut output = current.clone();
@@ -2131,12 +1798,6 @@ fn compose_implementation(
     output_fn.generics = transformed_fn.generics.clone();
     output_fn.sig.decl = transformed_fn.sig.decl.clone();
     output_fn.body = transformed_fn.body.clone();
-    if needs_wrapper {
-        output_fn.sig.header.ext = Extern::None;
-        output
-            .attrs
-            .retain(|attribute| !is_export_attribute(attribute));
-    }
     if output_fn.body.is_none() {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
@@ -2145,84 +1806,6 @@ fn compose_implementation(
         ));
     }
     Ok(output)
-}
-
-fn build_wrapper(
-    current: &CurrentFunction,
-    transformed: &rustc_ast::Fn,
-    requested: &ReplacementItem,
-    wrapper_name: &str,
-) -> Result<P<Item>, ReplacementError> {
-    let mut wrapper = current.item.clone();
-    let ItemKind::Fn(box wrapper_fn) = &mut wrapper.kind else { unreachable!() };
-    let source_fn = wrapper_fn.clone();
-    wrapper_fn.ident = parsed_ident(wrapper_name);
-    wrapper_fn.sig.header.safety = Safety::Unsafe(wrapper_fn.sig.span);
-
-    let arguments = source_fn
-        .sig
-        .decl
-        .inputs
-        .iter()
-        .zip(&transformed.sig.decl.inputs)
-        .map(|(source, target)| {
-            let name = simple_parameter_name(source).expect("current target header was checked");
-            input_conversion(&name, &source.ty, &target.ty, requested)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let call = format!(
-        "{}({})",
-        absolute_item_path(&current.module_path, &requested.name),
-        arguments.join(", ")
-    );
-    let body_source = match (&source_fn.sig.decl.output, &transformed.sig.decl.output) {
-        (FnRetTy::Default(_), FnRetTy::Default(_)) => format!("{{ {call}; }}"),
-        (source_return, target_return) => {
-            let result_name = fresh_result_name(&source_fn);
-            let conversion =
-                output_conversion(&result_name, source_return, target_return, requested)?;
-            format!("{{ let {result_name} = {call}; {conversion} }}")
-        }
-    };
-    wrapper_fn.body = Some(parse_body(&body_source)?);
-
-    let no_mangle = has_attr(&wrapper.attrs, sym::no_mangle);
-    let explicit_export = wrapper
-        .attrs
-        .iter()
-        .find(|attribute| attribute.has_name(sym::export_name))
-        .cloned();
-    wrapper.attrs.clear();
-    if no_mangle {
-        wrapper.attrs.extend(utils::attr!(
-            "#[export_name = \"{}\"]",
-            source_fn.ident.name.as_str()
-        ));
-    } else if let Some(attribute) = explicit_export {
-        wrapper.attrs.push(attribute);
-    }
-    Ok(wrapper)
-}
-
-fn fresh_result_name(function: &rustc_ast::Fn) -> String {
-    let occupied = function
-        .sig
-        .decl
-        .inputs
-        .iter()
-        .filter_map(simple_parameter_name)
-        .collect::<HashSet<_>>();
-    for index in 0usize.. {
-        let name = if index == 0 {
-            "__proctor_result".to_owned()
-        } else {
-            format!("__proctor_result_{}", index - 1)
-        };
-        if !occupied.contains(&name) {
-            return name;
-        }
-    }
-    unreachable!()
 }
 
 fn parse_body(source: &str) -> Result<P<rustc_ast::Block>, ReplacementError> {
@@ -2239,270 +1822,6 @@ fn parse_body(source: &str) -> Result<P<rustc_ast::Block>, ReplacementError> {
     Ok(function.body.unwrap())
 }
 
-#[derive(Clone)]
-enum ConvertedType {
-    Raw {
-        mutable: bool,
-        inner: String,
-        exact: String,
-    },
-    Ref {
-        mutable: bool,
-        inner: String,
-    },
-    Slice {
-        mutable: bool,
-        inner: String,
-    },
-    Box {
-        inner: String,
-    },
-    OptionalRef {
-        mutable: bool,
-        inner: String,
-    },
-    OptionalBox {
-        inner: String,
-    },
-    BoxedSlice,
-    OptionalBoxedSlice,
-    Other(String),
-}
-
-fn converted_type(ty: &Ty) -> ConvertedType {
-    let ty = without_parens(ty);
-    match &ty.kind {
-        TyKind::Ptr(mut_ty) => ConvertedType::Raw {
-            mutable: mut_ty.mutbl == Mutability::Mut,
-            inner: canonical_type(&mut_ty.ty),
-            exact: canonical_type(ty),
-        },
-        TyKind::Ref(_, mut_ty) => {
-            if let TyKind::Slice(inner) = &without_parens(&mut_ty.ty).kind {
-                ConvertedType::Slice {
-                    mutable: mut_ty.mutbl == Mutability::Mut,
-                    inner: canonical_type(inner),
-                }
-            } else {
-                ConvertedType::Ref {
-                    mutable: mut_ty.mutbl == Mutability::Mut,
-                    inner: canonical_type(&mut_ty.ty),
-                }
-            }
-        }
-        TyKind::Path(_, path) => {
-            let Some(segment) = path.segments.last() else {
-                return ConvertedType::Other(canonical_type(ty));
-            };
-            let Some(inner) = single_type_argument(segment.args.as_deref()) else {
-                return ConvertedType::Other(canonical_type(ty));
-            };
-            match segment.ident.name.as_str() {
-                "Box" => match &without_parens(inner).kind {
-                    TyKind::Slice(_) => ConvertedType::BoxedSlice,
-                    _ => ConvertedType::Box {
-                        inner: canonical_type(inner),
-                    },
-                },
-                "Option" => match converted_type(inner) {
-                    ConvertedType::Ref { mutable, inner } => {
-                        ConvertedType::OptionalRef { mutable, inner }
-                    }
-                    ConvertedType::Box { inner } => ConvertedType::OptionalBox { inner },
-                    ConvertedType::BoxedSlice => ConvertedType::OptionalBoxedSlice,
-                    _ => ConvertedType::Other(canonical_type(ty)),
-                },
-                _ => ConvertedType::Other(canonical_type(ty)),
-            }
-        }
-        _ => ConvertedType::Other(canonical_type(ty)),
-    }
-}
-
-fn single_type_argument(args: Option<&GenericArgs>) -> Option<&Ty> {
-    let GenericArgs::AngleBracketed(args) = args? else {
-        return None;
-    };
-    let [AngleBracketedArg::Arg(GenericArg::Type(ty))] = &args.args[..] else {
-        return None;
-    };
-    Some(ty)
-}
-
-fn input_conversion(
-    name: &str,
-    source: &Ty,
-    target: &Ty,
-    requested: &ReplacementItem,
-) -> Result<String, ReplacementError> {
-    let source_kind = converted_type(source);
-    let target_kind = converted_type(target);
-    let ConvertedType::Raw { .. } = source_kind else {
-        if canonical_type(source) == canonical_type(target) {
-            return Ok(name.to_owned());
-        }
-        return Err(unsupported_conversion(requested, source, target, "input"));
-    };
-    let output = match target_kind {
-        ConvertedType::Ref {
-            mutable: false,
-            inner,
-        } => format!("&*({name} as *const {inner})"),
-        ConvertedType::Ref {
-            mutable: true,
-            inner,
-        } => format!("&mut *({name} as *mut {inner})"),
-        ConvertedType::OptionalRef {
-            mutable: false,
-            inner,
-        } => format!("({name} as *const {inner}).as_ref()"),
-        ConvertedType::OptionalRef {
-            mutable: true,
-            inner,
-        } => format!("({name} as *mut {inner}).as_mut()"),
-        ConvertedType::Slice {
-            mutable: false,
-            inner,
-        } => format!(
-            "if {name}.is_null() {{ &[] }} else {{ std::slice::from_raw_parts({name} as *const {inner}, 1_000_000) }}"
-        ),
-        ConvertedType::Slice {
-            mutable: true,
-            inner,
-        } => format!(
-            "if {name}.is_null() {{ &mut [] }} else {{ std::slice::from_raw_parts_mut({name} as *mut {inner}, 1_000_000) }}"
-        ),
-        ConvertedType::Box { inner } => format!("Box::from_raw({name} as *mut {inner})"),
-        ConvertedType::OptionalBox { inner } => format!(
-            "if {name}.is_null() {{ None }} else {{ Some(Box::from_raw({name} as *mut {inner})) }}"
-        ),
-        ConvertedType::Raw { exact, .. } => {
-            if canonical_type(source) == exact {
-                name.to_owned()
-            } else {
-                format!("{name} as {exact}")
-            }
-        }
-        ConvertedType::BoxedSlice | ConvertedType::OptionalBoxedSlice => {
-            return Err(item_error(
-                ReplacementErrorKind::UnsupportedConversion,
-                requested,
-                format!(
-                    "boxed-slice input conversion from `{}` to `{}` is unsupported",
-                    canonical_type(source),
-                    canonical_type(target)
-                ),
-            ));
-        }
-        ConvertedType::Other(target) if canonical_type(source) == target => name.to_owned(),
-        _ => {
-            return Err(unsupported_conversion(requested, source, target, "input"));
-        }
-    };
-    Ok(output)
-}
-
-fn output_conversion(
-    value: &str,
-    source: &FnRetTy,
-    target: &FnRetTy,
-    requested: &ReplacementItem,
-) -> Result<String, ReplacementError> {
-    let (FnRetTy::Ty(source), FnRetTy::Ty(target)) = (source, target) else {
-        return Err(item_error(
-            ReplacementErrorKind::UnsupportedConversion,
-            requested,
-            "unit and non-unit return types cannot be converted".to_owned(),
-        ));
-    };
-    let source_kind = converted_type(source);
-    let target_kind = converted_type(target);
-    let ConvertedType::Raw {
-        mutable: source_mutable,
-        inner: source_inner,
-        exact: source_exact,
-    } = source_kind
-    else {
-        if canonical_type(source) == canonical_type(target) {
-            return Ok(value.to_owned());
-        }
-        return Err(unsupported_conversion(requested, target, source, "output"));
-    };
-    let null = typed_null(source_mutable, &source_inner, &source_exact);
-    let output = match target_kind {
-        ConvertedType::Ref { mutable, inner } => {
-            reference_to_raw(value, mutable, &inner, &source_exact)
-        }
-        ConvertedType::OptionalRef { mutable, inner } => format!(
-            "match {value} {{ None => {null}, Some({value}) => {} }}",
-            reference_to_raw(value, mutable, &inner, &source_exact)
-        ),
-        ConvertedType::Slice { mutable, .. } => {
-            let pointer = if mutable {
-                format!("{value}.as_mut_ptr() as {source_exact}")
-            } else {
-                format!("{value}.as_ptr() as {source_exact}")
-            };
-            format!("if {value}.is_empty() {{ {null} }} else {{ {pointer} }}")
-        }
-        ConvertedType::Box { .. } => {
-            format!("Box::into_raw({value}) as {source_exact}")
-        }
-        ConvertedType::OptionalBox { .. } => format!(
-            "match {value} {{ None => {null}, Some({value}) => Box::into_raw({value}) as {source_exact} }}"
-        ),
-        ConvertedType::BoxedSlice => format!(
-            "if {value}.is_empty() {{ drop({value}); {null} }} else {{ Box::leak({value}).as_mut_ptr() as {source_exact} }}"
-        ),
-        ConvertedType::OptionalBoxedSlice => format!(
-            "match {value} {{ None => {null}, Some({value}) if {value}.is_empty() => {{ drop({value}); {null} }}, Some({value}) => Box::leak({value}).as_mut_ptr() as {source_exact} }}"
-        ),
-        ConvertedType::Raw { exact, .. } => {
-            if exact == source_exact {
-                value.to_owned()
-            } else {
-                format!("{value} as {source_exact}")
-            }
-        }
-        ConvertedType::Other(target) if target == canonical_type(source) => value.to_owned(),
-        _ => {
-            return Err(unsupported_conversion(requested, target, source, "output"));
-        }
-    };
-    Ok(output)
-}
-
-fn reference_to_raw(value: &str, mutable: bool, inner: &str, source_exact: &str) -> String {
-    format!(
-        "{value} as *{} {inner} as {source_exact}",
-        if mutable { "mut" } else { "const" }
-    )
-}
-
-fn typed_null(mutable: bool, inner: &str, exact: &str) -> String {
-    format!(
-        "std::ptr::{}::<{inner}>() as {exact}",
-        if mutable { "null_mut" } else { "null" }
-    )
-}
-
-fn unsupported_conversion(
-    requested: &ReplacementItem,
-    source: &Ty,
-    target: &Ty,
-    direction: &str,
-) -> ReplacementError {
-    item_error(
-        ReplacementErrorKind::UnsupportedConversion,
-        requested,
-        format!(
-            "unsupported {direction} conversion from `{}` to `{}`",
-            canonical_type(source),
-            canonical_type(target)
-        ),
-    )
-}
-
 fn canonical_return(return_ty: &FnRetTy) -> String {
     match return_ty {
         FnRetTy::Default(_) => "<omitted>".to_owned(),
@@ -2514,13 +1833,6 @@ fn canonical_type(ty: &Ty) -> String {
     let mut ty = ty.clone();
     TypeParenRemover.visit_ty(&mut ty);
     pprust::ty_to_string(&ty)
-}
-
-fn without_parens(mut ty: &Ty) -> &Ty {
-    while let TyKind::Paren(inner) = &ty.kind {
-        ty = inner;
-    }
-    ty
 }
 
 struct TypeParenRemover;
@@ -2593,64 +1905,6 @@ fn absolute_item_path(module_path: &[String], name: &str) -> String {
         .join("::")
 }
 
-fn collect_call_rewrites(
-    surface: &Crate,
-    ast_to_hir: &utils::ir::AstToHir,
-    plans: &[ReplacementPlan],
-    tcx: TyCtxt<'_>,
-) -> Result<FxHashMap<NodeId, String>, ReplacementError> {
-    let targets = plans
-        .iter()
-        .filter_map(|plan| {
-            plan.wrapper_path
-                .as_ref()
-                .map(|path| (plan.current_def_id, format!("crate::{path}")))
-        })
-        .collect::<FxHashMap<_, _>>();
-    let current_scc = plans
-        .iter()
-        .map(|plan| plan.current_def_id)
-        .collect::<FxHashSet<_>>();
-    let mut collector = AstCallCollector {
-        ast_to_hir,
-        tcx,
-        targets: &targets,
-        current_scc: &current_scc,
-        current_function: None,
-        rewrites: FxHashMap::default(),
-    };
-    collector.visit_crate(surface);
-    Ok(collector.rewrites)
-}
-
-fn collect_source_copy_call_rewrites(
-    surface: &Crate,
-    ast_to_hir: &utils::ir::AstToHir,
-    plans: &[ReplacementPlan],
-    tcx: TyCtxt<'_>,
-) -> FxHashMap<NodeId, String> {
-    let source_paths = plans
-        .iter()
-        .map(|plan| {
-            (
-                plan.current_def_id,
-                format!("crate::{}", plan.source_copy_path),
-            )
-        })
-        .collect::<FxHashMap<_, _>>();
-    let current_scc = source_paths.keys().copied().collect::<FxHashSet<_>>();
-    let mut collector = SourceCopyCallCollector {
-        ast_to_hir,
-        tcx,
-        source_paths: &source_paths,
-        current_scc: &current_scc,
-        current_function: None,
-        rewrites: FxHashMap::default(),
-    };
-    collector.visit_crate(surface);
-    collector.rewrites
-}
-
 struct SourceCopyCallCollector<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
@@ -2677,39 +1931,6 @@ impl<'ast> Visitor<'ast> for SourceCopyCallCollector<'_, '_> {
             && let ExprKind::Call(callee, _) = &expression.kind
             && let Some(target) = resolved_local_function(callee, self.ast_to_hir, self.tcx)
             && let Some(path) = self.source_paths.get(&target)
-        {
-            self.rewrites.insert(callee.id, path.clone());
-        }
-        visit::walk_expr(self, expression);
-    }
-}
-
-struct AstCallCollector<'a, 'tcx> {
-    ast_to_hir: &'a utils::ir::AstToHir,
-    tcx: TyCtxt<'tcx>,
-    targets: &'a FxHashMap<LocalDefId, String>,
-    current_scc: &'a FxHashSet<LocalDefId>,
-    current_function: Option<LocalDefId>,
-    rewrites: FxHashMap<NodeId, String>,
-}
-
-impl<'ast> Visitor<'ast> for AstCallCollector<'_, '_> {
-    fn visit_item(&mut self, item: &'ast Item) {
-        let previous = self.current_function;
-        if matches!(item.kind, ItemKind::Fn(..)) {
-            self.current_function = self.ast_to_hir.global_map.get(&item.id).copied();
-        }
-        visit::walk_item(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        if let ExprKind::Call(callee, _) = &expression.kind
-            && self
-                .current_function
-                .is_none_or(|caller| !self.current_scc.contains(&caller))
-            && let Some(target) = resolved_local_function(callee, self.ast_to_hir, self.tcx)
-            && let Some(path) = self.targets.get(&target)
         {
             self.rewrites.insert(callee.id, path.clone());
         }
@@ -2746,138 +1967,6 @@ fn resolved_local_function(
     def_id.as_local()
 }
 
-fn validate_macro_call_rewrites(
-    surface: &Crate,
-    ast_to_hir: &utils::ir::AstToHir,
-    plans: &[ReplacementPlan],
-    functions: &[CurrentFunction],
-    tcx: TyCtxt<'_>,
-) -> Result<(), ReplacementError> {
-    let wrapped = plans
-        .iter()
-        .filter(|plan| plan.wrapper_path.is_some())
-        .map(|plan| plan.current_def_id)
-        .collect::<FxHashSet<_>>();
-    if wrapped.is_empty() {
-        return Ok(());
-    }
-    let scc = plans
-        .iter()
-        .map(|plan| plan.current_def_id)
-        .collect::<FxHashSet<_>>();
-
-    let mut ast_counts = FxHashMap::default();
-    let mut scanner = SurfaceCallCounter {
-        ast_to_hir,
-        tcx,
-        wrapped: &wrapped,
-        scc: &scc,
-        current_function: None,
-        ast_counts: &mut ast_counts,
-    };
-    scanner.visit_crate(surface);
-
-    for function in functions {
-        if scc.contains(&function.def_id) {
-            continue;
-        }
-        let hir::ItemKind::Fn { body, .. } =
-            tcx.hir_node_by_def_id(function.def_id).expect_item().kind
-        else {
-            continue;
-        };
-        let mut counter = HirDirectCallCounter {
-            wrapped: &wrapped,
-            include_expansions: false,
-            counts: FxHashMap::default(),
-        };
-        counter.visit_body(tcx.hir_body(body));
-        for plan in plans.iter().filter(|plan| plan.wrapper_path.is_some()) {
-            let hir_count = counter
-                .counts
-                .get(&plan.current_def_id)
-                .copied()
-                .unwrap_or(0);
-            let surface_count = ast_counts
-                .get(&(function.def_id, plan.current_def_id))
-                .copied()
-                .unwrap_or(0);
-            if hir_count > surface_count {
-                return Err(item_error(
-                    ReplacementErrorKind::UnsupportedCallRewrite,
-                    &plan.requested,
-                    format!(
-                        "a required call redirect in `{}` occurs inside a macro token input",
-                        function.path
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_source_copy_macro_rewrites(
-    surface: &Crate,
-    ast_to_hir: &utils::ir::AstToHir,
-    plans: &[ReplacementPlan],
-    functions: &[CurrentFunction],
-    tcx: TyCtxt<'_>,
-) -> Result<(), ReplacementError> {
-    let targets = plans
-        .iter()
-        .map(|plan| plan.current_def_id)
-        .collect::<FxHashSet<_>>();
-    let mut ast_counts = FxHashMap::default();
-    let mut scanner = CurrentSurfaceCallCounter {
-        ast_to_hir,
-        tcx,
-        targets: &targets,
-        callers: &targets,
-        current_function: None,
-        ast_counts: &mut ast_counts,
-    };
-    scanner.visit_crate(surface);
-    for function in functions
-        .iter()
-        .filter(|function| targets.contains(&function.def_id))
-    {
-        let hir::ItemKind::Fn { body, .. } =
-            tcx.hir_node_by_def_id(function.def_id).expect_item().kind
-        else {
-            continue;
-        };
-        let mut counter = HirDirectCallCounter {
-            wrapped: &targets,
-            include_expansions: true,
-            counts: FxHashMap::default(),
-        };
-        counter.visit_body(tcx.hir_body(body));
-        for plan in plans {
-            let hir_count = counter
-                .counts
-                .get(&plan.current_def_id)
-                .copied()
-                .unwrap_or(0);
-            let ast_count = ast_counts
-                .get(&(function.def_id, plan.current_def_id))
-                .copied()
-                .unwrap_or(0);
-            if hir_count > ast_count {
-                return Err(item_error(
-                    ReplacementErrorKind::UnsupportedCallRewrite,
-                    &plan.requested,
-                    format!(
-                        "a required source-copy call redirect in `{}` occurs inside a macro token input",
-                        function.path
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 struct CurrentSurfaceCallCounter<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
@@ -2910,38 +1999,6 @@ impl<'ast> Visitor<'ast> for CurrentSurfaceCallCounter<'_, '_> {
     }
 }
 
-struct SurfaceCallCounter<'a, 'tcx> {
-    ast_to_hir: &'a utils::ir::AstToHir,
-    tcx: TyCtxt<'tcx>,
-    wrapped: &'a FxHashSet<LocalDefId>,
-    scc: &'a FxHashSet<LocalDefId>,
-    current_function: Option<LocalDefId>,
-    ast_counts: &'a mut FxHashMap<(LocalDefId, LocalDefId), usize>,
-}
-
-impl<'ast> Visitor<'ast> for SurfaceCallCounter<'_, '_> {
-    fn visit_item(&mut self, item: &'ast Item) {
-        let previous = self.current_function;
-        if matches!(item.kind, ItemKind::Fn(..)) {
-            self.current_function = self.ast_to_hir.global_map.get(&item.id).copied();
-        }
-        visit::walk_item(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        if let Some(caller) = self.current_function
-            && !self.scc.contains(&caller)
-            && let ExprKind::Call(callee, _) = &expression.kind
-            && let Some(target) = resolved_local_function(callee, self.ast_to_hir, self.tcx)
-            && self.wrapped.contains(&target)
-        {
-            *self.ast_counts.entry((caller, target)).or_default() += 1;
-        }
-        visit::walk_expr(self, expression);
-    }
-}
-
 struct HirDirectCallCounter<'a> {
     wrapped: &'a FxHashSet<LocalDefId>,
     include_expansions: bool,
@@ -2961,116 +2018,6 @@ impl<'tcx> HirVisitor<'tcx> for HirDirectCallCounter<'_> {
         }
         intravisit::walk_expr(self, expression);
     }
-}
-
-fn apply_replacements(
-    items: &mut ThinVec<P<Item>>,
-    plans: &[ReplacementPlan],
-) -> Result<(), ReplacementError> {
-    let by_node = plans
-        .iter()
-        .map(|plan| (plan.current_node, plan))
-        .collect::<FxHashMap<_, _>>();
-    let mains = plans
-        .iter()
-        .filter_map(|plan| plan.main_node.map(|node| (node, &plan.requested)))
-        .collect::<FxHashMap<_, _>>();
-    rewrite_item_list(items, &by_node, &mains)
-}
-
-fn apply_observation_replacements(
-    items: &mut ThinVec<P<Item>>,
-    plans: &[ReplacementPlan],
-) -> Result<(), ReplacementError> {
-    let by_node = plans
-        .iter()
-        .map(|plan| (plan.current_node, plan))
-        .collect::<FxHashMap<_, _>>();
-    let mains = plans
-        .iter()
-        .filter_map(|plan| plan.main_node.map(|node| (node, &plan.requested)))
-        .collect::<FxHashMap<_, _>>();
-    rewrite_observation_item_list(items, &by_node, &mains)
-}
-
-fn rewrite_observation_item_list(
-    items: &mut ThinVec<P<Item>>,
-    plans: &FxHashMap<NodeId, &ReplacementPlan>,
-    mains: &FxHashMap<NodeId, &ReplacementItem>,
-) -> Result<(), ReplacementError> {
-    let mut output = ThinVec::with_capacity(items.len() + plans.len() * 2);
-    for mut item in std::mem::take(items) {
-        if let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &mut item.kind {
-            rewrite_observation_item_list(children, plans, mains)?;
-        }
-        if let Some(requested) = mains.get(&item.id) {
-            item = fixed_main_item().map_err(|mut error| {
-                error.item = Some(Box::new((*requested).clone()));
-                error
-            })?;
-            item.attrs.clear();
-        }
-        if let Some(plan) = plans.get(&item.id) {
-            let mut implementation = plan.observation_implementation.clone();
-            implementation.attrs.clear();
-            output.push(implementation);
-            if let Some(wrapper) = &plan.wrapper {
-                let mut wrapper = wrapper.clone();
-                wrapper.attrs.clear();
-                output.push(wrapper);
-            }
-            let mut source_copy = item;
-            source_copy.attrs.clear();
-            source_copy.vis.kind = VisibilityKind::Inherited;
-            let opaque =
-                collect_opaque_nested_ifs(&source_copy, &plan.requested.path).map_err(|error| {
-                    item_error(
-                        ReplacementErrorKind::RewriteFailure,
-                        &plan.requested,
-                        error.message,
-                    )
-                })?;
-            let ItemKind::Fn(box function) = &mut source_copy.kind else { unreachable!() };
-            function.ident = parsed_ident(&plan.source_copy_name);
-            function.sig.header.ext = Extern::None;
-            ProctorLabelRemover.visit_block(function.body.as_mut().unwrap());
-            annotate_function(&mut source_copy, &opaque);
-            output.push(source_copy);
-        } else {
-            output.push(item);
-        }
-    }
-    *items = output;
-    Ok(())
-}
-
-fn rewrite_item_list(
-    items: &mut ThinVec<P<Item>>,
-    plans: &FxHashMap<NodeId, &ReplacementPlan>,
-    mains: &FxHashMap<NodeId, &ReplacementItem>,
-) -> Result<(), ReplacementError> {
-    let mut output = ThinVec::with_capacity(items.len() + plans.len());
-    for mut item in std::mem::take(items) {
-        if let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &mut item.kind {
-            rewrite_item_list(children, plans, mains)?;
-        }
-        if let Some(requested) = mains.get(&item.id) {
-            item = fixed_main_item().map_err(|mut error| {
-                error.item = Some(Box::new((*requested).clone()));
-                error
-            })?;
-        }
-        if let Some(plan) = plans.get(&item.id) {
-            output.push(plan.implementation.clone());
-            if let Some(wrapper) = &plan.wrapper {
-                output.push(wrapper.clone());
-            }
-        } else {
-            output.push(item);
-        }
-    }
-    *items = output;
-    Ok(())
 }
 
 fn fixed_main_item() -> Result<P<Item>, ReplacementError> {
