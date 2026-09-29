@@ -152,9 +152,29 @@ pub fn normalize_target_safety(source: &str) -> Result<String, ReplacementError>
 pub fn make_initial_source(source: &str) -> Result<String, ReplacementError> {
     with_parse_session(|| {
         let mut krate = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
-        retain_non_function_items(&mut krate.items);
+        replace_pending_functions(&mut krate.items);
         Ok(pprust::crate_to_string_for_macros(&krate))
     })
+}
+
+fn replace_pending_functions(items: &mut ThinVec<P<Item>>) {
+    items.retain(|item| !matches!(&item.kind, ItemKind::Fn(function) if function.body.is_some() && function.ident.name == sym::main));
+    for item in items {
+        match &mut item.kind {
+            ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) => {
+                replace_pending_functions(children);
+            }
+            ItemKind::Fn(function) if function.body.is_some() => {
+                let ident = function.ident;
+                let mut pending = utils::ast::parse_item("fn __pending() {}".to_owned());
+                let ItemKind::Fn(pending_function) = &mut pending.kind else { unreachable!() };
+                pending_function.ident = ident;
+                pending.vis = item.vis.clone();
+                **item = pending;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn retain_non_function_items(items: &mut ThinVec<P<Item>>) {
@@ -176,6 +196,30 @@ fn function_at_path<'a>(items: &'a [P<Item>], path: &[String]) -> Option<&'a P<I
         return None;
     };
     function_at_path(children, rest)
+}
+
+fn replace_function_at_path(
+    items: &mut ThinVec<P<Item>>,
+    path: &[String],
+    replacement: P<Item>,
+) -> Result<(), ReplacementError> {
+    let (first, rest) = path
+        .split_first()
+        .expect("requested function path is nonempty");
+    if rest.is_empty() {
+        let target = items.iter_mut().find(|item| {
+            matches!(&item.kind, ItemKind::Fn(function) if function.ident.to_string() == *first)
+        }).ok_or_else(|| global_error(ReplacementErrorKind::TargetResolution, format!("partial target has no function `{}`", path.join("::"))))?;
+        *target = replacement;
+        return Ok(());
+    }
+    let module = items.iter_mut().find(|item| {
+        matches!(&item.kind, ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(..)) if ident.to_string() == *first)
+    }).ok_or_else(|| global_error(ReplacementErrorKind::TargetResolution, format!("partial target has no inline module `{first}`")))?;
+    let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &mut module.kind else {
+        unreachable!()
+    };
+    replace_function_at_path(children, rest, replacement)
 }
 
 fn insert_item_at_path(
@@ -237,27 +281,11 @@ pub fn add_functions_with_observations(
             "partial target has different non-function context from analysis source".to_owned(),
         ));
     }
-    let accepted = request
-        .accepted_correspondence
-        .iter()
-        .map(|entry| (entry.logical_path.as_str(), entry))
-        .collect::<HashMap<_, _>>();
     let requested_paths = request
         .items
         .iter()
         .map(|item| item.path.as_str())
         .collect::<HashSet<_>>();
-    let partial_functions = collect_function_paths(&partial.items, &[]);
-    if partial_functions.len() != accepted.len()
-        || partial_functions
-            .iter()
-            .any(|path| !accepted.contains_key(path.as_str()))
-    {
-        return Err(global_error(
-            ReplacementErrorKind::TargetResolution,
-            "partial target functions do not match accepted correspondence".to_owned(),
-        ));
-    }
     let mut accepted_sources = vec![];
     for record in &request.accepted_correspondence {
         if record.wrapper_path.is_some()
@@ -333,12 +361,12 @@ pub fn add_functions_with_observations(
                 .map(str::to_owned)
                 .collect::<Vec<_>>(),
         )
-        .is_some()
+        .is_none()
         {
             return Err(item_error(
                 ReplacementErrorKind::TargetResolution,
                 requested,
-                "function is already installed in partial target".to_owned(),
+                "pending function is absent from partial target".to_owned(),
             ));
         }
         validate_current_target(current, requested)?;
@@ -433,20 +461,16 @@ pub fn add_functions_with_observations(
             .split("::")
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        insert_item_at_path(
+        replace_function_at_path(
             &mut partial.items,
-            &module_path[..module_path.len() - 1],
+            &module_path,
             plan.implementation.clone(),
         )?;
         let mut labeled = plan.observation_implementation.clone();
         labeled
             .attrs
             .retain(|attribute| !is_export_attribute(attribute));
-        insert_item_at_path(
-            &mut observation.items,
-            &module_path[..module_path.len() - 1],
-            labeled,
-        )?;
+        replace_function_at_path(&mut observation.items, &module_path, labeled)?;
         let original = function_at_path(&analysis.items, &module_path)
             .expect("resolved current function exists");
         let mut copy = original.clone();
@@ -524,31 +548,6 @@ pub fn add_functions_with_observations(
 
 fn crate_visible() -> rustc_ast::Visibility {
     utils::ast::parse_item("pub(crate) fn __visibility() {}".to_owned()).vis
-}
-
-fn collect_function_paths(items: &[P<Item>], module: &[String]) -> Vec<String> {
-    let mut paths = vec![];
-    for item in items {
-        match &item.kind {
-            ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) => {
-                let mut nested = module.to_vec();
-                nested.push(ident.to_string());
-                paths.extend(collect_function_paths(children, &nested));
-            }
-            ItemKind::Fn(function) if function.body.is_some() => {
-                paths.push(
-                    module
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once(function.ident.to_string()))
-                        .collect::<Vec<_>>()
-                        .join("::"),
-                );
-            }
-            _ => {}
-        }
-    }
-    paths
 }
 
 fn validate_additive_macro_rewrites(
@@ -642,22 +641,6 @@ pub fn finalize_additive_source(
         return Err(global_error(
             ReplacementErrorKind::TargetResolution,
             "partial target has different non-function context from analysis source".to_owned(),
-        ));
-    }
-    let expected = functions
-        .iter()
-        .filter(|function| !function_named(function, "main"))
-        .map(|function| function.path.as_str())
-        .collect::<HashSet<_>>();
-    let installed = collect_function_paths(&partial.items, &[]);
-    if installed.len() != expected.len()
-        || installed
-            .iter()
-            .any(|path| !expected.contains(path.as_str()))
-    {
-        return Err(global_error(
-            ReplacementErrorKind::TargetResolution,
-            "partial target does not contain exactly the accepted non-main functions".to_owned(),
         ));
     }
     for main_0 in functions.iter().filter(|function| {

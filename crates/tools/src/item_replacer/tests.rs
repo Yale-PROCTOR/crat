@@ -245,6 +245,10 @@ fn compile(source: &str) {
     run_compiler_on_str(source, |_| ()).unwrap();
 }
 
+fn compile_checked(source: &str) {
+    run_compiler_on_str(source, utils::type_check).unwrap();
+}
+
 fn compact(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -253,12 +257,85 @@ fn count(source: &str, needle: &str) -> usize {
     source.match_indices(needle).count()
 }
 
+fn assert_function_at_path(source: &str, path: &str, expected: &str) {
+    with_parse_session(|| {
+        let krate = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
+        let segments = path.split("::").collect::<Vec<_>>();
+        let mut items = &krate.items[..];
+        for module_name in &segments[..segments.len() - 1] {
+            let modules = items
+                .iter()
+                .filter(|item| {
+                    matches!(&item.kind, ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(..)) if ident.to_string() == *module_name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(modules.len(), 1, "expected one module at `{path}`");
+            let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &modules[0].kind
+            else {
+                unreachable!()
+            };
+            items = children;
+        }
+        let name = segments.last().unwrap();
+        let functions = items
+            .iter()
+            .filter(|item| {
+                matches!(&item.kind, ItemKind::Fn(function) if function.ident.to_string() == *name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(functions.len(), 1, "expected one function at `{path}`");
+        let expected = utils::ast::parse_item(expected.to_owned());
+        assert_eq!(
+            compact(&pprust::item_to_string(functions[0])),
+            compact(&pprust::item_to_string(&expected)),
+            "function at `{path}` differs"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn assert_only_item_of_kind_in_module(source: &str, module_path: &str, expected: &str) {
+    with_parse_session(|| {
+        let krate = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
+        let expected = utils::ast::parse_item(expected.to_owned());
+        let mut items = &krate.items[..];
+        for module_name in module_path.split("::").filter(|segment| !segment.is_empty()) {
+            let modules = items
+                .iter()
+                .filter(|item| {
+                    matches!(&item.kind, ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(..)) if ident.to_string() == module_name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(modules.len(), 1, "expected one module at `{module_path}`");
+            let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &modules[0].kind
+            else {
+                unreachable!()
+            };
+            items = children;
+        }
+        let matching = items
+            .iter()
+            .filter(|item| std::mem::discriminant(&item.kind) == std::mem::discriminant(&expected.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "expected one matching item in `{module_path}`");
+        assert_eq!(
+            compact(&pprust::item_to_string(matching[0])),
+            compact(&pprust::item_to_string(&expected)),
+            "item in `{module_path}` differs"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
 #[test]
-fn initial_projection_keeps_context_and_omits_all_free_functions() {
+fn initial_projection_keeps_context_and_pending_functions() {
     let source = r#"#![allow(dead_code)]
 use core::ffi::c_int;
 const BASE: c_int = 3;
-mod inner { pub struct Cell { pub value: c_int } pub unsafe fn leaf() {} mod deep { pub fn main() {} } }
+mod inner { use super::c_int; pub struct Cell { pub value: c_int } pub unsafe fn leaf() {} mod deep { pub fn main() {} } }
+mod consumer { use crate::inner::leaf; }
 pub fn main() {}
 "#;
     let initial = make_initial_source(source).unwrap();
@@ -269,9 +346,252 @@ pub fn main() {}
     assert!(compact.contains("mod inner"));
     assert!(compact.contains("pub struct Cell"));
     assert!(compact.contains("mod deep"));
-    assert!(!compact.contains("fn leaf"));
+    assert!(compact.contains("pub fn leaf() {}"));
+    assert_eq!(count(&initial, "fn leaf"), 1);
+    assert!(!compact.contains("unsafe fn leaf"));
+    assert!(compact.contains("use crate::inner::leaf"));
     assert!(!compact.contains("fn main"));
-    compile(&initial);
+    assert_function_at_path(&initial, "inner::leaf", "pub fn leaf() {}");
+    compile_checked(&initial);
+}
+
+#[test]
+fn pending_function_resolves_cross_module_import() {
+    let analysis =
+        "mod defs { pub unsafe fn foo(p: i32) -> i32 { p } } mod imports { use crate::defs::foo; }";
+    let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "defs::foo", "pub fn foo() {}");
+    assert!(compact(&initial).contains("mod defs { pub fn foo() {} }"));
+    assert!(compact(&initial).contains("use crate::defs::foo"));
+    compile_checked(&initial);
+    let accepted = add(
+        analysis,
+        &initial,
+        &request(
+            "defs::foo",
+            "foo",
+            "unsafe fn foo(p: i32) -> i32 { #[proctor(0)] p }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(count(&accepted.replacement.source, "fn foo"), 1);
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "defs::foo",
+        "pub unsafe fn foo(p: i32) -> i32 { p }",
+    );
+    assert!(accepted.replacement.source.contains("use crate::defs::foo"));
+    compile_checked(&accepted.replacement.source);
+}
+
+#[test]
+fn pending_functions_resolve_grouped_imports_and_reexports() {
+    let analysis = "mod defs { pub unsafe fn f(p: i32) -> i32 { p } pub unsafe fn g() {} } mod imported { use crate::defs::{f as renamed, g}; } mod api { pub use crate::defs::{f as public_f, g}; }";
+    let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "defs::f", "pub fn f() {}");
+    assert_function_at_path(&initial, "defs::g", "pub fn g() {}");
+    assert!(compact(&initial).contains("pub fn f() {} pub fn g() {}"));
+    assert!(initial.contains("f as renamed"));
+    assert!(initial.contains("f as public_f"));
+    compile_checked(&initial);
+    let first = add(
+        analysis,
+        &initial,
+        &request(
+            "defs::f",
+            "f",
+            "unsafe fn f(p: i32) -> i32 { #[proctor(0)] p }",
+        ),
+    )
+    .unwrap();
+    assert!(compact(&first.replacement.source).contains("pub fn g() {}"));
+    assert_function_at_path(
+        &first.replacement.source,
+        "defs::f",
+        "pub unsafe fn f(p: i32) -> i32 { p }",
+    );
+    assert_function_at_path(&first.replacement.source, "defs::g", "pub fn g() {}");
+    compile_checked(&first.replacement.source);
+    let mut next = request("defs::g", "g", "unsafe fn g() {}");
+    next.items[0].id = 8;
+    next.accepted_correspondence = first.new_correspondence;
+    let second = add(analysis, &first.replacement.source, &next).unwrap();
+    assert_eq!(count(&second.replacement.source, "fn f"), 1);
+    assert_eq!(count(&second.replacement.source, "fn g"), 1);
+    assert_function_at_path(
+        &second.replacement.source,
+        "defs::f",
+        "pub unsafe fn f(p: i32) -> i32 { p }",
+    );
+    assert_function_at_path(
+        &second.replacement.source,
+        "defs::g",
+        "pub unsafe fn g() {}",
+    );
+    assert!(second.replacement.source.contains("f as renamed"));
+    assert!(second.replacement.source.contains("f as public_f"));
+    for source in [
+        &initial,
+        &first.replacement.source,
+        &second.replacement.source,
+    ] {
+        assert_only_item_of_kind_in_module(
+            source,
+            "imported",
+            "use crate::defs::{f as renamed, g};",
+        );
+        assert_only_item_of_kind_in_module(
+            source,
+            "api",
+            "pub use crate::defs::{f as public_f, g};",
+        );
+    }
+    compile_checked(&second.replacement.source);
+}
+
+#[test]
+fn pending_functions_keep_visibility_and_nested_paths() {
+    let analysis = "mod a { pub unsafe fn chosen() {} } mod b { unsafe fn chosen() {} pub(crate) mod deep { pub(crate) unsafe fn nested() {} pub(super) unsafe fn restricted() {} } } mod consumer { use crate::a::*; use crate::b::*; use crate::b::deep::nested; }";
+    let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "a::chosen", "pub fn chosen() {}");
+    assert_function_at_path(&initial, "b::chosen", "fn chosen() {}");
+    assert_function_at_path(&initial, "b::deep::nested", "pub(crate) fn nested() {}");
+    assert_function_at_path(
+        &initial,
+        "b::deep::restricted",
+        "pub(super) fn restricted() {}",
+    );
+    let text = compact(&initial);
+    assert!(text.contains("mod a { pub fn chosen() {} }"));
+    assert!(text.contains("mod b { fn chosen() {} pub(crate) mod deep { pub(crate) fn nested() {} pub(super) fn restricted() {} } }"));
+    assert!(text.contains("use crate::a::*"));
+    assert!(text.contains("use crate::b::*"));
+    assert!(text.contains("use crate::b::deep::nested"));
+    compile_checked(&initial);
+    let accepted = add(
+        analysis,
+        &initial,
+        &request("b::chosen", "chosen", "unsafe fn chosen() {}"),
+    )
+    .unwrap();
+    assert!(compact(&accepted.replacement.source).contains("mod a { pub fn chosen() {} }"));
+    assert!(compact(&accepted.replacement.source).contains("mod b { unsafe fn chosen() {}"));
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "b::chosen",
+        "unsafe fn chosen() {}",
+    );
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "a::chosen",
+        "pub fn chosen() {}",
+    );
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "b::deep::nested",
+        "pub(crate) fn nested() {}",
+    );
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "b::deep::restricted",
+        "pub(super) fn restricted() {}",
+    );
+    compile_checked(&accepted.replacement.source);
+}
+
+#[test]
+fn pending_function_drops_metadata_but_keeps_foreign_declarations() {
+    let analysis = "#[no_mangle] pub unsafe extern \"C\" fn exported(p: *const i32) -> i32 { *p } extern \"C\" { fn foreign(p: *const i8) -> i32; }";
+    let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "exported", "pub fn exported() {}");
+    assert!(compact(&initial).contains("pub fn exported() {}"));
+    assert!(!initial.contains("no_mangle"));
+    assert!(!initial.contains("unsafe fn exported"));
+    assert!(compact(&initial).contains("fn foreign(p: *const i8) -> i32;"));
+    assert_only_item_of_kind_in_module(
+        &initial,
+        "",
+        "extern \"C\" { fn foreign(p: *const i8) -> i32; }",
+    );
+    compile_checked(&initial);
+    let accepted = add(
+        analysis,
+        &initial,
+        &request(
+            "exported",
+            "exported",
+            "unsafe fn exported(p: &i32) -> i32 { #[proctor(0)] *p }",
+        ),
+    )
+    .unwrap();
+    assert!(accepted.replacement.source.contains("#[no_mangle]"));
+    assert!(
+        accepted
+            .replacement
+            .source
+            .contains("pub unsafe extern \"C\" fn exported(p: &i32)")
+    );
+    assert!(compact(&accepted.replacement.source).contains("fn foreign(p: *const i8) -> i32;"));
+    assert_only_item_of_kind_in_module(
+        &accepted.replacement.source,
+        "",
+        "extern \"C\" { fn foreign(p: *const i8) -> i32; }",
+    );
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "exported",
+        "#[no_mangle] pub unsafe extern \"C\" fn exported(p: &i32) -> i32 { *p }",
+    );
+    compile_checked(&accepted.replacement.source);
+}
+
+#[test]
+fn pending_raw_identifier_keeps_import_and_original_spelling() {
+    let analysis = "mod api { pub unsafe fn r#type(x: i32) -> i32 { x } } mod imported { use crate::api::r#type as chosen; }";
+    let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "api::r#type", "pub fn r#type() {}");
+    assert!(compact(&initial).contains("pub fn r#type() {}"));
+    assert!(initial.contains("use crate::api::r#type as chosen"));
+    compile_checked(&initial);
+    let accepted = add(
+        analysis,
+        &initial,
+        &request(
+            "api::r#type",
+            "r#type",
+            "unsafe fn r#type(x: i32) -> i32 { #[proctor(0)] x }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(count(&accepted.replacement.source, "fn r#type"), 1);
+    assert_function_at_path(
+        &accepted.replacement.source,
+        "api::r#type",
+        "pub unsafe fn r#type(x: i32) -> i32 { x }",
+    );
+    assert!(
+        accepted
+            .replacement
+            .source
+            .contains("use crate::api::r#type as chosen")
+    );
+    compile_checked(&accepted.replacement.source);
+}
+
+#[test]
+fn excluded_main_import_remains_unresolved() {
+    let source = "pub fn main() {} mod inner { pub fn main() {} }";
+    let initial = make_initial_source(source).unwrap();
+    assert!(!initial.contains("fn main"));
+    let finalized = finalize(source, &initial, &[]).unwrap();
+    assert_eq!(count(&finalized.source, "fn main"), 2);
+    assert_function_at_path(&finalized.source, "main", "pub fn main() {}");
+    assert_function_at_path(&finalized.source, "inner::main", "pub fn main() {}");
+    let unresolved =
+        make_initial_source("pub fn main() {} mod consumer { use crate::main; }").unwrap();
+    assert!(!unresolved.contains("fn main"));
+    assert!(unresolved.contains("use crate::main"));
+    assert!(run_compiler_on_str(&unresolved, utils::type_check).is_err());
 }
 
 #[test]
@@ -281,6 +601,9 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     pub unsafe fn caller(p: *mut i32) -> i32 { leaf(p) }
 }"#;
     let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "inner::leaf", "pub fn leaf() {}");
+    assert_function_at_path(&initial, "inner::caller", "pub fn caller() {}");
+    compile_checked(&initial);
     let first = add(
         analysis,
         &initial,
@@ -293,9 +616,20 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     .unwrap();
     assert!(first.replacement.source.contains("Box<[i32]>"));
     assert!(!first.replacement.source.contains("__proctor_wrapper"));
-    assert!(!first.replacement.source.contains("fn caller"));
+    assert!(compact(&first.replacement.source).contains("pub fn caller() {}"));
+    assert_eq!(count(&first.replacement.source, "fn leaf"), 1);
+    assert_function_at_path(
+        &first.replacement.source,
+        "inner::leaf",
+        "pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] }",
+    );
+    assert_function_at_path(
+        &first.replacement.source,
+        "inner::caller",
+        "pub fn caller() {}",
+    );
     assert!(first.source_stubs.is_empty());
-    compile(&first.replacement.source);
+    compile_checked(&first.replacement.source);
     let mut second_request = request(
         "inner::caller",
         "caller",
@@ -304,6 +638,12 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     second_request.items[0].id = 8;
     second_request.accepted_correspondence = first.new_correspondence.clone();
     let second = add(analysis, &first.replacement.source, &second_request).unwrap();
+    assert_eq!(second.accepted_correspondence, first.new_correspondence);
+    assert_eq!(second.new_correspondence[0].logical_path, "inner::caller");
+    assert_eq!(
+        second.new_correspondence[0].implementation_path,
+        "inner::caller"
+    );
     assert_eq!(
         second.source_stubs,
         vec![SourceStub {
@@ -318,7 +658,38 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     );
     assert!(!second.replacement.source.contains("source_stub"));
     assert!(!second.replacement.source.contains("__proctor_wrapper"));
-    compile(&second.replacement.source);
+    assert_eq!(count(&second.replacement.source, "fn caller"), 1);
+    assert!(compact(&second.replacement.source).contains("fn caller(p: Box<[i32]>)"));
+    assert_function_at_path(
+        &second.replacement.source,
+        "inner::leaf",
+        "pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] }",
+    );
+    assert_function_at_path(
+        &second.replacement.source,
+        "inner::caller",
+        "pub unsafe fn caller(p: Box<[i32]>) -> i32 { leaf(p) }",
+    );
+    assert_function_at_path(
+        &second.observation_source,
+        "inner::caller",
+        "pub unsafe fn caller(p: Box<[i32]>) -> i32 { #[proctor(0)] leaf(p) }",
+    );
+    assert_eq!(
+        second.current_items[0].source_copy_path,
+        "inner::__proctor_source_caller"
+    );
+    assert_function_at_path(
+        &second.observation_source,
+        "inner::__proctor_source_caller",
+        "pub(crate) unsafe fn __proctor_source_caller(p: *mut i32) -> i32 { #[proctor(0)] crate::inner::__proctor_source_stub_leaf(p) }",
+    );
+    assert_function_at_path(
+        &second.observation_source,
+        "inner::__proctor_source_stub_leaf",
+        "pub(crate) unsafe fn __proctor_source_stub_leaf(p: *mut i32) -> i32 { todo!() }",
+    );
+    compile_checked(&second.replacement.source);
     compile(&second.observation_source);
     let metadata = crate::ReplacementObservationMetadata::from_additive_output(
         &second,
@@ -375,15 +746,22 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     assert_eq!(count(&finalized.source, "fn leaf"), 1);
     assert!(compact(&finalized.source).contains("fn leaf(p: Box<[i32]>)"));
     assert!(!finalized.source.contains("__proctor_wrapper"));
+    assert!(!finalized.source.contains("__proctor_source"));
+    assert_function_at_path(
+        &finalized.source,
+        "inner::caller",
+        "pub unsafe fn caller(p: Box<[i32]>) -> i32 { leaf(p) }",
+    );
 }
 
 #[test]
 fn finalization_keeps_changed_apis_at_original_paths() {
     let analysis = r#"#[no_mangle] pub unsafe extern "C" fn first(p: *const i32) -> i32 { *p }
-pub unsafe fn middle(p: *const i32) -> i32 { *p }
+unsafe fn middle(p: *const i32) -> i32 { *p }
 #[export_name = "public_last"] pub unsafe extern "C" fn last(p: *const i32) -> i32 { *p }
 pub fn main() {}"#;
     let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "middle", "fn middle() {}");
     let mut partial = initial;
     for (id, name) in [(1, "first"), (2, "middle"), (3, "last")] {
         let transformation = if name == "last" {
@@ -412,6 +790,21 @@ pub fn main() {}"#;
     assert!(source.contains("fn main"));
     assert!(source.contains("pub unsafe extern \"C\" fn first(p: &i32)"));
     assert!(source.contains("fn middle(p: &i32)"));
+    assert_function_at_path(
+        &final_result.source,
+        "middle",
+        "unsafe fn middle(p: &i32) -> i32 { *p }",
+    );
+    assert_function_at_path(
+        &final_result.source,
+        "first",
+        "#[no_mangle] pub unsafe extern \"C\" fn first(p: &i32) -> i32 { *p }",
+    );
+    assert_function_at_path(
+        &final_result.source,
+        "last",
+        "#[export_name = \"public_last\"] pub unsafe extern \"C\" fn last(p: &[i32]) -> i32 { p[0] }",
+    );
     assert!(source.contains("pub unsafe extern \"C\" fn last(p: &[i32])"));
     assert!(source.contains("fn last(p: &[i32]) -> i32 { p[0] }"));
     assert_eq!(count(&final_result.source, "#[no_mangle]"), 1);
@@ -430,6 +823,8 @@ fn additive_cross_module_recursive_group_uses_visible_source_copies() {
     let analysis = r#"mod a { pub unsafe fn even(n: u32) -> bool { if n == 0 { true } else { crate::b::odd(n - 1) } } }
 mod b { pub unsafe fn odd(n: u32) -> bool { if n == 0 { false } else { crate::a::even(n - 1) } } }"#;
     let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "a::even", "pub fn even() {}");
+    assert_function_at_path(&initial, "b::odd", "pub fn odd() {}");
     let request = request_with_items(
         vec![
             replacement_item(1, "a::even", "even"),
@@ -439,6 +834,36 @@ mod b { pub unsafe fn odd(n: u32) -> bool { if n == 0 { false } else { crate::a:
 unsafe fn odd(n: u32) -> bool { #[proctor(0)] if n == 0 { false } else { crate::a::even(n - 1) } }"#,
     );
     let output = add(analysis, &initial, &request).unwrap();
+    assert_function_at_path(
+        &output.replacement.source,
+        "a::even",
+        "pub unsafe fn even(n: u32) -> bool { if n == 0 { true } else { crate::b::odd(n - 1) } }",
+    );
+    assert_function_at_path(
+        &output.replacement.source,
+        "b::odd",
+        "pub unsafe fn odd(n: u32) -> bool { if n == 0 { false } else { crate::a::even(n - 1) } }",
+    );
+    assert_function_at_path(
+        &output.observation_source,
+        "a::even",
+        "pub unsafe fn even(n: u32) -> bool { #[proctor(0)] if n == 0 { #[proctor(1)] true } else { #[proctor(2)] crate::b::odd(n - 1) } }",
+    );
+    assert_function_at_path(
+        &output.observation_source,
+        "b::odd",
+        "pub unsafe fn odd(n: u32) -> bool { #[proctor(0)] if n == 0 { #[proctor(1)] false } else { #[proctor(2)] crate::a::even(n - 1) } }",
+    );
+    assert_function_at_path(
+        &output.observation_source,
+        "a::__proctor_source_even",
+        "pub(crate) unsafe fn __proctor_source_even(n: u32) -> bool { #[proctor(0)] if n == 0 { #[proctor(1)] true } else { #[proctor(2)] crate::b::__proctor_source_odd(n - 1) } }",
+    );
+    assert_function_at_path(
+        &output.observation_source,
+        "b::__proctor_source_odd",
+        "pub(crate) unsafe fn __proctor_source_odd(n: u32) -> bool { #[proctor(0)] if n == 0 { #[proctor(1)] false } else { #[proctor(2)] crate::a::__proctor_source_even(n - 1) } }",
+    );
     assert!(output.source_stubs.is_empty());
     assert!(
         output
@@ -483,14 +908,11 @@ fn additive_rejects_wrong_path_and_repeated_installation() {
         &request("a::f", "f", "unsafe fn f() {}"),
     )
     .unwrap();
-    let error = add(
-        analysis,
-        &first.replacement.source,
-        &request("a::f", "f", "unsafe fn f() {}"),
-    )
-    .unwrap_err();
-    assert_eq!(error.kind, ReplacementErrorKind::TargetResolution);
-    assert!(!first.replacement.source.contains("mod b { pub unsafe fn f"));
+    let mut repeated = request("a::f", "f", "unsafe fn f() {}");
+    repeated.accepted_correspondence = first.new_correspondence.clone();
+    let error = add(analysis, &first.replacement.source, &repeated).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::InvalidRequest);
+    assert!(compact(&first.replacement.source).contains("mod b { pub fn f() {} }"));
 }
 
 #[test]
@@ -685,6 +1107,8 @@ fn finalization_selects_all_same_named_functions_and_deduplicates_api_entries() 
     let analysis = r#"mod a { pub unsafe fn work(p: *const i32) -> i32 { *p } }
 mod b { pub unsafe fn work(p: *const i32) -> i32 { *p } }"#;
     let initial = make_initial_source(analysis).unwrap();
+    assert_function_at_path(&initial, "a::work", "pub fn work() {}");
+    assert_function_at_path(&initial, "b::work", "pub fn work() {}");
     let first = add(
         analysis,
         &initial,
@@ -704,6 +1128,26 @@ mod b { pub unsafe fn work(p: *const i32) -> i32 { *p } }"#;
     second_request.accepted_correspondence = first.new_correspondence;
     let second = add(analysis, &first.replacement.source, &second_request).unwrap();
     let final_result = finalize(analysis, &second.replacement.source, &["work", "work"]).unwrap();
+    assert_function_at_path(
+        &second.replacement.source,
+        "a::work",
+        "pub unsafe fn work(p: &i32) -> i32 { *p }",
+    );
+    assert_function_at_path(
+        &second.replacement.source,
+        "b::work",
+        "pub unsafe fn work(p: &i32) -> i32 { *p }",
+    );
+    assert_function_at_path(
+        &final_result.source,
+        "a::work",
+        "pub unsafe fn work(p: &i32) -> i32 { *p }",
+    );
+    assert_function_at_path(
+        &final_result.source,
+        "b::work",
+        "pub unsafe fn work(p: &i32) -> i32 { *p }",
+    );
     assert_eq!(count(&final_result.source, "fn work"), 2);
     assert_eq!(count(&final_result.source, "p: &i32"), 2);
     assert!(!final_result.source.contains("__proctor_wrapper"));
@@ -1829,7 +2273,7 @@ unsafe fn choose<'a, 'b>(first: &'a i32, second: &'b i32, take_first: bool) -> &
     let text = compact(&output);
     assert!(text.contains("unsafe fn choose<'a, 'b>(first: &'a i32, second: &'b i32"));
     assert!(!text.contains("__proctor_wrapper"));
-    assert!(!text.contains("fn caller"));
+    assert!(text.contains("pub fn caller() {}"));
     compile(&output);
 }
 
@@ -1901,7 +2345,7 @@ fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
     let output = add_output(source, &request).unwrap();
     assert_eq!(
         compact(&output.source),
-        "pub unsafe fn second() { return; } pub unsafe fn first() { return; }"
+        "pub unsafe fn first() { return; } pub unsafe fn second() { return; }"
     );
     assert_eq!(
         output.statement_pairs,
