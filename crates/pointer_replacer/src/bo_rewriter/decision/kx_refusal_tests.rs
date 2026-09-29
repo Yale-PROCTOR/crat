@@ -145,3 +145,62 @@ fn w6l_mkc_a_count_that_is_not_a_mask_stays_licensed() {
         "{source}"
     );
 }
+
+/// MKm — item 6's second control: R477-6's MASKED arm licenses `mask + 1` on
+/// its own proof (the callee's indexes are masked by the companion), and the
+/// mask-as-count refusal leaves it alone.
+#[test]
+fn w6l_mkm_the_masked_arm_keeps_mask_plus_one() {
+    let input = r###"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case, unused_unsafe)]
+unsafe extern "C" fn StoreH2(mut data: *const u8, mut mask: usize, mut ix: usize) -> u32 {
+    (*data.offset((ix & mask) as isize) as u32).wrapping_add(*data.offset(((ix & mask) + 1) as isize) as u32)
+}
+unsafe extern "C" fn StitchH2(mut ringbuffer: *const u8, mut ringbuffer_mask: usize, mut position: usize) -> u32 {
+    StoreH2(ringbuffer, ringbuffer_mask, position)
+}
+pub unsafe fn Top(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) -> u32 {
+    let mut ringbuffer = addr as *const u8;
+    StitchH2(ringbuffer, ringbuffer_mask, n)
+}
+"###;
+    let edits = edits(input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && replacement.contains("ringbuffer_mask")
+            && extent.contains("MaskPlusOne")),
+        "{edits:#?}"
+    );
+}
+
+/// MK2 (the review's L3) — a mask reached through a plain alias
+/// (`let m = ringbuffer_mask;`) is still a mask.
+#[test]
+fn w6l_mk2_a_mask_through_an_alias_is_not_a_count() {
+    let input = MASK_AS_COUNT.replace(
+        "    FindAllMatchesH10(ringbuffer, ringbuffer_mask, n)",
+        "    let mut m = ringbuffer_mask;\n    FindAllMatchesH10(ringbuffer, m, n)",
+    );
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:m")),
+        "{edits:#?}"
+    );
+}
+
+/// MK3 (the review's L3) — the callee's own formal names the mask: a caller
+/// argument spelled otherwise is still handed to `ring_buffer_mask`.
+#[test]
+fn w6l_mk3_a_count_handed_to_a_mask_formal_is_refused() {
+    let input = MASK_AS_COUNT.replace("ringbuffer_mask", "window");
+    let edits = edits(&input);
+    assert!(
+        edits.iter().any(|(replacement, extent)| replacement
+            .contains("from_raw_parts(ringbuffer,")
+            && extent.contains("mask-as-count:window")),
+        "{edits:#?}"
+    );
+}
