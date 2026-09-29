@@ -117,6 +117,11 @@ pub(crate) enum CertificateKind {
     /// storage overlapping a live object, so the two are distinct allocations
     /// whatever their types — no P3 is needed.
     AllocationIdentity,
+    /// R645-10: the same, where the block came from an allocator admitted
+    /// under R409-1's CONTRACT rather than a resolved allocator call — the
+    /// contract is what says it returns storage overlapping no live object. A
+    /// separate kind so the census counts the sites that rest on it.
+    AllocationIdentityUnderContract,
 }
 
 impl CertificateKind {
@@ -135,6 +140,9 @@ impl CertificateKind {
             }
             Self::ReadReadShared => "pair-disjoint:read-read-shared",
             Self::AllocationIdentity => "pair-disjoint:allocation-identity",
+            Self::AllocationIdentityUnderContract => {
+                "pair-disjoint:allocation-identity:allocator-contract"
+            }
         }
     }
 
@@ -329,7 +337,9 @@ impl RootClass {
     /// The contract receipt this root carries, if its freshness rests on one.
     fn freshness(self) -> Freshness {
         match self {
-            Self::FreshAlloc(_, freshness) | Self::AllocatedHere(_, freshness) => freshness,
+            Self::FreshAlloc(_, freshness)
+            | Self::AllocatedHere(_, freshness)
+            | Self::FreshField { freshness, .. } => freshness,
             _ => Freshness::Proven,
         }
     }
@@ -1202,7 +1212,7 @@ impl PairDisjointnessIndex {
         // object, so they are distinct allocations whatever their types.
         for (field, other) in [(a, b), (b, a)] {
             if field.stored_since_entry && predates_or_is_not_a_block(other.class) {
-                return Ok(CertificateKind::AllocationIdentity);
+                return Ok(allocation_identity(field.class.freshness()));
             }
         }
         // R628-7 (f′), the same claim one call up: the field is read through
@@ -1216,7 +1226,9 @@ impl PairDisjointnessIndex {
                 && q != p
             {
                 match self.stored_before_call(caller, q, key, p, 0, &mut Vec::new()) {
-                    Some(PairSeparation::Proven) => return Ok(CertificateKind::AllocationIdentity),
+                    Some(PairSeparation::Proven) => {
+                        return Ok(allocation_identity(field.class.freshness()));
+                    }
                     // R631-11: the chain reached an exported entry, W4's edge.
                     Some(PairSeparation::Waived) => {
                         return Ok(CertificateKind::ExportedEntryWaiver);
@@ -1444,6 +1456,15 @@ impl PairDisjointnessIndex {
 /// allocated; a stack object or a static is no block an allocator ever returns.
 /// Either way the two are distinct allocations. A fresh local is not: the field
 /// may have been admitted through that very local (R579-3 (c)).
+/// R645-10: allocation identity, receipted by where the block's freshness came
+/// from.
+fn allocation_identity(freshness: Freshness) -> CertificateKind {
+    match freshness {
+        Freshness::Proven => CertificateKind::AllocationIdentity,
+        Freshness::Contract => CertificateKind::AllocationIdentityUnderContract,
+    }
+}
+
 fn predates_or_is_not_a_block(class: RootClass) -> bool {
     matches!(
         class,
@@ -1527,9 +1548,9 @@ fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     // receipt. Beside another fresh local, or another such local, it may be the
     // same block.
     match (a, b) {
-        (RootClass::AllocatedHere(..), other) | (other, RootClass::AllocatedHere(..)) => {
-            return predates_or_is_not_a_block(other)
-                .then_some(CertificateKind::AllocationIdentity);
+        (RootClass::AllocatedHere(_, freshness), other)
+        | (other, RootClass::AllocatedHere(_, freshness)) => {
+            return predates_or_is_not_a_block(other).then(|| allocation_identity(freshness));
         }
         _ => {}
     }
