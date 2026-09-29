@@ -569,3 +569,99 @@ fn w6l_seethrough_v4_the_forwarder_join_in_either_order() {
         assert!(map.iter().any(|(l, _)| l == "caller::fwd"), "{map:#?}");
     }
 }
+
+/// The guard's set (main's R416-5, guard mode) for one fixture.
+fn guard_set(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx)?;
+        let set =
+            super::local_callee_extent::accessed_past_one_element(tcx, &ctx.subjects, &ctx.facts);
+        let mut names = set
+            .iter()
+            .map(|(function, index)| format!("{}:{index}", tcx.item_name(function.to_def_id())))
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok::<_, String>(names)
+    })
+    .expect("fixture compiles")
+    .expect("decision table")
+}
+
+/// G2 (relay 064 review, finding 1) — a `c_void` formal with a LITERAL byte
+/// footprint is past one element only against the caller's element, which the
+/// guard's set does not carry: `clear4` (4 bytes) is left out, as main's guard
+/// left every uncast `c_void` formal out, so an `i32` handed to it is not
+/// refused. A runtime count (`clear_n`) and a sized formal's contract
+/// (`fill64`, bytes past its `u8`) stay in.
+#[test]
+fn w6l_seethrough_g2_a_literal_void_footprint_is_not_the_guards_to_judge() {
+    let set = guard_set(FOOTPRINT_JOIN);
+    assert!(!set.iter().any(|name| name == "clear4:0"), "{set:?}");
+    for name in ["clear_n:0", "fill64:0"] {
+        assert!(set.iter().any(|n| n == name), "{name}: {set:?}");
+    }
+}
+
+/// X4 (relay 064 review, finding 2) — C's `if (!s[0])` preamble
+/// (`*p.offset(0)`, R641-2) is not arithmetic for the walk either: main's
+/// guard exempts it, so a parameter that only reads element 0 in place
+/// carries its NUL walk to its caller, which no other set holds.
+#[test]
+fn w6l_seethrough_x4_element_zero_in_place_carries_the_walk() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn f(mut p: *const i8) -> u64 {
+    if *p.offset(0 as i32 as isize) as i32 == 0 as i32 {
+        return 0 as u64;
+    }
+    strlen(p)
+}
+pub unsafe fn g(mut name: *const i8) -> u64 {
+    f(name)
+}
+"#;
+    let held = held(input);
+    assert!(held.iter().any(|l| l == "g::name"), "{held:?}");
+}
+
+/// X2 / X3 (relay 064 review, finding 6) — the arithmetic gate at the call
+/// loop (`b::p` steps, so `a::x` is not carried) and at the copy loop (`f::p`
+/// steps before `let q = p`, so `h::y` is not carried); both parameters are
+/// held themselves.
+#[test]
+fn w6l_seethrough_x2_x3_the_gate_at_the_call_and_copy_loops() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn c(mut s: *const i8) -> u64 {
+    strlen(s)
+}
+unsafe fn b(mut p: *const i8) -> u64 {
+    let mut first = *p.offset(1 as i32 as isize);
+    c(p)
+}
+pub unsafe fn a(mut x: *const i8) -> u64 {
+    b(x)
+}
+unsafe fn f(mut p: *const i8) -> u64 {
+    let mut first = *p.offset(1 as i32 as isize);
+    let mut q = p;
+    strlen(q)
+}
+pub unsafe fn h(mut y: *const i8) -> u64 {
+    f(y)
+}
+"#;
+    let held = held(input);
+    for label in ["c::s", "b::p", "f::p"] {
+        assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
+    for label in ["a::x", "h::y"] {
+        assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
+}
