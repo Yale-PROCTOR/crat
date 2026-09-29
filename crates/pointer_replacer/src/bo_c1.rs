@@ -13084,6 +13084,40 @@ mod run {
             stamp(&owner_view_receipts),
         )
         .expect("write owner-view attributions");
+        // R675: the R462-1 surface shape, receipted per exported entry.
+        let exported_pairs = capture
+            .emitted_files
+            .as_ref()
+            .map(|files| {
+                super::exported_entry_same_pointee_pairs(
+                    &files
+                        .iter()
+                        .map(|(file, source)| (format!("{file:?}"), source.clone()))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        let mut exported_pair_rows = String::from("entry\tpointee\tformals\treceipt\n");
+        for (entry, pointee, formals) in &exported_pairs {
+            exported_pair_rows.push_str(&format!(
+                "{entry}\t{pointee}\t{}\texported-entry:same-pointee-mut-pair\n",
+                formals.join(",")
+            ));
+        }
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-exported-entry-pairs.tsv")),
+            stamp(&exported_pair_rows),
+        )
+        .expect("write exported-entry pairs");
+        row.set(
+            raw_schema::EXPORTED_ENTRY_SAME_POINTEE_MUT_PAIR,
+            exported_pairs
+                .iter()
+                .map(|(entry, _, _)| entry)
+                .collect::<BTreeSet<_>>()
+                .len()
+                .to_string(),
+        );
         row.set(raw_schema::REALIZED_SUBJECTS, tally.realized);
         row.set(raw_schema::DEGRADED_SUBJECTS, tally.degraded);
         row.set(
@@ -26465,6 +26499,94 @@ fn r760_1_the_allocator_line_reads_the_declaration_against_the_patch() {
 /// `class_id` is `local-def-index:N`, the same order key). A program with any
 /// `atom` revert attributes nothing: an atom names no class this join can
 /// read, so the rule fails closed there.
+/// **R675 (wave-6p 058 STOP 1; R462-1)** — the exported entries of an emitted tree
+/// whose signature carries two or more same-pointee reference formals with an
+/// `&mut` among them: `(entry, pointee, formals)` rows. A reference formal is `&T`,
+/// `&mut T`, `&[T]`, `&mut [T]`, or an `Option` of one; the pointee is `T`'s tokens.
+/// An exported entry is a `#[no_mangle]` fn at any module depth. This is the
+/// surface R462-1 covers for an external caller (`zcmp(a, a)`), receipted
+/// `exported-entry:same-pointee-mut-pair` whatever certificate the pair rows took.
+fn exported_entry_same_pointee_pairs(
+    sources: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String, Vec<String>)> {
+    fn reference(ty: &syn::Type) -> Option<(String, bool)> {
+        match ty {
+            syn::Type::Reference(reference) => {
+                let pointee = match reference.elem.as_ref() {
+                    syn::Type::Slice(slice) => slice.elem.as_ref(),
+                    other => other,
+                };
+                Some((
+                    quote::quote!(#pointee).to_string(),
+                    reference.mutability.is_some(),
+                ))
+            }
+            syn::Type::Path(path) => {
+                let last = path.path.segments.last()?;
+                if last.ident != "Option" {
+                    return None;
+                }
+                let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                    return None;
+                };
+                match args.args.first()? {
+                    syn::GenericArgument::Type(inner) => reference(inner),
+                    _ => None,
+                }
+            }
+            syn::Type::Paren(inner) => reference(&inner.elem),
+            _ => None,
+        }
+    }
+    fn walk(items: &[syn::Item], module: &str, out: &mut Vec<(String, String, Vec<String>)>) {
+        for item in items {
+            match item {
+                syn::Item::Mod(inner) => {
+                    if let Some((_, items)) = &inner.content {
+                        walk(items, &format!("{module}{}::", inner.ident), out);
+                    }
+                }
+                syn::Item::Fn(function)
+                    if function
+                        .attrs
+                        .iter()
+                        .any(|attribute| attribute.path().is_ident("no_mangle")) =>
+                {
+                    let mut groups =
+                        std::collections::BTreeMap::<String, (Vec<String>, bool)>::new();
+                    for input in &function.sig.inputs {
+                        let syn::FnArg::Typed(typed) = input else {
+                            continue;
+                        };
+                        let Some((pointee, mutable)) = reference(&typed.ty) else {
+                            continue;
+                        };
+                        let pat = &typed.pat;
+                        let name = quote::quote!(#pat).to_string().replace("mut ", "");
+                        let group = groups.entry(pointee).or_default();
+                        group.0.push(name);
+                        group.1 |= mutable;
+                    }
+                    for (pointee, (formals, mutable)) in groups {
+                        if formals.len() >= 2 && mutable {
+                            out.push((format!("{module}{}", function.sig.ident), pointee, formals));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for source in sources.values() {
+        if let Ok(file) = syn::parse_file(source) {
+            walk(&file.items, "", &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// **R674-6 (iii-b)** — the delivery expectation of an owner-view row: its
 /// declaration, found by owner and binding (and position, for a parameter),
 /// must carry a safe form in the emitted tree. Without it the ledger counts a
@@ -29037,6 +29159,36 @@ fn r738_1_delivery_custody_replay() {
     for issue in &report.issues {
         println!("  issue {issue}");
     }
+}
+
+/// **R675 (wave-6p 058 STOP 1)** — the R462-1 surface shape: an exported entry
+/// with two same-pointee reference formals, one `&mut` (libzahl's `zcmp`), is a
+/// row; two shared ones, a mixed pointee, or an entry that is not `#[no_mangle]`
+/// is not.
+#[test]
+fn r675_exported_entry_same_pointee_mut_pairs_are_rows() {
+    let source = r#"
+pub mod src { pub mod zcmp {
+    #[no_mangle] pub unsafe extern "C" fn zcmp(mut a: &mut z_t, mut b: Option<&z_t>) -> i32 { 0 }
+    #[no_mangle] pub unsafe extern "C" fn zread(a: &z_t, b: &z_t) -> i32 { 0 }
+    #[no_mangle] pub unsafe extern "C" fn zmix(a: &mut i32, b: &u8) -> i32 { 0 }
+    pub unsafe extern "C" fn zhidden(a: &mut i32, b: &mut i32) -> i32 { 0 }
+    #[no_mangle] pub unsafe extern "C" fn zslice(a: &mut [u8], b: &[u8], n: usize) {}
+} }
+"#;
+    let rows = exported_entry_same_pointee_pairs(&std::collections::BTreeMap::from([(
+        "lib.rs".to_owned(),
+        source.to_owned(),
+    )]));
+    let entries = rows
+        .iter()
+        .map(|(entry, _, formals)| format!("{entry}:{}", formals.join(",")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        vec!["src::zcmp::zcmp:a,b", "src::zcmp::zslice:a,b"],
+        "{rows:?}"
+    );
 }
 
 /// **R674 §2 (51r)** — a retained ledger with recorded coverage gaps replays when

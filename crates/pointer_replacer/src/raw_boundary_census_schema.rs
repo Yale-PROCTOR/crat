@@ -62,6 +62,13 @@ pub(crate) const EXPORTED_PRODUCER_WAIVER: &str = "raw_boundary_exported_produce
 /// exported-consumer waiver (`exported-consumer-waiver callee=<f>`), counted per
 /// program from the published `box-param-receipt` table.
 pub(crate) const EXPORTED_CONSUMER_WAIVER: &str = "raw_boundary_exported_consumer_waiver";
+/// **R675 (wave-6p 058 STOP 1; R462-1, USER)** — `#[no_mangle]` entries whose emitted
+/// signature carries two or more same-pointee reference formals, one of them `&mut`:
+/// the shape an external caller could alias (`zcmp(a, a)`), which R462-1 assumes it does
+/// not. Counted per program from the published `exported-entry-pairs` table, receipted
+/// `exported-entry:same-pointee-mut-pair`, beside the pair keys.
+pub(crate) const EXPORTED_ENTRY_SAME_POINTEE_MUT_PAIR: &str =
+    "raw_boundary_exported_entry_same_pointee_mut_pair";
 /// **R541-6 (wave-6v's R538-7 exemption)** — sites where a raw argument loaded from a
 /// field of a converted root was proved not to alias it, counted per program from the
 /// published `field-load-exemption-receipt` table (`alias-exempt:field-load(...)`).
@@ -293,6 +300,7 @@ pub(crate) const ALL: &[&str] = &[
     RETENTION_FRAME_BOUNDED,
     EXPORTED_PRODUCER_WAIVER,
     EXPORTED_CONSUMER_WAIVER,
+    EXPORTED_ENTRY_SAME_POINTEE_MUT_PAIR,
     ALIAS_EXEMPT_FIELD_LOAD,
     FIELD_REVERT_STATUS_NOTES,
     LAUNCH_ENV_SHA256,
