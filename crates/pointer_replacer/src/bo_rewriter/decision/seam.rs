@@ -5605,20 +5605,41 @@ pub(crate) fn synthesize_with_raw_boundary(
                     } else {
                         let argument = companion
                             .and_then(|i| site.args.iter().find(|argument| argument.index == i));
-                        // R631-4 (iv): a companion only ever `0` names no
-                        // extent. Relay 063 (item 6): a mask is not a count, on
-                        // the following-argument arm (R477-6's masked arm
-                        // licenses `mask + 1` on its own proof). Either way the
-                        // root takes the receipted fallback.
+                        // Relay 063: three refusals of a licensed companion,
+                        // each receipted; the root takes the fallback.
+                        //  * (item 2) the KX list: the adjacency licence of a
+                        //    listed parameter, whatever produced it;
+                        //  * (R631-4 (iv)) a companion only ever `0`;
+                        //  * (item 6) a mask as a count, on the adjacency arms
+                        //    (R477-6's masked arm licenses `mask + 1` on its
+                        //    own proof, and a contract's count is the count).
+                        let adjacency = arm != LenEvidence::Contract;
+                        let kx = param_key
+                            .get(&(*callee, pos.index))
+                            .and_then(|key| table.kx_refused.get(key));
+                        let mask_formal = companion
+                            .and_then(|i| tcx.fn_arg_idents(callee.to_def_id()).get(i).copied())
+                            .flatten()
+                            .is_some_and(|ident| {
+                                super::masked_runtime::mask_named(ident.name.as_str())
+                            });
                         refused = argument.and_then(|argument| {
-                            if super::masked_runtime::always_zero(tcx, site.caller, argument.span) {
+                            if adjacency && let Some(row) = kx {
+                                Some(format!("kx-list:{row}"))
+                            } else if super::masked_runtime::always_zero(
+                                tcx,
+                                site.caller,
+                                argument.span,
+                            ) {
                                 Some("only-zero".to_owned())
-                            } else if !masked
-                                && super::masked_runtime::mask_operand(
-                                    tcx,
-                                    site.caller,
-                                    argument.span,
-                                )
+                            } else if adjacency
+                                && !masked
+                                && (mask_formal
+                                    || super::masked_runtime::mask_operand(
+                                        tcx,
+                                        site.caller,
+                                        argument.span,
+                                    ))
                             {
                                 Some(format!(
                                     "mask-as-count:{}",
@@ -5641,14 +5662,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     (None, false, None)
                 };
-                // Relay 063 (item 2): the reader chain's licence the KX list
-                // refused (`kx_refused`, set where the licences are read).
-                let refused = refused.or_else(|| {
-                    param_key
-                        .get(&(*callee, pos.index))
-                        .and_then(|key| table.kx_refused.get(key))
-                        .map(|row| format!("kx-list:{row}"))
-                });
+                // Relay 063: a fallback a refusal caused says so, on the
+                // candidate and on its input-form twin alike.
+                let mark_refused = |mut candidate: Candidate| {
+                    if let Some(reason) = &refused
+                        && candidate.spec.len == Some(SeamLen::Fabricated)
+                    {
+                        candidate.spec.len = Some(SeamLen::Refused(reason.clone()));
+                    }
+                    candidate
+                };
                 // R625: a raw pointer to element 0 of a `[T; N]`, passed where no
                 // companion, contract, region or C string names a length, is
                 // bounded by the array itself: `N`, not the fabricated extent.
@@ -5765,13 +5788,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                             .to_owned(),
                                     );
                                 }
-                                // Relay 063: the fallback a refusal caused says so.
-                                if let Some(reason) = &refused
-                                    && candidate.spec.len == Some(SeamLen::Fabricated)
-                                {
-                                    candidate.spec.len = Some(SeamLen::Refused(reason.clone()));
-                                }
-                                candidate
+                                mark_refused(candidate)
                             })
                         })
                     },
@@ -5828,6 +5845,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             field_tied_params.contains(&pos.index),
                             region,
                         )
+                        .map(|candidate| candidate.map(mark_refused))
                     };
                     // R561-5: the same weakening when the CALLER is emitted in
                     // its input form beside a converted callee — `&mut place`

@@ -303,6 +303,12 @@ pub(crate) fn always_zero(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span:
         && !definitions.nonzero.contains(&id)
 }
 
+/// `mask`, or `*_mask`, with C's trailing `_` allowed.
+pub(crate) fn mask_named(name: &str) -> bool {
+    let name = name.trim_end_matches('_');
+    name == "mask" || name.ends_with("_mask")
+}
+
 /// **wave-6l relay 063 (item 6; wave-5d 096 STOP 3) — a mask is not a count.**
 /// The argument at `span` is an operand named `mask` or `*_mask` (a local, a
 /// parameter or a field; C's trailing `_` allowed), or a local defined once
@@ -321,14 +327,17 @@ pub(crate) fn mask_operand(tcx: TyCtxt<'_>, caller: LocalDefId, span: rustc_span
             ExprKind::Field(_, ident) => ident.name,
             _ => return false,
         };
-        let name = name.as_str().trim_end_matches('_');
-        name == "mask" || name.ends_with("_mask")
+        mask_named(name.as_str())
     };
     if named(argument) {
         return true;
     }
     let definitions = Definitions::of(tcx, body);
     let derived = definitions.resolve(argument);
+    // A plain alias (`let m = mask;`) resolves to the mask itself.
+    if named(derived) {
+        return true;
+    }
     match derived.kind {
         ExprKind::Binary(op, left, right) => match op.node {
             rustc_hir::BinOpKind::BitAnd => named(left) || named(right),

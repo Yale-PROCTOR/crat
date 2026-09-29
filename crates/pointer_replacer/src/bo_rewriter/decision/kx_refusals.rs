@@ -8,9 +8,11 @@
 //! evidence the extent record's classification read in the input
 //! (`agents/artifacts/2026-09-28-wave-6l-r641-extent-record/the-112-classified.tsv`).
 //!
-//! **A list, not a rule.** The seam refuses the listed licences and takes the
-//! root's array type or the fallback extent, receipted
-//! `fallback(extent-refused:kx-list:<subject>)`. The extent analysis
+//! **A list, not a rule.** The seam refuses a listed parameter's adjacency
+//! licence, whatever produced it (the reader chain, the thin-count proof, a
+//! field transaction), and takes the root's array type or the fallback extent,
+//! receipted `fallback(extent-refused:kx-list:<subject>)`. A contract's count
+//! is not an adjacency licence and is not refused. The extent analysis
 //! (`agents/plan/2026-09-28-extent-analysis-design.md`) replaces the reader
 //! chain, and with it this list.
 

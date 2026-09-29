@@ -1153,9 +1153,9 @@ pub(crate) struct DecisionTable {
     /// width at that index, and the allocation, which the signature does not
     /// carry).
     pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
-    /// **wave-6l relay 063 (R645-5 item 2).** The reader chain's licences the
-    /// KX list refuses (`kx_refusals::KX_LIST`), keyed as
-    /// `slice_input_companions`, with the row the receipt names.
+    /// **wave-6l relay 063 (R645-5 item 2).** The parameters the KX list names
+    /// (`kx_refusals::KX_LIST`), keyed as `slice_input_companions`, with the row
+    /// the receipt names. The seam refuses their adjacency licence.
     pub(crate) kx_refused: FxHashMap<(LocalDefId, rustc_hir::HirId), String>,
     /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
     /// with the EXACT extent licensed — the walk reaches the NUL on every path,
