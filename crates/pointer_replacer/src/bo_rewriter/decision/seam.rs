@@ -5762,6 +5762,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                     super::element_extent::constant_access_extent(tcx, *callee, pos.index)
                         .map(|elements| (pointer, elements.to_string()))
                 });
+                // **R674-6 (iii-a) — the exemption belongs to the decided form
+                // only.** For a SLICE root the decided candidate is the root's
+                // own tail view (a `Suffix`), and the exemption exists so that
+                // the INPUT-form candidate does not block the site (R641-2,
+                // main 131a). But the input form is what the call renders when
+                // the root does not deliver, and then there is no tail view: a
+                // one-element adapter there is exactly the claim R416-5
+                // refuses (batch 52: `FindLongestMatchH5::data`, unplaced, fed
+                // `from_ref(&*data.offset(k))` to `HashBytesH5`'s four-byte
+                // read). Such a position keeps NO input rendering: the argument
+                // keeps its text and verification takes the site back.
+                let spine_only = cursor_element
+                    && pos.root.is_some_and(|root| {
+                        matches!(
+                            decision_of.get(&(site.caller, root)).copied(),
+                            Some(Decision::Slice { .. } | Decision::Opt { slice: true, .. })
+                        )
+                    })
+                    && one_element_into_wide(
+                        table.wide_access_parameters.contains(&(*callee, pos.index)),
+                        pos.source_shape,
+                        element_address,
+                    );
                 let owner_view = pos
                     .root
                     .filter(|_| pos.source_shape == "bare-local")
@@ -5961,7 +5984,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     Ok(None)
                 };
-                input_candidates.push(input);
+                input_candidates.push(if spine_only { Ok(None) } else { input });
             }
 
             // ---- pass 2: THE SITE GATES, applied to adapter-generated
