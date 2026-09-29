@@ -2845,7 +2845,7 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
                 return;
             }
         };
-        let parsed = match graft_expr(&rendered) {
+        let mut parsed = match graft_expr(&rendered) {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.failure = Some(format!(
@@ -2878,8 +2878,55 @@ impl MutVisitor for PairRawGraftVisitor<'_> {
             self.held.insert(key);
             return;
         }
+        if let rustc_ast::ExprKind::Call(callee, _) = &expression.kind {
+            move_callee_into(&mut parsed, callee.clone());
+        }
         self.consumed.insert(key);
         expression.kind = parsed.kind;
+    }
+}
+
+/// **The node-moving discipline for a re-rendered call (main 131e; wave-5d 098
+/// STOP 1).** The PAIR arm prints the call, renders its temporaries around the
+/// text and re-parses it, so the rendered call's callee is a new node with a new
+/// span. `wave5r_helper_path::qualify` finds a surfaced helper's calls by their
+/// callee span, so a call to an imported helper stayed unqualified (E0425), the
+/// defect the construction bracket fixed the same way (wave-6l 055, C10). The
+/// original callee node is moved into the rendered call when exactly one call
+/// there has a callee that prints the same; otherwise the rendering stands as is.
+fn move_callee_into(rendered: &mut rustc_ast::Expr, callee: P<rustc_ast::Expr>) {
+    struct Callees<'a> {
+        text: &'a str,
+        matches: usize,
+        callee: Option<P<rustc_ast::Expr>>,
+    }
+    impl MutVisitor for Callees<'_> {
+        fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            if let rustc_ast::ExprKind::Call(callee, _) = &mut expression.kind
+                && rustc_ast_pretty::pprust::expr_to_string(callee) == self.text
+            {
+                self.matches += 1;
+                if let Some(original) = self.callee.take() {
+                    *callee = original;
+                }
+            }
+        }
+    }
+    let text = rustc_ast_pretty::pprust::expr_to_string(&callee);
+    let mut count = Callees {
+        text: &text,
+        matches: 0,
+        callee: None,
+    };
+    count.visit_expr(rendered);
+    if count.matches == 1 {
+        Callees {
+            text: &text,
+            matches: 0,
+            callee: Some(callee),
+        }
+        .visit_expr(rendered);
     }
 }
 
