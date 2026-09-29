@@ -664,6 +664,12 @@ pub unsafe fn h(mut y: *const i8) -> u64 {
     for label in ["a::x", "h::y"] {
         assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
     }
+    // Relay 065 review (finding 10): the callers the walk does not carry to
+    // are the local callee hold's, which is the claim.
+    let map = access_map(input);
+    for label in ["a::x", "h::y"] {
+        assert!(map.iter().any(|(l, _)| l == label), "{label}: {map:#?}");
+    }
 }
 
 /// G3 (relay 064; fault H22 was inert) — a SIZED formal's literal footprint
@@ -782,4 +788,57 @@ fn w6l_seethrough_k3_a_copy_of_a_copy() {
     assert_ne!(input, HOLD_COPIES, "the hop is in");
     let map = access_map(&input);
     assert!(map.iter().any(|(l, _)| l == "hopper::h"), "{map:#?}");
+}
+
+/// X5 (relay 065 review, finding 1) — a parameter copied into a local and
+/// handed on: `w` steps (`add`), so the walk stops at `w::p`, and the hold
+/// must reach `c::x` through `let y = x; w(y)` and `g::z` through `c`. No
+/// thin caller falls between the two sets.
+#[test]
+fn w6l_seethrough_x5_a_copy_handed_on_is_followed_by_the_hold() {
+    let input = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn w(mut p: *const i8) -> u64 {
+    let mut first = *p.add(1);
+    strlen(p)
+}
+unsafe fn c(mut x: *const i8) -> u64 {
+    let mut y = x;
+    w(y)
+}
+pub unsafe fn g(mut z: *const i8) -> u64 {
+    c(z)
+}
+"#;
+    let held = held(input);
+    let map = access_map(input);
+    for label in ["c::x", "g::z"] {
+        assert!(
+            held.iter().any(|l| l == label) || map.iter().any(|(l, _)| l == label),
+            "{label}: thin {held:?} hold {map:#?}"
+        );
+    }
+}
+
+/// G4 (relay 065 review, finding 7) — a formal whose IMMEDIATE pointee is
+/// sized (`*mut *mut c_void`, eight bytes) is compared with its element, not
+/// left out as a `c_void` formal: 16 bytes through its copy is past one.
+#[test]
+fn w6l_seethrough_g4_a_pointer_to_void_pointer_is_compared_with_its_element() {
+    let set = guard_set(
+        r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn memset(d: *mut core::ffi::c_void, c: i32, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn clearpp(mut pp: *mut *mut core::ffi::c_void) {
+    let mut q = pp;
+    memset(q as *mut core::ffi::c_void, 0, 16 as u64);
+}
+"#,
+    );
+    assert!(set.iter().any(|name| name == "clearpp:0"), "{set:?}");
 }
