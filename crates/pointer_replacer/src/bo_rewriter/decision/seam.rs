@@ -227,6 +227,10 @@ pub(crate) enum LenEvidence {
     /// `[T; N]` of its own pointee type: the length is `N`, the array's
     /// (`emitability::array_extent`).
     ArrayType,
+    /// **R674-9** — no companion, but the callee's own straight-line body
+    /// reads or writes exactly elements `0..N` of the parameter on every call
+    /// (`element_extent::constant_access_extent`): the length is `N`.
+    CalleeAccess,
 }
 
 impl LenEvidence {
@@ -238,6 +242,7 @@ impl LenEvidence {
             LenEvidence::None => "len-absent",
             LenEvidence::Contract => "len-contract",
             LenEvidence::ArrayType => "len-array-type",
+            LenEvidence::CalleeAccess => "len-callee-access",
         }
     }
 }
@@ -5529,7 +5534,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                         LenEvidence::Following => Some(pos.index + 1),
                         LenEvidence::Preceding => pos.index.checked_sub(1),
                         LenEvidence::Contract => contract_companion,
-                        LenEvidence::Elsewhere | LenEvidence::None | LenEvidence::ArrayType => None,
+                        LenEvidence::Elsewhere
+                        | LenEvidence::None
+                        | LenEvidence::ArrayType
+                        | LenEvidence::CalleeAccess => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -5716,6 +5724,33 @@ pub(crate) fn synthesize_with_raw_boundary(
                     pos.span,
                     element_spine_of_root,
                 );
+                // **R674-9 — the element address's longer rendering.** C2Rust
+                // spells `&a[k]` as `&*a.offset(k)`: one element to the
+                // `(Slice, Ref)` glue, which R622-1 refuses into a formal read
+                // past it. The pointer under the `&*` carries the allocation, so
+                // the raw arm takes it where the callee's own straight-line body
+                // proves the extent (`element_extent`: it reads or writes
+                // elements `0..N` on every call). Otherwise the refusal stands:
+                // no extent is fabricated, and a count companion waits for a
+                // licence that bounds every index by it (relay 067).
+                let element_pointer = (one_element_into_wide(
+                    table.wide_access_parameters.contains(&(*callee, pos.index)),
+                    pos.source_shape,
+                    element_address,
+                ) && !cursor_element
+                    && matches!(pos.expected, Form::Slice { .. }))
+                .then(|| {
+                    site.args
+                        .iter()
+                        .find(|argument| argument.index == pos.index)
+                })
+                .flatten()
+                .and_then(|argument| argument.deref_pointer)
+                .and_then(|span| sm.span_to_snippet(span).ok())
+                .and_then(|pointer| {
+                    super::element_extent::constant_access_extent(tcx, *callee, pos.index)
+                        .map(|elements| (pointer, elements.to_string()))
+                });
                 let owner_view = pos
                     .root
                     .filter(|_| pos.source_shape == "bare-local")
@@ -5744,6 +5779,26 @@ pub(crate) fn synthesize_with_raw_boundary(
                         .flatten()
                     {
                         bridged
+                    } else if let Some((pointer, elements)) = &element_pointer {
+                        build_candidate(
+                            pos.expected,
+                            Form::Raw,
+                            pointer,
+                            &pos.source_type,
+                            false,
+                            Some(elements.as_str()),
+                            false,
+                            Some(LenEvidence::CalleeAccess),
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            false,
+                            return_tied,
+                            None,
+                            field_tied_params.contains(&pos.index),
+                            None,
+                        )
                     } else {
                         build_candidate(
                             pos.expected,
@@ -5821,6 +5876,26 @@ pub(crate) fn synthesize_with_raw_boundary(
                         .and_then(|call| call.addresses.get(&pos.index))
                     {
                         shared_candidate(address, text)
+                    } else if let Some((pointer, elements)) = &element_pointer {
+                        build_candidate(
+                            pos.expected,
+                            Form::Raw,
+                            pointer,
+                            &pos.source_type,
+                            false,
+                            Some(elements.as_str()),
+                            false,
+                            Some(LenEvidence::CalleeAccess),
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            false,
+                            return_tied,
+                            None,
+                            field_tied_params.contains(&pos.index),
+                            None,
+                        )
                     } else {
                         build_candidate(
                             pos.expected,

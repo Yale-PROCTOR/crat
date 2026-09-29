@@ -284,6 +284,9 @@ pub(crate) struct Arg {
     /// **R641-2 (2)** — the argument borrows an ELEMENT of something larger:
     /// see [`element_address`].
     pub element_address: bool,
+    /// **R674-9** — the argument is `&*P` / `&mut *P` with `P` a raw pointer:
+    /// the span of `P`. See [`deref_pointer`].
+    pub deref_pointer: Option<Span>,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -304,6 +307,23 @@ pub(crate) fn element_address(expr: &Expr<'_>) -> bool {
         place.kind,
         ExprKind::Index(..) | ExprKind::Unary(rustc_hir::UnOp::Deref, _)
     )
+}
+
+/// **R674-9 — the raw pointer under an element address.** C2Rust's `&a[k]` is
+/// `&*a.offset(k)`: the borrow is of one element, but the pointer it
+/// dereferences carries the whole allocation's provenance. No casts: a cast
+/// changes what the pointer counts.
+pub(crate) fn deref_pointer(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expr: &Expr<'_>,
+) -> Option<Span> {
+    let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, place) = expr.kind else {
+        return None;
+    };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = place.kind else {
+        return None;
+    };
+    typeck.expr_ty(pointer).is_raw_ptr().then_some(pointer.span)
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -1494,6 +1514,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             element_of: super::box_facts::box_element_address(arg)
                                                 .map(|(owner, _, _)| owner),
                                             element_address: element_address(arg),
+                                            deref_pointer: deref_pointer(typeck, arg),
                                         }
                                     })
                                     .collect(),

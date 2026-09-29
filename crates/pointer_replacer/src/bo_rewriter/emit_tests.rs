@@ -14796,6 +14796,175 @@ fn custody_decision_descriptor_preserves_full_safe_form() {
     assert!(super::terminal_application(&boxed, false).is_none());
 }
 
+/// The placed seam rows for `callee` at `caller`, by length arm.
+fn r674_placed(seams: &str, callee: &str, caller: &str) -> Vec<String> {
+    seams
+        .lines()
+        .filter(|l| {
+            let f = l.split('\t').collect::<Vec<_>>();
+            f.first() == Some(&"placed") && f.get(1) == Some(&callee) && f.get(6) == Some(&caller)
+        })
+        .map(|l| l.split('\t').nth(4).unwrap_or("").to_owned())
+        .collect()
+}
+
+/// The blocked seam rows for `callee` at `caller`, by block reason.
+fn r674_blocked(seams: &str, callee: &str, caller: &str) -> Vec<String> {
+    seams
+        .lines()
+        .filter(|l| {
+            let f = l.split('\t').collect::<Vec<_>>();
+            f.first() == Some(&"blocked") && f.get(1) == Some(&callee) && f.get(6) == Some(&caller)
+        })
+        .map(|l| l.split('\t').nth(2).unwrap_or("").to_owned())
+        .collect()
+}
+
+/// **R674-9 (relay 139) — an element address takes the callee's proven
+/// extent.** lodepng's `lodepng_read32bitInt(&*in_0.offset(16))` and
+/// `lodepng_set32bitInt(&mut *out.offset(8), ..)`: C2Rust's `&a[k]` is one
+/// element to the `(Slice, Ref)` glue, and R622-1 refuses it into a formal the
+/// callee reads past element 0 (at batch 51 it rendered `from_ref` and panicked
+/// on `buffer[1]`). The callee's body reads (or writes) exactly elements `0..4`
+/// on every call, so the raw arm takes the pointer under the `&*` with that
+/// extent, receipted `len-callee-access`.
+#[test]
+fn r674_9_an_element_address_takes_the_callee_s_straight_line_extent() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn read32(buffer: *const u8) -> u32 {{\n\
+         \x20   return (*buffer.offset(0 as i32 as isize) as u32) << 24\n\
+         \x20       | (*buffer.offset(1 as i32 as isize) as u32) << 16\n\
+         \x20       | (*buffer.offset(2 as i32 as isize) as u32) << 8\n\
+         \x20       | *buffer.offset(3 as i32 as isize) as u32;\n\
+         }}\n\
+         pub unsafe fn set32(buffer: *mut u8, value: u32) {{\n\
+         \x20   *buffer.offset(0 as i32 as isize) = (value >> 24) as u8;\n\
+         \x20   *buffer.offset(3 as i32 as isize) = value as u8;\n\
+         }}\n\
+         pub unsafe fn caller(in_0: *mut u8) -> u32 {{\n\
+         \x20   let _address = in_0 as usize;\n\
+         \x20   set32(&mut *in_0.offset(8 as i32 as isize), 7);\n\
+         \x20   read32(&*in_0.offset(16 as i32 as isize))\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert_eq!(
+        r674_placed(&seams, "read32", "caller"),
+        ["len-callee-access"],
+        "{seams}"
+    );
+    assert_eq!(
+        r674_placed(&seams, "set32", "caller"),
+        ["len-callee-access"],
+        "{seams}"
+    );
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "read32(core::slice::from_raw_parts(in_0.offset(16 as i32 as isize), (4) as usize))"
+        ) && flat.contains(
+            "set32(core::slice::from_raw_parts_mut(in_0.offset(8 as i32 as isize), (4) as usize), 7)"
+        ),
+        "the pointer under the `&*`, the callee's own extent:\n{emitted}"
+    );
+    assert!(
+        !flat.contains("from_ref") && !flat.contains("FALLBACK_SLICE_EXTENT"),
+        "{emitted}"
+    );
+}
+
+/// **R674-9 controls — no proven extent, no rendering.** Each callee reads its
+/// parameter past element 0, and each call passes an element address, so the
+/// refusal stands (and no extent is fabricated) wherever the body does not
+/// prove what every call reads: a branch, a short-circuit, a non-literal
+/// offset, an access after an early return, and brotli's
+/// `BrotliCreateHuffmanTree(&*histogram.offset(64), 64)` (a count companion,
+/// which no licence yet bounds every index by). An element address over a
+/// REFERENCE is not a raw pointer's element and is refused too.
+#[test]
+fn r674_9_an_element_address_without_a_proven_extent_stays_refused() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         #![allow(unreachable_code)]\n\
+         pub unsafe fn read32(buffer: *const u8) -> u32 {{\n\
+         \x20   return (*buffer.offset(0 as i32 as isize) as u32) << 24 | *buffer.offset(3 as i32 as isize) as u32;\n\
+         }}\n\
+         pub unsafe fn upper(p: *mut u8) -> i32 {{\n\
+         \x20   if (*p.offset(0 as i32 as isize) as i32) < 0xc0 {{ *p.offset(1 as i32 as isize) ^= 32; }}\n\
+         \x20   2\n\
+         }}\n\
+         pub unsafe fn both(p: *const u8) -> bool {{\n\
+         \x20   *p.offset(0 as i32 as isize) != 0 && *p.offset(5 as i32 as isize) != 0\n\
+         }}\n\
+         pub unsafe fn at(p: *const u8, k: isize) -> u8 {{\n\
+         \x20   *p.offset(0 as i32 as isize) + *p.offset(k)\n\
+         }}\n\
+         pub unsafe fn dead(p: *const u8) -> u8 {{\n\
+         \x20   return *p.offset(0 as i32 as isize);\n\
+         \x20   *p.offset(9 as i32 as isize)\n\
+         }}\n\
+         pub unsafe fn tree(data: *const u32, length: usize) -> u32 {{\n\
+         \x20   let mut i = length;\n\
+         \x20   let mut s = 0u32;\n\
+         \x20   while i != 0 {{ i = i.wrapping_sub(1); s = s.wrapping_add(*data.offset(i as isize)); }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn caller(in_0: *mut u8, histogram: *mut u32, r: &u8) -> u32 {{\n\
+         \x20   let _address = in_0 as usize;\n\
+         \x20   let _histogram = histogram as usize;\n\
+         \x20   upper(&mut *in_0.offset(4 as i32 as isize)) as u32\n\
+         \x20       + both(&*in_0.offset(8 as i32 as isize)) as u32\n\
+         \x20       + at(&*in_0.offset(12 as i32 as isize), 1) as u32\n\
+         \x20       + dead(&*in_0.offset(20 as i32 as isize)) as u32\n\
+         \x20       + tree(&*histogram.offset(64 as i32 as isize), 64)\n\
+         \x20       + read32(&*r)\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    for callee in ["upper", "both", "at", "dead", "tree", "read32"] {
+        assert_eq!(
+            (
+                r674_placed(&seams, callee, "caller"),
+                r674_blocked(&seams, callee, "caller")
+            ),
+            (
+                Vec::<String>::new(),
+                vec!["seam-one-element-into-wider-formal".to_owned()]
+            ),
+            "{callee}: no proven extent, the refusal stands:\n{seams}"
+        );
+    }
+}
+
+/// **R674-9 — any other use of the parameter proves nothing.** Passed on
+/// (`fwd` hands it to another callee) or reassigned (`step` moves it before it
+/// reads), the literal offsets no longer say what every call reads. Read at the
+/// analysis itself: a parameter passed on is decided raw, so no seam asks.
+#[test]
+fn r674_9_a_parameter_used_otherwise_proves_no_extent() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn read4(p: *const u8) -> u32 { *p.offset(3 as i32 as isize) as u32 }\n\
+         pub unsafe fn fwd(p: *const u8) -> u32 { *p.offset(1 as i32 as isize) as u32 + read4(p) }\n\
+         pub unsafe fn step(mut p: *const u8) -> u8 { p = p.offset(10 as i32 as isize); *p.offset(0 as i32 as isize) }\n";
+    ::utils::compilation::run_compiler_on_str(SRC, |tcx| {
+        let function = |name: &str| {
+            tcx.hir_body_owners()
+                .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let extent = |name: &str| {
+            super::decision::element_extent::constant_access_extent(tcx, function(name), 0)
+        };
+        assert_eq!(
+            (extent("read4"), extent("fwd"), extent("step")),
+            (Some(4), None, None)
+        );
+    })
+    .expect("fixture compiles");
+}
+
 /// **R625 (relay 125) — a pointer into a fixed-size array names its own
 /// extent.** bzip2's `BZ2_hbCreateDecodeTables(&mut (*s).limit[t][0], ...)` and
 /// brotli's `BrotliBuildHuffmanTable(.., (*h).code_length_histo.as_mut_ptr())`

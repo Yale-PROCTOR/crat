@@ -63,6 +63,7 @@ pub(crate) mod cstring_receiver;
 pub(crate) mod cursor_native;
 pub(crate) mod declaration;
 pub(crate) mod declaration_pattern;
+pub(crate) mod element_extent;
 pub(crate) mod emitability;
 pub(crate) mod exported_pair;
 pub(crate) mod exposure;
