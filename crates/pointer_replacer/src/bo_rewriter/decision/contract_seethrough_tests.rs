@@ -241,3 +241,126 @@ fn w6l_seethrough_f3_the_counted_footprint_crosses_a_cast_between_forwarders() {
         "{map:#?}"
     );
 }
+
+/// Relay 063 (R645-5 item 3): the walk through LOCAL COPIES. A parameter
+/// copied into a local (`let q = p;`, `q = p;`) that reaches a many-element
+/// foreign position reaches it too.
+const COPIES: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+    fn strlen(s: *const i8) -> u64;
+}
+unsafe fn scan(mut p: *const i8) -> u64 {
+    let mut q = p;
+    strlen(q)
+}
+unsafe fn load(mut buffer: *const u8, mut dst: *mut u8) {
+    let mut buf: *const u8 = 0 as *const u8;
+    buf = buffer;
+    memcpy(dst as *mut core::ffi::c_void, buf as *const core::ffi::c_void, 16 as u64);
+}
+unsafe fn peek(mut p: *const i8) -> i8 {
+    let mut q = p;
+    *q
+}
+pub unsafe fn top(mut s: *const i8) -> u64 {
+    scan(s)
+}
+"#;
+
+/// The thin-extent set's labels for one fixture.
+fn held(input: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx)?;
+        let held = super::thin_extent::collect(tcx, &ctx.facts);
+        let mut labels = ctx
+            .subjects
+            .iter()
+            .filter(|subject| held.contains(&(subject.fn_did, subject.hir_id)))
+            .map(|subject| subject.label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        Ok::<_, String>(labels)
+    })
+    .expect("fixture compiles")
+    .expect("decision table")
+}
+
+/// C1 (item 3) — `scan::p` reaches `strlen` through `let q = p`, and the walk
+/// carries on to `scan`'s caller; `load::buffer` reaches `memcpy`'s 16 bytes
+/// through `buf = buffer`.
+#[test]
+fn w6l_seethrough_c1_a_copy_carries_the_foreign_extent_to_its_source() {
+    let held = held(COPIES);
+    for label in ["scan::p", "top::s", "load::buffer"] {
+        assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
+}
+
+/// C1c (item 3's control) — a copy read one element at a time holds nothing.
+#[test]
+fn w6l_seethrough_c1c_a_copy_read_one_element_holds_nothing() {
+    let held = held(COPIES);
+    assert!(
+        !held.iter().any(|l| l == "peek::p" || l == "peek::q"),
+        "{held:?}"
+    );
+}
+
+/// Relay 063 (R645-5 item 4): the footprint of an UNCAST `c_void` wrapper is
+/// the caller's question — 16 bytes pass one `u8`, 4 bytes do not pass one
+/// `i32`.
+const VOID_FOOTPRINT: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {
+    fn memset(d: *mut core::ffi::c_void, c: i32, n: u64) -> *mut core::ffi::c_void;
+}
+unsafe fn clear16(mut d: *mut core::ffi::c_void) {
+    memset(d, 0, 16 as u64);
+}
+unsafe fn clear4(mut d: *mut core::ffi::c_void) {
+    memset(d, 0, 4 as u64);
+}
+pub struct S {
+    pub a: *mut u8,
+    pub b: *mut i32,
+    pub c: *mut u8,
+}
+pub unsafe fn caller(mut s: *mut S) {
+    let mut bytes = (*s).a;
+    clear16(bytes as *mut core::ffi::c_void);
+    let mut word = (*s).b;
+    clear4(word as *mut core::ffi::c_void);
+    let mut small = (*s).c;
+    clear4(small as *mut core::ffi::c_void);
+}
+"#;
+
+/// V1 (item 4) — a `u8` caller into a 16-byte `memset` is held, and so is a
+/// `u8` caller into a 4-byte one.
+#[test]
+fn w6l_seethrough_v1_an_uncast_void_footprint_past_the_callers_element_is_held() {
+    let map = access_map(VOID_FOOTPRINT);
+    for label in ["caller::bytes", "caller::small"] {
+        let row = map
+            .iter()
+            .find(|(l, _)| l == label)
+            .unwrap_or_else(|| panic!("{label} is not held: {map:#?}"));
+        assert!(
+            row.1.ends_with("foreign-contract:memset:0:byte-count"),
+            "{map:#?}"
+        );
+    }
+}
+
+/// V1c (item 4's control) — an `i32` caller into a 4-byte `memset` is one
+/// element: not held (wave-6o's `binn_get_int32` shape).
+#[test]
+fn w6l_seethrough_v1c_an_uncast_void_footprint_of_one_element_is_kept() {
+    let map = access_map(VOID_FOOTPRINT);
+    assert!(
+        !map.iter().any(|(label, _)| label == "caller::word"),
+        "{map:#?}"
+    );
+}
