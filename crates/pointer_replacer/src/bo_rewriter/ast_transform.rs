@@ -1576,6 +1576,20 @@ pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize
 struct ConstructionBracketVisitor<'a> {
     brackets: &'a FxHashMap<(u32, u32), (String, String)>,
     applied: FxHashSet<(u32, u32)>,
+    /// Relay 066 (R666-2, STOP 2): the next FRESH `NodeId` for an outer
+    /// wrapper, above every id already assigned in the crate.
+    next_id: u32,
+}
+
+/// The largest assigned `NodeId` in a crate (`DUMMY_NODE_ID` aside).
+struct MaxNodeId(u32);
+
+impl MutVisitor for MaxNodeId {
+    fn visit_id(&mut self, id: &mut NodeId) {
+        if *id != rustc_ast::DUMMY_NODE_ID {
+            self.0 = self.0.max(id.as_u32());
+        }
+    }
 }
 
 impl MutVisitor for ConstructionBracketVisitor<'_> {
@@ -1605,6 +1619,10 @@ impl MutVisitor for ConstructionBracketVisitor<'_> {
         filler.visit_expr(&mut wrapper);
         if filler.node.is_none() {
             e.kind = wrapper.kind;
+            // The moved node keeps its id; the wrapper, which keeps the span,
+            // takes a fresh one, so no id-keyed pass sees one node twice.
+            e.id = NodeId::from_u32(self.next_id);
+            self.next_id += 1;
             self.applied.insert(key);
         }
     }
@@ -3415,6 +3433,7 @@ mod tests {
                 let mut brackets = ConstructionBracketVisitor {
                     brackets: &table,
                     applied: FxHashSet::default(),
+                    next_id: 41,
                 };
                 brackets.visit_expr(&mut e);
                 let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
@@ -5215,9 +5234,12 @@ fn transform_with<'tcx>(
     super::slice_forms_ast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
     // wave-6l (R615-7): the slice constructions wrapped around a raw call
     // result, LAST among the passes that may edit inside an initializer.
+    let mut max_id = MaxNodeId(0);
+    max_id.visit_crate(&mut krate);
     let mut brackets = ConstructionBracketVisitor {
         brackets: &construction_brackets,
         applied: FxHashSet::default(),
+        next_id: max_id.0 + 1,
     };
     brackets.visit_crate(&mut krate);
     // R631-12: every argument-level edit is in place; the arm-(a) reads are
