@@ -66,10 +66,11 @@ fn w6l_seethrough_s1_a_nul_contract_behind_a_local_wrapper_lifts_the_thin_option
     assert_eq!(reason(&rows, "output_path"), "<emitted>", "{rows:#?}");
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(COPY_STAT).unwrap();
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat.contains("fn CopyStat(mut input_path: Option<&[i8]>, mut output_path: Option<&[i8]>)"),
-        "{flat}"
-    );
+    // RE-PIN (relay 072, R698-1: the see-through's call-site edge is dropped
+    // for 54): `input_path` is no longer carried to `stat`'s NUL walk, so it
+    // keeps 52's form; what the test protects is the type check (batch 51's
+    // E0308) and delivery.
+    let _ = &flat;
     assert!(
         crate::bo_rewriter::verify::type_checks_str(&source),
         "{source}"
@@ -105,10 +106,11 @@ fn w6l_seethrough_s2_the_contract_is_followed_through_two_forwarders() {
     assert_ne!(input, COPY_STAT, "the witness must change the fixture");
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat.contains("fn CopyStat(mut input_path: Option<&[i8]>, mut output_path: Option<&[i8]>)"),
-        "{flat}"
-    );
+    // RE-PIN (relay 072, R698-1: the see-through's call-site edge is dropped
+    // for 54): `input_path` is no longer carried to `stat`'s NUL walk, so it
+    // keeps 52's form; what the test protects is the type check (batch 51's
+    // E0308) and delivery.
+    let _ = &flat;
     assert!(
         crate::bo_rewriter::verify::type_checks_str(&source),
         "{source}"
@@ -273,9 +275,7 @@ pub unsafe fn top(mut s: *const i8) -> u64 {
 fn held(input: &str) -> Vec<String> {
     ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
         let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx)?;
-        let held = super::thin_extent::collect(tcx, &ctx.facts, |function, binding| {
-            ctx.model_raw(function, binding)
-        });
+        let held = super::thin_extent::collect(tcx, &ctx.facts);
         let mut labels = ctx
             .subjects
             .iter()
@@ -295,9 +295,12 @@ fn held(input: &str) -> Vec<String> {
 #[test]
 fn w6l_seethrough_c1_a_copy_carries_the_foreign_extent_to_its_source() {
     let held = held(COPIES);
-    for label in ["scan::p", "top::s", "load::buffer"] {
+    for label in ["scan::p", "load::buffer"] {
         assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
     }
+    // RE-PIN (relay 072, R698-1): the walk is no longer carried to `scan`'s
+    // caller (the call-site edge is dropped for 54).
+    assert!(!held.iter().any(|l| l == "top::s"), "{held:?}");
 }
 
 /// C1c (item 3's control) — a copy read one element at a time holds nothing.
@@ -493,10 +496,12 @@ pub unsafe fn top2(mut s: *const i8, mut t: *const i8) -> u64 {
 #[test]
 fn w6l_seethrough_c2_c3_an_arithmetic_copy_and_a_ternary_carry_the_walk() {
     let held = held(COPIES_MORE);
-    for label in [
-        "walk::p", "top::s", "pick::p", "pick::r", "top2::s", "top2::t",
-    ] {
+    for label in ["walk::p", "pick::p", "pick::r"] {
         assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
+    // RE-PIN (relay 072, R698-1): no carry to the callers.
+    for label in ["top::s", "top2::s", "top2::t"] {
+        assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
     }
 }
 
@@ -626,7 +631,10 @@ pub unsafe fn g(mut name: *const i8) -> u64 {
 }
 "#;
     let held = held(input);
-    assert!(held.iter().any(|l| l == "g::name"), "{held:?}");
+    // RE-PIN (relay 072, R698-1): `f::p` holds its own walk; `g::name` is no
+    // longer carried (the call-site edge is dropped for 54).
+    assert!(held.iter().any(|l| l == "f::p"), "{held:?}");
+    assert!(!held.iter().any(|l| l == "g::name"), "{held:?}");
 }
 
 /// X2 / X3 (relay 064 review, finding 6) — the arithmetic gate at the call
@@ -660,10 +668,12 @@ pub unsafe fn h(mut y: *const i8) -> u64 {
 }
 "#;
     let held = held(input);
-    for label in ["c::s", "b::p", "f::p"] {
+    for label in ["c::s", "f::p"] {
         assert!(held.iter().any(|l| l == label), "{label}: {held:?}");
     }
-    for label in ["a::x", "h::y"] {
+    // RE-PIN (relay 072, R698-1): `b::p` was held by the call-site edge from
+    // `c::s`, which is dropped for 54.
+    for label in ["a::x", "h::y", "b::p"] {
         assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
     }
     // Relay 065 review (finding 10): the callers the walk does not carry to

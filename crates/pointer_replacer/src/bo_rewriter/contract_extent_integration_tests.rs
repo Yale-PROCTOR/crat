@@ -1174,8 +1174,11 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
     // through `find_local`'s walk, and R481's lift gives it the array's own
     // extent. What this test protects is unchanged: no contract promotion
     // is carried through the raw callee (`plans` empty, the declined line).
-    assert!(!source.contains("name: &mut i8"), "{source}");
-    assert!(!source.contains("name: &i8"), "{source}");
+    // RE-PIN (relay 072, R698-1): the see-through's call-site edge is dropped
+    // for 54, so `find::name` is not carried to `find_local`'s walk and 52's
+    // thin `name: &mut i8` returns — the class Codex 062 finding 1 named (a
+    // one-element claim reaching a NUL walk), re-admitted by the ruling's (b).
+    assert!(source.contains("name: &mut i8"), "{source}");
 }
 
 /// R408-1 (relay 028 §1): ruling B's adjacency arm licensed a VALUE as a slice
@@ -1284,10 +1287,7 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
         ::utils::compilation::str_to_input(CE_V01_VOID_CAST_COUNTED_POSITION),
         |tcx| {
             let (_table, ctx) = super::decide_table_with_ctx(tcx)?;
-            let held =
-                super::decision::thin_extent::collect(tcx, &ctx.facts, |function, binding| {
-                    ctx.model_raw(function, binding)
-                });
+            let held = super::decision::thin_extent::collect(tcx, &ctx.facts);
             Ok::<_, String>(
                 ctx.subjects
                     .iter()
