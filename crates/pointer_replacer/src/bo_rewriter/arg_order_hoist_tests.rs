@@ -344,3 +344,125 @@ fn r666_6_a_wrapper_carrying_the_call_s_span_is_not_hoisted_again() {
         );
     });
 }
+
+/// **R697-2 — quadtree's L01¹¹ frame: the loader feeds the hoist.** The frame's
+/// entry records three arm-(a) receipts (`quadtree_insert` bb7[15] twice,
+/// `quadtree_free` bb2[6]); the model decided `insert_`'s `tree` a reference on
+/// the premise that `insert_(tree, (*tree).root, point, key)` reads the root
+/// before the lend. Without the loader the call emits as written, E0502, and
+/// `insert_`'s class reverts (the frame census's 21 rows). Read through the
+/// census's one-iteration instrument on the frame's own entry, with no solve.
+///
+/// Run by hand, never by the suite: `CRAT_R697_QUADTREE=<…/rs-crown-derived/quadtree/lib.rs>`
+/// with the frame's env; `CRAT_R697_OUT` names a file for the rows the report
+/// quotes.
+#[test]
+#[ignore = "R697-2: quadtree's L01¹¹ frame; run by hand with CRAT_R697_QUADTREE and the frame's env"]
+fn r697_2_quadtree_insert_hoists_on_the_frame() {
+    let root = std::path::PathBuf::from(
+        std::env::var("CRAT_R697_QUADTREE")
+            .expect("CRAT_R697_QUADTREE: quadtree's substrate lib.rs"),
+    );
+    assert_eq!(
+        std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref(),
+        Ok("cache-only"),
+        "the frame is read from its accepted cache, never solved"
+    );
+    // The census's configured exposure row for quadtree (explicit-empty).
+    let config = super::EmissionRunConfig {
+        configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
+            "standing-raw-boundary-launch:Config::default.c_exposed_fns",
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .expect("quadtree's configured exposure row"),
+    };
+    let capture = super::rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(&root),
+        Some(&root),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        false,
+        None,
+        &config,
+    )
+    .into_e1_capture()
+    .expect("the one-iteration capture");
+    // The one-iteration capture stops at the first verify (its diagnostics
+    // are the E0502 question); the emitted tree is the full rewrite's.
+    let (emitted, rewrite_reverted) = match super::rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(&root),
+        Some(&root),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        None,
+        &config,
+    ) {
+        super::RewriteOutcome::Emitted {
+            source,
+            reverted_count,
+            ..
+        } => (source, reverted_count),
+        super::RewriteOutcome::Degraded { reason, .. } => panic!("degraded: {reason}"),
+    };
+    let flat = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hoists = flat.matches("let __crat_hoist_").count();
+    let e0502 = capture
+        .first_diags
+        .iter()
+        .filter(|d| d.message.contains("E0502") || d.message.contains("also borrowed as immutable"))
+        .map(|d| format!("{}:{}\t{}", d.line, d.column, d.message))
+        .collect::<Vec<_>>();
+    let reverts = capture
+        .reverts
+        .iter()
+        .map(|r| {
+            format!(
+                "{}\t{}\t{}",
+                r.function, r.attribution, r.diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>();
+    let insert_call = flat
+        .find("__crat_hoist_")
+        .map(|at| flat[at.saturating_sub(120)..(at + 200).min(flat.len())].to_owned())
+        .unwrap_or_default();
+    let record = [
+        format!(
+            "source={} reverted={} novel_errors={}",
+            capture.solve_receipt.source, capture.reverted_count, capture.novel_error_count
+        ),
+        format!("rewrite_reverted={rewrite_reverted}"),
+        format!(
+            "insert_lines={:?}",
+            emitted
+                .lines()
+                .filter(|line| line.contains("insert_("))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+        ),
+        format!("hoist_lets={hoists}"),
+        format!("insert_call={insert_call}"),
+        format!("e0502={e0502:?}"),
+        format!("reverts={reverts:?}"),
+    ]
+    .join("\n");
+    if let Ok(out) = std::env::var("CRAT_R697_OUT") {
+        std::fs::write(out, &record).unwrap();
+    }
+    eprintln!("{record}");
+    assert!(e0502.is_empty(), "{record}");
+    assert!(
+        !reverts
+            .iter()
+            .any(|r| r.starts_with("src::src::quadtree::quadtree_insert")
+                || r.starts_with("src::src::quadtree::insert_")),
+        "{record}"
+    );
+    assert!(flat.contains("insert_(tree, __crat_hoist_"), "{record}");
+}

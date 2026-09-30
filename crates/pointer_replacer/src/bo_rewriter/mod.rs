@@ -8497,6 +8497,16 @@ fn finish_decide<'tcx>(
         }
         // R586-2: the sole-origin upgrades, on the table the ladder settled.
         decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);
+        // **R666-1 / R697-2 — the loader.** The model's arm-(a) receipts
+        // (`arg-order-applied`: a pure read hoisted above the lend it sits
+        // beside) key the emission's hoist; without them the premise the model
+        // decided under is absent from the emitted call (quadtree's E0502 at
+        // the L01¹¹ frame). An entry that records none leaves the set empty.
+        table.arg_order_hoists = model_cache::prepared_arg_order_hoists(
+            tcx,
+            &model_cache::fingerprint(&program, analysis.a5_mode, analysis.attestation),
+        )
+        .unwrap_or_default();
         // R575-6: on the settled table, before anything is planned from it.
         apply_aliased_storage_withdrawals(tcx, &mut table, &aliased_storage_withdrawn);
         // **After the re-decide, deliberately.** `decide` returns a fresh table,
