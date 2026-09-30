@@ -3093,3 +3093,149 @@ fn w6a_r697_a_null_literal_actual_is_none() {
         out.artifacts.box_param_receipts
     );
 }
+
+/// **R697-3 (2)** — 020's `last(l)`, with the input's two other walls
+/// factored out (the nested `push(push(..), 2)` is a local `a`, and the
+/// recursive `drop` is a `free` of the head, whose tail C leaks). `l` is a
+/// certified receiver of `push`, lent to `last`, whose formal the model calls
+/// Ref and whose result it calls Ref too. `last` walks its formal down the
+/// list and returns it: the model's Ref at both ends is its borrow verdict on
+/// that returned pointer, so the call is a lend: `l` stays a `Box`, and
+/// `last(&mut *l)`.
+const RETURNED_LEND: &str = r#"
+// w6a-r697-linked-list-frame
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>() as usize) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+#[no_mangle]
+pub unsafe extern "C" fn last(mut head: *mut Node) -> *mut Node {
+    while !(*head).next.is_null() {
+        head = (*head).next;
+    }
+    return head;
+}
+unsafe fn main_0() -> ::core::ffi::c_int {
+    let mut a = push(::core::ptr::null_mut::<Node>(), 1 as ::core::ffi::c_int);
+    let mut l = push(a, 2 as ::core::ffi::c_int);
+    (*last(l)).val = 3 as ::core::ffi::c_int;
+    let mut v = (*l).val;
+    free(l as *mut ::core::ffi::c_void);
+    return v;
+}
+"#;
+
+#[test]
+fn w6a_r697_a_box_lent_to_a_ref_formal_it_returns_is_a_lend() {
+    let out = linked_list_with(
+        "r697-returned-lend",
+        RETURNED_LEND,
+        &[(
+            "node::n",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    let src = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{}\n{:#?}\nFIRST-FAILING-VERIFY\n{}",
+        out.artifacts.box_param_receipts,
+        out.artifacts.return_certificate_receipts,
+        out.source,
+        out.degradations,
+        out.artifacts.first_failing_verify_tree
+    );
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate callee=push ")
+            && out
+                .artifacts
+                .return_certificate_receipts
+                .contains("[main_0::a,main_0::l]"),
+        "{context}"
+    );
+    assert!(
+        src.contains("letmutl:Box<crate::Node>=push(Some(a),"),
+        "{context}"
+    );
+    assert!(
+        src.contains("fnlast<'a>(muthead:&'amutNode)->&'amutNode"),
+        "{context}"
+    );
+    assert!(src.contains("last(&mut*l)"), "{context}");
+    assert!(src.contains("drop(l);"), "{context}");
+    assert!(!src.contains("as_mut())"), "{context}");
+    assert_eq!(reason_of(&out.degradations, "main_0::l"), None, "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+
+    // Controls, one conjunct each. (a) The model does not call the formal
+    // Ref, so the pointer `last` hands back is no borrow it verified. (b) The
+    // formal is re-seated to ANOTHER pointer, not walked through itself.
+    let out = linked_list_with(
+        "r697-returned-lend-raw-formal",
+        RETURNED_LEND,
+        &[
+            (
+                "main_0::a",
+                crate::analyses::borrow_ownership::SlotKind::Owning,
+            ),
+            (
+                "last::head",
+                crate::analyses::borrow_ownership::SlotKind::Raw,
+            ),
+        ],
+    );
+    assert!(
+        out.artifacts.return_certificate_receipts.contains(
+            "main_0::l\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:last(l)"
+        ),
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.source
+    );
+    // (b)
+    let source = RETURNED_LEND
+        .replace(
+            "    (*last(l)).val = 3 as ::core::ffi::c_int;\n",
+            "    (*pick(l, ::core::ptr::null_mut::<Node>())).val = 3 as ::core::ffi::c_int;\n",
+        )
+        .replace(
+            "unsafe fn main_0()",
+            "#[no_mangle]\npub unsafe extern \"C\" fn pick(mut head: *mut Node, mut other: *mut Node) -> *mut Node {\n    if (*head).val == 0 as ::core::ffi::c_int {\n        head = other;\n    }\n    return head;\n}\nunsafe fn main_0()",
+        );
+    assert!(source.contains("fn pick(") && source.contains("(*pick(l,"));
+    let out = linked_list_with(
+        "r697-returned-lend-other-reseat",
+        &source,
+        &[
+            (
+                "main_0::a",
+                crate::analyses::borrow_ownership::SlotKind::Owning,
+            ),
+            (
+                "pick::head",
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+            ),
+            (
+                "pick::other",
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+            ),
+        ],
+    );
+    assert!(
+        out.artifacts.return_certificate_receipts.contains(
+            "main_0::l\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:pick(l,"
+        ),
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.source
+    );
+}

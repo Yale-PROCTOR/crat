@@ -1008,9 +1008,24 @@ struct LendWalk<'tcx> {
     binding: HirId,
     ok: bool,
     nested: Vec<(DefId, usize)>,
+    /// **R697-3 (2)**: the model calls both this formal and the callee's
+    /// return Ref, so a pointer it hands back is a borrow of the argument.
+    returns_ref: bool,
 }
 
 impl LendWalk<'_> {
+    /// `(*binding).f`, under its casts: a place read through the formal.
+    fn read_through_binding(&self, e: &Expr<'_>) -> bool {
+        let ExprKind::Field(base, _) = peel_casts(e).kind else {
+            return false;
+        };
+        let ExprKind::Unary(rustc_hir::UnOp::Deref, inner) = peel_casts(base).kind else {
+            return false;
+        };
+        matches!(&peel_casts(inner).kind, ExprKind::Path(QPath::Resolved(_, path))
+            if path.res == Res::Local(self.binding))
+    }
+
     /// `element` (a `p.offset(e)`), under its casts, as an argument of a call
     /// to a named function: that position, or `None`.
     fn element_argument(&self, element: &Expr<'_>) -> Option<(DefId, usize)> {
@@ -1099,6 +1114,17 @@ impl<'tcx> Visitor<'tcx> for LendWalk<'tcx> {
                             _ => self.ok = false,
                         }
                     }
+                    // **R697-3 (2) — a lend that hands its formal back.** Where
+                    // the model calls the formal and the return Ref, returning
+                    // the formal, or re-seating it to a field read through
+                    // itself (`head = (*head).next`, the walk down a list), is
+                    // the borrow the model verified in every caller: the
+                    // result is a reborrow of the argument, never kept.
+                    ExprKind::Ret(Some(value)) if self.returns_ref && value.hir_id == child => {}
+                    ExprKind::Assign(lhs, rhs, _)
+                        if self.returns_ref
+                            && lhs.hir_id == child
+                            && self.read_through_binding(rhs) => {}
                     _ => self.ok = false,
                 },
                 // A `let q = p` copy or a statement-level use.
@@ -1808,11 +1834,18 @@ impl<'a, 'tcx> LendOracle<'a, 'tcx> {
         let rustc_hir::PatKind::Binding(_, hir, _, None) = param.pat.kind else {
             return None;
         };
+        let returned = self
+            .slots
+            .fn_local_slots
+            .get(&callee)
+            .and_then(|u| u.slot_for_local_depth(rustc_middle::mir::Local::from_usize(0), 0))
+            .and_then(|slot| self.model.get(&SlotRef::Local(callee, slot)).copied());
         let mut walk = LendWalk {
             tcx,
             binding: hir,
             ok: true,
             nested: Vec::new(),
+            returns_ref: kind == Some(SlotKind::Ref) && returned == Some(SlotKind::Ref),
         };
         walk.visit_body(hir_body);
         walk.ok.then_some(walk.nested)
