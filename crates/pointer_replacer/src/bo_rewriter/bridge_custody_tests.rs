@@ -700,6 +700,44 @@ mod matcher {
         );
     }
 
+    /// R690-5 / R695-1 (main 134b §3). brotli's `compress_fragment` passes
+    /// `cmd_bits as *const uint16_t`, and the PAIR arm binds it as
+    /// `let __crat_a5_raw_N_2: *const u16 = cmd_bits;`: the original's own pointer
+    /// cast, re-applied by the temporary's annotation. Batch 53's 16 rows failed
+    /// `raw-initializer-source-relation-unbuilt` on it.
+    #[test]
+    fn r690_5_a_raw_temporary_may_drop_the_originals_own_pointer_cast() {
+        const CAST_INPUT: &str = "fn target(w: *mut i32, r: *const i32) {} fn caller(w: *mut i32, r: *mut i32) { target(w, r as *const i32); }";
+        let call = "target(w, r as *const i32)";
+        let lo = CAST_INPUT.find(call).unwrap();
+        let mut expected = expectation(BridgeKind::PairT2RawView);
+        expected.anchor = SiteAnchor::Call {
+            span: ByteSpan {
+                lo: lo as u32,
+                hi: (lo + call.len()) as u32,
+            },
+            argument_indices: vec![1],
+        };
+        let output = |initializer: &str| {
+            format!(
+                "fn target(w: &mut i32, r: *const i32) {{}} fn caller(w: &mut i32, r: *mut i32) {{ {{ let __crat_pair_raw_{lo}_1: *const i32 = {initializer}; target(w, __crat_pair_raw_{lo}_1); }} }}"
+            )
+        };
+        for initializer in ["r", "r as *const i32", "(r)"] {
+            let report = check_sources(CAST_INPUT, &output(initializer), &[expected.clone()]);
+            assert!(report.data, "{initializer}: {report:#?}");
+            assert_eq!(report.rows[0].status, ReceiptStatus::MatchedRaw);
+        }
+        // The peel drops the cast only: another pointer is still another pointer.
+        for initializer in ["r.add(1)", "w as *mut i32 as *const i32", "0 as *const i32"] {
+            let report = check_sources(CAST_INPUT, &output(initializer), &[expected.clone()]);
+            assert!(
+                !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+                "{initializer}: {report:#?}"
+            );
+        }
+    }
+
     /// R695-2 (a). An exposure-shimmed callee's in-program callers call its safe
     /// inner `__crat_safe_<callee>`, and the export receipts that as a
     /// typed-exposure `OwnerRename` of the CALLEE. The matcher looked for the call

@@ -1985,6 +1985,23 @@ fn witness(binding: &Binding, index: usize, kind: GeneratedKind) -> BindingWitne
     }
 }
 
+/// **R690-5 (main 134b §3) — the original's own pointer cast, re-applied by the
+/// annotation.** brotli's `compress_fragment` passes `cmd_bits as *const uint16_t`,
+/// and the PAIR arm binds it as `let __crat_a5_raw_N_2: *const u16 = cmd_bits;`: the
+/// same pointer, the `*mut -> *const` re-applied by the temporary's type. Only
+/// `validate_raw` asks this, where the temporary and the target formal are both
+/// already checked raw, so the peeled operand reaches the same formal as the same
+/// address. Pointer-to-pointer casts only; any other cast keeps its own key.
+fn peeled_pointer_casts(original: &ast::Expr) -> &ast::Expr {
+    let mut expression = unparen(original);
+    while let ast::ExprKind::Cast(inner, ty) = &expression.kind
+        && matches!(ty.kind, ast::TyKind::Ptr(_))
+    {
+        expression = unparen(inner);
+    }
+    expression
+}
+
 fn validate_raw(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -2030,7 +2047,9 @@ fn validate_raw(
                     .ok_or("raw-temporary-initializer-absent")?,
             )?;
             let source = expression(&original.arguments[index].text)?;
-            if !raw_initializer_matches(&init, &source) {
+            if !raw_initializer_matches(&init, &source)
+                && !raw_initializer_matches(&init, peeled_pointer_casts(&source))
+            {
                 return Err("raw-initializer-source-relation-unbuilt".into());
             }
             validate_initializer_bindings(input, original, index, binding)?;
