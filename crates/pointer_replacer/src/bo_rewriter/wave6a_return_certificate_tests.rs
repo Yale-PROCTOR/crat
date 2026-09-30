@@ -989,6 +989,72 @@ unsafe extern "C" fn test_node() {
     assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
 }
 
+/// **R710-5 S2 (127 STOP 1 (2)) — a sinkless receiver `None` at every exit
+/// closes nothing.** buffer's `test_buffer_slice__range_error` reduced: the
+/// receiver of an optional producer is tested null, and its other branch
+/// aborts (`__assert_fail`), so on the only path that returns it holds `None`
+/// and the scope-exit drop is a no-op (X's `none_proven`). The sinkless
+/// receiver's receipt is asked through the same exit walk as a sinking one's.
+/// Control: `test_node` in `w6a_r645_b_quadtrees_four_receiver_closes_are_receipted`,
+/// a sinkless receiver live at its exit, keeps its row.
+const SINKLESS_NONE_AT_EXIT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn __assert_fail(
+        assertion: *const core::ffi::c_char,
+        file: *const core::ffi::c_char,
+        line: u32,
+        function: *const core::ffi::c_char,
+    ) -> !;
+}
+#[repr(C)]
+pub struct buf { pub len: usize }
+pub unsafe extern "C" fn slice(mut n: usize) -> *mut buf {
+    if n > 4 as usize {
+        return 0 as *mut buf;
+    }
+    let mut b = malloc(::std::mem::size_of::<buf>()) as *mut buf;
+    (*b).len = n;
+    return b;
+}
+unsafe extern "C" fn test_range_error() {
+    let mut a = slice(10 as usize);
+    if a.is_null() {
+    } else {
+        __assert_fail(
+            b"NULL == a\0" as *const u8 as *const core::ffi::c_char,
+            b"test.c\0" as *const u8 as *const core::ffi::c_char,
+            103 as u32,
+            b"test\0" as *const u8 as *const core::ffi::c_char,
+        );
+    };
+}
+"#;
+
+#[test]
+fn w6a_r710_a_sinkless_receiver_none_at_every_exit_closes_nothing() {
+    let out = emitted("r710-sinkless-none", SINKLESS_NONE_AT_EXIT);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("return-certificate callee=slice ")
+            && receipts.contains("receivers=1 [test_range_error::a]"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !receipts.contains("test_range_error\treceiver\twaiver-drop(scope-exit)"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "test_range_error::a"),
+        None,
+        "{receipts}"
+    );
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+}
+
 /// **R619-3 (2), a loop body's scope exit.** `it` is a `let` receiver inside a
 /// loop: on the odd-id `continue` its scope ends before the store, so the
 /// emitted owner is dropped there with no `return` anywhere on the path. Its

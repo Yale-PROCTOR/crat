@@ -3697,9 +3697,6 @@ fn receiver_plan(
         receipts.push(format!("dead-null-return {}", span.lo().0));
     }
     let retained_sink = !frees.is_empty() || !uses.stores.is_empty() || !uses.transfers.is_empty();
-    if !retained_sink {
-        receipts.push("waiver-drop(scope-exit)".to_owned());
-    }
     // R619-3 (2): a sink on SOME path does not reach the exits that run
     // before it.
     let definitions: Vec<Span> = if assignments.is_empty() {
@@ -3727,6 +3724,17 @@ fn receiver_plan(
         retained_sink && live_at_an_exit(tcx, receiver, &definitions, &call_sinks, &value_sinks);
     if exit_close {
         receipts.push(format!("waiver-drop(scope-exit) exit-path receiver={name}"));
+    }
+    // **R710-5 S2** — a receiver with no sink is RECEIPTED as closing at scope
+    // exit only where an exit is reached holding it: the same walk, its own
+    // null edges pruned (buffer's `a`, tested null with an aborting other
+    // branch, holds `None` at the one exit, and its drop is a no-op). Receipt
+    // only: `implicit_scope_close` stays the MIR drop count D4 reconciles
+    // (the drop of a `None` is still a `Drop` terminator).
+    let sinkless_close =
+        !retained_sink && live_at_an_exit(tcx, receiver, &definitions, &[], &value_sinks);
+    if sinkless_close {
+        receipts.push("waiver-drop(scope-exit)".to_owned());
     }
     // An edit inside a deleted statement goes with it.
     expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
