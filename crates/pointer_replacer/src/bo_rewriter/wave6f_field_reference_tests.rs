@@ -3494,7 +3494,8 @@ fn w6f_a_certified_store_alone_joins_the_key_and_its_revert_withdraws() {
     let base = run("");
     let (source, emitted_count, reverted) = emitted_source(&base);
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!((emitted_count, reverted), (3, 0), "{source}");
+    // Four at the L01^11 frame: `value`'s `h` is delivered `&holder` too.
+    assert_eq!((emitted_count, reverted), (4, 0), "{source}");
     for needle in [
         "pub item: Option<Box<item>>,",
         "pub unsafe extern \"C\" fn make_item(mut v: i32) -> Box<item> {",
