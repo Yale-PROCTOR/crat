@@ -369,6 +369,7 @@ mod tests {
                         evidence: Box::new(origin), present: Default::default(),
                     },
                     move_store: Default::default(),
+                    arg_order: Default::default(),
                 };
                 metadata.validate_meta().unwrap();
                 let payload_digest = Sha256::digest(serde_json::to_vec(
