@@ -466,3 +466,84 @@ fn r697_2_quadtree_insert_hoists_on_the_frame() {
     );
     assert!(flat.contains("insert_(tree, __crat_hoist_"), "{record}");
 }
+
+/// **R697-2 — the hoist on any program's L01¹¹ entry**, for the count the
+/// relay asks: the calls hoisted, the first verify's borrow conflicts and the
+/// reverts, read from the full rewrite of `CRAT_R697_ROOT` (cache-only).
+/// Records only; asserts nothing about the program.
+#[test]
+#[ignore = "R697-2: a program's L01¹¹ frame; run by hand with CRAT_R697_ROOT and the frame's env"]
+fn r697_2_the_hoist_by_program_on_the_frame() {
+    let root = std::path::PathBuf::from(
+        std::env::var("CRAT_R697_ROOT").expect("CRAT_R697_ROOT: the program's substrate lib.rs"),
+    );
+    assert_eq!(
+        std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref(),
+        Ok("cache-only"),
+        "the frame is read from its accepted cache, never solved"
+    );
+    let config = super::EmissionRunConfig {
+        configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
+            "standing-raw-boundary-launch:Config::default.c_exposed_fns",
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .expect("the configured exposure row (explicit-empty for all twenty)"),
+    };
+    let rewrite = |census_once: bool| {
+        super::rewrite_core_injected_with_config(
+            ::utils::compilation::path_to_input(&root),
+            Some(&root),
+            super::MAX_REVERT_ROUNDS,
+            &|_| {},
+            false,
+            census_once,
+            false,
+            None,
+            &config,
+        )
+    };
+    let capture = rewrite(true)
+        .into_e1_capture()
+        .expect("the one-iteration capture");
+    let conflicts = capture
+        .first_diags
+        .iter()
+        .filter(|d| {
+            ["E0499", "E0502", "E0503", "E0505", "E0506"]
+                .iter()
+                .any(|code| d.code.as_deref() == Some(code))
+        })
+        .map(|d| format!("{}:{}\t{}", d.line, d.column, d.message))
+        .collect::<Vec<_>>();
+    let (emitted, reverted) = match rewrite(false) {
+        super::RewriteOutcome::Emitted {
+            source,
+            reverted_count,
+            ..
+        } => (source, reverted_count),
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            (format!("DEGRADED {reason}"), usize::MAX)
+        }
+    };
+    let hoisted = emitted
+        .lines()
+        .filter(|line| line.contains("__crat_hoist_") && !line.trim_start().starts_with("let "))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    let record = [
+        format!(
+            "source={} hoist_lets={} reverted={reverted} first_verify_borrow_conflicts={}",
+            capture.solve_receipt.source,
+            emitted.matches("let __crat_hoist_").count(),
+            conflicts.len()
+        ),
+        format!("hoisted={hoisted:?}"),
+        format!("conflicts={conflicts:?}"),
+    ]
+    .join("\n");
+    if let Ok(out) = std::env::var("CRAT_R697_OUT") {
+        std::fs::write(out, &record).unwrap();
+    }
+    eprintln!("{record}");
+}
