@@ -106,6 +106,12 @@ pub(crate) struct Chains {
     /// **R620-3** — the store consumers' formals: their block is the outside
     /// caller's C string, so libc may free it.
     pub(crate) external_blocks: FxHashSet<(LocalDefId, HirId)>,
+    /// **R698-4** — a local that MOVES an owned field out of the formal it
+    /// then frees and re-seats (`next = (*head).next; free(head); head =
+    /// next`, C's list-freeing loop): local → (label, the formal, the field).
+    /// It stands only while the field is delivered.
+    pub(crate) field_moves:
+        FxHashMap<(LocalDefId, HirId), (String, (LocalDefId, HirId), (LocalDefId, usize))>,
     /// A planned formal's (label, callee path, index), for its withdrawal.
     pub(crate) formal_labels: FxHashMap<(LocalDefId, HirId), (String, String, usize)>,
 }
@@ -151,6 +157,19 @@ fn withdraw_formal(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) 
         chains
             .holds
             .insert(key, (label, format!("{reason}:{callee}")));
+    }
+}
+
+/// Withdraw a field move's plan (R698-4) with a typed hold.
+fn withdraw_field_move(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) {
+    chains.plans.remove(&key);
+    if let Some((label, _, _)) = chains.field_moves.get(&key).cloned() {
+        chains
+            .receipts
+            .retain(|r| !r.starts_with(&format!("box-param-field-move local={label} ")));
+        chains
+            .holds
+            .insert(key, (label.clone(), format!("{reason}:{label}")));
     }
 }
 
@@ -330,8 +349,21 @@ pub(crate) fn withdraw_undelivered_reseats(
     for key in &chain_withdrawn {
         withdraw_formal(chains, *key, "box-param-chain-field-not-delivered");
     }
+    // R698-4: a field move over a field no owning transaction delivers would
+    // take a raw pointer into its `Option<Box<T>>`.
+    let moves_withdrawn = chains
+        .field_moves
+        .iter()
+        .filter(|(key, (_, _, (did, index)))| {
+            chains.plans.contains_key(*key) && !delivered(*did, *index)
+        })
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>();
+    for key in &moves_withdrawn {
+        withdraw_field_move(chains, *key, "box-param-field-move-not-delivered");
+    }
     let confirmed = confirm_hand_ons(chains);
-    !withdrawn.is_empty() || !chain_withdrawn.is_empty() || confirmed
+    !withdrawn.is_empty() || !chain_withdrawn.is_empty() || !moves_withdrawn.is_empty() || confirmed
 }
 
 /// **R579-4 R2** — the re-seats `derive` plans, computed from the same inputs
@@ -628,6 +660,20 @@ pub(crate) fn override_plan(
                 });
             }
             Err(failure)
+        }
+        // R698-4: a field move's local has no initializer form of its own —
+        // the field transaction renders its initializer as the move.
+        Err(BoxPlanFailure::InitializerUnsupported)
+            if ctx
+                .box_params
+                .field_moves
+                .contains_key(&(subject.fn_did, subject.hir_id)) =>
+        {
+            ctx.box_params
+                .plans
+                .get(&(subject.fn_did, subject.hir_id))
+                .cloned()
+                .ok_or(BoxPlanFailure::InitializerUnsupported)
         }
         Err(failure) => Err(failure),
     }
@@ -1413,6 +1459,17 @@ pub(crate) fn derive<'tcx>(
             .map(|slot| SlotRef::Local(s.fn_did, slot))
     };
     let system_allocator = emitted_allocator_is_system(tcx);
+    // R698-4: the formals a field move re-seats. C's loop hands the formal a
+    // value that may be null (`head = next`), so its chain plans it
+    // `Option<Box<T>>` whatever its callers pass (`Some(l)`, R561-4 W2).
+    let field_move_formals: FxHashSet<(LocalDefId, HirId)> = subjects
+        .iter()
+        .filter(|s| s.kind == SubjectKind::Local && s.ptr_depth == 1)
+        .filter_map(|local| {
+            field_move_candidate(tcx, local, &scans, constructions, subjects, slots, model)
+                .map(|(container, _)| (local.fn_did, container))
+        })
+        .collect();
     let mut params: Vec<&Subject> = subjects
         .iter()
         .filter(|s| matches!(s.kind, SubjectKind::Param { .. }) && s.ptr_depth == 1)
@@ -2094,7 +2151,9 @@ pub(crate) fn derive<'tcx>(
         // Admitted only where one type serves the whole chain and nothing
         // else needs an edit: every member optional, the sink a free, a sized
         // owner, and no raw exposure wrapper to re-enter ownership.
-        let optional = optional_members > 0 || !null_actuals.is_empty();
+        let optional = optional_members > 0
+            || !null_actuals.is_empty()
+            || field_move_formals.contains(&(param.fn_did, param.hir_id));
         // R583-8 wall 2(c): the store sink's field, when it is model-`Owning`.
         let owned_store_field: Option<(LocalDefId, usize)> = store
             .and_then(|_| {
@@ -2692,6 +2751,147 @@ pub(crate) fn derive<'tcx>(
         }
         out.hand_ons.extend(hand_on_target.map(|t| (formal, t)));
     }
+    // **R698-4 — an owned field moved out before its container is freed.** C's
+    // list-freeing loop `next = (*head).next; free(head); head = next` reads
+    // the field into a local the model calls Owning, frees the container, and
+    // moves the local back into the formal. The value is a transfer, not a
+    // raw alias: the local is `Option<Box<T>>`, and the field transaction
+    // renders its initializer as the move (`take()`, its `owned-field-move`
+    // arm), leaving `None` in a node freed by the very next statement. Only
+    // where the container is the function's own planned formal, the
+    // free is the next statement, and the local's only use moves it back into
+    // that formal.
+    for local in subjects
+        .iter()
+        .filter(|s| s.kind == SubjectKind::Local && s.ptr_depth == 1)
+    {
+        let key = (local.fn_did, local.hir_id);
+        if out.plans.contains_key(&key) {
+            continue;
+        }
+        let Some((container, field)) =
+            field_move_candidate(tcx, local, &scans, constructions, subjects, slots, model)
+        else {
+            continue;
+        };
+        let formal = (local.fn_did, container);
+        if !out.plans.contains_key(&formal) {
+            continue;
+        }
+        let field_path = format!("{}::{}", tcx.def_path_str(field.0.to_def_id()), field.1);
+        out.receipts.push(format!(
+            "box-param-field-move local={} field={field_path}",
+            local.label
+        ));
+        out.field_moves
+            .insert(key, (local.label.clone(), formal, field));
+        out.plans.insert(
+            key,
+            BoxPlan {
+                shape: BoxShape::Sized,
+                optional: true,
+                expr_edits: Vec::new(),
+                delete_statements: Vec::new(),
+                receipts: vec![format!("box-param-field-move field={field_path}")],
+                fabricated_extent: false,
+                pointee_override: None,
+                inferred_binding: local.ty_span.is_none(),
+                overwrite_spans: Vec::new(),
+                retained_sink: true,
+                implicit_scope_close: false,
+            },
+        );
+    }
     confirm_hand_ons(&mut out);
     out
+}
+
+/// **R698-4** — a local the field-move rule covers: model `Owning`, defined
+/// by a read of a model-`Owning` field `(*container).f` of its function's
+/// formal `container`, the container freed by the very next statement, and
+/// the local's only use a move back into `container`. Returns the container
+/// and the field.
+#[allow(clippy::too_many_arguments)]
+fn field_move_candidate(
+    tcx: TyCtxt<'_>,
+    local: &Subject,
+    scans: &FxHashMap<LocalDefId, Scan<'_>>,
+    constructions: &ConstructionFacts,
+    subjects: &[Subject],
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<(HirId, (LocalDefId, usize))> {
+    let key = (local.fn_did, local.hir_id);
+    let slot = slots
+        .fn_local_slots
+        .get(&local.fn_did)
+        .and_then(|u| u.slot_for_local_depth(local.local, 0))
+        .map(|slot| SlotRef::Local(local.fn_did, slot))?;
+    if model.get(&slot).copied() != Some(SlotKind::Owning) {
+        return None;
+    }
+    let scan = scans.get(&local.fn_did)?;
+    let init = tcx
+        .hir_node(*constructions.init_hirs.get(&key)?)
+        .expect_expr();
+    let field = field_key(tcx, peel_casts(init))?;
+    if field_kind(slots, model, field) != Some(SlotKind::Owning) {
+        return None;
+    }
+    let ExprKind::Field(base, _) = peel_casts(init).kind else { return None };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, inner) = peel_casts(base).kind else {
+        return None;
+    };
+    let container = bare_local(inner)?;
+    let is_formal = subjects.iter().any(|s| {
+        (s.fn_did, s.hir_id) == (local.fn_did, container)
+            && matches!(s.kind, SubjectKind::Param { .. })
+    });
+    if !is_formal || !freed_by_next_statement(tcx, scan, init, container) {
+        return None;
+    }
+    let uses = super::return_certificate::owner_uses(
+        tcx,
+        local,
+        BoxShape::Sized,
+        true,
+        false,
+        &[],
+        &|_, _| false,
+        &|_, _| false,
+        &|destination| destination == container,
+    )
+    .ok()?;
+    (uses.edits.is_empty()
+        && uses.stores.is_empty()
+        && uses.transfers.is_empty()
+        && uses.returns.is_empty()
+        && uses.lends.is_empty())
+    .then_some((container, field))
+}
+
+/// **R698-4** — the statement right after the `let` that holds `init` frees
+/// `container` (`free(container as ..)`), in the same block.
+fn freed_by_next_statement(
+    tcx: TyCtxt<'_>,
+    scan: &Scan<'_>,
+    init: &Expr<'_>,
+    container: HirId,
+) -> bool {
+    let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(init.hir_id) else {
+        return false;
+    };
+    let rustc_hir::Node::Stmt(stmt) = tcx.parent_hir_node(local.hir_id) else {
+        return false;
+    };
+    let rustc_hir::Node::Block(block) = tcx.parent_hir_node(stmt.hir_id) else {
+        return false;
+    };
+    let Some(position) = block.stmts.iter().position(|s| s.hir_id == stmt.hir_id) else {
+        return false;
+    };
+    let Some(next) = block.stmts.get(position + 1) else { return false };
+    scan.frees
+        .iter()
+        .any(|(hir, call, _)| *hir == container && next.span.contains(*call))
 }

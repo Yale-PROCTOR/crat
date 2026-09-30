@@ -3294,3 +3294,296 @@ fn w6a_r697_a_box_lent_to_a_ref_formal_it_returns_is_a_lend() {
         out.source
     );
 }
+
+/// **R698-4 (relay 129)** — analysis-fanout 021's O₀: the linked list with
+/// `0` for `NULL` and `drop` as C's loop, as C2Rust gives it, less `last`
+/// (this harness's solver calls `last`'s return Raw where the census model
+/// calls it Ref, and its hold would partition the field's owners). The model
+/// calls `drop`'s formal and its `next` Owning, and the field Owning.
+const DROP_LOOP: &str = r#"
+// w6a-r697-linked-list-frame
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>() as usize) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+#[export_name = "drop"]
+pub unsafe extern "C" fn drop_0(mut head: *mut Node) {
+    while !head.is_null() {
+        let mut next = (*head).next;
+        free(head as *mut ::core::ffi::c_void);
+        head = next;
+    }
+}
+"#;
+
+#[test]
+fn w6a_r698_a_field_read_into_an_owning_local_moves() {
+    let out = linked_list_with(
+        "r698-drop-loop",
+        DROP_LOOP,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    let src = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{}\n{}\n{:#?}",
+        out.artifacts.box_param_receipts,
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.field_transactions,
+        out.source,
+        out.degradations
+    );
+    assert!(
+        src.contains("fndrop_0(muthead:Option<Box<Node>>)"),
+        "{context}"
+    );
+    assert!(src.contains(".next.take();"), "{context}");
+    assert!(src.contains("letmutnext:Option<Box<"), "{context}");
+    assert!(src.contains("drop(head);head=next;"), "{context}");
+    assert!(!src.contains("Box::into_raw"), "{context}");
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-field-move local=drop_0::next field=Node::1"),
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+
+    // Controls, one condition each; none plans the move.
+    // (a) The destination is Raw in the model: the bridge stays its form.
+    let out = linked_list_with(
+        "r698-drop-loop-raw-local",
+        DROP_LOOP,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Raw,
+        )],
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-field-move"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    // (b) The field is Ref in the model: the reader arm, not a move.
+    {
+        use crate::analyses::borrow_ownership::SlotKind;
+        let _frame = super::test_model_override::frame_lock();
+        super::test_model_override::set(
+            "w6a-r697-linked-list-frame",
+            vec![("Node".to_owned(), 1, SlotKind::Ref)],
+            vec![
+                ("push::head".to_owned(), SlotKind::Owning),
+                ("push::n".to_owned(), SlotKind::Owning),
+                ("drop_0::head".to_owned(), SlotKind::Owning),
+                ("drop_0::next".to_owned(), SlotKind::Owning),
+            ],
+        );
+        let out = emitted("r698-drop-loop-ref-field", &with_prelude(DROP_LOOP));
+        super::test_model_override::clear();
+        assert!(
+            !out.artifacts
+                .box_param_receipts
+                .contains("box-param-field-move"),
+            "{}",
+            out.artifacts.box_param_receipts
+        );
+    }
+    // (c) A statement between the read and the container's free: the field
+    // could be read again while it holds `None`.
+    let between = DROP_LOOP.replace(
+        "        let mut next = (*head).next;\n",
+        "        let mut next = (*head).next;\n        (*head).val = 0 as ::core::ffi::c_int;\n",
+    );
+    assert_ne!(between, DROP_LOOP);
+    let out = linked_list_with(
+        "r698-drop-loop-not-adjacent",
+        &between,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-field-move"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+    // (d) The field is not delivered (a type alias mentions its struct, so
+    // the field transaction holds it): the planned move withdraws typed.
+    let aliased = DROP_LOOP.replace(
+        "#[export_name = \"drop\"]",
+        "pub type NodeAlias = Node;\n#[export_name = \"drop\"]",
+    );
+    assert_ne!(aliased, DROP_LOOP);
+    let out = linked_list_with(
+        "r698-drop-loop-field-held",
+        &aliased,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("drop_0::next\theld\tbox-param-field-move-not-delivered:drop_0::next"),
+        "{}\n{}",
+        out.artifacts.box_param_receipts,
+        out.artifacts.field_transactions
+    );
+    // (e) The container is not a planned formal (`drop_0` unexported and
+    // uncalled: no chain and no waiver plans it). (f) The local moves into
+    // ANOTHER local, not back into the container.
+    let internal = DROP_LOOP.replace("#[export_name = \"drop\"]\n", "");
+    assert_ne!(internal, DROP_LOOP);
+    let other = DROP_LOOP
+        .replace(
+            "    while !head.is_null() {\n",
+            "    let mut spare = 0 as *mut Node;\n    while !head.is_null() {\n",
+        )
+        .replace(
+            "        head = next;\n",
+            "        spare = next;\n        head = spare;\n",
+        );
+    assert_ne!(other, DROP_LOOP);
+    for (name, source, extra) in [
+        (
+            "r698-drop-loop-unplanned-formal",
+            internal.as_str(),
+            vec![(
+                "drop_0::next",
+                crate::analyses::borrow_ownership::SlotKind::Owning,
+            )],
+        ),
+        (
+            "r698-drop-loop-other-local",
+            other.as_str(),
+            vec![
+                (
+                    "drop_0::next",
+                    crate::analyses::borrow_ownership::SlotKind::Owning,
+                ),
+                (
+                    "drop_0::spare",
+                    crate::analyses::borrow_ownership::SlotKind::Owning,
+                ),
+            ],
+        ),
+    ] {
+        let out = linked_list_with(name, source, &extra);
+        assert!(
+            !out.artifacts
+                .box_param_receipts
+                .contains("box-param-field-move"),
+            "{name}\n{}",
+            out.artifacts.box_param_receipts
+        );
+    }
+    // (g) The local is used before it moves back (a read through it).
+    let read = DROP_LOOP.replace(
+        "        head = next;\n",
+        "        if !next.is_null() {\n            (*next).val += 1 as ::core::ffi::c_int;\n        }\n        head = next;\n",
+    );
+    assert_ne!(read, DROP_LOOP);
+    let out = linked_list_with(
+        "r698-drop-loop-read-through",
+        &read,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-field-move"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
+
+/// **R698-4 (3) — composed with 128.** O₀'s loop `drop` with a `main` that
+/// builds the list on a null actual (128 (1)) and frees it through `drop`:
+/// the certified `l` moves into the loop's `Option<Box<Node>>` formal. (The
+/// nested `push(push(0, 1), 2)` is a local `a`, 128 §3's call-actual wall;
+/// `last` is left out: this harness's solver calls its return Raw here, so
+/// 128 (2) is witnessed on its own fixture.)
+const DROP_LOOP_MAIN: &str = r#"
+// w6a-r697-linked-list-frame
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>() as usize) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+#[export_name = "drop"]
+pub unsafe extern "C" fn drop_0(mut head: *mut Node) {
+    while !head.is_null() {
+        let mut next = (*head).next;
+        free(head as *mut ::core::ffi::c_void);
+        head = next;
+    }
+}
+unsafe fn main_0() -> ::core::ffi::c_int {
+    let mut a = push(::core::ptr::null_mut::<Node>(), 1 as ::core::ffi::c_int);
+    let mut l = push(a, 2 as ::core::ffi::c_int);
+    let mut v = (*l).val;
+    drop_0(l);
+    return v;
+}
+"#;
+
+#[test]
+fn w6a_r698_the_loop_composes_with_128s_null_actual() {
+    let out = linked_list_with(
+        "r698-drop-loop-main",
+        DROP_LOOP_MAIN,
+        &[
+            (
+                "drop_0::next",
+                crate::analyses::borrow_ownership::SlotKind::Owning,
+            ),
+            (
+                "main_0::a",
+                crate::analyses::borrow_ownership::SlotKind::Owning,
+            ),
+        ],
+    );
+    let src = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{}\n{}\n{:#?}",
+        out.artifacts.box_param_receipts,
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.field_transactions,
+        out.source,
+        out.degradations
+    );
+    assert!(
+        src.contains("fndrop_0(muthead:Option<Box<Node>>)"),
+        "{context}"
+    );
+    assert!(src.contains(".next.take();"), "{context}");
+    assert!(src.contains("push(None,"), "{context}");
+    assert!(src.contains("drop_0(Some(l));"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+}
