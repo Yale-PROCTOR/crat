@@ -246,7 +246,7 @@ pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
 fn inert_body(tcx: rustc_middle::ty::TyCtxt<'_>, owner: rustc_hir::def_id::LocalDefId) -> bool {
     use rustc_hir::def::DefKind;
     let statik = match tcx.def_kind(owner) {
-        DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::InlineConst => false,
+        DefKind::Const | DefKind::AssocConst | DefKind::AnonConst => false,
         DefKind::Static { .. } => true,
         _ => return false,
     };
@@ -259,57 +259,38 @@ fn inert_body(tcx: rustc_middle::ty::TyCtxt<'_>, owner: rustc_hir::def_id::Local
     {
         return false;
     }
-    std::iter::once(tcx.mir_for_ctfe(owner))
-        .chain(tcx.promoted_mir(owner).iter())
-        .all(|body| names_no_function(tcx, body))
+    names_no_function(tcx, owner)
 }
 
-/// The collector's own tests: no local or indirect callee, no function value,
-/// no inline assembly.
-fn names_no_function<'tcx>(
-    tcx: rustc_middle::ty::TyCtxt<'tcx>,
-    body: &rustc_middle::mir::Body<'tcx>,
+/// The collector's tests (no program callee, no function value), read from the
+/// body's type-check results, never its MIR: const evaluation steals a const's
+/// MIR, and `ty_shape` reads a static's after this pass. A program function
+/// named in the body, a function pointer or a closure anywhere, or a method
+/// resolved to a program function, and the body is not inert.
+fn names_no_function(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    owner: rustc_hir::def_id::LocalDefId,
 ) -> bool {
-    use rustc_middle::{
-        mir::{Location, TerminatorKind, visit::Visitor},
-        ty::TyKind,
+    use rustc_hir::def::DefKind;
+    use rustc_middle::ty::TyKind;
+    let named = |ty: rustc_middle::ty::Ty<'_>| {
+        ty.walk()
+            .filter_map(|arg| arg.as_type())
+            .any(|ty| match *ty.kind() {
+                TyKind::FnDef(target, _) => target.is_local(),
+                TyKind::FnPtr(..) | TyKind::Closure(..) => true,
+                _ => false,
+            })
     };
-    let mut values = Values {
-        tcx,
-        body,
-        function: String::new(),
-        sites: BTreeSet::new(),
-    };
-    for (block, data) in body.basic_blocks.iter_enumerated() {
-        for (statement_index, statement) in data.statements.iter().enumerate() {
-            values.visit_statement(
-                statement,
-                Location {
-                    block,
-                    statement_index,
-                },
-            );
-        }
-        let location = Location {
-            block,
-            statement_index: data.statements.len(),
-        };
-        match &data.terminator().kind {
-            TerminatorKind::Call { func, args, .. }
-            | TerminatorKind::TailCall { func, args, .. } => {
-                for arg in args {
-                    values.visit_operand(&arg.node, location);
-                }
-                if !matches!(*func.ty(body, tcx).kind(), TyKind::FnDef(target, _) if !target.is_local())
-                {
-                    return false;
-                }
-            }
-            TerminatorKind::InlineAsm { .. } => return false,
-            _ => values.visit_terminator(data.terminator(), location),
-        }
-    }
-    values.sites.is_empty()
+    let results = tcx.typeck(owner);
+    !results.node_types().items().any(|(_, &ty)| named(ty))
+        && !results
+            .adjustments()
+            .items()
+            .any(|(_, adjustments)| adjustments.iter().any(|a| named(a.target)))
+        && !results.type_dependent_defs().items().any(|(_, def)| {
+            matches!(def, Ok((DefKind::Fn | DefKind::AssocFn, target)) if target.is_local())
+        })
 }
 
 fn carries_pointer<'tcx>(

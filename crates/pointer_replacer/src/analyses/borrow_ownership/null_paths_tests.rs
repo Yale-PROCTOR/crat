@@ -4231,6 +4231,10 @@ fn e5c_inner_w63() {
             owned = W84_LIST.replace(W84_NULL_ITEM, "");
             owned.as_str()
         }
+        Ok("w84-static") => {
+            owned = format!("{W84_LIST}{W84_STATIC}");
+            owned.as_str()
+        }
         Ok(file) if file.starts_with("file:") => {
             owned = std::fs::read_to_string(&file[5..]).expect("the W64 program");
             owned.as_str()
@@ -6331,6 +6335,15 @@ pub unsafe extern "C" fn drop_0(mut head: *mut Node) {
 const W84_NULL_ITEM: &str =
     "pub const NULL: *mut ::core::ffi::c_void = ::core::ptr::null_mut::<::core::ffi::c_void>();\n";
 
+/// W84's static: a pointer-free static the points-to type shapes read after
+/// coverage is collected. Reading the inert test from the static's MIR stole
+/// that body first (tisp: "attempted to read from stolen value" in `ty_shape`).
+const W84_STATIC: &str = r#"
+pub static mut COUNT: ::core::ffi::c_int = 0;
+#[no_mangle]
+pub unsafe extern "C" fn count() -> ::core::ffi::c_int { COUNT += 1; return COUNT; }
+"#;
+
 #[test]
 fn e5c_w84_an_inert_const_item_holds_no_caller_coverage() {
     assert!(W84_LIST.contains(W84_NULL_ITEM));
@@ -6347,6 +6360,8 @@ fn e5c_w84_an_inert_const_item_holds_no_caller_coverage() {
     assert_eq!(w63_kind(&null, "Node::field1@d0"), "owning");
     assert_eq!(w63_kind(&null, "push::_1@d0"), "owning");
     assert_eq!(w63_kind(&null, "last::_1@d0"), "ref");
+    let with_static = l01p13_lines("w84-static", &[]);
+    assert_eq!(w63_kind(&with_static, "Node::field1@d0"), "owning");
     let fault = l01p13_lines("w84-null", &[("CRAT_E5C_W84_FAULT", "no-inert")]);
     assert_eq!(
         w63_kind(&fault, "Node::field1@d0"),
