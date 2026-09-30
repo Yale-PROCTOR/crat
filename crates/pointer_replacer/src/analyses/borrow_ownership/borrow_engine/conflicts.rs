@@ -40,9 +40,14 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct WitnessedConflictEdge {
     pub(crate) edge: ConflictEdge,
-    pub(crate) loan: usize,
-    pub(crate) loan_location: crate::analyses::borrow_ownership::l2::MirLocationKey,
+    /// The invalid loan and its location. `None` for an A5 parameter edge (R617-1):
+    /// two Ref formals that may overlap, with no loan behind the conflict.
+    pub(crate) loan: Option<usize>,
+    pub(crate) loan_location: Option<crate::analyses::borrow_ownership::l2::MirLocationKey>,
     pub(crate) invalidators: Vec<Local>,
+    /// R617-1: the invalidators that met the loan only through an A5 overlap
+    /// partner (a subset of `invalidators`), part of the hazard key.
+    pub(crate) overlap_invalidators: Vec<Local>,
 }
 
 thread_local! {
@@ -190,17 +195,22 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
     copy_lends: &DenseBitSet<Loan>,
-) -> Vec<super::invalidates::InvalidationAccess> {
+    parameter_overlap: Option<&ParameterOverlap>,
+) -> (
+    Vec<super::invalidates::InvalidationAccess>,
+    Vec<(Local, Local)>,
+) {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
     let provenance_set = ctxt.provenances.get(&f).unwrap();
-    let (invalidates, mut accesses) =
-        super::invalidates::compute_invalidates_capturing_with_copy_lends(
+    let (invalidates, mut accesses, parameter_conflicts) =
+        super::invalidates::compute_invalidates_capturing_with_copy_lends_and_parameter_overlap(
             tcx,
             body,
             &inference.borrow_set,
             provenance_set,
             &inference.location_map,
             copy_lends,
+            parameter_overlap,
         );
     inference.invalidates = invalidates;
     crate::analyses::borrow_ownership::move_store::clear_removed(
@@ -220,7 +230,7 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
             .row(access.point)
             .is_some_and(|loans| loans.contains(access.loan))
     });
-    accesses
+    (accesses, parameter_conflicts)
 }
 
 /// The set of invalid loans (live ∧ invalidated) across all error points.
@@ -719,7 +729,14 @@ fn extract_witnessed_conflict_edges(
     accesses: Vec<super::invalidates::InvalidationAccess>,
 ) -> Vec<WitnessedConflictEdge> {
     let mut invalidators_by_loan: FxHashMap<Loan, Vec<Local>> = FxHashMap::default();
+    let mut overlap_by_loan: FxHashMap<Loan, Vec<Local>> = FxHashMap::default();
     for access in accesses {
+        if access.via_overlap_partner {
+            overlap_by_loan
+                .entry(access.loan)
+                .or_default()
+                .push(access.accessor);
+        }
         invalidators_by_loan
             .entry(access.loan)
             .or_default()
@@ -733,12 +750,13 @@ fn extract_witnessed_conflict_edges(
             let location = inference.facts.borrow_set.loans[loan].location();
             WitnessedConflictEdge {
                 edge,
-                loan: loan.index(),
-                loan_location: crate::analyses::borrow_ownership::l2::MirLocationKey::new(
+                loan: Some(loan.index()),
+                loan_location: Some(crate::analyses::borrow_ownership::l2::MirLocationKey::new(
                     location.block.index() as u32,
                     location.statement_index,
-                ),
+                )),
                 invalidators: invalidators_by_loan.remove(&loan).unwrap_or_default(),
+                overlap_invalidators: overlap_by_loan.remove(&loan).unwrap_or_default(),
             }
         })
         .collect()
@@ -1399,6 +1417,82 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    borrow_conflicts_replaying_witnessed_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
+        None,
+    )
+}
+
+/// R617-1 (the guarded port): the one witnessed replay with A5's overlap pairs.
+/// Its edges are Mode-A's -- the invalid loans' edges, then the Ref-Ref
+/// parameter edges -- each carrying its witness (loan identity and invalidating
+/// accesses; a parameter edge has no loan).
+pub(crate) fn borrow_conflicts_replaying_witnessed_with_flows_and_parameter_overlap_and_escaped<
+    I,
+    J,
+    M,
+    N,
+    K,
+    L,
+>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: &FxHashMap<LocalDefId, ParameterOverlap>,
+) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_witnessed_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
+        Some(parameter_overlaps),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrow_conflicts_replaying_witnessed_impl<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, ParameterOverlap>>,
+) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -1415,6 +1509,7 @@ where
     let mut out = FxHashMap::default();
     let no_copy_lends = FxHashSet::default();
     for f in program.functions.iter().copied() {
+        let is_ref_f = is_ref(f);
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
         let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
@@ -1436,14 +1531,31 @@ where
         let edges = loop {
             let mut inference =
                 ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
-            let accesses = overwrite_with_engine_facts_capturing(
+            let (accesses, parameter_conflicts) = overwrite_with_engine_facts_capturing(
                 program.tcx,
                 f,
                 &ctxt.borrow,
                 &mut inference.facts,
                 &inference.copy_lends,
+                parameter_overlaps.and_then(|overlaps| overlaps.get(&f)),
             );
             record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
+            // R617-1: the Ref-Ref parameter edges, as Mode-A's replay builds them.
+            let parameter_edges = parameter_conflicts
+                .into_iter()
+                .filter(|(left, right)| is_ref_f(*left) && is_ref_f(*right))
+                .map(|(left, right)| WitnessedConflictEdge {
+                    edge: ConflictEdge {
+                        issuer: Some(ProvenanceOwner::Local(left)),
+                        requirers: vec![ProvenanceOwner::Local(right)],
+                        esc_issuer_first: false,
+                    },
+                    loan: None,
+                    loan_location: None,
+                    invalidators: Vec::new(),
+                    overlap_invalidators: Vec::new(),
+                })
+                .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 // D2: the witnessed/L2 replay is structurally identical to the
@@ -1458,7 +1570,7 @@ where
                     &invalid_loans,
                     &inference.copy_lends,
                 );
-                break Vec::new();
+                break parameter_edges;
             }
 
             let to_demote: Vec<(Local, Local)> = {
@@ -1490,12 +1602,14 @@ where
                     &invalid_loans,
                     &inference.copy_lends,
                 );
-                break extract_witnessed_conflict_edges(
+                let mut edges = extract_witnessed_conflict_edges(
                     &inference,
                     provenance_set,
                     &invalid_loans,
                     accesses,
                 );
+                edges.extend(parameter_edges);
+                break edges;
             }
 
             drop(inference);

@@ -77,6 +77,10 @@ pub(crate) enum CommitKind {
     RetirementRaw,
     ReaderObligation,
     BorrowExclusion,
+    /// R617-1: a guarded clause `¬ref(t) ∨ ⋁¬ref(n) ∨ ⋁ref(p)`.
+    GuardedCommit,
+    /// R617-1: a guarded hazard re-witnessed with no re-enabler, made permanent.
+    RecurrenceEscalation,
 }
 
 impl CommitKind {
@@ -86,6 +90,8 @@ impl CommitKind {
             CommitKind::RetirementRaw => "retirement-raw",
             CommitKind::ReaderObligation => "reader-obligation",
             CommitKind::BorrowExclusion => "borrow-exclusion",
+            CommitKind::GuardedCommit => "guarded-commit",
+            CommitKind::RecurrenceEscalation => "recurrence-escalation",
         }
     }
 }

@@ -884,6 +884,12 @@ fn shape_model(code: &str) -> Vec<(String, String)> {
             std::fs::write(&path, text).expect("the ledger sidecar");
             eprintln!("E5C_LEDGER {path} rows={}", rows.len());
         }
+        // R617-1: the receipt's repair stamp (only a guarded run has one).
+        for line in verified.receipt.lines() {
+            if line.starts_with("repair=") || line.starts_with("guarded_") {
+                eprintln!("E5C_REPAIR {line}");
+            }
+        }
         // R612-2 (080's over-pin read): the Mode-A commit totals and A5's
         // may-overlap parameter pairs, beside the ledger.
         if let Ok(path) = std::env::var("CRAT_E5C_SIDE_STATS") {
@@ -2491,7 +2497,15 @@ fn e5c_inner_shape_decline_reason() {
             super::a5_overlap::A5Mode::PreciseReplay,
             Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ) {
-            Ok(_) => eprintln!("E5C_DECLINE none"),
+            Ok(verified) => {
+                eprintln!("E5C_DECLINE none");
+                // W69e (R617-1): the receipt's repair stamp.
+                for line in verified.receipt.lines() {
+                    if line.starts_with("repair=") || line.starts_with("guarded_") {
+                        eprintln!("E5C_REPAIR {line}");
+                    }
+                }
+            }
             Err(decline) => eprintln!("E5C_DECLINE {decline:?}"),
         }
     })
@@ -4209,6 +4223,8 @@ fn e5c_inner_w63() {
         Ok("w71-shapes") => W71_SHAPES,
         Ok("ctx-jail") => W71_CTX_JAIL,
         Ok("w74-shapes") => W74_SHAPES,
+        Ok("w75-shapes") => W75_SHAPES,
+        Ok("w79-shapes") => W79_SHAPES,
         Ok(file) if file.starts_with("file:") => {
             owned = std::fs::read_to_string(&file[5..]).expect("the W64 program");
             owned.as_str()
@@ -4286,6 +4302,51 @@ fn e5c_inner_w63() {
                     row.overlap
                 );
             }
+        }
+        // W76 (R677-4): the final review's discharged rows in the in-memory packet
+        // and in the prepared (streamed) entry.
+        if std::env::var_os("CRAT_E5C_W76").is_some() {
+            let mode = super::a5_overlap::A5Mode::PreciseReplay;
+            let attestation =
+                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
+            let discharged = |v: &serde_json::Value| {
+                v["families"]["retirement-final"]["records"][0]["fields"]["discharged"].clone()
+            };
+            // W79 (R690-6): a refused export is a line, so the fault's child exits cleanly.
+            let packet = match super::portable_export::collect(&program, &slots, &captured) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    eprintln!("E5C_W63 export-refused {error}");
+                    return;
+                }
+            };
+            let portable: serde_json::Value =
+                serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
+            let inputs = super::model_cache::semantic_inputs(&program, mode, attestation).unwrap();
+            let key = super::cache_contract::semantic_key(&inputs).unwrap();
+            super::model_cache::prepare(
+                &program,
+                &slots,
+                &origins,
+                &verified,
+                &captured,
+                mode,
+                attestation,
+            );
+            let entry = super::model_cache::prepared_entry(&key).unwrap_or_else(|| {
+                panic!(
+                    "the prepared entry: {:?}",
+                    super::model_cache::prepare_error()
+                )
+            });
+            let (p, e) = (discharged(&portable), discharged(&entry.exports));
+            let count = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len);
+            eprintln!(
+                "E5C_W63 discharged portable={} entry={} equal={}",
+                count(&p),
+                count(&e),
+                p == e
+            );
         }
         // W68 (R609-3): the A5 receipt's type-route keys.
         for line in verified.receipt.lines() {
@@ -4372,6 +4433,19 @@ fn e5c_inner_w63() {
                 );
             }
         }
+        // W69 (R617-1): the receipt's repair stamp and the residual certificate.
+        for line in verified.receipt.lines() {
+            if line.starts_with("repair=") || line.starts_with("guarded_") {
+                eprintln!("E5C_W63 repair-receipt {line}");
+            }
+        }
+        eprintln!(
+            "E5C_W63 residuals {}",
+            captured
+                .residual_conflicts
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |rows| rows.len().to_string())
+        );
         // W67 (R607-1): the raw-cause ledger of the accepted model.
         if super::raw_cause::enabled() {
             for row in super::raw_cause::last().unwrap_or_default() {
@@ -4383,6 +4457,17 @@ fn e5c_inner_w63() {
 }
 
 fn w63_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    w63_child(shape, extra)
+        .lines()
+        .filter_map(|l| {
+            l.find("E5C_W63 ")
+                .map(|i| l[i + 8..].to_owned())
+                .or_else(|| l.find("E5C_MODEL ").map(|i| l[i + 10..].to_owned()))
+        })
+        .collect()
+}
+
+fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
         ("CRAT_ERA5C_MUT_MODEL", "on"),
@@ -4404,13 +4489,6 @@ fn w63_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w63",
         &env,
     )
-    .lines()
-    .filter_map(|l| {
-        l.find("E5C_W63 ")
-            .map(|i| l[i + 8..].to_owned())
-            .or_else(|| l.find("E5C_MODEL ").map(|i| l[i + 10..].to_owned()))
-    })
-    .collect()
 }
 
 fn w63_kind(lines: &[String], key: &str) -> String {
@@ -5682,5 +5760,568 @@ fn e5c_w74_the_ledger_names_each_commits_clause() {
     assert!(
         fault.iter().all(|row| row[11] == "-"),
         "the fault must be caught: {fault:?}"
+    );
+}
+
+/// W69 (R617-1): the W63 child under the guarded repair with the L2 diagnostics on -- its lines,
+/// and the planner's `[bo-l2]` lines prefixed `l2 `.
+fn w69_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let mut env: Vec<(&str, &str)> = vec![
+        ("CRAT_ERA5C_LEND", "on"),
+        ("CRAT_BO_REPAIR", "guarded"),
+        ("CRAT_POINTER_DECISION_DIAGNOSTICS", "raw"),
+    ];
+    env.extend_from_slice(extra);
+    w63_child(shape, &env)
+        .lines()
+        .filter_map(|l| {
+            l.find("E5C_W63 ")
+                .map(|i| l[i + 8..].to_owned())
+                .or_else(|| l.find("E5C_MODEL ").map(|i| l[i + 10..].to_owned()))
+                .or_else(|| l.find("[bo-l2] ").map(|i| format!("l2 {}", &l[i + 8..])))
+        })
+        .collect()
+}
+
+fn w69_model(lines: &[String]) -> Vec<&String> {
+    lines
+        .iter()
+        .filter(|l| {
+            !l.starts_with("l2 ")
+                && !l.starts_with("repair-receipt ")
+                && !l.starts_with("residuals ")
+                && !l.starts_with("validate ")
+                && !l.starts_with("lendable ")
+                && !l.starts_with("waiver ")
+                && !l.starts_with("discharge ")
+                && !l.starts_with("retire-conflict ")
+                && !l.starts_with("a5-receipt ")
+                && !l.starts_with("ledger ")
+        })
+        .collect()
+}
+
+/// W69a's solve: one fixture under one repair mode, in process (NB5-L's S7 harness). The Ref
+/// count, the stats, and whether the accepted model is a Mode-A fixpoint (`model_accepts`).
+fn w69_solve(
+    code: &str,
+    mode: super::borrow_verify::RepairMode,
+) -> (usize, super::borrow_verify::RoundStats, bool) {
+    use rustc_hir::{ItemKind, OwnerNode};
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let mut functions = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            if let ItemKind::Fn { .. } = item.kind {
+                functions.push(item.owner_id.def_id);
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions,
+            structs: Vec::new(),
+        };
+        let slots = super::crate_slots::CrateSlots::build(&program);
+        let crate_ctxt = super::CrateCtxt::new(&program);
+        let solver = super::solver::KindSolver::new(&slots);
+        let (_emission, selectors) = super::emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &super::origins::compute_origins(&program),
+            &solver,
+        )
+        .expect("emit");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            super::coherence::add_coherence(&solver, &slots, g, &body);
+        }
+        let (model, stats) = super::borrow_verify::RepairMode::with_override(mode, || {
+            super::borrow_verify::verify_to_fixpoint_counting(
+                &program, &slots, &solver, &selectors, true,
+            )
+        });
+        let model = model.expect("the fixture accepts");
+        let accepts = super::borrow_verify::model_accepts(&program, &slots, &model, true);
+        let refs = model
+            .values()
+            .filter(|kind| **kind == super::SlotKind::Ref)
+            .count();
+        (refs, stats, accepts)
+    })
+    .unwrap()
+}
+
+/// NB5-L2's natural accumulation over-pin (`nb5l2_probe_finds_natural_accumulation_overpin`).
+const W69_CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+    unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+
+/// W69b's search (R617-1): shapes under both repairs, one line each; with the diagnostics switch the
+/// planner's `[bo-l2]` lines name any recurrence escalation.
+#[test]
+#[ignore = "the search for W69b's escalation shape"]
+fn e5c_inner_w69_search() {
+    use super::borrow_verify::RepairMode;
+    let fan_out = |n: usize| {
+        let aliases: String = (0..n).map(|i| format!("let a{i} = id(x); ")).collect();
+        let uses: String = (0..n).map(|i| format!("*a{i} + ")).collect();
+        format!(
+            "unsafe fn id(p: *mut i32) -> *mut i32 {{ p }} \
+             unsafe fn f(p: *mut i32) -> i32 {{ let bb = p; let x = id(p); {aliases}*bb = 5; {uses}*x }}"
+        )
+    };
+    let shapes: Vec<(&str, String)> = vec![
+        ("cascade", W69_CASCADE.to_owned()),
+        (
+            "two_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let base = id(p); let a = id(base); let b = id(base); \
+             let w = p; *w = 9; *a + *b }"
+                .to_owned(),
+        ),
+        (
+            "three_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let bb = p; let x = id(p); let z = id(x); let q = id(x); \
+             *bb = 5; *x + *z + *q }"
+                .to_owned(),
+        ),
+        (
+            "asymmetric",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let a = id(p); let b = id(p); let d = id(b); \
+             *a = 1; *b = 2; *d = 3; let w = p; *w = 4; *a + *b + *d }"
+                .to_owned(),
+        ),
+        (
+            "chain",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let a = id(p); let b = id(a); let c = id(b); \
+             *c = 1; *b = 2; *a = 3; let w = p; *w = 4; *a + *b + *c }"
+                .to_owned(),
+        ),
+        (
+            "crossed",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32, q: *mut i32) -> i32 { let a = id(p); let b = id(q); \
+             let c = id(a); *b = 1; *a = 2; let d = id(b); *c = 3; *d = 4; *p = 5; *q = 6; *a + *b + *c + *d }"
+                .to_owned(),
+        ),
+        ("fan_out_8", fan_out(8)),
+        ("fan_out_33", fan_out(32)),
+        // L01¹² (R677-4): W69b's candidates -- the issuer peer satisfies `¬ref` by
+        // owning (a later `free`), and an owning slot's loans stay in the replay.
+        (
+            "owning_peer",
+            "extern \"C\" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); } \
+             unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f() -> i32 { let p = malloc(4) as *mut i32; let a = id(p); let c = id(a); \
+             *p = 5; let r = *c; free(a as *mut core::ffi::c_void); r }"
+                .to_owned(),
+        ),
+        (
+            "owning_peer_direct",
+            "extern \"C\" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); } \
+             unsafe fn f() -> i32 { let p = malloc(4) as *mut i32; let a = p; let c = a; \
+             *p = 5; let r = *c; free(a as *mut core::ffi::c_void); r }"
+                .to_owned(),
+        ),
+    ];
+    for (name, code) in &shapes {
+        eprintln!("E5C_W69S begin {name}");
+        let (mode_a, mode_a_stats, _) = w69_solve(code, RepairMode::ModeA);
+        let (refs, stats, accepts) = w69_solve(code, RepairMode::Guarded);
+        eprintln!(
+            "E5C_W69S {name} guarded_refs={refs} mode_a_refs={mode_a} rounds={}/{} commits={}/{} \
+             fallback={:?} accepts={accepts}",
+            stats.rounds,
+            mode_a_stats.rounds,
+            stats.commits_conflict,
+            mode_a_stats.commits_conflict,
+            stats.guarded_fallback
+        );
+    }
+}
+
+/// W69a: a guarded round lifts Mode-A's over-pin. On the cascade Mode-A commits two `¬ref`s and
+/// the first is unnecessary once the second holds; the guarded clause on the first deactivates
+/// when its peer moves, so the guarded model keeps more Ref, accepts without falling back, and is
+/// a fixpoint of the Mode-A replay.
+#[test]
+fn e5c_w69_a_a_guarded_round_lifts_a_mode_a_over_pin() {
+    use super::borrow_verify::RepairMode;
+    let (mode_a, mode_a_stats, _) = w69_solve(W69_CASCADE, RepairMode::ModeA);
+    let (guarded, stats, accepts) = w69_solve(W69_CASCADE, RepairMode::Guarded);
+    assert_eq!(stats.repair, RepairMode::Guarded);
+    assert_eq!(stats.guarded_fallback, None, "{stats:?}");
+    assert!(
+        accepts,
+        "the guarded model must be a fixpoint of the replay"
+    );
+    assert!(
+        guarded > mode_a,
+        "RED: the guarded run keeps no more Ref than Mode-A ({guarded} vs {mode_a}); \
+         {stats:?} vs {mode_a_stats:?}"
+    );
+}
+
+/// W69c: an A5 overlap pair is in the guarded replay's context. `same_`'s two formals share one type
+/// (W68c's effective pair). Before the port the dispatch refused A5 in the L2 loop (a panic); the
+/// guarded run accepts without falling back, and the conflict met through the partner carries the
+/// mark in its hazard key. Fault `no-a5-context`: the mark is gone.
+#[test]
+fn e5c_w69_c_an_a5_pair_is_in_the_guarded_witness_context() {
+    let on = w69_lines("w68-shapes", &[]);
+    assert!(
+        on.contains(&"repair-receipt repair=guarded".to_owned()),
+        "{on:?}"
+    );
+    assert!(
+        on.contains(&"repair-receipt guarded_fallbacks=0".to_owned()),
+        "{on:?}"
+    );
+    let marked = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("l2 event=guarded_hazard") && l.contains("~partner:"))
+    };
+    assert!(marked(&on), "{on:?}");
+    let fault = w69_lines("w68-shapes", &[("CRAT_E5C_W69_FAULT", "no-a5-context")]);
+    assert!(!marked(&fault), "the fault must be caught: {fault:?}");
+}
+
+/// W69d: a guarded accept records the residual certificate, the rows Mode-A records on the same
+/// model (the separate loop left it `None`). Fault `no-certificate`: `none`.
+#[test]
+fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
+    let guarded = w69_lines("w68-shapes", &[]);
+    let mode_a = w63_lines("w68-shapes", &[("CRAT_ERA5C_LEND", "on")]);
+    assert_ne!(w63_kind(&guarded, "residuals"), "none", "{guarded:?}");
+    if w69_model(&guarded) == w69_model(&mode_a) {
+        assert_eq!(
+            w63_kind(&guarded, "residuals"),
+            w63_kind(&mode_a, "residuals")
+        );
+    }
+    let fault = w69_lines("w68-shapes", &[("CRAT_E5C_W69_FAULT", "no-certificate")]);
+    assert_eq!(
+        w63_kind(&fault, "residuals"),
+        "none",
+        "the fault must be caught"
+    );
+}
+
+/// W69e: the field-own branch (relay 117) runs under the guarded repair. avl's rotations leave a
+/// residual on an Owning field (W56); the separate loop declined it; the one loop repairs it before
+/// the mode arm, so the guarded run accepts without falling back. Fault `no-field-own`: the guarded
+/// run declines and the program falls back to Mode-A, which the receipt names.
+#[test]
+fn e5c_w69_e_the_field_own_branch_runs_under_the_guarded_repair() {
+    let run = |fault: Option<&str>| -> Vec<String> {
+        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
+        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
+        env.push(("CRAT_ERA5C_DEREF_READER", "on"));
+        env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"));
+        env.push(("CRAT_E5C_SHAPE", "AVL"));
+        env.push(("CRAT_BO_REPAIR", "guarded"));
+        if let Some(fault) = fault {
+            env.push(("CRAT_E5C_W69_FAULT", fault));
+        }
+        child(
+            "analyses::borrow_ownership::null_paths_tests::e5c_inner_shape_decline_reason",
+            &env,
+        )
+        .lines()
+        .filter_map(|l| {
+            l.find("E5C_DECLINE ")
+                .map(|i| l[i..].to_owned())
+                .or_else(|| l.find("E5C_REPAIR ").map(|i| l[i..].to_owned()))
+        })
+        .collect()
+    };
+    let on = run(None);
+    assert!(on.contains(&"E5C_DECLINE none".to_owned()), "{on:?}");
+    assert!(
+        on.contains(&"E5C_REPAIR repair=guarded".to_owned()),
+        "{on:?}"
+    );
+    let fault = run(Some("no-field-own"));
+    assert!(
+        fault.contains(&"E5C_REPAIR repair=guarded->mode-a".to_owned()),
+        "the fault must be caught: {fault:?}"
+    );
+    assert!(
+        fault
+            .iter()
+            .any(|l| l.starts_with("E5C_REPAIR guarded_fallback_reasons=field-conflict")),
+        "{fault:?}"
+    );
+}
+
+/// W75 (R677-4; era-5c 100a STOP 1): libtree's `string_table_maybe_grow` shape.
+/// `grow` reallocs `(*t).arr` to a computed size and exits on null; `grow16`
+/// reallocs to the constant 16. `store` / `store16` use `*t` after the call.
+const W75_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut)]
+extern "C" {
+    fn realloc(_: *mut core::ffi::c_void, _: u64) -> *mut core::ffi::c_void;
+    fn exit(_: i32) -> !;
+}
+#[repr(C)] pub struct tab { pub n: u64, pub cap: u64, pub arr: *mut i8 }
+unsafe extern "C" fn grow(t: *mut tab, k: u64) {
+    if (*t).n.wrapping_add(k) <= (*t).cap { return; }
+    (*t).cap = 2u64.wrapping_mul((*t).n.wrapping_add(k));
+    let a = realloc((*t).arr as *mut core::ffi::c_void, (*t).cap) as *mut i8;
+    if a.is_null() { exit(1); }
+    (*t).arr = a;
+}
+#[no_mangle] pub unsafe extern "C" fn store(t: *mut tab, k: u64) -> u64 {
+    grow(t, k);
+    (*t).n = (*t).n.wrapping_add(k);
+    (*t).n
+}
+unsafe extern "C" fn grow16(t: *mut tab) {
+    let a = realloc((*t).arr as *mut core::ffi::c_void, 16) as *mut i8;
+    if a.is_null() { exit(1); }
+    (*t).arr = a;
+}
+#[no_mangle] pub unsafe extern "C" fn store16(t: *mut tab) -> u64 {
+    grow16(t);
+    (*t).n
+}
+"#;
+
+/// W75: with (α)'s route condition (`CRAT_ERA5C_ALPHA_RETURNS`) the exit path
+/// removes `store`'s and `store16`'s (α) discharges (RED). With
+/// `CRAT_ERA5C_REALLOC_REFUTE` the constant size's null branch is refuted --
+/// `store16` and `grow16`'s own frame discharge -- while the computed size is
+/// not; the zero-size premise (`CRAT_ERA5C_REALLOC_NONZERO`) refutes both; the
+/// fault `no-refute` gives the RED back. Without the route condition both
+/// discharge (L01¹⁰'s control).
+#[test]
+fn e5c_w75_alpha_route_refutes_the_realloc_null_path() {
+    let run = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRAT_ERA5C_ALPHA_RETURNS", "on")];
+        env.extend_from_slice(extra);
+        w71_lines("w75-shapes", "off", &env)
+    };
+    let alpha = |lines: &[String], f: &str| {
+        w71_has(
+            lines,
+            "discharge",
+            &format!("target={f}::_1@d0"),
+            "post-free-use(",
+        )
+    };
+    let red = run(&[]);
+    assert!(
+        !alpha(&red, "store") && !alpha(&red, "store16"),
+        "RED: {red:?}"
+    );
+    let on = run(&[("CRAT_ERA5C_REALLOC_REFUTE", "on")]);
+    assert!(alpha(&on, "store16"), "{on:?}");
+    assert!(
+        alpha(&on, "grow16"),
+        "the releasing frame's own window: {on:?}"
+    );
+    assert!(
+        !alpha(&on, "store"),
+        "a computed size is not refuted: {on:?}"
+    );
+    let premise = run(&[
+        ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
+        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
+    ]);
+    assert!(
+        alpha(&premise, "store") && alpha(&premise, "store16"),
+        "{premise:?}"
+    );
+    let fault = run(&[
+        ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
+        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
+        ("CRAT_E5C_W71_FAULT", "no-refute"),
+    ]);
+    assert!(
+        !alpha(&fault, "store16"),
+        "the fault must be caught: {fault:?}"
+    );
+    let l10 = w71_lines("w75-shapes", "off", &[("CRAT_ERA5C_ALPHA_RETURNS", "off")]);
+    assert!(alpha(&l10, "store") && alpha(&l10, "store16"), "{l10:?}");
+}
+
+/// W78 (R682-3): a discharge only the zero-size `realloc` premise admits is
+/// receipted `premise=realloc-nonzero@R684-1` (R686-4). On W75's shapes with the premise on,
+/// `store`'s (computed size) receipt carries it; `store16`'s and `grow16`'s
+/// (constant size) do not; without the premise no receipt does; the fault
+/// `no-premise` keeps the discharge and drops the marker.
+#[test]
+fn e5c_w78_the_realloc_premise_is_receipted() {
+    let run = |extra: &[(&str, &str)]| {
+        let mut env = vec![
+            ("CRAT_ERA5C_ALPHA_RETURNS", "on"),
+            ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
+        ];
+        env.extend_from_slice(extra);
+        w71_lines("w75-shapes", "off", &env)
+    };
+    let marked = |lines: &[String], f: &str| {
+        w71_has(
+            lines,
+            "discharge",
+            &format!("target={f}::_1@d0"),
+            "premise=realloc-nonzero@R684-1)",
+        )
+    };
+    let discharged =
+        |lines: &[String], f: &str| w71_has(lines, "discharge", &format!("target={f}::_1@d0"), "");
+    let premise = run(&[("CRAT_ERA5C_REALLOC_NONZERO", "on")]);
+    assert!(marked(&premise, "store"), "{premise:?}");
+    assert!(
+        discharged(&premise, "store16") && !marked(&premise, "store16"),
+        "{premise:?}"
+    );
+    assert!(
+        discharged(&premise, "grow16") && !marked(&premise, "grow16"),
+        "{premise:?}"
+    );
+    let strict = run(&[]);
+    assert!(
+        !strict.iter().any(|l| l.contains("premise=realloc-nonzero")),
+        "{strict:?}"
+    );
+    let fault = run(&[
+        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
+        ("CRAT_E5C_W71_FAULT", "no-premise"),
+    ]);
+    assert!(
+        discharged(&fault, "store") && !marked(&fault, "store"),
+        "the fault must be caught: {fault:?}"
+    );
+}
+
+/// W79 (R690-6; analysis-fanout 018): tisp's `mk_list(st, n, ...)`. A call argument
+/// past a C-variadic callee's fixed parameters has no parameter local, so it is not
+/// bound as a loan on the callee's body local `_(i+1)`: before, the portable export
+/// refused the program ("unresolved callee argument: mk_list argument 4 of 3").
+const W79_SHAPES: &str = r#"
+#![feature(c_variadic)]
+#![allow(dead_code, unused_mut, non_camel_case_types, unused_braces, unused_assignments)]
+extern "C" { fn malloc(_: u64) -> *mut ::core::ffi::c_void; }
+#[repr(C)] pub struct Val { pub x: i32, pub next: *mut Val }
+// tisp's `mk_list(st, n, ...)` (analysis-fanout 018): its first body locals are pointers, so a call
+// argument past the fixed parameters is read as a loan on the callee's body local `_(i+1)`.
+#[no_mangle] pub unsafe extern "C" fn mk_list(mut st: *mut Val, mut n: i32, mut args: ...) -> *mut Val {
+    let mut lst = ::core::ptr::null_mut::<Val>();
+    let mut cur = ::core::ptr::null_mut::<Val>();
+    let mut argp: ::core::ffi::VaListImpl;
+    argp = args.clone();
+    lst = argp.arg::<*mut Val>();
+    cur = lst;
+    (*cur).next = st;
+    return lst;
+}
+#[no_mangle] pub unsafe extern "C" fn mk_pair(mut a: i32, mut next: *mut Val) -> *mut Val { let mut p = malloc(16) as *mut Val; (*p).x = a; (*p).next = next; return p; }
+#[no_mangle] pub unsafe extern "C" fn caller(mut st: *mut Val, mut v: *mut Val) -> *mut Val {
+    return { let __arg_2 = mk_pair(1, st); let __arg_4 = mk_pair(2, st); mk_list(st, 3, __arg_2, v, __arg_4) };
+}
+"#;
+
+/// W79: with the loan bounded by the callee's fixed inputs the entry is prepared
+/// (the W76 line prints; no refusal). The fault `no-fixed` gives the refusal back.
+#[test]
+fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
+    let env = [("CRAT_E5C_W76", "1")];
+    let on = w71_lines("w79-shapes", "on", &env);
+    assert!(
+        on.iter().any(|l| l.starts_with("discharged ")),
+        "the entry is prepared: {on:?}"
+    );
+    let text = w63_child(
+        "w79-shapes",
+        &[("CRAT_E5C_W76", "1"), ("CRAT_E5C_W79_FAULT", "no-fixed")],
+    );
+    assert!(
+        text.contains("unresolved callee argument: mk_list argument 4 of 3"),
+        "the fault must be caught: {text}"
+    );
+}
+
+/// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement
+/// review's discharged rows. On W71's shapes with L01¹¹'s discharges on, the
+/// in-memory packet and the prepared (streamed) entry hold the same rows; the
+/// fault `CRAT_E5C_W76_FAULT=no-discharged` (test builds) empties the entry's.
+#[test]
+fn e5c_w76_the_entry_carries_the_discharged_rows() {
+    let line = |extra: &[(&str, &str)]| {
+        let mut env = vec![("CRAT_E5C_W76", "1")];
+        env.extend_from_slice(extra);
+        w71_lines("w71-shapes", "on", &env)
+            .into_iter()
+            .find(|l| l.starts_with("discharged "))
+            .expect("the W76 line")
+    };
+    let on = line(&[]);
+    let portable: usize = on
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("portable="))
+        .and_then(|n| n.parse().ok())
+        .expect("portable count");
+    assert!(portable >= 4, "{on}");
+    assert!(on.ends_with("equal=true"), "{on}");
+    let fault = line(&[("CRAT_E5C_W76_FAULT", "no-discharged")]);
+    assert!(
+        fault.contains(" entry=0 ") && fault.ends_with("equal=false"),
+        "{fault}"
+    );
+}
+
+/// W77 (R677-4): RQ5's three switches in L01¹², default-inert. On the snapshot
+/// fixture (`two(p, p)`): by default precise replay plans a C-9 mark and the
+/// identity reads `a5_mode=precise_replay`, `mutability=foster-from-program-v1`,
+/// `era5c_a5_snapshot=true`; `CRAT_ERA5C_A5_SNAPSHOT=off` plans none;
+/// `CRAT_BO_A5_MODE=baseline` turns A5 off; `CRAT_BO_MUT_FACTS=off` names all-mut.
+#[test]
+fn e5c_w77_the_rq5_switches() {
+    let run = |env: &[(&str, &str)]| -> Vec<String> {
+        child(
+            "analyses::borrow_ownership::a5_producer::tests::e5c_inner_w77",
+            env,
+        )
+        .lines()
+        .filter_map(|l| l.find("E5C_W77 ").map(|i| l[i + 8..].to_owned()))
+        .collect()
+    };
+    let marks = |lines: &[String]| -> usize {
+        lines
+            .iter()
+            .find_map(|l| l.split("marks=").nth(1))
+            .and_then(|n| n.parse().ok())
+            .expect("marks")
+    };
+    let default = run(&[]);
+    assert!(marks(&default) > 0, "{default:?}");
+    for line in [
+        "a5_mode=precise_replay",
+        "mutability=foster-from-program-v1",
+        "era5c_a5_snapshot=true",
+    ] {
+        assert!(default.iter().any(|l| l == line), "{line}: {default:?}");
+    }
+    let snapshot = run(&[("CRAT_ERA5C_A5_SNAPSHOT", "off")]);
+    assert_eq!(marks(&snapshot), 0, "{snapshot:?}");
+    assert!(
+        snapshot.iter().any(|l| l == "era5c_a5_snapshot=false"),
+        "{snapshot:?}"
+    );
+    let overlap = run(&[("CRAT_BO_A5_MODE", "baseline")]);
+    assert_eq!(marks(&overlap), 0, "{overlap:?}");
+    assert!(
+        overlap.iter().any(|l| l == "a5_mode=baseline"),
+        "{overlap:?}"
+    );
+    let mutable = run(&[("CRAT_BO_MUT_FACTS", "off")]);
+    assert!(
+        mutable.iter().any(|l| l == "mutability=all-mut-v1"),
+        "{mutable:?}"
     );
 }

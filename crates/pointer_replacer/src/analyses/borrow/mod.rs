@@ -572,7 +572,22 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
                 {
-                    for (arg_index, arg) in mir_call.args.iter().enumerate() {
+                    // A C-variadic callee has no parameter local past its fixed
+                    // inputs: `_(i+1)` there is a body local (tisp's `mk_list`,
+                    // RQ3 / analysis-fanout 018), so no loan is bound to it.
+                    let fixed = if cfg!(test)
+                        && std::env::var("CRAT_E5C_W79_FAULT").as_deref() == Ok("no-fixed")
+                    {
+                        usize::MAX
+                    } else {
+                        self.tcx
+                            .fn_sig(callee)
+                            .skip_binder()
+                            .inputs()
+                            .skip_binder()
+                            .len()
+                    };
+                    for (arg_index, arg) in mir_call.args.iter().enumerate().take(fixed) {
                         let arg = &arg.node;
                         if let Some(arg) = arg.place() {
                             let callee_local = Local::from_usize(arg_index + 1);

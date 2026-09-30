@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p11-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p12-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -64,8 +64,10 @@ const ESC_MINIMAL_ALLOWLIST: &[u8] = include_bytes!("esc_minimal_allowlist.tsv")
 #[test]
 #[ignore = "diagnostic: prints the identity field map for a cross-lane diff"]
 fn e5c_print_solver_identity() {
+    // L01¹² (R677-4): the worker's mode (`CRAT_BO_A5_MODE`), so RQ5's `overlap`
+    // row's jobs carry the configuration its worker computes.
     let identity = solver_identity(
-        super::a5_overlap::A5Mode::PreciseReplay,
+        super::a5_overlap::A5Mode::production(),
         Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
     );
     eprintln!(
@@ -246,6 +248,15 @@ pub(crate) fn solver_identity(
         "era5c_alpha_returns",
         super::retirement::discharge::alpha_returns().to_string(),
     );
+    // L01¹² (R677-4): the realloc refutation on (α)'s route, and its zero-size premise.
+    fields.insert(
+        "era5c_realloc_refute",
+        super::retirement::discharge::realloc_refute().to_string(),
+    );
+    fields.insert(
+        "era5c_realloc_nonzero",
+        super::retirement::discharge::realloc_nonzero().to_string(),
+    );
     fields.insert(
         "era5c_own_named",
         super::field_moves::own_named().to_string(),
@@ -356,7 +367,20 @@ pub(crate) fn solver_identity(
     fields.insert("repair_mode", RepairMode::current().label().to_owned());
     fields.insert("safe_mono", SafeMonoMode::current().label().to_owned());
     fields.insert("t2", T2_MARKER.to_owned());
-    fields.insert("mutability", "foster-from-program-v1".to_owned());
+    // L01¹² (R677-4): RQ5's `mut` row (`CRAT_BO_MUT_FACTS=off`) solves with every
+    // pointer mutable.
+    fields.insert(
+        "mutability",
+        match super::mutability_facts::MutFactsMode::current() {
+            super::mutability_facts::MutFactsMode::On => "foster-from-program-v1",
+            super::mutability_facts::MutFactsMode::Off => "all-mut-v1",
+        }
+        .to_owned(),
+    );
+    fields.insert(
+        "era5c_a5_snapshot",
+        super::a5_producer::a5_snapshot().to_string(),
+    );
     for key in [
         "CRAT_BO_EXPORT",
         "CRAT_BO_L2_TRANSITION_DIAGNOSTICS",
@@ -1260,7 +1284,7 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5c-l01p11-v1",
+            "analysis_frame=era5c-l01p12-v1",
             "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",

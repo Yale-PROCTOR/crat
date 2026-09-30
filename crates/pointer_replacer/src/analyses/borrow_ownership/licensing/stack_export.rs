@@ -189,9 +189,14 @@ pub(crate) fn validate(
             .get("receipt")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
+        // L01¹¹ (R659-1): (γ), (α⁺) and (β′)'s sharpened containment.
         let well_formed = receipt.starts_with("retirement-disjoint:post-free-use(")
+            || receipt.starts_with("retirement-disjoint:fresh-in-route(")
+            || receipt.starts_with("retirement-disjoint:post-release-use-route(")
             || (receipt.starts_with("retirement-disjoint:effective-type(")
-                && receipt.ends_with(", premise=typed-release@R604-1)"));
+                && (receipt.ends_with(", premise=typed-release@R604-1)")
+                    || receipt
+                        .ends_with(", premise=typed-release@R604-1, containment=sole-type)")));
         if !well_formed {
             return Err("malformed retirement discharge receipt".into());
         }

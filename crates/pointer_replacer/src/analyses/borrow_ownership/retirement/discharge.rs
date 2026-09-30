@@ -94,6 +94,24 @@ pub(crate) fn alpha_returns() -> bool {
     switch("CRAT_ERA5C_ALPHA_RETURNS", &ONCE)
 }
 
+/// `CRAT_ERA5C_REALLOC_REFUTE` (on|off, fail-loud): **L01¹²** (R677-4, era-5c 100a
+/// STOP 1). In a route's releasing frame, the branch on which a `realloc`'s result
+/// tests null is not a path after the release when the old block was not released
+/// there: its size is a nonzero constant, or `realloc_nonzero()` holds.
+pub(crate) fn realloc_refute() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    switch("CRAT_ERA5C_REALLOC_REFUTE", &ONCE)
+}
+
+/// `CRAT_ERA5C_REALLOC_NONZERO` (on|off, fail-loud): the premise that a zero-size
+/// `realloc` is outside the target space (091 STOP 2 (ii); C23: undefined, C17:
+/// implementation-defined), so every `realloc`'s null result leaves the old block.
+/// A user decision; off by default.
+pub(crate) fn realloc_nonzero() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    switch("CRAT_ERA5C_REALLOC_NONZERO", &ONCE)
+}
+
 /// W71's faults (test builds only): `no-fresh`, `no-route-use`, `no-sole`.
 fn w71_fault(name: &str) -> bool {
     cfg!(test) && std::env::var("CRAT_E5C_W71_FAULT").ok().as_deref() == Some(name)
@@ -380,6 +398,10 @@ pub(crate) struct Discharges {
     /// (α⁺): the route's frames, bottom (the releasing function) to top (the
     /// conflict frame).
     chains: std::collections::BTreeMap<EventKey, Vec<RouteFrame>>,
+    /// L01¹² (R682-3): `after` / `chains` without the zero-size premise's
+    /// refuted edge, for the events where that edge was applied.
+    strict_after: std::collections::BTreeMap<EventKey, FxHashSet<Local>>,
+    strict_chains: std::collections::BTreeMap<EventKey, Option<Vec<RouteFrame>>>,
 }
 
 /// One frame of a release's route, for (α⁺).
@@ -399,11 +421,13 @@ struct RouteFrame {
     formals_from_caller: FxHashMap<usize, Local>,
 }
 
-/// One discharged conflict, for the receipt.
+/// One discharged conflict, for the receipt. `premise`: only the zero-size
+/// `realloc` premise admits it (L01¹², R682-3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Rule {
     PostFreeUse {
         local: u32,
+        premise: bool,
     },
     /// `sole`: the discharge needed (β′) (a pointer element type, or a
     /// referent that contains P but is not P-only).
@@ -420,7 +444,26 @@ pub(crate) enum Rule {
     PostReleaseUseRoute {
         frame: String,
         local: u32,
+        premise: bool,
     },
+}
+
+impl Rule {
+    /// The same discharge, resting on the zero-size `realloc` premise.
+    fn premised(self) -> Self {
+        match self {
+            Rule::PostFreeUse { local, .. } => Rule::PostFreeUse {
+                local,
+                premise: true,
+            },
+            Rule::PostReleaseUseRoute { frame, local, .. } => Rule::PostReleaseUseRoute {
+                frame,
+                local,
+                premise: true,
+            },
+            other => other,
+        }
+    }
 }
 
 impl Discharges {
@@ -460,15 +503,40 @@ impl Discharges {
                 let body = tcx
                     .mir_drops_elaborated_and_const_checked(event.frame)
                     .borrow();
-                let after = accessed_after(&body, event.location, event.frame, &out.reassigned);
+                // L01¹² (R677-4): a route-less release's own frame gets the same refutation.
+                let refuted = (event.route.is_empty()
+                    && realloc_refute()
+                    && !w71_fault("no-refute")
+                    && matches!(event.source.key.role, SourceRole::ReallocOld))
+                .then(|| refuted_realloc_edge(tcx, &body, event.location))
+                .flatten();
+                let after = accessed_after(
+                    &body,
+                    event.location,
+                    event.frame,
+                    &out.reassigned,
+                    refuted.map(|(edge, _)| edge),
+                );
+                // R682-3: what holds without the premise, for the receipt.
+                if refuted.is_some_and(|(_, premise)| premise) {
+                    let strict =
+                        accessed_after(&body, event.location, event.frame, &out.reassigned, None);
+                    out.strict_after.insert(key.clone(), strict);
+                }
                 out.after.insert(key.clone(), after);
                 if retire_fresh() && !w71_fault("no-fresh") {
                     let fresh = out.fresh_release(tcx, event, functions);
                     out.fresh.insert(key.clone(), fresh);
                 }
                 if (retire_route_use() && !w71_fault("no-route-use") || alpha_returns())
-                    && let Some(chain) = out.route_chain(tcx, event, functions)
+                    && let Some((chain, premised)) = out.route_chain(tcx, event, functions, false)
                 {
+                    if premised {
+                        let strict = out
+                            .route_chain(tcx, event, functions, true)
+                            .map(|(chain, _)| chain);
+                        out.strict_chains.insert(key.clone(), strict);
+                    }
                     out.chains.insert(key, chain);
                 }
             }
@@ -680,9 +748,12 @@ impl Discharges {
         tcx: TyCtxt<'tcx>,
         event: &FrameEvent,
         functions: &std::collections::BTreeMap<String, LocalDefId>,
-    ) -> Option<Vec<RouteFrame>> {
+        strict: bool,
+    ) -> Option<(Vec<RouteFrame>, bool)> {
         let releasing = *functions.get(&event.source.key.function)?;
         let mut chain = Vec::new();
+        // R682-3: whether the zero-size premise's edge was applied (`strict`: never).
+        let mut premised = false;
         // The bottom frame, from the release itself.
         let (mut function, mut start) = (
             releasing,
@@ -696,8 +767,22 @@ impl Discharges {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
-            let (accessed, accessed_or_returned, returns) =
-                after_frame(&body, start, function, &self.reassigned);
+            // L01¹² (R677-4): in the releasing frame only, a `realloc`'s refuted null branch.
+            let refuted = (chain.is_empty()
+                && realloc_refute()
+                && !w71_fault("no-refute")
+                && matches!(event.source.key.role, SourceRole::ReallocOld))
+            .then(|| refuted_realloc_edge(tcx, &body, start))
+            .flatten()
+            .filter(|&(_, premise)| !(strict && premise));
+            premised |= refuted.is_some_and(|(_, premise)| premise);
+            let (accessed, accessed_or_returned, returns) = after_frame(
+                &body,
+                start,
+                function,
+                &self.reassigned,
+                refuted.map(|(edge, _)| edge),
+            );
             let step = steps.next();
             let formals_from_caller = match step {
                 Some(step) => formals_from(tcx, step)?,
@@ -714,7 +799,7 @@ impl Discharges {
             function = step.caller;
             start = step.location;
         }
-        (chain.last().map(|f| f.function) == Some(event.frame)).then_some(chain)
+        (chain.last().map(|f| f.function) == Some(event.frame)).then_some((chain, premised))
     }
 
     /// T: the referent's type.
@@ -753,34 +838,64 @@ impl Discharges {
             event.phase,
             &event.route,
         );
+        let after = self.after.get(&key);
+        let chain = self.chains.get(&key).map(Vec::as_slice);
+        let rule = self.discharge_on(event, target, &key, after, chain);
+        // L01¹² (R682-3): a discharge only the zero-size `realloc` premise admits
+        // (a computed size's refuted null branch) says so in its receipt.
+        if rule.is_none()
+            || w71_fault("no-premise")
+            || !(self.strict_after.contains_key(&key) || self.strict_chains.contains_key(&key))
+        {
+            return rule;
+        }
+        let strict_after = self.strict_after.get(&key).or(after);
+        let strict_chain = match self.strict_chains.get(&key) {
+            Some(strict) => strict.as_deref(),
+            None => chain,
+        };
+        self.discharge_on(event, target, &key, strict_after, strict_chain)
+            .or_else(|| rule.map(Rule::premised))
+    }
+
+    fn discharge_on(
+        &self,
+        event: &FrameEvent,
+        target: &Target<'_>,
+        key: &EventKey,
+        after: Option<&FxHashSet<Local>>,
+        chain: Option<&[RouteFrame]>,
+    ) -> Option<Rule> {
         if let Some(base) = target.base()
             && !self.reassigned.contains(&(event.frame, base))
-            && self.after.get(&key).is_some_and(|set| set.contains(&base))
+            && after.is_some_and(|set| set.contains(&base))
             // R666-1: every route frame below returns (or uses the referent).
             && (!alpha_returns()
                 || w71_fault("no-alpha-returns")
-                || self.chains.get(&key).is_some_and(|chain| {
+                || chain.is_some_and(|chain| {
                     let pointer = pointers(chain, base);
                     below(chain, &pointer, chain.len() - 1)
                 }))
         {
             return Some(Rule::PostFreeUse {
                 local: base.as_u32(),
+                premise: false,
             });
         }
         if retire_route_use()
             && !w71_fault("no-route-use")
             && let Some(base) = target.base()
             && !self.reassigned.contains(&(event.frame, base))
-            && let Some(chain) = self.chains.get(&key)
+            && let Some(chain) = chain
             && let Some((frame, local)) = route_use(chain, base)
         {
             return Some(Rule::PostReleaseUseRoute {
                 frame: format!("{frame:?}"),
                 local: local.as_u32(),
+                premise: false,
             });
         }
-        if let Some(Some((allocation, made_in))) = self.fresh.get(&key)
+        if let Some(Some((allocation, made_in))) = self.fresh.get(key)
             && (*made_in != event.frame || matches!(target, Target::Entry { .. }))
         {
             return Some(Rule::FreshInRoute {
@@ -790,7 +905,7 @@ impl Discharges {
         if !typed_release() {
             return None;
         }
-        let freed = self.freed.get(&key)?.as_ref()?;
+        let freed = self.freed.get(key)?.as_ref()?;
         let referent = self.referent(event.frame, target)?;
         let sole = self.types.pointers;
         if !self.types.typed(freed)
@@ -899,6 +1014,99 @@ impl<'tcx> Visitor<'tcx> for Accesses {
     }
 }
 
+/// L01¹² (R677-4): the edge `(switch block, null branch)` on which the `realloc` at
+/// `at` has returned null with its old block untouched -- the result (through
+/// single-definition copies and pointer casts) tested by `is_null`, and a size that is
+/// a nonzero constant or `realloc_nonzero()`. `None` when any part is not found. The
+/// flag: the size is not a nonzero constant, so the edge rests on the premise (R682-3).
+fn refuted_realloc_edge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    at: Location,
+) -> Option<((BasicBlock, BasicBlock), bool)> {
+    let TerminatorKind::Call {
+        args, destination, ..
+    } = &body.basic_blocks[at.block].terminator().kind
+    else {
+        return None;
+    };
+    let size = &args.get(1)?.node;
+    let constant = size
+        .constant()
+        .and_then(|c| {
+            c.const_
+                .try_eval_target_usize(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
+        })
+        .is_some_and(|n| n != 0);
+    if !(constant || realloc_nonzero()) || !destination.projection.is_empty() {
+        return None;
+    }
+    // The result and its single-definition copies / pointer casts.
+    let mut result: FxHashSet<Local> = [destination.local].into_iter().collect();
+    loop {
+        let before = result.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(assign) = &statement.kind else { continue };
+                if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                | Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(p) | Operand::Move(p), _) =
+                    &assign.1
+                    && p.projection.is_empty()
+                    && assign.0.projection.is_empty()
+                    && result.contains(&p.local)
+                {
+                    result.insert(assign.0.local);
+                }
+            }
+        }
+        if result.len() == before {
+            break;
+        }
+    }
+    // `t = is_null(r)`, then `switchInt(t)`: the branch taken when `t` is true.
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination: tested,
+            target: Some(next),
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee, _)) = func.const_fn_def() else { continue };
+        if tcx.item_name(callee).as_str() != "is_null"
+            || !args
+                .first()
+                .and_then(|a| a.node.place())
+                .is_some_and(|p| p.projection.is_empty() && result.contains(&p.local))
+        {
+            continue;
+        }
+        let TerminatorKind::SwitchInt { discr, targets } =
+            &body.basic_blocks[*next].terminator().kind
+        else {
+            continue;
+        };
+        if discr.place().map(|p| p.local) != Some(tested.local) {
+            continue;
+        }
+        let null = targets
+            .iter()
+            .find(|(value, _)| *value == 1)
+            .map(|(_, bb)| bb)
+            .or_else(|| {
+                targets
+                    .iter()
+                    .any(|(value, _)| value == 0)
+                    .then(|| targets.otherwise())
+            })?;
+        return Some(((*next, null), !constant));
+    }
+    None
+}
+
 /// The locals accessed through (`*local`) on every path from `start` (after
 /// it) to a normal return, a single-definition copy folded to its source. A
 /// path that ends without returning (a diverging call, `unreachable`, a loop
@@ -908,6 +1116,7 @@ fn accessed_after(
     start: Location,
     function: LocalDefId,
     reassigned: &FxHashSet<(LocalDefId, Local)>,
+    refuted: Option<(BasicBlock, BasicBlock)>,
 ) -> FxHashSet<Local> {
     // Single-definition copies of an unassigned local.
     let mut alias: FxHashMap<Local, Local> = FxHashMap::default();
@@ -969,7 +1178,10 @@ fn accessed_after(
             TerminatorKind::Drop { target, .. } | TerminatorKind::Assert { target, .. } => {
                 vec![*target]
             }
-            _ => terminator.successors().collect(),
+            _ => terminator
+                .successors()
+                .filter(|s| refuted != Some((block, *s)))
+                .collect(),
         }
     };
     // Least fixpoint of IN[b] = GEN(b) ∪ ⋂ IN[succ], from ∅. A block with no
@@ -1271,8 +1483,9 @@ fn after_frame(
     start: Location,
     function: LocalDefId,
     reassigned: &FxHashSet<(LocalDefId, Local)>,
+    refuted: Option<(BasicBlock, BasicBlock)>,
 ) -> (FxHashSet<Local>, Option<FxHashSet<Local>>, bool) {
-    let accessed = accessed_after(body, start, function, reassigned);
+    let accessed = accessed_after(body, start, function, reassigned, refuted);
     // Every path returns normally: a least fixpoint over the blocks.
     let normal = |block: BasicBlock| -> (bool, Vec<BasicBlock>) {
         let terminator = body.basic_blocks[block].terminator();
@@ -1286,7 +1499,13 @@ fn after_frame(
             TerminatorKind::Drop { target, .. } | TerminatorKind::Assert { target, .. } => {
                 (false, vec![*target])
             }
-            _ => (false, terminator.successors().collect()),
+            _ => (
+                false,
+                terminator
+                    .successors()
+                    .filter(|s| refuted != Some((block, *s)))
+                    .collect(),
+            ),
         }
     };
     let blocks: Vec<BasicBlock> = body.basic_blocks.indices().collect();

@@ -41,6 +41,9 @@ pub(crate) struct InvalidationAccess {
     pub(crate) point: PointIndex,
     pub(crate) loan: Loan,
     pub(crate) accessor: Local,
+    /// R617-1 (the guarded port): the access met the loan only through an A5
+    /// overlap partner of the accessor (the loan's base is the partner).
+    pub(crate) via_overlap_partner: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,15 +141,19 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends<'tcx>(
     (invalidates, accesses)
 }
 
-pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
+/// R617-1 (the guarded port): the capturing replay with A5's overlap, for the
+/// one witnessed replay -- the invalidation matrix, the captured accesses and
+/// the parameter conflicts, each exactly as the two entry points compute them.
+pub(crate) fn compute_invalidates_capturing_with_copy_lends_and_parameter_overlap<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
     copy_lends: &DenseBitSet<Loan>,
-    parameter_overlap: &ParameterOverlap,
-) -> (Invalidates, Vec<(Local, Local)>) {
+    parameter_overlap: Option<&ParameterOverlap>,
+) -> (Invalidates, Vec<InvalidationAccess>, Vec<(Local, Local)>) {
+    let mut accesses = Vec::new();
     let mut parameter_accesses = Vec::new();
     let invalidates = compute_invalidates_inner(
         tcx,
@@ -155,12 +162,21 @@ pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
         provenance_set,
         location_map,
         copy_lends,
-        Some(parameter_overlap),
-        None,
-        Some(&mut parameter_accesses),
+        parameter_overlap,
+        Some(&mut accesses),
+        if parameter_overlap.is_some() {
+            Some(&mut parameter_accesses)
+        } else {
+            None
+        },
     );
-    let conflicts = parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap);
-    (invalidates, conflicts)
+    let conflicts = match parameter_overlap {
+        Some(parameter_overlap) => {
+            parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap)
+        }
+        None => Vec::new(),
+    };
+    (invalidates, accesses, conflicts)
 }
 
 /// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own replay.
@@ -230,6 +246,31 @@ fn parameter_conflict_pairs<'tcx>(
         }
     }
     conflicts.into_iter().collect()
+}
+
+pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
+    parameter_overlap: &ParameterOverlap,
+) -> (Invalidates, Vec<(Local, Local)>) {
+    let mut parameter_accesses = Vec::new();
+    let invalidates = compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        copy_lends,
+        Some(parameter_overlap),
+        None,
+        Some(&mut parameter_accesses),
+    );
+    let conflicts = parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap);
+    (invalidates, conflicts)
 }
 
 fn compute_invalidates_inner<'tcx>(
@@ -450,13 +491,20 @@ pub(crate) enum AccessKind {
 }
 
 impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
-    fn insert_invalidation(&mut self, point: PointIndex, loan: Loan, accessor: Local) {
+    fn insert_invalidation(
+        &mut self,
+        point: PointIndex,
+        loan: Loan,
+        accessor: Local,
+        via_overlap_partner: bool,
+    ) {
         self.facts.insert(point, loan);
         if let Some(accesses) = self.accesses.as_mut() {
             accesses.push(InvalidationAccess {
                 point,
                 loan,
                 accessor,
+                via_overlap_partner,
             });
         }
     }
@@ -616,7 +664,12 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                             candidate_base != place.local
                         );
                     }
-                    self.insert_invalidation(point_index, loan, place.local);
+                    self.insert_invalidation(
+                        point_index,
+                        loan,
+                        place.local,
+                        candidate_base != place.local,
+                    );
                 }
             }
         }
@@ -725,7 +778,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                                 borrow_data.borrowed
                             );
                         }
-                        self.insert_invalidation(point_index, loan, accessor);
+                        self.insert_invalidation(point_index, loan, accessor, false);
                     }
                 }
             }

@@ -478,7 +478,12 @@ impl Resolver<'_, '_> {
                     .mir_drops_elaborated_and_const_checked(did)
                     .borrow();
                 if arg_index >= body.arg_count {
-                    return Err("unresolved callee argument".into());
+                    return Err(format!(
+                        "unresolved callee argument: {} argument {arg_index} of {} (c-variadic: {})",
+                        self.program.tcx.def_path_str(did.to_def_id()),
+                        body.arg_count,
+                        self.program.tcx.fn_sig(did).skip_binder().c_variadic()
+                    ));
                 }
                 CanonicalBorrower::CallArg {
                     callee: self.function(did)?,

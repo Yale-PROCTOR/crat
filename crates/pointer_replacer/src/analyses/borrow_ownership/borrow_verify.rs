@@ -58,13 +58,18 @@ thread_local! {
 ///   `Ref(lemmas) ⊆ Ref(mode_a)` and on a high-arity fan-out strictly ⊊ (Lemmas loses ≥1 Ref). So the
 ///   disjunction axis is dead; `ModeA` is the shipped default and the demotion-choice mechanism.
 ///
-/// Selected by env `CRAT_BO_REPAIR ∈ {mode_a, lemmas}` (default `ModeA`; the gate did NOT flip it),
+/// Selected by env `CRAT_BO_REPAIR ∈ {mode_a, lemmas, guarded}` (default `ModeA`; the gate did NOT flip it),
 /// or a thread-local `with_override` that WINS over env. A uniform strategy toggle, constant within an
 /// override scope — no path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RepairMode {
     ModeA,
     Lemmas,
+    /// R617-1 (era-5c 082, approved R631-7): the guarded planner's clauses in
+    /// Mode-A's loop, at the point where Mode-A commits. Everything around the
+    /// commits is Mode-A's. A decline falls back to Mode-A for the program
+    /// (`RoundStats::guarded_fallback`, receipted).
+    Guarded,
 }
 
 impl Default for RepairMode {
@@ -85,23 +90,38 @@ impl RepairMode {
         if let Some(m) = REPAIR_OVERRIDE.with(|c| c.get()) {
             return m;
         }
-        match std::env::var("CRAT_BO_REPAIR") {
+        let selected = match std::env::var("CRAT_BO_REPAIR") {
             Ok(v) => match v.as_str() {
-                "mode_a" | "mode-a" => RepairMode::ModeA,
-                "lemmas" => RepairMode::Lemmas,
+                "mode_a" | "mode-a" => Some(RepairMode::ModeA),
+                "lemmas" => Some(RepairMode::Lemmas),
+                "guarded" => Some(RepairMode::Guarded),
                 other => panic!(
-                    "CRAT_BO_REPAIR={other:?} is not a valid selector (expected mode_a or lemmas) \
-                     — refusing to silently fall back"
+                    "CRAT_BO_REPAIR={other:?} is not a valid selector (expected mode_a, lemmas or \
+                     guarded) — refusing to silently fall back"
                 ),
             },
-            Err(_) => Self::DEFAULT,
+            Err(_) => None,
+        };
+        // R617-1: `CRAT_BO_L2_GUARDED_COMMITS=1` is `guarded`'s alias. Its historical form
+        // required Mode-A (`mode_a` or unset), so those select the guarded mode with it;
+        // `lemmas` contradicts it and is refused.
+        if super::l2::enabled_from_env() {
+            assert_ne!(
+                selected,
+                Some(RepairMode::Lemmas),
+                "CRAT_BO_L2_GUARDED_COMMITS=1 (the guarded repair's alias) contradicts \
+                 CRAT_BO_REPAIR=lemmas"
+            );
+            return RepairMode::Guarded;
         }
+        selected.unwrap_or(Self::DEFAULT)
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             RepairMode::ModeA => "mode_a",
             RepairMode::Lemmas => "lemmas",
+            RepairMode::Guarded => "guarded",
         }
     }
 
@@ -195,9 +215,12 @@ pub(crate) struct SlotConflict {
 #[derive(Clone, Debug)]
 struct WitnessedSlotConflict {
     conflict: SlotConflict,
-    loan: usize,
+    /// `None` for an A5 parameter edge (R617-1): no loan behind the conflict.
+    loan: Option<usize>,
     stable_loan_key: Option<StableLoanKey>,
     invalidators: Vec<SlotRef>,
+    /// R617-1: the invalidators that met the loan through an A5 overlap partner.
+    overlap_invalidators: Vec<SlotRef>,
 }
 
 struct Revalidated<T> {
@@ -546,6 +569,7 @@ fn revalidate_replaying_witnessed(
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> Revalidated<FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>>> {
     let reader_scope = super::licensing::reader_replay::begin_round(slots, &is_ref, &is_raw);
     let _entry_scope = super::protected_entry::for_model(program, slots, &is_ref);
@@ -585,8 +609,23 @@ fn revalidate_replaying_witnessed(
         super::borrow_engine::ForkEngineMode::Fork,
         "L2 witnessed invalidator capture requires CRAT_BO_FORK_ENGINE=fork (or the unset fork default)"
     );
-    let edges = match selected_copy_lends {
-        Some(selected) => {
+    let edges = match (selected_copy_lends, parameter_overlaps) {
+        // R617-1: A5's overlap pairs in the witness context, as in Mode-A's replay.
+        (selected, Some(parameter_overlaps)) => {
+            let empty = SelectedCopyLendLoans::default();
+            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_flows_and_parameter_overlap_and_escaped(
+                program,
+                origin_flows,
+                cand,
+                raw,
+                mutab,
+                &raw_fields,
+                selected.unwrap_or(&empty),
+                escaped_copy_lends.unwrap_or(&empty),
+                parameter_overlaps,
+            )
+        }
+        (Some(selected), None) => {
             super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped(
                 program,
                 origin_flows,
@@ -598,7 +637,7 @@ fn revalidate_replaying_witnessed(
                 escaped_copy_lends.unwrap_or(&SelectedCopyLendLoans::default()),
             )
         }
-        None => super::borrow_engine::borrow_conflicts_replaying_witnessed(
+        (None, None) => super::borrow_engine::borrow_conflicts_replaying_witnessed(
             program,
             origin_flows,
             cand,
@@ -620,18 +659,22 @@ fn revalidate_replaying_witnessed(
                     let issuer = edge
                         .issuer
                         .and_then(|owner| owner_to_slot(slots, fn_did, owner));
-                    let mut invalidators = witnessed
-                        .invalidators
-                        .into_iter()
-                        .filter_map(|local| {
-                            owner_to_slot(slots, fn_did, ProvenanceOwner::Local(local))
-                        })
-                        .collect::<Vec<_>>();
-                    invalidators.sort_by_key(slotref_key);
-                    invalidators.dedup();
+                    let to_slots = |locals: Vec<Local>| {
+                        let mut slots_of = locals
+                            .into_iter()
+                            .filter_map(|local| {
+                                owner_to_slot(slots, fn_did, ProvenanceOwner::Local(local))
+                            })
+                            .collect::<Vec<_>>();
+                        slots_of.sort_by_key(slotref_key);
+                        slots_of.dedup();
+                        slots_of
+                    };
+                    let invalidators = to_slots(witnessed.invalidators);
+                    let overlap_invalidators = to_slots(witnessed.overlap_invalidators);
                     if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
                         eprintln!(
-                            "E5C witnessed-conflict fn={fn_did:?} loan={loan} at={loan_location:?} issuer={issuer:?} requirers={:?} invalidators={invalidators:?} esc={}",
+                            "E5C witnessed-conflict fn={fn_did:?} loan={loan:?} at={loan_location:?} issuer={issuer:?} requirers={:?} invalidators={invalidators:?} via_partner={overlap_invalidators:?} esc={}",
                             edge.requirers, edge.esc_issuer_first
                         );
                     }
@@ -646,14 +689,11 @@ fn revalidate_replaying_witnessed(
                             esc_issuer_first: edge.esc_issuer_first,
                         },
                         loan,
-                        stable_loan_key: issuer.map(|issuer| {
-                            StableLoanKey::new(
-                                fn_did.local_def_index.as_u32(),
-                                issuer,
-                                loan_location,
-                            )
+                        stable_loan_key: issuer.zip(loan_location).map(|(issuer, location)| {
+                            StableLoanKey::new(fn_did.local_def_index.as_u32(), issuer, location)
                         }),
                         invalidators,
+                        overlap_invalidators,
                     }
                 })
                 .collect();
@@ -839,6 +879,41 @@ pub(crate) struct RoundStats {
     pub l2_decline: Option<L2DeclineReason>,
     /// Typed source-retirement coverage failure, separate from solver outcome.
     pub source_retirement_decline: Vec<super::retirement::RetirementUnresolved>,
+    /// R617-1 STOP 2 (R631-7): set when a `Guarded` run declined and the program
+    /// fell back to Mode-A. These stats are then the Mode-A run's, stamped
+    /// `repair = Guarded`; the receipt reads `repair=guarded->mode-a`.
+    pub guarded_fallback: Option<GuardedFallback>,
+}
+
+/// R617-1 STOP 2: the declined guarded run behind a Mode-A fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GuardedFallback {
+    /// The guarded run's decline, as its receipt names it.
+    pub reason: String,
+    pub rounds: usize,
+    pub commits: usize,
+}
+
+impl GuardedFallback {
+    fn of(stats: &RoundStats) -> Self {
+        let reason = if let Some(reason) = &stats.l2_decline {
+            reason
+                .diagnostic_label(stats.rounds)
+                .rsplit_once("reason=")
+                .map_or_else(|| "l2".to_owned(), |(_, detail)| detail.replace('|', ";"))
+        } else if stats.field_conflict_decline.is_some() {
+            "field-conflict".to_owned()
+        } else if !stats.source_retirement_decline.is_empty() {
+            "source-retirement".to_owned()
+        } else {
+            "round-decline".to_owned()
+        };
+        Self {
+            reason,
+            rounds: stats.rounds,
+            commits: stats.commits_conflict,
+        }
+    }
 }
 
 fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool]) {
@@ -964,6 +1039,34 @@ fn solve_l2_round_model(
             selectors,
         ),
     }
+}
+
+/// R617-1: one round's solve. Mode-A and Lemmas solve as they always have; `Guarded` solves the
+/// same system through the typed twin, so a solver decline is recorded in the planner's taxonomy.
+fn solve_round(
+    solver: &KindSolver,
+    selectors: &Selectors,
+    backend: LoopBackend,
+    hard: Option<&HardLoopSolver>,
+    planner: Option<&Planner>,
+    stats: &mut RoundStats,
+    diagnostics_enabled: bool,
+) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
+    let Some(planner) = planner else {
+        return solve_round_model(solver, selectors, backend, hard);
+    };
+    let decline = match solve_l2_round_model(solver, selectors, backend, hard) {
+        L2SolveResult::Sat { kinds, dropped } => return Some((kinds, dropped)),
+        L2SolveResult::Unsat => L2SolverDecline::Unsat,
+        L2SolveResult::Unknown => L2SolverDecline::Unknown,
+    };
+    record_l2_decline(
+        stats,
+        planner.validation_rounds(),
+        L2DeclineReason::Solver(decline),
+        diagnostics_enabled,
+    );
+    None
 }
 
 fn selected_copy_lends_for_round(
@@ -1103,19 +1206,9 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         !solver.is_diagnostic_tracked(),
         "diagnostic-tracked KindSolver must not enter verify_to_fixpoint"
     );
-    let l2_enabled = l2::enabled_from_env();
     let repair = RepairMode::current();
-    if l2_enabled {
-        assert!(
-            parameter_overlaps.is_none(),
-            "A5 parameter-overlap replay is not defined for the L2 validation loop"
-        );
-        assert_eq!(
-            repair,
-            RepairMode::ModeA,
-            "CRAT_BO_L2_GUARDED_COMMITS=1 requires CRAT_BO_REPAIR=mode_a (or the unset Mode-A default)"
-        );
-        return verify_l2_to_fixpoint_counting(
+    let rounds = |repair| {
+        verify_rounds(
             program,
             slots,
             origin_flows,
@@ -1124,9 +1217,71 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             is_mutable,
             copy_lends,
             escaped_copy_lends,
+            parameter_overlaps,
+            backend,
+            repair,
+        )
+    };
+    if repair != RepairMode::Guarded {
+        return rounds(repair);
+    }
+    // R617-1 STOP 2 (R631-7): a guarded decline falls back to Mode-A for this program. The
+    // guarded run's assertions (its clauses, pins and the field-ownership constraints the loop
+    // asserts first) live in a scope that is popped before the Mode-A run, so that run sees the
+    // solver exactly as a Mode-A-only run would. An accepting guarded run keeps its scope, as a
+    // Mode-A run keeps its commits.
+    solver.push_scope();
+    let (model, guarded) = rounds(RepairMode::Guarded);
+    if model.is_some() {
+        return (model, guarded);
+    }
+    solver.pop_scope();
+    let fallback = GuardedFallback::of(&guarded);
+    if l2::diagnostics_enabled_from_env() {
+        eprintln!(
+            "[bo-l2] event=guarded_fallback|reason={}|rounds={}|commits={}",
+            fallback.reason, fallback.rounds, fallback.commits
         );
     }
-    let cap = round_cap(slots);
+    let (model, mut stats) = rounds(RepairMode::ModeA);
+    stats.repair = RepairMode::Guarded;
+    stats.guarded_fallback = Some(fallback);
+    (model, stats)
+}
+
+/// The validate/re-solve rounds of one repair mode (R617-1: the one loop). `Guarded` differs from
+/// Mode-A only at the commit point, in its witnessed replay, and in its typed solver declines.
+fn verify_rounds(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
+    backend: LoopBackend,
+    repair: RepairMode,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    // R617-1: the guarded planner lives across rounds, and is told of every round -- the
+    // retirement pins' and the field-own repair's as empty ones -- so its validation counter
+    // stays equal to `stats.rounds`. Its own cap (10S + 1) bounds the guarded rounds.
+    let diagnostics_enabled = repair == RepairMode::Guarded && l2::diagnostics_enabled_from_env();
+    let mut planner = (repair == RepairMode::Guarded).then(|| {
+        let slot_count = slots
+            .fn_local_slots
+            .values()
+            .try_fold(slots.field_slots.len(), |count, universe| {
+                count.checked_add(universe.len())
+            })
+            .expect("L2 registered-slot count overflow");
+        Planner::new(slot_count)
+    });
+    let cap = match &planner {
+        Some(planner) => planner.validation_cap().saturating_add(1),
+        None => round_cap(slots),
+    };
     // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
@@ -1137,8 +1292,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     // §NB5-L guard 1 — resolve the repair strategy ONCE per invocation into a local; NO mid-loop
     // re-reads, so the whole fixpoint runs one consistent strategy. Guard 3 stamps it into `stats`.
     stats.repair = repair;
-    let Some((mut model, dropped)) = solve_round_model(solver, selectors, backend, hard.as_ref())
-    else {
+    let Some((mut model, dropped)) = solve_round(
+        solver,
+        selectors,
+        backend,
+        hard.as_ref(),
+        planner.as_ref(),
+        &mut stats,
+        diagnostics_enabled,
+    ) else {
         return (None, stats);
     };
     record_dropped(&mut stats, selectors, &dropped);
@@ -1188,51 +1350,99 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
                 &model,
             )
         });
-        let reviewed = revalidate_replaying_reviewed(
-            program,
-            slots,
-            origin_flows,
-            |s| model.get(&s) == Some(&SlotKind::Ref),
-            // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
-            // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
-            // depth-0 slot can be `Owning` (ownership ORs over versions) yet carry a *reference*
-            // role in another version (`p = &mut a; …; p = malloc()`; or via reborrow/`offset`);
-            // excluding such a slot as a non-candidate would HIDE its aliasing conflict — the
-            // BB3-b under-report. Including every non-`Ref` slot makes "no hidden `Ref`-vs-`Ref`
-            // aliasing" hold by construction, with no need to DETECT mixed-role locals (a tar pit:
-            // any syntactic/conflict predicate must re-derive the borrow analysis's full
-            // provenance flow — Ref/RawPtr, cast/copy, offset/library methods, … — and kept
-            // missing paths over four adversarial rounds). Treating an `Owning` slot as a raw
-            // candidate is strictly MORE conservative (its loans are included, never fewer), so it
-            // cannot under-report. RESIDUAL (deferred to flow-sensitivity): a mixed-role local is
-            // output `Owning` — an ownership-layer imprecision, NOT a borrow-verifier under-report
-            // (the borrow contract = the surviving `Ref` slots do not alias; that holds for the
-            // raw-role completeness THIS argument is about — but NOT under the NB2 mutability
-            // skip, which drops immutable *interprocedural* loans from invalidation: two surviving
-            // `Ref`s CAN then alias a written cell via a call-return/param/cast/offset/field alias
-            // the coherence equate-closure does not unify. That is the S2-6 acceptance-level gap,
-            // real today (call-return witness `nb2_cross_alias_write_uncaught_witness`;
-            // production-parity), guarded ONLY by §8 and fixed by write-aware invalidation in
-            // NB3-3b). The §8 guardrail (BO unconsumed) makes both the imprecision above and the
-            // S2-6 gap harmless until codegen.
-            //
-            // §NB5-F2 (Codex HIGH fix): this predicate is used TWO ways in `revalidate_replaying` and
-            // the two owner classes need OPPOSITE semantics. LOCAL replay candidacy stays the
-            // conservative non-`Ref` above (an `Owning` local's loans must be INCLUDED — BB3-b). But
-            // the field DISABLE list REMOVES loans, so it must be EXACT `Raw`: disabling an `Owning`
-            // field's loan would delete a conflict that should decline/demote (an owning + borrow-
-            // aliased field → unsound accept). So branch on the owner: fields → exactly `Raw`, locals
-            // → non-`Ref`. (`Raw` fields are the only ones F2 dischargeds; `Owning` fields fall through
-            // to the `residual_nonref_field` decline backstop.)
-            |s| match s {
-                SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
-                SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
-            },
-            round_mutable,
-            selected_copy_lends.as_ref(),
-            active_escaped_copy_lends.as_ref(),
-            parameter_overlaps,
-        );
+        let is_ref = |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref);
+        // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
+        // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
+        // depth-0 slot can be `Owning` (ownership ORs over versions) yet carry a *reference*
+        // role in another version (`p = &mut a; …; p = malloc()`; or via reborrow/`offset`);
+        // excluding such a slot as a non-candidate would HIDE its aliasing conflict — the
+        // BB3-b under-report. Including every non-`Ref` slot makes "no hidden `Ref`-vs-`Ref`
+        // aliasing" hold by construction, with no need to DETECT mixed-role locals (a tar pit:
+        // any syntactic/conflict predicate must re-derive the borrow analysis's full
+        // provenance flow — Ref/RawPtr, cast/copy, offset/library methods, … — and kept
+        // missing paths over four adversarial rounds). Treating an `Owning` slot as a raw
+        // candidate is strictly MORE conservative (its loans are included, never fewer), so it
+        // cannot under-report. RESIDUAL (deferred to flow-sensitivity): a mixed-role local is
+        // output `Owning` — an ownership-layer imprecision, NOT a borrow-verifier under-report
+        // (the borrow contract = the surviving `Ref` slots do not alias; that holds for the
+        // raw-role completeness THIS argument is about — but NOT under the NB2 mutability
+        // skip, which drops immutable *interprocedural* loans from invalidation: two surviving
+        // `Ref`s CAN then alias a written cell via a call-return/param/cast/offset/field alias
+        // the coherence equate-closure does not unify. That is the S2-6 acceptance-level gap,
+        // real today (call-return witness `nb2_cross_alias_write_uncaught_witness`;
+        // production-parity), guarded ONLY by §8 and fixed by write-aware invalidation in
+        // NB3-3b). The §8 guardrail (BO unconsumed) makes both the imprecision above and the
+        // S2-6 gap harmless until codegen.
+        //
+        // §NB5-F2 (Codex HIGH fix): this predicate is used TWO ways in `revalidate_replaying` and
+        // the two owner classes need OPPOSITE semantics. LOCAL replay candidacy stays the
+        // conservative non-`Ref` above (an `Owning` local's loans must be INCLUDED — BB3-b). But
+        // the field DISABLE list REMOVES loans, so it must be EXACT `Raw`: disabling an `Owning`
+        // field's loan would delete a conflict that should decline/demote (an owning + borrow-
+        // aliased field → unsound accept). So branch on the owner: fields → exactly `Raw`, locals
+        // → non-`Ref`. (`Raw` fields are the only ones F2 dischargeds; `Owning` fields fall through
+        // to the `residual_nonref_field` decline backstop.)
+        let is_raw = |s: SlotRef| match s {
+            SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
+            SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
+        };
+        // R617-1: the guarded arm reads the witnessed replay -- the same replay with its loans and
+        // invalidators, in the same A5 context and round facts -- and every step before its commit
+        // point reads that replay's plain conflicts. Mode-A and Lemmas keep the reviewed replay.
+        let (reviewed, witnessed) = if repair == RepairMode::Guarded {
+            let Revalidated {
+                conflicts,
+                retirement,
+                reader_failures,
+                ..
+            } = revalidate_replaying_witnessed(
+                program,
+                slots,
+                origin_flows,
+                is_ref,
+                is_raw,
+                round_mutable,
+                selected_copy_lends.as_ref(),
+                active_escaped_copy_lends.as_ref(),
+                parameter_overlaps.filter(|_| !w69_fault(repair, "no-a5-context")),
+            );
+            let plain = conflicts
+                .iter()
+                .map(|(did, witnessed)| {
+                    (
+                        *did,
+                        witnessed
+                            .iter()
+                            .map(|w| w.conflict.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            (
+                Revalidated {
+                    conflicts: plain,
+                    retirement,
+                    reader_failures,
+                    edge_invalidators: FxHashMap::default(),
+                },
+                Some(conflicts),
+            )
+        } else {
+            (
+                revalidate_replaying_reviewed(
+                    program,
+                    slots,
+                    origin_flows,
+                    is_ref,
+                    is_raw,
+                    round_mutable,
+                    selected_copy_lends.as_ref(),
+                    active_escaped_copy_lends.as_ref(),
+                    parameter_overlaps,
+                ),
+                None,
+            )
+        };
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved;
             return (None, stats);
@@ -1253,6 +1463,9 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             }
         }
         if !raw_targets.is_empty() {
+            if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
+                return (None, stats);
+            }
             for target in &raw_targets {
                 solver.assume(*target, SlotKind::Raw);
                 if ledger && let Some(track) = solver.last_track() {
@@ -1270,9 +1483,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             raw_commit_trace::record(stats.rounds, false, &raw_targets);
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
-            let Some((next, dropped)) =
-                solve_round_model(solver, selectors, backend, hard.as_ref())
-            else {
+            let Some((next, dropped)) = solve_round(
+                solver,
+                selectors,
+                backend,
+                hard.as_ref(),
+                planner.as_ref(),
+                &mut stats,
+                diagnostics_enabled,
+            ) else {
                 return (None, stats);
             };
             model = next;
@@ -1318,8 +1537,12 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             // L01⁹ (`CRAT_ERA5C_FIELD_OWN_REPAIR`): an OWNING field in a residual
             // is demoted (`¬own`, monotone) instead of declining the program.
             if super::field_moves::field_own_repair()
+                && !w69_fault(repair, "no-field-own")
                 && model.get(&field) == Some(&SlotKind::Owning)
             {
+                if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
+                    return (None, stats);
+                }
                 let owning: rustc_hash::FxHashSet<SlotRef> = conflicts
                     .values()
                     .flatten()
@@ -1333,9 +1556,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
                 }
                 stats.commits_conflict += owning.len();
                 stats.commits_per_round.push(owning.len());
-                let Some((next, dropped)) =
-                    solve_round_model(solver, selectors, backend, hard.as_ref())
-                else {
+                let Some((next, dropped)) = solve_round(
+                    solver,
+                    selectors,
+                    backend,
+                    hard.as_ref(),
+                    planner.as_ref(),
+                    &mut stats,
+                    diagnostics_enabled,
+                ) else {
                     return (None, stats);
                 };
                 model = next;
@@ -1475,24 +1704,132 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
                     }
                 }
             }
+            // R617-1: the guarded planner's clauses at Mode-A's commit point. Reader failures and
+            // retirement targets are observations with an empty guard (unconditional `¬ref`,
+            // Mode-A's commits); a witnessed conflict's observation carries its loan and its
+            // invalidators, those met through an A5 overlap partner marked. Everything before
+            // this point -- the pins, the field-own branch, the declines -- and the accept after
+            // it are the loop's own.
+            RepairMode::Guarded => {
+                let planner = planner.as_mut().expect("the guarded arm has its planner");
+                let witnessed = witnessed
+                    .as_ref()
+                    .expect("the guarded arm reads the witnessed replay");
+                let observations = guarded_observations(
+                    &reviewed.reader_failures,
+                    &reviewed.retirement,
+                    witnessed,
+                    &model,
+                    &stats,
+                    diagnostics_enabled,
+                );
+                match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
+                    L2RoundPlan::Accept { validation_round } => {
+                        assert_eq!(
+                            stats.rounds, validation_round,
+                            "guarded planner/fixpoint validation-round counters diverged"
+                        );
+                    }
+                    L2RoundPlan::Continue {
+                        validation_round,
+                        actions,
+                    } => {
+                        assert_eq!(
+                            stats.rounds, validation_round,
+                            "guarded planner/fixpoint validation-round counters diverged"
+                        );
+                        for action in &actions {
+                            solver.add_l2_commit(action);
+                            emit_l2_action_diagnostic(action, diagnostics_enabled);
+                            if ledger && let Some(track) = solver.last_track() {
+                                use super::raw_cause::CommitKind;
+                                let kind = match action.kind {
+                                    l2::CommitActionKind::GuardedCommit => {
+                                        CommitKind::GuardedCommit
+                                    }
+                                    l2::CommitActionKind::RecurrenceEscalation => {
+                                        CommitKind::RecurrenceEscalation
+                                    }
+                                    l2::CommitActionKind::UnconditionalCommit
+                                        if retirement_targets.contains(&action.target) =>
+                                    {
+                                        CommitKind::RetirementConflict
+                                    }
+                                    l2::CommitActionKind::UnconditionalCommit
+                                        if reader_targets.contains(&action.target) =>
+                                    {
+                                        CommitKind::ReaderObligation
+                                    }
+                                    l2::CommitActionKind::UnconditionalCommit => {
+                                        CommitKind::BorrowExclusion
+                                    }
+                                };
+                                // R668-4: under the guarded repair the ledger names the clause
+                                // the planner asserted (its Ref peers and Raw invalidators).
+                                ledger_commits.push(super::raw_cause::Commit {
+                                    track,
+                                    slot: action.target,
+                                    round: stats.rounds,
+                                    kind,
+                                    issuer: None,
+                                    clause: Some(super::raw_cause::Clause {
+                                        shape: match action.kind {
+                                            l2::CommitActionKind::GuardedCommit => "guarded",
+                                            _ => "unconditional",
+                                        },
+                                        ref_peers: action
+                                            .clause
+                                            .negative_refs
+                                            .iter()
+                                            .copied()
+                                            .filter(|slot| *slot != action.target)
+                                            .collect(),
+                                        raw_invalidators: action.clause.positive_refs.clone(),
+                                    }),
+                                });
+                            }
+                            committed += 1;
+                            stats.commits_conflict += 1;
+                        }
+                    }
+                    L2RoundPlan::Decline {
+                        validation_round,
+                        reason,
+                    } => {
+                        assert_eq!(
+                            stats.rounds, validation_round,
+                            "guarded planner/fixpoint validation-round counters diverged"
+                        );
+                        record_l2_decline(
+                            &mut stats,
+                            validation_round,
+                            reason,
+                            diagnostics_enabled,
+                        );
+                        return (None, stats);
+                    }
+                }
+            }
         }
         stats.commits_per_round.push(committed);
         if committed == 0 {
             // E-R4 certificate: record the residuals the accepted model
             // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
             // set, so this is non-empty in general. Recording-only.
-            super::export::record_residuals(
-                conflicts
-                    .iter()
-                    .flat_map(|(did, cs)| {
-                        cs.iter().map(move |c| super::export::ResidualConflict {
-                            fn_did: *did,
-                            issuer: c.issuer,
-                            requirers: c.requirers.clone(),
+            if !w69_fault(repair, "no-certificate") {
+                super::export::record_residuals(
+                    conflicts
+                        .iter()
+                        .flat_map(|(did, cs)| {
+                            cs.iter().map(move |c| super::export::ResidualConflict {
+                                fn_did: *did,
+                                issuer: c.issuer,
+                                requirers: c.requirers.clone(),
+                            })
                         })
-                    })
-                    .collect(),
-            );
+                        .collect(),
+                );
+            }
             // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
             // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
             // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
@@ -1513,7 +1850,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             }
             return (Some(model), stats);
         }
-        model = match solve_round_model(solver, selectors, backend, hard.as_ref()) {
+        model = match solve_round(
+            solver,
+            selectors,
+            backend,
+            hard.as_ref(),
+            planner.as_ref(),
+            &mut stats,
+            diagnostics_enabled,
+        ) {
             Some((m, dropped)) => {
                 record_dropped(&mut stats, selectors, &dropped);
                 last_dropped = dropped;
@@ -1544,7 +1889,142 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             stats.cap_exhausted = true;
             (None, stats)
         }
+        // R617-1: the planner declines at its own cap (10S + 1) one round before this bound, so
+        // reaching it is a planner defect; decline, which falls back to Mode-A.
+        RepairMode::Guarded => {
+            stats.cap_exhausted = true;
+            (None, stats)
+        }
     }
+}
+
+/// W69 faults (test builds only; era-5c 082 §3): each removes one piece of the guarded arm, and
+/// only in a guarded run, so the Mode-A fallback is untouched. `no-a5-context`: the witnessed
+/// replay without A5's overlap pairs. `no-field-own`: the field-own branch skipped. `no-certificate`:
+/// the residual certificate not recorded at a guarded accept.
+fn w69_fault(repair: RepairMode, name: &str) -> bool {
+    #[cfg(test)]
+    {
+        repair == RepairMode::Guarded && std::env::var("CRAT_E5C_W69_FAULT").as_deref() == Ok(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (repair, name);
+        false
+    }
+}
+
+/// R617-1: tell the guarded planner of a round whose commits are not its own (the retirement
+/// pins, the field-own repair), so its validation counter stays equal to `stats.rounds`. `false`
+/// when the planner declines (its cap). A no-op outside the guarded mode.
+fn planner_empty_round(
+    planner: Option<&mut Planner>,
+    stats: &mut RoundStats,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    diagnostics_enabled: bool,
+) -> bool {
+    let Some(planner) = planner else {
+        return true;
+    };
+    match planner.plan_round(L2SolverOutcome::Sat, &[], model) {
+        L2RoundPlan::Accept { validation_round } => {
+            assert_eq!(
+                stats.rounds, validation_round,
+                "guarded planner/fixpoint validation-round counters diverged"
+            );
+            true
+        }
+        L2RoundPlan::Decline {
+            validation_round,
+            reason,
+        } => {
+            record_l2_decline(stats, validation_round, reason, diagnostics_enabled);
+            false
+        }
+        L2RoundPlan::Continue { .. } => panic!("empty L2 observations produced commit actions"),
+    }
+}
+
+/// R617-1: one guarded round's observations, as the separate L2 loop built them: reader failures
+/// and retirement targets with an empty guard, then every witnessed conflict with a committable
+/// representative. The planner orders them canonically.
+fn guarded_observations(
+    reader_failures: &[super::licensing::reader_replay::Failure],
+    retirement: &super::retirement::RetirementReview,
+    witnessed: &FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    stats: &RoundStats,
+    diagnostics_enabled: bool,
+) -> Vec<ConflictObservation> {
+    let mut observations = Vec::new();
+    for failure in reader_failures {
+        let Some(target @ SlotRef::Local(function, _)) = failure.target else {
+            unreachable!("a reader failure without a local target declined before the arm");
+        };
+        observations.push(ConflictObservation::new(
+            function.local_def_index.as_u32(),
+            target,
+            Some(target),
+            Vec::new(),
+        ));
+    }
+    for target in retirement.targets() {
+        let row = retirement
+            .conflicts
+            .iter()
+            .find(|row| row.target == target)
+            .expect("retirement target");
+        observations.push(ConflictObservation::new(
+            row.function.local_def_index.as_u32(),
+            target,
+            Some(target),
+            Vec::new(),
+        ));
+    }
+    for (did, conflicts) in witnessed {
+        for witnessed in conflicts {
+            let Some(target) = representative(&witnessed.conflict, model) else {
+                continue;
+            };
+            let mut observation = ConflictObservation::new(
+                did.local_def_index.as_u32(),
+                target,
+                witnessed.conflict.issuer,
+                witnessed.conflict.requirers.clone(),
+            )
+            .with_invalidators(witnessed.invalidators.clone())
+            .with_overlap_invalidators(witnessed.overlap_invalidators.clone());
+            if let Some(stable_loan_key) = witnessed.stable_loan_key {
+                let loan = witnessed.loan.expect("a stable loan key has its loan");
+                observation = observation.with_loan_identity(loan, stable_loan_key);
+            }
+            if diagnostics_enabled {
+                eprintln!(
+                    "[bo-l2] {}",
+                    l2::conflict_witness_diagnostic(
+                        stats.rounds,
+                        did.local_def_index.as_u32(),
+                        // An A5 parameter edge has no loan behind it.
+                        witnessed.loan.unwrap_or(usize::MAX),
+                        target,
+                        witnessed.conflict.issuer,
+                        &witnessed.conflict.requirers,
+                        &witnessed.invalidators,
+                    )
+                );
+                // W69c: the hazard key, with the invalidators met through an A5 partner.
+                if witnessed.stable_loan_key.is_some() {
+                    eprintln!(
+                        "[bo-l2] event=guarded_hazard|round={}|hazard={}",
+                        stats.rounds,
+                        observation.hazard_key_diagnostic()
+                    );
+                }
+            }
+            observations.push(observation);
+        }
+    }
+    observations
 }
 
 /// L2 feature-on validate/re-solve loop. This is deliberately separate from
@@ -1608,6 +2088,10 @@ impl L2TransitionDiagnostics {
     }
 }
 
+/// R617-1: no production route reaches this loop any more. `CRAT_BO_L2_GUARDED_COMMITS=1` is the
+/// alias of `RepairMode::Guarded`, the guarded arm of the one loop above; this separate loop is kept
+/// as the door the existing L2 tests call directly. The rest of this note is its history.
+///
 /// D10: `pub(crate)` so a test can route through the L2 loop **directly**
 /// instead of mutating `CRAT_BO_L2_GUARDED_COMMITS` inside a parallel test
 /// binary. The env switch remains the production entry — resolved once in
@@ -1761,6 +2245,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             is_mutable,
             selected_copy_lends.as_ref(),
             active_escaped_copy_lends.as_ref(),
+            None,
         );
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved;
@@ -1884,7 +2369,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                 )
                 .with_invalidators(witnessed.invalidators.clone());
                 if let Some(stable_loan_key) = witnessed.stable_loan_key {
-                    observation = observation.with_loan_identity(witnessed.loan, stable_loan_key);
+                    let loan = witnessed.loan.expect("a stable loan key has its loan");
+                    observation = observation.with_loan_identity(loan, stable_loan_key);
                 }
                 observations.push(observation);
                 if diagnostics_enabled {
@@ -1892,7 +2378,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                         l2::conflict_witness_diagnostic_stable(
                             stats.rounds,
                             did.local_def_index.as_u32(),
-                            witnessed.loan,
+                            witnessed.loan.expect("a stable loan key has its loan"),
                             stable_loan_key,
                             target,
                             witnessed.conflict.issuer,
@@ -1903,7 +2389,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                         l2::conflict_witness_diagnostic(
                             stats.rounds,
                             did.local_def_index.as_u32(),
-                            witnessed.loan,
+                            // A5 parameter edge (R617-1): no loan behind it.
+                            witnessed.loan.unwrap_or(usize::MAX),
                             target,
                             witnessed.conflict.issuer,
                             &witnessed.conflict.requirers,

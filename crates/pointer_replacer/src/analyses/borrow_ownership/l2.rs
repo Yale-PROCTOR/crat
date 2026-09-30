@@ -66,11 +66,15 @@ impl StableLoanKey {
 pub(crate) struct HazardKey {
     pub(crate) loan: StableLoanKey,
     pub(crate) invalidators: Vec<SlotKey>,
+    /// R617-1: the invalidators met through an A5 overlap partner (`via_overlap_partner`), so a
+    /// hazard is not merged across the two ways of meeting it. Empty outside A5's context, where
+    /// the key, its order and its diagnostic are unchanged.
+    pub(crate) via_overlap_partner: Vec<SlotKey>,
 }
 
 impl HazardKey {
     fn diagnostic(&self) -> String {
-        format!(
+        let mut out = format!(
             "{}@{}",
             self.loan.diagnostic(),
             self.invalidators
@@ -78,7 +82,19 @@ impl HazardKey {
                 .map(|slot| slot.diagnostic())
                 .collect::<Vec<_>>()
                 .join(",")
-        )
+        );
+        if !self.via_overlap_partner.is_empty() {
+            out.push_str("~partner:");
+            out.push_str(
+                &self
+                    .via_overlap_partner
+                    .iter()
+                    .map(|slot| slot.diagnostic())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        out
     }
 }
 
@@ -133,6 +149,8 @@ pub(crate) struct ConflictObservation {
     pub(crate) issuer: Option<SlotRef>,
     pub(crate) requirers: Vec<SlotRef>,
     pub(crate) invalidators: Vec<SlotRef>,
+    /// R617-1: the subset of `invalidators` met through an A5 overlap partner.
+    pub(crate) overlap_invalidators: Vec<SlotRef>,
     /// Diagnostic-only per-model ordinal retained during MINI-RED. GREEN-3
     /// must never use it for recurrence identity.
     loan_ordinal: usize,
@@ -153,6 +171,7 @@ impl ConflictObservation {
             issuer,
             requirers,
             invalidators: Vec::new(),
+            overlap_invalidators: Vec::new(),
             loan_ordinal: 0,
             stable_loan_key: issuer
                 .map(|issuer| StableLoanKey::new(fn_key, issuer, MirLocationKey::new(fn_key, 0))),
@@ -163,6 +182,24 @@ impl ConflictObservation {
     pub(crate) fn with_invalidators(mut self, invalidators: Vec<SlotRef>) -> Self {
         self.invalidators = invalidators;
         self
+    }
+
+    /// R617-1: mark the invalidators met through an A5 overlap partner.
+    pub(crate) fn with_overlap_invalidators(mut self, overlap_invalidators: Vec<SlotRef>) -> Self {
+        self.overlap_invalidators = overlap_invalidators;
+        self
+    }
+
+    fn via_overlap_partner(&self) -> Vec<SlotKey> {
+        let mut keys = self
+            .overlap_invalidators
+            .iter()
+            .copied()
+            .map(SlotKey::of)
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     pub(crate) fn with_loan_identity(
@@ -188,7 +225,12 @@ impl ConflictObservation {
             .collect::<Vec<_>>();
         invalidators.sort();
         invalidators.dedup();
-        HazardKey { loan, invalidators }.diagnostic()
+        HazardKey {
+            loan,
+            invalidators,
+            via_overlap_partner: self.via_overlap_partner(),
+        }
+        .diagnostic()
     }
 }
 
@@ -1190,6 +1232,7 @@ impl Candidate {
                 .map(|loan| HazardKey {
                     loan,
                     invalidators: invalidators.iter().copied().map(SlotKey::of).collect(),
+                    via_overlap_partner: observation.via_overlap_partner(),
                 })
                 .into_iter()
                 .collect(),

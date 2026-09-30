@@ -97,10 +97,19 @@ impl RetirementDischarge {
             self.source.function, self.source.block, self.source.statement, self.source.role
         );
         let route = self.route_names.join(" ");
+        // L01¹² (R682-3, R684-1, R686-4): a discharge only the zero-size `realloc` premise admits.
+        let premise = |premise: bool| {
+            if premise {
+                ", premise=realloc-nonzero@R684-1"
+            } else {
+                ""
+            }
+        };
         match &self.rule {
-            discharge::Rule::PostFreeUse { local } => format!(
-                "retirement-disjoint:post-free-use(event={event}, route=[{route}], target={}, use=_{local})",
-                self.target_key
+            discharge::Rule::PostFreeUse { local, premise: p } => format!(
+                "retirement-disjoint:post-free-use(event={event}, route=[{route}], target={}, use=_{local}{})",
+                self.target_key,
+                premise(*p)
             ),
             // R604-1: every effective-type discharge rests on TypedReleaseDiscipline.
             // L01¹¹ (β′, R659-1): one the sharpened test alone admits says so.
@@ -119,9 +128,14 @@ impl RetirementDischarge {
                 self.target_key
             ),
             // L01¹¹ (α⁺, R659-1): the referent is used after the release inside the route.
-            discharge::Rule::PostReleaseUseRoute { frame, local } => format!(
-                "retirement-disjoint:post-release-use-route(frame={frame}, use=_{local}, event={event}, route=[{route}], target={})",
-                self.target_key
+            discharge::Rule::PostReleaseUseRoute {
+                frame,
+                local,
+                premise: p,
+            } => format!(
+                "retirement-disjoint:post-release-use-route(frame={frame}, use=_{local}, event={event}, route=[{route}], target={}{})",
+                self.target_key,
+                premise(*p)
             ),
         }
     }

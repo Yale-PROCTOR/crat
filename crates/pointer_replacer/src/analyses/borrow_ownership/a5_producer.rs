@@ -30,6 +30,22 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
+/// `CRAT_ERA5C_A5_SNAPSHOT` (on|off, fail-loud, absent = on): **L01¹²** (R677-4).
+/// Off (RQ5's `snapshot` row) takes A5's snapshot view away: no mutable-vs-
+/// read-only pair is read as a snapshot, so no C-9 mark is planned. In the identity.
+pub(crate) fn a5_snapshot() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5C_A5_SNAPSHOT") {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(value) => match value.as_str() {
+            "on" => true,
+            "off" => false,
+            other => panic!("CRAT_ERA5C_A5_SNAPSHOT must be on or off; got {other:?}"),
+        },
+        Err(error) => panic!("CRAT_ERA5C_A5_SNAPSHOT is not valid Unicode: {error}"),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedC9Mark {
     pub(crate) key: C9MarkKey,
@@ -1048,7 +1064,7 @@ pub(crate) fn produce_a5_plan(
                         )
                         .expect("distinct params");
                         let (read_only, effect) = match mutability.class {
-                            WitnessMutability::MutReadOnly { read_only } => (
+                            WitnessMutability::MutReadOnly { read_only } if a5_snapshot() => (
                                 Some(read_only),
                                 snapshot_verdict_for_target(tcx, target, left, right, read_only),
                             ),
@@ -1344,6 +1360,53 @@ mod tests {
                 .expect("ht_set-shaped site audit");
             assert_eq!(site.classifier, Some(PairClass::NotProvenDisjoint));
             assert_eq!(site.family, "recorded-risky");
+        })
+        .unwrap();
+    }
+
+    /// W77's child (R677-4): the worker's A5 mode on the snapshot fixture, its
+    /// planned C-9 marks, and the identity's three RQ5 lines.
+    #[test]
+    #[ignore = "runs in a child of W77"]
+    fn e5c_inner_w77() {
+        let code = r#"
+            unsafe fn two(x: *mut i32, y: *const i32) {
+                let snapshot = *y;
+                *x = snapshot + 1;
+            }
+            unsafe fn entry(p: *mut i32) { two(p, p); }
+        "#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let mutability = MutFacts::from_program(&program);
+            let model = baseline(&program, &slots, &origins, &mutability);
+            let mode = A5Mode::production();
+            let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+            let plan = produce_a5_plan(
+                &program,
+                &slots,
+                origins.native_flows(),
+                &mutability,
+                &model,
+                mode,
+                attestation,
+            )
+            .expect("plan");
+            eprintln!(
+                "E5C_W77 mode={} marks={}",
+                mode.label(),
+                plan.planned_marks.len()
+            );
+            let identity = super::super::model_cache::solver_identity(mode, attestation);
+            for line in identity.lines().filter(|l| {
+                l.starts_with("a5_mode=")
+                    || l.starts_with("mutability=")
+                    || l.starts_with("era5c_a5_snapshot=")
+            }) {
+                eprintln!("E5C_W77 {line}");
+            }
         })
         .unwrap();
     }

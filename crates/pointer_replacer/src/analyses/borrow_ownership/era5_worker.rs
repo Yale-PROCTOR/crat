@@ -257,7 +257,8 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
             functions,
             structs,
         };
-        let mode = A5Mode::PreciseReplay;
+        // L01¹² (R677-4): RQ5's `overlap` row sets `CRAT_BO_A5_MODE=baseline`.
+        let mode = A5Mode::production();
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         if model_cache::current_analysis_digest() != job.semantic.analysis {
             return Err(invalid("analysis tree changed before derivation".into()));
@@ -337,7 +338,13 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
                 let (result, _) = export::with_bo_export(|| {
                     let slots = CrateSlots::build(&program);
                     let origins = compute_origins(&program);
-                    let mutability = MutFacts::from_program(&program);
+                    // L01¹² (R677-4): RQ5's `mut` row sets `CRAT_BO_MUT_FACTS=off`.
+                    let mutability = match super::mutability_facts::MutFactsMode::current() {
+                        super::mutability_facts::MutFactsMode::On => {
+                            MutFacts::from_program(&program)
+                        }
+                        super::mutability_facts::MutFactsMode::Off => MutFacts::all_mut(),
+                    };
                     let solved = solve_bo_a5_config_reporting(
                         &program,
                         &slots,

@@ -86,6 +86,13 @@ mod tests {
             "src/analyses/borrow_ownership/array_fields/tests.rs",
             "e5_x_array_raw_summary_adds_no_reverse_ownership_demand",
         ),
+        // R617-1's W69 (the guarded repair's witnesses): Mode-A and the guarded repair on one
+        // legacy construction under `RepairMode::with_override`, reading `RoundStats`, as
+        // `bo_c1`'s repair probes below do.
+        (
+            "src/analyses/borrow_ownership/null_paths_tests.rs",
+            "w69_solve",
+        ),
         (
             "src/analyses/borrow_ownership/borrow_verify.rs",
             "verify_to_fixpoint",

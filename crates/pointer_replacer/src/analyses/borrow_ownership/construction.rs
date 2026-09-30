@@ -656,6 +656,48 @@ fn canonical_receipt(input: String) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+/// R617-1 STOP 2 (R631-7): the guarded repair's stamp, only when a verification ran guarded, so
+/// every Mode-A receipt is byte-identical. `repair=guarded->mode-a` when any guarded run declined
+/// and its program fell back to Mode-A; the fallbacks are counted and their reasons named.
+fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> String {
+    let guarded = stats
+        .iter()
+        .filter(|stats| stats.repair == super::borrow_verify::RepairMode::Guarded)
+        .collect::<Vec<_>>();
+    if guarded.is_empty() {
+        return receipt;
+    }
+    let fallbacks = guarded
+        .iter()
+        .filter_map(|stats| stats.guarded_fallback.as_ref())
+        .collect::<Vec<_>>();
+    let mut receipt = receipt;
+    receipt.push_str(&format!(
+        "repair={}\nguarded_verifications={}\nguarded_fallbacks={}\n",
+        if fallbacks.is_empty() {
+            "guarded"
+        } else {
+            "guarded->mode-a"
+        },
+        guarded.len(),
+        fallbacks.len()
+    ));
+    if !fallbacks.is_empty() {
+        receipt.push_str(&format!(
+            "guarded_fallback_reasons={}\n",
+            fallbacks
+                .iter()
+                .map(|fallback| format!(
+                    "{}@rounds:{}@commits:{}",
+                    fallback.reason, fallback.rounds, fallback.commits
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    canonical_receipt(receipt)
+}
+
 /// R609-3 (b): the type route's count and digest, only when it removed a pair,
 /// so every receipt without one is byte-identical.
 fn type_disjoint_keys(plan: &A5Plan, mut receipt: String) -> String {
@@ -1843,14 +1885,17 @@ fn solve_bo_a5_config_with_source_events(
         let selected_model_sha256 = model_digest(&baseline_model);
         return Ok((
             VerifiedBo {
-                receipt: a5_receipt(
-                    mode,
-                    &plan,
-                    0,
-                    0,
-                    &selected_model_sha256,
-                    &baseline_nullability,
-                    &baseline_a14,
+                receipt: repair_keys(
+                    &[&baseline_round_stats],
+                    a5_receipt(
+                        mode,
+                        &plan,
+                        0,
+                        0,
+                        &selected_model_sha256,
+                        &baseline_nullability,
+                        &baseline_a14,
+                    ),
                 ),
                 mark_artifact: a5_mark_artifact(
                     mode,
@@ -1940,14 +1985,17 @@ fn solve_bo_a5_config_with_source_events(
             let a14 = a14_artifacts(&construction);
             return Ok((
                 VerifiedBo {
-                    receipt: a5_receipt(
-                        mode,
-                        &plan,
-                        0,
-                        0,
-                        &selected_model_sha256,
-                        &nullability,
-                        &a14,
+                    receipt: repair_keys(
+                        &[&baseline_round_stats, &round_stats],
+                        a5_receipt(
+                            mode,
+                            &plan,
+                            0,
+                            0,
+                            &selected_model_sha256,
+                            &nullability,
+                            &a14,
+                        ),
                     ),
                     mark_artifact: a5_mark_artifact(
                         mode,
@@ -1992,14 +2040,17 @@ fn solve_bo_a5_config_with_source_events(
         let selected_model_sha256 = model_digest(&baseline_model);
         return Ok((
             VerifiedBo {
-                receipt: a5_receipt(
-                    mode,
-                    &plan,
-                    0,
-                    0,
-                    &selected_model_sha256,
-                    &baseline_nullability,
-                    &baseline_a14,
+                receipt: repair_keys(
+                    &[&baseline_round_stats],
+                    a5_receipt(
+                        mode,
+                        &plan,
+                        0,
+                        0,
+                        &selected_model_sha256,
+                        &baseline_nullability,
+                        &baseline_a14,
+                    ),
                 ),
                 mark_artifact: a5_mark_artifact(
                     mode,
@@ -2137,14 +2188,17 @@ fn solve_bo_a5_config_with_source_events(
     let a14 = a14_artifacts(&construction);
     Ok((
         VerifiedBo {
-            receipt: a5_receipt(
-                mode,
-                &plan,
-                retained_c9_marks.len(),
-                retained_c9_plans.len(),
-                &selected_model_sha256,
-                &nullability,
-                &a14,
+            receipt: repair_keys(
+                &[&baseline_round_stats, &round_stats],
+                a5_receipt(
+                    mode,
+                    &plan,
+                    retained_c9_marks.len(),
+                    retained_c9_plans.len(),
+                    &selected_model_sha256,
+                    &nullability,
+                    &a14,
+                ),
             ),
             mark_artifact: a5_mark_artifact(
                 mode,

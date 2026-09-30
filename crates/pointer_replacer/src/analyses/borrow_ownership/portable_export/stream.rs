@@ -532,6 +532,28 @@ fn write_review_fields(
         },
         residency,
     )?;
+    // L01¹² (R677-4; era-5c 099 STOP 1 (ii)): the discharged rows, as the in-memory
+    // writer writes them (absent when nothing was discharged). The streamed entry
+    // carried none before.
+    // W76's fault (test builds only): the streamed rows are skipped.
+    let skip = cfg!(test) && std::env::var("CRAT_E5C_W76_FAULT").as_deref() == Ok("no-discharged");
+    if !review.discharged.is_empty() && !skip {
+        raw(w, b",\"discharged\":")?;
+        values(
+            w,
+            &review.discharged,
+            |row| {
+                let target = r.slot(row.target)?;
+                if target != row.target_key {
+                    return Err("retirement discharge target canonical key mismatch".into());
+                }
+                Ok(
+                    json!({"function":r.function(row.function)?,"target":target,"source":source_key(&row.source),"phase":tag(row.phase),"location":location(row.location),"route":r.steps(&row.route)?,"receipt":row.receipt()}),
+                )
+            },
+            residency,
+        )?;
+    }
     raw(w, b",\"known_stack_entries\":")?;
     json(w, &review.known_stack_entries)?;
     raw(w, b",\"ordinary_error_points\":")?;
