@@ -1368,6 +1368,13 @@ pub(crate) fn audit(
             ) {
                 Ok(selected) => selected,
                 Err(reason) => {
+                    // era-5c R706 (instrument, test builds): the meets behind a held store.
+                    if cfg!(test) && std::env::var_os("CRAT_E5C_READER_DEBUG").is_some() {
+                        eprintln!(
+                            "E5C_TERMINAL_HELD {:?} {:?} meets={:?}",
+                            store.site, reason, meets
+                        );
+                    }
                     hold(Some(construction), reason);
                     continue;
                 }

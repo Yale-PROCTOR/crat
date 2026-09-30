@@ -2337,6 +2337,31 @@ impl KindSolver {
                 .iter()
                 .find(|proof| proof.field_key == candidate.field_key && proof.supported())
             else {
+                // era-5c R706 (instrument, test builds): why the reader's field is held.
+                if cfg!(test) && std::env::var_os("CRAT_E5C_READER_DEBUG").is_some() {
+                    for proof in frozen
+                        .field_support
+                        .iter()
+                        .filter(|proof| proof.field_key == candidate.field_key)
+                    {
+                        eprintln!(
+                            "E5C_READER_HELD {key} {} stores={} input_stores={} holds={:?} classified={:?}",
+                            proof.field_key,
+                            proof.stores.len(),
+                            proof.input_stores.len(),
+                            proof
+                                .holds
+                                .iter()
+                                .map(|h| (format!("{:?}", h.reason), h.site.clone()))
+                                .collect::<Vec<_>>(),
+                            proof
+                                .classified
+                                .iter()
+                                .map(|c| (c.site.clone(), format!("{:?}", c.origin)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
                 clauses.push((
                     format!("field-reader-support-held({key},{})", candidate.field_key),
                     !reader,
