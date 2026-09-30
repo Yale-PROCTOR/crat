@@ -677,6 +677,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                             if !lhs.projection.is_empty() {
                                 let _ = self.state.consume_chain.call_arg_temps.remove(&lhs.local);
                             }
+                            // era-5c R701 (instrument, test builds): a store the pass
+                            // cannot consume at its destination lends the value.
+                            if cfg!(test) && std::env::var_os("CRAT_E5C_SINK_DEBUG").is_some() {
+                                eprintln!(
+                                    "E5C_UNKNOWN_SINK {:?} {lhs:?} = {rhs:?}",
+                                    self.body.source.def_id()
+                                );
+                            }
                             Infer::unknown_sink(infer_cx, rhs_consume)
                         }
                     }

@@ -443,9 +443,22 @@ pub(crate) fn publish(
     let started = std::time::Instant::now();
     let budget = budget();
     let (mut probes, mut unprobed) = (0usize, 0usize);
+    // era-5c R701 (instrument, test builds): `CRAT_E5C_LEDGER_ALSO=<substring>` also
+    // probes the non-Raw slots whose key contains it, and prints why each is not Raw
+    // and not Ref (`E5C_ALSO`). The ledger's rows for Raw slots are unchanged.
+    let also = if cfg!(test) {
+        std::env::var("CRAT_E5C_LEDGER_ALSO").ok()
+    } else {
+        None
+    };
     let mut raw: Vec<(String, SlotRef)> = model
         .iter()
-        .filter(|(_, kind)| **kind == SlotKind::Raw)
+        .filter(|(slot, kind)| {
+            **kind == SlotKind::Raw
+                || also
+                    .as_deref()
+                    .is_some_and(|filter| key(**slot).contains(filter))
+        })
         .map(|(slot, _)| (key(*slot), *slot))
         .collect();
     raw.sort_by(|left, right| left.0.cmp(&right.0));
@@ -493,6 +506,40 @@ pub(crate) fn publish(
         };
         probes += 1;
         let own_probe = solver.raw_cause_probe(hard, &kept, slot, SlotKind::Owning);
+        if model[&slot] != SlotKind::Raw {
+            let render = |core: &[Bool]| -> String {
+                core.iter()
+                    .map(|literal| {
+                        selector_family
+                            .get(literal)
+                            .map(|f| format!("selector:{f}"))
+                            .or_else(|| {
+                                by_track
+                                    .get(literal)
+                                    .map(|c| format!("commit:{}({:?})", c.kind.label(), c.slot))
+                            })
+                            .or_else(|| labels.get(literal).cloned())
+                            .unwrap_or_else(|| format!("{literal:?}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            for (name, kind) in [
+                ("raw", SlotKind::Raw),
+                ("ref", SlotKind::Ref),
+                ("own", SlotKind::Owning),
+            ] {
+                let verdict = match solver.raw_cause_probe(hard, &kept, slot, kind) {
+                    Ok(None) => "sat".to_owned(),
+                    Ok(Some(core)) => format!("unsat {}", render(&core)),
+                    Err(reason) => format!("unknown {reason}"),
+                };
+                eprintln!(
+                    "E5C_ALSO {} model={:?} {name}-probe={verdict}",
+                    row.key, model[&slot]
+                );
+            }
+        }
         // (slot, kind, round, issuer, position, clause) of every exclusion in the Ref core.
         let mut exclusions: Vec<(
             SlotRef,
