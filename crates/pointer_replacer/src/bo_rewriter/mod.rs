@@ -7738,6 +7738,8 @@ fn finish_decide<'tcx>(
 
     perturb(&mut subjects);
     let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    // wave-6l relay 071 (R697-7): the field-carried allocation lengths.
+    let field_alloc_licences = decision::field_alloc::Licences::infer(tcx);
     let mut counted_void =
         decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees, |subject| {
             // BO's kind first (the ladder's own rule): a contract is never
@@ -8337,6 +8339,7 @@ fn finish_decide<'tcx>(
              $exposure:expr, $return_receivers:expr $(,)?) => {
                 decision::Ctx {
                     tcx,
+                    field_alloc: &field_alloc_licences,
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,
                     box_params: &box_params,
@@ -8858,6 +8861,20 @@ fn finish_decide<'tcx>(
                     })
                     .clone()?;
                 Some((key, (companion, proof.premises)))
+            })
+            .collect();
+        // wave-6l relay 071 (R697-7): the field-carried allocation length of
+        // every call argument that reads a licensed field.
+        table.field_alloc_lengths = facts
+            .call_args
+            .values()
+            .flatten()
+            .flat_map(|call| {
+                call.args.iter().filter_map(|arg| {
+                    field_alloc_licences
+                        .length_at(tcx, call.caller, arg.span)
+                        .map(|length| ((call.caller, arg.span), length))
+                })
             })
             .collect();
         // wave-6l relay 063 (R645-5 item 2): the parameters the KX list names.

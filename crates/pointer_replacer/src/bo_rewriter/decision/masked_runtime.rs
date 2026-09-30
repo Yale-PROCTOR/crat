@@ -47,6 +47,123 @@ pub(crate) fn held(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> O
     held_at(tcx, function, parameter, &mut Vec::new())
 }
 
+/// **Relay 071 (R697-7 (b)): the hold narrowed.** Does some root of
+/// `function`'s `parameter` take a FABRICATED length? The walk goes up through
+/// the callers: a parameter handed on bare (or under a cast) asks its own
+/// callers; a root is real when it is an array start (R625's `[T; N]`, directly
+/// or through a local defined once from one) or a licensed field read (the
+/// field-carried allocation length). Anything else, and a function whose
+/// callers are not all known, is a fabricated root: the reader is held.
+pub(crate) fn fabricated_root(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    licences: &super::field_alloc::Licences,
+    world: World<'_>,
+    function: LocalDefId,
+    parameter: usize,
+) -> bool {
+    fabricated_root_at(
+        tcx,
+        facts,
+        licences,
+        world,
+        function,
+        parameter,
+        &mut Vec::new(),
+    )
+}
+
+/// Whose calls reach a function. `Conservative`: only a private function's
+/// (`thin_counted::closed_calls`). `Closed`: the program's own calls, as the
+/// emission treats an exported function whose signature it changes in place
+/// (the exposure policy's `internal-by-configuration`); a function in a
+/// fn-pointer web, a configured entry, or one whose address is taken has
+/// callers the program does not see (`thin_counted::chain_gate`'s rule).
+#[derive(Clone, Copy)]
+pub(crate) enum World<'a> {
+    Conservative,
+    Closed(Option<&'a super::exposure::ExposurePolicy>),
+}
+
+fn callers<'a>(
+    tcx: TyCtxt<'_>,
+    facts: &'a super::emitability::EmitabilityFacts,
+    world: World<'_>,
+    function: LocalDefId,
+) -> Option<&'a [super::emitability::CallSite]> {
+    match world {
+        World::Conservative => super::thin_counted::closed_calls(tcx, function, facts).ok(),
+        World::Closed(policy) => {
+            let refs = facts.referenced.get(&function)?;
+            if !super::emitability::RefKind::is_adaptable(refs) {
+                return None;
+            }
+            if policy.is_some_and(|policy| {
+                policy.functions().iter().any(|row| {
+                    row.did == function
+                        && (row.fnptr_web
+                            || row
+                                .seed
+                                .is_some_and(|seed| seed.configured_name || seed.address_taken))
+                })
+            }) {
+                return None;
+            }
+            let calls = facts.call_args.get(&function).filter(|c| !c.is_empty())?;
+            (calls.len() == refs.len()).then_some(calls.as_slice())
+        }
+    }
+}
+
+fn fabricated_root_at(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    licences: &super::field_alloc::Licences,
+    world: World<'_>,
+    function: LocalDefId,
+    parameter: usize,
+    visited: &mut Vec<(LocalDefId, usize)>,
+) -> bool {
+    if visited.contains(&(function, parameter)) {
+        return false;
+    }
+    visited.push((function, parameter));
+    let Some(calls) = callers(tcx, facts, world, function) else {
+        return true;
+    };
+    for call in calls {
+        let Some(arg) = call.args.iter().find(|a| a.index == parameter) else {
+            return true;
+        };
+        if arg.array_extent.is_some() || licences.length_at(tcx, call.caller, arg.span).is_some() {
+            continue;
+        }
+        let local = match arg.shape {
+            super::emitability::ArgShape::BareLocal(id)
+            | super::emitability::ArgShape::CastOfLocal { binding: id, .. } => id,
+            _ => return true,
+        };
+        let body = tcx.hir_body_owned_by(call.caller);
+        if let Some(index) = body.params.iter().position(|p| p.pat.hir_id == local) {
+            if fabricated_root_at(tcx, facts, licences, world, call.caller, index, visited) {
+                return true;
+            }
+            continue;
+        }
+        // A local defined once, from an array start.
+        let definitions = Definitions::of(tcx, body);
+        let from_array = !definitions.unknown_writes.contains(&local)
+            && !definitions.assignments.contains_key(&local)
+            && definitions.initializer.get(&local).is_some_and(|init| {
+                super::emitability::array_extent(tcx, call.caller, init).is_some()
+            });
+        if !from_array {
+            return true;
+        }
+    }
+    false
+}
+
 fn held_at(
     tcx: TyCtxt<'_>,
     function: LocalDefId,

@@ -232,6 +232,10 @@ pub(crate) enum LenEvidence {
     /// parameter on every call (`element_extent::constant_access_extent`): the
     /// length is `N`, for an element address and a raw argument alike.
     CalleeAccess,
+    /// **wave-6l relay 071 (R697-7)** — the argument reads a struct's pointer
+    /// field whose every allocation holds `length + k` elements past it
+    /// (`field_alloc`): the length is that field's, read from the same object.
+    FieldAlloc,
 }
 
 impl LenEvidence {
@@ -244,6 +248,7 @@ impl LenEvidence {
             LenEvidence::Contract => "len-contract",
             LenEvidence::ArrayType => "len-array-type",
             LenEvidence::CalleeAccess => "len-callee-access",
+            LenEvidence::FieldAlloc => "len-field-alloc",
         }
     }
 }
@@ -4998,6 +5003,10 @@ pub(crate) fn synthesize_with_raw_boundary(
     let mut callees: Vec<&LocalDefId> = facts.call_args.keys().collect();
     callees.sort_unstable_by_key(|d| d.local_def_index.as_u32());
 
+    // wave-6l relay 071: which callee parameters read past a masked index by
+    // a runtime length (`masked_runtime::held`), memoized.
+    let masked_readers: std::cell::RefCell<rustc_hash::FxHashMap<(LocalDefId, usize), bool>> =
+        Default::default();
     for callee in callees {
         for site in &facts.call_args[callee] {
             let marked_shared =
@@ -5582,7 +5591,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                         LenEvidence::Elsewhere
                         | LenEvidence::None
                         | LenEvidence::ArrayType
-                        | LenEvidence::CalleeAccess => None,
+                        | LenEvidence::CalleeAccess
+                        | LenEvidence::FieldAlloc => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -5793,12 +5803,51 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 Some(elements) => {
                                     (Some(elements.to_string()), Some(LenEvidence::CalleeAccess))
                                 }
-                                None => (None, len_evidence),
+                                // wave-6l relay 071 (R697-7): nor a constant
+                                // access extent: a licensed field's allocation
+                                // length, read from the same object.
+                                None => match site
+                                    .args
+                                    .iter()
+                                    .find(|argument| argument.index == pos.index)
+                                    .and_then(|argument| {
+                                        table.field_alloc_lengths.get(&(site.caller, argument.span))
+                                    }) {
+                                    Some(length) => {
+                                        (Some(length.clone()), Some(LenEvidence::FieldAlloc))
+                                    }
+                                    None => (None, len_evidence),
+                                },
                             },
                         }
                     }
                     text => (text, len_evidence),
                 };
+                // wave-6l relay 071 (R697-7 (b)): a masked reader that reads
+                // past its masked index by a runtime length is never handed a
+                // fabricated length (the fallback, or `mask + 1`): its call is
+                // not adapted. The hold keeps such readers raw where every root
+                // is fabricated; this is the guard for a reader released on a
+                // real root and reached through a forwarder that stayed raw.
+                if (len_text.is_none() || len_masked)
+                    && region.is_none()
+                    && counted.is_none()
+                    && pos.found == Form::Raw
+                    && matches!(
+                        pos.expected,
+                        Form::Slice { .. } | Form::Opt { slice: true, .. }
+                    )
+                    && *masked_readers
+                        .borrow_mut()
+                        .entry((*callee, pos.index))
+                        .or_insert_with(|| {
+                            super::masked_runtime::held(tcx, *callee, pos.index).is_some()
+                        })
+                {
+                    candidates.push(Err(SeamBlock::LengthUnknown));
+                    input_candidates.push(Err(SeamBlock::LengthUnknown));
+                    continue;
+                }
                 // R641-2 (2)/(3): the HIR's element fact and the cursor's tail
                 // view, read once for both candidates below.
                 let element_address = site

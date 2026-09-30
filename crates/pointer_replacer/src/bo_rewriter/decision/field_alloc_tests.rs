@@ -115,17 +115,27 @@ fn flat(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// FA1 — the licence: `buffer_` holds `cur_size_ + 7`.
+/// FA1 — the licence: `buffer_` holds `cur_size_ + 7` (and `data_`, the
+/// allocation itself, `cur_size_ + 9`).
 #[test]
 fn w6l_fa1_the_ring_buffer_licence_is_inferred() {
     assert_eq!(
         licences(RB),
-        vec![Licence {
-            strukt: "RingBuffer".to_owned(),
-            pointer: "buffer_".to_owned(),
-            length: "cur_size_".to_owned(),
-            slack: 7,
-        }]
+        vec![
+            Licence {
+                strukt: "RingBuffer".to_owned(),
+                pointer: "buffer_".to_owned(),
+                length: "cur_size_".to_owned(),
+                slack: 7,
+            },
+            // `data_` itself holds the whole allocation, `2 + buflen + 7`.
+            Licence {
+                strukt: "RingBuffer".to_owned(),
+                pointer: "data_".to_owned(),
+                length: "cur_size_".to_owned(),
+                slack: 9,
+            },
+        ]
     );
 }
 
@@ -139,14 +149,15 @@ fn w6l_fa2_the_root_takes_the_field_length_and_the_reader_is_delivered() {
     let flat = flat(&source);
     assert!(
         flat.contains(
-            "core::slice::from_raw_parts(data, ((*s).ringbuffer_.cur_size_ as usize + 7))"
+            "core::slice::from_raw_parts(data, ((*s).ringbuffer_.cur_size_ as usize + 7) as usize)"
         ),
         "{source}"
     );
     assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{source}");
 }
 
-/// FA-c — the licence's controls: each refuses it.
+/// FA-c — the licence's controls: each refuses `buffer_`'s. (`data_`'s, the
+/// allocation itself, may stand: `alloc(buflen)` holds `buflen`.)
 #[test]
 fn w6l_fa_c_the_licence_controls_refuse_it() {
     let mut wrong = Vec::new();
@@ -179,7 +190,7 @@ fn w6l_fa_c_the_licence_controls_refuse_it() {
         let input = RB.replacen(from, to, 1);
         assert_ne!(input, RB, "{label}: the variant is in");
         let got = licences(&input);
-        if !got.is_empty() {
+        if got.iter().any(|l| l.pointer == "buffer_") {
             wrong.push(format!("{label}: {got:?}"));
         }
     }
@@ -190,7 +201,9 @@ fn w6l_fa_c_the_licence_controls_refuse_it() {
 /// be read at this call, so the reader stays held.
 /// - a writer called between the local's definition and the call (the field
 ///   reassigned between the allocation and the read);
-/// - the local defined from two different objects' fields.
+/// - the local defined from two different objects' fields;
+/// - the object's root reassigned after the local's definition;
+/// - a direct read in a function that may reallocate the field.
 #[test]
 fn w6l_fa_u_the_use_controls_keep_the_hold() {
     let mut wrong = Vec::new();
@@ -204,6 +217,16 @@ fn w6l_fa_u_the_use_controls_keep_the_hold() {
             "two objects",
             "pub unsafe fn Encode(mut s: *mut State) -> u32 {\n    let mut data = 0 as *mut u8;\n    data = (*s).ringbuffer_.buffer_;",
             "pub unsafe fn Encode(mut s: *mut State, mut t: *mut State, mut c: i32) -> u32 {\n    let mut data = 0 as *mut u8;\n    data = (*s).ringbuffer_.buffer_;\n    if c != 0 as i32 {\n        data = (*t).ringbuffer_.buffer_;\n    }",
+        ),
+        (
+            "root reassigned",
+            "pub unsafe fn Encode(mut s: *mut State) -> u32 {\n    let mut data = 0 as *mut u8;\n    data = (*s).ringbuffer_.buffer_;",
+            "pub unsafe fn Encode(mut s: *mut State, mut t: *mut State) -> u32 {\n    let mut data = 0 as *mut u8;\n    data = (*s).ringbuffer_.buffer_;\n    s = t;",
+        ),
+        (
+            "direct read in a writer",
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}",
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}\npub unsafe fn Refill(mut s: *mut State) -> u32 {\n    RingBufferInitBuffer(64 as i32 as u32, &mut (*s).ringbuffer_);\n    Reader((*s).ringbuffer_.buffer_, 4095 as i32 as u64, (*s).pos, 16 as i32 as u64)\n}",
         ),
     ] {
         let input = RB.replacen(from, to, 1);

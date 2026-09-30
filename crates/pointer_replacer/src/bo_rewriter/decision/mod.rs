@@ -1169,6 +1169,10 @@ pub(crate) struct DecisionTable {
     /// `slice_input_companions`, with the premises the proof rests on.
     pub(crate) extent_proof_companions:
         rustc_hash::FxHashMap<(LocalDefId, rustc_hir::HirId), (usize, Vec<&'static str>)>,
+    /// **wave-6l relay 071 (R697-7).** The field-carried allocation length
+    /// (`field_alloc::Licences::length_at`) of a call argument, keyed by the
+    /// caller and the argument's span: the seam's `len-field-alloc` arm.
+    pub(crate) field_alloc_lengths: rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), String>,
     /// **wave-6l relay 063 (R645-5 item 2).** The parameters the KX list names
     /// (`kx_refusals::KX_LIST`), keyed as `slice_input_companions`, with the row
     /// the receipt names. The seam refuses their adjacency licence.
@@ -1291,6 +1295,8 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
+    /// wave-6l relay 071: the field-carried allocation lengths.
+    pub(crate) field_alloc: &'a field_alloc::Licences,
     pub(crate) counted_void: &'a counted_void::Contracts,
     /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
     pub(crate) flexible_tails: &'a flexible_tail::Transactions,
@@ -1529,6 +1535,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
         extent_proof_companions: Default::default(),
+        field_alloc_lengths: Default::default(),
         kx_refused: Default::default(),
         nul_exact_parameters: Default::default(),
         wide_access_parameters: Default::default(),
@@ -2176,6 +2183,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
+        field_alloc,
         io_domain,
         counted_void: _,
         flexible_tails: _,
@@ -2293,6 +2301,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             Some(SlotKind::Ref)
         )
         && let Some(reader) = masked_runtime::held(tcx, subject.fn_did, hir_index)
+        // Relay 071 (R697-7 (b)): only where a root would take a fabricated
+        // length; a root with a real one (an array, a licensed field) reaches
+        // the reader with it.
+        && masked_runtime::fabricated_root(
+            tcx,
+            facts,
+            field_alloc,
+            exposure.map_or(masked_runtime::World::Conservative, |policy| {
+                masked_runtime::World::Closed(Some(policy))
+            }),
+            subject.fn_did,
+            hir_index,
+        )
     {
         return degrade(
             subject,
@@ -3254,6 +3275,7 @@ mod self_consistency_tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             extent_proof_companions: Default::default(),
+            field_alloc_lengths: Default::default(),
             kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),

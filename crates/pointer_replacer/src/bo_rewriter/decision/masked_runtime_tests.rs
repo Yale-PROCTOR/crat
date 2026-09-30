@@ -65,10 +65,11 @@ pub unsafe fn Compress(r: *mut Ring, n: usize) -> usize {
 }
 "###;
 
-/// M1 — every reader of the chain is held, and the reason names it.
+/// M1 — every reader of the chain is held, and the reason names it. (Relay
+/// 071: over brotli's raw field root; RING's array root is N1's.)
 #[test]
 fn w6l_mask_m1_a_read_past_a_masked_index_by_a_runtime_length_is_held() {
-    let rows = crate::bo_rewriter::emit_tests::decisions_of(&fixture(RING));
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(&ring_field_root());
     for name in ["data"] {
         let held: Vec<_> = rows
             .iter()
@@ -222,7 +223,8 @@ fn w6l_mask_zc3_a_borrowed_zero_local_stays_licensed() {
 }
 
 /// M2 — the runtime-length read inside a closure the function runs is the
-/// function's read.
+/// function's read. (Relay 071: the root is an entry's raw pointer, a
+/// fabricated length; an array root is N1's.)
 #[test]
 fn w6l_mask_m2_a_read_in_a_closure_is_held() {
     let input = fixture(
@@ -232,9 +234,8 @@ unsafe fn Reader(data: *const u8, ix: usize, mask: usize, len: usize) -> u8 {
     let read = |k: usize| *data.offset(at.wrapping_add(k) as isize);
     read(len)
 }
-pub unsafe fn run(n: usize) -> u8 {
-    let buf: [u8; 4096] = [7; 4096];
-    Reader(buf.as_ptr(), n, 4095, 3)
+pub unsafe fn run(buf: *const u8, n: usize) -> u8 {
+    Reader(buf, n, 4095, 3)
 }
 "###,
     );
@@ -259,7 +260,8 @@ fn w6l_mask_z3_a_zero_preserving_update_keeps_the_companion_refused() {
 }
 
 /// M3 (Codex 062b finding 3) — the runtime length on either side of
-/// `wrapping_add`: `len.wrapping_add(ix & mask)` is the same read.
+/// `wrapping_add`: `len.wrapping_add(ix & mask)` is the same read. (Relay 071:
+/// the root is an entry's raw pointer.)
 #[test]
 fn w6l_mask_m3_a_runtime_length_on_the_receiver_side_is_held() {
     let input = fixture(
@@ -267,9 +269,8 @@ fn w6l_mask_m3_a_runtime_length_on_the_receiver_side_is_held() {
 unsafe fn Reader(data: *const u8, ix: usize, mask: usize, len: usize) -> u8 {
     *data.offset(len.wrapping_add(ix & mask) as isize)
 }
-pub unsafe fn run(n: usize) -> u8 {
-    let buf: [u8; 4224] = [7; 4224];
-    Reader(buf.as_ptr(), n, 4095, 1)
+pub unsafe fn run(buf: *const u8, n: usize) -> u8 {
+    Reader(buf, n, 4095, 1)
 }
 "###,
     );

@@ -250,6 +250,7 @@ mod tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             extent_proof_companions: Default::default(),
+            field_alloc_lengths: Default::default(),
             kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
