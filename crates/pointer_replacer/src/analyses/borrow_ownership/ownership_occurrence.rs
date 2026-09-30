@@ -709,9 +709,10 @@ pub(crate) fn validate_terminal_links(
                             .get(&terminal.point)
                             .is_some_and(|vars| vars.contains(&value.var))
                     {
-                        return Err(
-                            "terminal final value has no corresponding zero assumption".into()
-                        );
+                        return Err(format!(
+                            "terminal final value has no corresponding zero assumption: {:?} local {} var {}",
+                            terminal.point, terminal.local, value.var
+                        ));
                     }
                     witnessed
                         .entry(terminal.point.clone())
