@@ -144,6 +144,9 @@ fn withdraw_formal(chains: &mut Chains, key: (LocalDefId, HirId), reason: &str) 
                 && !r.starts_with(&format!(
                     "box-param-store-c-free-lift callee={callee} index={index} "
                 ))
+                && !r.starts_with(&format!(
+                    "box-param-null-actual callee={callee} index={index} "
+                ))
         });
         chains
             .holds
@@ -718,6 +721,24 @@ fn peel_casts<'h>(mut e: &'h Expr<'h>) -> &'h Expr<'h> {
     e
 }
 
+/// **R697-3 (1)** — a null pointer as C2Rust writes C's `0` / `NULL`: the
+/// literal `0` under its casts, or core's `ptr::null_mut()` / `ptr::null()`.
+fn null_actual(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
+    match &peel_casts(e).kind {
+        ExprKind::Lit(lit) => {
+            matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0)
+        }
+        ExprKind::Call(callee, []) => matches!(
+            &callee.kind,
+            ExprKind::Path(QPath::Resolved(_, path))
+                if matches!(path.res, Res::Def(DefKind::Fn, did)
+                    if tcx.crate_name(did.krate).as_str() == "core"
+                        && matches!(tcx.item_name(did).as_str(), "null_mut" | "null"))
+        ),
+        _ => false,
+    }
+}
+
 fn bare_local(e: &Expr<'_>) -> Option<HirId> {
     match &peel_casts(e).kind {
         ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
@@ -785,6 +806,9 @@ struct Scan<'tcx> {
     /// place `(*p).f`: (call span, index, the field, the argument's span,
     /// whether the call's result is stored back into that same place).
     field_args: Vec<(Span, usize, (LocalDefId, usize), Span, bool)>,
+    /// **R697-3 (1)**: a local call's null actual: (call span, index, the
+    /// argument's span).
+    null_args: Vec<(Span, usize, Span)>,
 }
 
 /// The local struct field a place projects (`(*p).f`), as (struct, index).
@@ -897,6 +921,9 @@ impl<'tcx> Visitor<'tcx> for Scan<'tcx> {
                             _ => None,
                         };
                         for (index, arg) in args.iter().enumerate() {
+                            if null_actual(tcx, arg) {
+                                self.null_args.push((e.span, index, arg.span));
+                            }
                             if let Some(field) = field_key(tcx, arg) {
                                 let stored_back = stored_back_into.as_deref().is_some_and(|lhs| {
                                     tcx.sess
@@ -1698,6 +1725,8 @@ pub(crate) fn derive<'tcx>(
         // R561-4 W2: each member's argument at its call, for the `Some(..)`
         // a non-optional member needs at an optional formal.
         let mut member_args: Vec<((LocalDefId, HirId), Span)> = Vec::new();
+        // R697-3 (1): the null actuals, each `None` at its call.
+        let mut null_actuals: Vec<Span> = Vec::new();
         let mut failure: Option<String> = None;
         let mut callers: Vec<(&LocalDefId, &Scan<'tcx>)> = scans.iter().collect();
         callers.sort_by_key(|(f, _)| f.local_def_index.as_u32());
@@ -1709,6 +1738,18 @@ pub(crate) fn derive<'tcx>(
                 }
                 call_count += 1;
                 let Some(Some((arg, arg_span))) = args.get(hir_index) else {
+                    // **R697-3 (1) — a null actual retains nothing.** C's
+                    // `push(NULL, 1)` hands the formal no block: it is `None`
+                    // at an `Option<Box<T>>` formal, and the optional-owner
+                    // rule below asks the same of it as of an optional member.
+                    if let Some((_, _, arg_span)) = caller_scan
+                        .null_args
+                        .iter()
+                        .find(|(call, index, _)| call == call_span && *index == hir_index)
+                    {
+                        null_actuals.push(*arg_span);
+                        continue;
+                    }
                     // **R583-8 wall 2(b) — an owned child moved out.** The
                     // argument is an owned field `(*p).f` (model `Owning`) and
                     // the call's result goes back into that same place
@@ -2052,7 +2093,7 @@ pub(crate) fn derive<'tcx>(
         // Admitted only where one type serves the whole chain and nothing
         // else needs an edit: every member optional, the sink a free, a sized
         // owner, and no raw exposure wrapper to re-enter ownership.
-        let optional = optional_members > 0;
+        let optional = optional_members > 0 || !null_actuals.is_empty();
         // R583-8 wall 2(c): the store sink's field, when it is model-`Owning`.
         let owned_store_field: Option<(LocalDefId, usize)> = store
             .and_then(|_| {
@@ -2524,6 +2565,11 @@ pub(crate) fn derive<'tcx>(
         let wrapped_members = optional_wraps.len();
         let mut param_edits = param_edits;
         param_edits.extend(optional_wraps);
+        param_edits.extend(null_actuals.iter().map(|span| BoxExprEdit {
+            span: *span,
+            replacement: "None".to_owned(),
+            receipt: "box-param-null-actual",
+        }));
         let pointee = {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(param.fn_did)
@@ -2567,6 +2613,12 @@ pub(crate) fn derive<'tcx>(
             members.join(",")
         ));
         out.receipts.extend(lift_receipt);
+        if !null_actuals.is_empty() {
+            out.receipts.push(format!(
+                "box-param-null-actual callee={callee_path} index={hir_index} sites={}",
+                null_actuals.len()
+            ));
+        }
         if store_consumer {
             out.receipts.push(format!(
                 "exported-consumer-store callee={callee_path} index={hir_index} extent=strlen+1"

@@ -2954,3 +2954,142 @@ fn w6a_r620_the_store_extension_holds_outside_its_shape() {
         );
     }
 }
+
+/// The census model of analysis-fanout 020's linked list (`r029_B0_main/
+/// model-slots.tsv`, R697-3): `next`, `push` at both ends, `drop_0`'s formal
+/// and `main_0`'s `l` Owning, `last` Ref; `extra` adds or overrides.
+fn linked_list_with(
+    name: &str,
+    source: &str,
+    extra: &[(&str, crate::analyses::borrow_ownership::SlotKind)],
+) -> super::wave6a_allocation_tests::Emitted {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    let mut locals = vec![
+        ("push::head".to_owned(), SlotKind::Owning),
+        ("push::n".to_owned(), SlotKind::Owning),
+        ("last::head".to_owned(), SlotKind::Ref),
+        ("drop_0::head".to_owned(), SlotKind::Owning),
+        ("main_0::l".to_owned(), SlotKind::Owning),
+    ];
+    locals.extend(
+        extra
+            .iter()
+            .map(|(label, kind)| ((*label).to_owned(), *kind)),
+    );
+    super::test_model_override::set(
+        "w6a-r697-linked-list-frame",
+        vec![("Node".to_owned(), 1, SlotKind::Owning)],
+        locals,
+    );
+    let out = emitted(name, &with_prelude(source));
+    super::test_model_override::clear();
+    out
+}
+
+/// **R697-3 (1)** — 020's `push` with its null literal alone: `a` is built on
+/// `push(null_mut(), 1)` and handed into `push(a, 2)`; `main_0` frees the
+/// list's head. The null actual retains nothing, it is `None`: the formal is
+/// `Option<Box<Node>>`, the literal `None`, the certified receiver `Some(a)`.
+const NULL_ACTUAL: &str = r#"
+// w6a-r697-linked-list-frame
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>() as usize) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+unsafe fn main_0() -> ::core::ffi::c_int {
+    let mut a = push(::core::ptr::null_mut::<Node>(), 1 as ::core::ffi::c_int);
+    let mut l = push(a, 2 as ::core::ffi::c_int);
+    let mut v = (*l).val;
+    free(l as *mut ::core::ffi::c_void);
+    return v;
+}
+"#;
+
+#[test]
+fn w6a_r697_a_null_literal_actual_is_none() {
+    let out = linked_list_with(
+        "r697-null-actual",
+        NULL_ACTUAL,
+        &[(
+            "main_0::a",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    let src = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{}\n{:#?}",
+        out.artifacts.box_param_receipts,
+        out.artifacts.return_certificate_receipts,
+        out.source,
+        out.degradations
+    );
+    assert!(
+        src.contains("fnpush(muthead:Option<Box<Node>>,"),
+        "{context}"
+    );
+    assert!(
+        src.contains("push(None,1asi32)") || src.contains("push(None,1as::core::ffi::c_int)"),
+        "{context}"
+    );
+    assert!(src.contains("push(Some(a),"), "{context}");
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("box-param-chain callee=push index=0 sink=store"),
+        "{context}"
+    );
+    for subject in ["push::head", "main_0::a", "main_0::l"] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{context}"
+        );
+    }
+    assert_eq!(out.reverted, 0, "{context}");
+
+    // C2Rust's other spelling of C's `0`: the literal under its cast.
+    let literal = NULL_ACTUAL.replace("::core::ptr::null_mut::<Node>()", "0 as *mut Node");
+    assert_ne!(literal, NULL_ACTUAL);
+    let out = linked_list_with(
+        "r697-null-actual-literal",
+        &literal,
+        &[(
+            "main_0::a",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        compact(&out.source).contains("push(None,1as::core::ffi::c_int)") && out.reverted == 0,
+        "{}\n{}",
+        out.artifacts.box_param_receipts,
+        out.source
+    );
+
+    // Control: a non-zero literal is an address, not `None`.
+    let address = NULL_ACTUAL.replace("::core::ptr::null_mut::<Node>()", "8 as *mut Node");
+    assert_ne!(address, NULL_ACTUAL);
+    let out = linked_list_with(
+        "r697-null-actual-control",
+        &address,
+        &[(
+            "main_0::a",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("push::head\theld\tbox-param-caller-retains:main_0:not-a-local"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
+}
