@@ -4225,6 +4225,7 @@ fn e5c_inner_w63() {
         Ok("w74-shapes") => W74_SHAPES,
         Ok("w75-shapes") => W75_SHAPES,
         Ok("w79-shapes") => W79_SHAPES,
+        Ok("w83-swap") => W83_SWAP,
         Ok(file) if file.starts_with("file:") => {
             owned = std::fs::read_to_string(&file[5..]).expect("the W64 program");
             owned.as_str()
@@ -6244,6 +6245,45 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
         text.contains("unresolved callee argument: mk_list argument 4 of 3"),
         "the fault must be caught: {text}"
     );
+}
+
+/// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines, the guarded
+/// repair, and the allocator contract on (R691-1).
+const L01P13_ARMS: &[(&str, &str)] = &[
+    ("CRAT_ERA5C_LEND", "on"),
+    ("CRAT_ERA5C_REF_PEEL_ZERO", "on"),
+    ("CRAT_ERA5C_RETIRE_FRESH", "on"),
+    ("CRAT_ERA5C_RETIRE_ROUTE_USE", "on"),
+    ("CRAT_ERA5C_TYPED_SOLE", "on"),
+    ("CRAT_ERA5C_ALPHA_RETURNS", "on"),
+    ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
+    ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
+    ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
+    ("CRAT_BO_REPAIR", "guarded"),
+    ("CRAT_BO_SAFE_MONO", "per_site"),
+    ("CRAT_NB4R_ROUTING", "on"),
+    ("CRAT_E5C_W63_MODEL_ONLY", "1"),
+];
+
+fn l01p13_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let mut env = L01P13_ARMS.to_vec();
+    env.extend_from_slice(extra);
+    w63_lines(shape, &env)
+}
+
+/// W83 (R697-6; analysis-fanout 018, era-5c 106): carrays' `void *` swap. The
+/// allocator finder of `points_to` followed `_0 <- p1 <- p0 <- p1 <- ...` with no
+/// visited set and overflowed the stack before the solve began; RED at L01¹²
+/// (the child aborts). With the visited set the program solves.
+const W83_SWAP: &str = r#"
+#![allow(unused)]
+pub unsafe extern "C" fn f(mut p0: *mut ::core::ffi::c_void, mut p1: *mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void { p0 = p1; p1 = p0; return p1; }
+"#;
+
+#[test]
+fn e5c_w83_a_void_pointer_swap_solves() {
+    let lines = l01p13_lines("w83-swap", &[]);
+    w63_kind(&lines, "f::_0@d0");
 }
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement
