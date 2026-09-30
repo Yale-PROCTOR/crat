@@ -5829,10 +5829,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // not adapted. The hold keeps such readers raw where every root
                 // is fabricated; this is the guard for a reader released on a
                 // real root and reached through a forwarder that stayed raw.
+                // (The relay 071 review's (9): keyed on the length the reader
+                // would receive, whatever form it comes from, save a slice it
+                // already has; a byte region only where it has no exact length.)
                 if (len_text.is_none() || len_masked)
-                    && region.is_none()
-                    && counted.is_none()
-                    && pos.found == Form::Raw
+                    && region.is_none_or(|region| region.len_text().is_none())
+                    && !matches!(
+                        pos.found,
+                        Form::Slice { .. } | Form::Opt { slice: true, .. }
+                    )
                     && matches!(
                         pos.expected,
                         Form::Slice { .. } | Form::Opt { slice: true, .. }
