@@ -1186,6 +1186,60 @@ fn twin_callee_key(
     Ok(Some(expression_key(&*expression(&text)?)))
 }
 
+/// **R695-2 (a) — follow the callee's EXPOSURE rename.** An exposure-shimmed
+/// callee keeps its original name as the raw `extern "C"` shim, and the
+/// in-program callers call its safe inner `__crat_safe_<callee>` instead. The
+/// export already receipts that as the callee's typed-exposure `OwnerRename` (the
+/// one `target_owner` reads), so the call binding the stamped raw temporaries is
+/// the call to that inner. Like R447-1's twin, the alias is derived from the
+/// receipt, not guessed: only a `typed-exposure:` row for this very callee is
+/// followed, only when the original call names the callee by its own item name,
+/// and only when the emitted tree declares exactly that inner.
+fn exposure_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    callee_text: &str,
+) -> MatchResult<Option<String>> {
+    let [row] = input
+        .context
+        .owner_renames
+        .iter()
+        .filter(|row| row.original_owner == expected.callee)
+        .collect::<Vec<_>>()[..]
+    else {
+        return Ok(None);
+    };
+    if !row.evidence.starts_with("typed-exposure:") {
+        return Ok(None);
+    }
+    let item = |path: &str| path.rsplit("::").next().map(str::trim).map(str::to_owned);
+    let (Some(named), Some(original), Some(inner)) = (
+        item(callee_text),
+        item(&expected.callee),
+        item(&row.emitted_owner),
+    ) else {
+        return Ok(None);
+    };
+    if named != original
+        || inner.is_empty()
+        || !inner.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || input
+            .emitted
+            .functions
+            .iter()
+            .filter(|function| function.owner == row.emitted_owner)
+            .count()
+            != 1
+    {
+        return Ok(None);
+    }
+    let text = match callee_text.rsplit_once("::") {
+        Some((prefix, _)) => format!("{prefix}::{inner}"),
+        None => inner,
+    };
+    Ok(Some(expression_key(&*expression(&text)?)))
+}
+
 fn emitted_candidates<'a>(
     input: &'a BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -1240,6 +1294,7 @@ fn emitted_candidates<'a>(
     // declares that function, so a call to an unrelated `__crat_raw_*` cannot
     // be mistaken for this callee's.
     let twin_key = twin_callee_key(input, callee_text)?;
+    let exposure_key = exposure_callee_key(input, expected, callee_text)?;
     let mut candidates = Vec::new();
     for call in input
         .emitted
@@ -1248,7 +1303,10 @@ fn emitted_candidates<'a>(
         .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
     {
         let call_key = expression_key(&*expression(&call.callee_text)?);
-        if call_key == key || twin_key.as_ref() == Some(&call_key) {
+        if call_key == key
+            || twin_key.as_ref() == Some(&call_key)
+            || exposure_key.as_ref() == Some(&call_key)
+        {
             candidates.push(call);
         }
     }
@@ -2815,6 +2873,63 @@ fn pending_target_raw(
     Ok(())
 }
 
+/// **R695-2 (b) — a C-variadic position has no formal to be raw.** A foreign
+/// `sprintf(_: *mut c_char, _: *const c_char, _: ...)` hands the value at
+/// position 2 onward with the argument's own type, so there the ARGUMENT must be
+/// raw by construction: `x.as_ptr()`, `x.as_mut_ptr()`, or a cast to a raw
+/// pointer. Anything else -- a bare reference among them -- fails closed. A fixed
+/// formal is checked by `pending_target_raw`, unchanged.
+fn pending_target_accepts(
+    scopes: &[&Inventory],
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+    argument_text: &str,
+) -> MatchResult<()> {
+    let variadic_from = target
+        .parameters
+        .last()
+        .filter(|parameter| parameter.type_text.trim() == "...")
+        .map(|_| target.parameters.len() - 1);
+    match variadic_from {
+        Some(first) if index >= first => {
+            let argument = expression(argument_text)?;
+            let raw = match &unparen(&argument).kind {
+                ast::ExprKind::MethodCall(call) => {
+                    call.args.is_empty()
+                        && matches!(call.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+                }
+                ast::ExprKind::Cast(_, ty) => matches!(ty.kind, ast::TyKind::Ptr(_)),
+                _ => false,
+            };
+            if raw {
+                Ok(())
+            } else {
+                Err("pending-variadic-argument-not-raw".into())
+            }
+        }
+        _ => pending_target_raw(scopes, target, index),
+    }
+}
+
+/// R695-2 (b): the pending-target check with its argument, on one emitted source.
+#[cfg(test)]
+pub(crate) fn pending_target_accepts_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+    argument: &str,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        pending_target_accepts(&[&inventory], target, index, argument)
+    })
+}
+
 /// R605-2: a callee formal written as the bare name of a type alias its module
 /// binds -- by its own `type` item, or by an un-renamed crate-path import of one --
 /// is classified by the alias's type, one level: brotli's `literal_context_lut:
@@ -2917,7 +3032,17 @@ fn pending_selected_argument(
     index: usize,
 ) -> MatchResult<Vec<BindingWitness>> {
     let target = target_owner(input, expected)?;
-    pending_target_raw(&[input.emitted, input.original], target, index)?;
+    let argument_text = &call
+        .arguments
+        .get(index)
+        .ok_or("emitted-argument-absent")?
+        .text;
+    pending_target_accepts(
+        &[input.emitted, input.original],
+        target,
+        index,
+        argument_text,
+    )?;
     if expected.pending_source.as_ref().is_some_and(|source| {
         matches!(
             &source.shape,

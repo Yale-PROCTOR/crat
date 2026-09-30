@@ -700,6 +700,72 @@ mod matcher {
         );
     }
 
+    /// R695-2 (a). An exposure-shimmed callee's in-program callers call its safe
+    /// inner `__crat_safe_<callee>`, and the export receipts that as a
+    /// typed-exposure `OwnerRename` of the CALLEE. The matcher looked for the call
+    /// under the original name only, so lil's frame11 PAIR view at
+    /// `lil_register(sublil, (*fnc).name, ..)`, emitted as
+    /// `__crat_safe_lil_register(&mut *sublil, __crat_a5_raw_.., ..)`, failed
+    /// `stamped-raw-temporary-has-no-exact-bound-call-use` on a correct emission.
+    #[test]
+    fn r695_2_a_the_matcher_follows_the_callees_receipted_exposure_rename_only() {
+        let lo = INPUT.find("target(w, r)").unwrap();
+        let shimmed = format!(
+            "fn target(w: *mut i32, r: *const i32) {{ __crat_safe_target(&mut *w, r) }} \
+             fn __crat_safe_target(w: &mut i32, r: *const i32) {{}} \
+             fn caller(w: &mut i32, r: &i32) {{ {{ let __crat_pair_raw_{lo}_1: *const i32 = \
+             core::ptr::from_ref(r); __crat_safe_target(w, __crat_pair_raw_{lo}_1); }} }}"
+        );
+        let renamed = |evidence: &str| BridgeCustodyContext {
+            owner_renames: vec![OwnerRename {
+                original_owner: "target".into(),
+                emitted_owner: "__crat_safe_target".into(),
+                evidence: evidence.into(),
+            }],
+            ..Default::default()
+        };
+        let run = |output: &str, context: &BridgeCustodyContext| {
+            let original = syntax::inventory_source("original.rs", INPUT).unwrap();
+            let emitted = syntax::inventory_source("emitted.rs", output).unwrap();
+            compare(BridgeCustodyInput {
+                original: &original,
+                emitted: &emitted,
+                original_source: INPUT,
+                emitted_source: output,
+                expectations: &[expectation(BridgeKind::PairT2RawView)],
+                context,
+            })
+        };
+        let report = run(&shimmed, &renamed("typed-exposure:original.rs:0..44"));
+        assert!(
+            report.data,
+            "the inner's call carries the custody: {report:#?}"
+        );
+        assert_eq!(report.rows[0].status, ReceiptStatus::MatchedRaw);
+        assert_eq!(report.rows[0].bindings.len(), 1);
+
+        // Without the callee's rename row the redirected call is an unknown callee.
+        let report = run(&shimmed, &BridgeCustodyContext::default());
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "no receipted rename, nothing to follow: {report:#?}"
+        );
+        // A rename that is not the exposure's receipt is not followed.
+        let report = run(&shimmed, &renamed("consumer-only:explicit-rename"));
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "only a typed-exposure rename is followed: {report:#?}"
+        );
+        // The rename is followed only when the tree declares the inner.
+        let undeclared =
+            shimmed.replace("fn __crat_safe_target(w: &mut i32, r: *const i32) {} ", "");
+        let report = run(&undeclared, &renamed("typed-exposure:original.rs:0..44"));
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "an undeclared inner is not a rename to follow: {report:#?}"
+        );
+    }
+
     #[test]
     fn bridge_custody_match_receipt_without_render_is_missing() {
         let report = check(
@@ -2846,6 +2912,52 @@ fn r568_1_b_an_element_address_through_the_owner_view_is_the_original_element() 
             original
         ),
         "one argument"
+    );
+}
+
+/// **R695-2 (b) — a C-variadic position has no formal to be raw.** lil's frame11
+/// pending sibling-overlap at `sprintf(name, fmt, part.as_ptr(), i)` (argument 2)
+/// read `pending-target-is-not-raw`: the "formal" there is `...`. At a variadic
+/// position the value passes with its own type, so the ARGUMENT must be raw by
+/// construction; a fixed formal is checked as before.
+#[test]
+fn r695_2_b_a_variadic_position_asks_the_argument_to_be_raw() {
+    use crate::bo_rewriter::bridge_custody_match::pending_target_accepts_for_test as check;
+    const EMITTED: &str = "extern \"C\" {
+    fn sprintf(_: *mut i8, _: *const i8, _: ...) -> i32;
+}
+pub unsafe fn fixed(p: *const i8, n: usize) {}
+";
+    for raw in [
+        "part.as_ptr()",
+        "part.as_mut_ptr()",
+        "(part.as_ptr())",
+        "part as *const i8",
+    ] {
+        assert_eq!(check(EMITTED, "sprintf", 2, raw), Ok(()), "{raw}");
+        assert_eq!(
+            check(EMITTED, "sprintf", 3, raw),
+            Ok(()),
+            "{raw}, past the `...`"
+        );
+    }
+    for not_raw in ["part", "&part", "&mut *part", "part.len()", "part as usize"] {
+        assert_eq!(
+            check(EMITTED, "sprintf", 2, not_raw),
+            Err("pending-variadic-argument-not-raw".to_owned()),
+            "{not_raw}"
+        );
+    }
+    // Fixed formals are unchanged: raw passes, a scalar does not, past the end is absent.
+    assert_eq!(check(EMITTED, "sprintf", 0, "part"), Ok(()));
+    assert_eq!(check(EMITTED, "fixed", 0, "part"), Ok(()));
+    assert_eq!(
+        check(EMITTED, "fixed", 1, "part.as_ptr()"),
+        Err("pending-target-is-not-raw".to_owned())
+    );
+    assert_eq!(
+        check(EMITTED, "fixed", 2, "part.as_ptr()"),
+        Err("pending-target-absent".to_owned())
     );
 }
 
