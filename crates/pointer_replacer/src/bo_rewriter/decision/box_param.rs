@@ -722,7 +722,8 @@ fn peel_casts<'h>(mut e: &'h Expr<'h>) -> &'h Expr<'h> {
 }
 
 /// **R697-3 (1)** — a null pointer as C2Rust writes C's `0` / `NULL`: the
-/// literal `0` under its casts, or core's `ptr::null_mut()` / `ptr::null()`.
+/// literal `0` under its casts, or core's `ptr::null_mut()` / `ptr::null()`,
+/// by their diagnostic items (a program's own `null_mut` is not one).
 fn null_actual(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
     match &peel_casts(e).kind {
         ExprKind::Lit(lit) => {
@@ -732,8 +733,8 @@ fn null_actual(tcx: TyCtxt<'_>, e: &Expr<'_>) -> bool {
             &callee.kind,
             ExprKind::Path(QPath::Resolved(_, path))
                 if matches!(path.res, Res::Def(DefKind::Fn, did)
-                    if tcx.crate_name(did.krate).as_str() == "core"
-                        && matches!(tcx.item_name(did).as_str(), "null_mut" | "null"))
+                    if tcx.get_diagnostic_name(did)
+                        .is_some_and(|name| matches!(name.as_str(), "ptr_null_mut" | "ptr_null")))
         ),
         _ => false,
     }

@@ -2987,6 +2987,48 @@ fn linked_list_with(
     out
 }
 
+/// analysis-fanout 020's linked list, variant C (`0` for `NULL`) with `main`,
+/// as C2Rust gives it (`r029_B0_main/substrate-lib.rs`).
+const LINKED_LIST_MAIN: &str = r#"
+// w6a-r697-linked-list-frame
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>() as usize) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+#[no_mangle]
+pub unsafe extern "C" fn last(mut head: *mut Node) -> *mut Node {
+    while !(*head).next.is_null() {
+        head = (*head).next;
+    }
+    return head;
+}
+#[export_name = "drop"]
+pub unsafe extern "C" fn drop_0(mut head: *mut Node) {
+    if head.is_null() {
+        return;
+    }
+    drop_0((*head).next);
+    free(head as *mut ::core::ffi::c_void);
+}
+unsafe fn main_0() -> ::core::ffi::c_int {
+    let mut l = push(
+        push(::core::ptr::null_mut::<Node>(), 1 as ::core::ffi::c_int),
+        2 as ::core::ffi::c_int,
+    );
+    (*last(l)).val = 3 as ::core::ffi::c_int;
+    drop_0(l);
+    return 0 as ::core::ffi::c_int;
+}
+"#;
+
 /// **R697-3 (1)** — 020's `push` with its null literal alone: `a` is built on
 /// `push(null_mut(), 1)` and handed into `push(a, 2)`; `main_0` frees the
 /// list's head. The null actual retains nothing, it is `None`: the formal is
@@ -3233,6 +3275,19 @@ fn w6a_r697_a_box_lent_to_a_ref_formal_it_returns_is_a_lend() {
     assert!(
         out.artifacts.return_certificate_receipts.contains(
             "main_0::l\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:pick(l,"
+        ),
+        "{}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.source
+    );
+    // (c) 020's own input with `main`: in this harness the model calls
+    // `last`'s formal Ref but its return Raw (the census model calls both
+    // Ref), so the pointer `last` hands back is no borrow the model verified,
+    // and the call is not a lend.
+    let out = linked_list_with("r697-returned-lend-raw-return", LINKED_LIST_MAIN, &[]);
+    assert!(
+        out.artifacts.return_certificate_receipts.contains(
+            "main_0::l\theld\treturn-certificate-receiver-use:call-argument-not-a-lend:last(l)"
         ),
         "{}\n{}",
         out.artifacts.return_certificate_receipts,
