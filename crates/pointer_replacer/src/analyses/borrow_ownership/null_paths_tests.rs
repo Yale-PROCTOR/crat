@@ -4226,6 +4226,11 @@ fn e5c_inner_w63() {
         Ok("w75-shapes") => W75_SHAPES,
         Ok("w79-shapes") => W79_SHAPES,
         Ok("w83-swap") => W83_SWAP,
+        Ok("w84-null") => W84_LIST,
+        Ok("w84-zero") => {
+            owned = W84_LIST.replace(W84_NULL_ITEM, "");
+            owned.as_str()
+        }
         Ok(file) if file.starts_with("file:") => {
             owned = std::fs::read_to_string(&file[5..]).expect("the W64 program");
             owned.as_str()
@@ -6284,6 +6289,120 @@ pub unsafe extern "C" fn f(mut p0: *mut ::core::ffi::c_void, mut p1: *mut ::core
 fn e5c_w83_a_void_pointer_swap_solves() {
     let lines = l01p13_lines("w83-swap", &[]);
     w63_kind(&lines, "f::_0@d0");
+}
+
+/// W84 (R697-3; analysis-fanout 020 STOP 1): the paper's linked list with the
+/// fork's `pub const NULL` item. The item's body names no program function, so
+/// caller coverage is complete and the list settles as it does with `0` for
+/// `NULL`: `next` Owning, `push`'s formal Owning, `last` Ref. RED at L01¹²: the
+/// item held coverage (`CompilerBodies`) and `next` settled Raw. The fault
+/// `CRAT_E5C_W84_FAULT=no-inert` (test builds) admits no inert body.
+const W84_LIST: &str = r#"
+#![allow(unused_mut)]
+extern "C" {
+    fn malloc(__size: usize) -> *mut ::core::ffi::c_void;
+    fn free(__ptr: *mut ::core::ffi::c_void);
+}
+#[repr(C)]
+pub struct Node {
+    pub val: ::core::ffi::c_int,
+    pub next: *mut Node,
+}
+pub const NULL: *mut ::core::ffi::c_void = ::core::ptr::null_mut::<::core::ffi::c_void>();
+#[no_mangle]
+pub unsafe extern "C" fn push(mut head: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>()) as *mut Node;
+    (*n).val = val;
+    (*n).next = head;
+    return n;
+}
+#[no_mangle]
+pub unsafe extern "C" fn last(mut head: *mut Node) -> *mut Node {
+    while !(*head).next.is_null() { head = (*head).next; }
+    return head;
+}
+#[export_name = "drop"]
+pub unsafe extern "C" fn drop_0(mut head: *mut Node) {
+    if head.is_null() { return; }
+    drop_0((*head).next);
+    free(head as *mut ::core::ffi::c_void);
+}
+"#;
+const W84_NULL_ITEM: &str =
+    "pub const NULL: *mut ::core::ffi::c_void = ::core::ptr::null_mut::<::core::ffi::c_void>();\n";
+
+#[test]
+fn e5c_w84_an_inert_const_item_holds_no_caller_coverage() {
+    assert!(W84_LIST.contains(W84_NULL_ITEM));
+    let null = l01p13_lines("w84-null", &[]);
+    let zero = l01p13_lines("w84-zero", &[]);
+    for key in [
+        "Node::field1@d0",
+        "push::_1@d0",
+        "last::_1@d0",
+        "last::_0@d0",
+    ] {
+        assert_eq!(w63_kind(&null, key), w63_kind(&zero, key), "{key}");
+    }
+    assert_eq!(w63_kind(&null, "Node::field1@d0"), "owning");
+    assert_eq!(w63_kind(&null, "push::_1@d0"), "owning");
+    assert_eq!(w63_kind(&null, "last::_1@d0"), "ref");
+    let fault = l01p13_lines("w84-null", &[("CRAT_E5C_W84_FAULT", "no-inert")]);
+    assert_eq!(
+        w63_kind(&fault, "Node::field1@d0"),
+        "raw",
+        "the fault must be caught: {fault:?}"
+    );
+}
+
+/// W84's corpus read (R697-3 (3)): the compiler bodies a derived program's caller
+/// coverage still holds on, once the inert ones are admitted. No solve.
+#[test]
+#[ignore = "driven by era-5c's R697-3 corpus read"]
+fn e5c_inner_w84_coverage_of_file() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    let path = std::env::var("CRAT_E5C_W84_SOURCE").expect("CRAT_E5C_W84_SOURCE");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions,
+            structs,
+        };
+        let c = super::licensing::caller_coverage::Coverage::collect(&program);
+        let unconfigured: Vec<_> = c
+            .compiler_bodies
+            .iter()
+            .filter(|b| !c.configured_functions.contains(*b) && !c.derived_impl_bodies.contains(*b))
+            .collect();
+        let held: Vec<_> = unconfigured
+            .iter()
+            .filter(|b| !c.inert_bodies.contains(**b))
+            .collect();
+        eprintln!(
+            "E5C_W84 {path} unconfigured={} inert={} held={} indirect={} values={} asm={}",
+            unconfigured.len(),
+            unconfigured.len() - held.len(),
+            held.len(),
+            c.indirect_calls.len(),
+            c.function_values.len(),
+            c.inline_assembly.len()
+        );
+        for body in held {
+            eprintln!("E5C_W84 held {body}");
+        }
+    });
 }
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement

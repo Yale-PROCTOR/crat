@@ -21,6 +21,13 @@ pub(crate) struct Coverage {
     /// pointers, so it must stay visible to every consumer that asks.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) derived_impl_bodies: BTreeSet<String>,
+    /// R697-3: const, anonymous-const and static bodies that name no program
+    /// function (no call to one, no function value, no indirect call), and, for
+    /// a static, whose type carries no pointer. They call nothing in the
+    /// program and store nothing a slot could own, so they are accounted for by
+    /// their role, as a derived body is.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) inert_bodies: BTreeSet<String>,
     pub(crate) local_calls: BTreeSet<LocalCall>,
     pub(crate) indirect_calls: BTreeSet<SourceSite>,
     pub(crate) function_values: BTreeSet<SourceSite>,
@@ -66,6 +73,16 @@ impl Coverage {
                 })
                 .map(|f| tcx.def_path_str(f))
                 .collect(),
+            inert_bodies: if cfg!(test)
+                && std::env::var("CRAT_E5C_W84_FAULT").as_deref() == Ok("no-inert")
+            {
+                BTreeSet::new()
+            } else {
+                tcx.hir_body_owners()
+                    .filter(|&owner| inert_body(tcx, owner))
+                    .map(|f| tcx.def_path_str(f))
+                    .collect()
+            },
             ..Self::default()
         };
         result.duplicate_functions = result.configured_functions.len() != program.functions.len();
@@ -151,10 +168,12 @@ pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
         held.insert(Reason::ConfiguredFunctions);
     }
     // R304-10: a derived impl body is accounted for by its role, never dropped
-    // from the denominator. Every other compiler body still has to be configured.
+    // from the denominator; R697-3: so is an inert const or static body. Every
+    // other compiler body still has to be configured.
     if coverage.compiler_bodies.iter().any(|body| {
         !coverage.configured_functions.contains(body)
             && !coverage.derived_impl_bodies.contains(body)
+            && !coverage.inert_bodies.contains(body)
     }) || coverage
         .configured_functions
         .iter()
@@ -219,6 +238,103 @@ pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
         Status::Complete
     } else {
         Status::Held(held)
+    }
+}
+
+/// R697-3: a const-like body that names no program function, or a static that
+/// does so and whose type carries no pointer (its initializer is a store).
+fn inert_body(tcx: rustc_middle::ty::TyCtxt<'_>, owner: rustc_hir::def_id::LocalDefId) -> bool {
+    use rustc_hir::def::DefKind;
+    let statik = match tcx.def_kind(owner) {
+        DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::InlineConst => false,
+        DefKind::Static { .. } => true,
+        _ => return false,
+    };
+    if statik
+        && carries_pointer(
+            tcx,
+            tcx.type_of(owner).instantiate_identity(),
+            &mut rustc_hash::FxHashSet::default(),
+        )
+    {
+        return false;
+    }
+    std::iter::once(tcx.mir_for_ctfe(owner))
+        .chain(tcx.promoted_mir(owner).iter())
+        .all(|body| names_no_function(tcx, body))
+}
+
+/// The collector's own tests: no local or indirect callee, no function value,
+/// no inline assembly.
+fn names_no_function<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &rustc_middle::mir::Body<'tcx>,
+) -> bool {
+    use rustc_middle::{
+        mir::{Location, TerminatorKind, visit::Visitor},
+        ty::TyKind,
+    };
+    let mut values = Values {
+        tcx,
+        body,
+        function: String::new(),
+        sites: BTreeSet::new(),
+    };
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            values.visit_statement(
+                statement,
+                Location {
+                    block,
+                    statement_index,
+                },
+            );
+        }
+        let location = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => {
+                for arg in args {
+                    values.visit_operand(&arg.node, location);
+                }
+                if !matches!(*func.ty(body, tcx).kind(), TyKind::FnDef(target, _) if !target.is_local())
+                {
+                    return false;
+                }
+            }
+            TerminatorKind::InlineAsm { .. } => return false,
+            _ => values.visit_terminator(data.terminator(), location),
+        }
+    }
+    values.sites.is_empty()
+}
+
+fn carries_pointer<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    seen: &mut rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+    match *ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never => false,
+        TyKind::Array(element, _) | TyKind::Slice(element) => carries_pointer(tcx, element, seen),
+        TyKind::Tuple(items) => items.iter().any(|item| carries_pointer(tcx, item, seen)),
+        TyKind::Adt(adt, args) => {
+            seen.insert(adt.did())
+                && adt
+                    .all_fields()
+                    .any(|field| carries_pointer(tcx, field.ty(tcx, args), seen))
+        }
+        _ => true,
     }
 }
 
@@ -351,6 +467,34 @@ pub unsafe fn f(){let owner=make();let mut c=Cell{ptr:0 as *mut i32};put(&mut c,
                 held(assess(facts), reason);
                 Snapshot::capture(facts, 0).unwrap().validate().unwrap();
             });
+        }
+    }
+    /// R697-3 (W84's unit half): the fork's `pub const NULL` item, a pointer-free
+    /// static and an array length name no program function, so they hold no
+    /// coverage; a pointer-carrying static and a const that calls a program
+    /// function still do.
+    #[test]
+    fn c04_caller_coverage_inert_const_and_static_bodies() {
+        with_facts(
+            &format!(
+                "{CODE}\npub const NULL:*mut core::ffi::c_void=core::ptr::null_mut::<core::ffi::c_void>();\npub static mut COUNT:i32=0;\npub struct Buf{{b:[u8;16]}}"
+            ),
+            |facts| {
+                assert_eq!(assess(facts), Status::Complete);
+                let inert = &facts.caller_coverage.as_ref().unwrap().inert_bodies;
+                assert!(
+                    inert.contains("NULL") && inert.contains("COUNT"),
+                    "{inert:?}"
+                );
+                assert!(inert.iter().any(|b| b.contains("{constant#")), "{inert:?}");
+                Snapshot::capture(facts, 0).unwrap().validate().unwrap();
+            },
+        );
+        for code in [
+            format!("{CODE}\npub static mut HEAD:*mut i32=0 as *mut i32;"),
+            format!("{CODE}\npub const fn seven()->i32{{7}}\npub const SEVEN:i32=seven();"),
+        ] {
+            with_facts(&code, |facts| held(assess(facts), Reason::CompilerBodies));
         }
     }
     #[test]
