@@ -18,7 +18,6 @@
 //! receipt does not license.
 
 use rustc_ast::mut_visit::MutVisitor;
-use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashSet;
 
 use super::ast_transform::{Composition, graft_expr};
@@ -75,6 +74,10 @@ pub(crate) struct HoistVisitor<'a> {
     guard: &'a mut Composition,
     applied: usize,
     held: Vec<&'static str>,
+    /// **R666-6.** The spans already hoisted. wave-6l's bracket leaves the
+    /// wrapper and the call it moved under one span (and `NodeId`); the call is
+    /// hoisted once, and the wrapper meeting the same key is not tried again.
+    hoisted: FxHashSet<(u32, u32)>,
 }
 
 impl<'a> HoistVisitor<'a> {
@@ -84,6 +87,7 @@ impl<'a> HoistVisitor<'a> {
             guard,
             applied: 0,
             held: Vec::new(),
+            hoisted: FxHashSet::default(),
         }
     }
 
@@ -112,25 +116,54 @@ impl<'a> HoistVisitor<'a> {
         if reads.is_empty() {
             return Err("no-read-through-a-received-reborrow");
         }
+        // The block is parsed around holes and the call's own nodes are moved
+        // into them, so every node keeps its span: the passes after this one
+        // find nodes by span (`wave5r_helper_path::qualify` qualifies an
+        // imported helper call by its callee's), as for wave-6l's bracket.
         let mut lets = String::new();
+        let mut nodes = Vec::new();
         for index in reads {
             let name = format!("__crat_hoist_{lo}_{index}");
-            lets.push_str(&format!(
-                "let {name} = {};\n",
-                pprust::expr_to_string(&arguments[index])
-            ));
-            arguments[index] = rustc_ast::ptr::P(graft_expr(&name).map_err(|_| "unparsable")?);
+            let hole = format!("{HOLE}{index}");
+            lets.push_str(&format!("let {name} = {hole};\n"));
+            let path = graft_expr(&name).map_err(|_| "unparsable")?;
+            nodes.push((hole, std::mem::replace(&mut *arguments[index], path)));
         }
-        let rendered = format!("{{\n{lets}{}\n}}", pprust::expr_to_string(expression));
-        let parsed = graft_expr(&rendered).map_err(|_| "unparsable")?;
+        let mut block =
+            graft_expr(&format!("{{\n{lets}{HOLE}call\n}}")).map_err(|_| "unparsable")?;
         if !self
             .guard
             .claim(expression.id, expression.span, "arg-order-hoist")
         {
             return Err("node-claimed-by-another-arm");
         }
-        expression.kind = parsed.kind;
+        nodes.push((format!("{HOLE}call"), expression.clone()));
+        let mut filler = HoleFiller(nodes);
+        filler.visit_expr(&mut block);
+        expression.kind = block.kind;
         Ok(())
+    }
+}
+
+/// The placeholder prefix the hoist's block is parsed around.
+const HOLE: &str = "__crat_hoist_hole_";
+
+/// Moves each named node into the path of the same name in a parsed block.
+struct HoleFiller(Vec<(String, rustc_ast::Expr)>);
+
+impl MutVisitor for HoleFiller {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Path(None, path) = &e.kind
+            && let [segment] = path.segments.as_slice()
+            && let Some(at) = self
+                .0
+                .iter()
+                .position(|(hole, _)| hole.as_str() == segment.ident.name.as_str())
+        {
+            *e = self.0.swap_remove(at).1;
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
     }
 }
 
@@ -139,16 +172,16 @@ impl MutVisitor for HoistVisitor<'_> {
         // Children first: a receipted call nested in another's argument list is
         // hoisted inside it, and the outer call then sees its product.
         rustc_ast::mut_visit::walk_expr(self, expression);
-        if expression.span.is_dummy()
-            || !self
-                .calls
-                .contains(&(expression.span.lo().0, expression.span.hi().0))
-        {
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        if expression.span.is_dummy() || !self.calls.contains(&key) || self.hoisted.contains(&key) {
             return;
         }
         let pristine = expression.kind.clone();
         match self.hoist(expression) {
-            Ok(()) => self.applied += 1,
+            Ok(()) => {
+                self.applied += 1;
+                self.hoisted.insert(key);
+            }
             Err(why) => {
                 expression.kind = pristine;
                 self.held.push(why);

@@ -235,3 +235,112 @@ fn r631_12_a_raw_received_subject_is_not_hoisted() {
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("insert_(t, (*t).root, v)"), "{source}");
 }
+
+/// The spans of the call to `callee` in `krate` (its callee path's and each
+/// argument's), and of every `__crat_hoist_*` binding's initializer.
+fn node_spans(krate: &rustc_ast::Crate, callee: &str) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    struct Find<'a>(&'a str, Vec<(u32, u32)>, Vec<(u32, u32)>);
+    impl<'ast> rustc_ast::visit::Visitor<'ast> for Find<'_> {
+        fn visit_expr(&mut self, e: &'ast rustc_ast::Expr) {
+            if let rustc_ast::ExprKind::Call(f, args) = &e.kind
+                && pprust::expr_to_string(f) == self.0
+            {
+                self.1.push((f.span.lo().0, f.span.hi().0));
+                self.1
+                    .extend(args.iter().map(|a| (a.span.lo().0, a.span.hi().0)));
+            }
+            rustc_ast::visit::walk_expr(self, e);
+        }
+
+        fn visit_local(&mut self, local: &'ast rustc_ast::Local) {
+            if pprust::pat_to_string(&local.pat).starts_with("__crat_hoist_")
+                && let Some(init) = local.kind.init()
+            {
+                self.2.push((init.span.lo().0, init.span.hi().0));
+            }
+            rustc_ast::visit::walk_local(self, local);
+        }
+    }
+    let mut find = Find(callee, Vec::new(), Vec::new());
+    rustc_ast::visit::walk_crate(&mut find, krate);
+    (find.1, find.2)
+}
+
+/// **R650-4 — the hoist keeps the call's own nodes.** The passes after it
+/// find nodes by span (`wave5r_helper_path::qualify` qualifies an imported
+/// helper call by its callee's span; wave-6l's C10), so the hoist moves the
+/// callee and the arguments into its block instead of re-parsing their text.
+#[test]
+fn r650_4_the_hoist_keeps_the_call_s_own_nodes() {
+    let body = "pub unsafe fn tree_insert(mut tree: Option<&mut Tree>, v: i32) -> i32 {\n\
+         \x20   insert_(tree.as_deref_mut().unwrap(), (*tree.as_deref_mut().unwrap()).root, v)\n\
+         }\n";
+    rustc_span::create_default_session_globals_then(|| {
+        let mut krate = ::utils::ast::parse_crate(format!("{PRELUDE}{body}"));
+        let (before, _) = node_spans(&krate, "insert_");
+        let mut calls = FxHashSet::default();
+        calls.insert(call_span(&krate, "insert_"));
+        let mut guard = Composition::default();
+        let mut visitor = HoistVisitor::new(&calls, &mut guard);
+        visitor.visit_crate(&mut krate);
+        assert_eq!(visitor.finish().0, 1);
+        let (after, bound) = node_spans(&krate, "insert_");
+        // The callee and the two arguments left in place keep their spans; the
+        // read moves into the binding with its own.
+        assert_eq!(
+            (after[0], after[1], after[3]),
+            (before[0], before[1], before[3])
+        );
+        assert_eq!(bound, [before[2]]);
+    });
+}
+
+/// **R666-6 (wave-6l 063 §2) — a span already hoisted is skipped.** wave-6l's
+/// bracket moves a CLONE of the initializer's call into its constructor's
+/// hole, so the wrapper keeps the call's span and `NodeId`. The hoist rewrites
+/// the inner call, then meets the wrapper under the same key: it must not try
+/// it again, or the receipt counts once `applied` and once `held`.
+#[test]
+fn r666_6_a_wrapper_carrying_the_call_s_span_is_not_hoisted_again() {
+    let body = "pub unsafe fn tree_insert(mut tree: Option<&mut Tree>, v: i32) -> i32 {\n\
+         \x20   let r = insert_(tree.as_deref_mut().unwrap(), (*tree.as_deref_mut().unwrap()).root, v);\n\
+         \x20   r\n\
+         }\n";
+    rustc_span::create_default_session_globals_then(|| {
+        let mut krate = ::utils::ast::parse_crate(format!("{PRELUDE}{body}"));
+        let key = call_span(&krate, "insert_");
+        // The bracket's move: the call node becomes a wrapper around its clone.
+        struct Wrap((u32, u32));
+        impl MutVisitor for Wrap {
+            fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+                rustc_ast::mut_visit::walk_expr(self, e);
+                if (e.span.lo().0, e.span.hi().0) == self.0 {
+                    let mut wrapper =
+                        super::ast_transform::graft_expr("core::convert::identity(0)").unwrap();
+                    if let rustc_ast::ExprKind::Call(_, args) = &mut wrapper.kind {
+                        args[0] = rustc_ast::ptr::P(e.clone());
+                    }
+                    e.kind = wrapper.kind;
+                }
+            }
+        }
+        Wrap(key).visit_crate(&mut krate);
+        let mut calls = FxHashSet::default();
+        calls.insert(key);
+        let mut guard = Composition::default();
+        let mut visitor = HoistVisitor::new(&calls, &mut guard);
+        visitor.visit_crate(&mut krate);
+        assert_eq!(visitor.finish(), (1, Vec::<&str>::new()));
+        let text = krate
+            .items
+            .iter()
+            .map(|item| pprust::item_to_string(item))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("core::convert::identity({ let __crat_hoist_"),
+            "the wrapper stays outermost: {flat}"
+        );
+    });
+}
