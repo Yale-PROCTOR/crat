@@ -273,7 +273,9 @@ pub unsafe fn top(mut s: *const i8) -> u64 {
 fn held(input: &str) -> Vec<String> {
     ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
         let (_table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx)?;
-        let held = super::thin_extent::collect(tcx, &ctx.facts);
+        let held = super::thin_extent::collect(tcx, &ctx.facts, |function, binding| {
+            ctx.model_raw(function, binding)
+        });
         let mut labels = ctx
             .subjects
             .iter()
@@ -931,4 +933,68 @@ pub unsafe fn widener_n(mut b: *mut u8, mut n: usize) -> u32 {
 "#;
     let map = access_map(input);
     assert!(map.iter().any(|(l, _)| l == "widener_n::b"), "{map:#?}");
+}
+
+/// **Relay 072 (R698-1), binn's 18.** binn's `binn_object_<type>` getters hand
+/// `key` bare to `binn_object_get`, which hands it to `binn_object_get_value`,
+/// which hands it to `SearchForKey`'s `strlen`. `SearchForKey::key` is a
+/// converted slice position (the model calls it `Ref`), so the thin callers'
+/// value reaches the NUL walk through `SearchForKey`'s own slice, not unbridged
+/// — a thin delivery exists (52 delivered the getters' keys thin). The
+/// see-through carries a walk to a caller only through a callee parameter the
+/// model keeps `Raw` (CopyStat's `stat`, CE-D06's `find_local`), so these keys
+/// stay out of the thin-extent set, and a withdrawn family (binn's
+/// `restore-family-interface-path:[186, ..]`) can no longer take them.
+const BINN_KEY: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_camel_case_types)]
+extern "C" {
+    fn strlen(s: *const i8) -> u64;
+    fn strncasecmp(a: *const i8, b: *const i8, n: u64) -> i32;
+}
+unsafe fn SearchForKey(mut p: *mut u8, mut key: *const i8) -> *mut u8 {
+    let mut keylen = strlen(key) as i32;
+    if strncasecmp(p as *mut i8, key, keylen as u64) == 0 as i32 {
+        return p;
+    }
+    0 as *mut u8
+}
+#[no_mangle]
+pub unsafe extern "C" fn binn_object_get_value(mut ptr: *mut u8, mut key: *const i8, mut value: *mut i32) -> i32 {
+    if ptr.is_null() || key.is_null() || value.is_null() {
+        return 0 as i32;
+    }
+    let mut p = SearchForKey(ptr, key);
+    if p.is_null() {
+        return 0 as i32;
+    }
+    *value = *p as i32;
+    1 as i32
+}
+#[no_mangle]
+pub unsafe extern "C" fn binn_object_get(mut ptr: *mut u8, mut key: *const i8, mut pvalue: *mut i32) -> i32 {
+    let mut value: i32 = 0;
+    if binn_object_get_value(ptr, key, &mut value) == 0 as i32 {
+        return 0 as i32;
+    }
+    *pvalue = value;
+    1 as i32
+}
+#[no_mangle]
+pub unsafe extern "C" fn binn_object_int32(mut obj: *mut u8, mut key: *const i8) -> i32 {
+    let mut value: i32 = 0;
+    binn_object_get(obj, key, &mut value);
+    value
+}
+"#;
+
+#[test]
+fn w6l_r072_a_walk_through_a_converted_callee_does_not_hold_its_thin_callers() {
+    let held = held(BINN_KEY);
+    for label in [
+        "binn_object_get_value::key",
+        "binn_object_get::key",
+        "binn_object_int32::key",
+    ] {
+        assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
+    }
 }

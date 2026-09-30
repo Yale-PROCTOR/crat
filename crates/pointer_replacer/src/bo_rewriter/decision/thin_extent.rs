@@ -95,8 +95,15 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// one-element-into-wider guard's (a slice callee, R365-2). **A model-`Raw`
 /// callee does carry it** (Codex 062 finding 1): keeping the callee raw does
 /// not protect a caller that converts, and wave-4's CE-D06 emitted exactly
-/// that, `find(name: &mut i8)` into `find_local`'s `strcmp`.
-pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
+/// that, `find(name: &mut i8)` into `find_local`'s `strcmp`. **Only a
+/// model-`Raw` one does** (relay 072, R698-1): a callee parameter the model
+/// converts takes the caller's value in its own form, so the caller's thin
+/// delivery stands (binn's `binn_object_*::key`).
+pub(crate) fn collect(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    model_raw: impl Fn(LocalDefId, HirId) -> bool,
+) -> FxHashSet<(LocalDefId, HirId)> {
     // The arithmetic gate is a PARAMETER's: its thin callers are the local
     // callee hold's, so the gate is that hold's own arithmetic test (relay 064
     // review: C's `p[0]` in place carries the walk, as the hold exempts it). A
@@ -162,7 +169,14 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(L
                     let Some(param) = params.get(arg.index) else {
                         continue;
                     };
-                    if walked.contains(&(*callee, param.pat.hir_id)) {
+                    // Relay 072 (R698-1): only through a callee parameter the
+                    // model keeps `Raw`. A converted one (a slice position)
+                    // takes the caller's value in its own form, so the thin
+                    // caller's delivery stands (binn's getters' `key`s, whose
+                    // `SearchForKey` is a slice).
+                    if walked.contains(&(*callee, param.pat.hir_id))
+                        && (true || model_raw(*callee, param.pat.hir_id))
+                    {
                         grew |= out.insert((site.caller, root));
                         if carries((site.caller, root)) {
                             grew |= walked.insert((site.caller, root));

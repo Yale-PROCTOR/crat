@@ -7740,7 +7740,9 @@ fn finish_decide<'tcx>(
     // the region bridge's node instead of the call.
     counted_void.retain(|key, _| !void_region.contains_key(key));
     let original_body_adapters = facts.body_adapters.clone();
-    let thin_extent_subjects = decision::thin_extent::collect(tcx, &facts);
+    let thin_extent_subjects = decision::thin_extent::collect(tcx, &facts, |function, binding| {
+        model_keeps_raw(&subjects, &slots, &model, function, binding)
+    });
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.
@@ -10990,6 +10992,16 @@ pub(crate) struct DecideCtx {
 }
 
 impl DecideCtx {
+    /// Relay 072: does the model keep `function`'s binding `Raw` (the
+    /// thin-extent see-through's gate)?
+    pub(crate) fn model_raw(
+        &self,
+        function: rustc_hir::def_id::LocalDefId,
+        binding: rustc_hir::HirId,
+    ) -> bool {
+        model_keeps_raw(&self.subjects, &self.slots, &self.model, function, binding)
+    }
+
     /// The escape records, for the witness that each shape is recognised.
     ///
     /// A test accessor rather than a `pub` field: the production consumer is
@@ -13590,4 +13602,29 @@ fn apply_aliased_storage_withdrawals(
             },
         });
     }
+}
+
+/// Relay 072: the BO model's verdict on `function`'s binding is `Raw`.
+fn model_keeps_raw(
+    subjects: &[decision::Subject],
+    slots: &CrateSlots,
+    model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    function: rustc_hir::def_id::LocalDefId,
+    binding: rustc_hir::HirId,
+) -> bool {
+    subjects
+        .iter()
+        .find(|subject| subject.fn_did == function && subject.hir_id == binding)
+        .is_some_and(|subject| {
+            slots
+                .fn_local_slots
+                .get(&function)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .is_some_and(|slot| {
+                    matches!(
+                        model.get(&SlotRef::Local(function, slot)),
+                        Some(SlotKind::Raw)
+                    )
+                })
+        })
 }
