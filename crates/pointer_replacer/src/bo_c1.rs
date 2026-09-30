@@ -16093,15 +16093,16 @@ fn nb5m_native_round_stats_contract() {
     );
     assert_eq!(commit.dropped_sinks, 0);
     assert_eq!(commit.dropped_sources, 0);
-    // (c) R213-1/R217-2(a) migration: delete-node now commits 11 conflicts with source-retirement
-    // coverage, then the final solve leaks its two
+    // (c) R213-1/R217-2(a) migration: delete-node commits its conflicts with source-retirement
+    // coverage (11 through L01^9; 8 at the L01^11 frame, whose entries carry fewer conflicts into
+    // the commit round), then the final solve leaks its two
     // free sinks. `dropped_sources == 0` here guards the `record_dropped` is_sink split (a regression
     // counting the 2 sinks as sources would make this 2). Genuine source-leak COUNTING
     // (`dropped_sources > 0`) is exercised across the corpus and was verified at the NB5-M parity gate.
     let sink = stats_of(DELETE_NODE_WITNESS);
     assert_eq!(sink.rounds, 2);
-    assert_eq!(sink.commits_conflict, 11);
-    assert_eq!(sink.commits_per_round, vec![11, 0]);
+    assert_eq!(sink.commits_conflict, 8);
+    assert_eq!(sink.commits_per_round, vec![8, 0]);
     assert_eq!(
         sink.dropped_sinks, 2,
         "delete-node leaks its two free sinks"
