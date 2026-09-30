@@ -3514,6 +3514,34 @@ fn w6a_r698_a_field_read_into_an_owning_local_moves() {
         "{}",
         out.artifacts.box_param_receipts
     );
+    // (h) The free is inside a compound next statement, after a read of the
+    // field (Codex, R698-4 review): the read would see the `None` the move
+    // left.
+    let compound = DROP_LOOP
+        .replace(
+            "    while !head.is_null() {\n",
+            "    let mut seen = 0 as ::core::ffi::c_int;\n    while !head.is_null() {\n",
+        )
+        .replace(
+            "        free(head as *mut ::core::ffi::c_void);\n",
+            "        {\n            seen += !(*head).next.is_null() as ::core::ffi::c_int;\n            free(head as *mut ::core::ffi::c_void);\n        }\n",
+        );
+    assert_ne!(compound, DROP_LOOP);
+    let out = linked_list_with(
+        "r698-drop-loop-compound-free",
+        &compound,
+        &[(
+            "drop_0::next",
+            crate::analyses::borrow_ownership::SlotKind::Owning,
+        )],
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-field-move"),
+        "{}",
+        out.artifacts.box_param_receipts
+    );
 }
 
 /// **R698-4 (3) — composed with 128.** O₀'s loop `drop` with a `main` that

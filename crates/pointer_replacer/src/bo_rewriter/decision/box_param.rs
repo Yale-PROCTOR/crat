@@ -2870,8 +2870,8 @@ fn field_move_candidate(
     .then_some((container, field))
 }
 
-/// **R698-4** — the statement right after the `let` that holds `init` frees
-/// `container` (`free(container as ..)`), in the same block.
+/// **R698-4** — the statement right after the `let` that holds `init` is the
+/// call `free(container as ..)`, in the same block.
 fn freed_by_next_statement(
     tcx: TyCtxt<'_>,
     scan: &Scan<'_>,
@@ -2891,7 +2891,12 @@ fn freed_by_next_statement(
         return false;
     };
     let Some(next) = block.stmts.get(position + 1) else { return false };
+    // The statement IS the free call, not a compound one that contains it: a
+    // read of the field ahead of the free would see the `None` the move left.
+    let (rustc_hir::StmtKind::Semi(expr) | rustc_hir::StmtKind::Expr(expr)) = next.kind else {
+        return false;
+    };
     scan.frees
         .iter()
-        .any(|(hir, call, _)| *hir == container && next.span.contains(*call))
+        .any(|(hir, call, _)| *hir == container && *call == expr.span)
 }
