@@ -332,3 +332,23 @@ fn w6l_mask_n1_the_hold_is_kept_only_where_the_root_is_fabricated() {
     );
     assert!(!flat_source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
 }
+
+/// N2 (relay 071; fault FA13f's witness) — a root that is an array start
+/// handed DIRECTLY (`buf.as_ptr()`, R625's `[T; N]`) is a real length: the
+/// reader is released and takes the array's length.
+#[test]
+fn w6l_mask_n2_a_direct_array_start_is_a_real_root() {
+    let input = fixture(
+        r###"
+unsafe fn Reader(data: *const u8, ix: usize, mask: usize, len: usize) -> u8 {
+    *data.offset(len.wrapping_add(ix & mask) as isize)
+}
+pub unsafe fn run(n: usize) -> u8 {
+    let buf: [u8; 4224] = [7; 4224];
+    Reader(buf.as_ptr(), n, 4095, 1)
+}
+"###,
+    );
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(&input);
+    assert_eq!(reason(&rows, "data"), "<emitted>", "{rows:#?}");
+}

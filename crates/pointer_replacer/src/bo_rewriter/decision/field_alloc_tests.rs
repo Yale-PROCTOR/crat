@@ -239,3 +239,216 @@ fn w6l_fa_u_the_use_controls_keep_the_hold() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Every call argument a licence renders a length for: `(caller, argument,
+/// length)`.
+fn lengths(input: &str) -> Vec<(String, String, String)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let licences = Licences::infer(tcx);
+        let functions = tcx
+            .hir_body_owners()
+            .filter(|d| matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Fn))
+            .collect::<Vec<_>>();
+        let facts = super::emitability::collect(tcx, &functions);
+        let mut out = Vec::new();
+        for calls in facts.call_args.values() {
+            for call in calls {
+                for arg in &call.args {
+                    if let Some(length) = licences.length_at(tcx, call.caller, arg.span) {
+                        out.push((
+                            tcx.item_name(call.caller.to_def_id()).to_string(),
+                            flat(
+                                &tcx.sess
+                                    .source_map()
+                                    .span_to_snippet(arg.span)
+                                    .unwrap_or_default(),
+                            ),
+                            length,
+                        ));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    })
+    .expect("fixture compiles")
+}
+
+/// The relay 071 review's licence findings: each variant refuses `buffer_`'s
+/// licence.
+/// - (1) a length written beside only a null pointer write (`resize`);
+/// - (2) a length atom reassigned between the allocation and the length write;
+/// - (3) the allocation stored conditionally before the pointer is derived;
+/// - (4) the length written unconditionally, the pointer conditionally;
+/// - (6) a whole-object write (`*rb = *saved`);
+/// - (7) a stray length write in a closure;
+/// - (10) a signed length field.
+#[test]
+fn w6l_fa_r_the_review_licence_findings_refuse_it() {
+    let mut wrong = Vec::new();
+    for (label, from, to) in [
+        (
+            "(1) null-only resize",
+            "pub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+            "pub unsafe fn Resize(mut rb: *mut RingBuffer, mut n: u32) {\n    if n == 0 as i32 as u32 {\n        (*rb).buffer_ = 0 as *mut u8;\n    }\n    (*rb).cur_size_ = n;\n}\npub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+        ),
+        (
+            "(2) atom reassigned",
+            "unsafe fn RingBufferInitBuffer(buflen: u32, mut rb: *mut RingBuffer) {",
+            "unsafe fn RingBufferInitBuffer(mut buflen: u32, mut rb: *mut RingBuffer) {",
+        ),
+        (
+            "(3) conditional allocation store",
+            "    let ref mut fresh66 = (*rb).data_;\n    *fresh66 = new_data;\n",
+            "    if buflen > 0 as i32 as u32 {\n        let ref mut fresh66 = (*rb).data_;\n        *fresh66 = new_data;\n    }\n",
+        ),
+        (
+            "(4) conditional pointer write",
+            "    let ref mut fresh67 = (*rb).buffer_;\n    *fresh67 = ((*rb).data_).offset(2 as i32 as isize);\n",
+            "    if !new_data.is_null() {\n        let ref mut fresh67 = (*rb).buffer_;\n        *fresh67 = ((*rb).data_).offset(2 as i32 as isize);\n    }\n",
+        ),
+        (
+            "(6) whole-object write",
+            "pub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+            "pub unsafe fn Restore(mut rb: *mut RingBuffer, mut saved: *const RingBuffer) {\n    *rb = core::ptr::read(saved);\n}\npub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+        ),
+        (
+            "(7) stray length in a closure",
+            "pub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+            "pub unsafe fn Poke(mut rb: *mut RingBuffer) {\n    let mut f = || (*rb).cur_size_ = 99 as i32 as u32;\n    f();\n}\npub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
+        ),
+        (
+            "(10) signed length",
+            "    pub cur_size_: u32,",
+            "    pub cur_size_: i32,",
+        ),
+    ] {
+        let mut input = RB.replacen(from, to, 1);
+        if label == "(2) atom reassigned" {
+            input = input.replacen(
+                "    (*rb).cur_size_ = buflen;\n",
+                "    buflen = buflen.wrapping_mul(2 as i32 as u32);\n    (*rb).cur_size_ = buflen;\n",
+                1,
+            );
+        }
+        if label == "(10) signed length" {
+            input = input
+                .replace(
+                    "(*rb).cur_size_ = 0 as i32 as u32;",
+                    "(*rb).cur_size_ = 0 as i32;",
+                )
+                .replace(
+                    "(*rb).cur_size_ = buflen;",
+                    "(*rb).cur_size_ = buflen as i32;",
+                );
+        }
+        assert_ne!(input, RB, "{label}: the variant is in");
+        let got = licences(&input);
+        if got.iter().any(|l| l.pointer == "buffer_") {
+            wrong.push(format!("{label}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// (5) the element type: `n * size_of::<u16>()` over a `*mut u32` holds `n / 2`
+/// elements, not `n` (refused); `size_of::<u32>()` holds `n` (the control).
+#[test]
+fn w6l_fa_r5_the_element_size_is_the_pointee_s() {
+    let words = |t: &str| {
+        format!(
+            r#"
+#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+extern "C" {{
+    fn malloc(n: u64) -> *mut core::ffi::c_void;
+}}
+pub struct Words {{
+    pub w: *mut u32,
+    pub n: u32,
+}}
+pub unsafe fn Init(mut s: *mut Words, mut n: u32) {{
+    (*s).w = malloc((n as u64).wrapping_mul(::std::mem::size_of::<{t}>() as u64)) as *mut u32;
+    (*s).n = n;
+}}
+"#
+        )
+    };
+    assert_eq!(licences(&words("u16")), vec![], "u16 over u32");
+    assert_eq!(
+        licences(&words("u32")),
+        vec![Licence {
+            strukt: "Words".to_owned(),
+            pointer: "w".to_owned(),
+            length: "n".to_owned(),
+            slack: 0,
+        }]
+    );
+}
+
+/// The review's use findings: no length is rendered at `Encode`'s call.
+/// - (5) the argument cast to a wider pointee;
+/// - (6) an inner dereference in the base (`(*(*s).rb).buffer_`);
+/// - (7) a writer reached through a function pointer;
+/// - (8) the local still possibly null at the call.
+#[test]
+fn w6l_fa_s_the_review_use_findings_render_no_length() {
+    let control = lengths(RB);
+    assert!(
+        control
+            .iter()
+            .any(|(caller, arg, _)| caller == "Encode" && arg == "data"),
+        "the control: {control:#?}"
+    );
+    let mut wrong = Vec::new();
+    for (label, from, to) in [
+        (
+            "(5) wider cast",
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}",
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}\nunsafe fn Wide(mut w: *const u32, mut n: u64) -> u32 {\n    *w.offset(n as isize)\n}\npub unsafe fn Encode32(mut s: *mut State) -> u32 {\n    Wide((*s).ringbuffer_.buffer_ as *const u32, 3 as i32 as u64)\n}",
+        ),
+        (
+            "(7) writer through a fn pointer",
+            "    let mut mask = (*s).ringbuffer_.mask_ as u64;\n    Reader(",
+            "    let mut mask = (*s).ringbuffer_.mask_ as u64;\n    let mut grow: unsafe fn(u32, *mut RingBuffer) = RingBufferInitBuffer;\n    grow(64 as i32 as u32, &mut (*s).ringbuffer_);\n    Reader(",
+        ),
+        (
+            "(8) possibly null at the call",
+            "    data = (*s).ringbuffer_.buffer_;\n",
+            "    if (*s).pos > 0 as i32 as u64 {\n        data = (*s).ringbuffer_.buffer_;\n    }\n",
+        ),
+    ] {
+        let input = RB.replacen(from, to, 1);
+        assert_ne!(input, RB, "{label}: the variant is in");
+        let got = lengths(&input);
+        let target = if label.starts_with("(5)") {
+            "Encode32"
+        } else {
+            "Encode"
+        };
+        let bad: Vec<_> = got
+            .iter()
+            .filter(|(caller, arg, _)| {
+                caller == target && (arg == "data" || arg.contains("buffer_"))
+            })
+            .collect();
+        if !bad.is_empty() {
+            wrong.push(format!("{label}: {bad:?}"));
+        }
+    }
+    // (6) an inner dereference: the object is reached through another pointer.
+    let inner = RB
+        .replace(
+            "pub struct State {\n    pub ringbuffer_: RingBuffer,\n    pub pos: u64,\n}",
+            "pub struct State {\n    pub ringbuffer_: RingBuffer,\n    pub pos: u64,\n}\n#[repr(C)]\npub struct Outer {\n    pub rb: *mut RingBuffer,\n}",
+        )
+        .replace(
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}",
+            "    Reader(data, mask, (*s).pos, 16 as i32 as u64)\n}\npub unsafe fn Through(mut o: *mut Outer) -> u32 {\n    Reader((*(*o).rb).buffer_, 4095 as i32 as u64, 0 as i32 as u64, 16 as i32 as u64)\n}",
+        );
+    let got = lengths(&inner);
+    if got.iter().any(|(caller, ..)| caller == "Through") {
+        wrong.push(format!("(6) inner dereference: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
