@@ -175,10 +175,7 @@ fn add_coherence_impl<'tcx>(
     // so the dispatch falls through to the pin's unconditional `equate` — the
     // general equate is restored, never deleted.
     let joint = super::licensing::facts::Pass::current() == super::licensing::facts::Pass::Joint
-        && !super::licensing::facts::repair()
-        // R467-2 diagnosis: `readers` omits era-5b's field-reader / reference-reader
-        // guard maps so their cost can be measured. Verdicts are NOT valid with it on.
-        && !std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default().split(',').any(|s| s.trim() == "readers");
+        && !super::licensing::facts::repair();
     // L01^5 (ii): the strong-update field moves of this body (empty unless the
     // pin is on), consulted just before the pin's unconditional `equate`.
     let field_moves = super::field_moves::compute(body);

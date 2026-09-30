@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub(crate) mod call_reach;
+pub(crate) mod discharge;
 pub(crate) mod field_objects;
 pub(crate) mod inner_loan;
 pub(crate) mod local_outcome;
@@ -71,6 +72,59 @@ pub(crate) struct RetirementConflict {
     pub(crate) loan: Option<LoanIdentity>,
     pub(crate) entry: Option<EntryKey>,
     pub(crate) overlap: OverlapReason,
+}
+
+/// L01¹⁰ (R603-2): a conflict the overlap analysis raised and a discharge
+/// removed; its receipt is counted per program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetirementDischarge {
+    pub(crate) function: LocalDefId,
+    pub(crate) target: SlotRef,
+    pub(crate) target_key: String,
+    pub(crate) source: SourceEventKey,
+    pub(crate) phase: SourcePhase,
+    pub(crate) location: Location,
+    pub(crate) route: Vec<RouteStep>,
+    /// The route's call sites by name, inner to outer, for the receipt.
+    pub(crate) route_names: Vec<String>,
+    pub(crate) rule: discharge::Rule,
+}
+
+impl RetirementDischarge {
+    pub(crate) fn receipt(&self) -> String {
+        let event = format!(
+            "{}:bb{}[{}]:{:?}",
+            self.source.function, self.source.block, self.source.statement, self.source.role
+        );
+        let route = self.route_names.join(" ");
+        match &self.rule {
+            discharge::Rule::PostFreeUse { local } => format!(
+                "retirement-disjoint:post-free-use(event={event}, route=[{route}], target={}, use=_{local})",
+                self.target_key
+            ),
+            // R604-1: every effective-type discharge rests on TypedReleaseDiscipline.
+            // L01¹¹ (β′, R659-1): one the sharpened test alone admits says so.
+            discharge::Rule::EffectiveType {
+                freed,
+                referent,
+                sole,
+            } => format!(
+                "retirement-disjoint:effective-type(P={freed}, T={referent}, event={event}, route=[{route}], target={}, premise=typed-release@R604-1{})",
+                self.target_key,
+                if *sole { ", containment=sole-type" } else { "" }
+            ),
+            // L01¹¹ (γ, R659-1): the released block was allocated inside the route.
+            discharge::Rule::FreshInRoute { allocation } => format!(
+                "retirement-disjoint:fresh-in-route(allocation={allocation}, event={event}, route=[{route}], target={})",
+                self.target_key
+            ),
+            // L01¹¹ (α⁺, R659-1): the referent is used after the release inside the route.
+            discharge::Rule::PostReleaseUseRoute { frame, local } => format!(
+                "retirement-disjoint:post-release-use-route(frame={frame}, use=_{local}, event={event}, route=[{route}], target={})",
+                self.target_key
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +183,8 @@ pub(crate) struct ContextCoverage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetirementReview {
     pub(crate) conflicts: Vec<RetirementConflict>,
+    /// L01¹⁰ (R603-2): conflicts a discharge removed, with their receipts.
+    pub(crate) discharged: Vec<RetirementDischarge>,
     pub(crate) demotions: Vec<local_outcome::Demotion>,
     pub(crate) unresolved: Vec<RetirementUnresolved>,
     pub(crate) coverage: Vec<ContextCoverage>,
@@ -266,6 +322,7 @@ struct Context {
     inner_loans: inner_loan::InnerLoans,
     entry_consistent: bool,
     latest: FxHashMap<LocalDefId, RetirementReview>,
+    discharges: discharge::Discharges,
 }
 
 thread_local! {
@@ -315,6 +372,12 @@ pub(crate) fn begin(
     let entries = protected_entry::current().expect("validated parameter-entry scope");
     let objects = ObjectFacts::analyze(program, slots, &source, origin_flows);
     let routed = routes::expand(program, &source, &objects);
+    let function_names: BTreeMap<String, LocalDefId> = program
+        .functions
+        .iter()
+        .map(|&function| (program.tcx.def_path_str(function), function))
+        .collect();
+    let discharges = discharge::Discharges::analyze(program.tcx, &routed, &function_names);
     let known_stack_entries = super::licensing::reader_replay::selected_owned_cells()
         .map(|(facts, selected)| {
             let mut known = super::licensing::stack_entry::collect_known_stack_entries(
@@ -345,11 +408,7 @@ pub(crate) fn begin(
         fields: FxHashMap::default(),
         refs: FxHashSet::default(),
         known_stack_entries,
-        function_names: program
-            .functions
-            .iter()
-            .map(|&function| (program.tcx.def_path_str(function), function))
-            .collect(),
+        function_names,
         safe_holders: Vec::new(),
         copy_graph: local_outcome::copy_graph(program, slots),
         exact_kinds: exact.is_some(),
@@ -357,6 +416,7 @@ pub(crate) fn begin(
         inner_loans: inner_loan::analyze(program, slots, &is_ref),
         entry_consistent: true,
         latest: FxHashMap::default(),
+        discharges,
     };
     let mut expected_entries = FxHashSet::default();
     for (&function, universe) in &slots.fn_local_slots {
@@ -453,6 +513,85 @@ impl Context {
             ProvenanceOwner::Local(_) => self.locals.get(&(function, owner)).copied(),
             ProvenanceOwner::Field(field) => self.fields.get(&field).copied(),
         }
+    }
+
+    /// L01¹⁰ (R603-2): a would-be conflict of a heap release the overlap
+    /// analysis could not place, offered to the two discharges first. Returns
+    /// whether it was discharged (and receipted).
+    fn try_discharge(
+        &self,
+        review: &mut RetirementReview,
+        event: &FrameEvent,
+        slot: SlotRef,
+        heap_only: bool,
+        reason: OverlapReason,
+        target: discharge::Target<'_>,
+    ) -> bool {
+        if !heap_only || reason == OverlapReason::SameAbstractRoot {
+            return false;
+        }
+        let rule = self.discharges.discharge(event, &target);
+        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+            eprintln!(
+                "E5C discharge-check event={}:bb{}[{}] target={} {} at={:?} route_len={} rule={rule:?}",
+                event.source.key.function,
+                event.source.key.block,
+                event.source.key.statement,
+                self.keys.get(&slot).map_or("?", String::as_str),
+                self.discharges.explain(event, &target),
+                event.location,
+                event.route.len(),
+            );
+        }
+        let Some(rule) = rule else {
+            return false;
+        };
+        self.discharged(review, event, slot, rule);
+        true
+    }
+
+    fn discharged(
+        &self,
+        review: &mut RetirementReview,
+        event: &FrameEvent,
+        target: SlotRef,
+        rule: discharge::Rule,
+    ) {
+        let Some(target_key) = self.keys.get(&target) else {
+            review
+                .unresolved
+                .push(residual(event, UnresolvedReason::MissingSlotKey(target)));
+            return;
+        };
+        let name = |function: LocalDefId| {
+            self.function_names
+                .iter()
+                .find(|(_, f)| **f == function)
+                .map_or_else(|| format!("{function:?}"), |(n, _)| n.clone())
+        };
+        let route_names = event
+            .route
+            .iter()
+            .map(|step| {
+                format!(
+                    "{}:bb{}[{}]",
+                    name(step.caller),
+                    step.location.block.as_u32(),
+                    step.location.statement_index
+                )
+            })
+            .collect();
+        review.discharged.push(RetirementDischarge {
+            function: event.frame,
+            target,
+            target_key: target_key.clone(),
+            source: event.source.key.clone(),
+            phase: event.phase,
+            location: event.location,
+            route: event.route.clone(),
+            route_names,
+            rule,
+        });
     }
 
     fn conflict(
@@ -583,6 +722,18 @@ impl Context {
                 let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
                     continue;
                 };
+                if let Some((_, local)) = owner
+                    && self.try_discharge(
+                        &mut review,
+                        event,
+                        slot,
+                        heap_only,
+                        reason,
+                        discharge::Target::Inner { local, depth },
+                    )
+                {
+                    continue;
+                }
                 let disposition = match owner {
                     Some((_, local)) => {
                         self.inner_loans
@@ -699,7 +850,19 @@ impl Context {
                     EntryMoment::AtEvent,
                 ) {
                     Ok(Some(slot)) if self.refs.contains(&slot) => {
-                        self.conflict(&mut review, event, slot, None, Some(entry.key), reason)
+                        if !self.try_discharge(
+                            &mut review,
+                            event,
+                            slot,
+                            heap_only,
+                            reason,
+                            discharge::Target::Entry {
+                                parameter: entry.key.parameter,
+                                depth: entry.key.depth,
+                            },
+                        ) {
+                            self.conflict(&mut review, event, slot, None, Some(entry.key), reason)
+                        }
                     }
                     Ok(_) => review
                         .unresolved
@@ -759,6 +922,18 @@ impl Context {
                     }
                 }
                 if let Some((_, slot)) = candidates.into_iter().next() {
+                    if self.try_discharge(
+                        &mut review,
+                        event,
+                        slot,
+                        heap_only,
+                        reason,
+                        discharge::Target::Loan {
+                            borrowed: &borrowed,
+                        },
+                    ) {
+                        continue;
+                    }
                     self.conflict(
                         &mut review,
                         event,
@@ -925,6 +1100,7 @@ impl RetirementScope {
             }
             review.ordinary_error_points += latest.ordinary_error_points;
             review.conflicts.append(&mut latest.conflicts);
+            review.discharged.append(&mut latest.discharged);
             review.demotions.append(&mut latest.demotions);
             review.unresolved.append(&mut latest.unresolved);
             review.coverage.append(&mut latest.coverage);

@@ -56,6 +56,8 @@ pub(crate) struct Facts {
     pub(crate) unit_locals: Vec<(String, u32)>,
     pub(crate) reader_inputs: super::readers::Inputs,
     pub(crate) reader_plan: super::readers::Plan,
+    /// L01¹⁰ the lend (era-5c 066, R579-2): empty unless `CRAT_ERA5C_LEND=on`.
+    pub(crate) lend_plan: super::lend::Plan,
     pub(crate) field_support_inputs: super::field_support::Inputs,
     pub(crate) caller_coverage: Option<super::caller_coverage::Coverage>,
     pub(crate) traversal_native: Option<super::traversal_native::Inputs>,
@@ -151,41 +153,6 @@ pub(crate) fn relax_frame() -> bool {
 /// R353-2: the pass is read once. It is process-wide by construction — an
 /// environment pin — and the inference walk asks per statement, which is not a
 /// place to re-read the environment.
-/// R467-2 diagnosis: omit era-5b's per-constant SOURCE registration so its
-/// cost can be measured. Verdicts are NOT valid with it on.
-/// R467-2 diagnosis pins: omit era-5b's joint-gated EMISSION sites in the solver,
-/// split so the guarded-reader family can be separated from the rest.
-/// Verdicts are NOT valid with either on.
-fn skip_family(name: &str) -> bool {
-    std::env::var("CRAT_ERA5C_SKIP_FAMILY")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| {
-            let s = s.trim();
-            s == name || s == "joint_emission"
-        })
-}
-
-pub(crate) fn skip_joint_readers() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| skip_family("joint_readers"))
-}
-
-pub(crate) fn skip_joint_other() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| skip_family("joint_other"))
-}
-
-pub(crate) fn skip_constant_sources() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| {
-        std::env::var("CRAT_ERA5C_SKIP_FAMILY")
-            .unwrap_or_default()
-            .split(',')
-            .any(|s| s.trim() == "constant_sources")
-    })
-}
-
 pub(crate) fn joint() -> bool {
     static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ONCE.get_or_init(|| Pass::current() == Pass::Joint)

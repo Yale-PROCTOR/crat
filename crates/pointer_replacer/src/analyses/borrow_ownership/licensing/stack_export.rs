@@ -168,6 +168,34 @@ pub(crate) fn validate(
     let final_rows = &portable.families[&ExportFamily::RetirementFinal].records;
     let final_row = final_rows.first().ok_or("missing final retirement row")?;
     let empty = serde_json::json!([]);
+    // L01¹⁰ (R603-2): the retirement discharges, as receipts. The final row's
+    // list is the last round's, every receipt names its rule, and an
+    // effective-type discharge names the premise it rests on.
+    let final_discharged = final_row.fields.get("discharged").unwrap_or(&empty);
+    let last_round = portable.families[&ExportFamily::RetirementRounds]
+        .records
+        .iter()
+        .max_by_key(|row| row.fields.get("round").and_then(serde_json::Value::as_u64));
+    if last_round.map_or(&empty, |row| row.fields.get("discharged").unwrap_or(&empty))
+        != final_discharged
+    {
+        return Err("retirement discharge final/round mismatch".into());
+    }
+    for row in final_discharged
+        .as_array()
+        .ok_or("retirement discharges not a list")?
+    {
+        let receipt = row
+            .get("receipt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let well_formed = receipt.starts_with("retirement-disjoint:post-free-use(")
+            || (receipt.starts_with("retirement-disjoint:effective-type(")
+                && receipt.ends_with(", premise=typed-release@R604-1)"));
+        if !well_formed {
+            return Err("malformed retirement discharge receipt".into());
+        }
+    }
     let final_proofs = final_row
         .fields
         .get("known_stack_entries")

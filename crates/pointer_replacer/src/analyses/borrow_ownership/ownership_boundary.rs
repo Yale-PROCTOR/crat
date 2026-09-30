@@ -255,6 +255,34 @@ pub(crate) enum LicensingRole {
     Borrowed,
     OriginalCell,
     TraversalBorrow,
+    /// L01¹⁰ the lend (era-5c 066 / the record 2026-09-27-lend-interior-window,
+    /// R590-5): component 0 of the formal window is lent (the caller's frame, a
+    /// zero view in the callee); every interior component takes the ordinary
+    /// call equalities. Never a reader's call, which stays `Borrowed`.
+    Lent,
+}
+
+impl Substitution {
+    /// Whether matched pair `index` is lent: every pair of a reader's `Borrowed`
+    /// row; only the container pair (component 0) of a `Lent` row.
+    pub(crate) fn lends_pair(&self, index: usize) -> bool {
+        match self.licensing_role {
+            LicensingRole::Borrowed => true,
+            LicensingRole::Lent => self.is_container_pair(index),
+            _ => false,
+        }
+    }
+
+    /// The matched pair whose formal is the first var of the formal window.
+    pub(crate) fn is_container_pair(&self, index: usize) -> bool {
+        let Availability::Present(Window::UseDef { use_start, .. }) = &self.formal else {
+            return false;
+        };
+        matches!(
+            self.matched.get(index),
+            Some(Matched { formal: Variables::UseDef { use_var, .. }, .. }) if use_var == use_start
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -345,6 +373,12 @@ pub(crate) fn traversal_borrow(recording: &mut Option<Recording>) {
 pub(crate) fn borrowed(recording: &mut Option<Recording>) {
     if let Some(recording) = recording {
         recording.0.licensing_role = LicensingRole::Borrowed;
+    }
+}
+
+pub(crate) fn lent(recording: &mut Option<Recording>) {
+    if let Some(recording) = recording {
+        recording.0.licensing_role = LicensingRole::Lent;
     }
 }
 
@@ -750,7 +784,40 @@ pub(crate) fn validate_links(
                 return Err("borrowed call lost full frame or zero-view obligations".into());
             }
         }
-        for pair in &row.matched {
+        if row.licensing_role == LicensingRole::Lent {
+            // The container (component 0) is framed and zero; an interior
+            // component is never zeroed (R590-5 L-B).
+            let (
+                Present(Window::UseDef {
+                    use_start: a0,
+                    def_start: a2,
+                    ..
+                }),
+                Present(Window::UseDef {
+                    use_start: p0,
+                    use_end: p1,
+                    def_start: p2,
+                    def_end: p3,
+                }),
+            ) = (&row.actual, &row.formal)
+            else {
+                return Err("lent call needs actual and formal windows".into());
+            };
+            if row.reference_peel.is_some()
+                || !has(&row.point, "equal", &[*a0, *a2], None)
+                || !has(&row.point, "assume", &[*p0], Some(false))
+                || !has(&row.point, "assume", &[*p2], Some(false))
+            {
+                return Err("lent call lost its container frame or zero view".into());
+            }
+            if (*p0 + 1..*p1)
+                .chain(*p2 + 1..*p3)
+                .any(|var| has(&row.point, "assume", &[var], Some(false)))
+            {
+                return Err("lent call zeroes an interior component".into());
+            }
+        }
+        for (index, pair) in row.matched.iter().enumerate() {
             let supported = match (row.role, &pair.actual, &pair.formal) {
                 (
                     Role::Entry | Role::ExitReturn | Role::ExitOutput,
@@ -802,7 +869,7 @@ pub(crate) fn validate_links(
                             &[*formal_use, *actual_use, *formal_def, *actual_def],
                             None,
                         )
-                    } else if row.licensing_role == LicensingRole::Borrowed {
+                    } else if row.lends_pair(index) {
                         has(&row.point, "equal", &[*actual_use, *actual_def], None)
                             && has(&row.point, "assume", &[*formal_use], Some(false))
                             && has(&row.point, "assume", &[*formal_def], Some(false))

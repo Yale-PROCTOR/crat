@@ -45,6 +45,56 @@ pub(crate) struct WitnessedConflictEdge {
     pub(crate) invalidators: Vec<Local>,
 }
 
+thread_local! {
+    /// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own
+    /// replay -- per function, each returned edge's invalidating access roots,
+    /// in the edges' order (a parameter edge has none). `None`: not recording.
+    static EDGE_INVALIDATORS: std::cell::RefCell<Option<FxHashMap<LocalDefId, Vec<Vec<Local>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `replay` recording each edge's invalidators, as the L2 capture keeps
+/// them (the accesses behind the error rows that made the loan invalid).
+/// Observation only: the replay's facts and edges are unchanged.
+pub(crate) fn recording_edge_invalidators<R>(
+    replay: impl FnOnce() -> R,
+) -> (R, FxHashMap<LocalDefId, Vec<Vec<Local>>>) {
+    EDGE_INVALIDATORS.with(|capture| *capture.borrow_mut() = Some(FxHashMap::default()));
+    let out = replay();
+    let captured = EDGE_INVALIDATORS
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (out, captured)
+}
+
+/// The invalidators of each invalid loan, in `invalid_loans`' order (the order
+/// `extract_conflict_edges` emits its edges in), kept to the accesses at an
+/// error row of that loan.
+fn edge_invalidators(
+    inference: &NativeInference<'_>,
+    invalid_loans: &DenseBitSet<Loan>,
+    accesses: Vec<super::invalidates::InvalidationAccess>,
+) -> Vec<Vec<Local>> {
+    let mut by_loan: FxHashMap<Loan, Vec<Local>> = FxHashMap::default();
+    for access in accesses {
+        if inference
+            .facts
+            .errors
+            .row(access.point)
+            .is_some_and(|loans| loans.contains(access.loan))
+        {
+            by_loan
+                .entry(access.loan)
+                .or_default()
+                .push(access.accessor);
+        }
+    }
+    invalid_loans
+        .iter()
+        .map(|loan| by_loan.remove(&loan).unwrap_or_default())
+        .collect()
+}
+
 /// The 3a fork seam. Run production `borrow_inference` for every fact, then REPLACE `invalidates`
 /// + `errors` with the BO engine's. At 3a the BO `invalidates` is a byte-identical copy, so the
 /// replacement is a no-op on behavior (the equivalence gate). At 3b `invalidates` becomes
@@ -57,10 +107,43 @@ fn overwrite_with_engine_facts<'tcx>(
     copy_lends: &DenseBitSet<Loan>,
     parameter_overlap: Option<&ParameterOverlap>,
 ) -> Vec<(Local, Local)> {
+    overwrite_with_engine_facts_recording(
+        tcx,
+        f,
+        ctxt,
+        inference,
+        copy_lends,
+        parameter_overlap,
+        None,
+    )
+}
+
+/// era-5c L01¹¹ (R668-4): the seam above, with every invalidation's accessor
+/// recorded into `accesses` when it is given (the raw-cause ledger's capture).
+/// The facts are the seam's own either way.
+fn overwrite_with_engine_facts_recording<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    f: LocalDefId,
+    ctxt: &GBorrowInferCtxt,
+    inference: &mut BorrowInferenceResults<'tcx>,
+    copy_lends: &DenseBitSet<Loan>,
+    parameter_overlap: Option<&ParameterOverlap>,
+    accesses: Option<&mut Vec<super::invalidates::InvalidationAccess>>,
+) -> Vec<(Local, Local)> {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
     let provenance_set = ctxt.provenances.get(&f).unwrap();
-    let (invalidates, parameter_conflicts) = match parameter_overlap {
-        Some(parameter_overlap) => {
+    let (invalidates, parameter_conflicts) = match (accesses, parameter_overlap) {
+        (Some(accesses), parameter_overlap) => super::invalidates::compute_invalidates_recording(
+            tcx,
+            body,
+            &inference.borrow_set,
+            provenance_set,
+            &inference.location_map,
+            copy_lends,
+            parameter_overlap,
+            accesses,
+        ),
+        (None, Some(parameter_overlap)) => {
             super::invalidates::compute_invalidates_with_copy_lends_and_parameter_overlap(
                 tcx,
                 body,
@@ -71,7 +154,7 @@ fn overwrite_with_engine_facts<'tcx>(
                 parameter_overlap,
             )
         }
-        None => (
+        (None, None) => (
             super::invalidates::compute_invalidates_with_copy_lends(
                 tcx,
                 body,
@@ -1093,6 +1176,7 @@ where
 
     let mut out = FxHashMap::default();
     let no_copy_lends = FxHashSet::default();
+    let recording = EDGE_INVALIDATORS.with(|capture| capture.borrow().is_some());
     for f in program.functions.iter().copied() {
         let is_ref_f = is_ref(f);
         let is_raw_f = is_raw(f);
@@ -1116,13 +1200,15 @@ where
         let edges = loop {
             let mut inference =
                 ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
-            let parameter_conflicts = overwrite_with_engine_facts(
+            let mut accesses = Vec::new();
+            let parameter_conflicts = overwrite_with_engine_facts_recording(
                 program.tcx,
                 f,
                 &ctxt.borrow,
                 &mut inference.facts,
                 &inference.copy_lends,
                 parameter_overlaps.and_then(|overlaps| overlaps.get(&f)),
+                recording.then_some(&mut accesses),
             );
             record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
             let parameter_edges = parameter_conflicts
@@ -1181,6 +1267,16 @@ where
                     &inference.copy_lends,
                 );
                 let mut edges = extract_conflict_edges(&inference, provenance_set, &invalid_loans);
+                if recording {
+                    // One edge per invalid loan, then the parameter edges (no loan).
+                    let mut invalidators = edge_invalidators(&inference, &invalid_loans, accesses);
+                    invalidators.resize(edges.len() + parameter_edges.len(), Vec::new());
+                    EDGE_INVALIDATORS.with(|capture| {
+                        if let Some(captured) = capture.borrow_mut().as_mut() {
+                            captured.insert(f, invalidators);
+                        }
+                    });
+                }
                 edges.extend(parameter_edges);
                 break edges;
             }

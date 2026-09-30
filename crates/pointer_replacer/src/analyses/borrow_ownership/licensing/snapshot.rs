@@ -256,6 +256,10 @@ pub(crate) struct Snapshot {
     pub(crate) reader_transfers: Vec<super::readers::TransferProof>,
     pub(crate) field_support: Vec<super::field_support::FieldProof>,
     pub(crate) reference_effects: super::ref_effects::Plan,
+    /// L01¹⁰ the lend (era-5c 066): recorded, since it is computed from MIR and
+    /// not from the recorded occurrences; absent with the arm off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lend_plan: Option<super::lend::Plan>,
 }
 
 impl Metadata {
@@ -342,13 +346,16 @@ impl Snapshot {
             reader_transfers: frozen.reader_transfers.clone(),
             field_support: frozen.field_support.clone(),
             reference_effects: frozen.reference_effects.clone(),
+            lend_plan: (super::lend::lend() && !super::lend::w64_fault("drop-plan"))
+                .then(|| facts.lend_plan.clone()),
         })
     }
 
     /// Recompute all transport from recorded metadata, with no AST or solver.
     pub(crate) fn validate(&self) -> Result<(), String> {
         use std::collections::BTreeSet;
-        let facts = self.metadata.facts();
+        let mut facts = self.metadata.facts();
+        facts.lend_plan = self.lend_plan.clone().unwrap_or_default();
         if super::caller_coverage::assess(&facts) != self.caller_coverage {
             return Err(
                 "caller-coverage status differs from recorded compiler/source observations".into(),

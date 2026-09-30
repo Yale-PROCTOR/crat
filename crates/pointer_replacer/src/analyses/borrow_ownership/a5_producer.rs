@@ -52,6 +52,8 @@ pub(crate) struct A5ProducerStats {
     pub(crate) effective_pairs: usize,
     pub(crate) planned_marks: usize,
     pub(crate) missing_mutability_defaults: usize,
+    /// R609-3 (b): pairs the type route removed (`CRAT_ERA5C_OVERLAP_TYPE_ROUTE`).
+    pub(crate) type_disjoint_pairs: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,8 @@ pub(crate) struct A5Plan {
     pub(crate) site_ledger: Vec<A5ProductionSiteRow>,
     pub(crate) summary_artifact: A5SummaryArtifact,
     pub(crate) stats: A5ProducerStats,
+    /// R609-3 (b): `overlap-partner-disjoint:type-rule(…)`, one per removed pair.
+    pub(crate) type_disjoint: Vec<String>,
 }
 
 impl A5Plan {
@@ -88,6 +92,7 @@ impl A5Plan {
             site_ledger: Vec::new(),
             summary_artifact: render_summary_artifact(&fixpoint, A5Mode::Baseline, &guard),
             stats: A5ProducerStats::default(),
+            type_disjoint: Vec::new(),
         }
     }
 
@@ -757,6 +762,29 @@ fn actual_slot<'tcx>(
     }
 }
 
+/// `overlap-partner-disjoint:type-rule(…)` when the two formals' pointees are
+/// disjoint by the type rule (`retirement::discharge::disjoint_pointees`).
+fn type_disjoint_receipt(
+    tcx: TyCtxt<'_>,
+    target: LocalDefId,
+    left: u32,
+    right: u32,
+) -> Option<String> {
+    let body = tcx.mir_drops_elaborated_and_const_checked(target).borrow();
+    let pointee = |local: u32| {
+        body.local_decls
+            .get(Local::from_u32(local))?
+            .ty
+            .builtin_deref(true)
+    };
+    let (p, q) =
+        super::retirement::discharge::disjoint_pointees(tcx, pointee(left)?, pointee(right)?)?;
+    Some(format!(
+        "overlap-partner-disjoint:type-rule(function={}, left=_{left}, right=_{right}, P_left={p}, P_right={q})",
+        tcx.def_path_str(target.to_def_id())
+    ))
+}
+
 fn type_filters(
     tcx: TyCtxt<'_>,
     targets: &[LocalDefId],
@@ -1075,6 +1103,8 @@ pub(crate) fn produce_a5_plan(
     let fixpoint = solve_may_overlap(transfers);
     let mut overlap_pairs = FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
     let mut coarse = BTreeMap::<(SlotKey, SlotKey), (SlotRef, SlotRef)>::new();
+    let type_route = super::field_moves::overlap_type_route();
+    let mut type_disjoint = Vec::new();
     let mut planned = Vec::new();
     let mut site_classes = BTreeMap::<
         (u32, MirLocationKey, u32, u32, u32, SlotKey, SlotKey),
@@ -1112,6 +1142,24 @@ pub(crate) fn produce_a5_plan(
                 .push(witness.class);
         }
         stats.raw_pairs += 1;
+        // R609-3 (b), under R542: formals whose pointees are incompatible object
+        // types, neither containing the other by value, cannot overlap. The pair
+        // is neither an effective overlap nor a coarse exclusion nor a mark.
+        if type_route
+            && let Some(receipt) = type_disjoint_receipt(
+                tcx,
+                witnesses[0].target,
+                pair.params().first(),
+                pair.params().second(),
+            )
+        {
+            stats.type_disjoint_pairs += 1;
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!("E5C type-disjoint {receipt}");
+            }
+            type_disjoint.push(receipt);
+            continue;
+        }
         let class = join_record_classes(&witnesses);
         let discharged = matches!(class, WitnessMutability::MutReadOnly { .. })
             && witnesses.iter().all(|witness| witness.class == class)
@@ -1187,6 +1235,7 @@ pub(crate) fn produce_a5_plan(
         site_ledger,
         summary_artifact,
         stats,
+        type_disjoint,
     })
 }
 

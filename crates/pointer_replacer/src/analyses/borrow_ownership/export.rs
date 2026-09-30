@@ -558,6 +558,10 @@ pub(crate) struct BoExport {
     /// obligations (design record §3.3). In-process only: not in the portable
     /// export or the cache entry until the seat rules on the schema.
     pub(crate) move_store_obligations: Option<Vec<super::move_store::MoveStoreObligation>>,
+    /// L01¹¹ (R659-1; wave-5d 133 STOP 2): the final round's arm-(a) applications, one per
+    /// (call, lent pointer); `None` when `CRAT_ERA5C_ARG_ORDER` is off. The rewriter's hoist
+    /// (`arg_order_hoists`) keys them by the call's span, caller and lent local.
+    pub(crate) arg_order_applied: Option<Vec<ArgOrderApplied>>,
     /// E-R3 selector provenance, index-aligned with `Selectors`.
     pub source_sites: Vec<SelectorSite>,
     pub sink_sites: Vec<SelectorSite>,
@@ -1040,6 +1044,31 @@ pub(crate) fn begin_round() {
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
         export.move_store_obligations = None;
+        export.arg_order_applied = super::field_moves::arg_order().then(Vec::new);
+    });
+}
+
+/// One arm-(a) application (R609-3 (a)): at `location` (the receiving call) in
+/// `function`, a read of the argument list was not an invalidation of the loan
+/// on `*lent`, whose reborrow `owner` the call receives. The emission owes the
+/// hoist of that read above the reborrow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArgOrderApplied {
+    pub(crate) function: LocalDefId,
+    pub(crate) location: Location,
+    pub(crate) span: rustc_span::Span,
+    pub(crate) lent: Local,
+    pub(crate) owner: Local,
+}
+
+/// L01¹¹: record an arm-(a) application in the current round, once.
+pub(crate) fn record_arg_order_applied(row: ArgOrderApplied) {
+    record(|export| {
+        if let Some(rows) = export.arg_order_applied.as_mut()
+            && !rows.contains(&row)
+        {
+            rows.push(row);
+        }
     });
 }
 

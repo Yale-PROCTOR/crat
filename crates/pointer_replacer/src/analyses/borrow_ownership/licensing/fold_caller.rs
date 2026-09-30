@@ -863,7 +863,7 @@ pub(crate) fn returned_token(
                 && row.callee.as_deref() == Some(call.callee.as_str())
                 && !matches!(
                     row.licensing_role,
-                    LicensingRole::Borrowed | LicensingRole::TraversalBorrow
+                    LicensingRole::Borrowed | LicensingRole::TraversalBorrow | LicensingRole::Lent
                 )
                 && matches!(row.actual_occurrence, Present(_))
         })

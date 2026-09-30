@@ -174,12 +174,11 @@ impl ValueOrigins {
                 Evidence::Boundary {
                     construction,
                     ordinal,
-                    ..
+                    matched,
                 } => {
                     let Some(row) = boundaries.get(&(construction, ordinal)) else { continue };
                     if matches!(row.role, Role::CallArgument | Role::ReturnReceiver)
-                        && row.licensing_role
-                            != super::super::ownership_boundary::LicensingRole::Borrowed
+                        && !row.lends_pair(matched)
                     {
                         continue;
                     }
@@ -339,7 +338,11 @@ impl ValueOrigins {
                     // TraversalBorrow retains the authenticated legacy MAY
                     // substitution. Its true caller-local frame arrives through
                     // the graph; a held candidate creates no returned Borrow atom.
-                    for pair in &row.matched {
+                    for (index, pair) in row.matched.iter().enumerate() {
+                        // L01¹⁰: a Lent row's container pair is framed, not a port.
+                        if row.lends_pair(index) {
+                            continue;
+                        }
                         match (&pair.formal, &pair.actual) {
                             (
                                 Variables::UseDef {

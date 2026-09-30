@@ -159,6 +159,52 @@ pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
         None,
         Some(&mut parameter_accesses),
     );
+    let conflicts = parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap);
+    (invalidates, conflicts)
+}
+
+/// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own replay.
+/// The invalidation matrix and the parameter conflicts are computed exactly as
+/// the two entry points above compute them; every insertion's accessor is also
+/// recorded, write-only, as the L2 capture records it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_invalidates_recording<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
+    parameter_overlap: Option<&ParameterOverlap>,
+    accesses: &mut Vec<InvalidationAccess>,
+) -> (Invalidates, Vec<(Local, Local)>) {
+    let mut parameter_accesses = Vec::new();
+    let invalidates = compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        copy_lends,
+        parameter_overlap,
+        Some(accesses),
+        parameter_overlap.map(|_| &mut parameter_accesses),
+    );
+    let conflicts = match parameter_overlap {
+        Some(parameter_overlap) => {
+            parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap)
+        }
+        None => Vec::new(),
+    };
+    (invalidates, conflicts)
+}
+
+fn parameter_conflict_pairs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    parameter_accesses: &[ParameterAccess<'tcx>],
+    parameter_overlap: &ParameterOverlap,
+) -> Vec<(Local, Local)> {
     let mut conflicts = BTreeSet::new();
     for (offset, left) in parameter_accesses.iter().enumerate() {
         for right in &parameter_accesses[offset + 1..] {
@@ -183,7 +229,7 @@ pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
             ));
         }
     }
-    (invalidates, conflicts.into_iter().collect())
+    conflicts.into_iter().collect()
 }
 
 fn compute_invalidates_inner<'tcx>(
@@ -222,6 +268,7 @@ fn compute_invalidates_inner<'tcx>(
         },
         routing_enabled,
         deferring_from: None,
+        receiving: None,
     }
     .visit_body(body);
 
@@ -379,6 +426,10 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     /// terminator, the statement it was deferred from — its own loans are not
     /// invalidated by their own issuing read.
     deferring_from: Option<Location>,
+    /// L01¹⁰ (R609-3 (a), `CRAT_ERA5C_ARG_ORDER`): while a call's pure-read
+    /// operand is consumed, the locals that same call receives -- a read its
+    /// argument list makes counts as made before their reborrows.
+    receiving: Option<Vec<Local>>,
 }
 
 /// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
@@ -512,6 +563,35 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 if self.deferring_from == Some(borrow_data.location()) {
                     continue; // era-5c: a deferred read does not invalidate its own loan
                 }
+                // R609-3 (a): a read in the argument list of the call that
+                // receives the reborrow is hoisted above it by the emission side,
+                // when only pure reads lie between the reborrow and the call.
+                if kind == AccessKind::Read
+                    && let Some(passed) = &self.receiving
+                    && let Borrower::Assign(ProvenanceOwner::Local(owner)) = borrow_data.assigned
+                    && passed.contains(&owner)
+                    && crate::analyses::borrow_ownership::null_paths::pure_reads_until_call(
+                        self.body,
+                        borrow_data.location(),
+                        location,
+                    )
+                {
+                    // L01¹¹ (R659-1): the receipt the emission's hoist keys on.
+                    let span = match &self.body.basic_blocks[location.block].terminator().kind {
+                        TerminatorKind::Call { fn_span, .. } => *fn_span,
+                        _ => self.body.source_info(location).span,
+                    };
+                    crate::analyses::borrow_ownership::export::record_arg_order_applied(
+                        crate::analyses::borrow_ownership::export::ArgOrderApplied {
+                            function: self.body.source.def_id().expect_local(),
+                            location,
+                            span,
+                            lent: borrow_data.borrowed.local,
+                            owner,
+                        },
+                    );
+                    continue;
+                }
                 let copy_lend_write = kind == AccessKind::Write && self.copy_lends.contains(loan);
                 if !copy_lend_write
                     && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
@@ -528,6 +608,14 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     PlaceConflictBias::Overlap,
                     self.parameter_overlap,
                 ) {
+                    // era-5c (debug only): the access that invalidates a loan.
+                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                        eprintln!(
+                            "E5C invalidating-access direct at={location:?} place={place:?} kind={kind:?} depth={access_depth:?} loan={loan:?} borrowed={:?} via_overlap_partner={}",
+                            borrow_data.borrowed,
+                            candidate_base != place.local
+                        );
+                    }
                     self.insert_invalidation(point_index, loan, place.local);
                 }
             }
@@ -630,6 +718,13 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         self.parameter_overlap,
                     ) {
                         let accessor = if copy_lends_only { base } else { place.local };
+                        // era-5c (debug only): the access that invalidates a loan.
+                        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                            eprintln!(
+                                "E5C invalidating-access routed at={location:?} place={place:?} routed={routed:?} kind={kind:?} loan={loan:?} borrowed={:?}",
+                                borrow_data.borrowed
+                            );
+                        }
                         self.insert_invalidation(point_index, loan, accessor);
                     }
                 }
@@ -733,7 +828,20 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 ) {
                     Some(terminator) => {
                         self.deferring_from = Some(location);
+                        // R609-3 (a): a deferred argument read is a read of the
+                        // receiving call's argument list.
+                        if crate::analyses::borrow_ownership::field_moves::arg_order()
+                            && let TerminatorKind::Call { args, .. } =
+                                &self.body.basic_blocks[location.block].terminator().kind
+                        {
+                            self.receiving = Some(
+                                args.iter()
+                                    .filter_map(|arg| arg.node.place().and_then(|p| p.as_local()))
+                                    .collect(),
+                            );
+                        }
                         self.consume_rvalue(terminator, rhs);
+                        self.receiving = None;
                         self.deferring_from = None;
                     }
                     None => self.consume_rvalue(location, rhs),
@@ -810,11 +918,25 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
             } => {
                 self.consume_operand(location, func, AccessKind::Read);
                 let copy_lend_deallocator = exact_foreign_sink(func, self.body, self.tcx);
+                // R609-3 (a): the locals this call receives, for its other operands' reads.
+                let passed: Vec<Local> =
+                    if crate::analyses::borrow_ownership::field_moves::arg_order() {
+                        args.iter()
+                            .filter_map(|arg| arg.node.place().and_then(|p| p.as_local()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 for arg in args {
                     // §NB4-4a-ii: labeled `Read` here; 4a-ii's GATING commit refines the arg
                     // access by the callee's effect class (a `no-access` callee gets a SHALLOW
                     // access instead of this blanket `Deep` one).
+                    let own = arg.node.place().and_then(|p| p.as_local());
+                    if !passed.is_empty() && own.is_none_or(|local| !passed.contains(&local)) {
+                        self.receiving = Some(passed.clone());
+                    }
                     self.consume_operand(location, &arg.node, AccessKind::Read);
+                    self.receiving = None;
                 }
                 if copy_lend_deallocator
                     && let Some(arg0) = args.first()

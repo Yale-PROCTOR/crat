@@ -608,6 +608,46 @@ pub(crate) fn deferred_argument_read<'tcx>(
     })
 }
 
+/// R609-3 (a): `reservation` is a statement of `call`'s block and every
+/// statement after it, up to the call, is a pure read (a fresh local written by a
+/// non-writing rvalue, or a storage marker) -- so a read of the call's argument
+/// list can be hoisted above the reservation without reading a stale value.
+pub(crate) fn pure_reads_until_call(
+    body: &Body<'_>,
+    reservation: rustc_middle::mir::Location,
+    call: rustc_middle::mir::Location,
+) -> bool {
+    if reservation.block != call.block {
+        return false;
+    }
+    let data = &body.basic_blocks[call.block];
+    if reservation.statement_index >= data.statements.len()
+        || call.statement_index != data.statements.len()
+    {
+        return false;
+    }
+    data.statements[reservation.statement_index + 1..]
+        .iter()
+        .all(|later| match &later.kind {
+            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
+                true
+            }
+            StatementKind::Assign(assign) => {
+                let (dst, rvalue) = &**assign;
+                dst.as_local().is_some()
+                    && matches!(
+                        rvalue,
+                        Rvalue::Use(_)
+                            | Rvalue::Cast(..)
+                            | Rvalue::UnaryOp(..)
+                            | Rvalue::BinaryOp(..)
+                            | Rvalue::CopyForDeref(_)
+                    )
+            }
+            _ => false,
+        })
+}
+
 fn operand_reads_other(operand: &Operand<'_>, temp: Local) -> bool {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place.local != temp,

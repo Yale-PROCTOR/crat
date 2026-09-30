@@ -215,12 +215,60 @@ where 'tcx: 'infercx
                 let crate::analyses::borrow_ownership::Param::Output(output_param) = param else {
                     unreachable!("B4: call args are always Param::Output");
                 };
-                let borrowed = crate::analyses::borrow_ownership::licensing::facts::read(|facts| {
-                    facts
-                        .reader_plan
-                        .borrows_parameter(&infer_cx.tcx.def_path_str(callee), index)
-                })
-                .unwrap_or(false);
+                use crate::analyses::borrow_ownership::licensing::lend;
+                let (borrowed, lent) =
+                    crate::analyses::borrow_ownership::licensing::facts::read(|facts| {
+                        let callee = infer_cx.tcx.def_path_str(callee);
+                        let reader = facts.reader_plan.borrows_parameter(&callee, index);
+                        // L01¹⁰ (era-5c 071, R590-5): a lendable formal is lent --
+                        // component 0 only; a reader's call keeps the whole window.
+                        let lent = !reader
+                            && !is_ref
+                            && (facts.lend_plan.lends(&callee, index) || lend::fault("lend-all"));
+                        (reader, lent)
+                    })
+                    .unwrap_or((false, false));
+                // W64's faults: the 070 full-window lend (W64a's RED), an interior
+                // zero and a missing interior equality (W64e, the validator's REDs).
+                let full_window = lent && lend::w64_fault("full-window");
+                let container = lent.then(|| (output_param.r#use.start, output_param.def.start));
+                if lent {
+                    ownership_boundary::lent(&mut argument_record);
+                    if let (Some(before), Some(after)) =
+                        (arg.r#use.clone().next(), arg.def.clone().next())
+                    {
+                        infer_cx.database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), before, after);
+                    }
+                    infer_cx
+                        .database
+                        .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            output_param.r#use.start,
+                            false,
+                        );
+                    infer_cx
+                        .database
+                        .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            output_param.def.start,
+                            false,
+                        );
+                    if full_window || lend::w64_fault("interior-zero") {
+                        for var in output_param
+                            .r#use
+                            .clone()
+                            .skip(1)
+                            .chain(output_param.def.clone().skip(1))
+                        {
+                            infer_cx.database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), var, false);
+                        }
+                    }
+                    if full_window {
+                        for (before, after) in arg.r#use.clone().zip(arg.def.clone()).skip(1) {
+                            infer_cx.database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), before, after);
+                        }
+                    }
+                }
                 if borrowed {
                     ownership_boundary::borrowed(&mut argument_record);
                     // The full actual window is retained, including precision
@@ -250,6 +298,15 @@ where 'tcx: 'infercx
                 let ty = if is_ref {
                     let skipped = output_param.next().unwrap();
                     ownership_boundary::peel(&mut argument_record, &skipped);
+                    // L01¹¹ (R645-2, era-5c 086): the peeled outer component is the
+                    // formal pointer itself, a view of the actual's place; nothing
+                    // else constrains it, so without this law Owning could appear
+                    // at the formal from no source.
+                    if crate::analyses::borrow_ownership::field_moves::ref_peel_zero() {
+                        for var in [skipped.r#use, skipped.def] {
+                            infer_cx.database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), var, false);
+                        }
+                    }
                     ty.builtin_deref(true).unwrap()
                 } else {
                     ty
@@ -278,6 +335,19 @@ where 'tcx: 'infercx
                             return;
                         }
                         if borrowed {
+                            return;
+                        }
+                        if let Some((container_use, container_def)) = container {
+                            // The container pair is lent; an interior pair takes the
+                            // ordinary equalities (R590-5; the record §2).
+                            if (param.r#use, param.def) == (container_use, container_def)
+                                || full_window
+                                || lend::w64_fault("no-interior-equal")
+                            {
+                                return;
+                            }
+                            database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), param.r#use, arg.r#use);
+                            database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), param.def, arg.def);
                             return;
                         }
                         if ownership_boundary::preview(&argument_record)

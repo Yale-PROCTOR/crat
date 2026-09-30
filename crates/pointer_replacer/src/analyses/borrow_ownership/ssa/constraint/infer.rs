@@ -558,9 +558,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 if let Some(lhs_consume) =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
-                    if crate::analyses::borrow_ownership::licensing::facts::joint()
-                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
-                    {
+                    if crate::analyses::borrow_ownership::licensing::facts::joint() {
                         Infer::constant_source(
                             infer_cx,
                             lhs_consume,
@@ -586,9 +584,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     if matches!(operand, Operand::Constant(_)) {
-                        if crate::analyses::borrow_ownership::licensing::facts::joint()
-                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
-                    {
+                        if crate::analyses::borrow_ownership::licensing::facts::joint() {
                             Infer::constant_source(
                                 infer_cx,
                                 lhs_consume,
@@ -634,9 +630,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
-                    if crate::analyses::borrow_ownership::licensing::facts::joint()
-                        && !crate::analyses::borrow_ownership::licensing::facts::skip_constant_sources()
-                    {
+                    if crate::analyses::borrow_ownership::licensing::facts::joint() {
                         Infer::constant_source(
                             infer_cx,
                             lhs_consume,

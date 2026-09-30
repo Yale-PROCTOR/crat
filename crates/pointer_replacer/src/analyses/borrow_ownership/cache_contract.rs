@@ -472,20 +472,6 @@ pub(crate) fn stage_streamed(
         payload: payload.finish(),
         exports: export_hash.finish(),
     });
-    // R473-4: the byte-identity proof for design (A). Diagnosis print only.
-    if std::env::var_os("CRAT_ERA5C_PROFILE").is_some()
-        && let Some(h) = &staged.hashes
-    {
-        eprintln!(
-            "E5C_ENTRY_DIGEST entry={} payload={} exports={} bytes={}",
-            h.entry,
-            h.payload,
-            h.exports,
-            std::fs::metadata(&staged.path)
-                .map(|m| m.len())
-                .unwrap_or(0)
-        );
-    }
     Ok(staged)
 }
 

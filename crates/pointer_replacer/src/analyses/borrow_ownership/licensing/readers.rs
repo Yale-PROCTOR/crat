@@ -114,16 +114,23 @@ pub(crate) fn validate_call_roles(facts: &super::facts::Facts) -> Result<(), Str
                 && row.variables == [var]
         })
     };
-    for call in facts
-        .boundary_substitutions
-        .iter()
-        .filter(|row| row.licensing_role == LicensingRole::Borrowed)
-    {
+    for call in facts.boundary_substitutions.iter().filter(|row| {
+        matches!(
+            row.licensing_role,
+            LicensingRole::Borrowed | LicensingRole::Lent
+        )
+    }) {
+        let lent = call.licensing_role == LicensingRole::Lent;
         let (Some(callee), Some(index)) = (&call.callee, call.argument_index) else {
             return Err("borrowed call has no target parameter".into());
         };
-        if !facts.reader_plan.borrows_parameter(callee, index) {
-            return Err("borrowed call has no complete readonly body contract".into());
+        // A reader's call is `Borrowed`; a lend is `Lent` and its certificate is
+        // the recorded lend plan (R590-5 L-B: absent from the snapshot = refused).
+        if lent && !facts.lend_plan.lends(callee, index) {
+            return Err("lent call has no lend certificate".into());
+        }
+        if !lent && !facts.reader_plan.borrows_parameter(callee, index) {
+            return Err("borrowed call has no reader certificate".into());
         }
         let entries: Vec<_> = facts
             .boundary_substitutions
@@ -155,7 +162,18 @@ pub(crate) fn validate_call_roles(facts: &super::facts::Facts) -> Result<(), Str
         else {
             return Err("borrowed call has no full formal window".into());
         };
-        if !(*use_start..*use_end)
+        if lent {
+            // Component 0 only: the container is lent, its contents are not.
+            if !zero(&call.point, *use_start) || !zero(&call.point, *def_start) {
+                return Err("lent call signature lost its container zero view".into());
+            }
+            if (*use_start + 1..*use_end)
+                .chain(*def_start + 1..*def_end)
+                .any(|var| zero(&call.point, var))
+            {
+                return Err("lent call zeroes an interior component".into());
+            }
+        } else if !(*use_start..*use_end)
             .chain(*def_start..*def_end)
             .all(|var| zero(&call.point, var))
         {

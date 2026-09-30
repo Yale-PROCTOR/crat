@@ -53,6 +53,7 @@ pub(crate) mod fold_types;
 mod fold_views_tests;
 pub(crate) mod fold_zero;
 pub(crate) mod grants;
+pub(crate) mod lend;
 pub(crate) mod matched;
 pub(crate) mod model_selection;
 pub(crate) mod read_b;

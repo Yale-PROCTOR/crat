@@ -243,6 +243,48 @@ pub(crate) fn move_store() -> bool {
     }
 }
 
+/// `CRAT_ERA5C_ARG_ORDER=on|off` (fail-loud, absent = off): **L01¹⁰, R609-3 (a)**.
+/// The argument-order premise: a call's pure-read operands are evaluated before
+/// the reborrows the same call receives, when every statement between such a
+/// reborrow and the call is a pure read (E5C-3's pattern). The emission side owes
+/// the hoist (`let r = (*tree).root; insert_(&mut *tree, r, …)`).
+pub(crate) fn arg_order() -> bool {
+    match std::env::var("CRAT_ERA5C_ARG_ORDER").ok().as_deref() {
+        None | Some("off") => false,
+        Some("on") => true,
+        Some(other) => panic!("CRAT_ERA5C_ARG_ORDER must be `on` or `off`, got {other:?}"),
+    }
+}
+
+/// `CRAT_ERA5C_REF_PEEL_ZERO=on|off` (fail-loud, absent = off): **L01¹¹, R645-2**
+/// (era-5c 086). At a local call whose actual is the address of a place (`is_ref`),
+/// the formal's peeled outer component -- the formal pointer's own window, use and
+/// def -- is `¬own`: the view of a place is never its owner. Forbid-only.
+pub(crate) fn ref_peel_zero() -> bool {
+    match std::env::var("CRAT_ERA5C_REF_PEEL_ZERO").ok().as_deref() {
+        None | Some("off") => false,
+        Some("on") => true,
+        Some(other) => panic!("CRAT_ERA5C_REF_PEEL_ZERO must be `on` or `off`, got {other:?}"),
+    }
+}
+
+/// `CRAT_ERA5C_OVERLAP_TYPE_ROUTE=on|off` (fail-loud, absent = off): **L01¹⁰,
+/// R609-3 (b), under R542**. Two formals whose pointees are incompatible object
+/// types, neither containing the other by value, are not A5 overlap partners;
+/// receipt `overlap-partner-disjoint:type-rule`.
+pub(crate) fn overlap_type_route() -> bool {
+    match std::env::var("CRAT_ERA5C_OVERLAP_TYPE_ROUTE")
+        .ok()
+        .as_deref()
+    {
+        None | Some("off") => false,
+        Some("on") => true,
+        Some(other) => {
+            panic!("CRAT_ERA5C_OVERLAP_TYPE_ROUTE must be `on` or `off`, got {other:?}")
+        }
+    }
+}
+
 /// `CRAT_ERA5C_TRAVERSAL_REF=on|off` (fail-loud, absent = off): **L01⁶-A2**.
 /// A field-load re-seat in a loop (`node = (*node).left`) types its result as a
 /// BORROW of the container rather than transferring ownership to it. Era-5c

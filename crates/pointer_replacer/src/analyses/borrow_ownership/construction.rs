@@ -656,6 +656,19 @@ fn canonical_receipt(input: String) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+/// R609-3 (b): the type route's count and digest, only when it removed a pair,
+/// so every receipt without one is byte-identical.
+fn type_disjoint_keys(plan: &A5Plan, mut receipt: String) -> String {
+    if !plan.type_disjoint.is_empty() {
+        receipt.push_str(&format!(
+            "a5_type_disjoint_pairs={}\na5_type_disjoint_sha256={:x}\n",
+            plan.type_disjoint.len(),
+            Sha256::digest(plan.type_disjoint.join("\n").as_bytes())
+        ));
+    }
+    receipt
+}
+
 fn a5_receipt(
     mode: A5Mode,
     plan: &A5Plan,
@@ -665,8 +678,10 @@ fn a5_receipt(
     nullability: &NullabilityArtifacts,
     a14: &A14Artifacts,
 ) -> String {
-    canonical_receipt(format!(
-        "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
+    canonical_receipt(type_disjoint_keys(
+        plan,
+        format!(
+            "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
          a2_mode=off\nsoundness_mode=a14\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
          a5_abi_guard={}\na5_raw_pairs={}\na5_effective_pairs={}\n\
          a5_raw_site_pairs={}\na5_raw_site_mut_mut={}\na5_raw_site_mut_read_only={}\n\
@@ -679,27 +694,28 @@ fn a5_receipt(
          nullable_ledger_sha256={:x}\na14_opaque_stores={}\n\
          a14_unresolved_unresolvable={}\na14_nullable_store_fields={}\n\
          field_ref_ledger_sha256={:x}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
-        mode.label(),
-        A5World::ClosedWorldFrozenGraph.label(),
-        plan.abi_guard.stamp(),
-        plan.stats.raw_pairs,
-        plan.stats.effective_pairs,
-        plan.stats.raw_site_pairs,
-        plan.stats.raw_site_mut_mut,
-        plan.stats.raw_site_mut_read_only,
-        plan.stats.raw_site_shared_shared,
-        plan.stats.planned_marks,
-        retained,
-        retained_sites,
-        selected_model_sha256,
-        summary_digest(plan),
-        nullability.slots,
-        nullability.fields,
-        Sha256::digest(nullability.artifact.as_bytes()),
-        a14.opaque_stores,
-        a14.unresolved_unresolvable,
-        a14.nullable_store_fields,
-        Sha256::digest(a14.artifact.as_bytes()),
+            mode.label(),
+            A5World::ClosedWorldFrozenGraph.label(),
+            plan.abi_guard.stamp(),
+            plan.stats.raw_pairs,
+            plan.stats.effective_pairs,
+            plan.stats.raw_site_pairs,
+            plan.stats.raw_site_mut_mut,
+            plan.stats.raw_site_mut_read_only,
+            plan.stats.raw_site_shared_shared,
+            plan.stats.planned_marks,
+            retained,
+            retained_sites,
+            selected_model_sha256,
+            summary_digest(plan),
+            nullability.slots,
+            nullability.fields,
+            Sha256::digest(nullability.artifact.as_bytes()),
+            a14.opaque_stores,
+            a14.unresolved_unresolvable,
+            a14.nullable_store_fields,
+            Sha256::digest(a14.artifact.as_bytes()),
+        ),
     ))
 }
 
@@ -1399,6 +1415,13 @@ pub(crate) fn construct_bo_into_a2(
             continue;
         };
         solver.add_borrow_exclusion(Some(SlotRef::Local(guard.function, slot)), &[]);
+        super::raw_cause::note_eager(solver, "opaque-result-guard");
+        super::raw_cause::dump_eager(
+            program.tcx,
+            slots,
+            SlotRef::Local(guard.function, slot),
+            "opaque-result-guard",
+        );
         guards += 1;
     }
     construction.a2_mode = A2Mode::DefinitelyOverwritten;

@@ -869,6 +869,46 @@ fn shape_model(code: &str) -> Vec<(String, String)> {
             Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )
         .expect("the shape solves");
+        // R609-3 (080 / 074): the raw-cause ledger of this model, as the entry's
+        // sidecar would carry it, when a path is named.
+        if let Ok(path) = std::env::var("CRAT_E5C_SIDE_LEDGER") {
+            let program =
+                std::env::var("CRAT_E5C_SIDE_PROGRAM").unwrap_or_else(|_| "shape".to_owned());
+            // `prepare` (inside the solve) already took the ledger that explains
+            // this model for its own sidecar; `last` is that ledger.
+            let rows = super::raw_cause::last().expect("the ledger is on and explains the model");
+            let mut text = format!("{}\n", super::raw_cause::HEADER);
+            for row in &rows {
+                text.push_str(&format!("{program}\t{}\n", row.sidecar()));
+            }
+            std::fs::write(&path, text).expect("the ledger sidecar");
+            eprintln!("E5C_LEDGER {path} rows={}", rows.len());
+        }
+        // R612-2 (080's over-pin read): the Mode-A commit totals and A5's
+        // may-overlap parameter pairs, beside the ledger.
+        if let Ok(path) = std::env::var("CRAT_E5C_SIDE_STATS") {
+            let stats = &verified.round_stats;
+            let mut text = format!(
+                "rounds\t{}\ncommits_conflict\t{}\ncommits_per_round\t{:?}\n",
+                stats.rounds, stats.commits_conflict, stats.commits_per_round
+            );
+            for line in verified.summary_artifact.summary_tsv.lines().skip(1) {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let Some(function) = fields.first().and_then(|f| f.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let did = rustc_span::def_id::LocalDefId {
+                    local_def_index: rustc_span::def_id::DefIndex::from_u32(function),
+                };
+                text.push_str(&format!(
+                    "a5_pair\t{}\t{}\t{}\n",
+                    tcx.def_path_str(did.to_def_id()),
+                    fields[1],
+                    fields[2]
+                ));
+            }
+            std::fs::write(&path, text).expect("the side stats");
+        }
         for (slot, kind) in &verified.model {
             let key = match slot {
                 super::SlotRef::Local(function, id) => {
@@ -2952,7 +2992,6 @@ fn e5c_w53_a_every_switch_moves_the_identity() {
         ("CRAT_ERA5C_MOVE_STORE", "on"),
         ("CRAT_E5C_W61_FAULT", "raw-too"),
         ("CRAT_ERA5C_DEBUG", "1"),
-        ("CRAT_ERA5C_PROFILE", "1"),
         ("CRAT_ERA5C_BYTEPROOF", "1"),
         ("CRAT_ERA5C_RESEAT_DUMP", "1"),
     ] {
@@ -3766,5 +3805,1882 @@ fn e5c_entry_digests() {
     println!(
         "E5C_ENTRY_DIGESTS {{\"key\":\"{}\",\"entry\":\"{}\",\"payload\":\"{}\",\"exports\":\"{}\"}}",
         entry.key, hashes.entry, hashes.payload, hashes.exports
+    );
+}
+
+/// era-5c 066 (the lend, rule 5): the market as a MIR walk, no solver. For every
+/// raw-pointer formal of a local function, the formal's derivation closure (copies,
+/// casts, field and element addresses, `offset`-like library calls, interior-pointer
+/// libc results) is followed through the body, and the formal is a CONSUMER if the
+/// closure is freed, stored as a value (into memory or an aggregate), returned, or
+/// handed to a consuming or unknown callee; otherwise it only reads or writes
+/// THROUGH the pointer and is a PASS-THROUGH (lendable). Greatest fixpoint over the
+/// local callees. `reader=` says whether era 5b's reader plan already certifies it.
+/// `CRAT_E5C_LEND_INPUT` names one `lib.rs`; `CRAT_E5C_LEND_STRICT=1` treats every
+/// libc callee as unknown.
+#[test]
+#[ignore = "era-5c 066: the lend's market as a MIR walk, no solver"]
+fn e5c_lend_market() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::mir::{Operand, Rvalue, StatementKind};
+
+    use crate::analyses::mir::{CallKind, TerminatorExt};
+    let path = std::env::var("CRAT_E5C_LEND_INPUT").expect("CRAT_E5C_LEND_INPUT");
+    let strict = std::env::var("CRAT_E5C_LEND_STRICT").as_deref() == Ok("1");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions: functions.clone(),
+            structs,
+        };
+        let slots = super::crate_slots::CrateSlots::build(&program);
+        let plan = super::licensing::readers::Plan::build(
+            &super::licensing::readers::Inputs::collect(&program, &slots),
+        );
+        // libc callees that neither free nor retain a pointer argument (and the
+        // ones whose result points into an argument).
+        const NO_RETAIN: &[&str] = &[
+            "strlen", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strcpy", "strncpy",
+            "strcat", "strncat", "memcpy", "memmove", "memset", "memcmp", "printf", "fprintf",
+            "sprintf", "snprintf", "vsnprintf", "vfprintf", "puts", "fputs", "fputc", "putc",
+            "fwrite", "fread", "fgets", "fgetc", "getc", "sscanf", "fscanf", "atoi", "atol",
+            "atof", "strtol", "strtoul", "strtod", "strtoll", "strtoull", "fflush", "ferror",
+            "feof", "fseek", "ftell", "rewind", "strspn", "strcspn", "qsort", "bsearch",
+        ];
+        const INTERIOR: &[&str] = &["strchr", "strrchr", "strstr", "strpbrk", "memchr"];
+        let name = |f: rustc_span::def_id::LocalDefId| tcx.def_path_str(f.to_def_id());
+        let pointer_formals = |f: rustc_span::def_id::LocalDefId| -> Vec<rustc_middle::mir::Local> {
+            let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+            (1..=body.arg_count)
+                .map(rustc_middle::mir::Local::from_usize)
+                .filter(|&l| body.local_decls[l].ty.is_raw_ptr())
+                .collect()
+        };
+        let mut consumer: std::collections::BTreeMap<(String, u32), String> = Default::default();
+        loop {
+            let before = consumer.len();
+            for &f in &functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                for formal in pointer_formals(f) {
+                    let key = (name(f), formal.as_u32());
+                    if consumer.contains_key(&key) {
+                        continue;
+                    }
+                    // The derivation closure, to a fixpoint.
+                    let mut closure = std::collections::BTreeSet::from([formal]);
+                    let in_closure = |op: &Operand<'_>, c: &std::collections::BTreeSet<_>| {
+                        op.place()
+                            .is_some_and(|p| p.projection.is_empty() && c.contains(&p.local))
+                    };
+                    let mut reason: Option<String> = None;
+                    loop {
+                        let size = closure.len();
+                        for data in body.basic_blocks.iter() {
+                            for statement in &data.statements {
+                                let StatementKind::Assign(assign) = &statement.kind else {
+                                    continue;
+                                };
+                                let (dest, rvalue) = &**assign;
+                                let derived = match rvalue {
+                                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => {
+                                        in_closure(op, &closure)
+                                    }
+                                    Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
+                                        place.is_indirect_first_projection()
+                                            && closure.contains(&place.local)
+                                    }
+                                    _ => false,
+                                };
+                                if derived {
+                                    if dest.projection.is_empty() {
+                                        if dest.local.as_u32() == 0 {
+                                            reason.get_or_insert("return".into());
+                                        } else {
+                                            closure.insert(dest.local);
+                                        }
+                                    } else {
+                                        reason.get_or_insert("store".into());
+                                    }
+                                }
+                                if let Rvalue::Aggregate(_, ops) = rvalue
+                                    && ops.iter().any(|op| in_closure(op, &closure))
+                                {
+                                    reason.get_or_insert("aggregate".into());
+                                }
+                            }
+                            let Some(call) = data.terminator().as_call(tcx) else { continue };
+                            let hits: Vec<usize> = call
+                                .args
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, a)| in_closure(&a.node, &closure))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if hits.is_empty() {
+                                continue;
+                            }
+                            let mut derives = false;
+                            match &call.func {
+                                CallKind::FreeStanding(g) | CallKind::Impl(g) => {
+                                    let gbody = tcx.mir_drops_elaborated_and_const_checked(*g).borrow();
+                                    for &i in &hits {
+                                        let k = (name(*g), (i + 1) as u32);
+                                        let is_ptr = i < gbody.arg_count
+                                            && gbody.local_decls[rustc_middle::mir::Local::from_usize(i + 1)]
+                                                .ty
+                                                .is_raw_ptr();
+                                        if !is_ptr {
+                                            reason.get_or_insert(format!("callee-nonpointer:{}#{}", k.0, k.1));
+                                        } else if consumer.contains_key(&k) {
+                                            reason.get_or_insert(format!("consuming-callee:{}#{}", k.0, k.1));
+                                        }
+                                    }
+                                }
+                                CallKind::LibC(sym) => {
+                                    let s = sym.as_str();
+                                    if s == "free" || s == "realloc" {
+                                        reason.get_or_insert(format!("frees:{s}"));
+                                    } else if !strict && INTERIOR.contains(&s) {
+                                        derives = true;
+                                    } else if strict || !NO_RETAIN.contains(&s) {
+                                        reason.get_or_insert(format!("unknown-libc:{s}"));
+                                    }
+                                }
+                                CallKind::RustLib(did) => {
+                                    let s = tcx.item_name(*did);
+                                    let s = s.as_str();
+                                    if matches!(
+                                        s,
+                                        "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add"
+                                            | "wrapping_sub" | "cast" | "cast_mut" | "cast_const"
+                                            | "as_ptr" | "as_mut_ptr"
+                                    ) {
+                                        derives = true;
+                                    } else if !matches!(
+                                        s,
+                                        "is_null" | "offset_from" | "addr" | "eq" | "ne"
+                                            // an `Option` field read in place (a callback
+                                            // slot's test): the object is read, not handed on
+                                            | "is_some" | "is_none" | "expect" | "unwrap"
+                                    ) {
+                                        reason.get_or_insert(format!("rust-lib:{s}"));
+                                    }
+                                }
+                                CallKind::Closure | CallKind::Dynamic => {
+                                    reason.get_or_insert("indirect".into());
+                                }
+                            }
+                            if derives && call.destination.projection.is_empty() {
+                                if call.destination.local.as_u32() == 0 {
+                                    reason.get_or_insert("return".into());
+                                } else {
+                                    closure.insert(call.destination.local);
+                                }
+                            }
+                        }
+                        if closure.len() == size {
+                            break;
+                        }
+                    }
+                    if let Some(reason) = reason {
+                        consumer.insert(key, reason);
+                    }
+                }
+            }
+            if consumer.len() == before {
+                break;
+            }
+        }
+        for &f in &functions {
+            let fname = name(f);
+            let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+            for formal in pointer_formals(f) {
+                let var = body
+                    .var_debug_info
+                    .iter()
+                    .find_map(|info| match info.value {
+                        rustc_middle::mir::VarDebugInfoContents::Place(p)
+                            if p.local == formal && p.projection.is_empty() =>
+                        {
+                            Some(info.name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let key = (fname.clone(), formal.as_u32());
+                let reader = plan.borrows_parameter(&fname, formal.as_usize() - 1);
+                match consumer.get(&key) {
+                    Some(reason) => eprintln!(
+                        "E5C_LEND {fname}::_{}@d0 {var} class=consumer reason={reason} reader={reader}",
+                        formal.as_u32()
+                    ),
+                    None => eprintln!(
+                        "E5C_LEND {fname}::_{}@d0 {var} class=pass-through reader={reader}",
+                        formal.as_u32()
+                    ),
+                }
+            }
+        }
+    })
+    .unwrap();
+}
+
+/// W63 (era-5c 066, R579-2): lil's context shape (062's `ctx.rs`, verbatim): a
+/// constructor, two readers of the context, a writer that pushes an
+/// environment, a parse that drives them, and a null-checked free.
+const W63_CTX: &str = r#"#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[repr(C)] pub struct env_t { pub parent: *mut env_t, pub depth: i32 }
+#[repr(C)] pub struct ctx_t { pub code: *const u8, pub head: usize, pub clen: usize, pub ignoreeol: i32, pub env: *mut env_t }
+pub type lil_t = *mut ctx_t;
+#[no_mangle] pub unsafe extern "C" fn lil_new() -> lil_t {
+    let mut lil = malloc(core::mem::size_of::<ctx_t>() as u64) as lil_t;
+    (*lil).code = 0 as *const u8; (*lil).head = 0; (*lil).clen = 0; (*lil).ignoreeol = 0;
+    (*lil).env = malloc(core::mem::size_of::<env_t>() as u64) as *mut env_t;
+    (*(*lil).env).parent = 0 as *mut env_t; (*(*lil).env).depth = 0;
+    return lil;
+}
+unsafe extern "C" fn ateol(mut lil: lil_t) -> i32 {
+    return ((*lil).ignoreeol == 0 && *((*lil).code).offset((*lil).head as isize) == b'\n') as i32;
+}
+unsafe extern "C" fn skip_spaces(mut lil: lil_t) {
+    while (*lil).head < (*lil).clen && *((*lil).code).offset((*lil).head as isize) == b' ' {
+        if ateol(lil) != 0 { break; }
+        (*lil).head = (*lil).head.wrapping_add(1);
+    }
+}
+#[no_mangle] pub unsafe extern "C" fn lil_push_env(mut lil: lil_t) -> *mut env_t {
+    let mut env = malloc(core::mem::size_of::<env_t>() as u64) as *mut env_t;
+    (*env).parent = (*lil).env; (*env).depth = 1; (*lil).env = env;
+    return env;
+}
+#[no_mangle] pub unsafe extern "C" fn lil_pop_env(mut lil: lil_t) {
+    let mut env = (*lil).env;
+    if !(*env).parent.is_null() { (*lil).env = (*env).parent; free(env as *mut core::ffi::c_void); }
+}
+#[no_mangle] pub unsafe extern "C" fn lil_parse(mut lil: lil_t, mut code: *const u8, mut len: usize) -> i32 {
+    let save = (*lil).code; (*lil).code = code; (*lil).clen = len; (*lil).head = 0;
+    lil_push_env(lil);
+    skip_spaces(lil);
+    let r = ateol(lil);
+    lil_pop_env(lil);
+    (*lil).code = save;
+    return r;
+}
+#[no_mangle] pub unsafe extern "C" fn lil_free(mut lil: lil_t) {
+    if lil.is_null() { return; }
+    free((*lil).env as *mut core::ffi::c_void);
+    free(lil as *mut core::ffi::c_void);
+}
+#[no_mangle] pub unsafe extern "C" fn run(code: *const u8, len: usize) -> i32 {
+    let mut lil = lil_new();
+    let r = lil_parse(lil, code, len);
+    lil_free(lil);
+    return r;
+}
+"#;
+
+/// W63 (R580-1): a context whose writer invokes a callback installed in it,
+/// with the context as the callback's argument.
+const W63_CALLBACK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[repr(C)] pub struct ctx_t { pub n: i32, pub cb: Option<unsafe extern "C" fn(*mut ctx_t) -> i32> }
+unsafe extern "C" fn set_var(mut c: *mut ctx_t, v: i32) {
+    (*c).n = v;
+    if (*c).cb.is_some() { (*c).cb.expect("non-null function pointer")(c); }
+}
+unsafe extern "C" fn get_var(mut c: *mut ctx_t) -> i32 { return (*c).n; }
+#[no_mangle] pub unsafe extern "C" fn run(v: i32) -> i32 {
+    let mut c = malloc(core::mem::size_of::<ctx_t>() as u64) as *mut ctx_t;
+    (*c).n = 0; (*c).cb = None;
+    set_var(c, v);
+    let r = get_var(c);
+    free(c as *mut core::ffi::c_void);
+    return r;
+}
+"#;
+
+/// W67 (R607-1): small shapes for the raw-cause ledger's classes -- a pointer
+/// joined at a phi with null or with a borrowed pointer, and locals no rule
+/// reaches.
+const W67_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn phi_null(c: i32) -> i32 {
+    let mut p: *mut i32 = 0 as *mut i32;
+    if c != 0 { p = malloc(4) as *mut i32; *p = c; }
+    let r = if p.is_null() { 0 } else { *p };
+    free(p as *mut core::ffi::c_void);
+    r
+}
+#[no_mangle] pub unsafe extern "C" fn phi_join(c: i32, q: *mut i32) -> i32 {
+    let mut p: *mut i32 = if c != 0 { malloc(4) as *mut i32 } else { q };
+    *p = 1;
+    *p
+}
+#[no_mangle] pub unsafe extern "C" fn pick(a: *mut i32, b: *mut i32, c: i32) -> i32 {
+    let mut p: *mut i32 = if c != 0 { a } else { b };
+    *p
+}
+#[repr(C)] pub struct S { pub p: *mut i32 }
+#[no_mangle] pub unsafe extern "C" fn two(s: *mut S, a: *mut i32, b: *mut i32, c: i32) -> i32 {
+    if c != 0 { (*s).p = a; } else { (*s).p = b; }
+    (*s).p = (*s).p.offset(1);
+    *a + *b
+}
+#[repr(C)] pub struct N { pub l: *mut N, pub r: *mut N }
+pub unsafe fn del(root: *mut N) -> *mut N {
+    if root.is_null() { return root; }
+    if (*root).l.is_null() {
+        let t = (*root).r;
+        free(root as *mut core::ffi::c_void);
+        return t;
+    }
+    return root;
+}
+#[no_mangle] pub unsafe extern "C" fn keep(a: *mut i32) -> *mut i32 {
+    let mut p: *mut i32 = a;
+    let mut t: *mut i32 = p;
+    t
+}
+"#;
+
+/// W68 (R609-3): W64d's two walls, reduced. `tree_insert` reads the container
+/// in the argument list of the call that receives its reborrow (quadtree's
+/// `insert_(tree, (*tree).root, …)`); `reset_` writes through `tree` while the
+/// reborrow of `node` it passes on is live, the two formals A5 overlap partners
+/// of incompatible types (quadtree's `reset_node_`); `same_` is that shape with
+/// both formals of one type, the control.
+const W68_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+#[repr(C)] pub struct node_t { pub v: i32, pub next: *mut node_t }
+#[repr(C)] pub struct tree_t { pub root: *mut node_t, pub n: u32 }
+unsafe extern "C" fn insert_(tree: *mut tree_t, root: *mut node_t, v: i32) -> i32 {
+    (*root).v = v;
+    (*tree).n = (*tree).n.wrapping_add(1);
+    1
+}
+#[no_mangle] pub unsafe extern "C" fn tree_insert(tree: *mut tree_t, v: i32) -> i32 {
+    if insert_(tree, (*tree).root, v) == 0 { return 0; }
+    (*tree).n = (*tree).n.wrapping_add(1);
+    1
+}
+unsafe extern "C" fn node_reset(node: *mut node_t) { (*node).v = 0; }
+unsafe extern "C" fn reset_(tree: *mut tree_t, node: *mut node_t) {
+    let mut n = node;
+    (*tree).n = 0;
+    node_reset(n);
+}
+#[no_mangle] pub unsafe extern "C" fn tree_reset(tree: *mut tree_t) { reset_(tree, (*tree).root); }
+unsafe extern "C" fn same_(a: *mut node_t, b: *mut node_t) {
+    let mut n = b;
+    (*a).v = 1;
+    node_reset(n);
+}
+#[no_mangle] pub unsafe extern "C" fn node_same(a: *mut node_t) { same_(a, (*a).next); }
+"#;
+
+/// The W63 child: the shape's model, the lend plan, and every licensing
+/// snapshot of an export-capturing solve re-validated.
+#[test]
+#[ignore = "runs under L01¹⁰'s arms in a child of the W63 witnesses"]
+fn e5c_inner_w63() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    let owned;
+    let shape = match std::env::var("CRAT_E5C_W63_SHAPE").as_deref() {
+        Ok("ctx") => W63_CTX,
+        Ok("callback") => W63_CALLBACK,
+        Ok("w66-controls") => W66_CONTROLS,
+        Ok("w67-shapes") => W67_SHAPES,
+        Ok("w68-shapes") => W68_SHAPES,
+        Ok("w71-shapes") => W71_SHAPES,
+        Ok("ctx-jail") => W71_CTX_JAIL,
+        Ok("w74-shapes") => W74_SHAPES,
+        Ok(file) if file.starts_with("file:") => {
+            owned = std::fs::read_to_string(&file[5..]).expect("the W64 program");
+            owned.as_str()
+        }
+        other => panic!("CRAT_E5C_W63_SHAPE: {other:?}"),
+    };
+    shape_model(shape);
+    // W64d reads the model alone.
+    if std::env::var_os("CRAT_E5C_W63_MODEL_ONLY").is_some() {
+        return;
+    }
+    ::utils::compilation::run_compiler_on_str(shape, |tcx| {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions,
+            structs,
+        };
+        let plan = super::licensing::lend::collect(&program);
+        for (function, formal) in &plan.lendable {
+            eprintln!("E5C_W63 lendable {function}::_{formal}");
+        }
+        for site in &plan.waivers {
+            eprintln!(
+                "E5C_W63 waiver {} id={}",
+                site.receipt(),
+                super::licensing::lend::WAIVER_ID
+            );
+        }
+        let slots = super::crate_slots::CrateSlots::build(&program);
+        let origins = super::origins::compute_origins(&program);
+        let mutability = super::mutability_facts::MutFacts::from_program(&program);
+        let (verified, captured) = super::export::with_bo_export(|| {
+            super::construction::solve_bo_a5_config_reporting(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                super::a5_overlap::A5Mode::PreciseReplay,
+                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+            .expect("W63 needs an accepted model")
+        });
+        for snapshot in captured.ownership_licensing.iter().flatten() {
+            match snapshot.validate() {
+                Ok(()) => eprintln!(
+                    "E5C_W63 validate ok lend_plan={}",
+                    snapshot.lend_plan.is_some()
+                ),
+                Err(e) => eprintln!("E5C_W63 validate err:{e}"),
+            }
+        }
+        // W66 (R603-2): the final retirement review's discharges and conflicts.
+        if let Some(review) = &captured.source_retirement {
+            for row in &review.discharged {
+                eprintln!("E5C_W63 discharge {}", row.receipt());
+            }
+            for row in &review.conflicts {
+                eprintln!(
+                    "E5C_W63 retire-conflict {} {}:bb{}[{}] {:?}",
+                    row.target_key,
+                    row.source.function,
+                    row.source.block,
+                    row.source.statement,
+                    row.overlap
+                );
+            }
+        }
+        // W68 (R609-3): the A5 receipt's type-route keys.
+        for line in verified.receipt.lines() {
+            if line.starts_with("a5_type_disjoint") {
+                eprintln!("E5C_W63 a5-receipt {line}");
+            }
+        }
+        // W72 (R659-1): the arm-(a) receipts from the model, the portable
+        // export and the prepared cache entry.
+        if std::env::var_os("CRAT_E5C_W72").is_some() {
+            let mode = super::a5_overlap::A5Mode::PreciseReplay;
+            let attestation =
+                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
+            let model = super::portable_export::arg_order_rows(&program, &slots, &captured)
+                .expect("rows convert");
+            let packet = super::portable_export::collect(&program, &slots, &captured).unwrap();
+            let decoded: super::portable_export::PortableExport =
+                serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
+            let portable = decoded.arg_order_applied();
+            let inputs = super::model_cache::semantic_inputs(&program, mode, attestation).unwrap();
+            let key = super::cache_contract::semantic_key(&inputs).unwrap();
+            super::model_cache::prepare(
+                &program,
+                &slots,
+                &origins,
+                &verified,
+                &captured,
+                mode,
+                attestation,
+            );
+            let entry = super::model_cache::prepared_arg_order_applied(&key);
+            let describe =
+                |rows: &Result<Vec<super::portable_export::ArgOrderRow>, String>| match rows {
+                    Ok(rows) => format!("ok:{}", rows.len()),
+                    Err(e) => format!("err:{e}"),
+                };
+            eprintln!(
+                "E5C_W63 arg-order model={} portable={} entry={} equal={}",
+                model
+                    .as_ref()
+                    .map_or("none".into(), |m| m.len().to_string()),
+                describe(&portable),
+                describe(&entry),
+                model
+                    .as_ref()
+                    .is_some_and(|m| portable.as_ref().is_ok_and(|p| p == m)
+                        && entry.as_ref().is_ok_and(|e| e == m))
+            );
+            // R666-1: the loader's keys, spans re-read from this session's MIR.
+            match super::model_cache::prepared_arg_order_hoists(tcx, &key) {
+                Ok(hoists) => {
+                    for ((lo, hi), caller, lent) in hoists {
+                        let span = rustc_span::Span::with_root_ctxt(
+                            rustc_span::BytePos(lo),
+                            rustc_span::BytePos(hi),
+                        );
+                        let text = tcx
+                            .sess
+                            .source_map()
+                            .span_to_snippet(span)
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "E5C_W63 arg-order-hoist {} lent=_{} text={text}",
+                            tcx.def_path_str(caller.to_def_id()),
+                            lent.as_u32()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("E5C_W63 arg-order-hoist err:{e}"),
+            }
+            for row in model.iter().flatten() {
+                eprintln!(
+                    "E5C_W63 arg-order-row {} bb{}[{}] lent=_{} owner=_{} span={}..{}",
+                    row.function,
+                    row.call.block,
+                    row.call.statement,
+                    row.lent,
+                    row.owner,
+                    row.span.lo,
+                    row.span.hi
+                );
+            }
+        }
+        // W67 (R607-1): the raw-cause ledger of the accepted model.
+        if super::raw_cause::enabled() {
+            for row in super::raw_cause::last().unwrap_or_default() {
+                eprintln!("E5C_W63 ledger {}", row.tsv());
+            }
+        }
+    })
+    .unwrap();
+}
+
+fn w63_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
+    env.extend_from_slice(&[
+        ("CRAT_ERA5C_MUT_MODEL", "on"),
+        ("CRAT_ERA5C_ORIGIN_SET", "on"),
+        ("CRAT_ERA5C_DEREF_READER", "on"),
+        ("CRAT_ERA5C_MOVED_INPUT", "on"),
+        ("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"),
+        ("CRAT_ERA5C_MOVE_STORE", "on"),
+        // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
+        ("CRAT_ERA5C_TYPED_RELEASE", "on"),
+        // L01¹⁰'s configuration (R609-3): the argument-order premise and the
+        // A5 type route are on.
+        ("CRAT_ERA5C_ARG_ORDER", "on"),
+        ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
+        ("CRAT_E5C_W63_SHAPE", shape),
+    ]);
+    env.extend_from_slice(extra);
+    child(
+        "analyses::borrow_ownership::null_paths_tests::e5c_inner_w63",
+        &env,
+    )
+    .lines()
+    .filter_map(|l| {
+        l.find("E5C_W63 ")
+            .map(|i| l[i + 8..].to_owned())
+            .or_else(|| l.find("E5C_MODEL ").map(|i| l[i + 10..].to_owned()))
+    })
+    .collect()
+}
+
+fn w63_kind(lines: &[String], key: &str) -> String {
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix(&format!("{key} ")).map(str::to_owned))
+        .unwrap_or_else(|| panic!("no {key}: {lines:?}"))
+}
+
+/// W63a: with the lend, the context's pass-through formals are not Owning --
+/// every call lends them; without it they take the owner (062's wall, RED).
+#[test]
+fn e5c_w63_a_a_lendable_formal_is_a_zero_view_at_every_call() {
+    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    let off = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "off")]);
+    // R590-5 L-G (W64b): every lent context formal is Ref, not merely "not
+    // Owning" -- 070b's Raw passed the weaker claim.
+    for f in [
+        "ateol",
+        "skip_spaces",
+        "lil_push_env",
+        "lil_pop_env",
+        "lil_parse",
+    ] {
+        let key = format!("{f}::_1@d0");
+        assert!(
+            on.iter().any(|l| l == &format!("lendable {f}::_1")),
+            "{on:?}"
+        );
+        assert_eq!(w63_kind(&on, &key), "ref", "{key} lends: {on:?}");
+        assert_eq!(
+            w63_kind(&off, &key),
+            "owning",
+            "{key} without the lend: {off:?}"
+        );
+    }
+}
+
+/// W63b: a consuming callee still takes the owner -- `lil_free` frees its
+/// formal, is no lend, and stays Owning with the arm; the constructor's owner
+/// reaches it.
+#[test]
+fn e5c_w63_b_a_consuming_formal_keeps_the_owner() {
+    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    assert!(!on.iter().any(|l| l == "lendable lil_free::_1"), "{on:?}");
+    assert_eq!(w63_kind(&on, "lil_free::_1@d0"), "owning", "{on:?}");
+    assert_eq!(w63_kind(&on, "lil_new::_0@d0"), "owning", "{on:?}");
+}
+
+/// W63c (R580-1): a member handed to an indirect callee is no consumer; the
+/// site is receipted under R481's tier-2 waiver. Under `no-waiver` the
+/// indirect call consumes again (RED).
+#[test]
+fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
+    let on = w63_lines("callback", &[("CRAT_ERA5C_LEND", "on")]);
+    assert!(on.iter().any(|l| l == "lendable set_var::_1"), "{on:?}");
+    assert_eq!(
+        on.iter().filter(|l| l.starts_with("waiver ")).count(),
+        1,
+        "one site: {on:?}"
+    );
+    assert!(
+        on.iter().any(|l| l
+            .starts_with("waiver lend-waiver(tier-2, kind=indirect-call, site=set_var:bb")
+            && l.ends_with("id=retention-waiver:tier-2@2026-09-21")),
+        "{on:?}"
+    );
+    let fault = w63_lines(
+        "callback",
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_E5C_W63_FAULT", "no-waiver"),
+        ],
+    );
+    assert!(
+        !fault.iter().any(|l| l == "lendable set_var::_1"),
+        "RED: {fault:?}"
+    );
+    assert!(!fault.iter().any(|l| l.starts_with("waiver ")), "{fault:?}");
+}
+
+/// W63e: the recorded plan travels in the licensing snapshot and a restored
+/// snapshot validates; under `lend-all` (every pointer argument borrowed, the
+/// plan honest) the validator refuses the uncertified borrowed calls (RED).
+#[test]
+fn e5c_w63_e_the_validator_refuses_an_uncertified_borrowed_call() {
+    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    assert!(
+        on.iter().any(|l| l == "validate ok lend_plan=true"),
+        "{on:?}"
+    );
+    assert!(!on.iter().any(|l| l.starts_with("validate err")), "{on:?}");
+    let fault = w63_lines(
+        "ctx",
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_E5C_W63_FAULT", "lend-all"),
+        ],
+    );
+    assert!(
+        fault
+            .iter()
+            .any(|l| l == "validate err:lent call has no lend certificate"),
+        "RED: {fault:?}"
+    );
+}
+
+/// era-5c 070: the production lend plan (`licensing::lend::collect`) of one
+/// program's `lib.rs` (`CRAT_E5C_LEND_INPUT`): its lendable formals and its
+/// R580-1 waiver receipts. A MIR walk, no solver.
+#[test]
+#[ignore = "era-5c 070: the lend plan of a named program, no solver"]
+fn e5c_lend_plan_of() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    let path = std::env::var("CRAT_E5C_LEND_INPUT").expect("CRAT_E5C_LEND_INPUT");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            if let ItemKind::Fn { .. } = item.kind {
+                functions.push(item.owner_id.def_id);
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions,
+            structs: Vec::new(),
+        };
+        let plan = super::licensing::lend::collect(&program);
+        for (function, formal) in &plan.lendable {
+            eprintln!("E5C_LEND_PLAN lendable {function}::_{formal}@d0");
+        }
+        for site in &plan.waivers {
+            eprintln!("E5C_LEND_PLAN waiver {}", site.receipt());
+        }
+        eprintln!(
+            "E5C_LEND_PLAN total lendable={} waivers={}",
+            plan.lendable.len(),
+            plan.waivers.len()
+        );
+    })
+    .unwrap();
+}
+
+const W64_HT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../benchmarks/rs-crown-derived/ht/lib.rs"
+);
+
+/// W64a (R590-5, the record §5): ht's `ht_expand` frees and replaces
+/// `(*table).entries`; `ht_set` calls it. With the lend both `table` formals
+/// are **Ref** and the `entries` field stays **Owning** -- the interior
+/// component carries the field's ownership through the call. RED: the
+/// full-window lend of 070 (`full-window`) sends the tables to Raw.
+#[test]
+fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
+    if !std::path::Path::new(W64_HT).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W64_HT}");
+    let on = w63_lines(&shape, &[("CRAT_ERA5C_LEND", "on")]);
+    for key in ["src::ht::ht_expand::_1@d0", "src::ht::ht_set::_1@d0"] {
+        assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
+    }
+    assert_eq!(w63_kind(&on, "src::ht::ht::field0@d0"), "owning", "{on:?}");
+    let fault = w63_lines(
+        &shape,
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_E5C_W64_FAULT", "full-window"),
+            // R609-3: the discharge would remove the conflict the fault acts through.
+            ("CRAT_E5C_W66_FAULT", "no-discharge"),
+        ],
+    );
+    assert_eq!(
+        w63_kind(&fault, "src::ht::ht_expand::_1@d0"),
+        "raw",
+        "RED: {fault:?}"
+    );
+}
+
+/// W64d (R590-5 L-C, a LANDING GATE; restated R631-6): the no-loss control
+/// on the five. With the lend no slot falls to Raw and no Ref becomes Owning;
+/// the gains (raw -> ref, owning -> ref, raw -> owning) are allowed and listed.
+#[test]
+fn e5c_w64_d_no_slot_of_the_five_falls() {
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/rs-crown-derived"
+    );
+    for program in ["bst", "avl", "ht", "buffer", "quadtree"] {
+        let path = format!("{root}/{program}/lib.rs");
+        if !std::path::Path::new(&path).is_file() {
+            eprintln!("corpus absent; skipping {program}");
+            continue;
+        }
+        let shape = format!("file:{path}");
+        let model = |lend: &str| -> std::collections::BTreeMap<String, String> {
+            w63_lines(
+                &shape,
+                &[("CRAT_ERA5C_LEND", lend), ("CRAT_E5C_W63_MODEL_ONLY", "1")],
+            )
+            .into_iter()
+            .filter_map(|l| {
+                let (k, v) = l.rsplit_once(' ')?;
+                k.contains("@d").then(|| (k.to_owned(), v.to_owned()))
+            })
+            .collect()
+        };
+        let (off, on) = (model("off"), model("on"));
+        assert_eq!(off.len(), on.len(), "{program}: the slot universe");
+        let moved: Vec<_> = off
+            .iter()
+            .filter(|(k, v)| on.get(*k) != Some(*v))
+            .map(|(k, v)| format!("{k} {v}->{}", on[k]))
+            .collect();
+        eprintln!("E5C_W64D {program} moved={} {moved:?}", moved.len());
+        let lost: Vec<_> = moved
+            .iter()
+            .filter(|m| m.ends_with("->raw") || m.ends_with("ref->owning"))
+            .collect();
+        assert!(lost.is_empty(), "{program}: a slot fell: {lost:?}");
+    }
+}
+
+/// W64f (R659-1, R668-4: W64d restated for L01¹¹, losses only): on the five and
+/// `ctx`, L01¹⁰'s configuration (the lend on) against every L01¹¹ switch on --
+/// the zero law, (γ), (α⁺), (β′), (α)'s route condition and the allocator
+/// contract. No slot falls to Raw and no Ref becomes Owning; every move is
+/// printed (`E5C_W64F`).
+#[test]
+fn e5c_w64_f_no_slot_of_the_six_falls_under_l01p11() {
+    const L01P11: [&str; 6] = [
+        "CRAT_ERA5C_REF_PEEL_ZERO",
+        "CRAT_ERA5C_RETIRE_FRESH",
+        "CRAT_ERA5C_RETIRE_ROUTE_USE",
+        "CRAT_ERA5C_TYPED_SOLE",
+        "CRAT_ERA5C_ALPHA_RETURNS",
+        "CRAT_ERA5C_ALLOCATOR_CONTRACT",
+    ];
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/rs-crown-derived"
+    );
+    let mut shapes = vec![("ctx".to_owned(), "ctx".to_owned())];
+    for program in ["bst", "avl", "ht", "buffer", "quadtree"] {
+        let path = format!("{root}/{program}/lib.rs");
+        if std::path::Path::new(&path).is_file() {
+            shapes.push((program.to_owned(), format!("file:{path}")));
+        } else {
+            eprintln!("corpus absent; skipping {program}");
+        }
+    }
+    for (program, shape) in &shapes {
+        let model = |value: &str| -> std::collections::BTreeMap<String, String> {
+            let mut env = vec![("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W63_MODEL_ONLY", "1")];
+            env.extend(L01P11.iter().map(|switch| (*switch, value)));
+            w63_lines(shape, &env)
+                .into_iter()
+                .filter_map(|l| {
+                    let (k, v) = l.rsplit_once(' ')?;
+                    k.contains("@d").then(|| (k.to_owned(), v.to_owned()))
+                })
+                .collect()
+        };
+        let (off, on) = (model("off"), model("on"));
+        assert_eq!(off.len(), on.len(), "{program}: the slot universe");
+        let moved: Vec<_> = off
+            .iter()
+            .filter(|(k, v)| on.get(*k) != Some(*v))
+            .map(|(k, v)| format!("{k} {v}->{}", on[k]))
+            .collect();
+        eprintln!("E5C_W64F {program} moved={} {moved:?}", moved.len());
+        let lost: Vec<_> = moved
+            .iter()
+            .filter(|m| m.ends_with("->raw") || m.ends_with("ref->owning"))
+            .collect();
+        assert!(lost.is_empty(), "{program}: a slot fell: {lost:?}");
+    }
+}
+
+/// W64e (R590-5 L-B): the validator refuses a `Lent` row with an interior
+/// zero, one missing an interior equality, and one whose certificate is
+/// absent from the snapshot (three faults, each RED).
+#[test]
+fn e5c_w64_e_the_validator_refuses_a_malformed_lent_row() {
+    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    assert!(
+        on.iter().any(|l| l == "validate ok lend_plan=true"),
+        "{on:?}"
+    );
+    for (fault, message) in [
+        (
+            "interior-zero",
+            "validate err:lent call zeroes an interior component",
+        ),
+        (
+            "no-interior-equal",
+            "validate err:boundary matched pair has no corresponding emitted equation",
+        ),
+        (
+            "drop-plan",
+            "validate err:lent call has no lend certificate",
+        ),
+    ] {
+        let lines = w63_lines(
+            "ctx",
+            &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W64_FAULT", fault)],
+        );
+        assert!(lines.iter().any(|l| l == message), "{fault}: {lines:?}");
+    }
+}
+
+// ---- era-5c 077 / R603-2: the retirement discharges. (α) the post-free use,
+// unconditional; (β) the effective type behind CRAT_ERA5C_TYPED_RELEASE, which
+// rests on the premise TypedReleaseDiscipline (R603-1, the user's).
+
+const W66_QUADTREE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../benchmarks/rs-crown-derived/quadtree/lib.rs"
+);
+
+fn w66_lines(shape: &str, typed: &str, fault: Option<&str>) -> Vec<String> {
+    let mut extra = vec![
+        ("CRAT_ERA5C_LEND", "on"),
+        ("CRAT_ERA5C_TYPED_RELEASE", typed),
+    ];
+    if let Some(fault) = fault {
+        extra.push(("CRAT_E5C_W66_FAULT", fault));
+    }
+    w63_lines(shape, &extra)
+}
+
+/// W66a: ht's lent tables are Ref and `entries` Owning under the discharge;
+/// every discharge is receipted. RED: `no-discharge` gives 072's Raw back.
+#[test]
+fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
+    if !std::path::Path::new(W64_HT).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W64_HT}");
+    let on = w66_lines(&shape, "on", None);
+    for key in ["src::ht::ht_expand::_1@d0", "src::ht::ht_set::_1@d0"] {
+        assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
+    }
+    assert_eq!(w63_kind(&on, "src::ht::ht::field0@d0"), "owning", "{on:?}");
+    assert!(
+        on.iter()
+            .any(|l| l.starts_with("discharge retirement-disjoint:")
+                && l.contains("target=src::ht::ht_expand::_1@d0")),
+        "{on:?}"
+    );
+    let red = w66_lines(&shape, "on", Some("no-discharge"));
+    assert_eq!(
+        w63_kind(&red, "src::ht::ht_expand::_1@d0"),
+        "raw",
+        "RED: {red:?}"
+    );
+    assert!(!red.iter().any(|l| l.starts_with("discharge ")), "{red:?}");
+}
+
+/// W66b: lil's context shape; the two formals 072 lost are Ref again.
+#[test]
+fn e5c_w66_b_the_context_formals_return_to_ref_under_the_discharge() {
+    let on = w66_lines("ctx", "on", None);
+    for key in ["lil_parse::_1@d0", "lil_pop_env::_1@d0"] {
+        assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
+    }
+    let red = w66_lines("ctx", "on", Some("no-discharge"));
+    assert_eq!(w63_kind(&red, "lil_pop_env::_1@d0"), "raw", "RED: {red:?}");
+}
+
+/// W66c: quadtree's four `::tree` formals are Ref again; each rests on the
+/// premise (an effective-type receipt).
+#[test]
+fn e5c_w66_c_quadtrees_four_return_to_ref_under_the_discharge() {
+    if !std::path::Path::new(W66_QUADTREE).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W66_QUADTREE}");
+    let on = w66_lines(&shape, "on", None);
+    for function in ["insert_", "quadtree_insert", "reset_node_", "split_node_"] {
+        let key = format!("src::src::quadtree::{function}::_1@d0");
+        assert_eq!(w63_kind(&on, &key), "ref", "{key}: {on:?}");
+    }
+    assert!(
+        on.iter()
+            .any(|l| l.contains("retirement-disjoint:effective-type(")
+                && l.contains("target=src::src::quadtree::reset_node_::_1@d0")
+                && l.ends_with("premise=typed-release@R604-1)")),
+        "{on:?}"
+    );
+    let red = w66_lines(&shape, "on", Some("no-discharge"));
+    assert_eq!(
+        w63_kind(&red, "src::src::quadtree::reset_node_::_1@d0"),
+        "raw",
+        "RED: {red:?}"
+    );
+}
+
+/// W66's controls: a `void` free, a referent embedding the freed type by
+/// value and a union give no discharge; unrelated types discharge under the
+/// premise only; the carve discharges too, which is exactly what the premise
+/// excludes (its receipt names the premise).
+const W66_CONTROLS: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[repr(C)] #[derive(Clone, Copy)] pub struct P { pub x: i32, pub y: i32 }
+#[repr(C)] pub struct T { pub n: i32, pub m: i32 }
+#[repr(C)] pub struct E { pub inner: P, pub n: i32 }
+#[repr(C)] pub union U { pub p: P, pub n: i64 }
+unsafe fn release(q: *mut core::ffi::c_void) { free(q); }
+pub unsafe fn void_free(t: *mut T, q: *mut core::ffi::c_void) -> i32 { let r = (*t).n; release(q); return r; }
+pub unsafe fn embedded(e: *mut E, p: *mut P) -> i32 { let r = (*e).n; free(p as *mut core::ffi::c_void); return r; }
+pub unsafe fn unioned(u: *mut U, p: *mut P) -> i64 { let r = (*u).n; free(p as *mut core::ffi::c_void); return r; }
+pub unsafe fn typed(t: *mut T, p: *mut P) -> i32 { let r = (*t).n; free(p as *mut core::ffi::c_void); return r; }
+pub unsafe fn carved_use(t: *mut T, p: *mut P) -> i32 { let r = (*t).n; free(p as *mut core::ffi::c_void); return r; }
+pub unsafe fn carve() -> i32 {
+    let p = malloc(64) as *mut P;
+    let t = (p as *mut u8).offset(32) as *mut T;
+    (*p).x = 1; (*t).n = 2;
+    return carved_use(t, p);
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 {
+    let t = malloc(8) as *mut T; let e = malloc(12) as *mut E; let u = malloc(8) as *mut U;
+    (*t).n = 1; (*e).n = 2; (*u).n = 3;
+    let r = void_free(t, malloc(8)) + embedded(e, malloc(8) as *mut P)
+        + unioned(u, malloc(8) as *mut P) as i32 + typed(t, malloc(8) as *mut P) + carve();
+    free(t as *mut core::ffi::c_void); free(e as *mut core::ffi::c_void); free(u as *mut core::ffi::c_void);
+    return r;
+}
+"#;
+
+#[test]
+fn e5c_w66_controls_void_embedded_union_and_the_carve() {
+    let discharges = |lines: &[String], function: &str| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| {
+                l.starts_with("discharge ") && l.contains(&format!("target={function}::_1@d0"))
+            })
+            .cloned()
+            .collect()
+    };
+    let on = w66_lines("w66-controls", "on", None);
+    for function in ["void_free", "embedded", "unioned"] {
+        assert!(discharges(&on, function).is_empty(), "{function}: {on:?}");
+    }
+    for function in ["typed", "carved_use"] {
+        let rows = discharges(&on, function);
+        assert!(
+            !rows.is_empty()
+                && rows
+                    .iter()
+                    .all(|l| l.ends_with("premise=typed-release@R604-1)")),
+            "{function}: {on:?}"
+        );
+    }
+    let off = w66_lines("w66-controls", "off", None);
+    assert!(
+        !off.iter()
+            .any(|l| l.contains("retirement-disjoint:effective-type(")),
+        "no effective-type discharge without the premise: {off:?}"
+    );
+}
+
+/// 077's census for a program too large to solve here (brotli): every heap
+/// release in the MIR, its freed type recovered in its own frame and, where
+/// that ends at a parameter, from each direct caller's argument. No solver.
+#[test]
+#[ignore = "era-5c 077: the freed types of a named program, MIR only"]
+fn e5c_free_types_of() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::mir::TerminatorKind;
+    let path = std::env::var("CRAT_E5C_RD_INPUT").expect("CRAT_E5C_RD_INPUT");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            if let ItemKind::Fn { .. } = item.kind {
+                functions.push(item.owner_id.def_id);
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions: functions.clone(),
+            structs: Vec::new(),
+        };
+        let events = super::source_events::collect(&program);
+        let names: std::collections::BTreeMap<String, _> = functions
+            .iter()
+            .map(|&f| (tcx.def_path_str(f), f))
+            .collect();
+        let mut table = super::retirement::discharge::Discharges::default();
+        let mut tally = std::collections::BTreeMap::<String, usize>::new();
+        for (key, row) in &events.retirements {
+            if !matches!(
+                key.role,
+                super::source_events::SourceRole::Free
+                    | super::source_events::SourceRole::ReallocOld
+            ) {
+                continue;
+            }
+            let super::source_events::SourceObject::HeapThrough(place) = &row.object else {
+                continue;
+            };
+            let Some(&function) = names.get(&key.function) else { continue };
+            let local = table.recover(tcx, function, function, place.clone(), &[]);
+            let mut rows = vec![("own-frame".to_owned(), local)];
+            if rows[0].1.is_none() {
+                for &caller in &functions {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+                    for (bb, data) in body.basic_blocks.iter_enumerated() {
+                        let TerminatorKind::Call { func, .. } = &data.terminator().kind else {
+                            continue;
+                        };
+                        let Some((callee, _)) = func.const_fn_def() else { continue };
+                        if callee != function.to_def_id() {
+                            continue;
+                        }
+                        let step = super::retirement::RouteStep {
+                            caller,
+                            callee: function,
+                            location: rustc_middle::mir::Location {
+                                block: bb,
+                                statement_index: data.statements.len(),
+                            },
+                        };
+                        let found = table.recover(tcx, caller, function, place.clone(), &[step]);
+                        rows.push((format!("caller {}", tcx.def_path_str(caller)), found));
+                    }
+                }
+            }
+            for (via, found) in rows {
+                let name = found
+                    .as_ref()
+                    .map_or("none".to_owned(), |t| table.name_of(t));
+                eprintln!(
+                    "E5C_FREE {}:bb{}[{}] {:?} via={via} P={name}",
+                    key.function, key.block, key.statement, key.role
+                );
+                *tally
+                    .entry(if found.is_some() {
+                        "typed".into()
+                    } else {
+                        "none".into()
+                    })
+                    .or_default() += 1;
+            }
+        }
+        eprintln!("E5C_FREE total {tally:?}");
+    })
+    .unwrap();
+}
+
+/// W67 (R607-1 leg A): the raw-cause ledger's rows, from the W63 child with L01¹⁰'s
+/// arms and the lend on. `CRAT_E5C_W67_FAULT=no-ledger` (test builds) silences the
+/// ledger: every W67 witness is RED under it.
+fn w67_rows(shape: &str, extra: &[(&str, &str)]) -> Vec<Vec<String>> {
+    let mut env = vec![
+        ("CRAT_ERA5C_LEND", "on"),
+        ("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on"),
+    ];
+    env.extend_from_slice(extra);
+    w63_lines(shape, &env)
+        .iter()
+        .filter_map(|l| l.strip_prefix("ledger "))
+        .map(|row| row.split('\t').map(str::to_owned).collect())
+        .collect()
+}
+
+fn w67_row<'a>(rows: &'a [Vec<String>], key: &str) -> &'a Vec<String> {
+    rows.iter()
+        .find(|row| row[0] == key)
+        .unwrap_or_else(|| panic!("no ledger row {key}: {rows:?}"))
+}
+
+/// W67a: ht's `ht_expand::_1` without the discharge is Raw by its own
+/// retirement conflict; with the discharge it is Ref and has no row.
+#[test]
+fn e5c_w67_a_the_ledger_names_a_retirement_conflict() {
+    if !std::path::Path::new(W64_HT).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W64_HT}");
+    let red = w67_rows(&shape, &[("CRAT_E5C_W66_FAULT", "no-discharge")]);
+    let row = w67_row(&red, "src::ht::ht_expand::_1@d0");
+    assert_eq!(
+        (row[2].as_str(), row[3].as_str(), row[6].as_str()),
+        ("retirement-conflict", "src::ht::ht_expand::_1@d0", "direct"),
+        "{row:?}"
+    );
+    let on = w67_rows(&shape, &[]);
+    assert!(
+        !on.iter().any(|row| row[0] == "src::ht::ht_expand::_1@d0"),
+        "{on:?}"
+    );
+    let off = w67_rows(
+        &shape,
+        &[
+            ("CRAT_E5C_W66_FAULT", "no-discharge"),
+            ("CRAT_ERA5C_RAW_CAUSE_LEDGER", "off"),
+        ],
+    );
+    assert!(off.is_empty(), "{off:?}");
+}
+
+/// W67b: bst with its driver restored and A1 off (015's variant): `main_0`'s
+/// `root` is refused ownership by the temporary finalization.
+#[test]
+fn e5c_w67_b_the_ledger_names_the_temporary_finalization() {
+    let variant = "/home/p51lee/dev/.crat-scratch/era-5c/bst-main/lib-variant.rs";
+    if !std::path::Path::new(variant).is_file() {
+        eprintln!("variant absent; skipping");
+        return;
+    }
+    let rows = w67_rows(
+        &format!("file:{variant}"),
+        &[("CRAT_ERA5C_RESEAT_A1", "off")],
+    );
+    let row = w67_row(&rows, "src::bst::main_0::_2@d0");
+    assert_eq!(row[1], "both", "{row:?}");
+    assert!(
+        row[7].contains("own-assume[temporary-finalization]"),
+        "{row:?}"
+    );
+}
+
+/// W67c: a kind-equate partner. On buffer (the corpus), some Raw slot has no
+/// commit of its own: its row names a partner, reached through `kind-equate`,
+/// whose own row is `direct`.
+#[test]
+fn e5c_w67_c_the_ledger_names_a_kind_equate_partner() {
+    let buffer = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/rs-crown-derived/buffer/lib.rs"
+    );
+    if !std::path::Path::new(buffer).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let rows = w67_rows(&format!("file:{buffer}"), &[]);
+    let partnered = rows
+        .iter()
+        .find(|row| {
+            row[3] != row[0]
+                && row[6].contains("kind-equate")
+                && rows
+                    .iter()
+                    .any(|partner| partner[0] == row[3] && partner[6] == "direct")
+        })
+        .unwrap_or_else(|| panic!("no kind-equate partner: {rows:?}"));
+    assert_ne!(partnered[2], "none", "{partnered:?}");
+}
+
+/// W67d: a pointer joined at a phi with null. The null edge excludes nothing
+/// (§29): the row names the allocation source and the ownership refusal.
+#[test]
+fn e5c_w67_d_a_phi_with_null_names_its_real_cause() {
+    let rows = w67_rows("w67-shapes", &[]);
+    let row = w67_row(&rows, "phi_null::_2@d0");
+    assert_eq!(
+        (row[2].as_str(), row[6].as_str()),
+        ("eager:allocation-source", "direct"),
+        "{row:?}"
+    );
+    assert!(row[7].starts_with("own-assume["), "{row:?}");
+    assert!(
+        rows.iter()
+            .all(|row| !row[6].contains("null") && !row[8].contains("null")),
+        "{rows:?}"
+    );
+}
+
+/// W67e: the objective class. With temporaries' Ref weight withheld
+/// (`CRAT_ERA5C_REF_WEIGHT_NAMED=on`), `del::_13` can be Ref and can own, and
+/// the optimum still chooses Raw; under the frame's weights it is not Raw.
+#[test]
+fn e5c_w67_e_the_ledger_names_the_objective() {
+    let rows = w67_rows("w67-shapes", &[("CRAT_ERA5C_REF_WEIGHT_NAMED", "on")]);
+    let row = w67_row(&rows, "del::_13@d0");
+    assert_eq!(
+        (row[1].as_str(), row[2].as_str(), row[7].as_str()),
+        ("objective", "none", "none"),
+        "{row:?}"
+    );
+    let frame = w67_rows("w67-shapes", &[]);
+    assert!(
+        !frame.iter().any(|row| row[0] == "del::_13@d0"),
+        "{frame:?}"
+    );
+}
+
+/// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on and the
+/// two arms as given, plus the type route's debug rows.
+fn w68_lines(arg_order: &str, type_route: &str) -> Vec<String> {
+    w63_lines(
+        "w68-shapes",
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_ERA5C_ARG_ORDER", arg_order),
+            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", type_route),
+        ],
+    )
+}
+
+/// W68a: the argument-order premise, on the corpus's own shape: quadtree's
+/// `insert_(tree, (*tree).root, point, key)` reads the container in the argument
+/// list of the call that receives the lent reborrow of `*tree` (the read is an
+/// argument copy E5C-3 defers to the call).
+#[test]
+fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
+    if !std::path::Path::new(W66_QUADTREE).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W66_QUADTREE}");
+    let lines = |arg_order: &str| {
+        w63_lines(
+            &shape,
+            &[
+                ("CRAT_ERA5C_LEND", "on"),
+                ("CRAT_ERA5C_ARG_ORDER", arg_order),
+                ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
+                ("CRAT_E5C_W63_MODEL_ONLY", "1"),
+            ],
+        )
+    };
+    let key = "src::src::quadtree::quadtree_insert::_1@d0";
+    let red = lines("off");
+    assert_eq!(w63_kind(&red, key), "raw", "RED: {red:?}");
+    let on = lines("on");
+    assert_ne!(w63_kind(&on, key), "raw", "{on:?}");
+    assert_ne!(
+        w63_kind(&on, "src::src::quadtree::quadtree_insert::_23@d0"),
+        "raw",
+        "{on:?}"
+    );
+}
+
+/// W68b: the type route. `reset_`'s `tree_t` and `node_t` formals are A5 overlap
+/// partners; a store through `tree` while the reborrow of `node` is live is not
+/// an argument of the receiving call, so only the type route clears it.
+#[test]
+fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
+    let red = w68_lines("on", "off");
+    assert_ne!(w63_kind(&red, "reset_::_2@d0"), "ref", "RED: {red:?}");
+    assert!(!red.iter().any(|l| l.starts_with("a5-receipt ")), "{red:?}");
+    let on = w68_lines("on", "on");
+    assert_eq!(w63_kind(&on, "reset_::_2@d0"), "ref", "{on:?}");
+    assert!(
+        on.iter()
+            .any(|l| l.starts_with("a5-receipt a5_type_disjoint_pairs=")),
+        "{on:?}"
+    );
+}
+
+/// W68c: the control. `same_`'s two formals share one type: the route gives
+/// nothing and the conflict stays.
+#[test]
+fn e5c_w68_c_one_type_keeps_its_overlap_partner() {
+    let on = w68_lines("on", "on");
+    assert_ne!(w63_kind(&on, "same_::_2@d0"), "ref", "{on:?}");
+}
+
+/// The zero law's market (R645-2, era-5c 086), compile-only: every call from a
+/// local function to a local function whose raw-pointer formal receives the
+/// address of a place (a call-argument temporary defined once by `&mut place`,
+/// `&place`, `&raw mut place` or `&raw const place`). One line per pair:
+/// `E5C_PEEL caller callee formal-slot pointee-type place`.
+#[test]
+#[ignore = "the zero law's market probe, run on a named source"]
+fn e5c_inner_ref_peel_market() {
+    use rustc_data_structures::fx::FxHashMap;
+    use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind};
+    let path = std::env::var("CRAT_E5C_SIDE_SOURCE").expect("CRAT_E5C_SIDE_SOURCE");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            if let ItemKind::Fn { .. } = item.kind {
+                functions.push(item.owner_id.def_id);
+            }
+        }
+        let local: rustc_data_structures::fx::FxHashSet<_> =
+            functions.iter().map(|f| f.to_def_id()).collect();
+        let (mut calls, mut pairs) = (0usize, 0usize);
+        for &caller in &functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            let mut defs: FxHashMap<Local, (usize, Option<String>)> = FxHashMap::default();
+            for block in body.basic_blocks.iter() {
+                for statement in &block.statements {
+                    if let StatementKind::Assign(assign) = &statement.kind
+                        && let Some(lhs) = assign.0.as_local()
+                    {
+                        let entry = defs.entry(lhs).or_insert((0, None));
+                        entry.0 += 1;
+                        entry.1 = match &assign.1 {
+                            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                                Some(format!("{place:?}"))
+                            }
+                            _ => None,
+                        };
+                    }
+                }
+            }
+            for block in body.basic_blocks.iter() {
+                let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
+                    continue;
+                };
+                let Some((callee, _)) = func.const_fn_def() else { continue };
+                if !local.contains(&callee) {
+                    continue;
+                }
+                calls += 1;
+                let inputs = tcx.fn_sig(callee).skip_binder().skip_binder().inputs();
+                for (index, arg) in args.iter().enumerate() {
+                    let Some(proxy) = arg.node.place().and_then(|p| p.as_local()) else {
+                        continue;
+                    };
+                    let Some((1, Some(place))) = defs.get(&proxy) else { continue };
+                    let Some(formal_ty) = inputs.get(index) else { continue };
+                    let rustc_middle::ty::TyKind::RawPtr(pointee, _) = formal_ty.kind() else {
+                        continue;
+                    };
+                    pairs += 1;
+                    println!(
+                        "E5C_PEEL\t{}\t{}\t{}::_{}@d0\t{pointee}\t{place}",
+                        tcx.def_path_str(caller),
+                        tcx.def_path_str(callee),
+                        tcx.def_path_str(callee),
+                        index + 1
+                    );
+                }
+            }
+        }
+        println!("E5C_PEEL_STATS calls={calls} pairs={pairs}");
+    })
+    .unwrap();
+}
+
+/// lil's no-ref-carrier losses (R645-3, era-5c 088), construction only: the
+/// emission-time exclusions of a named source under the caller's arms, one
+/// `E5C_EAGER kind slot` line each (`CRAT_ERA5C_EAGER_DUMP=on`). No solve.
+#[test]
+#[ignore = "the eager-exclusion dump, run on a named source"]
+fn e5c_inner_eager_exclusions() {
+    let path = std::env::var("CRAT_E5C_SIDE_SOURCE").expect("CRAT_E5C_SIDE_SOURCE");
+    let source = std::fs::read_to_string(&path).expect("source");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        let program = crate::utils::rustc::RustProgram {
+            tcx,
+            functions,
+            structs,
+        };
+        let slots = super::crate_slots::CrateSlots::build(&program);
+        let origins = super::origins::compute_origins(&program);
+        let mutability = super::mutability_facts::MutFacts::from_program(&program);
+        let solver = super::solver::KindSolver::new(&slots);
+        super::construction::construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &solver,
+            super::construction::CopyLendMode::Baseline,
+        )
+        .expect("the construction");
+        eprintln!("E5C_EAGER_DONE");
+    })
+    .unwrap();
+}
+
+/// W71 (R659-1; the record `2026-09-29-retirement-fresh-and-interior-release-discharge.md`):
+/// one program with a positive shape per discharge and the three controls. Each
+/// conflict frame reads its formal, then calls a routed release, and does not
+/// touch the formal again, so (α) never discharges.
+const W71_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut)]
+extern "C" {
+    fn malloc(_: u64) -> *mut core::ffi::c_void;
+    fn free(_: *mut core::ffi::c_void);
+    fn realloc(_: *mut core::ffi::c_void, _: u64) -> *mut core::ffi::c_void;
+    fn exit(_: i32) -> !;
+}
+#[repr(C)] pub struct ctx_t { pub err: i32, pub msg: *mut i8, pub n: i32 }
+#[repr(C)] pub struct env_t { pub parent: *mut env_t, pub name: *mut i8 }
+#[repr(C)] pub struct stack_t { pub env: *mut env_t, pub depth: i32 }
+#[repr(C)] pub struct z_t { pub sign: i32, pub used: u64, pub alloced: u64, pub chars: *mut u64 }
+#[repr(C)] pub struct quad_t { pub w: [u64; 4] }
+#[repr(C)] pub struct holder_t { pub q: *mut quad_t, pub buf: *mut u64 }
+#[repr(C)] pub struct val_t { pub d: *mut i8, pub l: u64 }
+// (γ): the released block is a local producer's, made below the conflict frame.
+unsafe extern "C" fn make() -> *mut i8 { malloc(16) as *mut i8 }
+unsafe extern "C" fn tmp_work() { let t = make(); *t = 1; free(t as *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn run_step(c: *mut ctx_t) -> i32 { let n = (*c).n; tmp_work(); n }
+// (α⁺): free-and-replace, the referent stored right after the release.
+unsafe extern "C" fn set_error(c: *mut ctx_t) { free((*c).msg as *mut core::ffi::c_void); (*c).err = 1; (*c).msg = malloc(8) as *mut i8; }
+#[no_mangle] pub unsafe extern "C" fn step(c: *mut ctx_t) -> i32 { let n = (*c).n; set_error(c); n }
+// (α⁺), one frame up: the release in a callee that gets another pointer, the
+// referent stored back in the caller (lil's `lil_pop_env`).
+unsafe extern "C" fn free_env(e: *mut env_t) { free((*e).name as *mut core::ffi::c_void); free(e as *mut core::ffi::c_void); }
+unsafe extern "C" fn pop_env(s: *mut stack_t) { let next = (*(*s).env).parent; free_env((*s).env); (*s).env = next; }
+#[no_mangle] pub unsafe extern "C" fn leave(s: *mut stack_t) -> i32 { let d = (*s).depth; pop_env(s); d }
+// (β′): u64 limbs against a struct with an `int`.
+unsafe extern "C" fn zfree(a: *mut z_t) { free((*a).chars as *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn zclear(a: *mut z_t) -> u64 { let u = (*a).used; zfree(a); u }
+// Control: a genuine release of the referent itself.
+unsafe extern "C" fn destroy(a: *mut z_t) { free(a as *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn finish(a: *mut z_t) -> u64 { let u = (*a).used; destroy(a); u }
+// Control: a P-only referent (four u64) against a released u64 block.
+unsafe extern "C" fn drop_buf(h: *mut holder_t) { free((*h).buf as *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn touch(q: *mut quad_t, h: *mut holder_t) -> u64 { let x = (*q).w[0]; drop_buf(h); x }
+// STOP 2 (i): a possibly-zero-size `realloc` whose null path returns untouched.
+unsafe extern "C" fn append(v: *mut val_t) -> i32 {
+    let n = realloc((*v).d as *mut core::ffi::c_void, (*v).l.wrapping_add(2)) as *mut i8;
+    if n.is_null() { return 0; }
+    (*v).d = n; (*v).l = (*v).l.wrapping_add(1); 1
+}
+#[no_mangle] pub unsafe extern "C" fn push(v: *mut val_t) -> u64 { let l = (*v).l; append(v); l }
+// W73 (R666-1): a callee that releases and then diverges never reaches the
+// caller's later use; the same callee returning is the control.
+unsafe extern "C" fn die(c: *mut ctx_t) { free((*c).msg as *mut core::ffi::c_void); exit(1); }
+#[no_mangle] pub unsafe extern "C" fn fail(c: *mut ctx_t, bad: i32) -> i32 { if bad != 0 { die(c); } (*c).n }
+unsafe extern "C" fn reset_msg(c: *mut ctx_t) { free((*c).msg as *mut core::ffi::c_void); }
+#[no_mangle] pub unsafe extern "C" fn recover(c: *mut ctx_t, bad: i32) -> i32 { if bad != 0 { reset_msg(c); } (*c).n }
+"#;
+
+/// W71a: `ctx.rs` with a command callback that `lil_parse` dispatches while its
+/// `lil` is live, registered as `fnc_jaileval` (a sub-interpreter made and freed).
+const W71_CTX_JAIL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[repr(C)] pub struct env_t { pub parent: *mut env_t, pub depth: i32 }
+pub type proc_t = Option<unsafe extern "C" fn(lil_t, i32) -> i32>;
+#[repr(C)] pub struct ctx_t { pub code: *const u8, pub head: usize, pub clen: usize, pub ignoreeol: i32, pub env: *mut env_t, pub cmd: proc_t }
+pub type lil_t = *mut ctx_t;
+#[no_mangle] pub unsafe extern "C" fn lil_new() -> lil_t {
+    let mut lil = malloc(core::mem::size_of::<ctx_t>() as u64) as lil_t;
+    (*lil).code = 0 as *const u8; (*lil).head = 0; (*lil).clen = 0; (*lil).ignoreeol = 0; (*lil).cmd = None;
+    (*lil).env = malloc(core::mem::size_of::<env_t>() as u64) as *mut env_t;
+    (*(*lil).env).parent = 0 as *mut env_t; (*(*lil).env).depth = 0;
+    return lil;
+}
+unsafe extern "C" fn ateol(mut lil: lil_t) -> i32 {
+    return ((*lil).ignoreeol == 0 && *((*lil).code).offset((*lil).head as isize) == b'\n') as i32;
+}
+unsafe extern "C" fn skip_spaces(mut lil: lil_t) {
+    while (*lil).head < (*lil).clen && *((*lil).code).offset((*lil).head as isize) == b' ' {
+        if ateol(lil) != 0 { break; }
+        (*lil).head = (*lil).head.wrapping_add(1);
+    }
+}
+#[no_mangle] pub unsafe extern "C" fn lil_push_env(mut lil: lil_t) -> *mut env_t {
+    let mut env = malloc(core::mem::size_of::<env_t>() as u64) as *mut env_t;
+    (*env).parent = (*lil).env; (*env).depth = 1; (*lil).env = env;
+    return env;
+}
+#[no_mangle] pub unsafe extern "C" fn lil_pop_env(mut lil: lil_t) {
+    let mut env = (*lil).env;
+    if !(*env).parent.is_null() { (*lil).env = (*env).parent; free(env as *mut core::ffi::c_void); }
+}
+#[no_mangle] pub unsafe extern "C" fn lil_parse(mut lil: lil_t, mut code: *const u8, mut len: usize) -> i32 {
+    let save = (*lil).code; (*lil).code = code; (*lil).clen = len; (*lil).head = 0;
+    lil_push_env(lil);
+    skip_spaces(lil);
+    if let Some(f) = (*lil).cmd { f(lil, 0); }
+    let r = ateol(lil);
+    lil_pop_env(lil);
+    (*lil).code = save;
+    return r;
+}
+#[no_mangle] pub unsafe extern "C" fn lil_free(mut lil: lil_t) {
+    if lil.is_null() { return; }
+    free((*lil).env as *mut core::ffi::c_void);
+    free(lil as *mut core::ffi::c_void);
+}
+#[no_mangle] pub unsafe extern "C" fn lil_register(mut lil: lil_t, mut f: proc_t) { (*lil).cmd = f; }
+unsafe extern "C" fn fnc_jaileval(mut lil: lil_t, mut x: i32) -> i32 {
+    let mut sublil = lil_new();
+    let r = lil_parse(sublil, (*lil).code, (*lil).clen);
+    lil_free(sublil);
+    return r;
+}
+#[no_mangle] pub unsafe extern "C" fn run(code: *const u8, len: usize) -> i32 {
+    let mut lil = lil_new();
+    lil_register(lil, Some(fnc_jaileval));
+    let r = lil_parse(lil, code, len);
+    lil_free(lil);
+    return r;
+}
+"#;
+
+/// W71's lines: the W63 child's receipts (`discharge …`, `retire-conflict …`)
+/// and model, under L01¹⁰'s arms with the three switches set to `on` / `off`.
+fn w71_lines(shape: &str, on: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let mut env: Vec<(&str, &str)> = vec![
+        ("CRAT_ERA5C_LEND", "on"),
+        ("CRAT_ERA5C_RETIRE_FRESH", on),
+        ("CRAT_ERA5C_RETIRE_ROUTE_USE", on),
+        ("CRAT_ERA5C_TYPED_SOLE", on),
+    ];
+    env.extend_from_slice(extra);
+    w63_lines(shape, &env)
+}
+
+fn w71_has(lines: &[String], prefix: &str, target: &str, needle: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| l.starts_with(prefix) && l.contains(target) && l.contains(needle))
+}
+
+/// W71 (b, c, d, the controls, g): each discharge on its shape, off vs on; each
+/// fault takes its GREEN away; the controls and the zero-size path stay conflicts.
+#[test]
+fn e5c_w71_the_three_discharges_and_their_controls() {
+    let off = w71_lines("w71-shapes", "off", &[]);
+    let on = w71_lines("w71-shapes", "on", &[]);
+    // A crate-root function's slot key is `<f>::_<n>@d<k>`. A held conflict
+    // frame's formal is not Ref in the accepted model (the final review lists
+    // no conflict: its target is already committed).
+    let conflict = |lines: &[String], f: &str| w63_kind(lines, &format!("{f}::_1@d0")) != "ref";
+    let receipt = |lines: &[String], f: &str, rule: &str| {
+        w71_has(lines, "discharge", &format!("target={f}::_1@d0"), rule)
+    };
+    // RED: at L01¹⁰ every conflict frame is held.
+    for f in [
+        "run_step", "step", "leave", "zclear", "finish", "touch", "push",
+    ] {
+        assert!(conflict(&off, f), "RED {f}: {off:?}");
+    }
+    for f in ["run_step", "step", "leave", "zclear"] {
+        assert!(!conflict(&on, f), "GREEN {f}: {on:?}");
+    }
+    // GREEN.
+    assert!(receipt(&on, "run_step", "fresh-in-route"), "(γ) {on:?}");
+    assert!(
+        receipt(&on, "step", "post-release-use-route"),
+        "(α⁺) {on:?}"
+    );
+    assert!(
+        receipt(&on, "leave", "post-release-use-route"),
+        "(α⁺) one frame up {on:?}"
+    );
+    assert!(
+        receipt(&on, "zclear", "containment=sole-type"),
+        "(β′) {on:?}"
+    );
+    // The controls and STOP 2 (i).
+    for f in ["finish", "touch", "push"] {
+        assert!(conflict(&on, f), "control {f}: {on:?}");
+        assert!(!receipt(&on, f, ""), "control {f}: {on:?}");
+    }
+    // The faults.
+    for (fault, f, rule) in [
+        ("no-fresh", "run_step", "fresh-in-route"),
+        ("no-route-use", "step", "post-release-use-route"),
+        ("no-sole", "zclear", "containment=sole-type"),
+    ] {
+        let lines = w71_lines("w71-shapes", "on", &[("CRAT_E5C_W71_FAULT", fault)]);
+        assert!(
+            !receipt(&lines, f, rule),
+            "fault {fault} must be caught: {lines:?}"
+        );
+    }
+}
+
+/// W71a: lil's shape. Does the review raise the context formals' conflict on
+/// the jail's release, and does (γ) discharge it through the callback's route?
+/// Measured (era-5c 097): on this reduction the review raises none -- the
+/// jail's `env_t` release is (β)'s at L01¹⁰ and the sub-interpreter's own
+/// release is no conflict -- so the context formal is Ref in both arms; lil's
+/// held formals are measured on the solve.
+#[test]
+fn e5c_w71_a_the_jail_release_is_fresh() {
+    let off = w71_lines("ctx-jail", "off", &[]);
+    let on = w71_lines("ctx-jail", "on", &[]);
+    let jail = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.contains("lil_free") || l.contains("jaileval"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    eprintln!("W71a off {:?}\nW71a on {:?}", jail(&off), jail(&on));
+    assert_eq!(w63_kind(&off, "fnc_jaileval::_1@d0"), "ref", "{off:?}");
+    assert_eq!(w63_kind(&on, "fnc_jaileval::_1@d0"), "ref", "{on:?}");
+}
+
+/// W72 (R659-1; wave-5d 133 STOP 2): the arm-(a) receipt export. On quadtree's
+/// own `insert_(tree, (*tree).root, …)` the model's receipts equal the portable
+/// export's and the prepared entry's, and one names `quadtree_insert`'s call
+/// with the tree as its lent pointer; with the arm off the family is not recorded.
+#[test]
+fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
+    if !std::path::Path::new(W66_QUADTREE).is_file() {
+        eprintln!("corpus absent; skipping");
+        return;
+    }
+    let shape = format!("file:{W66_QUADTREE}");
+    let lines = |arg_order: &str| {
+        w63_lines(
+            &shape,
+            &[
+                ("CRAT_ERA5C_LEND", "on"),
+                ("CRAT_ERA5C_ARG_ORDER", arg_order),
+                ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
+                ("CRAT_E5C_W72", "1"),
+            ],
+        )
+    };
+    let on = lines("on");
+    let summary = on
+        .iter()
+        .find(|l| l.starts_with("arg-order model="))
+        .unwrap_or_else(|| panic!("{on:?}"));
+    assert!(summary.ends_with("equal=true"), "{summary}");
+    assert!(
+        on.iter().any(|l| l.starts_with("arg-order-row ")
+            && l.contains("quadtree_insert")
+            && l.contains("lent=_1 ")),
+        "{on:?}"
+    );
+    // R666-1, the loader: the key's span is the receiving call's own text.
+    assert!(
+        on.iter().any(|l| l.starts_with("arg-order-hoist ")
+            && l.contains("quadtree_insert")
+            && l.contains("lent=_1 ")
+            && l.contains("text=insert_(")
+            && l.contains(".root")),
+        "{on:?}"
+    );
+    let off = lines("off");
+    let summary = off
+        .iter()
+        .find(|l| l.starts_with("arg-order model="))
+        .unwrap_or_else(|| panic!("{off:?}"));
+    assert!(
+        summary.starts_with("arg-order model=none") && summary.contains("not recorded"),
+        "{summary}"
+    );
+}
+
+/// W73 (R666-1): (α) discharges only when every route frame below returns. At
+/// L01¹⁰ `fail`'s later use discharges `die`'s release although `die` exits
+/// after it (RED); with `CRAT_ERA5C_ALPHA_RETURNS` it stays a conflict, while
+/// `recover` (a returning callee) keeps its discharge; the fault gives it back.
+#[test]
+fn e5c_w73_alpha_needs_the_route_to_return() {
+    let run = |alpha: &str, fault: Option<&str>| {
+        let mut extra = vec![("CRAT_ERA5C_ALPHA_RETURNS", alpha)];
+        if let Some(fault) = fault {
+            extra.push(("CRAT_E5C_W71_FAULT", fault));
+        }
+        w71_lines("w71-shapes", "off", &extra)
+    };
+    let alpha = |lines: &[String], f: &str| {
+        w71_has(
+            lines,
+            "discharge",
+            &format!("target={f}::"),
+            "post-free-use(",
+        )
+    };
+    let off = run("off", None);
+    assert!(alpha(&off, "fail"), "RED: {off:?}");
+    assert!(alpha(&off, "recover"), "{off:?}");
+    let on = run("on", None);
+    assert!(!alpha(&on, "fail"), "{on:?}");
+    assert_ne!(w63_kind(&on, "fail::_1@d0"), "ref", "{on:?}");
+    assert!(
+        alpha(&on, "recover"),
+        "the control keeps its discharge: {on:?}"
+    );
+    let fault = run("on", Some("no-alpha-returns"));
+    assert!(alpha(&fault, "fail"), "the fault must be caught: {fault:?}");
+}
+
+/// W74 (R668-4; analysis-fanout 014 STOP 1 (i)): the ledger names each Mode-A
+/// commit's witnessed clause. `g`: `p` lends `(*s).x`, `q` copies it, and a
+/// write through `r`, a Raw copy of `s` (cast to an integer), invalidates the
+/// loan while `q` is live -- the commit falls on `q` with `p` its Ref peer and
+/// `r` its Raw invalidator. `h`: `p` is its own loan's issuer and only live
+/// requirer -- self-issued.
+const W74_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+#[repr(C)] pub struct S { pub x: i32 }
+#[no_mangle] pub unsafe extern "C" fn g(s: *mut S) -> i32 {
+    let r: *mut S = s;
+    let n = r as usize;
+    let p: *mut i32 = &mut (*s).x;
+    let q: *mut i32 = p;
+    (*r).x = 5;
+    *q + n as i32
+}
+#[no_mangle] pub unsafe extern "C" fn h(a: *mut i32) -> i32 {
+    let p: *mut i32 = a;
+    *a = 1;
+    *p
+}
+"#;
+
+/// W74: the ledger's clause columns (`tsv` 9–11: `noref_clause`,
+/// `noref_ref_peers`, `noref_raw_invalidators`). A Mode-A first cause names its
+/// commit's clause; any other names none. `CRAT_E5C_W74_FAULT=no-invalidators`
+/// (test builds) drops the recorded invalidators: RED.
+#[test]
+fn e5c_w74_the_ledger_names_each_commits_clause() {
+    let rows = w67_rows("w74-shapes", &[]);
+    let mode_a = [
+        "borrow-exclusion",
+        "retirement-conflict",
+        "reader-obligation",
+    ];
+    for row in &rows {
+        let clause = row[9].as_str();
+        if mode_a.contains(&row[2].as_str()) {
+            assert!(clause == "guarded" || clause == "self-issued", "{row:?}");
+        } else {
+            assert_eq!(
+                (clause, &row[10][..], &row[11][..]),
+                ("-", "-", "-"),
+                "{row:?}"
+            );
+        }
+    }
+    let guarded = rows
+        .iter()
+        .find(|row| row[3].starts_with("g::") && row[9] == "guarded")
+        .unwrap_or_else(|| panic!("no guarded commit in g: {rows:?}"));
+    assert_eq!(
+        guarded[10], guarded[5],
+        "the Ref peer is the issuer: {guarded:?}"
+    );
+    // `r`'s write invalidates in round 1, while `r` is still Ref; the round-2
+    // commit lists the round-1 target as its Raw invalidator.
+    assert!(
+        rows.iter()
+            .any(|row| row[3].starts_with("g::") && row[11].starts_with("g::")),
+        "a Raw invalidator: {rows:?}"
+    );
+    let own = rows
+        .iter()
+        .find(|row| row[3].starts_with("h::") && row[9] == "self-issued")
+        .unwrap_or_else(|| panic!("no self-issued commit in h: {rows:?}"));
+    assert_eq!(own[10], "-", "{own:?}");
+    let fault = w67_rows("w74-shapes", &[("CRAT_E5C_W74_FAULT", "no-invalidators")]);
+    assert!(
+        fault.iter().all(|row| row[11] == "-"),
+        "the fault must be caught: {fault:?}"
     );
 }

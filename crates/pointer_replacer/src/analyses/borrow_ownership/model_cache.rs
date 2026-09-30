@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p9-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p11-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -213,6 +213,39 @@ pub(crate) fn solver_identity(
         "era5c_move_store",
         super::field_moves::move_store().to_string(),
     );
+    fields.insert("era5c_lend", super::licensing::lend::lend().to_string());
+    fields.insert(
+        "era5c_typed_release",
+        super::retirement::discharge::typed_release().to_string(),
+    );
+    fields.insert(
+        "era5c_arg_order",
+        super::field_moves::arg_order().to_string(),
+    );
+    fields.insert(
+        "era5c_overlap_type_route",
+        super::field_moves::overlap_type_route().to_string(),
+    );
+    fields.insert(
+        "era5c_ref_peel_zero",
+        super::field_moves::ref_peel_zero().to_string(),
+    );
+    fields.insert(
+        "era5c_retire_fresh",
+        super::retirement::discharge::retire_fresh().to_string(),
+    );
+    fields.insert(
+        "era5c_retire_route_use",
+        super::retirement::discharge::retire_route_use().to_string(),
+    );
+    fields.insert(
+        "era5c_typed_sole",
+        super::retirement::discharge::typed_sole().to_string(),
+    );
+    fields.insert(
+        "era5c_alpha_returns",
+        super::retirement::discharge::alpha_returns().to_string(),
+    );
     fields.insert(
         "era5c_own_named",
         super::field_moves::own_named().to_string(),
@@ -266,6 +299,9 @@ pub(crate) fn solver_identity(
             "CRAT_E5C_W60_FAULT",
             "CRAT_E5C_W61_FAULT",
             "CRAT_E5C_W62_FAULT",
+            "CRAT_E5C_W63_FAULT",
+            "CRAT_E5C_W64_FAULT",
+            "CRAT_E5C_W66_FAULT",
         ]
         .iter()
         .filter_map(|name| {
@@ -285,7 +321,6 @@ pub(crate) fn solver_identity(
             "CRAT_ERA5C_DEBUG",
             "CRAT_ERA5C_EQ_BACKTRACE",
             "CRAT_ERA5C_FIELDSIZE",
-            "CRAT_ERA5C_PROFILE",
             "CRAT_ERA5C_RESEAT_DUMP",
             "CRAT_ERA5C_RESEAT_WHY",
         ]
@@ -294,13 +329,6 @@ pub(crate) fn solver_identity(
         .copied()
         .collect::<Vec<_>>()
         .join(","),
-    );
-    // The diagnosis gate is not an arm, but it DOES change the constraint set,
-    // so by R374-1's own argument it belongs in the identity: a solve run with
-    // a family skipped must not compute the same key as one without.
-    fields.insert(
-        "era5c_skip_family",
-        std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default(),
     );
     fields.insert("copy_lend_mode", CopyLendMode::current().label().to_owned());
     fields.insert(
@@ -376,23 +404,6 @@ pub(crate) fn read_enabled() -> bool {
         return read;
     }
     matches!(std::env::var("CRAT_BO_CACHE").as_deref(), Ok("1"))
-}
-
-/// R471-3 (i) diagnosis: RSS at a phase boundary, behind CRAT_ERA5C_PROFILE.
-fn e5c_rss(tag: &str) {
-    if std::env::var_os("CRAT_ERA5C_PROFILE").is_none() {
-        return;
-    }
-    let gib = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| {
-            s.split_whitespace()
-                .nth(1)
-                .and_then(|p| p.parse::<f64>().ok())
-        })
-        .map(|pages| pages * 4096.0 / 1073741824.0)
-        .unwrap_or(0.0);
-    eprintln!("E5C_PHASE {tag:<34} rss={gib:7.2} GiB");
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
@@ -681,30 +692,47 @@ pub(crate) fn prepare(
         let directory = dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("era5b-model-cache-v1");
-        e5c_rss("stream::collect_to_path ENTER");
         let portable =
             super::portable_export::stream::collect_to_path(program, slots, captured, &directory)?;
-        e5c_rss("stream::collect_to_path EXIT");
         let origin = super::origin_evidence::collect(program, slots, origins, Some(captured));
-        e5c_rss("origin_evidence::collect EXIT");
         let mut functions: Vec<_> = program
             .functions
             .iter()
             .map(|did| program.tcx.def_path_str(did.to_def_id()))
             .collect();
         functions.sort();
-        e5c_rss("functions built");
         let e5c_universe: Vec<_> = universe(program.tcx, slots)
             .ok_or("invalid slot universe")?
             .into_keys()
             .collect();
-        e5c_rss("universe built");
         let e5c_model =
             model_map(program.tcx, slots, &verified.model).ok_or("invalid accepted model keys")?;
-        e5c_rss("model_map(model) built");
         let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
             .ok_or("invalid baseline model keys")?;
-        e5c_rss("model_map(baseline) built");
+        // era-5c R607-1: the raw-cause ledger, a sidecar beside the entry; the
+        // entry's bytes, identity and readback are untouched.
+        if super::raw_cause::enabled() {
+            let path = directory.join(format!("{}.raw-cause-ledger.tsv", inputs.program));
+            match super::raw_cause::take_for(&verified.model) {
+                Some(rows) => {
+                    let mut text = format!("{}\n", super::raw_cause::HEADER);
+                    for row in &rows {
+                        text.push_str(&format!("{}\t{}\n", inputs.program, row.sidecar()));
+                    }
+                    // A failed sidecar never fails the entry.
+                    match std::fs::create_dir_all(&directory)
+                        .and_then(|()| std::fs::write(&path, text))
+                    {
+                        Ok(()) => eprintln!("E5C_LEDGER {} rows={}", path.display(), rows.len()),
+                        Err(error) => eprintln!("E5C_LEDGER {} error: {error}", path.display()),
+                    }
+                }
+                None => eprintln!(
+                    "E5C_LEDGER {} missing: no ledger explains the model",
+                    path.display()
+                ),
+            }
+        }
         // R473-4 design (A): stream the canonical origin bytes to a file,
         // per element, and hand the cache the PATH. The whole-`Value` form that
         // cost 31 GiB on libzahl is never built. The file is removed once the
@@ -735,10 +763,9 @@ pub(crate) fn prepare(
             origin.write_canonical_json(&mut writer)?;
             std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
         }
-        e5c_rss("origin streamed to file");
         // R473-4: compare the streamed file against the OLD whole-Value bytes,
         // in the real write path, and report the first divergence. This REBUILDS
-        // the old path, so it must never ride on CRAT_ERA5C_PROFILE -- an
+        // the old path, so it must never ride on a profiling switch -- an
         // acceptance run would then measure the proof instead of the fix.
         if std::env::var_os("CRAT_ERA5C_BYTEPROOF").is_some() {
             let old_bytes = serde_json::to_string(
@@ -804,8 +831,8 @@ pub(crate) fn prepare(
             receipt: verified.receipt.clone(),
             origin: e5c_origin,
             move_store: Default::default(),
+            arg_order: Default::default(),
         };
-        e5c_rss("Metadata built");
         let e5c_twin = e5c_twin_path.map(|twin| {
             let guard = OriginFile(twin.clone());
             let mut twin_metadata = metadata.clone();
@@ -813,7 +840,6 @@ pub(crate) fn prepare(
             (guard, twin_metadata)
         });
         let entry = super::cache_contract::stage_streamed(&directory, metadata, &portable.path)?;
-        e5c_rss("stage_streamed done");
         if let Some((_guard, twin_metadata)) = e5c_twin {
             let twin_entry =
                 super::cache_contract::stage_streamed(&directory, twin_metadata, &portable.path)?;
@@ -853,9 +879,7 @@ pub(crate) fn prepare(
                 .map_err(|error| error.to_string())?;
             // The frozen materializer sees the same capture and actual entry.metadata.
             // No diagnostic labels, history, identities, or bytes are normalized.
-            e5c_rss("portable_export::collect ENTER");
             let reference_exports = super::portable_export::collect(program, slots, captured)?;
-            e5c_rss("portable_export::collect EXIT");
             let reference = super::cache_contract::CompleteEntry {
                 schema: entry.metadata.schema.clone(),
                 key: entry.metadata.key.clone(),
@@ -934,6 +958,80 @@ pub(crate) fn prepare(
             PREPARE_ERROR.with(|e| *e.borrow_mut() = Some(error));
         }
     }
+}
+
+/// L01¹¹ (R659-1; wave-5d 133 STOP 2): the prepared entry's arm-(a) receipts,
+/// for the emission's hoist (`DecisionTable::arg_order_hoists`). Refused unless
+/// the entry records them.
+pub(crate) fn prepared_arg_order_applied(
+    fingerprint: &str,
+) -> Result<Vec<super::portable_export::ArgOrderRow>, String> {
+    let (path, metadata) = PREPARED
+        .with(|prepared| {
+            prepared
+                .borrow()
+                .as_ref()
+                .filter(|prepared| prepared.entry.metadata.key == fingerprint)
+                .map(|prepared| (prepared.entry.path.clone(), prepared.entry.metadata.clone()))
+        })
+        .ok_or("no prepared entry for this fingerprint")?;
+    match metadata.arg_order {
+        super::cache_contract::stream::MoveStoreCapture::Missing => {
+            super::cache_contract::validate_file(&path)?.arg_order_applied()
+        }
+        _ => metadata.arg_order_applied(),
+    }
+}
+
+/// L01¹¹ (R666-1, the loader): the prepared entry's arm-(a) receipts as the
+/// emission's hoist keys `((lo, hi), caller, lent)`, for the one line the
+/// rewriter needs: `table.arg_order_hoists = prepared_arg_order_hoists(tcx, &fp)`.
+/// Each call's span is re-read from THIS session's MIR at the receipt's
+/// location, so a receipt another process wrote keys this session's AST.
+pub(crate) fn prepared_arg_order_hoists(
+    tcx: TyCtxt<'_>,
+    fingerprint: &str,
+) -> Result<
+    rustc_hash::FxHashSet<(
+        (u32, u32),
+        rustc_span::def_id::LocalDefId,
+        rustc_middle::mir::Local,
+    )>,
+    String,
+> {
+    let rows = prepared_arg_order_applied(fingerprint)?;
+    let by_path: FxHashMap<String, rustc_span::def_id::LocalDefId> = tcx
+        .hir_body_owners()
+        .filter(|did| tcx.def_kind(*did).is_fn_like())
+        .map(|did| (tcx.def_path_str(did.to_def_id()), did))
+        .collect();
+    rows.iter()
+        .map(|row| {
+            let caller = *by_path
+                .get(&row.function)
+                .ok_or_else(|| format!("arg-order receipt names no local fn: {}", row.function))?;
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            let block = body
+                .basic_blocks
+                .get(rustc_middle::mir::BasicBlock::from_u32(row.call.block))
+                .ok_or("arg-order receipt's block is out of range")?;
+            match &block.terminator().kind {
+                rustc_middle::mir::TerminatorKind::Call { fn_span, .. }
+                    if row.call.statement == block.statements.len() =>
+                {
+                    Ok((
+                        (fn_span.lo().0, fn_span.hi().0),
+                        caller,
+                        rustc_middle::mir::Local::from_u32(row.lent),
+                    ))
+                }
+                _ => Err(format!(
+                    "arg-order receipt is not at a call: {}:bb{}[{}]",
+                    row.function, row.call.block, row.call.statement
+                )),
+            }
+        })
+        .collect()
 }
 
 /// L01⁹ wall 4 (R574-5 (iii)): the prepared entry's store-as-move obligations,
@@ -1066,7 +1164,7 @@ pub(crate) fn store(
     }
 }
 
-fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Option<String> {
+pub(crate) fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Option<String> {
     match r {
         SlotRef::Local(fn_did, id) => {
             let slot = slots.fn_local_slots.get(&fn_did)?.slot(id);
@@ -1162,7 +1260,7 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5c-l01p9-v1",
+            "analysis_frame=era5c-l01p11-v1",
             "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",

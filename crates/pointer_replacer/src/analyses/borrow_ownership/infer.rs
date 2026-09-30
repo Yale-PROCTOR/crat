@@ -1193,17 +1193,7 @@ where
 
         // finalize temporaries
         //
-        // R510-1(1) COUNTERFACTUAL PIN -- NEVER LANDS. era-5c report 033 found
-        // `own-assume[temporary-finalization]` in all nine relaxation cores of
-        // the bst driver variant while the corpus form has none. This gate drops
-        // the family so the seat can see whether removing it RECOVERS the model
-        // (the caller re-seat rule is then sufficient) or exposes a second wall.
-        // Diagnosis only: `CRAT_ERA5C_SKIP_FAMILY=temporary-finalization`.
-        let skip_finalization = super::field_moves::finalize_soft()
-            || std::env::var("CRAT_ERA5C_SKIP_FAMILY")
-                .unwrap_or_default()
-                .split(',')
-                .any(|name| name.trim() == "temporary-finalization");
+        let skip_finalization = super::field_moves::finalize_soft();
         with_own_assume_site(OwnAssumeSite::TemporaryFinalization, || {
             if skip_finalization {
                 return;

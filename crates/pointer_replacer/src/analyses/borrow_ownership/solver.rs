@@ -193,6 +193,16 @@ impl CoreTracker {
             .collect()
     }
 
+    /// era-5c R607-1 (the raw-cause ledger): the track of the constraint
+    /// recorded last, and every track with its label.
+    fn last_track(&self) -> Option<Bool> {
+        self.entries.borrow().last().map(|(track, _)| track.clone())
+    }
+
+    fn labeled(&self) -> Vec<(Bool, String)> {
+        self.entries.borrow().clone()
+    }
+
     fn len(&self) -> usize {
         self.entries.borrow().len()
     }
@@ -691,6 +701,54 @@ impl KindSolver {
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
         self.tracker.as_ref()
+    }
+
+    /// era-5c R607-1: the production track of the hard constraint asserted
+    /// last, so a core literal names the commit it came from.
+    pub(crate) fn last_track(&self) -> Option<Bool> {
+        self.tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+            .and_then(CoreTracker::last_track)
+    }
+
+    /// era-5c R607-1: every production track with its label.
+    pub(crate) fn tracked_labels(&self) -> Vec<(Bool, String)> {
+        self.tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+            .map(CoreTracker::labeled)
+            .unwrap_or_default()
+    }
+
+    /// era-5c R607-1: can `slot` take `kind` under the hard system and the
+    /// selectors `kept`? `Ok(None)`: yes. `Ok(Some(core))`: no, and the tracked
+    /// core says why. `Err`: unknown. Asserts nothing and touches no counter
+    /// the entry records, so the accepted model and its entry are unchanged.
+    pub(crate) fn raw_cause_probe(
+        &self,
+        hard: &HardLoopSolver,
+        kept: &[Bool],
+        slot: SlotRef,
+        kind: SlotKind,
+    ) -> Result<Option<Vec<Bool>>, String> {
+        execution_guard::require(Operation::Query(QueryStage::HardTrackedRecheck));
+        let vars = &self.vars[&slot];
+        let bit = match kind {
+            SlotKind::Raw => &vars.raw,
+            SlotKind::Ref => &vars.ref_,
+            SlotKind::Owning => &vars.own,
+        };
+        let mut bundle = self.assumption_bundle(kept);
+        bundle.push(bit.clone());
+        match hard.solver.check_assumptions(&bundle) {
+            SatResult::Sat => Ok(None),
+            SatResult::Unsat => Ok(Some(hard.solver.get_unsat_core())),
+            SatResult::Unknown => Err(hard
+                .solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())),
+        }
     }
 
     pub(crate) fn is_diagnostic_tracked(&self) -> bool {
@@ -2874,16 +2932,6 @@ impl KindSolver {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(assumptions);
-        // R467-2 profile: the size of the query actually handed to z3.
-        if self.check_sat_count.get() == 1 && std::env::var("CRAT_ERA5C_PROFILE").is_ok() {
-            eprintln!(
-                "E5C_QUERY hard={} tracks={} assumptions={} vars={}",
-                self.hard_assertion_count(),
-                self.mandatory_tracks().len(),
-                bundle.len(),
-                self.vars.len()
-            );
-        }
         let outcome = self.solver.check(&bundle);
         let query_reason = (outcome == SatResult::Unknown)
             .then(|| self.solver.get_reason_unknown())
@@ -3134,19 +3182,7 @@ impl KindSolver {
             Some(epoch)
         });
 
-        let mut relax_rounds = 0usize;
-        let profile_rounds = std::env::var("CRAT_ERA5C_PROFILE").is_ok();
         loop {
-            // R467-2 profile: the relax loop's shape — rounds and live assumptions.
-            if profile_rounds && relax_rounds % 200 == 0 {
-                eprintln!(
-                    "E5C_RELAX round={relax_rounds} assumptions={} dropped={} tracks={}",
-                    assumptions.len(),
-                    dropped.len(),
-                    self.mandatory_tracks().len()
-                );
-            }
-            relax_rounds += 1;
             self.prepare_demand_query(QueryPhase::SelectorSearch, None);
             match self.hard_check_with_assumptions(hard, &assumptions) {
                 SatResult::Sat => break,
@@ -3317,18 +3353,6 @@ impl KindSolver {
         }
         self.assert_return_port_rows(&rows);
         self.prepare_demand_query(QueryPhase::Materialization, None);
-        // R467-2 profile: the size of the materialization query handed to z3.
-        if std::env::var("CRAT_ERA5C_PROFILE").is_ok() {
-            eprintln!(
-                "E5C_QUERY materialization#{} hard={} tracks={} bundle={} rows={} vars={}",
-                self.optimize_materialization_count.get(),
-                self.hard_assertion_count(),
-                self.mandatory_tracks().len(),
-                bundle.len(),
-                rows.len(),
-                self.vars.len()
-            );
-        }
         let mut outcome = self.solver.check(&[]);
         if outcome == SatResult::Unsat && !rows.is_empty() {
             self.solver.pop();
@@ -3930,7 +3954,7 @@ impl BoOwnDatabase<'_> {
     pub(crate) fn declare_pending_fold(&mut self, key: (u32, usize)) {
         let candidate = {
             // R353-2: era-5b's own addition; the pin had no such constraint.
-            if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            if !super::licensing::facts::joint() {
                 return;
             }
             let facts = self.ownership_facts.borrow();
@@ -3980,7 +4004,7 @@ impl BoOwnDatabase<'_> {
     pub(crate) fn traversal_view_zero(&mut self, guard: &Bool, var: Var, formal: bool) {
         let operation = if formal {
             // R353-2: era-5b's own addition; the pin had no such constraint.
-            if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+            if !super::licensing::facts::joint() {
                 return;
             }
             "guarded-traversal-formal-zero"
@@ -4013,7 +4037,7 @@ impl BoOwnDatabase<'_> {
 
     pub(crate) fn pending_traversal_pair(&mut self, guard: &Bool, variables: &[Var]) {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+        if !super::licensing::facts::joint() {
             return;
         }
         let (operation, clause) = match variables {
@@ -4470,7 +4494,7 @@ impl Database for BoOwnDatabase<'_> {
         ensure_move: bool,
     ) {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_readers() {
+        if !super::licensing::facts::joint() {
             return;
         }
         super::ownership_evidence::record(
@@ -4514,9 +4538,7 @@ impl Database for BoOwnDatabase<'_> {
         super::ownership_evidence::record(
             if source {
                 // R353-2: era-5b's own addition; the pin had no such constraint.
-                if !super::licensing::facts::joint()
-                    || super::licensing::facts::skip_joint_readers()
-                {
+                if !super::licensing::facts::joint() {
                     return;
                 }
                 "guarded-reader-source-tail"
@@ -4547,7 +4569,7 @@ impl Database for BoOwnDatabase<'_> {
         boundary: &super::ownership_boundary::Substitution,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+        if !super::licensing::facts::joint() {
             return false;
         }
         use super::{
@@ -4666,7 +4688,7 @@ impl Database for BoOwnDatabase<'_> {
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+        if !super::licensing::facts::joint() {
             return false;
         }
         use super::ownership_occurrence::Availability::Present;
@@ -4738,7 +4760,7 @@ impl Database for BoOwnDatabase<'_> {
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() || super::licensing::facts::skip_joint_other() {
+        if !super::licensing::facts::joint() {
             return false;
         }
         use super::ownership_occurrence::{Availability::Present, PathStep};

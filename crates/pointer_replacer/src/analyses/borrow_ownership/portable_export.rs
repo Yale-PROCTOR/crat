@@ -38,9 +38,12 @@ pub(crate) enum ExportFamily {
     /// L01⁹ wall 4: one row per qualifying store (design record §3.3);
     /// `NotRecorded` when `CRAT_ERA5C_MOVE_STORE` is off.
     MoveStoreObligations,
+    /// L01¹¹ (R659-1): one row per arm-(a) application (the call and the lent
+    /// pointer); `NotRecorded` when `CRAT_ERA5C_ARG_ORDER` is off.
+    ArgOrderApplied,
 }
 
-pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 21] = [
+pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 22] = [
     ExportFamily::OwnershipVersions,
     ExportFamily::OwnershipValues,
     ExportFamily::SourceSelectors,
@@ -62,6 +65,7 @@ pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 21] = [
     ExportFamily::DemandEvidence,
     ExportFamily::ProofEvidence,
     ExportFamily::MoveStoreObligations,
+    ExportFamily::ArgOrderApplied,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -164,7 +168,9 @@ impl PortableExport {
                 CaptureAvailability::NotRecorded { reason }
                     if matches!(
                         family,
-                        ExportFamily::ResidualConflicts | ExportFamily::MoveStoreObligations
+                        ExportFamily::ResidualConflicts
+                            | ExportFamily::MoveStoreObligations
+                            | ExportFamily::ArgOrderApplied
                     ) && !reason.is_empty()
                         && payload.source_rows == 0
                         && payload.records.is_empty() => {}
@@ -623,10 +629,18 @@ impl Resolver<'_, '_> {
                 })
             })
             .collect::<Vec<_>>();
-        Ok((
-            json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal,"known_stack_entries":review.known_stack_entries}),
-            json!(diagnostics),
-        ))
+        let mut value = json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal,"known_stack_entries":review.known_stack_entries});
+        // L01¹⁰ (R603-2): additive, and absent when nothing was discharged, so
+        // an entry without a discharge is byte-identical to the frame before.
+        if !review.discharged.is_empty() {
+            let discharged=review.discharged.iter().map(|row|{
+                let target=self.slot(row.target)?;
+                if target!=row.target_key{return Err("retirement discharge target canonical key mismatch".into());}
+                Ok(json!({"function":self.function(row.function)?,"target":target,"source":source_key(&row.source),"phase":tag(row.phase),"location":location(row.location),"route":self.steps(&row.route)?,"receipt":row.receipt()}))
+            }).collect::<Result<Vec<_>,String>>()?;
+            value["discharged"] = json!(discharged);
+        }
+        Ok((value, json!(diagnostics)))
     }
 }
 
@@ -647,6 +661,7 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         F::RetirementRounds => vec!["round"],
         F::RetirementFinal | F::DemandEvidence | F::ProofEvidence => vec![],
         F::MoveStoreObligations => vec!["function", "store"],
+        F::ArgOrderApplied => vec!["function", "call", "lent"],
         _ => fields.keys().map(String::as_str).collect(),
     };
     let identity = selected
@@ -663,6 +678,106 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         "{family:?}/{}",
         serde_json::to_string(&identity).map_err(|e| e.to_string())?
     ))
+}
+
+/// L01¹¹ (R659-1; wave-5d 133 STOP 2): the typed row of the `arg-order-applied`
+/// family. `call` is the receiving call's MIR location, `span` its `fn_span`,
+/// `lent` the pointer whose reborrow the call receives (the subject the
+/// emission's hoist matches), `owner` the receiving temporary.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArgOrderRow {
+    pub(crate) function: String,
+    pub(crate) call: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) lent: u32,
+    pub(crate) owner: u32,
+}
+
+/// Why the family is `NotRecorded`: the arm was off.
+pub(crate) const ARG_ORDER_NOT_RECORDED: &str =
+    "CRAT_ERA5C_ARG_ORDER off: arm (a) admitted no argument read";
+
+/// The rows a producer recorded, in the portable form; `None` = arm off.
+pub(crate) fn arg_order_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<ArgOrderRow>>, String> {
+    let Some(rows) = &export.arg_order_applied else {
+        return Ok(None);
+    };
+    let tcx = program.tcx;
+    let resolver = Resolver { program, slots };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(ArgOrderRow {
+                function: resolver.function(row.function)?,
+                call: MoveStoreLocation {
+                    block: row.location.block.as_u32(),
+                    statement: row.location.statement_index,
+                },
+                span: super::ownership_occurrence::SourceSpan {
+                    file: tcx
+                        .sess
+                        .source_map()
+                        .span_to_filename(row.span)
+                        .prefer_local()
+                        .to_string(),
+                    lo: row.span.lo().0,
+                    hi: row.span.hi().0,
+                },
+                lent: row.lent.as_u32(),
+                owner: row.owner.as_u32(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(arg_order_order);
+    Ok(Some(out))
+}
+
+fn arg_order_order(a: &ArgOrderRow, b: &ArgOrderRow) -> std::cmp::Ordering {
+    // Total: two receipts of one call and lent differ in their owner.
+    (&a.function, a.call.block, a.call.statement, a.lent, a.owner).cmp(&(
+        &b.function,
+        b.call.block,
+        b.call.statement,
+        b.lent,
+        b.owner,
+    ))
+}
+
+/// The consumer's accessor: a family that is `NotRecorded` or rows that do not
+/// decode are refused.
+pub(crate) fn decode_arg_order(
+    availability: &CaptureAvailability,
+    records: &[BTreeMap<String, Value>],
+) -> Result<Vec<ArgOrderRow>, String> {
+    if let CaptureAvailability::NotRecorded { reason } = availability {
+        return Err(format!("arg-order receipts not recorded: {reason}"));
+    }
+    let mut rows = records
+        .iter()
+        .map(|fields| {
+            serde_json::from_value(Value::Object(fields.clone().into_iter().collect()))
+                .map_err(|e| format!("arg-order row: {e}"))
+        })
+        .collect::<Result<Vec<ArgOrderRow>, String>>()?;
+    rows.sort_by(arg_order_order);
+    Ok(rows)
+}
+
+impl PortableExport {
+    /// The rows, or a refusal: a missing family or `NotRecorded`.
+    pub(crate) fn arg_order_applied(&self) -> Result<Vec<ArgOrderRow>, String> {
+        let family = self
+            .families
+            .get(&ExportFamily::ArgOrderApplied)
+            .ok_or("arg-order-applied family missing")?;
+        let records: Vec<_> = family.records.iter().map(|r| r.fields.clone()).collect();
+        decode_arg_order(&family.availability, &records)
+    }
 }
 
 /// L01⁹ wall 4: the typed row of the `move-store-obligations` family. The
@@ -1011,6 +1126,22 @@ pub(crate) fn collect(
                 .unwrap()
                 .availability = CaptureAvailability::NotRecorded {
                 reason: MOVE_STORE_NOT_RECORDED.into(),
+            };
+        }
+    }
+    match arg_order_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::ArgOrderApplied, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::ArgOrderApplied)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: ARG_ORDER_NOT_RECORDED.into(),
             };
         }
     }

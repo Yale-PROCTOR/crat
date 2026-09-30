@@ -61,6 +61,7 @@ mod ptr;
 #[cfg(test)]
 pub(crate) mod ptr;
 pub(crate) mod qualifier_facts;
+pub(crate) mod raw_cause;
 pub(crate) mod realloc;
 pub(crate) mod realloc_ssa;
 pub mod resolve;
@@ -341,6 +342,9 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
         facts.reader_inputs = licensing::readers::Inputs::collect(&program, slots);
         facts.reader_plan = licensing::readers::Plan::build(&facts.reader_inputs);
+        if licensing::lend::lend() {
+            facts.lend_plan = licensing::lend::collect(&program);
+        }
         facts.traversal_native = Some(licensing::traversal_native::collect(
             &program,
             slots,
@@ -456,6 +460,8 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     };
     for slot in malloc_sources {
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
+        raw_cause::note_eager(&kind_solver, "allocation-source");
+        raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "allocation-source");
         comparison::record_guard(
             crate_ctxt.tcx,
             slots,
@@ -488,6 +494,8 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
                 eprintln!("E5C may-supply-exclusion slot={slot:?}");
             }
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
+            raw_cause::note_eager(&kind_solver, "may-supply");
+            raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "may-supply");
             comparison::record_guard(
                 crate_ctxt.tcx,
                 slots,
@@ -566,14 +574,10 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         // fresh responsibility cannot acquire an invented borrow lifetime.
         // R371-2: the repair arm withdraws this exclusion and leaves every
         // grant constraint below on.
-        if joint
-            && !licensing::facts::repair()
-            && !std::env::var("CRAT_ERA5C_SKIP_FAMILY")
-                .unwrap_or_default()
-                .split(',')
-                .any(|s| s.trim() == "no_ref_carriers")
-        {
+        if joint && !licensing::facts::repair() {
             kind_solver.add_borrow_exclusion(Some(slot), &[]);
+            raw_cause::note_eager(&kind_solver, "no-ref-carrier");
+            raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
             // L01⁶ (b) / R517-12: this slot's reference has just been refused,
             // so `raw ∨ own` is all that remains and only `raw` carries weight.
             // Prefer `own` where it is legal. Objective-only; report 034b §3
@@ -724,94 +728,16 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
     }
     if joint {
-        // R467-2 (019 profile): per-family RSS, so libzahl says which joint-gated
-        // family retains. Diagnosis only, behind CRAT_ERA5C_PROFILE.
-        let profile = std::env::var_os("CRAT_ERA5C_PROFILE").is_some();
-        let rss = || -> f64 {
-            std::fs::read_to_string("/proc/self/statm")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.parse::<f64>().ok())
-                })
-                .map(|pages| pages * 4096.0 / 1073741824.0)
-                .unwrap_or(0.0)
-        };
-        let mut mark = rss();
-        macro_rules! step {
-            ($name:literal, $e:expr) => {{
-                let value = $e;
-                if profile {
-                    let now = rss();
-                    eprintln!(
-                        "E5C_PROFILE {:<34} rss={:7.2} GiB  delta={:+7.2}",
-                        $name,
-                        now,
-                        now - mark
-                    );
-                    mark = now;
-                }
-                value
-            }};
-        }
-        // R467-2 diagnosis: CRAT_ERA5C_SKIP_FAMILY=<comma list> omits joint-gated
-        // families so the one that drives the solver's blow-up can be named. Never
-        // set in a measurement run; the verdicts are not valid with it on.
-        let skipped = std::env::var("CRAT_ERA5C_SKIP_FAMILY").unwrap_or_default();
-        let skip = |name: &str| skipped.split(',').any(|s| s.trim() == name);
-        step!("start", ());
-        if !skip("grants") {
-            step!(
-                "apply_licensing_grants",
-                kind_solver.apply_licensing_grants(&facts)?
-            );
-        }
-        if !skip("transfers") {
-            step!(
-                "block_incomplete_transfers",
-                licensing::readers::block_incomplete_transfers(&facts, kind_solver)
-            );
-        }
-        if !skip("reader_field_support") {
-            step!(
-                "constrain_reader_field_support",
-                kind_solver.constrain_reader_field_support(&facts)?
-            );
-        }
-        if !skip("reference_field_effects") {
-            step!(
-                "constrain_reference_field_effects",
-                kind_solver.constrain_reference_field_effects(&facts)?
-            );
-        }
-        if !skip("first_permissions") {
-            step!(
-                "constrain_first_permissions",
-                kind_solver.constrain_first_permissions(&facts)?
-            );
-        }
-        if !skip("traversal_calls") {
-            step!(
-                "constrain_traversal_calls",
-                kind_solver.constrain_traversal_calls(&facts)?
-            );
-        }
-        if !skip("fold_callers") {
-            step!(
-                "constrain_fold_callers",
-                kind_solver.constrain_fold_callers(&facts)?
-            );
-        }
+        kind_solver.apply_licensing_grants(&facts)?;
+        licensing::readers::block_incomplete_transfers(&facts, kind_solver);
+        kind_solver.constrain_reader_field_support(&facts)?;
+        kind_solver.constrain_reference_field_effects(&facts)?;
+        kind_solver.constrain_first_permissions(&facts)?;
+        kind_solver.constrain_traversal_calls(&facts)?;
+        kind_solver.constrain_fold_callers(&facts)?;
         // era-5c (R409-1): an allocation is released by its own allocator.
-        step!(
-            "allocator_contract_pairing",
-            kind_solver.constrain_allocator_contract_pairing(&facts)
-        );
-        step!(
-            "record_ownership_facts",
-            export::record_ownership_facts(&facts)
-        );
+        kind_solver.constrain_allocator_contract_pairing(&facts);
+        export::record_ownership_facts(&facts);
     }
     kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))

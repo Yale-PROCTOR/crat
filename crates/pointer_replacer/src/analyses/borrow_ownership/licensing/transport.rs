@@ -522,9 +522,7 @@ impl CandidateGraph {
                             def_var: formal_def,
                         },
                     ) => {
-                        if boundary.licensing_role
-                            == super::super::ownership_boundary::LicensingRole::Borrowed
-                        {
+                        if boundary.lends_pair(index) {
                             edge(*actual_use, *actual_def, Rule::Frame);
                         } else {
                             edge(*actual_use, *formal_use, Rule::Param);

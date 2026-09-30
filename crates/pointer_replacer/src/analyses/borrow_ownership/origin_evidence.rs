@@ -800,6 +800,10 @@ impl OriginEvidence {
         }
         raw(w, b",\"grant_holds\":")?;
         Self::write_rows(&mut *w, &s.grant_holds, None)?;
+        if let Some(plan) = &s.lend_plan {
+            raw(w, b",\"lend_plan\":")?;
+            Self::write_small(&mut *w, plan)?;
+        }
         raw(w, b",\"matched\":")?;
         s.matched.write_canonical(&mut *w)?;
         raw(w, b",\"metadata\":")?;
@@ -983,18 +987,6 @@ impl OriginEvidence {
         present: super::cache_contract::stream::OriginKeys,
     ) -> Result<(), String> {
         let err = |e: std::io::Error| e.to_string();
-        let rss = || -> f64 {
-            std::fs::read_to_string("/proc/self/statm")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.parse::<f64>().ok())
-                })
-                .map(|pages| pages * 4096.0 / 1073741824.0)
-                .unwrap_or(0.0)
-        };
-        let profile = std::env::var_os("CRAT_ERA5C_PROFILE").is_some();
         w.write_all(b"{\"functions\":[").map_err(err)?;
         let mut order: Vec<usize> = (0..self.functions.len()).collect();
         if canonical {
@@ -1008,13 +1000,6 @@ impl OriginEvidence {
             // row. No clone of the function, no `Value` of the whole function --
             // memory is bounded by the largest single ROW.
             Self::write_function(&mut *w, &self.functions[index], canonical)?;
-        }
-        if profile {
-            eprintln!(
-                "E5C_ELEM functions n={} rss={:.2} GiB",
-                self.functions.len(),
-                rss()
-            );
         }
         if present.licensing {
             w.write_all(b"],\"licensing\":").map_err(err)?;
@@ -1038,13 +1023,6 @@ impl OriginEvidence {
                 }
                 w.write_all(b"]").map_err(err)?;
             }
-        }
-        if profile {
-            eprintln!(
-                "E5C_ELEM licensing n={} rss={:.2} GiB",
-                self.licensing.as_ref().map(|s| s.len()).unwrap_or(0),
-                rss()
-            );
         }
         if present.reader_replay {
             w.write_all(b",\"reader_replay\":").map_err(err)?;

@@ -157,6 +157,8 @@ pub(crate) struct Metadata {
     pub(crate) receipt: String,
     pub(crate) origin: OriginSource,
     pub(crate) move_store: MoveStoreCapture,
+    /// L01¹¹ (R659-1): the `arg-order-applied` family, read the same way.
+    pub(crate) arg_order: MoveStoreCapture,
 }
 
 impl Metadata {
@@ -174,6 +176,20 @@ impl Metadata {
             }
             MoveStoreCapture::Captured(records) => {
                 portable_export::decode_move_store(&CaptureAvailability::Captured, records)
+            }
+        }
+    }
+
+    /// L01¹¹: the frame's arm-(a) receipts for the emission's hoist: refused
+    /// unless the entry carries them.
+    pub(crate) fn arg_order_applied(&self) -> Result<Vec<portable_export::ArgOrderRow>, String> {
+        match &self.arg_order {
+            MoveStoreCapture::Missing => Err("arg-order receipts not read from an entry".into()),
+            MoveStoreCapture::NotRecorded(reason) => {
+                Err(format!("arg-order receipts not recorded: {reason}"))
+            }
+            MoveStoreCapture::Captured(records) => {
+                portable_export::decode_arg_order(&CaptureAvailability::Captured, records)
             }
         }
     }
@@ -369,8 +385,35 @@ impl TryFrom<CompleteEntry> for Metadata {
                 ),
             }
         };
+        let arg_order = {
+            let family = &entry.exports["families"]["arg-order-applied"];
+            if family.is_null() {
+                MoveStoreCapture::Missing
+            } else {
+                let availability: CaptureAvailability =
+                    serde_json::from_value(family["availability"].clone())
+                        .map_err(|e| format!("arg-order availability: {e}"))?;
+                match availability {
+                    CaptureAvailability::NotRecorded { reason } => {
+                        MoveStoreCapture::NotRecorded(reason)
+                    }
+                    CaptureAvailability::Captured => MoveStoreCapture::Captured(
+                        family["records"]
+                            .as_array()
+                            .ok_or("arg-order records")?
+                            .iter()
+                            .map(|r| {
+                                serde_json::from_value(r["fields"].clone())
+                                    .map_err(|e| format!("arg-order fields: {e}"))
+                            })
+                            .collect::<Result<_, String>>()?,
+                    ),
+                }
+            }
+        };
         Ok(Self {
             move_store,
+            arg_order,
             schema: entry.schema,
             key: entry.key,
             inputs: entry.inputs,
@@ -520,9 +563,10 @@ impl<'de> Visitor<'de> for MetadataVisitor {
                 _ => return Err(de::Error::custom(format!("unknown cache field: {name}"))),
             }
         }
-        let move_store = required(exports, "exports")?;
+        let (move_store, arg_order) = required(exports, "exports")?;
         Ok(Metadata {
             move_store,
+            arg_order,
             schema: required(schema, "schema")?,
             key: required(key, "key")?,
             inputs: required(inputs, "inputs")?,
@@ -542,24 +586,32 @@ struct ExportSummary {
     diagnostic_families: BTreeSet<ExportFamily>,
     move_store_records: Vec<BTreeMap<String, Value>>,
     move_store_not_recorded: Option<String>,
+    arg_order_records: Vec<BTreeMap<String, Value>>,
+    arg_order_not_recorded: Option<String>,
 }
 
 struct Exports;
 impl<'de> DeserializeSeed<'de> for Exports {
-    type Value = MoveStoreCapture;
+    type Value = (MoveStoreCapture, MoveStoreCapture);
 
-    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<MoveStoreCapture, D::Error> {
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> Result<(MoveStoreCapture, MoveStoreCapture), D::Error> {
         d.deserialize_map(self)
     }
 }
 impl<'de> Visitor<'de> for Exports {
-    type Value = MoveStoreCapture;
+    type Value = (MoveStoreCapture, MoveStoreCapture);
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("portable exports")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<MoveStoreCapture, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<(MoveStoreCapture, MoveStoreCapture), A::Error> {
         let (mut schema, mut licensing, mut identities, mut gaps, mut families, mut diagnostics) =
             (None, None, None, None, None, None);
         let mut summary = ExportSummary::default();
@@ -601,10 +653,15 @@ impl<'de> Visitor<'de> for Exports {
         {
             return Err(de::Error::custom("unresolved portable identity"));
         }
-        Ok(match summary.move_store_not_recorded {
+        let move_store = match summary.move_store_not_recorded {
             Some(reason) => MoveStoreCapture::NotRecorded(reason),
             None => MoveStoreCapture::Captured(summary.move_store_records),
-        })
+        };
+        let arg_order = match summary.arg_order_not_recorded {
+            Some(reason) => MoveStoreCapture::NotRecorded(reason),
+            None => MoveStoreCapture::Captured(summary.arg_order_records),
+        };
+        Ok((move_store, arg_order))
     }
 }
 
@@ -693,6 +750,14 @@ impl<'de> Visitor<'de> for Family<'_> {
                     && records == 0 =>
             {
                 self.summary.move_store_not_recorded = Some(reason);
+            }
+            CaptureAvailability::NotRecorded { reason }
+                if self.family == ExportFamily::ArgOrderApplied
+                    && !reason.is_empty()
+                    && source_rows == 0
+                    && records == 0 =>
+            {
+                self.summary.arg_order_not_recorded = Some(reason);
             }
             _ => return Err(de::Error::custom("required capture unavailable")),
         }
@@ -790,6 +855,8 @@ impl<'de> Visitor<'de> for Record<'_> {
             .extend(required(references, "references")?);
         if self.family == ExportFamily::MoveStoreObligations {
             self.summary.move_store_records.push(fields);
+        } else if self.family == ExportFamily::ArgOrderApplied {
+            self.summary.arg_order_records.push(fields);
         }
         Ok(())
     }

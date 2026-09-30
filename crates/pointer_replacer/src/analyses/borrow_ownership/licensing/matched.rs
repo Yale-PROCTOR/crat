@@ -1553,12 +1553,11 @@ impl MatchedTransport {
                 Evidence::Boundary {
                     construction,
                     ordinal,
-                    ..
+                    matched,
                 } => {
                     let Some(row) = boundaries.get(&(construction, ordinal)) else { continue };
                     if matches!(row.role, Role::CallArgument | Role::ReturnReceiver)
-                        && row.licensing_role
-                            != super::super::ownership_boundary::LicensingRole::Borrowed
+                        && !row.lends_pair(matched)
                     {
                         continue;
                     }
@@ -1727,6 +1726,10 @@ impl MatchedTransport {
                             Guards::new()
                         };
                     for (matched, pair) in row.matched.iter().enumerate() {
+                        // L01¹⁰: a Lent row's container pair is framed, not a port.
+                        if row.lends_pair(matched) {
+                            continue;
+                        }
                         let part = |formal, actual| BoundaryPart {
                             guards: part_guards.clone(),
                             construction: row.point.construction,
