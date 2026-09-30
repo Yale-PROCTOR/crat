@@ -319,6 +319,16 @@ fn w6l_fa_r_the_review_licence_findings_refuse_it() {
             "pub unsafe fn Poke(mut rb: *mut RingBuffer) {\n    let mut f = || (*rb).cur_size_ = 99 as i32 as u32;\n    f();\n}\npub unsafe fn Setup(mut s: *mut State, mut n: u32) {",
         ),
         (
+            "(2b) atom reassigned without a call",
+            "unsafe fn RingBufferInitBuffer(buflen: u32, mut rb: *mut RingBuffer) {",
+            "unsafe fn RingBufferInitBuffer(mut buflen: u32, mut rb: *mut RingBuffer) {",
+        ),
+        (
+            "(4b) conditional length write",
+            "    (*rb).cur_size_ = buflen;\n    let ref mut fresh67 = (*rb).buffer_;\n    *fresh67 = ((*rb).data_).offset(2 as i32 as isize);\n",
+            "    let ref mut fresh67 = (*rb).buffer_;\n    *fresh67 = ((*rb).data_).offset(2 as i32 as isize);\n    if buflen > 0 as i32 as u32 {\n        (*rb).cur_size_ = buflen;\n    }\n",
+        ),
+        (
             "(10) signed length",
             "    pub cur_size_: u32,",
             "    pub cur_size_: i32,",
@@ -329,6 +339,13 @@ fn w6l_fa_r_the_review_licence_findings_refuse_it() {
             input = input.replacen(
                 "    (*rb).cur_size_ = buflen;\n",
                 "    buflen = buflen.wrapping_mul(2 as i32 as u32);\n    (*rb).cur_size_ = buflen;\n",
+                1,
+            );
+        }
+        if label == "(2b) atom reassigned without a call" {
+            input = input.replacen(
+                "    (*rb).cur_size_ = buflen;\n",
+                "    buflen = buflen + 1 as i32 as u32;\n    (*rb).cur_size_ = buflen;\n",
                 1,
             );
         }
