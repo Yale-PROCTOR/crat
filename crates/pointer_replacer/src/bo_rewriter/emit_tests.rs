@@ -15140,8 +15140,8 @@ fn r645_4_a_byte_string_literal_takes_its_own_length() {
          pub static mut WORDS: [u32; 4] = [0; 4];\n\
          pub unsafe fn equal(a: *mut i8, b: *mut i8) -> i32 {{ (*a.offset(0) == *b.offset(0) && *a.offset(1) == *b.offset(1)) as i32 }}\n\
          pub unsafe fn strclone(s: *const i8) -> i8 {{ *s.offset(0) + *s.offset(1) }}\n\
-         pub unsafe fn words(w: *const u32) -> u32 {{ *w.offset(0) + *w.offset(1) }}\n\
-         pub unsafe fn bytes(b: *const u8) -> u8 {{ *b.offset(0) + *b.offset(5) }}\n\
+         pub unsafe fn words(w: *const u32) -> u32 {{ if *w.offset(0) > 7 {{ *w.offset(1) }} else {{ 0 }} }}\n\
+         pub unsafe fn bytes(b: *const u8) -> u8 {{ if *b.offset(0) > 7 {{ *b.offset(5) }} else {{ 0 }} }}\n\
          pub unsafe fn caller(buf: *mut Buf) -> i32 {{\n\
          \x20   let _next = buf.offset(1);\n\
          \x20   equal(b\"Hello World\\0\" as *const u8 as *const i8 as *mut i8, (*buf).data)\n\
@@ -15182,7 +15182,9 @@ fn r645_4_a_byte_string_literal_takes_its_own_length() {
         "the length is the literal's:\n{emitted}"
     );
     // Controls: bytes read as `u32` are not `N` elements, and a `[u32; 4]`
-    // read as bytes is not 4.
+    // read as bytes is not 4. Their callees read under a branch, so R677-6's
+    // straight-line extent (tried before the fallback) proves nothing either,
+    // and each control still asks this arm alone.
     assert_eq!(placed("words", "control"), ["len-fabricated"], "{seams}");
     assert_eq!(placed("bytes", "control"), ["len-fabricated"], "{seams}");
     assert_eq!(
