@@ -6993,7 +6993,12 @@ mod run {
             crate::analyses::borrow_ownership::l2::enabled_from_env(),
             "L2 RED gate requires CRAT_BO_L2_GUARDED_COMMITS=1"
         );
-        assert_eq!(repair, RepairMode::ModeA, "L2 RED gate is Mode-A-only");
+        // R617-1: `CRAT_BO_L2_GUARDED_COMMITS=1` is the guarded repair's alias.
+        assert_eq!(
+            repair,
+            RepairMode::Guarded,
+            "L2 RED gate runs the guarded repair"
+        );
         let diagnostics = std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS")
             .expect("L2 RED gate requires decision diagnostics");
         assert_eq!(
@@ -31577,9 +31582,10 @@ fn boc1_corpus() {
             Ok("mode_a"),
             "L2 RED requires CRAT_BO_REPAIR=mode_a"
         );
+        // R617-1: with CRAT_BO_L2_GUARDED_COMMITS=1 (its alias) the repair resolves guarded.
         assert_eq!(
             crate::analyses::borrow_ownership::borrow_verify::RepairMode::current(),
-            crate::analyses::borrow_ownership::borrow_verify::RepairMode::ModeA,
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::Guarded,
         );
         assert_eq!(
             std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS").as_deref(),
@@ -33970,6 +33976,8 @@ fn nb5l_lemma_ref_subset_mode_a_on_fixtures() {
                     model: model.expect("fixture must accept under both modes"),
                 }
             };
+            // R617-1: the guarded repair stamps itself too (S7 guard 3).
+            solve(RepairMode::Guarded);
             (
                 solve(RepairMode::ModeA),
                 solve(RepairMode::Lemmas),
@@ -34485,9 +34493,9 @@ fn nb5l2_capture_is_mode_a_only() {
                     verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
                 })
             });
-            (stats.repair, events)
+            (stats.repair, stats.guarded_fallback.is_some(), events)
         };
-        let (mode_a_repair, mode_a_events) = run_mode(RepairMode::ModeA);
+        let (mode_a_repair, _, mode_a_events) = run_mode(RepairMode::ModeA);
         assert_eq!(
             mode_a_repair,
             RepairMode::ModeA,
@@ -34497,7 +34505,7 @@ fn nb5l2_capture_is_mode_a_only() {
             !mode_a_events.is_empty(),
             "Mode-A must capture commits on a conflict fixture"
         );
-        let (lemmas_repair, lemmas_events) = run_mode(RepairMode::Lemmas);
+        let (lemmas_repair, _, lemmas_events) = run_mode(RepairMode::Lemmas);
         assert_eq!(
             lemmas_repair,
             RepairMode::Lemmas,
@@ -34507,6 +34515,19 @@ fn nb5l2_capture_is_mode_a_only() {
             lemmas_events.is_empty(),
             "Lemmas must capture NO commit events — the audit is Mode-A-only (got {} events)",
             lemmas_events.len()
+        );
+        // R617-1: a guarded run stamps Guarded and captures nothing -- unless it fell back to
+        // Mode-A, whose commits are then the capture.
+        let (guarded_repair, fell_back, guarded_events) = run_mode(RepairMode::Guarded);
+        assert_eq!(
+            guarded_repair,
+            RepairMode::Guarded,
+            "a guarded run must stamp Guarded"
+        );
+        assert!(
+            fell_back || guarded_events.is_empty(),
+            "an accepting guarded run must capture NO Mode-A commit events (got {})",
+            guarded_events.len()
         );
     })
     .unwrap_or_else(|e| e.raise())
