@@ -266,11 +266,18 @@ fn transfer_call<'tcx>(
     let Some(call) = terminator.as_call(tcx) else { return };
     if call.destination.projection.is_empty() {
         // Only the compiler-resolved non-local null constructor establishes None.
-        state[call.destination.local.as_usize()] = matches!(call.func, CallKind::RustLib(did)
-            if matches!(tcx.item_name(did).as_str(), "null" | "null_mut")
-                && tcx.crate_name(did.krate).as_str() == "core"
-                && tcx.def_path_str(did).contains("::ptr::"));
+        state[call.destination.local.as_usize()] =
+            matches!(call.func, CallKind::RustLib(did) if null_constructor(tcx, did));
     }
+}
+
+/// `core::ptr::null()` / `null_mut()`: the compiler-resolved non-local null
+/// constructor. The Yale-PROCTOR fork translates C's `NULL` to this call where
+/// the older translation wrote `0 as *mut T` (R701).
+pub(crate) fn null_constructor(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
+    matches!(tcx.item_name(did).as_str(), "null" | "null_mut")
+        && tcx.crate_name(did.krate).as_str() == "core"
+        && tcx.def_path_str(did).contains("::ptr::")
 }
 
 pub(super) fn null_entries<'tcx>(

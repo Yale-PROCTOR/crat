@@ -4231,6 +4231,11 @@ fn e5c_inner_w63() {
             owned = W84_LIST.replace(W84_NULL_ITEM, "");
             owned.as_str()
         }
+        Ok("w85-call") => W85_G,
+        Ok("w85-cast") => {
+            owned = W85_G.replace("::core::ptr::null_mut::<Node>()", "0 as *mut Node");
+            owned.as_str()
+        }
         Ok("w84-static") => {
             owned = format!("{W84_LIST}{W84_STATIC}");
             owned.as_str()
@@ -6418,6 +6423,69 @@ fn e5c_inner_w84_coverage_of_file() {
             eprintln!("E5C_W84 held {body}");
         }
     });
+}
+
+/// W85 (R701; analysis-fanout 023 STOP 1): G, AVL's `insert` one level down, as the
+/// Yale-PROCTOR fork translates it -- `NULL` becomes `::core::ptr::null_mut::<Node>()`,
+/// a library call, where the older translation (the corpus, AVL) writes `0 as *mut Node`.
+/// RED at L01¹²: the call went through the opaque-call arm, which pins the new value
+/// non-owning, so `new_node`'s `n->next = NULL` forbade `next`'s ownership
+/// (`coherence::field-and` -> `link-own` -> `own-assume[opaque-call-arg]`) and `next`
+/// settled Ref. GREEN: the null constructor is a null constant, as the cast is; `next`
+/// Owning, `put` Owning in and out, `last` Ref -- equal to the cast text. The fault
+/// `CRAT_E5C_W85_FAULT=opaque-null` (test builds) gives the opaque arm back.
+const W85_G: &str = r#"
+#![allow(unused_mut)]
+extern "C" { fn malloc(__size: usize) -> *mut ::core::ffi::c_void; }
+#[repr(C)]
+pub struct Node { pub val: ::core::ffi::c_int, pub next: *mut Node }
+#[no_mangle]
+pub unsafe extern "C" fn new_node(mut val: ::core::ffi::c_int) -> *mut Node {
+    let mut n = malloc(::core::mem::size_of::<Node>()) as *mut Node;
+    (*n).val = val;
+    (*n).next = ::core::ptr::null_mut::<Node>();
+    return n;
+}
+#[no_mangle]
+pub unsafe extern "C" fn last(mut head: *mut Node) -> *mut Node {
+    while !(*head).next.is_null() { head = (*head).next; }
+    return head;
+}
+#[no_mangle]
+pub unsafe extern "C" fn put(mut node: *mut Node, mut val: ::core::ffi::c_int) -> *mut Node {
+    if node.is_null() { return new_node(val); }
+    (*node).val = val;
+    return node;
+}
+#[no_mangle]
+pub unsafe extern "C" fn set_next(mut node: *mut Node, mut val: ::core::ffi::c_int) {
+    (*node).next = put((*node).next, val);
+}
+"#;
+
+#[test]
+fn e5c_w85_the_null_constructor_is_a_null_constant() {
+    let call = l01p13_lines("w85-call", &[]);
+    let cast = l01p13_lines("w85-cast", &[]);
+    for key in [
+        "Node::field1@d0",
+        "put::_0@d0",
+        "put::_1@d0",
+        "last::_0@d0",
+        "last::_1@d0",
+        "new_node::_0@d0",
+    ] {
+        assert_eq!(w63_kind(&call, key), w63_kind(&cast, key), "{key}");
+    }
+    assert_eq!(w63_kind(&call, "Node::field1@d0"), "owning");
+    assert_eq!(w63_kind(&call, "put::_1@d0"), "owning");
+    assert_eq!(w63_kind(&call, "last::_1@d0"), "ref");
+    let fault = l01p13_lines("w85-call", &[("CRAT_E5C_W85_FAULT", "opaque-null")]);
+    assert_eq!(
+        w63_kind(&fault, "Node::field1@d0"),
+        "ref",
+        "the fault must be caught: {fault:?}"
+    );
 }
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement

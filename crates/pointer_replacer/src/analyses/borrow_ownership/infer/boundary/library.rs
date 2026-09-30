@@ -24,6 +24,21 @@ where
         callee: DefId,
         _substs: GenericArgsRef<'tcx>,
     ) {
+        // R701 (the fork's `NULL`): `core::ptr::null()` / `null_mut()` is a null
+        // constant, as `0 as *mut T` is. The value is None and names no owner
+        // (§29): the value it overwrites must not own, the new one is free. The
+        // opaque arm below pinned the new value non-owning too, so a field the
+        // fork's `NULL` initializes could never own. `source_events` and
+        // `nullability` already read this call as null; `origin_evidence` gives
+        // its occurrence the `Null` origin a null literal has.
+        if crate::analyses::borrow_ownership::source_events::null_constructor(self.tcx, callee)
+            && !(cfg!(test) && std::env::var("CRAT_E5C_W85_FAULT").as_deref() == Ok("opaque-null"))
+        {
+            if let Some(destination) = destination {
+                <Analysis as InferMode>::constant_source(self, destination, true);
+            }
+            return;
+        }
         let def_path = self.tcx.def_path(callee);
         // if it is a library call in core::ptr
         if matches!(

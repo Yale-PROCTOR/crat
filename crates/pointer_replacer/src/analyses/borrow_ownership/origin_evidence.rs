@@ -421,11 +421,23 @@ pub(crate) fn occurrences<'tcx>(
                     .iter()
                     .map(|argument| operand_key(program, slots, function, &body, &argument.node))
                     .collect(),
-                syntax: super::ownership_access::call(
-                    call.destination,
-                    call.args.iter().map(|arg| &arg.node),
-                    program.tcx,
-                ),
+                syntax: {
+                    let mut syntax = super::ownership_access::call(
+                        call.destination,
+                        call.args.iter().map(|arg| &arg.node),
+                        program.tcx,
+                    );
+                    // R701: the null constructor's result is a null literal's (the
+                    // fork's `NULL`), as `0 as *mut T` is in `assignment`.
+                    if matches!(call.func, CallKind::RustLib(did)
+                        if super::source_events::null_constructor(program.tcx, did))
+                        && !(cfg!(test)
+                            && std::env::var("CRAT_E5C_W85_FAULT").as_deref() == Ok("opaque-null"))
+                    {
+                        syntax.immediate_origin = super::ownership_access::ImmediateOrigin::Null;
+                    }
+                    syntax
+                },
             });
         }
     }
