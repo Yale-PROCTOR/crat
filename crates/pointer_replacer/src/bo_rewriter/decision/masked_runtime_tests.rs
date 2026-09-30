@@ -291,3 +291,43 @@ fn w6l_mask_zc4_a_runtime_increment_stays_licensed() {
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     assert!(flat(&source).contains("(gap) as usize"), "{source}");
 }
+
+/// RING with brotli's root: the buffer is a raw field, so every root takes a
+/// fabricated length.
+fn ring_field_root() -> String {
+    let field = RING
+        .replace(
+            "pub struct Ring {\n    pub buffer: [u8; 4224],\n}",
+            "pub struct Ring {\n    pub buffer: *mut u8,\n    pub cur_size: usize,\n}",
+        )
+        .replace(
+            "let data = ((*r).buffer).as_ptr();",
+            "let data = (*r).buffer as *const u8;",
+        );
+    assert_ne!(field, RING, "the field root is in");
+    fixture(&field)
+}
+
+/// N1 (relay 071, R697-7 (b)) — the hold narrowed to chains whose root would
+/// take a fabricated length. With brotli's raw field root, the four readers
+/// stay held; with the array root (`[u8; 4224]`, R625's real length), the
+/// reader the root reaches directly, `FindAllMatches`, is released and gets
+/// the array, and no reader is handed the fallback extent: a masked reader
+/// whose call would take a fabricated length is not adapted (the seam's
+/// guard).
+#[test]
+fn w6l_mask_n1_the_hold_is_kept_only_where_the_root_is_fabricated() {
+    let field = crate::bo_rewriter::emit_tests::decisions_of(&ring_field_root());
+    let held = field
+        .iter()
+        .filter(|(n, p, r)| n == "data" && *p && r == "held:masked-index-runtime-length")
+        .count();
+    assert_eq!(held, 4, "field root: {field:#?}");
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(RING)).unwrap();
+    let flat_source = flat(&source);
+    assert!(
+        flat_source.contains("unsafe fn FindAllMatches(data: &[u8],"),
+        "{source}"
+    );
+    assert!(!flat_source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+}

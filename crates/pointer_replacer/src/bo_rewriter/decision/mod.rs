@@ -72,6 +72,9 @@ pub(crate) mod exposure;
 pub(crate) mod extent_proof;
 #[cfg(test)]
 mod extent_proof_tests;
+pub(crate) mod field_alloc;
+#[cfg(test)]
+mod field_alloc_tests;
 pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod interface;
