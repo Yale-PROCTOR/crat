@@ -689,6 +689,10 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
     /// loop body's top level, AFTER the statement that contains `at`.
     fn loop_bound(&self, i: HirId, at: HirId) -> Option<Lin> {
         let tcx = self.a.tcx;
+        // A counter whose address is taken may be written through it.
+        if self.writes.borrowed.contains(&i) {
+            return None;
+        }
         for frame in self.loops.iter().rev() {
             let mut found = None;
             for c in &frame.conjuncts {
@@ -917,9 +921,14 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
             }
             ExprKind::Ret(..) => {
                 // A tail `return` keeps the body straight; R677-6 admits it.
-                let tail = self.a.tcx.hir_parent_iter(e.hir_id).nth(1).is_some_and(|(_, n)| {
-                    matches!(n, Node::Block(b) if b.stmts.last().is_some_and(|s| matches!(s.kind, StmtKind::Semi(x) if x.hir_id == e.hir_id)) && b.expr.is_none())
-                });
+                let mut parents = self.a.tcx.hir_parent_iter(e.hir_id);
+                let first = parents.next().map(|(_, n)| n);
+                let second = parents.next().map(|(_, n)| n);
+                // `{ …; return x; }` or `{ …; return x }`, as the block's end.
+                let tail = matches!(first, Some(Node::Block(b)) if b.expr.is_some_and(|x| x.hir_id == e.hir_id))
+                    || matches!(second, Some(Node::Block(b))
+                        if b.expr.is_none()
+                            && b.stmts.last().is_some_and(|s| matches!(s.kind, StmtKind::Semi(x) if x.hir_id == e.hir_id)));
                 if !tail {
                     self.straight = false;
                 }
