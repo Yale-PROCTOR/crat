@@ -4138,3 +4138,87 @@ unsafe extern "C" fn use_one() -> usize {
         "{context}"
     );
 }
+
+/// **R713 STOP 2 (131 §2) — a returning wrapper over a pointer-alias return.**
+/// lil's `alloc_value` reduced, with the exported `lil_alloc_string(str) ->
+/// lil_value_t { return alloc_value(str); }` over it. Once `alloc_value`
+/// certifies, the wrapper's own certificate (its source the returned call)
+/// spelled its output `Option<Box<_>>`: the return is the alias path
+/// `lil_value_t`, not a `*mut T`, and it has no owner local to take the
+/// pointee from. E0121, and the whole crate stopped emitting ("no strict
+/// compiling subset"). The pointee comes from the resolved signature.
+const LIL_ALLOC_VALUE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn strlen(s: *const core::ffi::c_char) -> usize;
+}
+#[repr(C)]
+pub struct _lil_value_t { pub l: usize, pub d: *mut core::ffi::c_char }
+pub type lil_value_t = *mut _lil_value_t;
+#[repr(C)]
+pub struct _lil_t { pub empty: lil_value_t }
+unsafe extern "C" fn alloc_value(mut str: *const core::ffi::c_char) -> lil_value_t {
+    let mut val = calloc(1 as usize, ::std::mem::size_of::<_lil_value_t>()) as lil_value_t;
+    if val.is_null() {
+        return 0 as lil_value_t;
+    }
+    if !str.is_null() {
+        (*val).l = strlen(str);
+        (*val).d = malloc((*val).l.wrapping_add(1 as usize)) as *mut core::ffi::c_char;
+        if ((*val).d).is_null() {
+            free(val as *mut core::ffi::c_void);
+            return 0 as lil_value_t;
+        }
+    } else {
+        (*val).l = 0 as usize;
+        (*val).d = 0 as *mut core::ffi::c_char;
+    }
+    return val;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_alloc_string(mut str: *const core::ffi::c_char) -> lil_value_t {
+    return alloc_value(str);
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_free_value(mut val: lil_value_t) {
+    if val.is_null() {
+        return;
+    }
+    free((*val).d as *mut core::ffi::c_void);
+    free(val as *mut core::ffi::c_void);
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_new(mut lil: *mut _lil_t) {
+    (*lil).empty = alloc_value(0 as *const core::ffi::c_char);
+}
+#[no_mangle]
+pub unsafe extern "C" fn get_len() -> usize {
+    let mut val = alloc_value(0 as *const core::ffi::c_char);
+    let mut n = (*val).l;
+    lil_free_value(val);
+    return n;
+}
+"#;
+
+#[test]
+fn w6a_r713_a_returning_wrapper_over_an_alias_return_spells_its_pointee() {
+    let out = emitted("r713-wrapper", LIL_ALLOC_VALUE);
+    let src = compact(&out.source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        src.contains("fnlil_alloc_string(mutstr:*constcore::ffi::c_char)->Option<Box<crate::_lil_value_t>>{returnalloc_value(str);}"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(!src.contains("Box<_>"), "{}", out.source);
+    assert!(
+        receipts.contains(
+            "return-certificate callee=lil_alloc_string output=Option<Box<crate::_lil_value_t>>"
+        ),
+        "{receipts}"
+    );
+    assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
+}

@@ -3172,6 +3172,11 @@ fn certify<'tcx, 's>(
     let rustc_hir::FnRetTy::Return(output_ty) = decl.output else {
         return Err(hold("return-certificate-allocation:no-output".to_owned()));
     };
+    // **R713 STOP 2** — a return spelled through a pointer alias
+    // (`-> lil_value_t`) with no owner local to read the pointee from (a
+    // returning wrapper, `return alloc_value(str)`) takes it from the resolved
+    // signature, a raw pointer for every candidate; a `_` here was E0121 and
+    // stopped the whole crate emitting.
     let pointee = match (output_ty.kind, pointee_ty) {
         (rustc_hir::TyKind::Ptr(p), _) => tcx
             .sess
@@ -3179,7 +3184,16 @@ fn certify<'tcx, 's>(
             .span_to_snippet(p.ty.span)
             .unwrap_or_else(|_| "_".to_owned()),
         (_, Some(ty)) => pointee_source(tcx, ty),
-        _ => "_".to_owned(),
+        _ => match tcx
+            .fn_sig(callee.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .output()
+            .kind()
+        {
+            TyKind::RawPtr(ty, _) => pointee_source(tcx, *ty),
+            _ => "_".to_owned(),
+        },
     };
     let base = match shape {
         BoxShape::Sized => format!("Box<{pointee}>"),
