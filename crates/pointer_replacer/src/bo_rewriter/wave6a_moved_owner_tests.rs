@@ -6,6 +6,10 @@
 //!   reborrow pass: a call inside a loop the binding outlives has a later use
 //!   (the next pass), and an A5 raw-view wrapper re-parses the call it wraps,
 //!   so the argument no longer carries its source span.
+//! - `common::transform::BrotliTransformDictionaryWord` (lib.rs:101357): the
+//!   cursor's tail view at a slice formal (`ToUpperCase(&mut *dst.offset(k))`)
+//!   was `dst.offset_by(k).as_slice_mut()`, which consumes the mutable cursor
+//!   the suffix loop then writes through.
 
 use super::wave6a_allocation_tests::{compact, rewrite_precise};
 use crate::analyses::borrow_ownership::SlotKind;
@@ -299,5 +303,102 @@ fn w6a_r738_a_wrapped_call_lends_its_optional() {
         text.matches("next_out.as_deref_mut()").count(),
         1,
         "{source}"
+    );
+}
+
+/// brotli `common::transform::BrotliTransformDictionaryWord`, reduced: the
+/// c2rust idiom handed straight to slice callees, then a write through `dst`.
+/// `word` is a shared cursor handed the same way (the control).
+const TRANSFORM: &str = r#"
+// w6a-r738-transform-frame
+unsafe extern "C" fn ToUpperCase(mut p: *mut u8) -> i32 {
+    if (*p.offset(0 as i32 as isize) as i32) < 0xc0 as i32 {
+        *p.offset(0 as i32 as isize) = (*p.offset(0 as i32 as isize) as i32 ^ 32 as i32) as u8;
+        return 1 as i32;
+    }
+    *p.offset(1 as i32 as isize) = (*p.offset(1 as i32 as isize) as i32 ^ 32 as i32) as u8;
+    return 2 as i32;
+}
+unsafe extern "C" fn Shift(mut word: *mut u8, mut word_len: i32, mut parameter: u16) -> i32 {
+    if word_len < 2 as i32 {
+        return 1 as i32;
+    }
+    *word.offset(0 as i32 as isize) = (*word.offset(1 as i32 as isize) as u16 ^ parameter) as u8;
+    return 2 as i32;
+}
+unsafe extern "C" fn Weight(mut p: *const u8, mut n: i32) -> i32 {
+    let mut w = 0 as i32;
+    let mut i = 0 as i32;
+    while i < n {
+        w += *p.offset(i as isize) as i32;
+        i += 1;
+    }
+    return w;
+}
+pub unsafe extern "C" fn TransformWord(
+    mut dst: *mut u8,
+    mut word: *const u8,
+    mut len: i32,
+    mut t: i32,
+    mut param: u16,
+) -> i32 {
+    let mut idx = 0 as i32;
+    let mut i = 0 as i32;
+    while i < len {
+        let fresh7 = i;
+        i = i + 1;
+        let fresh8 = idx;
+        idx = idx + 1;
+        *dst.offset(fresh8 as isize) = *word.offset(fresh7 as isize);
+    }
+    let mut weight = Weight(&*word.offset((i - len) as isize), len);
+    if t == 10 as i32 {
+        ToUpperCase(&mut *dst.offset((idx - len) as isize));
+    } else if t == 30 as i32 {
+        Shift(&mut *dst.offset((idx - len) as isize), len, param);
+    }
+    let fresh12 = idx;
+    idx = idx + 1;
+    *dst.offset(fresh12 as isize) = weight as u8;
+    return idx + *word.offset(0 as i32 as isize) as i32;
+}
+"#;
+
+#[test]
+fn w6a_r738_a_mutable_cursor_lends_its_tail_view_to_a_slice_callee() {
+    let _frame = super::test_model_override::frame_lock();
+    let src = format!("{PRELUDE}{TRANSFORM}");
+    let (source, reverted) = match rewrite_precise("r738-transform", &src) {
+        super::RewriteOutcome::Emitted {
+            source,
+            reverted_count,
+            ..
+        } => (source, reverted_count),
+        super::RewriteOutcome::Degraded {
+            reason,
+            first_diags,
+            ..
+        } => panic!("the transform must emit: {reason}\n{first_diags:#?}"),
+    };
+    let text = compact(&source);
+    assert_eq!(reverted, 0, "{source}");
+    assert!(
+        text.contains("letmutdst=crate::slice_cursor::SliceCursorMut::new(dst);"),
+        "dst is a mutable cursor: {source}"
+    );
+    for callee in ["ToUpperCase(", "Shift("] {
+        assert!(
+            text.contains(&format!("{callee}dst.as_deref_mut().offset_by(")),
+            "{callee} takes a reborrowed tail view: {source}"
+        );
+    }
+    assert!(
+        text.contains("dst[(0isize).wrapping_add((fresh12asisize)asisize)]=weightasu8;"),
+        "dst is written after the calls: {source}"
+    );
+    // Control: a shared cursor is `Copy`; its tail view needs no lend.
+    assert!(
+        text.contains("Weight(word.offset_by("),
+        "the shared cursor's view: {source}"
     );
 }

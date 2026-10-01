@@ -1170,9 +1170,18 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                 match self.index(chain) {
                     Ok(d) => {
                         let view = if want { "as_slice_mut" } else { "as_slice" };
+                        // R738-1 (brotli's dictionary-word transform, E0382): a
+                        // mutable cursor's `offset_by` takes it by value, and the
+                        // caller writes through it after the call; the tail
+                        // view is taken from a reborrow, as a derived cursor is.
+                        let lend = if self.subject.mutable {
+                            ".as_deref_mut()"
+                        } else {
+                            ""
+                        };
                         self.push(
                             e,
-                            format!("{}.offset_by({d}).{view}()", self.view()),
+                            format!("{}{lend}.offset_by({d}).{view}()", self.view()),
                             "cursor-element",
                         );
                     }
