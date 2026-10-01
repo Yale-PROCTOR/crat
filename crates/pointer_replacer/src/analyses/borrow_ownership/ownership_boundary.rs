@@ -830,7 +830,7 @@ pub(crate) fn validate_links(
                     Variables::Single { var: formal },
                 ) => {
                     has(&row.point, "assume", &[*use_var], Some(false))
-                        && has(
+                        && (has(
                             &row.point,
                             if row.licensing_role == LicensingRole::TraversalBorrow {
                                 "guarded-traversal-receiver-legacy"
@@ -839,7 +839,13 @@ pub(crate) fn validate_links(
                             },
                             &[*def_var, *formal],
                             None,
-                        )
+                        ) || has(
+                            &row.point,
+                            // era-5c (R409-1): a contract producer's guarded port.
+                            "guarded-contract-port",
+                            &[*def_var, *formal],
+                            None,
+                        ))
                 }
                 (
                     Role::CallArgument,
@@ -874,7 +880,14 @@ pub(crate) fn validate_links(
                             && has(&row.point, "assume", &[*formal_use], Some(false))
                             && has(&row.point, "assume", &[*formal_def], Some(false))
                     } else {
-                        has(&row.point, "equal", &[*formal_use, *actual_use], None)
+                        // L01¹³ (c)(iii): a contract releaser's guarded sink formal.
+                        (has(&row.point, "equal", &[*formal_use, *actual_use], None)
+                            || has(
+                                &row.point,
+                                "guarded-contract-sink",
+                                &[*formal_use, *actual_use],
+                                None,
+                            ))
                             && has(&row.point, "equal", &[*formal_def, *actual_def], None)
                     }
                 }

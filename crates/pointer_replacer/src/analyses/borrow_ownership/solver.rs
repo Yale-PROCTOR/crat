@@ -308,6 +308,10 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "own-guarded-traversal-receiver-legacy",
     // L01⁹ rule 1b.
     "deref-reader-kind",
+    // L01¹³ (c), era-5c 108 / 115.
+    "allocator-contract-port-retracted",
+    "own-contract-sink-drop",
+    "own-contract-sink",
 ];
 
 pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
@@ -566,6 +570,9 @@ pub struct KindSolver {
     demand_capture: RefCell<Option<DemandCapture>>,
     ownership_facts: RefCell<Option<Rc<super::licensing::facts::Facts>>>,
     original_cell_model: RefCell<Option<Rc<super::licensing::model_selection::Selection>>>,
+    /// L01¹³ (c)(ii), era-5c 108: the open allocator-contract ports whose guards
+    /// the next relaxation settles.
+    pending_contract_ports: RefCell<Vec<(String, Bool)>>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
@@ -878,6 +885,7 @@ impl KindSolver {
             demand_capture: RefCell::new(None),
             ownership_facts: RefCell::new(None),
             original_cell_model: RefCell::new(None),
+            pending_contract_ports: RefCell::new(Vec::new()),
         }
     }
 
@@ -1896,6 +1904,18 @@ impl KindSolver {
             let open = !misusing.contains(&port.function);
             if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
                 eprintln!("E5C contract-port {} open={open}", port.function);
+            }
+            // L01¹³ (c)(ii), era-5c 108: an open port's guard is settled by the
+            // relaxation (`settle_contract_ports`), retracted only where the
+            // round is otherwise unsatisfiable; a closed port stays hard-false.
+            if open
+                && !(cfg!(test)
+                    && std::env::var("CRAT_E5C_W81_FAULT").as_deref() == Ok("no-site-guard"))
+            {
+                self.pending_contract_ports
+                    .borrow_mut()
+                    .push((port.function.clone(), port.guard.clone()));
+                continue;
             }
             assert_hard(
                 &self.solver,
@@ -3176,6 +3196,7 @@ impl KindSolver {
             !self.is_diagnostic_tracked(),
             "diagnostic-tracked KindSolver must not enter hard selector relaxation"
         );
+        self.settle_contract_ports(Some(hard), selectors);
         hard.sync_from(self);
         let expected_hard = self.mandatory_tracks().len() + selectors.all().len();
         assert_eq!(
@@ -3503,6 +3524,165 @@ impl KindSolver {
             .map(|(kinds, _dropped)| kinds)
     }
 
+    /// L01¹³ (c)(ii), era-5c 108: settle the pending allocator-contract ports
+    /// before the selectors are relaxed. With the selectors and every open
+    /// port's guard assumed, while the round is UNSAT: a core that names a
+    /// guard drops that guard; a core that names none drops the selector the
+    /// relaxation would drop (the least `sort_key`), here only, so the search
+    /// reaches the conflicts behind it; a core of mandatory tracks alone ends
+    /// the search. Then each dropped guard is restored if the round stays SAT
+    /// with it (cores are not minimal). Kept guards are asserted open, as
+    /// before; dropped ones are asserted closed and receipted
+    /// (`allocator-contract-port-retracted`): that site's receiver takes the
+    /// drop constraint, and the port stays free for the others. A port is
+    /// retracted before any source or sink is leaked.
+    fn settle_contract_ports(&self, hard: Option<&HardLoopSolver>, selectors: &Selectors) {
+        let mut pending = std::mem::take(&mut *self.pending_contract_ports.borrow_mut());
+        if pending.is_empty() {
+            return;
+        }
+        let mut active = selectors.all().to_vec();
+        let check = |active: &[Bool], guards: &[(String, Bool)]| -> (SatResult, Vec<Bool>) {
+            let mut assumptions = active.to_vec();
+            assumptions.extend(guards.iter().map(|(_, guard)| guard.clone()));
+            match hard {
+                Some(hard) => {
+                    hard.sync_from(self);
+                    let outcome = self.hard_check_with_assumptions(hard, &assumptions);
+                    let core = (outcome == SatResult::Unsat)
+                        .then(|| hard.solver.get_unsat_core())
+                        .unwrap_or_default();
+                    (outcome, core)
+                }
+                None => {
+                    let outcome = self.check_with_assumptions(&assumptions);
+                    let core = (outcome == SatResult::Unsat)
+                        .then(|| self.solver.get_unsat_core())
+                        .unwrap_or_default();
+                    (outcome, core)
+                }
+            }
+        };
+        let mut dropped: Vec<(String, Bool)> = Vec::new();
+        let mut unknown = false;
+        loop {
+            let (outcome, core) = check(&active, &pending);
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!(
+                    "E5C contract-settle hard={} pending={} outcome={outcome:?} core={:?}",
+                    hard.is_some(),
+                    pending.len(),
+                    self.core_labels(selectors, &core)
+                );
+            }
+            unknown |= outcome == SatResult::Unknown;
+            if outcome != SatResult::Unsat {
+                break;
+            }
+            if let Some(index) = pending
+                .iter()
+                .position(|(_, guard)| core.iter().any(|literal| literal == guard))
+            {
+                dropped.push(pending.swap_remove(index));
+                continue;
+            }
+            let Some(selector) = active
+                .iter()
+                .enumerate()
+                .filter(|(_, selector)| core.iter().any(|literal| literal == *selector))
+                .filter_map(|(position, selector)| {
+                    selectors
+                        .index_of(selector)
+                        .map(|index| (selectors.keys[index].sort_key(), position))
+                })
+                .min()
+                .map(|(_, position)| position)
+            else {
+                break;
+            };
+            active.swap_remove(selector);
+        }
+        // The selectors the search dropped here are offered back in the
+        // relaxation's order; one that a kept guard blocks retracts that guard,
+        // so a port yields before a selector leaks here too (era-5c 115).
+        let sort_key = |selector: &Bool| {
+            selectors
+                .index_of(selector)
+                .map(|index| selectors.keys[index].sort_key())
+        };
+        let mut offered: Vec<Bool> = selectors
+            .all()
+            .iter()
+            .filter(|selector| !active.contains(selector))
+            .cloned()
+            .collect();
+        offered.sort_by(|left, right| sort_key(left).cmp(&sort_key(right)));
+        for selector in offered {
+            if unknown {
+                break;
+            }
+            active.push(selector);
+            loop {
+                let (outcome, core) = check(&active, &pending);
+                unknown |= outcome == SatResult::Unknown;
+                if outcome == SatResult::Sat {
+                    break;
+                }
+                if outcome == SatResult::Unsat
+                    && let Some(index) = pending
+                        .iter()
+                        .position(|(_, guard)| core.iter().any(|literal| literal == guard))
+                {
+                    dropped.push(pending.swap_remove(index));
+                    continue;
+                }
+                active.pop();
+                break;
+            }
+        }
+        let mut index = 0;
+        while index < dropped.len() && !unknown {
+            pending.push(dropped[index].clone());
+            match check(&active, &pending).0 {
+                SatResult::Sat => {
+                    dropped.swap_remove(index);
+                }
+                outcome => {
+                    unknown |= outcome == SatResult::Unknown;
+                    pending.pop();
+                    index += 1;
+                }
+            }
+        }
+        if unknown {
+            // An inconclusive settlement decides nothing (Codex, era-5c 115): every
+            // guard stays pending, free in this relaxation, for the next to settle.
+            pending.append(&mut dropped);
+            *self.pending_contract_ports.borrow_mut() = pending;
+            return;
+        }
+        for (function, guard) in &pending {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("allocator-contract-port-open({function})"),
+                guard,
+            );
+        }
+        for (function, guard) in &dropped {
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!("E5C contract-port retracted {function}");
+            }
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("allocator-contract-port-retracted({function})"),
+                &!guard,
+            );
+            super::allocator_contract::note_retracted(function.clone());
+        }
+    }
+
     /// §NB-F reporting twin of `model_kinds_relaxing`: also returns WHICH
     /// selectors were dropped (leaked sources and/or leaked sinks — classify
     /// via `Selectors`). Same semantics; the plain fn delegates here.
@@ -3525,6 +3705,7 @@ impl KindSolver {
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
         );
+        self.settle_contract_ports(None, selectors);
         self.begin_demand_epoch(selectors);
         let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
@@ -4497,6 +4678,29 @@ impl Database for BoOwnDatabase<'_> {
             self.tracker,
             || format!("own-contract-port-drop({dest:?}<={ret:?})"),
             &Bool::or(&[guard, &!d, r]),
+        );
+    }
+
+    fn push_guarded_contract_sink(&mut self, guard: &Bool, param: Var, arg: Var) {
+        super::ownership_evidence::record(
+            "guarded-contract-sink",
+            &[param, arg],
+            None,
+            Some(guard),
+        );
+        let p = &self.z3_ast[param];
+        let a = &self.z3_ast[arg];
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-contract-sink({param:?}={arg:?})"),
+            &Bool::or(&[&!guard, &!p.xor(a)]),
+        );
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            || format!("own-contract-sink-drop({arg:?})"),
+            &Bool::or(&[guard, &!a]),
         );
     }
 

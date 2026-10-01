@@ -312,6 +312,24 @@ where 'tcx: 'infercx
                     ty
                 };
                 let arg = arg.transpose();
+                // L01¹³ (c)(iii), era-5c 115: the formal a contract releaser frees
+                // through `free_func` takes the caller's token through a guarded
+                // equality, as a producer's return port does; a retracted guard
+                // releases a raw value (the consumer keeps `p` raw).
+                let contract_sink = (!lent
+                    && !borrowed
+                    && crate::analyses::borrow_ownership::allocator_contract::is_sink_formal(
+                        callee, index,
+                    ))
+                .then(|| {
+                    let guard = Bool::fresh_const("contract-sink");
+                    crate::analyses::borrow_ownership::allocator_contract::note_port(
+                        infer_cx.tcx.def_path_str(infer_cx.function()),
+                        guard.clone(),
+                    );
+                    guard
+                });
+                let mut sink_depth = 0usize;
 
                 matcher(
                     ty,
@@ -320,6 +338,8 @@ where 'tcx: 'infercx
                     infer_cx.struct_ctxt.unrestricted,
                     infer_cx.database,
                     |param, arg, database| {
+                        let first = sink_depth == 0;
+                        sink_depth += 1;
                         ownership_boundary::matched(
                             &mut argument_record,
                             Variables::consume(&arg),
@@ -356,11 +376,15 @@ where 'tcx: 'infercx
                             ownership_boundary::original_cell(&mut argument_record);
                             return;
                         }
-                        database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            param.r#use,
-                            arg.r#use,
-                        );
+                        if let Some(guard) = contract_sink.as_ref().filter(|_| first) {
+                            database.push_guarded_contract_sink(guard, param.r#use, arg.r#use);
+                        } else {
+                            database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                                (),
+                                param.r#use,
+                                arg.r#use,
+                            );
+                        }
                         database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
                             (),
                             param.def,

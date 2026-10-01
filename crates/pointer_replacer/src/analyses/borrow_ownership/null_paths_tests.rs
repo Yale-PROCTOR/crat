@@ -4231,6 +4231,19 @@ fn e5c_inner_w63() {
             owned = W84_LIST.replace(W84_NULL_ITEM, "");
             owned.as_str()
         }
+        Ok("w80-base") => W80_BASE,
+        Ok("w81-grow") => {
+            owned = format!("{W80_BASE}{W81_GROW}");
+            owned.as_str()
+        }
+        Ok("w82-cond") => {
+            owned = format!("{W80_BASE}{W82_COND}");
+            owned.as_str()
+        }
+        Ok("w82-lent") => {
+            owned = format!("{W80_BASE}{W82_LENT}");
+            owned.as_str()
+        }
         Ok("w85-call") => W85_G,
         Ok("w85-cast") => {
             owned = W85_G.replace("::core::ptr::null_mut::<Node>()", "0 as *mut Node");
@@ -4301,6 +4314,14 @@ fn e5c_inner_w63() {
                 ),
                 Err(e) => eprintln!("E5C_W63 validate err:{e}"),
             }
+        }
+        // W81 (era-5c 115): the receipt's retracted contract ports.
+        for line in verified
+            .receipt
+            .lines()
+            .filter(|line| line.starts_with("allocator_contract_ports_retracted"))
+        {
+            eprintln!("E5C_W63 {line}");
         }
         // W66 (R603-2): the final retirement review's discharges and conflicts.
         if let Some(review) = &captured.source_retirement {
@@ -6486,6 +6507,255 @@ fn e5c_w85_the_null_constructor_is_a_null_constant() {
         "ref",
         "the fault must be caught: {fault:?}"
     );
+}
+
+/// W80–W82 (R691-1, era-5c 108): brotli's memory manager reduced (era-5c 100b's
+/// `br-*.rs`). The base: `make` allocates through `BrotliAllocate` (the contract's
+/// producer), writes, reads and releases through `BrotliFree` (its `free_func` sink).
+const W80_BASE: &str = r#"
+
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case)]
+use core::ffi::c_void;
+extern "C" { fn malloc(_: u64) -> *mut c_void; fn free(_: *mut c_void); fn exit(_: i32) -> !; fn memcpy(_: *mut c_void, _: *const c_void, _: u64) -> *mut c_void; }
+pub type brotli_alloc_func = Option<unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void>;
+pub type brotli_free_func = Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>;
+#[repr(C)] pub struct MemoryManager { pub alloc_func: brotli_alloc_func, pub free_func: brotli_free_func, pub opaque: *mut c_void }
+pub unsafe extern "C" fn BrotliDefaultAllocFunc(opaque: *mut c_void, size: u64) -> *mut c_void { return malloc(size); }
+pub unsafe extern "C" fn BrotliDefaultFreeFunc(opaque: *mut c_void, address: *mut c_void) { free(address); }
+pub unsafe fn BrotliInitMemoryManager(m: *mut MemoryManager, alloc_func: brotli_alloc_func, free_func: brotli_free_func, opaque: *mut c_void) {
+    if alloc_func.is_none() {
+        (*m).alloc_func = Some(BrotliDefaultAllocFunc as unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void);
+        (*m).free_func = Some(BrotliDefaultFreeFunc as unsafe extern "C" fn(*mut c_void, *mut c_void));
+        (*m).opaque = 0 as *mut c_void;
+    } else { (*m).alloc_func = alloc_func; (*m).free_func = free_func; (*m).opaque = opaque; }
+}
+pub unsafe fn BrotliAllocate(m: *mut MemoryManager, n: u64) -> *mut c_void {
+    let result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1); }
+    return result;
+}
+pub unsafe fn BrotliFree(m: *mut MemoryManager, p: *mut c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe fn opaque_of(m: *mut MemoryManager) -> *mut c_void { return (*m).opaque; }
+pub unsafe fn make(m: *mut MemoryManager) -> u32 {
+    let p = BrotliAllocate(m, 16) as *mut u32;
+    *p = 1;
+    let v = *p;
+    BrotliFree(m, p as *mut c_void);
+    return v;
+}
+pub unsafe fn wrong_free(m: *mut MemoryManager) -> u32 {
+    let q = BrotliAllocate(m, 16) as *mut u32;
+    *q = 2;
+    let v = *q;
+    free(q as *mut c_void);
+    return v;
+}
+pub unsafe fn not_an_allocation(m: *mut MemoryManager) -> u32 {
+    let o = opaque_of(m) as *mut u32;
+    return *o;
+}
+"#;
+/// The ensure-capacity swap (100b's `grow`): the receiver that cannot own.
+const W81_GROW: &str = r#"
+pub unsafe fn grow(m: *mut MemoryManager, n: u64) -> u32 {
+    let mut arr = BrotliAllocate(m, 16) as *mut u32;
+    *arr = 3;
+    let new_arr = BrotliAllocate(m, n.wrapping_mul(4)) as *mut u32;
+    memcpy(new_arr as *mut c_void, arr as *const c_void, 16);
+    BrotliFree(m, arr as *mut c_void);
+    arr = new_arr;
+    let v = *arr;
+    BrotliFree(m, arr as *mut c_void);
+    return v;
+}
+"#;
+/// Releasers whose released value is not the incoming formal (Codex, era-5c 115):
+/// `keep_and_free` overwrites `p`; `wrap_free` overwrites a wrapper's field
+/// between two transmutes.
+const W81_REASSIGNED: &str = r#"
+pub unsafe fn keep_and_free(m: *mut MemoryManager, mut p: *mut c_void) -> *mut c_void {
+    let saved = p;
+    p = BrotliAllocate(m, 8);
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+    return saved;
+}
+#[repr(transparent)] pub struct W(pub *mut c_void);
+pub unsafe fn wrap_free(m: *mut MemoryManager, p: *mut c_void) -> *mut c_void {
+    let mut w: W = core::mem::transmute(p);
+    w.0 = BrotliAllocate(m, 8);
+    let q: *mut c_void = core::mem::transmute(w);
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, q);
+    return p;
+}
+"#;
+/// A conditional allocation (`cond`).
+const W82_COND: &str = r#"
+pub unsafe fn cond(m: *mut MemoryManager, n: u64) -> u32 {
+    let p = if n > 0 { BrotliAllocate(m, n.wrapping_mul(4)) as *mut u32 } else { 0 as *mut u32 };
+    let mut v = 0;
+    if !p.is_null() { *p = 1; v = *p; }
+    BrotliFree(m, p as *mut c_void);
+    return v;
+}
+"#;
+/// An allocation lent to a local callee (`lent`).
+const W82_LENT: &str = r#"
+pub unsafe fn fill(p: *mut u32, n: u64) { let mut i = 0; while i < n { *p.offset(i as isize) = 0; i = i.wrapping_add(1); } }
+pub unsafe fn lent(m: *mut MemoryManager, n: u64) -> u32 {
+    let p = BrotliAllocate(m, n.wrapping_mul(4)) as *mut u32;
+    fill(p, n);
+    let v = *p;
+    BrotliFree(m, p as *mut c_void);
+    return v;
+}
+"#;
+
+/// W80 (R691-1, era-5c 108 (i)): the lend reads the contract's `free_func` as
+/// consuming, so `BrotliFree`'s `p` is the contract's sink and `make` owns its
+/// allocation. RED at L01¹² with the contract on: `BrotliFree::p` lent, `make::p`
+/// raw. W12–W15 restated under the frame's arms ride along as controls. The fault
+/// `CRAT_E5C_W80_FAULT=no-contract-sink` (test builds) lends `p` again.
+#[test]
+fn e5c_w80_the_contract_sink_consumes() {
+    let lines = l01p13_lines("w80-base", &[]);
+    for key in [
+        "make::_4@d0",
+        "make::_3@d0",
+        "BrotliAllocate::_0@d0",
+        "BrotliFree::_2@d0",
+    ] {
+        assert_eq!(w63_kind(&lines, key), "owning", "{key}");
+    }
+    assert_eq!(w63_kind(&lines, "wrong_free::_4@d0"), "raw");
+    assert_eq!(w63_kind(&lines, "wrong_free::_3@d0"), "raw");
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.starts_with("not_an_allocation::") || !l.ends_with(" owning")),
+        "{lines:?}"
+    );
+    let fault = l01p13_lines("w80-base", &[("CRAT_E5C_W80_FAULT", "no-contract-sink")]);
+    assert_eq!(
+        w63_kind(&fault, "make::_4@d0"),
+        "raw",
+        "the fault must be caught: {fault:?}"
+    );
+}
+
+/// W81 (R691-1, era-5c 108 (ii) and 115 (iii)): `grow`'s ensure-capacity swap
+/// cannot own its receivers. Its ports and its releases through `BrotliFree`'s
+/// sink formal are retracted per call site, so the swap stays raw in `grow`
+/// alone: `make`, the port and the sink keep Owning, and the receipt counts the
+/// four retractions. RED at L01¹² with the contract on (every receiver raw), and
+/// with 108's port guard alone (the swap reaches `make` through the sink's one
+/// formal). The fault `CRAT_E5C_W81_FAULT=no-site-guard` asserts every open guard.
+#[test]
+fn e5c_w81_a_swap_site_retracts_its_own_ports() {
+    let lines = l01p13_lines("w81-grow", &[]);
+    for key in ["make::_4@d0", "BrotliAllocate::_0@d0", "BrotliFree::_2@d0"] {
+        assert_eq!(w63_kind(&lines, key), "owning", "{key}");
+    }
+    assert_eq!(w63_kind(&lines, "grow::_4@d0"), "raw");
+    assert_eq!(w63_kind(&lines, "grow::_8@d0"), "raw");
+    let debug = w63_child("w81-grow", &{
+        let mut env = L01P13_ARMS.to_vec();
+        env.push(("CRAT_ERA5C_DEBUG", "1"));
+        env
+    });
+    assert!(debug.contains("contract-port retracted grow"), "{debug}");
+    assert!(!debug.contains("contract-port retracted make"), "{debug}");
+    let full: Vec<(&str, &str)> = L01P13_ARMS
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != "CRAT_E5C_W63_MODEL_ONLY")
+        .collect();
+    let full = w63_lines("w81-grow", &full);
+    assert!(
+        full.iter()
+            .any(|l| l == "allocator_contract_ports_retracted=4"),
+        "{full:?}"
+    );
+    let fault = l01p13_lines("w81-grow", &[("CRAT_E5C_W81_FAULT", "no-site-guard")]);
+    assert_eq!(
+        w63_kind(&fault, "make::_4@d0"),
+        "raw",
+        "the fault must be caught: {fault:?}"
+    );
+}
+
+/// W81b (Codex, era-5c 115): the sink formal is the incoming value. On `W80_BASE`
+/// with `W81_REASSIGNED`, `BrotliFree`'s `p` is recorded; `keep_and_free` and
+/// `wrap_free`, which release a fresh allocation in place of the incoming value,
+/// record no sink formal. The fault `CRAT_E5C_W81_FAULT=reassigned-formal` (test
+/// builds) skips the checks. No solve: the analysis refuses `wrap_free`'s struct
+/// transmute (`infer.rs`'s cast arm), so the records are read from `prepare`.
+#[test]
+fn e5c_w81_b_a_reassigned_formal_is_not_a_sink() {
+    const INNER: &str = "analyses::borrow_ownership::null_paths_tests::e5c_inner_w81_sink_formals";
+    let mut env = vec![
+        ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
+        ("CRAT_ERA5C_DEBUG", "1"),
+    ];
+    let text = child(INNER, &env);
+    assert!(text.contains("E5C_W81B_OK"), "{text}");
+    assert!(
+        text.contains("E5C contract-sink-formal BrotliFree 1"),
+        "{text}"
+    );
+    for releaser in ["keep_and_free", "wrap_free"] {
+        assert!(
+            !text.contains(&format!("E5C contract-sink-formal {releaser}")),
+            "{releaser}: {text}"
+        );
+    }
+    env.push(("CRAT_E5C_W81_FAULT", "reassigned-formal"));
+    let fault = child(INNER, &env);
+    for releaser in ["keep_and_free", "wrap_free"] {
+        assert!(
+            fault.contains(&format!("E5C contract-sink-formal {releaser} 1")),
+            "the fault must be caught: {fault}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs under the contract pin in a child of e5c_w81_b"]
+fn e5c_inner_w81_sink_formals() {
+    use rustc_hir::{ItemKind, OwnerNode};
+    assert!(super::allocator_contract::enabled());
+    let source = format!("{W80_BASE}{W81_REASSIGNED}");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let functions: Vec<_> = tcx
+            .hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|owner| {
+                let OwnerNode::Item(item) = owner.as_owner()?.node() else {
+                    return None;
+                };
+                matches!(item.kind, ItemKind::Fn { .. }).then_some(item.owner_id.def_id)
+            })
+            .collect();
+        super::allocator_contract::prepare(tcx, &functions);
+    })
+    .unwrap_or_else(|error| error.raise());
+    eprintln!("E5C_W81B_OK");
+}
+
+/// W82 (R691-1, era-5c 108): a conditional allocation and one lent to a local
+/// callee own under the contract. RED at L01¹² with the contract on.
+#[test]
+fn e5c_w82_a_conditional_or_lent_allocation_owns() {
+    let cond = l01p13_lines("w82-cond", &[]);
+    for key in ["cond::_4@d0", "cond::_7@d0", "make::_4@d0"] {
+        assert_eq!(w63_kind(&cond, key), "owning", "{key}");
+    }
+    let lent = l01p13_lines("w82-lent", &[]);
+    for key in ["lent::_4@d0", "lent::_5@d0", "make::_4@d0"] {
+        assert_eq!(w63_kind(&lent, key), "owning", "{key}");
+    }
 }
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement

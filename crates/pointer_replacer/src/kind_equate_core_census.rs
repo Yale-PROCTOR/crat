@@ -1438,10 +1438,14 @@ pub unsafe fn s1(val: i32) -> i32 {
 }
 "#;
 
+    // W85 (R701) reads `core::ptr::null_mut()` as a null constant, which lets the
+    // return own; the control keeps the opaque null the analysis read before, through
+    // an extern call (the same opaque-call arm).
     const LINES_IN_BUFFER: &str = r#"
 extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);
+    fn opaque_null() -> *mut *const i8;
 }
 
 pub unsafe fn lines_in_buffer(
@@ -1452,11 +1456,11 @@ pub unsafe fn lines_in_buffer(
         malloc(num_lines.wrapping_mul(core::mem::size_of::<*const i8>()));
     let line_pointers: *mut *const i8 = buffer_ptrs as *mut *const i8;
     if buffer_ptrs.is_null() {
-        return core::ptr::null_mut();
+        return opaque_null();
     }
     if num_lines == 0 {
         free(buffer_ptrs);
-        return core::ptr::null_mut();
+        return opaque_null();
     }
     *line_pointers = buffer;
     line_pointers

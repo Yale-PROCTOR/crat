@@ -78,6 +78,7 @@ impl Equation {
             | "less-equal"
             | "null-join"
             | "guarded-contract-port"
+            | "guarded-contract-sink"
             | "guarded-lend-source"
             | "guarded-reader-source-tail"
             | "guarded-reader-view-tail"

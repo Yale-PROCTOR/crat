@@ -15963,7 +15963,9 @@ pub unsafe fn f() -> i32 {
     unsafe { *holder.ptr }
 }
 "#,
-        SlotKind::Ref,
+        // W85 (R701): `core::ptr::null()` is a null constant, so the field takes the
+        // fresh allocation's token; the null initializer still never makes it Raw.
+        SlotKind::Owning,
     );
 }
 

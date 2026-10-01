@@ -698,6 +698,21 @@ fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> 
     canonical_receipt(receipt)
 }
 
+/// L01¹³ (c), era-5c 108 / 115: the retracted allocator-contract guards (producer
+/// ports and releaser sink formals, by caller), counted and digested, only when one
+/// was retracted, so every other receipt is byte-identical.
+fn contract_port_keys(mut receipt: String) -> String {
+    let retracted = super::allocator_contract::retracted();
+    if !retracted.is_empty() {
+        receipt.push_str(&format!(
+            "allocator_contract_ports_retracted={}\nallocator_contract_ports_retracted_sha256={:x}\n",
+            retracted.len(),
+            Sha256::digest(retracted.join("\n").as_bytes())
+        ));
+    }
+    receipt
+}
+
 /// R609-3 (b): the type route's count and digest, only when it removed a pair,
 /// so every receipt without one is byte-identical.
 fn type_disjoint_keys(plan: &A5Plan, mut receipt: String) -> String {
@@ -720,7 +735,7 @@ fn a5_receipt(
     nullability: &NullabilityArtifacts,
     a14: &A14Artifacts,
 ) -> String {
-    canonical_receipt(type_disjoint_keys(
+    canonical_receipt(contract_port_keys(type_disjoint_keys(
         plan,
         format!(
             "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
@@ -758,7 +773,7 @@ fn a5_receipt(
             a14.nullable_store_fields,
             Sha256::digest(a14.artifact.as_bytes()),
         ),
-    ))
+    )))
 }
 
 pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> String {

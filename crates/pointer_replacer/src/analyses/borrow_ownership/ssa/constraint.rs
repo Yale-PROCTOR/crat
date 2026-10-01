@@ -304,6 +304,13 @@ pub trait Database {
     fn push_guarded_contract_port(&mut self, _guard: &z3::ast::Bool, _dest: Var, _ret: Var) {
         panic!("guarded contract-port constraints require the BO Optimize database")
     }
+    /// L01¹³ (c)(iii), era-5c 115: a contract releaser's sink formal. `guard ⇒
+    /// param = arg` (the caller's token is released), `¬guard ⇒ ¬arg` (the
+    /// caller passes a raw value). The settlement retracts the guard only where
+    /// the round is otherwise unsatisfiable.
+    fn push_guarded_contract_sink(&mut self, _guard: &z3::ast::Bool, _param: Var, _arg: Var) {
+        panic!("guarded contract-sink constraints require the BO Optimize database")
+    }
     fn push_guarded_field_reader(
         &mut self,
         _reader: &z3::ast::Bool,

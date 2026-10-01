@@ -25,7 +25,8 @@
 
 use rustc_middle::{
     mir::{
-        BasicBlock, Body, Local, Location, Operand, Place, Rvalue, StatementKind, TerminatorKind,
+        BasicBlock, Body, CastKind, Local, Location, Operand, Place, Rvalue, StatementKind,
+        TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -289,7 +290,12 @@ pub(crate) fn pairing_refusals(facts: &super::licensing::facts::Facts) -> Vec<Re
 #[derive(Default)]
 struct State {
     producers: rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+    /// L01¹³ (c)(iii), era-5c 115: the formals (function, 0-based index) a
+    /// local function releases through the contract's `free_func`.
+    sinks: rustc_hash::FxHashSet<(rustc_hir::def_id::DefId, usize)>,
     ports: Vec<Port>,
+    /// L01¹³ (c)(ii): the ports the relaxation retracted (callers), receipted.
+    retracted: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +331,111 @@ pub(crate) fn prepare<'tcx>(tcx: TyCtxt<'tcx>, functions: &[rustc_hir::def_id::L
         if producer {
             note_producer(function.to_def_id());
         }
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            let location = Location {
+                block: bb,
+                statement_index: data.statements.len(),
+            };
+            if classify(tcx, &body, location) != Some(ContractCall::Free) {
+                continue;
+            }
+            let TerminatorKind::Call { args, .. } = &data.terminator().kind else {
+                continue;
+            };
+            if let Some(formal) = args
+                .get(1)
+                .and_then(|argument| argument.node.place())
+                .and_then(|place| place.as_local())
+                .and_then(|local| formal_of(&body, local))
+            {
+                if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                    eprintln!(
+                        "E5C contract-sink-formal {} {}",
+                        tcx.def_path_str(function.to_def_id()),
+                        formal.as_usize() - 1
+                    );
+                }
+                STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .sinks
+                        .insert((function.to_def_id(), formal.as_usize() - 1));
+                });
+            }
+        }
     }
+}
+
+/// L01¹³ (c)(iii): the formal whose incoming value a released local is, through
+/// raw-pointer locals each assigned exactly once, by a copy or a pointer-to-pointer
+/// cast. The formal itself is never written, no local on the path is a call's
+/// destination or has its address taken, and a body with inline assembly (whose
+/// outputs write places) has none (Codex, era-5c 115).
+fn formal_of(body: &Body<'_>, mut local: Local) -> Option<Local> {
+    let fault =
+        cfg!(test) && std::env::var("CRAT_E5C_W81_FAULT").as_deref() == Ok("reassigned-formal");
+    if !fault
+        && body
+            .basic_blocks
+            .iter()
+            .any(|data| matches!(&data.terminator().kind, TerminatorKind::InlineAsm { .. }))
+    {
+        return None;
+    }
+    for _ in 0..body.local_decls.len() {
+        let other_write = body.basic_blocks.iter().any(|data| {
+            matches!(
+                &data.terminator().kind,
+                TerminatorKind::Call { destination, .. } if destination.local == local
+            ) || data.statements.iter().any(|statement| {
+                matches!(
+                    &statement.kind,
+                    StatementKind::Assign(assign)
+                        if matches!(
+                            &assign.1,
+                            Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                                if place.local == local && !place.is_indirect_first_projection()
+                        )
+                )
+            })
+        });
+        if !fault && (other_write || !body.local_decls[local].ty.is_raw_ptr()) {
+            return None;
+        }
+        let mut assignments = body
+            .basic_blocks
+            .iter()
+            .flat_map(|data| &data.statements)
+            .filter_map(|statement| match &statement.kind {
+                StatementKind::Assign(assign) if assign.0.as_local() == Some(local) => {
+                    Some(&assign.1)
+                }
+                _ => None,
+            });
+        if (1..=body.arg_count).contains(&local.as_usize()) {
+            return (assignments.next().is_none() || fault).then_some(local);
+        }
+        let (Some(rvalue), None) = (assignments.next(), assignments.next()) else {
+            return None;
+        };
+        let source = match rvalue {
+            Rvalue::Use(Operand::Copy(source) | Operand::Move(source)) => source,
+            Rvalue::Cast(kind, Operand::Copy(source) | Operand::Move(source), _)
+                if fault || matches!(kind, CastKind::PtrToPtr) =>
+            {
+                source
+            }
+            _ => return None,
+        };
+        local = source.as_local()?;
+    }
+    None
+}
+
+/// L01¹³ (c)(iii): argument `index` of `function` is the formal it releases
+/// through the contract's `free_func`.
+pub(crate) fn is_sink_formal(function: rustc_hir::def_id::DefId, index: usize) -> bool {
+    enabled() && STATE.with(|state| state.borrow().sinks.contains(&(function, index)))
 }
 
 pub(crate) fn note_producer(function: rustc_hir::def_id::DefId) {
@@ -344,6 +454,15 @@ pub(crate) fn note_port(function: String, guard: z3::ast::Bool) {
 
 pub(crate) fn ports() -> Vec<Port> {
     STATE.with(|state| state.borrow().ports.clone())
+}
+
+/// L01¹³ (c)(ii), era-5c 108: a port whose guard the relaxation retracted.
+pub(crate) fn note_retracted(function: String) {
+    STATE.with(|state| state.borrow_mut().retracted.push(function));
+}
+
+pub(crate) fn retracted() -> Vec<String> {
+    STATE.with(|state| state.borrow().retracted.clone())
 }
 
 /// The functions that release a contract allocation through a libc sink:
