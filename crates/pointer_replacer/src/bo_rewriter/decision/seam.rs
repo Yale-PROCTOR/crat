@@ -240,6 +240,11 @@ pub(crate) enum LenEvidence {
     /// than its NUL, with the arm and provenance that prove it terminated
     /// (`nul_walk_arm`): the length is `strlen + 1`.
     NulWalk,
+    /// **R707 (wave-4 build 1)** — nor an array: the callee's own accesses
+    /// bound the parameter (`callee_bound`), instantiated with this call's
+    /// arguments. `key` is the full receipt,
+    /// `len-callee-bound:<must|may>:<expr>`.
+    CalleeBound { key: &'static str },
 }
 
 impl LenEvidence {
@@ -254,6 +259,7 @@ impl LenEvidence {
             LenEvidence::CalleeAccess => "len-callee-access",
             LenEvidence::FieldAlloc => "len-field-alloc",
             LenEvidence::NulWalk => "len-nul-walk",
+            LenEvidence::CalleeBound { key } => key,
         }
     }
 }
@@ -5873,7 +5879,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                         | LenEvidence::ArrayType
                         | LenEvidence::CalleeAccess
                         | LenEvidence::FieldAlloc
-                        | LenEvidence::NulWalk => None,
+                        | LenEvidence::NulWalk
+                        | LenEvidence::CalleeBound { .. } => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -6134,7 +6141,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                                             nul_walk_used.set(true);
                                             (Some(len.clone()), Some(LenEvidence::NulWalk))
                                         }
-                                        None => (None, len_evidence),
+                                        // **R707** (last, R788-5) — the callee's own
+                                        // accesses, instantiated with this call's arguments.
+                                        None => match super::callee_bound::at_call_site(
+                                            tcx, *callee, pos.index, &site.args, sm,
+                                        ) {
+                                            Some((text, key)) => {
+                                                (Some(text), Some(LenEvidence::CalleeBound { key }))
+                                            }
+                                            None => (None, len_evidence),
+                                        },
                                     },
                                 },
                             },

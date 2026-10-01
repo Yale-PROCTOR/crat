@@ -229,10 +229,26 @@ pub(crate) fn plan(
                         original_type,
                     ));
                 }
+                // **R707 (wave-4 build 1)** — the entry's own body bounds the
+                // formal (`callee_bound`): the wrapper's formals carry the same
+                // names, so the length is rendered in them. Not over a void
+                // region, whose element is the region's, not the formal's.
+                let callee_bound =
+                    (matches!(form, Form::Slice { .. } | Form::Opt { slice: true, .. })
+                        && table.void_region.get(&node).is_none())
+                    .then(|| super::callee_bound::of_parameter(tcx, function.did, parameter_index))
+                    .flatten()
+                    .and_then(|bound| {
+                        super::callee_bound::in_own_parameters(tcx, function.did, &bound)
+                    });
+                if let Some((text, _)) = &callee_bound {
+                    spec.len = Some(seam::SeamLen::Licensed(text.clone()));
+                }
                 if spec.render_in_context(&parameter_name, unsafe_fn).is_none() {
                     return Err("surface-argument-render-unavailable");
                 }
-                let fallback = matches!(form, Form::Slice { .. } | Form::Opt { slice: true, .. });
+                let fallback = callee_bound.is_none()
+                    && matches!(form, Form::Slice { .. } | Form::Opt { slice: true, .. });
                 let unsafe_context = spec.requires_unsafe().then_some(UnsafeContextPresentation {
                     unsafe_fn,
                     wrapper_inserted: !unsafe_fn,
@@ -251,6 +267,8 @@ pub(crate) fn plan(
                     argument_kind: "generated-wrapper-argument".into(),
                     extent: if fallback {
                         BridgeExtentKind::Fallback
+                    } else if let Some((_, receipt)) = &callee_bound {
+                        BridgeExtentKind::Evidence(receipt.clone())
                     } else {
                         BridgeExtentKind::None
                     },
@@ -301,6 +319,8 @@ pub(crate) fn plan(
                                     receipt: fallback_extent_receipt(),
                                     waiver_id: SLICE_EXTENT_WAIVER_ID.into(),
                                 }
+                            } else if let Some((_, receipt)) = &callee_bound {
+                                MechanicalExtent::Evidence(receipt.clone())
                             } else {
                                 MechanicalExtent::None
                             },

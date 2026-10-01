@@ -40,6 +40,7 @@ pub(crate) mod binn_counted;
 pub(crate) mod box_facts;
 pub(crate) mod box_param;
 pub(crate) mod call_result_option;
+pub(crate) mod callee_bound;
 pub(crate) mod callee_parameter_input;
 #[cfg(test)]
 mod carried_nullability_indexed_tests;

@@ -228,7 +228,7 @@ pub(super) fn inspect<'tcx>(
         {
             continue;
         }
-        let (mutable, length, _from_cursor) = match decision {
+        let (mutable, length, was_fallback) = match decision {
             // The row becomes a plain slice local.
             Decision::Slice { mutable, .. } => {
                 let Some(construction) = table
@@ -245,12 +245,22 @@ pub(super) fn inspect<'tcx>(
                     || construction.nullable
                     // Only a fabricated extent is known to be a constant, and
                     // only a constant is known to mean the same thing in the
-                    // wrapper.
-                    || !construction.length.is_fallback()
+                    // wrapper — or (R707) a callee bound, which names only the
+                    // function's own parameters, never written in its body,
+                    // and the wrapper's formals carry the same names.
+                    || !(construction.length.is_fallback()
+                        || matches!(
+                            construction.length.source,
+                            crate::bo_rewriter::decision::construction::SliceLengthSource::CalleeBound { .. }
+                        ))
                 {
                     continue;
                 }
-                (*mutable, construction.length.expression.clone(), false)
+                (
+                    *mutable,
+                    construction.length.expression.clone(),
+                    construction.length.is_fallback(),
+                )
             }
             // N2 (the cursor seam, relay 002 §2). The row becomes a cursor
             // over the inner slice. The cursor VERDICT and the runtime type are
@@ -302,7 +312,7 @@ pub(super) fn inspect<'tcx>(
             init: init.hir_id,
             index: projection,
             mutable,
-            was_fallback: true,
+            was_fallback,
             length,
             raw_name: format!("__crat_nested_{}_raw", id.local_id.as_u32()),
             view_name: format!("__crat_nested_{}_view", id.local_id.as_u32()),

@@ -908,8 +908,11 @@ pub(crate) fn promote(
                 // fabricated length keeps its plan and its receipt.
                 c.initializer_kind = if plan.count_guard {
                     "nested-reborrow-relocated"
-                } else {
+                } else if c.length.is_fallback() {
                     "nested-reborrow-relocated-fallback"
+                } else {
+                    // R707: a callee-bound length, relocated with its receipt.
+                    "nested-reborrow-relocated-callee-bound"
                 };
             }
             changed = true;

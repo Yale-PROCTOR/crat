@@ -198,6 +198,12 @@ pub(crate) enum SliceLengthSource {
         field: String,
         sibling: String,
     },
+    /// **R707 (wave-4 build 1)** — the function's own accesses through the
+    /// local bound it (`callee_bound`): `len-callee-bound:<must|may>:<expr>`,
+    /// the expression in the function's own parameters.
+    CalleeBound {
+        receipt: String,
+    },
     Fallback,
 }
 
@@ -231,6 +237,7 @@ impl SliceLengthSource {
                     .join(";")
             ),
             Self::SiblingSize { field, sibling } => format!("sibling-size:{field}:{sibling}"),
+            Self::CalleeBound { receipt } => receipt.clone(),
             Self::Fallback => fallback_extent_receipt(),
         }
     }
@@ -1018,6 +1025,18 @@ fn select_length(
     if let Some(length) = root_extent(tcx, facts, subject, element_type, init_hir, known) {
         return length;
     }
+    // **R707** — nor a root extent: the function's own accesses through the
+    // local, before the §77 fallback.
+    if let Some(bound) = super::callee_bound::of_local(tcx, subject.fn_did, subject.hir_id)
+        && let Some((expression, receipt)) =
+            super::callee_bound::in_own_parameters(tcx, subject.fn_did, &bound)
+    {
+        return SliceLengthPlan {
+            expression,
+            source: SliceLengthSource::CalleeBound { receipt },
+            provenance: Vec::new(),
+        };
+    }
     SliceLengthPlan {
         expression: "crate::FALLBACK_SLICE_EXTENT".to_owned(),
         source: SliceLengthSource::Fallback,
@@ -1135,6 +1154,9 @@ fn bind_allocation_arguments(
         // A sibling size is read at the base, not bound out of an allocation
         // argument: there is no call to hoist an argument from.
         | SliceLengthSource::SiblingSize { .. }
+        // The bound names the function's parameters, not an allocation
+        // argument.
+        | SliceLengthSource::CalleeBound { .. }
         | SliceLengthSource::Fallback => {
             return Ok((
                 Vec::new(),
