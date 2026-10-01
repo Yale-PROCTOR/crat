@@ -299,6 +299,8 @@ mod option_pending_sibling_tests;
 #[cfg(test)]
 mod option_projection_tests;
 #[cfg(test)]
+mod option_raw_formal_tests;
+#[cfg(test)]
 mod option_reborrow_tests;
 #[cfg(test)]
 mod option_receiver_tests;
