@@ -1528,15 +1528,15 @@ fn r475_3_offset_from_on_delivered_references() {
     // The R130 bridge at a use: a delivered reference reaches `offset_from` through
     // `core::ptr::from_ref`. The defect is a use left BARE on a delivered receiver, not
     // the presence of `offset_from` -- the bridged form contains it too.
-    for bad in ["end.offset_from(", "begin.offset_from("] {
-        assert!(
-            !source.contains(bad),
-            "a delivered reference kept a bare raw-pointer `offset_from` use ({bad}):\n{source}"
-        );
-    }
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): `end` is only measured, so it is held raw and its
+    // `offset_from` stays the raw method call; `begin` is delivered (a `sink`
+    // argument too) and is never the receiver.
+    assert!(source.contains("end: *const u8"), "{source}");
+    assert!(source.contains("begin: &u8"), "{source}");
+    assert!(source.contains("end.offset_from(begin)"), "{source}");
     assert!(
-        source.contains("core::ptr::from_ref(end).offset_from("),
-        "the use must bridge through from_ref:\n{source}"
+        !source.contains("begin.offset_from("),
+        "a delivered reference kept a bare raw-pointer `offset_from` use:\n{source}"
     );
 }
 

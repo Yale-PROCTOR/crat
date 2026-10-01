@@ -133,7 +133,8 @@ fn wave6k_brotli_base_ip_copy() {
 
 #[test]
 fn wave6k_lodepng_strlen_original_pointer_copy() {
-    let source = emitted(
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): `orig` is only measured, so it is held, not a copy value.
+    let got = decisions(
         r#"
         pub unsafe fn lodepng_strlen(mut a: *const i8) -> usize {
             let mut orig = a;
@@ -141,9 +142,12 @@ fn wave6k_lodepng_strlen_original_pointer_copy() {
             a.offset_from(orig) as usize
         }
     "#,
-        "orig",
     );
-    assert!(source.contains("orig: &i8"), "{source}");
+    let (_, orig) = got.iter().find(|(name, _)| name == "orig").expect("orig");
+    assert!(
+        format!("{orig:?}").contains("AddressObservationOnly"),
+        "{orig:?}"
+    );
 }
 
 #[test]

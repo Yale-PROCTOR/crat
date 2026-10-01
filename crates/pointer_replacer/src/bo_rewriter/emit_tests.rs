@@ -2993,14 +2993,16 @@ fn one_comparison_opens_its_parameter_and_local_operand_alike() {
          pub unsafe fn f(a: *mut i32, b: *mut i32) -> i32 { \
          let q: *mut i32 = a; if q == b { return 1; } 0 }\n",
     );
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`). The pair's point stands: ONE comparison, ONE answer for both
+    // operands, whichever population each belongs to -- now the held form.
     assert_eq!(
         reason_of(&got, "b", true),
-        "<emitted>",
+        "held:address-observation-only",
         "parameter operand: {got:?}"
     );
     assert_eq!(
         reason_of(&got, "q", false),
-        "<emitted>",
+        "held:address-observation-only",
         "local operand: {got:?}"
     );
 }
@@ -11826,11 +11828,10 @@ fn addr_w1_pointer_to_integer_is_a_terminal_safe_view() {
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
         panic!("terminal address observation must emit");
     };
-    assert!(source.contains("p: &i32"), "{source}");
-    assert!(
-        source.contains("core::ptr::from_ref(p) as usize"),
-        "{source}"
-    );
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): no reference is created for a value that is only observed.
+    assert!(source.contains("p: *const i32"), "{source}");
+    assert!(source.contains("p as usize"), "{source}");
+    assert!(!source.contains("core::ptr::from_ref(p)"), "{source}");
 }
 
 /// ADDR-W1 — same-allocation difference is observation-only and converts both
@@ -11842,9 +11843,10 @@ fn addr_w1_offset_from_is_a_terminal_safe_view() {
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
         panic!("terminal pointer difference must emit");
     };
-    assert!(source.contains("p: &i32"), "{source}");
-    assert!(source.contains("q: &i32"), "{source}");
-    assert_eq!(source.matches("core::ptr::from_ref").count(), 2, "{source}");
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): both operands of a bare difference are held.
+    assert!(source.contains("p: *const i32"), "{source}");
+    assert!(source.contains("q: *const i32"), "{source}");
+    assert!(!source.contains("core::ptr::from_ref"), "{source}");
 }
 
 /// ADDR-N1 — a pointer-producing arithmetic use remains access-producing and
@@ -13176,8 +13178,12 @@ fn slu_w1_named_copy_uses_a_checked_reference_origin() {
             p.offset_from(base)\n\
         }\n";
     let emitted = ast_emitted_source_of(input).expect("SLU named-copy emission");
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): `base` is only measured (`offset_from`), so it stays the raw
+    // entry address `p.as_ptr()`; `p` itself is still the delivered slice.
     assert!(
-        emitted.contains("p: &[i32]") && emitted.contains("let base: &i32 = &p[0]"),
+        emitted.contains("p: &[i32]")
+            && emitted.contains("let base = p.as_ptr()")
+            && emitted.contains("p.as_ptr().offset_from(base)"),
         "{emitted}"
     );
     slu_w1_assert_use_receipt_count(input, 2);

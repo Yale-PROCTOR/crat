@@ -922,9 +922,12 @@ fn ptr_comparison_shape_emits_explicit_address_views() {
     let RewriteOutcome::Emitted { source, .. } = rewrite_m1(&src) else {
         panic!("value-observing comparison must emit")
     };
-    assert!(source.contains("p: &u8"), "{source}");
-    assert!(source.contains("plimit: &u8"), "{source}");
-    assert_eq!(source.matches("core::ptr::from_ref").count(), 2, "{source}");
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): a compared-only pair is not opened at all; the comparison
+    // stays the input's raw address comparison.
+    assert!(source.contains("p: *mut u8"), "{source}");
+    assert!(source.contains("plimit: *mut u8"), "{source}");
+    assert!(source.contains("if p > plimit"), "{source}");
+    assert!(!source.contains("core::ptr::from_ref"), "{source}");
 }
 
 /// **F1 fixture — the fn-table / address-taken shape, which had NO fixture.**

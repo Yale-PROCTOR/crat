@@ -30,9 +30,18 @@ fn wave6r_h65_shared_root_field_address_into_readonly_raw_formal() {
     let source = super::emitted(INPUT);
     assert!(source.contains("s: &H65"), "{source}");
     assert!(source.contains("prepare_h6(s: &H6"), "{source}");
-    assert!(source.contains("prepare_hrolling(s: &HROLLING"), "{source}");
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): `prepare_hrolling::s` is only an `as usize` observation, so it
+    // is held raw and the caller bridges the shared root read-only; `prepare_h6`'s
+    // `s` is read (`(*s).num`) and is still delivered.
+    assert!(
+        source.contains("prepare_hrolling(s: *mut HROLLING"),
+        "{source}"
+    );
     assert!(source.contains("prepare_h6(&(*s).ha"), "{source}");
-    assert!(source.contains("prepare_hrolling(&(*s).hb"), "{source}");
+    assert!(
+        source.contains("prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()"),
+        "{source}"
+    );
     assert!(!source.contains("&mut (*s)"), "{source}");
 }
 
