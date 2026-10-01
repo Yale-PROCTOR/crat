@@ -1324,10 +1324,9 @@ fn wave6s_deref_rooted_view_base_and_destination_are_other_families() {
         flat.contains("(*out).offset(2asi32asisize)"),
         "{fabricated}"
     );
-    assert!(
-        flat.contains("crate::FALLBACK_SLICE_EXTENT"),
-        "{fabricated}"
-    );
+    // R707: the body's own `while i < n` bounds the destination, so the
+    // construction family delivers it at `n`, not the fallback.
+    assert!(flat.contains("(((n)asi128).max(0)asusize)"), "{fabricated}");
 }
 
 // ---------------------------------------------------------------------------

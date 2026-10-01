@@ -3486,6 +3486,7 @@ fn an_unfreed_subject_carries_a_present_false_not_an_absent_column() {
 /// micro-plan §10. Item 2 replaces the old construction hold with `<emitted>`.
 /// This copy initializer has no length evidence, so its exact construction
 /// identity must carry the named fallback and §77 waiver in both receipt rows.
+/// R707: the loop is bounded by a count read through the pointer itself, so the body bounds nothing and the fallback is still the length this pins.
 #[test]
 fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
     use super::mechanical_receipt::{
@@ -3493,7 +3494,7 @@ fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
         fallback_extent_receipt,
     };
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n";
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; let n = *p as isize; let mut s = 0; let mut i: isize = 0; while i < n { s += *p.offset(i); i += 1; } s }\n";
     let got = decisions_of(src);
     assert_eq!(
         reason_of(&got, "p", false),
@@ -5914,8 +5915,11 @@ const E_ADAPT_PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused
 
 /// E-ADAPT-W1 — raw expressions into shared slices, covering BOTH extent arms.
 ///
-/// The first callee has an adjacent count and must retain the licensed arm. The
-/// second has no count and must name the §77 fallback. Both callers use an
+/// The first callee has an adjacent count; since R408-1 adjacency alone licenses
+/// nothing, and (R707) its own `while i < n` bounds the pointer, so it takes
+/// `n` as `len-callee-bound:may:n`. The
+/// second has no count and must name the §77 fallback (R707: its loop is bounded
+/// by a count read through the pointer itself, so its body bounds nothing). Both callers use an
 /// offset expression rather than a bare local: that is the corpus shape the
 /// existing argument classifier calls `Other`, so the witness is RED before
 /// wave 1 even though g25/g26 already cover the glue algebra in isolation.
@@ -6095,8 +6099,9 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
 
 /// E-ADAPT-N4 — fallback identity is inseparable from its receipt and name.
 ///
-/// R677-6: `sum` branches, so its accesses prove no extent and the fallback
-/// is still the length this pins.
+/// R677-6 / R707: the loop is bounded by a count read through the pointer
+/// itself, so neither the callee's straight-line accesses nor its bound prove
+/// an extent, and the fallback is still the length this pins.
 ///
 /// wave-6s (report 007): the raw expression is kept raw by a signed delta
 /// (R394-2); a forward one would deliver the suffix view with no fallback.
@@ -6104,7 +6109,7 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
 fn e_adapt_n4_fallback_name_and_receipt_are_one_production_fact() {
     let src = format!(
         "{E_ADAPT_PRE}\
-         pub unsafe fn sum(p: *const i32) -> i32 {{ if *p.offset(0) > 0 {{ *p.offset(1) }} else {{ 0 }} }}\n\
+         pub unsafe fn sum(p: *const i32) -> i32 {{ let n = *p as isize; let mut s = 0; let mut i: isize = 0; while i < n {{ s += *p.offset(i); i += 1; }} s }}\n\
          pub unsafe fn caller(p: *const i32, k: isize) -> i32 {{ sum(p.offset(k)) }}\n"
     );
     let seams = e_adapt_seams(&src);
@@ -6635,11 +6640,12 @@ const E3_CLEAR_RAW: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unuse
         target(left.offset(0), right.offset(0));\n\
     }\n";
 
-/// R677-6: [`E3_CLEAR_RAW`] with a `target` that branches, so its accesses
-/// prove no extent: the fallback stays the only length (E-ADAPT-W3-N7).
-const E3_CLEAR_RAW_BRANCHED: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+/// R707: [`E3_CLEAR_RAW`] with a `target` whose indexes are read through the
+/// pointers themselves, so its body bounds nothing and the fallback is still the
+/// only length (E-ADAPT-W3-N7).
+const E3_CLEAR_RAW_UNBOUNDED: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
     extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
-    pub unsafe fn target(a: *mut i32, b: *mut i32) { if *a > 0 { *a += 1; } *b += 1; }\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { *a.offset(*a as isize) += 1; *b.offset(*b as isize) += 1; }\n\
     pub unsafe fn caller() {\n\
         let left = malloc(8) as *mut i32;\n\
         let right = malloc(8) as *mut i32;\n\
@@ -11313,7 +11319,9 @@ fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
 /// names it; `target` reads one element under `if a_len != 0`, which is no
 /// count, so both placements fabricate with the named fallback and their
 /// signature evidence (`len-following`) survives only in the derivability
-/// column.
+/// column. R707: the callee's own body reads element 0 of each (behind its
+/// `if`), so each length is that bound, `may:1` — still never the following
+/// `2`.
 #[test]
 fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
     let attempt = e3_attempt_with(E3_CLEAR_LICENSED, true, &|table| {
@@ -11329,12 +11337,18 @@ fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
         .filter(|row| row.first() == Some(&"placed"))
         .collect::<Vec<_>>();
     assert_eq!(placed.len(), 2, "{}", attempt.receipt);
-    assert!(placed.iter().all(|row| row[len_arm] == "len-fabricated"));
-    assert_eq!(
-        e2_root_text(&attempt)
-            .matches("crate::FALLBACK_SLICE_EXTENT")
-            .count(),
-        2
+    assert!(
+        placed
+            .iter()
+            .all(|row| row[len_arm] == "len-callee-bound:may:1"),
+        "{}",
+        attempt.receipt
+    );
+    let root = e2_root_text(&attempt);
+    assert_eq!(root.matches("crate::FALLBACK_SLICE_EXTENT").count(), 0);
+    assert!(
+        !root.contains("(2) as usize"),
+        "the following `2` is not the length: {root}"
     );
 }
 
@@ -11342,7 +11356,7 @@ fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
 /// and the receipt carries the fabricated arm.
 #[test]
 fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
-    let attempt = e3_attempt(E3_CLEAR_RAW_BRANCHED, true, true);
+    let attempt = e3_attempt(E3_CLEAR_RAW_UNBOUNDED, true, true);
     let len_arm = receipt_column(&attempt.receipt, "len_arm");
     let placed = attempt
         .receipt
@@ -12671,6 +12685,8 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
     );
 }
 
+/// R707: `with_fallback`'s loop is bounded by a count read through the pointer
+/// itself, so its body bounds nothing and the fallback half stays the fallback.
 const SLC_W1: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
     pub unsafe fn with_evidence() -> i32 {\n\
         let mut values = [0i32, 1i32, 2i32, 3i32];\n\
@@ -12679,7 +12695,9 @@ const SLC_W1: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
     }\n\
     pub unsafe fn with_fallback(src: *mut i32) -> i32 {\n\
         let p: *mut i32 = src as *mut i32;\n\
-        *p.offset(1)\n\
+        let n = *p as isize; let mut s = 0; let mut i: isize = 0;\n\
+        while i < n { s += *p.offset(i); i += 1; }\n\
+        s\n\
     }\n";
 
 /// SLC-W1(a) migration receipt: addendum 206 E11, micro-plan §10. Adjacency
@@ -15142,7 +15160,9 @@ fn r677_6_a_raw_argument_takes_the_callee_s_straight_line_extent() {
 /// seam's C arm rendered `FALLBACK_SLICE_EXTENT` though the array type IS the
 /// extent. The witness: each such argument gets `N` as `len-array-type`. The
 /// controls: a pointer-typed field, an array read through a cast that changes
-/// the element type, and a start one element in stay at the fallback.
+/// the element type, and a start one element in stay at the fallback. R707:
+/// they now take their callees' own straight-line bounds (`tables` reads 3,
+/// `bytes` 6) — still never the array's length.
 #[test]
 fn r625_an_array_element_zero_argument_takes_the_array_length() {
     let src = format!(
