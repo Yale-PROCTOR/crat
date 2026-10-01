@@ -39,7 +39,7 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
-pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p12-v1";
+pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p13-v1";
 
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
@@ -1284,7 +1284,7 @@ mod tests {
             Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         for required in [
-            "analysis_frame=era5c-l01p12-v1",
+            "analysis_frame=era5c-l01p13-v1",
             "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",
