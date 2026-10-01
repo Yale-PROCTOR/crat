@@ -310,6 +310,28 @@ fn freed_before_in_its_block(
         .any(|(call, _)| call.hi() <= ret.lo() && innermost(*call) == Some(block))
 }
 
+/// **R713 STOP 1** — an off-by-default trace of each certificate candidate's
+/// `certify` outcome per fixpoint round, for one lil census (131 §2): the
+/// rowless withdrawal is not reproducible on a reduction. Test builds only
+/// (the census runner is a test binary); `CRAT_W6A_CERTIFY_TRACE=<file>`
+/// appends `round\tcallee\toutcome\tdetail` rows and a `derive` line per
+/// derivation. Nothing reads it back.
+#[cfg(test)]
+fn certify_trace(line: impl FnOnce() -> String) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("CRAT_W6A_CERTIFY_TRACE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{}", line());
+    }
+}
+
+#[cfg(not(test))]
+fn certify_trace(_line: impl FnOnce() -> String) {}
+
 /// **R713 STOP 3** — `ret` (a null return's operand) ends before the `let`
 /// that declares `binding`. A binding's scope starts at its `let`, so no
 /// generation of it is live there (in a loop, the previous iteration's ended
@@ -2186,8 +2208,12 @@ fn derive_once<'tcx>(
     }
     let mut pending: Vec<LocalDefId> = candidates;
     let mut changed = true;
+    let path = |callee: LocalDefId| tcx.def_path_str(callee.to_def_id());
+    certify_trace(|| "derive".to_owned());
+    let mut round = 0usize;
     while changed {
         changed = false;
+        round += 1;
         let mut next = Vec::new();
         for callee in pending {
             match certify(
@@ -2211,15 +2237,22 @@ fn derive_once<'tcx>(
                 &out,
             ) {
                 Ok(Some((certificate, plans))) => {
+                    certify_trace(|| format!("{round}\t{}\tadmitted\t-", path(callee)));
                     out.plans.extend(plans);
                     out.callees.insert(callee, certificate);
                     changed = true;
                 }
-                Ok(None) => next.push(callee),
+                Ok(None) => {
+                    certify_trace(|| format!("{round}\t{}\tpending\t-", path(callee)));
+                    next.push(callee);
+                }
                 // The pass-over was settled before the fixpoint; `certify`
                 // still reports it so the two can never disagree.
-                Err((_, _, hold)) if hold.starts_with(CHAIN_THROUGH) => {}
+                Err((_, _, hold)) if hold.starts_with(CHAIN_THROUGH) => {
+                    certify_trace(|| format!("{round}\t{}\tpassed-over\t{hold}", path(callee)));
+                }
                 Err((key, label, hold)) => {
+                    certify_trace(|| format!("{round}\t{}\theld\t{hold}", path(callee)));
                     out.holds.insert(key, (label, hold));
                 }
             }
@@ -2251,6 +2284,7 @@ fn derive_once<'tcx>(
             break;
         }
         for callee in withdraw {
+            certify_trace(|| format!("-\t{}\twithdrawn\tchain-open", path(callee)));
             let Some(c) = out.callees.remove(&callee) else { continue };
             if let Some(returned) = c.returned {
                 out.plans.remove(&returned);
@@ -2293,6 +2327,7 @@ fn derive_once<'tcx>(
     }
     // Chains that never closed (a return chained from an uncertified callee).
     for callee in pending {
+        certify_trace(|| format!("-\t{}\tnever-closed\t-", path(callee)));
         let Some(scan) = scans.get(&callee) else { continue };
         let key = scan
             .returns

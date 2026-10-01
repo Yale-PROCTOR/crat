@@ -1092,6 +1092,34 @@ fn w6a_r713_a_null_return_before_the_owner_closes_nothing() {
     );
 }
 
+/// **R713 STOP 1 — the certify trace is off by default and, switched on,
+/// names each candidate's outcome per round.** `CRAT_W6A_CERTIFY_TRACE=<file>`
+/// on S2's fixture: a `derive` line, `slice` admitted in round 1; unset, the
+/// file is not written.
+#[test]
+fn w6a_r713_the_certify_trace_is_off_by_default() {
+    let _frame = frame_locks();
+    let path = std::env::temp_dir().join(format!("w6a-r713-certify-trace-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = emitted("r713-trace-off", SINKLESS_NONE_AT_EXIT);
+    assert!(!path.exists(), "the trace is written only when switched on");
+    // SAFETY: the frame locks serialize the witnesses that set this.
+    unsafe {
+        std::env::set_var("CRAT_W6A_CERTIFY_TRACE", &path);
+    }
+    let _ = emitted("r713-trace-on", SINKLESS_NONE_AT_EXIT);
+    unsafe {
+        std::env::remove_var("CRAT_W6A_CERTIFY_TRACE");
+    }
+    let trace = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    assert!(trace.lines().any(|line| line == "derive"), "{trace}");
+    assert!(
+        trace.lines().any(|line| line == "1\tslice\tadmitted\t-"),
+        "{trace}"
+    );
+}
+
 /// **R619-3 (2), a loop body's scope exit.** `it` is a `let` receiver inside a
 /// loop: on the odd-id `continue` its scope ends before the store, so the
 /// emitted owner is dropped there with no `return` anywhere on the path. Its
