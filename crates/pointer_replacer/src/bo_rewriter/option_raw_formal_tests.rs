@@ -63,3 +63,40 @@ fn wave6o_optional_reference_into_a_local_raw_formal_is_bridged() {
     assert!(flat.contains("map_or(core::ptr::null::<"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+const MUT_FORMAL: &str = r#"
+#![allow(dead_code, unused_mut)]
+unsafe fn fill(mut p: *mut i32, mut q: *const i32) -> i32 { 0 }
+"#;
+
+/// The `*mut` direction, at the seam's own arm (a late-raw `*mut` local formal
+/// has no small natural reduction): `Option<&mut i32>` at `*mut i32` takes the
+/// exclusive template, `Option<&i32>` at `*mut i32` is refused shared-to-mut,
+/// and either optional at `*const i32` takes the shared one.
+#[test]
+fn wave6o_optional_into_a_raw_formal_selects_by_the_formal_type() {
+    use super::decision::seam::{Form, optional_into_raw_formal_for_tests as bridge};
+    ::utils::compilation::run_compiler_on_str(MUT_FORMAL, |tcx| {
+        let fill = tcx
+            .hir_body_owners()
+            .find(|d| tcx.item_name(d.to_def_id()).as_str() == "fill")
+            .expect("fill");
+        let opt = |mutable| Form::Opt {
+            mutable,
+            slice: false,
+        };
+        assert_eq!(
+            bridge(tcx, fill, 0, opt(true), "q").as_deref(),
+            Ok("q.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), core::ptr::from_mut)")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 0, opt(false), "q").as_deref(),
+            Err(&"seam-shared-to-mut")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 1, opt(true), "q").as_deref(),
+            Ok("q.as_deref().map_or(core::ptr::null::<i32>(), core::ptr::from_ref)")
+        );
+    })
+    .expect("fixture compiler context");
+}

@@ -3732,6 +3732,75 @@ fn owner_view_candidate(
     })
 }
 
+/// **Wave-6o (relay 121, R738-1).** An optional reference at a callee formal
+/// whose FINAL form is raw. A plain `&T` / `&mut T` coerces to `*const T` /
+/// `*mut T` at a call, so `glue(Raw, _)` adds nothing; an `Option<&T>` does not
+/// coerce. The formal may be decided a reference in the hypothetical the raw
+/// boundary planned against and only fall back to raw at its own boundary site
+/// (brotli's `stat::__path`, blocked `write-through-shared-view` at `__xstat`),
+/// so the boundary pass never saw this site as a raw target. The bridge is the
+/// raw boundary's own optional template, selected by the callee formal's type
+/// exactly as `bridge_template` selects it: `x.as_deref().map_or(null, from_ref)`
+/// and its `*mut` / slice twins; a shared optional at a `*mut` formal is refused
+/// (no negative-write evidence is asked here).
+fn optional_into_raw_formal(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    expected: Form,
+    found: Form,
+    literal_null: bool,
+    text: &str,
+) -> Option<Result<Option<Candidate>, SeamBlock>> {
+    use super::raw_boundary::{BridgeTemplate, RawMutability};
+    let (Form::Raw, Form::Opt { mutable, slice }) = (expected, found) else { return None };
+    if literal_null {
+        return None;
+    }
+    let formal = *tcx
+        .fn_sig(callee.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .inputs()
+        .get(index)?;
+    let target = super::raw_boundary::raw_target_type(tcx, formal)?;
+    let template = match (slice, mutable, target.mutability) {
+        (false, true, RawMutability::Mut) => BridgeTemplate::OptRefMutToRawMut,
+        (false, _, RawMutability::Const) => BridgeTemplate::OptRefToRawConst,
+        (true, true, RawMutability::Mut) | (true, _, RawMutability::Const) => {
+            BridgeTemplate::OptSliceToRaw
+        }
+        (_, false, RawMutability::Mut) => return Some(Err(SeamBlock::SharedToMut)),
+    };
+    let spec = GlueSpec::raw_boundary_target(template, &target, false, true);
+    let replacement = spec.render(text)?;
+    Some(Ok(Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })))
+}
+
+/// Test seam for [`optional_into_raw_formal`]: the rendered bridge, or the
+/// block's key.
+#[cfg(test)]
+pub(crate) fn optional_into_raw_formal_for_tests(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    found: Form,
+    text: &str,
+) -> Result<String, &'static str> {
+    match optional_into_raw_formal(tcx, callee, index, Form::Raw, found, false, text) {
+        Some(Ok(Some(candidate))) => Ok(candidate.replacement),
+        Some(Err(block)) => Err(block.key()),
+        _ => Err("none"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     expected: Form,
@@ -4822,7 +4891,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // raw-boundary market is the one exception to dropping the
                 // position entirely: PAIR owes its A5 receipt even when the
                 // boundary bridge itself rendered as zero syntax.
-                if matches!(expected, Form::Raw) && !raw_boundary_observation {
+                // Wave-6o (relay 121): an OPTIONAL local is the exception to
+                // the exception — `Option<&T>` does not coerce, so its position
+                // is kept for `optional_into_raw_formal`'s bridge.
+                let optional_local = matches!(arg.shape, ArgShape::BareLocal(hir)
+                    if decision_of
+                        .get(&(site.caller, hir))
+                        .is_some_and(|d| matches!(form_of(d), Form::Opt { .. })));
+                if matches!(expected, Form::Raw) && !raw_boundary_observation && !optional_local {
                     continue;
                 }
                 // wave-6b (R609-4): at a byte-region formal an `&mut x as ..`
@@ -5403,6 +5479,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                         shared_candidate(address, text)
                     } else if let Some(candidate) = owner_view {
                         Ok(Some(candidate))
+                    } else if let Some(bridged) =
+                        optional_into_raw_formal(tcx, *callee, pos.index, pos.expected, pos.found, pos.literal_null, text)
+                    {
+                        bridged
                     } else {
                         build_candidate(
                             pos.expected,
@@ -6072,7 +6152,19 @@ pub(crate) fn synthesize_with_raw_boundary(
                             span: pos.span,
                             call_span: site.span,
                             replacement: candidate.replacement.clone(),
-                            owner_class: SignatureClassId::of(*callee),
+                            // Wave-6o (relay 121): an optional actual at a formal
+                            // that stays raw is bridged for the CALLER's decision,
+                            // not the callee's — the callee is raw either way, so
+                            // the edit lives and reverts with the caller's class
+                            // (a held callee class, brotli's `stat`, must not
+                            // drop it).
+                            owner_class: if pos.expected == Form::Raw
+                                && matches!(pos.found, Form::Opt { .. })
+                            {
+                                SignatureClassId::of(site.caller)
+                            } else {
+                                SignatureClassId::of(*callee)
+                            },
                             bridge: BridgeSitePlan {
                                 caller: site.caller,
                                 callee: BridgeCalleeId::Local(*callee),
