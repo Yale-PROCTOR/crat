@@ -4859,6 +4859,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// this position. It enters PAIR for proof/receipt coverage,
                 /// never so this seam stage can block or edit it.
                 raw_boundary_observation: bool,
+                /// Wave-6o (relay 121): an OPTIONAL bare local at a formal that
+                /// ended raw COLLATERALLY (its class blocked or held), which no
+                /// earlier stage bridged.
+                late_raw_optional: bool,
                 source_shape: &'static str,
                 source_type: String,
                 target: Option<super::raw_boundary::RawTargetType>,
@@ -4894,11 +4898,28 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // Wave-6o (relay 121): an OPTIONAL local is the exception to
                 // the exception — `Option<&T>` does not coerce, so its position
                 // is kept for `optional_into_raw_formal`'s bridge.
-                let optional_local = matches!(arg.shape, ArgShape::BareLocal(hir)
-                    if decision_of
-                        .get(&(site.caller, hir))
-                        .is_some_and(|d| matches!(form_of(d), Form::Opt { .. })));
-                if matches!(expected, Form::Raw) && !raw_boundary_observation && !optional_local {
+                // Only where the formal ended raw collaterally — a formal raw on
+                // its own evidence was raw when the Option stage planned the
+                // actual's uses, and its `body-option-raw-view` edits own it.
+                let late_raw_optional = matches!(expected, Form::Raw)
+                    && !raw_boundary_observation
+                    && param_key
+                        .get(&(*callee, arg.index))
+                        .and_then(|k| decision_of.get(k))
+                        .is_some_and(|d| {
+                            matches!(d, Decision::Degraded(record) if matches!(
+                                record.reason,
+                                super::DegradeReason::SilentCoercion { .. }
+                                    | super::DegradeReason::ClassBlocked { .. }
+                                    | super::DegradeReason::SignatureClassHeld { .. }
+                            ))
+                        })
+                    && matches!(arg.shape, ArgShape::BareLocal(hir)
+                        if decision_of
+                            .get(&(site.caller, hir))
+                            .is_some_and(|d| matches!(form_of(d), Form::Opt { .. })));
+                if matches!(expected, Form::Raw) && !raw_boundary_observation && !late_raw_optional
+                {
                     continue;
                 }
                 // wave-6b (R609-4): at a byte-region formal an `&mut x as ..`
@@ -5055,6 +5076,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     borrows,
                     literal_null,
                     raw_boundary_observation,
+                    late_raw_optional,
                     source_shape: arg.shape.key(),
                     source_type: arg.source_type.clone(),
                     target: arg.target.clone(),
@@ -5479,8 +5501,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                         shared_candidate(address, text)
                     } else if let Some(candidate) = owner_view {
                         Ok(Some(candidate))
-                    } else if let Some(bridged) =
-                        optional_into_raw_formal(tcx, *callee, pos.index, pos.expected, pos.found, pos.literal_null, text)
+                    } else if let Some(bridged) = pos
+                        .late_raw_optional
+                        .then(|| {
+                            optional_into_raw_formal(tcx, *callee, pos.index, pos.expected, pos.found, pos.literal_null, text)
+                        })
+                        .flatten()
                     {
                         bridged
                     } else {
@@ -6158,9 +6184,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             // the edit lives and reverts with the caller's class
                             // (a held callee class, brotli's `stat`, must not
                             // drop it).
-                            owner_class: if pos.expected == Form::Raw
-                                && matches!(pos.found, Form::Opt { .. })
-                            {
+                            owner_class: if pos.late_raw_optional {
                                 SignatureClassId::of(site.caller)
                             } else {
                                 SignatureClassId::of(*callee)
