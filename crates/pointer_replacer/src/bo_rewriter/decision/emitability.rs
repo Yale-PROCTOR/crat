@@ -1796,6 +1796,99 @@ impl EmitabilityFacts {
             (false, false) => AddressUseClass::Neither,
         }
     }
+
+    /// **R739-1 (slicecursor relay 099): the subject is only ever measured.**
+    /// Every use of the local in its own body is an operand of an address
+    /// observation that measures it — a difference (`offset_from`), a
+    /// comparison, `ptr::eq`, a cast to an integer — or the receiver of
+    /// `is_null`, and at least one use measures. Returns the first measuring
+    /// observation's span.
+    ///
+    /// Such a value may be an END SENTINEL: brotli's
+    /// `EmitUncompressedMetaBlock(input, input.offset(input_size), ..)` hands
+    /// `end` one past the end of `input`. A reference there asserts a
+    /// dereferenceable element that does not exist — UB at its creation, which
+    /// the UB-free C input does not have — so the subject is held raw.
+    ///
+    /// `ptr-cast` is not a measurement (`*(p as *const u32)` reads through it).
+    /// Any other use — a dereference, a call argument, a store, an assignment,
+    /// a use inside a closure — answers `None`, so the subject is untouched.
+    pub(crate) fn address_observation_only(
+        &self,
+        tcx: TyCtxt<'_>,
+        node: (LocalDefId, HirId),
+    ) -> Option<Span> {
+        const MEASURES: &[&str] = &[
+            "difference",
+            "ptr-to-int",
+            "ptr-eq",
+            "eq",
+            "ne",
+            "lt",
+            "le",
+            "gt",
+            "ge",
+        ];
+        let measuring = self
+            .address_observations
+            .iter()
+            .filter(|observation| {
+                observation.owner == node.0
+                    && MEASURES.contains(&observation.op)
+                    && observation
+                        .operands
+                        .iter()
+                        .any(|operand| operand.node == node)
+            })
+            .collect::<Vec<_>>();
+        let first = measuring.first()?.span;
+        let measured = measuring
+            .iter()
+            .flat_map(|observation| observation.operands.iter())
+            .filter(|operand| operand.node == node)
+            .map(|operand| operand.span)
+            .collect::<rustc_hash::FxHashSet<_>>();
+
+        struct Uses<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            local: HirId,
+            measured: &'a rustc_hash::FxHashSet<Span>,
+            in_closure: bool,
+            other: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                if BodyFacts::resolved_local(expr) == Some(self.local) {
+                    let null_test = matches!(
+                        self.tcx.parent_hir_node(expr.hir_id),
+                        rustc_hir::Node::Expr(Expr {
+                            kind: ExprKind::MethodCall(segment, receiver, [], _),
+                            ..
+                        }) if segment.ident.name.as_str() == "is_null"
+                            && receiver.hir_id == expr.hir_id
+                    );
+                    if self.in_closure || !(self.measured.contains(&expr.span) || null_test) {
+                        self.other = true;
+                    }
+                }
+                if let ExprKind::Closure(closure) = expr.kind {
+                    let outer = std::mem::replace(&mut self.in_closure, true);
+                    self.visit_body(self.tcx.hir_body(closure.body));
+                    self.in_closure = outer;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut uses = Uses {
+            tcx,
+            local: node.1,
+            measured: &measured,
+            in_closure: false,
+            other: false,
+        };
+        uses.visit_body(tcx.hir_body_owned_by(node.0));
+        (!uses.other).then_some(first)
+    }
 }
 
 #[cfg(test)]

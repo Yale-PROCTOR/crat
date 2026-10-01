@@ -207,6 +207,8 @@ mod a5_inner_argument_tests;
 #[cfg(test)]
 mod additive_tests;
 #[cfg(test)]
+mod address_observation_only_tests;
+#[cfg(test)]
 mod address_view_tests;
 #[cfg(test)]
 mod aliased_storage_withdrawal_tests;

@@ -622,6 +622,12 @@ pub(crate) enum DegradeReason {
     /// and inverts. Refusing here is the only place that catches it before a
     /// behavioral gate exists.
     PtrComparison,
+    /// R739-1 (slicecursor relay 099). Every use of the subject only measures
+    /// its address — `offset_from`, a comparison, `is_null`, a cast to an
+    /// integer — so its value may be an end sentinel one past an allocation,
+    /// and a reference to it would be UB at creation
+    /// ([`EmitabilityFacts::address_observation_only`]).
+    AddressObservationOnly,
     /// R261-3. The subject's own type reaches the io-domain -- a stream handle,
     /// or an aggregate holding one. A `FILE*` promoted to `&mut FILE` claims
     /// exclusive access to a handle libc holds its own pointer to, so the
@@ -901,6 +907,7 @@ impl DegradeReason {
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
+            DegradeReason::AddressObservationOnly => "held:address-observation-only",
             DegradeReason::IoDomainType => "held:io-domain:type",
             DegradeReason::VoidPointee => "held:void-pointee",
             DegradeReason::ThinExtent => "held:thin-extent",
@@ -2498,6 +2505,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && fat.is_array(subject.fn_did, subject.local)
     {
         form = Form::Slice;
+    }
+    // **R739-1 (slicecursor relay 099).** A subject that is only ever MEASURED
+    // — `offset_from`, compared, null-tested, cast to an integer, and nothing
+    // else — may hold an end sentinel one past its allocation, and no
+    // reference form may claim an element there. Ahead of the comparison gate: a
+    // comparison the address arm would open is held before any view is
+    // rendered for it or for its partner.
+    if let Some(span) = facts.address_observation_only(tcx, (subject.fn_did, subject.hir_id)) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::AddressObservationOnly,
+        );
     }
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         let node = (subject.fn_did, subject.hir_id);
