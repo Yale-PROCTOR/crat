@@ -4185,6 +4185,19 @@ fn existing_interface_disposition(
     }) {
         return Some("a5-t2-raw-view");
     }
+    // **R738-1** — a call routed to the callee's pristine raw twin takes the
+    // input's arguments at every position (the seam renders zero syntax
+    // there): a bridge rendered here would hand the twin's raw formal a safe
+    // form (brotli's `__crat_raw_ProcessSingleCodeLength(…,
+    // from_raw_parts_mut(..), ..)`, E0308).
+    if plan.counted_void_calls.iter().any(|call| {
+        call.route == super::counted_void::Route::RawTwin
+            && call.caller == caller
+            && call.callee == callee
+            && call_spans_match(call.call_span, call_span)
+    }) {
+        return Some("raw-twin-original");
+    }
     if plan.blocked.iter().any(|site| {
         site.caller == caller
             && site.callee == callee
