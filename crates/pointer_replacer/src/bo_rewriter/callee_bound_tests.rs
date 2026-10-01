@@ -88,7 +88,7 @@ fn w4cb_1_seam_constant_indices_bound_a_raw_argument() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        out.contains("from_raw_parts(base.offset(k), (3i128.max(0) as usize))"),
+        out.contains("from_raw_parts(base.offset(k), (3) as usize)"),
         "{out}"
     );
     assert!(
@@ -121,7 +121,7 @@ fn w4cb_2_seam_straight_line_constant_is_must() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        out.contains("from_raw_parts(in_0.offset(k), (4i128.max(0) as usize))"),
+        out.contains("from_raw_parts(in_0.offset(k), (4) as usize)"),
         "{out}"
     );
 }
@@ -148,14 +148,17 @@ fn w4cb_3_seam_loop_bound_is_instantiated_with_the_call_s_argument() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        out.contains("from_raw_parts(base.offset(k), (((count) as i128).max(0) as usize))"),
+        out.contains("from_raw_parts(base.offset(k), (((count) as i128).max(0)) as usize)"),
         "{out}"
     );
 }
 
-/// **W4CB-4 — seam × (c) composition.** `outer` passes its pointer on to a
-/// local callee whose loop bound is its own second parameter; `outer` passes
-/// the literal `4` there, so `outer`'s bound is `4`.
+/// **W4CB-4 — seam × (c) composition.** `outer` reads `p[1]` and passes `p`
+/// on to a local callee whose loop bound is its own third parameter; `outer`
+/// passes the literal `4` there, so `outer`'s bound is `max(2, 4) = 4`. (`outer`
+/// reads `p` itself so that its own decision is a slice: a pointer it only
+/// passes on is decided `Ref`, which is the pass-on line's question, not this
+/// arm's.)
 #[test]
 fn w4cb_4_seam_bound_composes_through_a_local_callee() {
     let src = format!(
@@ -165,7 +168,7 @@ fn w4cb_4_seam_bound_composes_through_a_local_callee() {
          \x20   while i < m {{ s += *q.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n\
-         pub unsafe fn outer(flag: i32, p: *const i32) -> i32 {{ inner(p, flag, 4) }}\n\
+         pub unsafe fn outer(flag: i32, p: *const i32) -> i32 {{ *p.offset(1) + inner(p, flag, 4) }}\n\
          pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ outer(1, base.offset(k)) }}\n"
     );
     assert_eq!(
@@ -174,9 +177,7 @@ fn w4cb_4_seam_bound_composes_through_a_local_callee() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        out.contains(
-            "outer(1, core::slice::from_raw_parts(base.offset(k), (4i128.max(0) as usize)))"
-        ),
+        out.contains("outer(1, core::slice::from_raw_parts(base.offset(k), (4) as usize))"),
         "{out}"
     );
 }
@@ -251,12 +252,12 @@ fn w4cb_5_exposure_wrapper_views_take_the_entry_s_own_bound() {
     let source = emitted_closed_world(TULIP);
     let start = flat(wrapper(&source, "ti_sma_start"));
     assert!(
-        start.contains("from_raw_parts(options, (1i128.max(0) as usize))"),
+        start.contains("from_raw_parts(options, (1) as usize)"),
         "{start}"
     );
     let sma = flat(wrapper(&source, "ti_sma"));
     assert!(
-        sma.contains("from_raw_parts(options, (1i128.max(0) as usize))"),
+        sma.contains("from_raw_parts(options, (1) as usize)"),
         "{sma}"
     );
     assert!(!start.contains("FALLBACK_SLICE_EXTENT"), "{start}");
@@ -435,7 +436,7 @@ fn w4cb_f8_a_negative_bound_renders_an_empty_slice() {
          pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ total(-5, 1, base.offset(k)) }}\n"
     );
     let out = flat(&emitted(&src));
-    assert!(out.contains("(((-5) as i128).max(0) as usize)"), "{out}");
+    assert!(out.contains("(((-5) as i128).max(0)) as usize"), "{out}");
     // The rendered arithmetic itself, evaluated.
     assert_eq!(((-5i128).max(0)) as usize, 0);
 }

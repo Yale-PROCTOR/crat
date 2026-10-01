@@ -239,7 +239,7 @@ pub(crate) fn plan(
                     .then(|| super::callee_bound::of_parameter(tcx, function.did, parameter_index))
                     .flatten()
                     .and_then(|bound| {
-                        super::callee_bound::in_own_parameters(tcx, function.did, &bound)
+                        super::callee_bound::in_own_parameters(tcx, function.did, &bound, true)
                     });
                 if let Some((text, _)) = &callee_bound {
                     spec.len = Some(seam::SeamLen::Licensed(text.clone()));

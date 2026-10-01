@@ -6141,16 +6141,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                             nul_walk_used.set(true);
                                             (Some(len.clone()), Some(LenEvidence::NulWalk))
                                         }
-                                        // **R707** (last, R788-5) — the callee's own
-                                        // accesses, instantiated with this call's arguments.
-                                        None => match super::callee_bound::at_call_site(
-                                            tcx, *callee, pos.index, &site.args, sm,
-                                        ) {
-                                            Some((text, key)) => {
-                                                (Some(text), Some(LenEvidence::CalleeBound { key }))
-                                            }
-                                            None => (None, len_evidence),
-                                        },
+                                        None => (None, len_evidence),
                                     },
                                 },
                             },
@@ -6284,6 +6275,28 @@ pub(crate) fn synthesize_with_raw_boundary(
                     pos.index,
                     len_text,
                 );
+                // **R707** — no companion, contract, region, C string, array or
+                // tail companion: the callee's own accesses, instantiated with
+                // this call's arguments, rather than the fabricated extent. Last
+                // of the evidence arms, so it replaces only a fallback.
+                let (len_text, len_evidence) = match len_text {
+                    None if pos.found == Form::Raw
+                        && matches!(
+                            pos.expected,
+                            Form::Slice { .. } | Form::Opt { slice: true, .. }
+                        ) =>
+                    {
+                        match super::callee_bound::at_call_site(
+                            tcx, *callee, pos.index, &site.args, sm,
+                        ) {
+                            Some((text, key)) => {
+                                (Some(text), Some(LenEvidence::CalleeBound { key }))
+                            }
+                            None => (None, len_evidence),
+                        }
+                    }
+                    text => (text, len_evidence),
+                };
                 candidates.push(
                     if let Some(address) = shared_pairs
                         .at(*callee, site)

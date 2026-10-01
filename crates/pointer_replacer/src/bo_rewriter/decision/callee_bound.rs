@@ -143,12 +143,35 @@ impl Bound {
         if self.must { "must" } else { "may" }
     }
 
-    /// The length expression with parameter `i` spelled `argument(i)`.
-    pub(crate) fn render(&self, argument: &dyn Fn(usize) -> String) -> String {
+    /// The clamped count, an `i128`, with parameter `i` spelled
+    /// `argument(i)` — for the glue, which casts a length `(len) as usize`
+    /// itself.
+    pub(crate) fn render_count(&self, argument: &dyn Fn(usize) -> String) -> String {
+        if let Some(k) = self.constant() {
+            return k.to_string();
+        }
         let mut terms = self.terms.iter().map(|t| t.render(argument));
         let first = terms.next().unwrap_or_else(|| "0i128".to_owned());
         let max = terms.fold(first, |acc, t| format!("{acc}.max({t})"));
-        format!("({max}.max(0) as usize)")
+        format!("{max}.max(0)")
+    }
+
+    /// The length expression, a `usize`, for a site that uses it verbatim.
+    pub(crate) fn render(&self, argument: &dyn Fn(usize) -> String) -> String {
+        match self.constant() {
+            // A bare literal, so a consumer that reads a constant length
+            // (`cursor::delivered::provider_minimum`) reads this one.
+            Some(k) => k.to_string(),
+            None => format!("({} as usize)", self.render_count(argument)),
+        }
+    }
+
+    /// The bound when it is one non-negative constant.
+    fn constant(&self) -> Option<i128> {
+        match self.terms.as_slice() {
+            [only] if only.terms.is_empty() && only.k >= 0 => Some(only.k),
+            _ => None,
+        }
     }
 
     /// `len-callee-bound:<must|may>:<expr>`, the expression in the bounded
@@ -169,11 +192,15 @@ impl Bound {
         format!("len-callee-bound:{}:{expr}", self.tag())
     }
 
+    /// The max of both. Terms over the same parameters differ only in their
+    /// constant, so the larger one dominates and the other is dropped (`max(1,
+    /// 4)` is `4`; `max(n, n + 1)` is `n + 1`).
     fn join(&mut self, other: Bound) {
         self.must &= other.must;
         for t in other.terms {
-            if !self.terms.contains(&t) {
-                self.terms.push(t);
+            match self.terms.iter_mut().find(|known| known.terms == t.terms) {
+                Some(known) => known.k = known.k.max(t.k),
+                None => self.terms.push(t),
             }
         }
         self.terms.sort();
@@ -353,7 +380,7 @@ pub(crate) fn at_call_site(
     {
         return None;
     }
-    let text = bound.render(&|i| texts[&i].clone());
+    let text = bound.render_count(&|i| texts[&i].clone());
     Some((text, intern(bound.receipt(&parameter_names(tcx, callee)))))
 }
 
@@ -365,6 +392,7 @@ pub(crate) fn in_own_parameters(
     tcx: TyCtxt<'_>,
     f: LocalDefId,
     bound: &Bound,
+    count: bool,
 ) -> Option<(String, String)> {
     let names = parameter_names(tcx, f);
     let needed = bound
@@ -378,7 +406,13 @@ pub(crate) fn in_own_parameters(
     {
         return None;
     }
-    Some((bound.render(&|i| names[i].clone()), bound.receipt(&names)))
+    let argument = |i: usize| names[i].clone();
+    let text = if count {
+        bound.render_count(&argument)
+    } else {
+        bound.render(&argument)
+    };
+    Some((text, bound.receipt(&names)))
 }
 
 struct Analysis<'tcx> {

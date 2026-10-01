@@ -1029,12 +1029,15 @@ fn select_length(
     // local, before the §77 fallback.
     if let Some(bound) = super::callee_bound::of_local(tcx, subject.fn_did, subject.hir_id)
         && let Some((expression, receipt)) =
-            super::callee_bound::in_own_parameters(tcx, subject.fn_did, &bound)
+            super::callee_bound::in_own_parameters(tcx, subject.fn_did, &bound, false)
     {
         return SliceLengthPlan {
             expression,
             source: SliceLengthSource::CalleeBound { receipt },
-            provenance: Vec::new(),
+            // The inert adjacency stays receipted (CP2's movement count).
+            provenance: unlicensed_argument_adjacency(tcx, table, facts, node)
+                .into_iter()
+                .collect(),
         };
     }
     SliceLengthPlan {
@@ -2539,7 +2542,9 @@ mod slice_construction_tests {
     }
 
     /// Addendum 206 E05/E10: a product appearing inside a sum is not exact
-    /// divisibility evidence; production must receipt the fallback.
+    /// divisibility evidence; production must receipt the fallback. (R707: the
+    /// fixtures below read their index through the pointer, so the body bounds
+    /// nothing either.)
     #[test]
     fn slc_r206_nondivisible_sum_uses_receipted_fallback() {
         let construction = Construction::Alloc {
@@ -2553,7 +2558,7 @@ mod slice_construction_tests {
              extern \"C\" { fn malloc(size: usize) -> *mut i32; }\n\
              pub unsafe fn target(items: usize) -> i32 {\n\
                  let p: *mut i32 = malloc(items * core::mem::size_of::<i32>() + 1);\n\
-                 *p.offset(1)\n\
+                 *p.offset(*p as isize)\n\
              }\n",
         );
         assert_eq!(plans.len(), 1);
@@ -2601,7 +2606,7 @@ mod slice_construction_tests {
              extern \"C\" { fn malloc(size: usize) -> *mut i32; }\n\
              pub unsafe fn target(items: usize) -> i32 {\n\
                  let p: *mut i32 = malloc(items.wrapping_mul(7usize));\n\
-                 *p.offset(1)\n\
+                 *p.offset(*p as isize)\n\
              }\n",
         );
         assert_eq!(plans.len(), 1);
@@ -2619,7 +2624,7 @@ mod slice_construction_tests {
             "#![allow(dead_code, unused_unsafe)]\n\
              pub unsafe fn target(src: *const i32, flag: usize) -> i32 {\n\
                  let p: *const i32 = src;\n\
-                 *p.offset(1) + flag as i32\n\
+                 *p.offset(*p as isize) + flag as i32\n\
              }\n",
         );
         assert_eq!(plans.len(), 1);
