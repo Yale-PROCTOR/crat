@@ -902,7 +902,15 @@ fn lower_computed_argument_views(
                     endpoint.box_slice,
                     false,
                 );
-                spec.forward_slice = Some(forward(target_mutable));
+                // **R738-1 (ii).** The view follows the input's borrow, not
+                // only the target: `&mut *p.offset(e)` into a `*const` formal
+                // may be sealed as the WRITABLE view
+                // (`{view}.as_mut_ptr().cast_const()`), which a shared suffix
+                // cannot give (brotli's `SortHuffmanTreeItems`, E0596). A
+                // mutable view also serves `.as_ptr()`.
+                spec.forward_slice = Some(forward(
+                    target_mutable || (view.borrowed && view.mutable && mutable),
+                ));
                 edit.spec = spec;
                 edit.bridge.bridge_kind = template.key().to_owned();
             } else if edit.spec.raw_boundary.is_none()

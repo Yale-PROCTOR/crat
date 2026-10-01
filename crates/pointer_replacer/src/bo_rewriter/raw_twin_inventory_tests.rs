@@ -114,3 +114,66 @@ fn r738_1_a_raw_twin_call_takes_the_original_arguments() {
         "a call not routed to the twin keeps its bridges:\n{source}"
     );
 }
+
+/// **R738-1 (ii) — a computed view borrowed mutably stays mutable when its
+/// raw-boundary bridge reads it mutably.** brotli's `SortHuffmanTreeItems`
+/// passes `&mut *items.offset(j)` (items a delivered `&mut [HuffmanTree]`) to a
+/// comparator taking `*const HuffmanTree`. The computed sub-view took the
+/// TARGET's mutability (`&(items)[j..]`) while the terminal sealing picked the
+/// writable view `{view}.as_mut_ptr().cast::<T>().cast_const()`: E0596 ×4 at
+/// L01¹². The view follows the input's borrow when the base is mutable.
+const SORT: &str = "#![allow(dead_code, non_snake_case, unused_mut, unused_assignments)]\n\
+pub mod entropy_encode {\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)]\n\
+    pub struct HuffmanTree {\n\
+        pub total_count_: u32,\n\
+        pub index_left_: i16,\n\
+        pub index_right_or_value_: i16,\n\
+    }\n\
+    pub type HuffmanTreeComparator =\n\
+        Option<unsafe extern \"C\" fn(*const HuffmanTree, *const HuffmanTree) -> i32>;\n\
+    #[inline]\n\
+    unsafe extern \"C\" fn SortHuffmanTreeItems(mut items: *mut HuffmanTree, n: usize,\n\
+        mut comparator: HuffmanTreeComparator) {\n\
+        let mut i: usize = 1;\n\
+        while i < n {\n\
+            let mut tmp = *items.offset(i as isize);\n\
+            let mut k = i;\n\
+            let mut j = i.wrapping_sub(1);\n\
+            while comparator.expect(\"non-null function pointer\")(&mut tmp,\n\
+                    &mut *items.offset(j as isize)) != 0 {\n\
+                *items.offset(k as isize) = *items.offset(j as isize);\n\
+                k = j;\n\
+                let fresh0 = j;\n\
+                j = j.wrapping_sub(1);\n\
+                if fresh0 == 0 { break; }\n\
+            }\n\
+            *items.offset(k as isize) = tmp;\n\
+            i = i.wrapping_add(1);\n\
+        }\n\
+    }\n\
+    unsafe extern \"C\" fn SortHuffmanTree(mut v0: *const HuffmanTree, mut v1: *const HuffmanTree) -> i32 {\n\
+        ((*v0).total_count_ < (*v1).total_count_) as i32\n\
+    }\n\
+    #[no_mangle]\n\
+    pub unsafe extern \"C\" fn BrotliCreateHuffmanTree(mut tree: *mut HuffmanTree, n: usize) {\n\
+        let cmp = Some(SortHuffmanTree as unsafe extern \"C\" fn(*const HuffmanTree, *const HuffmanTree) -> i32);\n\
+        SortHuffmanTreeItems(tree, n, cmp);\n\
+    }\n\
+}\n";
+
+#[test]
+fn r738_1_a_mutably_borrowed_computed_view_stays_mutable_under_a_writable_bridge() {
+    let (source, reverted) = emitted(SORT, "sort");
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("fn SortHuffmanTreeItems(mut items: &mut [HuffmanTree],"),
+        "the sorted items are delivered as a mutable slice:\n{source}"
+    );
+    assert!(
+        flat.contains("(&mut (items)[j..])") && !flat.contains("(&(items)[j..]).as_mut_ptr()"),
+        "the input's `&mut *items.offset(j)` keeps a mutable view:\n{source}"
+    );
+    assert_eq!(reverted, 0, "{source}");
+}
