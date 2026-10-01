@@ -310,6 +310,17 @@ fn freed_before_in_its_block(
         .any(|(call, _)| call.hi() <= ret.lo() && innermost(*call) == Some(block))
 }
 
+/// **R713 STOP 3** — `ret` (a null return's operand) ends before the `let`
+/// that declares `binding`. A binding's scope starts at its `let`, so no
+/// generation of it is live there (in a loop, the previous iteration's ended
+/// with its block): that return closes nothing.
+fn before_its_let(tcx: TyCtxt<'_>, binding: HirId, ret: Span) -> bool {
+    let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(binding) else {
+        return false;
+    };
+    ret.hi() <= local.span.lo()
+}
+
 #[cfg(test)]
 pub(crate) fn fields_held_by_value_for_test<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -3518,6 +3529,7 @@ fn certify<'tcx, 's>(
     for span in null_returns
         .iter()
         .filter(|span| !released_null_returns.contains(span))
+        .filter(|span| owner_subject.is_none_or(|owner| !before_its_let(tcx, owner.hir_id, **span)))
     {
         certificate.receipts.push(format!(
             "waiver-drop(scope-exit) site={}",

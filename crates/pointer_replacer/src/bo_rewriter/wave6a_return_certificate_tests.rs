@@ -1055,6 +1055,43 @@ fn w6a_r710_a_sinkless_receiver_none_at_every_exit_closes_nothing() {
     assert_eq!(out.reverted, 0, "{receipts}\n{}", out.source);
 }
 
+/// **R713 STOP 3 — a null return ahead of the owner's `let` closes nothing.**
+/// `slice`'s `if n > 4 { return 0; }` runs before `b` exists: the binding's
+/// scope starts at its `let`, so no generation of it is live there, in this
+/// iteration or a previous one. Control: a null return AFTER the allocation,
+/// which abandons the live owner (C leaks it), keeps its receipt.
+#[test]
+fn w6a_r713_a_null_return_before_the_owner_closes_nothing() {
+    let out = emitted("r713-early-null-return", SINKLESS_NONE_AT_EXIT);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert!(
+        receipts.contains("return-certificate callee=slice "),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !receipts.contains("slice\tadmitted\twaiver-drop(scope-exit)"),
+        "{receipts}\n{}",
+        out.source
+    );
+    let late = SINKLESS_NONE_AT_EXIT.replace(
+        "    (*b).len = n;\n    return b;\n",
+        "    (*b).len = n;\n    if n == 3 as usize {\n        return 0 as *mut buf;\n    }\n    return b;\n",
+    );
+    assert_ne!(late, SINKLESS_NONE_AT_EXIT);
+    let out = emitted("r713-late-null-return", &late);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        receipts
+            .lines()
+            .filter(|line| line.starts_with("slice\tadmitted\twaiver-drop(scope-exit)"))
+            .count(),
+        1,
+        "{receipts}\n{}",
+        out.source
+    );
+}
+
 /// **R619-3 (2), a loop body's scope exit.** `it` is a `let` receiver inside a
 /// loop: on the odd-id `continue` its scope ends before the store, so the
 /// emitted owner is dropped there with no `return` anywhere on the path. Its
