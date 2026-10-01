@@ -338,6 +338,31 @@ fn raw_boundary_custody_observed_form(
     }
 }
 
+/// R738-1: an unannotated local whose whole initializer is its own name's optional
+/// access (`let s = s.as_deref_mut().unwrap();`, `as_deref` / `as_mut` / `as_ref` alike):
+/// the emission's re-binding of an optional's referent, never a declaration of the subject.
+fn raw_boundary_optional_referent_rebinding(
+    source: &str,
+    row: &crate::bo_rewriter::delivery_custody::Declaration,
+) -> bool {
+    if row.explicit_type.is_some() || row.parameter_index.is_some() {
+        return false;
+    }
+    let Some(text) = source.get(row.declaration_span.lo as usize..row.declaration_span.hi as usize)
+    else {
+        return false;
+    };
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.trim_end_matches(';').trim_end();
+    let name = &row.binding;
+    ["as_deref_mut", "as_deref", "as_mut", "as_ref"]
+        .iter()
+        .any(|access| {
+            flat == format!("let {name} = {name}.{access}().unwrap()")
+                || flat == format!("let mut {name} = {name}.{access}().unwrap()")
+        })
+}
+
 fn raw_boundary_delivery_custody(
     expectations: &[crate::bo_rewriter::DeliveryExpectation],
     delivered_by_ledger: &std::collections::BTreeSet<String>,
@@ -402,6 +427,32 @@ fn raw_boundary_delivery_custody(
                     .then_some(index)
             })
             .collect::<Vec<_>>();
+        // **R738-1 (main 141) — an optional's referent re-bound under its own name is not
+        // a second declaration of the subject.** bzip2's `BZ2_bzDecompress::s#4` delivers
+        // `let mut s: Option<&mut DState>`, and the emission re-binds the referent in two
+        // nested blocks as `let s = s.as_deref_mut().unwrap();` (unannotated). Three
+        // declarations named `s` made the subject `ambiguous` over a correct emission.
+        // The narrowing applies only where it leaves exactly ONE candidate; otherwise the
+        // row stays ambiguous (fail closed).
+        let candidates = if candidates.len() > 1 {
+            let narrowed = candidates
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    let (file, row) = &report.declarations[index];
+                    !sources
+                        .get(file)
+                        .is_some_and(|source| raw_boundary_optional_referent_rebinding(source, row))
+                })
+                .collect::<Vec<_>>();
+            if narrowed.len() == 1 {
+                narrowed
+            } else {
+                candidates
+            }
+        } else {
+            candidates
+        };
         let state = if reverted_owners.contains(&expected.owner_fn)
             || reverted_owners.contains(&expected.emitted_owner)
         {
@@ -28553,6 +28604,160 @@ fn r219_custody_observe(
         &std::collections::BTreeMap::from([("fixture.rs".to_owned(), source.to_owned())]),
         &reverted.iter().map(|owner| (*owner).to_owned()).collect(),
     )
+}
+
+/// R738-1 (main 141): bzip2's `BZ2_bzDecompress::s#4` shape. The subject's own
+/// `let mut s: Option<&mut DState>` and the emission's two nested re-bindings of its
+/// referent, `let s = s.as_deref_mut().unwrap();`; the subject is observed, not ambiguous.
+/// Controls: a second ANNOTATED declaration, or a re-binding with any other initializer,
+/// keeps the row ambiguous.
+#[test]
+fn r738_1_an_optional_referent_rebinding_is_not_a_second_declaration() {
+    let expected = crate::bo_rewriter::DeliveryExpectation {
+        subject_key: "f::s#1".to_owned(),
+        owner_fn: "f".to_owned(),
+        emitted_owner: "f".to_owned(),
+        source_file: Some("fixture.rs".to_owned()),
+        binding: "s".to_owned(),
+        parameter_index: None,
+        expected_form: crate::bo_rewriter::DeliveryForm::Borrowed {
+            mutable: true,
+            optional: true,
+            slice: false,
+        },
+    };
+    let source = |inner: &str| {
+        format!(
+            "pub struct D {{ pub x: i32 }} pub unsafe fn f(p: *mut D) {{ let mut s: Option<&mut D> = None; s = p.as_mut(); {{ {inner} s.x = 1; }} {{ let s = s.as_deref_mut().unwrap(); s.x = 2; }} }}"
+        )
+    };
+    let report = r219_custody_observe(
+        std::slice::from_ref(&expected),
+        &["f::s#1"],
+        &source("let s = s.as_deref_mut().unwrap();"),
+        &[],
+    );
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    assert!(report.delivered_by_tree.contains("f::s#1"));
+    for control in [
+        "let mut s: Option<&mut D> = None; let s = s.as_deref_mut().unwrap();",
+        "let s = s;",
+    ] {
+        let report = r219_custody_observe(
+            std::slice::from_ref(&expected),
+            &["f::s#1"],
+            &source(control),
+            &[],
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("ambiguous")),
+            "{control}: {:?}",
+            report.issues
+        );
+    }
+}
+
+/// R738-1: re-compare one census program's delivery custody offline under this matcher
+/// (`CRAT_DELIVERY_REPLAY_DIR` = the census dir, `CRAT_DELIVERY_REPLAY_PROGRAM`). The
+/// expectations, the ledger's delivered set and the reverted owners come from the
+/// census's own exports; the tree from its `emitted-trees/<program>/`, each expectation's
+/// source file mapped to the tree's file of the same name.
+#[test]
+#[ignore]
+fn r738_1_delivery_custody_replay() {
+    let dir = std::path::PathBuf::from(std::env::var("CRAT_DELIVERY_REPLAY_DIR").expect("dir"));
+    let program = std::env::var("CRAT_DELIVERY_REPLAY_PROGRAM").expect("program");
+    let read_json = |suffix: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.join(format!("{program}.raw-boundary-{suffix}.json")))
+                .expect("read export"),
+        )
+        .expect("parse export")
+    };
+    // `DeliveryExpectation` serializes only; read its fields back by name.
+    let mut expectations = read_json("delivery-expectations")["expectations"]
+        .as_array()
+        .expect("expectations")
+        .iter()
+        .map(|row| {
+            let text = |key: &str| row[key].as_str().map(str::to_owned);
+            let flag = |key: &str| row["expected_form"][key].as_bool().unwrap_or(false);
+            crate::bo_rewriter::DeliveryExpectation {
+                subject_key: text("subject_key").expect("subject_key"),
+                owner_fn: text("owner_fn").expect("owner_fn"),
+                emitted_owner: text("emitted_owner").expect("emitted_owner"),
+                source_file: text("source_file"),
+                binding: text("binding").expect("binding"),
+                parameter_index: row["parameter_index"].as_u64().map(|index| index as usize),
+                expected_form: match row["expected_form"]["kind"].as_str() {
+                    Some("borrowed") => crate::bo_rewriter::DeliveryForm::Borrowed {
+                        mutable: flag("mutable"),
+                        optional: flag("optional"),
+                        slice: flag("slice"),
+                    },
+                    Some("owning") => crate::bo_rewriter::DeliveryForm::Owning {
+                        optional: flag("optional"),
+                        slice: flag("slice"),
+                    },
+                    Some("cursor") => crate::bo_rewriter::DeliveryForm::Cursor {
+                        mutable: flag("mutable"),
+                        optional: flag("optional"),
+                        wrapper: flag("wrapper"),
+                    },
+                    other => panic!("unknown expected form {other:?}"),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let retained = read_json("delivery-custody");
+    let ledger = retained["comparison"]["delivered_by_ledger"]
+        .as_array()
+        .expect("ledger")
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    let tree = dir.join("emitted-trees").join(&program);
+    let mut sources = std::collections::BTreeMap::new();
+    for expected in &mut expectations {
+        let Some(file) = expected.source_file.clone() else { continue };
+        let name = file
+            .trim_end_matches("\")")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        let key = format!("tree:{name}");
+        if !sources.contains_key(&key) {
+            if let Ok(text) = std::fs::read_to_string(tree.join(&name)) {
+                sources.insert(key.clone(), text);
+            }
+        }
+        expected.source_file = Some(key);
+    }
+    let reverted =
+        std::fs::read_to_string(dir.join(format!("{program}.raw-boundary-final-reverts.tsv")))
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split('\t').nth(15).map(str::to_owned))
+            .collect::<std::collections::BTreeSet<_>>();
+    let report = raw_boundary_delivery_custody(&expectations, &ledger, &sources, &reverted);
+    let retained_issues = retained["comparison"]["issues"]
+        .as_array()
+        .map_or(0, Vec::len);
+    println!(
+        "program={program} issues={} (retained {retained_issues}) delivered_by_ledger={} delivered_by_tree={} declarations={}",
+        report.issues.len(),
+        report.delivered_by_ledger.len(),
+        report.delivered_by_tree.len(),
+        report.declarations.len()
+    );
+    for issue in &report.issues {
+        println!("  issue {issue}");
+    }
 }
 
 #[test]
