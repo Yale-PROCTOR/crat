@@ -5,24 +5,7 @@
 //! `CopyStat` (L01¹² diagnostic, lib.rs:493854): `input_path` / `output_path`
 //! are null-tested, so optional, and handed to libc's `stat` / `utime`, whose
 //! formals are `*const c_char`.
-use super::{decision::Decision, emit_tests::ast_emitted_source_of, verify};
-
-fn decision_of(input: &str, function: &str, binding: &str) -> Decision {
-    ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        let table = super::decide_table(tcx).expect("native decisions");
-        table
-            .entries
-            .iter()
-            .find(|(subject, _)| {
-                tcx.item_name(subject.fn_did.to_def_id()).as_str() == function
-                    && subject.param_name.as_deref() == Some(binding)
-            })
-            .expect("corpus-derived subject")
-            .1
-            .clone()
-    })
-    .expect("fixture compiler context")
-}
+use super::{emit_tests::ast_emitted_source_of, verify};
 
 const FOREIGN: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, non_camel_case_types)]
@@ -49,30 +32,65 @@ unsafe fn CloseFiles(mut a: *const i8, mut b: *const i8) {
 "#;
 
 /// brotli's shape: `stat` is glibc's LOCAL inline wrapper over `__xstat`, its
-/// `__path` stays raw; the null-tested `input_path` stays optional, and the
-/// call into the local raw formal carries the optional bridge as the libc
-/// calls do (`option-to-raw-null-map`).
+/// `__path` ends raw collaterally, and the null-tested `input_path` is a THIN
+/// `Option<&i8>`. A thin reference carries one element of provenance and the
+/// callee reads a whole C string through it (relay 122), so no bridge is
+/// built: the caller's class is held `held:thin-cstring-to-libc` (receipted),
+/// `CopyStat` stays raw, and the output type-checks (no E0308).
 #[test]
-fn wave6o_optional_reference_into_a_local_raw_formal_is_bridged() {
+fn wave6o_thin_optional_into_a_local_raw_formal_is_held() {
     assert!(verify::type_checks_str(FOREIGN));
-    let d = decision_of(FOREIGN, "CopyStat", "input_path");
-    assert!(matches!(d, Decision::Opt { .. }), "{d:?}");
     let output = ast_emitted_source_of(FOREIGN).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
-    assert!(flat.contains("input_path:Option<&i8>"), "{output}");
-    assert!(flat.contains("map_or(core::ptr::null::<"), "{output}");
+    // CopyStat itself: no bridge built from the thin reference; the raw value
+    // reaches `stat` (CloseFiles's `from_ref(a)` into CopyStat's raw formal is
+    // the pre-existing raw-boundary `RefSharedToRawConst`, not this arm).
+    assert!(
+        !flat.contains("input_path.as_deref()"),
+        "no cast of a thin reference: {output}"
+    );
+    assert!(
+        flat.contains("fnCopyStat(mutinput_path:*consti8"),
+        "{output}"
+    );
+    assert!(flat.contains("stat(input_path,&mutstatbuf)"), "{output}");
+    assert!(verify::type_checks_str(&output), "{output}");
+}
+
+/// The control: the same path argument also reaches libc `chmod`, whose path
+/// the fatness table already types as a C string, and is indexed once (op facts
+/// govern the slice form, fatness corroborates: S3.2′-2), so `input_path` is
+/// FAT (`Option<&[i8]>`) and carries its extent: the bridge into the raw formal
+/// is built (`OptSliceToRaw`, `.as_ptr()`).
+#[test]
+fn wave6o_fat_optional_into_a_local_raw_formal_is_bridged() {
+    let input = FOREIGN
+        .replace(
+            "    fn utime(__file: *const i8, __file_times: *const utimbuf) -> i32;\n",
+            "    fn utime(__file: *const i8, __file_times: *const utimbuf) -> i32;\n    fn chmod(__file: *const i8, __mode: u32) -> i32;\n",
+        )
+        .replace(
+            "    if stat(input_path, &mut statbuf) != 0 as i32 { return; }\n",
+            "    if *input_path.offset(1 as isize) == 0 as i8 { return; }\n    if stat(input_path, &mut statbuf) != 0 as i32 { return; }\n    chmod(input_path, statbuf.st_mode);\n",
+        );
+    assert!(verify::type_checks_str(&input));
+    let output = ast_emitted_source_of(&input).expect("native emission");
+    let flat = output.split_whitespace().collect::<String>();
+    assert!(flat.contains("input_path:Option<&[i8]>"), "{output}");
+    assert!(flat.contains("as_ptr()"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
 
 const MUT_FORMAL: &str = r#"
 #![allow(dead_code, unused_mut)]
-unsafe fn fill(mut p: *mut i32, mut q: *const i32) -> i32 { 0 }
+unsafe fn fill(mut p: *mut i32, mut q: *const i32, mut path: *const i8) -> i32 { 0 }
 "#;
 
-/// The `*mut` direction, at the seam's own arm (a late-raw `*mut` local formal
-/// has no small natural reduction): `Option<&mut i32>` at `*mut i32` takes the
-/// exclusive template, `Option<&i32>` at `*mut i32` is refused shared-to-mut,
-/// and either optional at `*const i32` takes the shared one.
+/// The arm's selection, both directions: a THIN optional at a raw formal is
+/// held (`held:thin-cstring-to-libc` at a `c_char` pointee,
+/// `held:thin-optional-to-raw-formal` otherwise); a FAT optional is bridged by
+/// the raw boundary's slice template, `*mut` and `*const`; a shared fat
+/// optional at `*mut` is refused shared-to-mut.
 #[test]
 fn wave6o_optional_into_a_raw_formal_selects_by_the_formal_type() {
     use super::decision::seam::{Form, optional_into_raw_formal_for_tests as bridge};
@@ -81,21 +99,33 @@ fn wave6o_optional_into_a_raw_formal_selects_by_the_formal_type() {
             .hir_body_owners()
             .find(|d| tcx.item_name(d.to_def_id()).as_str() == "fill")
             .expect("fill");
-        let opt = |mutable| Form::Opt {
+        let thin = |mutable| Form::Opt {
             mutable,
             slice: false,
         };
+        let fat = |mutable| Form::Opt {
+            mutable,
+            slice: true,
+        };
         assert_eq!(
-            bridge(tcx, fill, 0, opt(true), "q").as_deref(),
-            Ok("q.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), core::ptr::from_mut)")
+            bridge(tcx, fill, 0, thin(true), "q").as_deref(),
+            Err(&"held:thin-optional-to-raw-formal")
         );
         assert_eq!(
-            bridge(tcx, fill, 0, opt(false), "q").as_deref(),
+            bridge(tcx, fill, 2, thin(false), "q").as_deref(),
+            Err(&"held:thin-cstring-to-libc")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 0, fat(true), "q").as_deref(),
+            Ok("q.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), |slice| slice.as_mut_ptr())")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 2, fat(false), "q").as_deref(),
+            Ok("q.as_deref().map_or(core::ptr::null::<i8>(), |slice| slice.as_ptr())")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 0, fat(false), "q").as_deref(),
             Err(&"seam-shared-to-mut")
-        );
-        assert_eq!(
-            bridge(tcx, fill, 1, opt(true), "q").as_deref(),
-            Ok("q.as_deref().map_or(core::ptr::null::<i32>(), core::ptr::from_ref)")
         );
     })
     .expect("fixture compiler context");
