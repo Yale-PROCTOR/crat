@@ -289,6 +289,8 @@ pub(crate) mod bridge_custody_syntax;
 #[cfg(test)]
 mod bridge_custody_tests;
 #[cfg(test)]
+mod callee_bound_tests;
+#[cfg(test)]
 mod callee_input_tests;
 #[cfg(test)]
 mod cast_of_local_bridge_tests;
