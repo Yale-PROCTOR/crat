@@ -23,10 +23,12 @@ fn emitted(src: &str) -> String {
 /// The same entry under the frozen benchmark's closed world, which is what
 /// gives a function-pointer table's members their exposure wrappers.
 fn emitted_closed_world(src: &str) -> String {
+    // One directory per call: witnesses run in parallel and must not share it.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "crat-callee-bound-{}-{}",
         std::process::id(),
-        src.len()
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let root = dir.join("lib.rs");
