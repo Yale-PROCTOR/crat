@@ -5662,7 +5662,19 @@ pub(crate) fn plan(
             .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
         preclass_sites.push(ClassSite {
             atom_ids: Vec::new(),
-            key: bridge.materialize(SignatureClassId::of(blocked.callee), file, lo, hi),
+            // Wave-6o (relay 122): a thin optional held at a formal that ended
+            // raw costs the CALLER's conversion (the callee is raw either way),
+            // so the caller's class carries the block.
+            key: bridge.materialize(
+                SignatureClassId::of(if blocked.block.held_at_caller() {
+                    blocked.caller
+                } else {
+                    blocked.callee
+                }),
+                file,
+                lo,
+                hi,
+            ),
             edit_key: "-".to_owned(),
             state: ClassSiteState::Dropped(blocked.block.key().to_owned()),
             expected_form: blocked.expected.map_or("-", |form| form.key()).to_owned(),

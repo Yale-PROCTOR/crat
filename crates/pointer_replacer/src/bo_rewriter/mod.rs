@@ -12851,7 +12851,15 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
     // being dropped.
     for blocked in &table.seams.blocked {
         let caller = tcx.def_path_str(blocked.caller.to_def_id());
-        let callee = tcx.def_path_str(blocked.callee.to_def_id());
+        // Wave-6o (relay 122): the revert key of a caller-held block is the caller.
+        let callee = tcx.def_path_str(
+            if blocked.block.held_at_caller() {
+                blocked.caller
+            } else {
+                blocked.callee
+            }
+            .to_def_id(),
+        );
         let site = sm.span_to_diagnostic_string(blocked.span);
         let adapter_key = format!("{caller}=>{callee}#{}@{site}", blocked.index);
         let peers = if blocked.peers.is_empty() {

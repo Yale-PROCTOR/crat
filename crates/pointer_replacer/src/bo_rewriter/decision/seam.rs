@@ -150,9 +150,25 @@ pub(crate) enum SeamBlock {
     /// (or from a converted subject's own storage) without a fitting proof
     /// that the count equals the named place — never widen a thin reference.
     CountedVoidRoot,
+    /// Wave-6o (relay 122): a THIN optional reference at a callee formal that
+    /// ended raw, the formal a C string (`c_char` pointee): casting the thin
+    /// reference hands the callee one byte of provenance for the whole string.
+    /// Held, receipted; the fat twin (`Option<&[c_char]>`) is bridged instead.
+    ThinCStringToRaw,
+    /// The same at any other pointee: the raw callee's access extent is not
+    /// known to be one element.
+    ThinOptionalToRaw,
 }
 
 impl SeamBlock {
+    /// Wave-6o (relay 122): the blocks whose revert key is the CALLER.
+    pub(crate) fn held_at_caller(self) -> bool {
+        matches!(
+            self,
+            SeamBlock::ThinCStringToRaw | SeamBlock::ThinOptionalToRaw
+        )
+    }
+
     pub(crate) fn key(self) -> &'static str {
         match self {
             SeamBlock::NestedBoundaryUnbuilt => "nested-boundary-unbuilt",
@@ -169,6 +185,8 @@ impl SeamBlock {
             SeamBlock::A5NegativeWriteAbsent => "raw-boundary-shared-to-mut:negative-write-absent",
             SeamBlock::A5RawViewUnavailable => "a5-raw-view-template-unavailable",
             SeamBlock::CountedVoidRoot => "counted-void:safe-root-extent-unproved",
+            SeamBlock::ThinCStringToRaw => "held:thin-cstring-to-libc",
+            SeamBlock::ThinOptionalToRaw => "held:thin-optional-to-raw-formal",
         }
     }
 }
@@ -3740,9 +3758,10 @@ fn owner_view_candidate(
 /// (brotli's `stat::__path`, blocked `write-through-shared-view` at `__xstat`),
 /// so the boundary pass never saw this site as a raw target. The bridge is the
 /// raw boundary's own optional template, selected by the callee formal's type
-/// exactly as `bridge_template` selects it: `x.as_deref().map_or(null, from_ref)`
-/// and its `*mut` / slice twins; a shared optional at a `*mut` formal is refused
-/// (no negative-write evidence is asked here).
+/// as `bridge_template` selects it — for the FAT form only (`OptSliceToRaw`, the
+/// slice carries its extent); a THIN optional is held (relay 122:
+/// `held:thin-cstring-to-libc` / `held:thin-optional-to-raw-formal`), never cast;
+/// a shared fat optional at a `*mut` formal is refused shared-to-mut.
 fn optional_into_raw_formal(
     tcx: TyCtxt<'_>,
     callee: LocalDefId,
@@ -3765,12 +3784,24 @@ fn optional_into_raw_formal(
         .get(index)?;
     let target = super::raw_boundary::raw_target_type(tcx, formal)?;
     let template = match (slice, mutable, target.mutability) {
-        (false, true, RawMutability::Mut) => BridgeTemplate::OptRefMutToRawMut,
-        (false, _, RawMutability::Const) => BridgeTemplate::OptRefToRawConst,
         (true, true, RawMutability::Mut) | (true, _, RawMutability::Const) => {
             BridgeTemplate::OptSliceToRaw
         }
-        (_, false, RawMutability::Mut) => return Some(Err(SeamBlock::SharedToMut)),
+        (true, false, RawMutability::Mut) => return Some(Err(SeamBlock::SharedToMut)),
+        // Relay 122: never cast a THIN reference into a raw formal — one
+        // element of provenance for an access the callee may extend (a C
+        // string to its NUL). Hold, receipted.
+        (false, ..) => {
+            let c_char = matches!(target.pointee.trim_start_matches("::"), "i8" | "u8")
+                || target.pointee.ends_with("c_char")
+                || target.pointee.ends_with("c_uchar")
+                || target.pointee.ends_with("c_schar");
+            return Some(Err(if c_char {
+                SeamBlock::ThinCStringToRaw
+            } else {
+                SeamBlock::ThinOptionalToRaw
+            }));
+        }
     };
     let spec = GlueSpec::raw_boundary_target(template, &target, false, true);
     let replacement = spec.render(text)?;
