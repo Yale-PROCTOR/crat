@@ -340,7 +340,9 @@ fn before_its_let(tcx: TyCtxt<'_>, binding: HirId, ret: Span) -> bool {
     let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(binding) else {
         return false;
     };
-    ret.hi() <= local.span.lo()
+    // An expansion's span is the macro definition's, not the use's: source
+    // order says nothing about it (Codex, R713 review), so it keeps its receipt.
+    !ret.from_expansion() && !local.span.from_expansion() && ret.hi() <= local.span.lo()
 }
 
 #[cfg(test)]

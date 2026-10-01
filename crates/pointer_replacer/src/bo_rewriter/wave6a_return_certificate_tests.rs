@@ -1090,6 +1090,29 @@ fn w6a_r713_a_null_return_before_the_owner_closes_nothing() {
         "{receipts}\n{}",
         out.source
     );
+    // Control (Codex): a null return written through a macro defined ABOVE
+    // the function, at a live owner. Its operand's span is the macro's, in
+    // the definition: it is not "before the let", and it keeps its receipt.
+    let mut macro_late = late.replace(
+        "    if n == 3 as usize {\n        return 0 as *mut buf;\n    }\n",
+        "    if n == 3 as usize {\n        return nil!();\n    }\n",
+    );
+    macro_late = macro_late.replace(
+        "#[repr(C)]\npub struct buf",
+        "macro_rules! nil {\n    () => {\n        0 as *mut buf\n    };\n}\n#[repr(C)]\npub struct buf",
+    );
+    assert!(macro_late.contains("return nil!();") && macro_late.contains("macro_rules! nil"));
+    let out = emitted("r713-macro-null-return", &macro_late);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        receipts
+            .lines()
+            .filter(|line| line.starts_with("slice\tadmitted\twaiver-drop(scope-exit)"))
+            .count(),
+        1,
+        "{receipts}\n{}",
+        out.source
+    );
 }
 
 /// **R713 STOP 1 — the certify trace is off by default and, switched on,
