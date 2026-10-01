@@ -14675,7 +14675,7 @@ mod run {
             let decl = format!(
                 "const {}: usize = {};",
                 crate::bo_rewriter::decision::seam::SEAM_LEN_CONST,
-                crate::bo_rewriter::decision::seam::FALLBACK_SLICE_EXTENT
+                crate::bo_rewriter::decision::seam::fallback_slice_extent()
             );
             let (mut decls, mut refs) = (0usize, 0usize);
             for text in files.values() {
@@ -24834,9 +24834,10 @@ fn raw_boundary_wave2_corpus_census() {
         fs::write(
             artifact_dir.join("census-receipt.txt"),
             format!(
-                "status=probe\nrun_kind=diagnostic\ndata=false\nprobe_programs={}\ntyped_failures={}\nnote=a probe is not a census: no ledger, no controls, no verdict\n",
+                "status=probe\nrun_kind=diagnostic\ndata=false\nprobe_programs={}\ntyped_failures={}\nnote=a probe is not a census: no ledger, no controls, no verdict\nfallback_slice_extent={}\n",
                 selected.join(","),
                 typed,
+                crate::bo_rewriter::decision::seam::fallback_slice_extent(),
             ),
         )
         .expect("write probe receipt");
@@ -24927,10 +24928,11 @@ fn raw_boundary_wave2_corpus_census() {
         fs::write(
             artifact_dir.join("census-receipt.txt"),
             format!(
-                "status=complete-with-typed-failure\nrun_kind={}\ndata=false\ndelivery=degraded\nprograms=20/20\ntyped_failures={}\nworker_aborts={}\nin_run_repair=none\n",
+                "status=complete-with-typed-failure\nrun_kind={}\ndata=false\ndelivery=degraded\nprograms=20/20\ntyped_failures={}\nworker_aborts={}\nin_run_repair=none\nfallback_slice_extent={}\n",
                 if diagnostic_run { "diagnostic" } else { "formal" },
                 failures.len(),
                 aborts.len(),
+                crate::bo_rewriter::decision::seam::fallback_slice_extent(),
             ),
         )
         .expect("write typed-failure census receipt");
@@ -24968,8 +24970,15 @@ fn raw_boundary_wave2_corpus_census() {
             format!("{}\n", report::to_kv_line(&aggregate)),
         )
         .expect("write frame-absent aggregate");
-        fs::write(artifact_dir.join("census-receipt.txt"), receipt)
-            .expect("write frame-absent census receipt");
+        fs::write(
+            artifact_dir.join("census-receipt.txt"),
+            receipt
+                + &format!(
+                    "fallback_slice_extent={}\n",
+                    crate::bo_rewriter::decision::seam::fallback_slice_extent()
+                ),
+        )
+        .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
         return;
     }
@@ -26204,7 +26213,7 @@ fn raw_boundary_wave2_corpus_census() {
             retirement_sha256,
             retirement_receipt.lines().count() - 1,
             gate_lost.lines().count() - 1,
-        ),
+        ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent()),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");

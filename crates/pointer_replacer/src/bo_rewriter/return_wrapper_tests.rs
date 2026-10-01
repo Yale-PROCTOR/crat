@@ -17,8 +17,8 @@ use super::{
     },
     delivery_custody::{TypeShape, inventory_source},
     mechanical_receipt::{
-        FALLBACK_EXTENT_RECEIPT, MechanicalExtent, MechanicalObligationEvent, MechanicalStage,
-        MechanicalState, MechanicalSubjectKey, SLICE_EXTENT_WAIVER_ID,
+        MechanicalExtent, MechanicalObligationEvent, MechanicalStage, MechanicalState,
+        MechanicalSubjectKey, SLICE_EXTENT_WAIVER_ID, fallback_extent_receipt,
     },
 };
 
@@ -264,7 +264,7 @@ fn require_slice_extent(output: &Output) {
     else {
         unreachable!()
     };
-    assert_eq!(receipt, FALLBACK_EXTENT_RECEIPT);
+    assert_eq!(*receipt, fallback_extent_receipt());
     assert_eq!(waiver_id, SLICE_EXTENT_WAIVER_ID);
 }
 

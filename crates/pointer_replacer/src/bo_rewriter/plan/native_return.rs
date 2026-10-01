@@ -17,13 +17,12 @@ use super::super::{
         seam::{Form, SeamEdit, TerminalCallPlans},
     },
     mechanical_receipt::{
-        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, FALLBACK_EXTENT_RECEIPT,
-        MechanicalEvidence, MechanicalExtent, MechanicalFamily, MechanicalMechanism,
-        MechanicalObligationEvent, MechanicalObligationKey, MechanicalObligationPlan,
-        MechanicalRetention, MechanicalStage, MechanicalState, MechanicalSubjectKey,
-        NativeReturnEvidence, NegativeWriteEvidence, OutboundReturnBridgeReceiptRow,
-        OutboundReturnReceiptPlan, OutboundReturnRequirement, SLICE_EXTENT_WAIVER_ID,
-        TerminalContract,
+        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, MechanicalEvidence, MechanicalExtent,
+        MechanicalFamily, MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
+        MechanicalObligationPlan, MechanicalRetention, MechanicalStage, MechanicalState,
+        MechanicalSubjectKey, NativeReturnEvidence, NegativeWriteEvidence,
+        OutboundReturnBridgeReceiptRow, OutboundReturnReceiptPlan, OutboundReturnRequirement,
+        SLICE_EXTENT_WAIVER_ID, TerminalContract, fallback_extent_receipt,
     },
 };
 
@@ -345,7 +344,7 @@ fn capture_one(
     let negative_write = NegativeWriteEvidence::NotApplicable;
     let extent = if seam.bridge.extent == BridgeExtentKind::Fallback {
         MechanicalExtent::Fallback {
-            receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+            receipt: fallback_extent_receipt(),
             waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
         }
     } else {

@@ -88,7 +88,11 @@ impl BridgeExtentKind {
         match self {
             Self::None => "none".to_owned(),
             Self::Evidence(source) => format!("evidence({source})"),
-            Self::Fallback => "fallback(FALLBACK_SLICE_EXTENT=1024)".to_owned(),
+            // R641-3: the extent this run emits.
+            Self::Fallback => format!(
+                "fallback(FALLBACK_SLICE_EXTENT={})",
+                super::decision::seam::fallback_slice_extent()
+            ),
             Self::MaskPlusOne(source) => {
                 format!("fallback(mask+1@addendum-77:{source})")
             }

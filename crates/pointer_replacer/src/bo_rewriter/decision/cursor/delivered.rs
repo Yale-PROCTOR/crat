@@ -408,7 +408,7 @@ fn provider_minimum(provider: &DeliveredBaseProvider) -> Option<u64> {
         DeliveredBaseProvider::OriginalSlice => None,
         DeliveredBaseProvider::Slice { producer } => {
             if producer.length.is_fallback() {
-                Some(crate::bo_rewriter::mechanical_receipt::FALLBACK_SLICE_EXTENT as u64)
+                Some(crate::bo_rewriter::decision::seam::fallback_slice_extent() as u64)
             } else {
                 // Only an unambiguous literal in the sealed producer's length
                 // expression is a constant proof; no variable-name inference.

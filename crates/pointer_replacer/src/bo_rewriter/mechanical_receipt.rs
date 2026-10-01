@@ -14,10 +14,15 @@ use super::{
 };
 use crate::raw_boundary_census_schema as raw_schema;
 
-pub(crate) const FALLBACK_SLICE_EXTENT: usize = 1024;
 pub(crate) const SLICE_EXTENT_WAIVER_ID: &str = "slice-extent-out-of-scope@addendum-77";
-pub(crate) const FALLBACK_EXTENT_RECEIPT: &str =
-    "fabricated-extent:slice-extent-out-of-scope@addendum-77:FALLBACK_SLICE_EXTENT=1024";
+
+/// The per-site fallback receipt, naming the extent this run emits (R641-3).
+pub(crate) fn fallback_extent_receipt() -> String {
+    format!(
+        "fabricated-extent:slice-extent-out-of-scope@addendum-77:FALLBACK_SLICE_EXTENT={}",
+        super::decision::seam::fallback_slice_extent()
+    )
+}
 
 pub(crate) fn present_unsafe_text(
     expression: impl Into<String>,
@@ -573,7 +578,7 @@ impl MechanicalExtent {
                 Err("empty evidence-backed slice extent".to_owned())
             }
             Self::Fallback { receipt, waiver_id }
-                if receipt != FALLBACK_EXTENT_RECEIPT || waiver_id != SLICE_EXTENT_WAIVER_ID =>
+                if *receipt != fallback_extent_receipt() || waiver_id != SLICE_EXTENT_WAIVER_ID =>
             {
                 Err(format!(
                     "fallback slice extent lacks typed receipt/waiver: {receipt:?}/{waiver_id:?}"
@@ -2349,7 +2354,7 @@ pub(crate) fn reconcile_outbound_return_rows(
                 {
                     // W6L-1 wave 2: the slice return's fabricated extent.
                     MechanicalExtent::Fallback {
-                        receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                        receipt: fallback_extent_receipt(),
                         waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
                     }
                 } else {
@@ -2383,7 +2388,7 @@ pub(crate) fn reconcile_outbound_return_rows(
                 != if bridge.site.position.contains(":through_raw_field=")
                     && event.evidence.extent
                         == (MechanicalExtent::Fallback {
-                            receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                            receipt: fallback_extent_receipt(),
                             waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
                         })
                 {
@@ -3400,7 +3405,7 @@ mod tests {
         )
         .with_evidence(MechanicalEvidence {
             extent: MechanicalExtent::Fallback {
-                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                receipt: fallback_extent_receipt(),
                 waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
             },
             ..MechanicalEvidence::default()
@@ -3408,7 +3413,7 @@ mod tests {
         assert!(fallback.validate().is_ok());
         let invalid_fallback = fallback.with_evidence(MechanicalEvidence {
             extent: MechanicalExtent::Fallback {
-                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                receipt: fallback_extent_receipt(),
                 waiver_id: "wrong".to_owned(),
             },
             ..MechanicalEvidence::default()

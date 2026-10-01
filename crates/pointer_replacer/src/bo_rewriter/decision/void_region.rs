@@ -1294,7 +1294,7 @@ pub(crate) fn owns_address(
 fn claimed_range(region: &Region) -> (u64, u64) {
     let len = region
         .len_bytes
-        .unwrap_or(super::seam::FALLBACK_SLICE_EXTENT as u64 * region.element_size);
+        .unwrap_or(super::seam::fallback_slice_extent() as u64 * region.element_size);
     (region.offset_bytes, region.offset_bytes.saturating_add(len))
 }
 

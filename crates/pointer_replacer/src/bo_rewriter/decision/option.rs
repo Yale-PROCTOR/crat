@@ -625,7 +625,7 @@ pub(crate) fn plan_values(
                     })
                     .unwrap_or_else(|| "_".to_owned());
                 evidence.extent = MechanicalExtent::Fallback {
-                    receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                    receipt: fallback_extent_receipt(),
                     waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
                 };
                 adapter = "nullable-slice-assignment".to_owned();

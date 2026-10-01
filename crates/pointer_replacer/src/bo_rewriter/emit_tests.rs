@@ -3447,8 +3447,8 @@ fn an_unfreed_subject_carries_a_present_false_not_an_absent_column() {
 #[test]
 fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
     use super::mechanical_receipt::{
-        FALLBACK_EXTENT_RECEIPT, MechanicalExtent, MechanicalStage, MechanicalState,
-        SLICE_EXTENT_WAIVER_ID,
+        MechanicalExtent, MechanicalStage, MechanicalState, SLICE_EXTENT_WAIVER_ID,
+        fallback_extent_receipt,
     };
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
          pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n";
@@ -3485,7 +3485,7 @@ fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
     assert!(rows.iter().all(|row| {
         row.extent
             == MechanicalExtent::Fallback {
-                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                receipt: fallback_extent_receipt(),
                 waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
             }
             && row.element_type == "i32"
@@ -11626,16 +11626,18 @@ fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
     let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
 
     let ast = ast_emitted_source_of(SRC).expect("the AST layer emits");
-    assert_eq!(ast.matches(decl).count(), 0, "{ast}");
-    assert!(ast.contains("core::slice::from_ref(d)"), "{ast}");
+    assert_eq!(ast.matches(decl).count(), 1, "{ast}");
+    assert!(!ast.contains("core::slice::from_ref(d)"), "{ast}");
+    assert!(ast.contains("crate::FALLBACK_SLICE_EXTENT"), "{ast}");
 
     // The span layer, on the SAME input, through the production entry point.
     let span = match super::rewrite_m1(SRC) {
         super::RewriteOutcome::Emitted { source, .. } => source,
         other => panic!("the span layer must emit: {other:?}"),
     };
-    assert_eq!(span.matches(decl).count(), 0, "{span}");
-    assert!(span.contains("core::slice::from_ref(d)"), "{span}");
+    assert_eq!(span.matches(decl).count(), 1, "{span}");
+    assert!(!span.contains("core::slice::from_ref(d)"), "{span}");
+    assert!(span.contains("crate::FALLBACK_SLICE_EXTENT"), "{span}");
 }
 
 /// **CROSS-ARM PARITY — one function carrying BOTH a declaration edit and a
@@ -11678,7 +11680,13 @@ fn a_function_carrying_declaration_and_safe_glue_renders_identically_in_both_lay
     // Without this the test would pass on a fixture where fabrication never
     // fired, or where the caller kept every raw parameter — which is exactly
     // the shape it exists to cover.
-    assert!(span.contains("core::slice::from_ref(p)"), "{span}");
+    //
+    // Restated (R641-2, R217-2): `cx_sum` reads four elements, so the seam is no
+    // longer `from_ref(p)` (R416-5's one-element adapter): `p` is held raw and
+    // the site fabricates the extent, which is still a seam arm beside the
+    // declaration edit. RED first: at `45d794661` the span read `from_ref(p)`.
+    assert!(!span.contains("core::slice::from_ref(p)"), "{span}");
+    assert!(span.contains("crate::FALLBACK_SLICE_EXTENT"), "{span}");
     assert!(
         span.contains("out: &mut i32"),
         "arm 2 (a declaration edit) must be present IN THE CALLER, or this is \

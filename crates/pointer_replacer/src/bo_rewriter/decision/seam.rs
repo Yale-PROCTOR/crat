@@ -332,6 +332,22 @@ impl SeamLen {
 /// emission path alike.
 pub(crate) const FALLBACK_SLICE_EXTENT: usize = 1024;
 
+/// **R641-3 — N for a census build.** `CRAT_FALLBACK_SLICE_EXTENT` overrides
+/// the ruled extent for the run that sets it (R693-1, USER: N = 2^28 of record
+/// from the final frame's census); unset, it is [`FALLBACK_SLICE_EXTENT`]. Read
+/// once: every emitted declaration, receipt and extent claim in one process
+/// agrees. (Taken stand-alone from main's `0a40583c1`, R738-1 / main 141a.)
+pub(crate) fn fallback_slice_extent() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CRAT_FALLBACK_SLICE_EXTENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(FALLBACK_SLICE_EXTENT)
+    })
+}
+
 /// The const's name in the emitted crate (marker ruling, 2026-08-15).
 pub(crate) const SEAM_LEN_CONST: &str = "FALLBACK_SLICE_EXTENT";
 
@@ -356,7 +372,8 @@ pub(crate) const FABRICATED_LEN_PATH: &str = "crate::FALLBACK_SLICE_EXTENT";
 /// One producer, two consumers: the span layer splices this string and the AST
 /// layer appends it, so the two emitters cannot disagree about the const's text.
 pub(crate) fn fabricated_len_item() -> String {
-    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {FALLBACK_SLICE_EXTENT};");
+    let extent = fallback_slice_extent();
+    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {extent};");
     rustc_ast_pretty::pprust::item_to_string(&item)
 }
 
@@ -7445,4 +7462,36 @@ fn inventory_expression_bridge_declines_when_doubly_passed() -> bool {
         .find("glue(expected, found, None)")
         .expect("the matrix call");
     gate < matrix
+}
+
+/// **R738-1 (main 141a) — the census build's N reaches the emitted const.** Run
+/// once without the variable (the ruled 1,024) and once with
+/// `CRAT_FALLBACK_SLICE_EXTENT=268435456` (R693-1): the emitted declaration, the
+/// mechanical receipt and the bridge receipt's fallback text all carry the same N.
+#[cfg(test)]
+mod r738_1_census_n_override {
+    #[test]
+    fn r738_1_the_emitted_const_and_the_receipts_carry_the_census_n() {
+        let expected = std::env::var("CRAT_FALLBACK_SLICE_EXTENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(super::FALLBACK_SLICE_EXTENT);
+        assert_eq!(super::fallback_slice_extent(), expected);
+        let item = rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2021,
+            &[],
+            None,
+            super::fabricated_len_item,
+        );
+        assert!(
+            item.contains(&format!("const FALLBACK_SLICE_EXTENT: usize = {expected};")),
+            "{item}"
+        );
+        let receipt = crate::bo_rewriter::mechanical_receipt::fallback_extent_receipt();
+        assert!(
+            receipt.ends_with(&format!("FALLBACK_SLICE_EXTENT={expected}")),
+            "{receipt}"
+        );
+    }
 }

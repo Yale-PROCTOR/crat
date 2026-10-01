@@ -3297,7 +3297,7 @@ fn cursor_obligations(
                         && edit.is_some_and(|edit| edit.bridge_kind == "cursor-constructor")
                     {
                         MechanicalExtent::Fallback {
-                            receipt: super::mechanical_receipt::FALLBACK_EXTENT_RECEIPT.to_owned(),
+                            receipt: super::mechanical_receipt::fallback_extent_receipt(),
                             waiver_id: super::mechanical_receipt::SLICE_EXTENT_WAIVER_ID.to_owned(),
                         }
                     } else {

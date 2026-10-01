@@ -44,8 +44,8 @@ use rustc_span::Span;
 
 use super::{Decision, DecisionTable, Subject, SubjectKind};
 use crate::bo_rewriter::mechanical_receipt::{
-    CanonicalLocation, FALLBACK_EXTENT_RECEIPT, MechanicalExtent, SLICE_EXTENT_WAIVER_ID,
-    UnsafeContextPresentation, present_unsafe_text,
+    CanonicalLocation, MechanicalExtent, SLICE_EXTENT_WAIVER_ID, UnsafeContextPresentation,
+    fallback_extent_receipt, present_unsafe_text,
 };
 
 /// How a pointer binding got its value.
@@ -231,7 +231,7 @@ impl SliceLengthSource {
                     .join(";")
             ),
             Self::SiblingSize { field, sibling } => format!("sibling-size:{field}:{sibling}"),
-            Self::Fallback => FALLBACK_EXTENT_RECEIPT.to_owned(),
+            Self::Fallback => fallback_extent_receipt(),
         }
     }
 }
@@ -279,7 +279,7 @@ impl SliceLengthPlan {
     pub(crate) fn extent(&self) -> MechanicalExtent {
         match &self.source {
             SliceLengthSource::Fallback => MechanicalExtent::Fallback {
-                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                receipt: fallback_extent_receipt(),
                 waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
             },
             source => MechanicalExtent::Evidence(source.receipt_key()),
@@ -2445,7 +2445,7 @@ mod slice_construction_tests {
             assert_eq!(
                 plan.length.extent(),
                 MechanicalExtent::Fallback {
-                    receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                    receipt: fallback_extent_receipt(),
                     waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
                 },
                 "dependent local changed its inherited extent: {plan:?}"

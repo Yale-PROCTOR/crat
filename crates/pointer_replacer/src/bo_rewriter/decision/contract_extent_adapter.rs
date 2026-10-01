@@ -100,14 +100,14 @@ impl Promotion {
 
     pub(crate) fn mechanical_extent(&self) -> super::super::mechanical_receipt::MechanicalExtent {
         use super::super::mechanical_receipt::{
-            FALLBACK_EXTENT_RECEIPT, MechanicalExtent, SLICE_EXTENT_WAIVER_ID,
+            MechanicalExtent, SLICE_EXTENT_WAIVER_ID, fallback_extent_receipt,
         };
         match &self.length {
             LengthPlan::Evidence { source, .. } => {
                 MechanicalExtent::Evidence(format!("contract-extent:{source:?}"))
             }
             LengthPlan::Fallback(_) => MechanicalExtent::Fallback {
-                receipt: FALLBACK_EXTENT_RECEIPT.to_owned(),
+                receipt: fallback_extent_receipt(),
                 waiver_id: SLICE_EXTENT_WAIVER_ID.to_owned(),
             },
         }

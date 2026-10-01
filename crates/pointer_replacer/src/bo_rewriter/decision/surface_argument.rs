@@ -16,11 +16,11 @@ use crate::bo_rewriter::{
         BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSitePlan, SignatureClassId,
     },
     mechanical_receipt::{
-        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, FALLBACK_EXTENT_RECEIPT,
-        MechanicalEvidence, MechanicalExtent, MechanicalFamily, MechanicalMechanism,
-        MechanicalObligationEvent, MechanicalObligationKey, MechanicalObligationPlan,
-        MechanicalRetention, MechanicalStage, MechanicalState, MechanicalSubjectKey,
-        SLICE_EXTENT_WAIVER_ID, UnsafeContextPresentation,
+        CanonicalCallee, CanonicalLocation, CanonicalSiteKey, MechanicalEvidence, MechanicalExtent,
+        MechanicalFamily, MechanicalMechanism, MechanicalObligationEvent, MechanicalObligationKey,
+        MechanicalObligationPlan, MechanicalRetention, MechanicalStage, MechanicalState,
+        MechanicalSubjectKey, SLICE_EXTENT_WAIVER_ID, UnsafeContextPresentation,
+        fallback_extent_receipt,
     },
 };
 
@@ -298,7 +298,7 @@ pub(crate) fn plan(
                         evidence: MechanicalEvidence {
                             extent: if fallback {
                                 MechanicalExtent::Fallback {
-                                    receipt: FALLBACK_EXTENT_RECEIPT.into(),
+                                    receipt: fallback_extent_receipt(),
                                     waiver_id: SLICE_EXTENT_WAIVER_ID.into(),
                                 }
                             } else {
