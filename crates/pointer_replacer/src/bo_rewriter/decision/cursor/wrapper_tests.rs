@@ -792,6 +792,13 @@ pub unsafe fn caller(t: *const *const f64) -> f64 { sma(4, t, 2) }
 fn slicecursor_ordering_walk_to_derived_end() {
     // brotli `ShannonEntropy`: a forward walk of a parameter cursor compared
     // against a derived, untyped end (`population < population_end`).
+    //
+    // **Re-pinned by R743-1 (2):** `population_end` is only ever compared, so
+    // R739-1 holds it raw (`held:address-observation-only`): it may be one
+    // past the window, and no reference may claim an element there. This
+    // family's ordering arm selects `ptr-comparison` subjects only, so the walk
+    // keeps its raw form until the ordering half (held ends ordered against a
+    // window one past its end) is built RED-first after the final frame (55).
     let input = r#"
 pub unsafe fn entropy(mut population: *const u32, size: usize) -> u64 {
     let mut sum = 0u64;
@@ -803,20 +810,25 @@ pub unsafe fn entropy(mut population: *const u32, size: usize) -> u64 {
     sum
 }
 "#;
+    let reasons = crate::bo_rewriter::emit_tests::decisions_of(input);
+    assert!(
+        reasons
+            .iter()
+            .any(|(name, is_param, reason)| name == "population_end"
+                && !*is_param
+                && reason == "held:address-observation-only"),
+        "the derived end is held as measured only: {reasons:?}"
+    );
     let source = emitted(input);
     save_fixture("ordering-walk-to-derived-end", input, &source);
     assert!(
-        source.contains("let mut population_end: crate::slice_cursor::SliceCursor<'_, u32> ="),
-        "derived end declaration absent: {source}"
-    );
-    assert!(
-        source.contains(".addr() < ") || source.contains(".addr()) < "),
-        "ordering address view absent: {source}"
+        source.contains("let mut population_end = population.offset(size as isize);"),
+        "the held end keeps its raw declaration: {source}"
     );
     compile(
         &source,
         Some(
-            "fn main() { let p = [1u32, 2, 3, 4]; assert_eq!(unsafe { entropy(&p, 4) }, 10); assert_eq!(unsafe { entropy(&p[1..], 2) }, 5); }",
+            "fn main() { let p = [1u32, 2, 3, 4]; assert_eq!(unsafe { entropy(p.as_ptr(), 4) }, 10); assert_eq!(unsafe { entropy(p.as_ptr().add(1), 2) }, 5); }",
         ),
     );
 }
@@ -826,6 +838,13 @@ fn slicecursor_ordering_two_parameters_with_difference() {
     // lodepng `lodepng_chunk_next` / binn `AdvanceDataPos`: two parameter
     // cursors ordered against each other and their difference taken; neither
     // walks backward. (Its E2-permitted raw return is the seam's, not tested here.)
+    //
+    // **Re-pinned by R743-1 (2):** `end` is only ever measured (the
+    // difference and the comparison), so R739-1 holds it raw
+    // (`held:address-observation-only`) — the caller may hand it one past the
+    // buffer. `chunk` is dereferenced and stays this family's cursor, ordered
+    // and differenced against the raw `end` through its address view. The
+    // ordering half (a held end taken into the window) is 55's.
     let input = r#"
 pub unsafe fn chunk_len(chunk: *mut u8, end: *mut u8) -> usize {
     let available = end.offset_from(chunk) as usize;
@@ -833,12 +852,20 @@ pub unsafe fn chunk_len(chunk: *mut u8, end: *mut u8) -> usize {
     *chunk.offset(3) as usize + available
 }
 "#;
+    let reasons = crate::bo_rewriter::emit_tests::decisions_of(input);
+    assert!(
+        reasons.iter().any(|(name, is_param, reason)| name == "end"
+            && *is_param
+            && reason == "held:address-observation-only"),
+        "the end is held as measured only: {reasons:?}"
+    );
     let source = emitted(input);
     save_fixture("ordering-two-parameters", input, &source);
     assert!(
         source.contains("slice_cursor::SliceCursor::new(chunk)")
-            && source.contains("slice_cursor::SliceCursor::new(end)"),
-        "wrapper absent: {source}"
+            && source.contains("end: *mut u8")
+            && !source.contains("slice_cursor::SliceCursor::new(end)"),
+        "the cursor over `chunk`, `end` raw: {source}"
     );
     assert!(
         source.contains(".addr()") && source.contains("offset_from("),
@@ -847,7 +874,7 @@ pub unsafe fn chunk_len(chunk: *mut u8, end: *mut u8) -> usize {
     compile(
         &source,
         Some(
-            "fn main() { let b = [0u8, 0, 0, 2, 9, 9, 9, 9]; assert_eq!(unsafe { chunk_len(&b[..], &b[8..]) }, 10); let c = [9u8, 9]; assert_eq!(unsafe { chunk_len(&c[..], &c[2..]) }, 0); }",
+            "fn main() { let b = [0u8, 0, 0, 2, 9, 9, 9, 9]; assert_eq!(unsafe { chunk_len(&b[..], b.as_ptr().add(8).cast_mut()) }, 10); let c = [9u8, 9]; assert_eq!(unsafe { chunk_len(&c[..], c.as_ptr().add(2).cast_mut()) }, 0); }",
         ),
     );
 }
