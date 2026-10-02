@@ -4943,6 +4943,11 @@ pub(crate) enum BridgeTemplate {
     CursorSharedToRawConst,
     CursorMutToRawMut,
     CursorMutToRawConst,
+    /// R757-1 (1): an optional WRAPPER cursor (`Option<SliceCursor<'_, T>>` /
+    /// `Option<SliceCursorMut<'_, T>>`, a null-tested parameter cursor) at a
+    /// raw formal: `None` is null, `Some` is the cursor's current position.
+    OptCursorToRawConst,
+    OptCursorMutToRawMut,
     SliceMutToRawMut,
     SliceToRawConst,
     SliceMutToWritableRawConst,
@@ -5002,6 +5007,8 @@ impl BridgeTemplate {
             Self::CursorSharedToRawConst => "cursor-shared-to-raw-const",
             Self::CursorMutToRawMut => "cursor-mut-to-raw-mut",
             Self::CursorMutToRawConst => "cursor-mut-to-raw-const",
+            Self::OptCursorToRawConst => "opt-cursor-to-raw-const",
+            Self::OptCursorMutToRawMut => "opt-cursor-mut-to-raw-mut",
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
             Self::SliceMutToWritableRawConst => "returned-child-slice-mut-to-raw-const",
@@ -5174,6 +5181,23 @@ impl BridgeTemplate {
                 Ok(BridgeRender::Edit(format!(
                     "{{ let __crat_cursor = {borrow}({argument}); __crat_cursor.0.{method}().add(__crat_cursor.1){cast}{as_const} }}"
                 )))
+            }
+            // R757-1 (1): `null` for `None` (§29), the cursor's own position
+            // otherwise. Not the native window tuple's `.0` / `.1`: a wrapper
+            // cursor is a struct, and here it is inside an `Option`.
+            Self::OptCursorToRawConst | Self::OptCursorMutToRawMut => {
+                let cast = cast_pointee
+                    .map(|pointee| format!(".cast::<{pointee}>()"))
+                    .unwrap_or_default();
+                Ok(BridgeRender::Edit(if self == Self::OptCursorMutToRawMut {
+                    format!(
+                        "{argument}.as_mut().map_or(core::ptr::null_mut(), |cursor| cursor.as_mut_ptr()){cast}"
+                    )
+                } else {
+                    format!(
+                        "{argument}.as_ref().map_or(core::ptr::null(), |cursor| cursor.as_ptr()){cast}"
+                    )
+                }))
             }
             Self::SliceMutToRawMut => Ok(BridgeRender::Edit(format!("{argument}.as_mut_ptr()"))),
             Self::SliceToRawConst => Ok(BridgeRender::Edit(format!("{argument}.as_ptr()"))),
@@ -5855,6 +5879,16 @@ pub(crate) fn template_for(
         }
         Decision::NestedSlice { .. } => Err(RawBoundaryBlockReason::TemplateUnavailable),
         Decision::Cursor { mutable, plan } => {
+            if plan.wrapper && plan.optional {
+                if ownership == Some(OwnershipContract::Consume) {
+                    return Err(RawBoundaryBlockReason::OwnershipTransfer);
+                }
+                return match (*mutable, target.mutability) {
+                    (_, RawMutability::Const) => Ok(BridgeTemplate::OptCursorToRawConst),
+                    (true, RawMutability::Mut) => Ok(BridgeTemplate::OptCursorMutToRawMut),
+                    (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+                };
+            }
             if plan.wrapper && !plan.optional {
                 if ownership == Some(OwnershipContract::Consume) {
                     return Err(RawBoundaryBlockReason::OwnershipTransfer);

@@ -2547,3 +2547,56 @@ fn slicecursor_the_top_index_entry_window_is_receipted_and_a_held_row_is_not() {
     );
     assert_eq!(rows.len(), 1, "{receipts}");
 }
+
+/// **R757-1 (1), jccc `ttype_many_chars`.** A parameter cursor (it reads
+/// `contents[i - 1]` after its walk) that is also null-tested is presented as
+/// `Option<SliceCursor<'_, i8>>`; handed to a foreign raw formal (`strcmp`,
+/// 55 times in jccc), its bridge must open the option. The cursor's raw-view
+/// template for the native window tuple read `.0` / `.1` off the option:
+/// 110 × E0609 at the seal (rq3-inator 005 STOP 1).
+#[test]
+fn slicecursor_an_optional_cursor_handed_to_a_foreign_raw_formal_is_bridged() {
+    let input = r#"
+unsafe extern "C" {
+    fn strcmp(a: *const i8, b: *const i8) -> i32;
+}
+pub unsafe fn many(contents: *const i8) -> i32 {
+    if strcmp(contents, b"auto\0".as_ptr() as *const i8) == 0 {
+        return 1;
+    }
+    if contents.is_null() {
+        return 0;
+    }
+    let mut i: i32 = 0;
+    while *contents.offset(i as isize) != 0 {
+        i += 1;
+    }
+    if i > 0 && *contents.offset((i - 1) as isize) == b'u' as i8 {
+        return 2;
+    }
+    3
+}
+"#;
+    let source = emitted(input);
+    save_fixture("optional-cursor-into-foreign-raw-formal", input, &source);
+    assert!(
+        source.contains("contents: Option<&[i8]>")
+            && source.contains("contents.map(crate::slice_cursor::SliceCursor::new)"),
+        "the null-tested parameter cursor is optional: {source}"
+    );
+    assert!(
+        !source.contains("__crat_cursor.0"),
+        "an optional wrapper cursor is not a native window tuple: {source}"
+    );
+    assert!(
+        source.contains("contents.as_ref().map_or(core::ptr::null(), |cursor| cursor.as_ptr())")
+            || source.contains("contents.as_ref().map_or(core::ptr::null(),\n"),
+        "the option is opened at the foreign formal: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let c = |s: &[u8]| s.iter().map(|&b| b as i8).collect::<Vec<i8>>(); let (auto, menu, ab) = (c(b\"auto\\0\"), c(b\"menu\\0\"), c(b\"ab\\0\")); unsafe { assert_eq!(many(Some(&auto)), 1); assert_eq!(many(Some(&menu)), 2); assert_eq!(many(Some(&ab)), 3); } }",
+        ),
+    );
+}

@@ -229,6 +229,8 @@ fn shared_to_mut(template: raw_boundary::BridgeTemplate) -> bool {
         | BridgeTemplate::CursorSharedToRawConst
         | BridgeTemplate::CursorMutToRawMut
         | BridgeTemplate::CursorMutToRawConst
+        | BridgeTemplate::OptCursorToRawConst
+        | BridgeTemplate::OptCursorMutToRawMut
         | BridgeTemplate::KnownFreeDrop => false,
     }
 }
