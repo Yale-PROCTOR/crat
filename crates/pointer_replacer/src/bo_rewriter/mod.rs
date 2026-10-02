@@ -313,13 +313,11 @@ mod option_cmp_tests;
 #[cfg(test)]
 mod option_decl_tests;
 #[cfg(test)]
+mod option_exported_null_handoff_tests;
+#[cfg(test)]
 mod option_forward_nullability_tests;
 #[cfg(test)]
 mod option_null_arg_tests;
-#[cfg(test)]
-mod option_exported_null_handoff_tests;
-#[cfg(test)]
-mod r462_in_crate_alias_tests;
 #[cfg(test)]
 mod option_ops_tests;
 #[cfg(test)]
@@ -358,6 +356,8 @@ pub(crate) mod outbound_return_transport;
 mod r216_boundary_tests;
 #[cfg(test)]
 mod r233_shape_emission_tests;
+#[cfg(test)]
+mod r462_in_crate_alias_tests;
 #[cfg(test)]
 mod r593_raw_expression_tests;
 #[cfg(test)]

@@ -66,10 +66,7 @@ fn wave6o_exported_formal_handed_to_a_null_testing_callee_is_optional() {
 /// NULL is expected and the exported formal stays a plain reference.
 #[test]
 fn wave6o_exported_formal_handed_to_a_non_testing_callee_stays_plain() {
-    let input = INPUT.replace(
-        "if item.is_null() || (*item).type_0",
-        "if (*item).type_0",
-    );
+    let input = INPUT.replace("if item.is_null() || (*item).type_0", "if (*item).type_0");
     assert!(verify::type_checks_str(&input));
     let (decision, reason) = decision_and_reason(&input, "binn_list_add", "list");
     assert!(
@@ -83,9 +80,10 @@ fn wave6o_exported_formal_handed_to_a_non_testing_callee_stays_plain() {
 /// actuals are the evidence (R462-1 (2) / P2), not the callee's test.
 #[test]
 fn wave6o_unexported_formal_handed_to_a_null_testing_callee_stays_plain() {
-    let input = INPUT
-        .replace("#[no_mangle]\npub unsafe extern \"C\" fn binn_list_add", "unsafe extern \"C\" fn binn_list_add")
-        + "\nunsafe fn caller(mut b: binn) -> i32 { binn_list_add(&mut b, 1 as i32) }\n";
+    let input = INPUT.replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn binn_list_add",
+        "unsafe extern \"C\" fn binn_list_add",
+    ) + "\nunsafe fn caller(mut b: binn) -> i32 { binn_list_add(&mut b, 1 as i32) }\n";
     assert!(verify::type_checks_str(&input));
     let (decision, reason) = decision_and_reason(&input, "binn_list_add", "list");
     assert!(

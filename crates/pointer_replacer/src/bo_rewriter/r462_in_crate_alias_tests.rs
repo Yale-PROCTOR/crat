@@ -59,7 +59,10 @@ fn both_mut_refs(ds: &[(String, Decision)]) -> bool {
 fn wave6o_in_crate_aliased_call_refuses_the_exported_pair() {
     assert!(verify::type_checks_str(INPUT));
     let ds = decisions(INPUT, "zcmp");
-    assert!(!both_mut_refs(&ds), "an in-crate aliased call refuses the pair: {ds:?}");
+    assert!(
+        !both_mut_refs(&ds),
+        "an in-crate aliased call refuses the pair: {ds:?}"
+    );
     let output = ast_emitted_source_of(INPUT).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
     assert!(!flat.contains("fnzcmp(muta:&mutZ,mutb:&mutZ)"), "{output}");
@@ -74,5 +77,8 @@ fn wave6o_in_crate_distinct_calls_keep_the_exported_pair() {
     let input = INPUT.replace("    r += zcmp(&mut x, &mut x);\n", "");
     assert!(verify::type_checks_str(&input));
     let ds = decisions(&input, "zcmp");
-    assert!(both_mut_refs(&ds), "distinct in-crate arguments keep the pair: {ds:?}");
+    assert!(
+        both_mut_refs(&ds),
+        "distinct in-crate arguments keep the pair: {ds:?}"
+    );
 }

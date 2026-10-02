@@ -623,16 +623,19 @@ pub(super) fn exported_param_handed_to_null_tested_formal(
         return false;
     }
     facts.call_args.iter().any(|(callee, sites)| {
-        sites.iter().filter(|site| site.caller == subject.fn_did).any(|site| {
-            site.args.iter().any(|arg| {
-                matches!(arg.shape, ArgShape::BareLocal(binding) if binding == subject.hir_id)
-                    && tcx
-                        .hir_maybe_body_owned_by(*callee)
-                        .and_then(|body| body.params.get(arg.index))
-                        .and_then(|param| facts.raw_only_uses.get(&(*callee, param.pat.hir_id)))
-                        .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+        sites
+            .iter()
+            .filter(|site| site.caller == subject.fn_did)
+            .any(|site| {
+                site.args.iter().any(|arg| {
+                    matches!(arg.shape, ArgShape::BareLocal(binding) if binding == subject.hir_id)
+                        && tcx
+                            .hir_maybe_body_owned_by(*callee)
+                            .and_then(|body| body.params.get(arg.index))
+                            .and_then(|param| facts.raw_only_uses.get(&(*callee, param.pat.hir_id)))
+                            .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+                })
             })
-        })
     })
 }
 

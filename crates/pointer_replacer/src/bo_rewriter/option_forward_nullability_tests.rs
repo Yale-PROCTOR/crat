@@ -69,17 +69,17 @@ fn wave6o_null_literal_formal_handed_to_a_wider_raw_formal_stays_raw() {
 
 const PRETTY: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case)]
-unsafe fn write_indent(mut indent: *const i8, mut data: *mut i8) -> *mut i8 {
-    if !indent.is_null() { *data = *indent; }
-    return data;
+unsafe fn write_indent(mut indent: *const i8) -> i32 {
+    if !indent.is_null() { return *indent as i32; }
+    return 0 as i32;
 }
-unsafe fn pretty_value(mut value: *const i32, mut indent: *const i8, mut data: *mut i8) -> *mut i8 {
-    if *value == 0 as i32 { return data; }
-    return write_indent(indent, data);
+unsafe fn pretty_value(mut depth: i32, mut indent: *const i8) -> i32 {
+    if depth == 0 as i32 { return 0 as i32; }
+    return write_indent(indent);
 }
-unsafe fn write_pretty(mut value: *const i32, mut indent: *const i8, mut data: *mut i8) -> *mut i8 {
-    if indent.is_null() { *data = 32 as i8; }
-    return pretty_value(value, indent, data);
+unsafe fn write_pretty(mut depth: i32, mut indent: *const i8) -> i32 {
+    if indent.is_null() { return -(1 as i32); }
+    return pretty_value(depth, indent);
 }
 "#;
 
@@ -93,10 +93,15 @@ fn wave6o_hand_on_formal_receiving_a_nullable_actual_is_optional() {
     let output = ast_emitted_source_of(PRETTY).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
     assert!(
-        flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"),
+        flat.contains("fnpretty_value(mutdepth:i32,mutindent:Option<&i8>"),
         "{output}"
     );
-    assert!(!flat.contains("indent.unwrap()"), "{output}");
+    // the hand-on is same-form at both calls: no unwrap where C continues with NULL
+    assert!(flat.contains("returnwrite_indent(indent)"), "{output}");
+    assert!(
+        flat.contains("returnpretty_value(depth,indent)"),
+        "{output}"
+    );
     assert!(verify::type_checks_str(&output), "{output}");
 }
 
@@ -105,14 +110,14 @@ fn wave6o_hand_on_formal_receiving_a_nullable_actual_is_optional() {
 #[test]
 fn wave6o_dereferenced_formal_receiving_a_nullable_actual_stays_plain() {
     let input = PRETTY.replace(
-        "    if *value == 0 as i32 { return data; }\n",
-        "    if *value == 0 as i32 { return data; }\n    *data = *indent;\n",
+        "    if depth == 0 as i32 { return 0 as i32; }\n",
+        "    if depth == 0 as i32 { return 0 as i32; }\n    if *indent == 0 as i8 { return 1 as i32; }\n",
     );
     assert!(verify::type_checks_str(&input));
     let output = ast_emitted_source_of(&input).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
     assert!(
-        !flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"),
+        !flat.contains("fnpretty_value(mutdepth:i32,mutindent:Option<&i8>"),
         "{output}"
     );
     assert!(verify::type_checks_str(&output), "{output}");
