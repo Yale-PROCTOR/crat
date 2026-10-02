@@ -313,9 +313,9 @@ mod option_cmp_tests;
 #[cfg(test)]
 mod option_decl_tests;
 #[cfg(test)]
-mod option_null_arg_tests;
-#[cfg(test)]
 mod option_forward_nullability_tests;
+#[cfg(test)]
+mod option_null_arg_tests;
 #[cfg(test)]
 mod option_ops_tests;
 #[cfg(test)]

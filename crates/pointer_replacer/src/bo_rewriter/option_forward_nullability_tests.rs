@@ -40,7 +40,9 @@ fn wave6o_null_literal_formal_handed_to_a_pointee_only_raw_formal_is_optional() 
     assert!(flat.contains("total_out:Option<&mutusize>"), "{output}");
     assert!(flat.contains("Stream(s,None)"), "{output}");
     assert!(
-        flat.contains("total_out.as_deref_mut().map_or(core::ptr::null_mut::<usize>(),core::ptr::from_mut)"),
+        flat.contains(
+            "total_out.as_deref_mut().map_or(core::ptr::null_mut::<usize>(),core::ptr::from_mut)"
+        ),
         "{output}"
     );
     assert!(verify::type_checks_str(&output), "{output}");
@@ -90,7 +92,10 @@ fn wave6o_hand_on_formal_receiving_a_nullable_actual_is_optional() {
     assert!(verify::type_checks_str(PRETTY));
     let output = ast_emitted_source_of(PRETTY).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
-    assert!(flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"), "{output}");
+    assert!(
+        flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"),
+        "{output}"
+    );
     assert!(!flat.contains("indent.unwrap()"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
@@ -106,6 +111,9 @@ fn wave6o_dereferenced_formal_receiving_a_nullable_actual_stays_plain() {
     assert!(verify::type_checks_str(&input));
     let output = ast_emitted_source_of(&input).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
-    assert!(!flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"), "{output}");
+    assert!(
+        !flat.contains("fnpretty_value(mutvalue:&i32,mutindent:Option<&i8>"),
+        "{output}"
+    );
     assert!(verify::type_checks_str(&output), "{output}");
 }
