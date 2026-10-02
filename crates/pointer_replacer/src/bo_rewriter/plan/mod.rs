@@ -177,6 +177,12 @@ pub(crate) enum Justification {
     /// fabricated site reverts. It is DERIVED from the surviving edits instead,
     /// which is why it is created after the revert filter rather than before.
     FabricatedLenConst,
+    /// **The System global-allocator declaration** (R443-1 in form (B′), R448-1): like
+    /// [`Self::FabricatedLenConst`] it is crate-level and owner-less and is created
+    /// after the revert filter; it is emitted in every crate in which at least one
+    /// edit survives, so a fully reverted crate keeps its input bytes (R216) -- and a
+    /// Box cannot exist without a surviving edit.
+    GlobalAllocator,
     /// G07/G09: a store form that must NOT drop — (N-raw)/(N-safe)/(R) — or a
     /// P-drop suppression, carrying which rule applied.
     StoreForm { form: &'static str },
@@ -2021,6 +2027,9 @@ pub(crate) struct Plan {
     /// text, no insertion, and the adapters that name it fail `verify` loudly
     /// rather than emitting a crate with a dangling path.
     pub len_const_item: Option<String>,
+    /// The System global-allocator item (R448-1 (B′)), produced beside
+    /// [`Self::len_const_item`] for the same reason: it needs a compiler session.
+    pub global_allocator_item: Option<String>,
     /// Sites known without a successfully placed text edit (blocked,
     /// unplaceable, or explicit zero-syntax).
     pub preclass_sites: Vec<ClassSite>,
@@ -5923,6 +5932,7 @@ pub(crate) fn plan(
         // neither which file is the crate root nor the parser for an item.
         root_file: None,
         len_const_item: None,
+        global_allocator_item: None,
         preclass_sites,
         class_finalization: ClassFinalization::default(),
         attribution_intervals,

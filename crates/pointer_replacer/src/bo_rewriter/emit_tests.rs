@@ -936,10 +936,15 @@ fn a_subject_in_a_module_is_emitted_into_that_module() {
         module.contains("p: &mut i32"),
         "the module's subject was not rewritten: {module}"
     );
+    // MIGRATED under R217-2 by R760-1, (B′) (R619-3 (1) in 53's line): an edit
+    // survives (in the module), so the crate root carries the crate's one
+    // `#[global_allocator]` declaration, appended after its input bytes. The point
+    // stands: no subject edit lands in the root.
+    let root = text_for(&emission, "lib.rs").expect("the root carries the declaration");
+    assert_eq!(root.matches("#[global_allocator]").count(), 1, "{root}");
     assert!(
-        text_for(&emission, "lib.rs").is_none(),
-        "the crate root has no subject and must not be emitted: {:?}",
-        emission.files.keys().collect::<Vec<_>>()
+        root.starts_with(ROOT_WITH_MODULE),
+        "the root's own bytes are untouched: {root}"
     );
     assert!(emission.rollbacks.is_empty(), "{:?}", emission.rollbacks);
     assert!(
@@ -11586,6 +11591,61 @@ fn a_reverted_fn_keeps_its_raw_declaration() {
         "KEPT: `keep_me` must still convert — reverting one function may not \
          revert the crate:\n{one}"
     );
+}
+
+/// **(B′) — the allocator declaration rides a surviving edit, once** (R443-1,
+/// R448-1; relay main/201 R619-3 (1)). A crate in which an edit survives
+/// declares `#[global_allocator] static …: std::alloc::System` at its root,
+/// so a Rust drop of a C-allocated `Box` is libc `free` (R443); a crate whose
+/// every edit is withdrawn keeps its input bytes (R216) and gains nothing.
+/// Both layers: the text layer (`validate_plan`) and the AST layer of record.
+///
+/// *Mutation-tested:* drop the `an_edit_survives` guard, or the AST layer's
+/// `!edited.is_empty()`, and the withdrawn half fails; drop the insertion and
+/// the surviving half fails.
+#[test]
+fn b_prime_the_allocator_declaration_rides_a_surviving_edit_once() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn f(p: *mut i32) -> i32 { *p }\n";
+    const DECLARED: &str = "__CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;";
+    let fixture = Fixture::new(&[("lib.rs", SRC)]);
+    let (plan, texts) =
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let table = decide_table(tcx).expect("decides");
+            let e = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &[]).expect("emits");
+            (e.plan, e.texts)
+        })
+        .expect("fixture compiles");
+    let (files, rollbacks, _) = super::validate_plan(&plan, &texts);
+    assert!(rollbacks.is_empty(), "{rollbacks:?}");
+    let [root] = files.values().collect::<Vec<_>>()[..] else {
+        panic!("one emitted file: {files:?}")
+    };
+    assert_eq!(root.matches("#[global_allocator]").count(), 1, "{root}");
+    assert!(root.contains(DECLARED), "{root}");
+    assert!(
+        !root.contains("p: *mut i32"),
+        "the subject's edit survives: {root}"
+    );
+    assert!(super::verify::type_checks_str(root), "{root}");
+    // Every edit withdrawn: nothing is emitted, the declaration included.
+    let mut withdrawn = plan.clone();
+    withdrawn.by_file.values_mut().for_each(Vec::clear);
+    let (files, _, _) = super::validate_plan(&withdrawn, &texts);
+    assert!(
+        files
+            .values()
+            .all(|text| !text.contains("#[global_allocator]")),
+        "{files:?}"
+    );
+    // The AST layer: one declaration beside the surviving edit, none when the
+    // only subject is reverted.
+    let kept = ast_emitted_source_of(SRC).expect("the AST layer emits");
+    assert_eq!(kept.matches("#[global_allocator]").count(), 1, "{kept}");
+    assert!(kept.contains(DECLARED), "{kept}");
+    let reverted = super::ast_emitted_source_of_reverting(SRC, "f::p#1")
+        .expect("the AST layer emits under a revert set");
+    assert!(!reverted.contains("#[global_allocator]"), "{reverted}");
 }
 
 /// **The one-capture-per-session fact, measured rather than cited.**

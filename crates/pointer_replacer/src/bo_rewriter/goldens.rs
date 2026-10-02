@@ -249,6 +249,40 @@ pub(super) fn canonicalize(label: &str, src: &str) -> String {
     String::from_utf8(out.stdout).expect("rustfmt emitted valid UTF-8")
 }
 
+/// **(B′) — the allocator declaration** (R443-1, R448-1; relay main/201
+/// R619-3 (1)). An emitted crate in which an edit survives declares
+/// `#[global_allocator] static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System`.
+/// The goldens are the M1 spec, landed verbatim, and predate it. So instead
+/// of adding the same two lines to every expected file, the comparison takes
+/// the declaration off the emitted side, having asserted that the crate
+/// declares it exactly when its text moved, and returns the rest canonically
+/// formatted. The expected files are unchanged (migration receipted under
+/// R217-2).
+pub(super) fn without_allocator_declaration(label: &str, input: &str, emitted: &str) -> String {
+    const ATTRIBUTE: &str = "#[global_allocator]";
+    const ITEM: &str = "static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;";
+    let canonical = canonicalize(label, emitted);
+    let declared = canonical.matches(ATTRIBUTE).count();
+    let rest = if declared == 0 {
+        canonical.clone()
+    } else {
+        assert_eq!(canonical.matches(ITEM).count(), 1, "{label}:\n{canonical}");
+        let kept = canonical
+            .lines()
+            .filter(|line| line.trim() != ATTRIBUTE && line.trim() != ITEM)
+            .collect::<Vec<_>>()
+            .join("\n");
+        canonicalize(label, &(kept + "\n"))
+    };
+    let edited = rest != canonicalize("input", input);
+    assert_eq!(
+        declared,
+        usize::from(edited),
+        "{label}: a crate declares the allocator once exactly when an edit survives:\n{canonical}"
+    );
+    rest
+}
+
 /// The ten goldens. RED until the emitter exists.
 ///
 /// Each is a separate `#[test]` rather than one loop, so a partially working
@@ -272,7 +306,7 @@ macro_rules! golden_test {
                     golden.name, degradations
                 ),
             };
-            let emitted = canonicalize("emitted", &emitted);
+            let emitted = without_allocator_declaration("emitted", golden.input, &emitted);
             let expected = canonicalize("expected", golden.expected);
             assert_eq!(
                 emitted, expected,
@@ -1231,7 +1265,9 @@ fn the_ast_layer_reproduces_every_green_golden() {
         let src = super::emit_tests::ast_emitted_source_of(g.input)
             .unwrap_or_else(|why| panic!("{}: AST layer declined to emit — {why}", g.name));
         compared += 1;
-        if canonicalize("new", &src) != canonicalize("expected", g.expected) {
+        if without_allocator_declaration("new", g.input, &src)
+            != canonicalize("expected", g.expected)
+        {
             differing.push(g.name);
         }
     }

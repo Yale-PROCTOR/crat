@@ -395,6 +395,33 @@ pub(crate) fn fabricated_len_item() -> String {
     rustc_ast_pretty::pprust::item_to_string(&item)
 }
 
+/// The global allocator's name in the emitted crate (R443-1, R448-1 (B′), R619-3 item 1).
+pub(crate) const GLOBAL_ALLOCATOR_NAME: &str = "__CRAT_GLOBAL_ALLOCATOR";
+
+/// **The System-allocator declaration, as emitted text** (R443-1; form (B′), R448-1;
+/// R760-1: taken stand-alone from 53's `0a40583c1` for 54).
+///
+/// An emitted crate adopts C-allocated memory: a subject whose allocation came from
+/// `malloc` / `calloc` / `realloc` (or a program allocator wrapping them) can be
+/// delivered as a `Box`, and Rust's drop glue then frees it. That is well-defined only
+/// if Rust's global allocator IS the C allocator; declaring `std::alloc::System` makes
+/// that the program's own statement rather than a platform coincidence (Miri reports
+/// the undeclared case as "deallocating C heap memory using Rust heap deallocation").
+/// Built like [`fabricated_len_item`]: parsed, printed, discarded, so a typo fails here.
+/// **R641-2 — a crate that declares its own global allocator keeps it.** (B′)
+/// appends its declaration only where the input crate has none: a second one is
+/// `cannot define multiple global allocators`.
+pub(crate) fn emits_global_allocator(tcx: TyCtxt<'_>) -> bool {
+    !tcx.has_global_allocator(rustc_span::def_id::LOCAL_CRATE)
+}
+
+pub(crate) fn global_allocator_item() -> String {
+    let item = ::utils::item!(
+        "#[global_allocator] static {GLOBAL_ALLOCATOR_NAME}: std::alloc::System = std::alloc::System;"
+    );
+    rustc_ast_pretty::pprust::item_to_string(&item)
+}
+
 /// Which family a placed adapter came from. Reported in the artifacts' seam
 /// column so the reborrow population — the one carrying the aliasing exposure —
 /// stays countable on its own.

@@ -10039,6 +10039,7 @@ mod run {
                     seam_adapter,
                     seam_adapter_fabricated,
                     fabricated_len_const,
+                    global_allocator,
                     reroute,
                     drop_form,
                     store_form,
@@ -10058,6 +10059,7 @@ mod run {
                          a5_raw_view\t{a5_raw_view}\n\
                          lifetime_plan\t{lifetime_plan}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
+                         global_allocator\t{global_allocator}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),
                 )
@@ -24984,7 +24986,7 @@ fn raw_boundary_wave2_corpus_census() {
                 failures.len(),
                 aborts.len(),
                 crate::bo_rewriter::decision::seam::fallback_slice_extent(),
-            ),
+            ) + &raw_boundary_allocator_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25027,7 +25029,8 @@ fn raw_boundary_wave2_corpus_census() {
                 + &format!(
                     "fallback_slice_extent={}\n",
                     crate::bo_rewriter::decision::seam::fallback_slice_extent()
-                ),
+                )
+                + &raw_boundary_allocator_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26264,10 +26267,96 @@ fn raw_boundary_wave2_corpus_census() {
             retirement_sha256,
             retirement_receipt.lines().count() - 1,
             gate_lost.lines().count() - 1,
-        ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent()),
+        ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent())
+            + &raw_boundary_allocator_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+/// **R760-1 (R443 / D2; (B′), R619-3 item 1)** — each emitted tree's allocator
+/// verdict, one line per program in `census-receipt.txt`: the System global allocator
+/// the (B′) item declares, checked against the tree's own patch. `declared` is one
+/// declaration in a tree with an edit, `absent` none in a tree with no edit (it keeps
+/// its input bytes, R216); anything else is named (`missing`, `unexpected`,
+/// `duplicate`, `unreadable`). Taken from 53's `0a40583c1` without its panic-strategy
+/// half.
+fn raw_boundary_allocator_lines(ledger_dir: &std::path::Path) -> String {
+    let Some(dir) =
+        std::env::var_os("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR").map(std::path::PathBuf::from)
+    else {
+        return "global_allocator_check=unreadable\n".to_owned();
+    };
+    CORPUS
+        .iter()
+        .map(|program| {
+            let declarations =
+                std::fs::read_to_string(dir.join(program.name).join(program.lib_root))
+                    .map(|text| text.matches("#[global_allocator]").count());
+            let edited = std::fs::read_to_string(
+                ledger_dir.join(format!("{}.raw-boundary-emitted.patch", program.name)),
+            )
+            .map(|patch| raw_boundary_patch_edits(&patch));
+            format!(
+                "tree={} global_allocator={}\n",
+                program.name,
+                raw_boundary_allocator_verdict(declarations.ok(), edited.ok())
+            )
+        })
+        .collect()
+}
+
+/// Does the census's unified diff of a tree carry a hunk (an edit survived)?
+fn raw_boundary_patch_edits(patch: &str) -> bool {
+    patch.lines().any(|line| line.starts_with("@@ "))
+}
+
+fn raw_boundary_allocator_verdict(
+    declarations: Option<usize>,
+    edited: Option<bool>,
+) -> &'static str {
+    match (declarations, edited) {
+        (Some(1), Some(true)) => "declared",
+        (Some(0), Some(false)) => "absent",
+        (Some(0), Some(true)) => "missing",
+        (Some(1), Some(false)) => "unexpected",
+        (Some(_), Some(_)) => "duplicate",
+        _ => "unreadable",
+    }
+}
+
+/// R619-3 (1) / R760-1: the per-tree allocator line. A declaration counts only beside
+/// an edit, and a tree the census left untouched must not carry one.
+#[test]
+fn r760_1_the_allocator_line_reads_the_declaration_against_the_patch() {
+    assert_eq!(
+        raw_boundary_allocator_verdict(Some(1), Some(true)),
+        "declared"
+    );
+    assert_eq!(
+        raw_boundary_allocator_verdict(Some(0), Some(false)),
+        "absent"
+    );
+    assert_eq!(
+        raw_boundary_allocator_verdict(Some(0), Some(true)),
+        "missing"
+    );
+    assert_eq!(
+        raw_boundary_allocator_verdict(Some(1), Some(false)),
+        "unexpected"
+    );
+    assert_eq!(
+        raw_boundary_allocator_verdict(Some(2), Some(true)),
+        "duplicate"
+    );
+    assert_eq!(
+        raw_boundary_allocator_verdict(None, Some(true)),
+        "unreadable"
+    );
+    assert!(raw_boundary_patch_edits(
+        "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n"
+    ));
+    assert!(!raw_boundary_patch_edits(""));
 }
 
 /// **R541-5** — one program's rows of `gate-lost-identities.tsv`: every identity

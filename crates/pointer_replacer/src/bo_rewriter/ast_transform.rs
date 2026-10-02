@@ -5250,6 +5250,21 @@ pub(crate) fn ast_emitted_files_from(
             text.push('\n');
         }
     }
+    // **R448-1 (B′) — the System global allocator**, in every crate in which an edit
+    // survives: `edited` is empty exactly when every function reverted, and then the
+    // crate keeps its input bytes (R216). Appended after the cursor prelude and before
+    // the fabricated-extent const, the span layer's order for the two crate items.
+    if !edited.is_empty() && super::decision::seam::emits_global_allocator(tcx) {
+        let key = root_key.cloned().or_else(|| files.keys().next().cloned());
+        if let Some(key) = key
+            && let Some(text) = files.get_mut(&key)
+            && !text.is_empty()
+        {
+            text.push('\n');
+            text.push_str(&super::decision::seam::global_allocator_item());
+            text.push('\n');
+        }
+    }
     if seams.len_fabricated > 0 || surviving_wrappers.iter().any(|plan| plan.fallback) {
         // Root selection: the caller's key when it has one (the loop's round-0
         // file), else the map's first — deterministic because the map is
@@ -5363,6 +5378,15 @@ pub(crate) fn ast_emitted_source_from(
     // Appended, matching `render`'s end-of-file insertion: the spliced output
     // replaces function spans in place, so appending here and inserting at
     // `source.len()` of the original put the item in the same position.
+    // R448-1 (B′): the System global allocator, as in `ast_emitted_files_from`.
+    if !edited.is_empty()
+        && !source.is_empty()
+        && super::decision::seam::emits_global_allocator(tcx)
+    {
+        source.push('\n');
+        source.push_str(&super::decision::seam::global_allocator_item());
+        source.push('\n');
+    }
     if seams.len_fabricated > 0 && !source.is_empty() {
         source.push('\n');
         source.push_str(&super::decision::seam::fabricated_len_item());
@@ -5583,6 +5607,10 @@ pub(crate) struct JustificationCensus {
     /// reach `count()` could not be silently dropped from the total, and
     /// labelled so nobody reads its zero as evidence about the const.
     pub fabricated_len_const: usize,
+    /// The System global-allocator declaration (R448-1 (B′)). A PIN like
+    /// [`Self::fabricated_len_const`]: created inside `render` after the revert
+    /// filter, never in `plan.by_file`; the real claim is gated on the emitted text.
+    pub global_allocator: usize,
     // ---- arm 4's three: expected zero, and MEASURED rather than assumed ----
     pub reroute: usize,
     pub drop_form: usize,
@@ -5622,6 +5650,7 @@ impl JustificationCensus {
         self.kind_decision
             + self.seam_adapter
             + self.fabricated_len_const
+            + self.global_allocator
             + self.reroute
             + self.drop_form
             + self.store_form
@@ -5678,6 +5707,7 @@ impl JustificationCensus {
                 }
             }
             J::FabricatedLenConst => self.fabricated_len_const += 1,
+            J::GlobalAllocator => self.global_allocator += 1,
             J::ReRoute { .. } => self.reroute += 1,
             J::DropForm { .. } => self.drop_form += 1,
             J::StoreForm { .. } => self.store_form += 1,
@@ -9502,6 +9532,7 @@ mod arm2_witnesses {
                 seam_adapter: 2,
                 seam_adapter_fabricated: 1,
                 fabricated_len_const: 1,
+                global_allocator: 0,
                 reroute: 1,
                 drop_form: 1,
                 store_form: 1,
@@ -9584,6 +9615,7 @@ mod arm2_witnesses {
                 seam_adapter: 1,
                 seam_adapter_fabricated: 0,
                 fabricated_len_const: 0,
+                global_allocator: 0,
                 reroute: 0,
                 drop_form: 1,
                 store_form: 0,
