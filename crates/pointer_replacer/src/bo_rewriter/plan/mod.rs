@@ -6268,6 +6268,7 @@ mod tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
@@ -6364,6 +6365,7 @@ mod tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
@@ -6452,6 +6454,7 @@ mod tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),
             entries: vec![(
                 alias_subject(),

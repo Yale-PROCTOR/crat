@@ -88,6 +88,8 @@ mod field_reference_ast;
 pub(crate) mod flexible_tail_ast;
 #[cfg(test)]
 mod nested_one_sided_tests;
+#[cfg(test)]
+mod one_element_guard_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;
@@ -8568,6 +8570,10 @@ fn finish_decide<'tcx>(
                 .then_some((subject.fn_did, hir_index))
             })
             .collect();
+        // **R622-1 / R628-2** — the parameters accessed past one element, for
+        // the seam's `(Slice, Ref)` row (R416-5).
+        table.wide_access_parameters =
+            decision::local_callee_extent::accessed_past_one_element(tcx, &subjects, &facts);
         // R491-7's caller-side clause: the subjects whose own body establishes
         // the terminator.
         table.nul_exact_callers = subjects

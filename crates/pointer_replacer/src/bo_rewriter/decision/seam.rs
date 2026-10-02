@@ -158,6 +158,9 @@ pub(crate) enum SeamBlock {
     /// The same at any other pointee: the raw callee's access extent is not
     /// known to be one element.
     ThinOptionalToRaw,
+    /// **R622-1 / R628-2 (R416-5).** A one-element `from_ref` / `from_mut`
+    /// into a formal the callee accesses past its first element.
+    OneElementIntoWider,
 }
 
 impl SeamBlock {
@@ -187,6 +190,7 @@ impl SeamBlock {
             SeamBlock::CountedVoidRoot => "counted-void:safe-root-extent-unproved",
             SeamBlock::ThinCStringToRaw => "held:thin-cstring-to-libc",
             SeamBlock::ThinOptionalToRaw => "held:thin-optional-to-raw-formal",
+            SeamBlock::OneElementIntoWider => "seam-one-element-into-wider-formal",
         }
     }
 }
@@ -3859,6 +3863,68 @@ pub(crate) fn optional_into_raw_formal_for_tests(
     }
 }
 
+/// **R622-1 / R628-2 — which positions the row's extent conjunct reads.** A
+/// one-element claim may be narrower than its referent only where the argument
+/// is a thin subject (a bare or cast local, possibly into an array) or the
+/// address of an ELEMENT (R641-2 (1)/(2), read from the HIR, casts included:
+/// `&*p.offset(k)`, lodepng's `lodepng_read32bitInt` shape, `&mut buf[k]`,
+/// `&mut *p.offset(k) as *mut T`). The address of a local or field place
+/// (`&mut x`, golden g24) is exactly one object: a UB-free input (§28) cannot
+/// index past it on that path, so `from_ref` there is faithful and stays.
+/// A cursor's tail view (R217-2(a)) is never one element: the cursor family
+/// renders it with the tail's full extent, so the caller passes `false`.
+///
+/// **R761-1 (the re-cut for 54): the ELEMENT-ADDRESS arm only.** `0a40583c1` also
+/// refused a thin bare / cast subject (shape (i)) and paired that refusal with the
+/// thin-caller hold, since a refused adapter leaves the delivered thin reference
+/// coercing into the withdrawn raw formal (golden g25). The hold is ruled out of
+/// 54, so shape (i) keeps its `from_ref` until 55's thin-into-fat rule delivers it
+/// as a slice. Refusing an element address of a raw base (shape (ii),
+/// `from_ref(&*p.offset(k))`) needs no hold: no delivered reference is left behind.
+fn one_element_into_wide(wide: bool, source_shape: &str, element_address: bool) -> bool {
+    wide && match source_shape {
+        "addr-of" | "addr-of-mut" | "addr-of-cast" | "addr-of-mut-cast" => element_address,
+        _ => false,
+    }
+}
+
+/// **R641-2 (3) — R217-2(a)'s cursor-element view, and its slice twin.** The
+/// position's root is a cursor carrying its `cursor-element` edit at exactly
+/// this span: the cursor family renders the tail view
+/// (`ToUpperCase(&mut *dst.offset(k))`), which carries the tail's extent. Or the
+/// argument is exactly the element spine `&*root.offset(e)` / `&mut
+/// *root.offset(e)` of a root decided a slice (`Arg::element_of`;
+/// `ReplicateValue(&mut *table.offset(k), ..)`): the slice family's computed
+/// view renders it as the suffix `&mut table[k..]`, the base's own extent
+/// (wave-6s W6S-14). A nested place under the element
+/// (`&mut (*table.offset(i)).arr[k]`) has no such view and stays refused. A view
+/// the slice family then cannot render degrades the root and keeps the adapter:
+/// the landed reading, named in main 131a.
+fn cursor_element_view(
+    decision_of: &FxHashMap<(LocalDefId, HirId), &Decision>,
+    caller: LocalDefId,
+    root: Option<HirId>,
+    span: Span,
+    element_spine_of_root: bool,
+) -> bool {
+    let Some(decision) = root.and_then(|root| decision_of.get(&(caller, root)).copied()) else {
+        return false;
+    };
+    match decision {
+        Decision::Cursor { plan, .. } => plan
+            .uses
+            .iter()
+            .any(|edit| edit.span == span && edit.bridge_kind == "cursor-element"),
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. } => element_spine_of_root,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     expected: Form,
@@ -3873,6 +3939,7 @@ fn build_candidate(
     retention_facts: &super::raw_boundary::RetentionSummaries,
     callee: LocalDefId,
     argument_index: usize,
+    callee_accesses_wide: bool,
     return_tied: bool,
     counted: Option<(&super::counted_void::Contract, super::counted_void::Route)>,
     field_tied: bool,
@@ -3903,6 +3970,18 @@ fn build_candidate(
     let Some((spec, family)) = answer else {
         return Ok(None);
     };
+    // **R622-1 / R628-2 — the extent conjunct on the `(Slice, Ref)` row
+    // (R416-5).** `from_ref` / `from_mut` hands the callee ONE element; a formal
+    // the callee accesses past it (offset or index, a cast from `c_void`, or a
+    // bare hand-on to one that does) then panics on its checked index where C
+    // read on — brotli's `dist_cache` into `BrotliZopfliCreateCommands`,
+    // lodepng's `&*in_0.offset(k)` into `lodepng_read32bitInt`. The row admits
+    // the thin argument only into a formal accessed at one element; anything
+    // else is refused here, whatever the decisions upstream left standing (a
+    // withdrawn family can leave the subject's Core `ref`).
+    if matches!(spec.core, GlueCore::FromRefMut) && callee_accesses_wide {
+        return Err(SeamBlock::OneElementIntoWider);
+    }
     let spec = if spec.null_arm == NullArm::Checked {
         spec.with_checked_binding_type(source_type.to_owned())
     } else {
@@ -5539,6 +5618,26 @@ pub(crate) fn synthesize_with_raw_boundary(
                     }
                     text => (text, len_evidence),
                 };
+                // R641-2 (2)/(3): the HIR's element fact and the cursor's tail
+                // view, read once for both candidates below.
+                let element_address = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .is_some_and(|argument| argument.element_address);
+                let element_spine_of_root = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .and_then(|argument| argument.element_of)
+                    .is_some_and(|owner| pos.root == Some(owner));
+                let cursor_element = cursor_element_view(
+                    &decision_of,
+                    site.caller,
+                    pos.root,
+                    pos.span,
+                    element_spine_of_root,
+                );
                 let owner_view = pos
                     .root
                     .filter(|_| pos.source_shape == "bare-local")
@@ -5581,6 +5680,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                             retention,
                             *callee,
                             pos.index,
+                            one_element_into_wide(
+                                table.wide_access_parameters.contains(&(*callee, pos.index)),
+                                pos.source_shape,
+                                element_address,
+                            ) && !cursor_element,
                             return_tied,
                             counted,
                             field_tied_params.contains(&pos.index),
@@ -5653,6 +5757,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                             retention,
                             *callee,
                             pos.index,
+                            one_element_into_wide(
+                                table.wide_access_parameters.contains(&(*callee, pos.index)),
+                                pos.source_shape,
+                                element_address,
+                            ) && !cursor_element,
                             return_tied,
                             counted,
                             field_tied_params.contains(&pos.index),

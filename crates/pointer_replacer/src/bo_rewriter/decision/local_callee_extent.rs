@@ -155,6 +155,7 @@ fn parameter_access(
     cursor_candidates: &CursorCandidates,
     decided: Option<&DecidedForms>,
     visited: &mut Vec<(LocalDefId, HirId)>,
+    guard: bool,
 ) -> Option<LocalCalleeAccess> {
     let Node::Pat(pattern) = tcx.hir_node(param.hir_id) else {
         return None;
@@ -184,19 +185,25 @@ fn parameter_access(
     // place and its siblings fall with it (047 §2, measured −3 on libtree). The
     // candidate set carries the same intent from facts that exist before any
     // decision, so the lift happens in the FIRST pass and the planning sees it.
-    if let SubjectKind::Param { hir_index } = param.kind
+    // **R622-1 / R628-2 (`guard`).** Both exclusions below are about the
+    // CALLER's hold, not about what the callee accesses: a slice-shaped or
+    // C-string parameter still reads past its first element. The glue row's
+    // extent conjunct asks exactly that, so in guard mode neither applies.
+    if !guard
+        && let SubjectKind::Param { hir_index } = param.kind
         && !cursor_candidates.contains(&(param.fn_did, hir_index))
         && nul_walk(tcx, param, facts).is_some()
     {
         return None;
     }
-    if slice_uses
-        .get(&(param.fn_did, param.hir_id))
-        .is_some_and(|uses| {
-            uses.unsupported.is_none()
-                && !uses.rewrites.is_empty()
-                && !super::slice_return_evidence::needs_full_base(tcx, param, uses)
-        })
+    if !guard
+        && slice_uses
+            .get(&(param.fn_did, param.hir_id))
+            .is_some_and(|uses| {
+                uses.unsupported.is_none()
+                    && !uses.rewrites.is_empty()
+                    && !super::slice_return_evidence::needs_full_base(tcx, param, uses)
+            })
     {
         return None;
     }
@@ -215,8 +222,10 @@ fn parameter_access(
             cast_to: cast.target_type.clone(),
         }
     } else if let Some((op, _)) = facts.raw_only_uses.get(&key).and_then(|uses| {
-        uses.iter()
-            .find(|(op, _)| EXTENT_LEAVING_OPS.contains(&op.as_str()))
+        uses.iter().find(|(op, span)| {
+            EXTENT_LEAVING_OPS.contains(&op.as_str())
+                && !(guard && element_zero_in_place(tcx, param.fn_did, *span))
+        })
     }) {
         AccessReason::PointerArithmetic { op: op.clone() }
     } else {
@@ -232,7 +241,14 @@ fn parameter_access(
             .flat_map(|(callee, sites)| sites.iter().map(move |site| (*callee, site)))
             .filter(|(_, site)| site.caller == param.fn_did)
             .flat_map(|(callee, site)| site.args.iter().map(move |arg| (callee, arg)))
-            .filter(|(_, arg)| matches!(arg.shape, ArgShape::BareLocal(binding) if binding == param.hir_id))
+            .filter(|(_, arg)| match arg.shape {
+                ArgShape::BareLocal(binding) => binding == param.hir_id,
+                // Guard mode: a cast of the parameter hands on the same address
+                // (brotli `Hash14(data)`: `BrotliUnalignedRead32(data as *const
+                // c_void)`, a four-byte read).
+                ArgShape::CastOfLocal { binding, .. } => guard && binding == param.hir_id,
+                _ => false,
+            })
             .find_map(|(callee, arg)| {
                 let target = parameters.get(&(callee, arg.index))?;
                 parameter_access(
@@ -244,6 +260,7 @@ fn parameter_access(
                     cursor_candidates,
                     decided,
                     visited,
+                    guard,
                 )
             })?;
         AccessReason::Forwarded {
@@ -268,6 +285,62 @@ fn parameter_access(
         access,
         reason,
     })
+}
+
+/// **R641-2 — C's `p[0]` stays within the first element.** The arithmetic use
+/// at `span` is `*p.offset(0)` (c2rust writes `p[0]` as
+/// `*p.offset(0 as i32 as isize)`): a literal-0 offset dereferenced in place,
+/// read or written but never borrowed, so it names element 0 and nothing past
+/// it. Anything else a literal-0 offset feeds (a copy, a hand-on, an address
+/// taken) keeps the conservative reading.
+fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::Span) -> bool {
+    use rustc_hir::intravisit::Visitor;
+
+    struct At<'tcx> {
+        span: rustc_span::Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for At<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none()
+                && expr.span == self.span
+                && matches!(expr.kind, rustc_hir::ExprKind::MethodCall(..))
+            {
+                self.found = Some(expr);
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+
+    if !tcx.hir_body_owners().any(|did| did == owner) {
+        return false;
+    }
+    let body = tcx.hir_body_owned_by(owner);
+    let mut at = At { span, found: None };
+    at.visit_body(&body);
+    let Some(call) = at.found else { return false };
+    let rustc_hir::ExprKind::MethodCall(_, _, [offset], _) = call.kind else {
+        return false;
+    };
+    if !super::emitability::is_zero_literal(offset) {
+        return false;
+    }
+    let Node::Expr(deref) = tcx.parent_hir_node(call.hir_id) else {
+        return false;
+    };
+    if !matches!(
+        deref.kind,
+        rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, _)
+    ) {
+        return false;
+    }
+    !matches!(
+        tcx.parent_hir_node(deref.hir_id),
+        Node::Expr(rustc_hir::Expr {
+            kind: rustc_hir::ExprKind::AddrOf(..),
+            ..
+        })
+    )
 }
 
 /// **R491-7 — a local callee that reads a C STRING.**
@@ -630,6 +703,15 @@ pub(crate) fn collect(
                     continue;
                 };
                 let access = classified.entry((*callee, arg.index)).or_insert_with(|| {
+                    // **R761-1 — NOT guard mode here** (the re-cut of 53's
+                    // `0a40583c1` for 54). In `0a40583c1` this hold ran in guard
+                    // mode: the seam's row refused a thin caller's `from_ref`
+                    // into a wide formal, so the thin caller had to be held raw
+                    // (golden g25). The re-cut's row refuses only an ELEMENT
+                    // ADDRESS of a raw base (shape (ii)); a thin caller's
+                    // `from_ref` is untouched (shape (i), 55's thin-into-fat
+                    // rule), so the thin-caller hold is deliberately omitted and
+                    // this collect keeps its pre-guard exclusions.
                     parameter_access(
                         tcx,
                         parameter,
@@ -639,6 +721,7 @@ pub(crate) fn collect(
                         cursor_candidates,
                         decided,
                         &mut vec![],
+                        false,
                     )
                 });
                 if let Some(access) = access {
@@ -699,6 +782,46 @@ pub(crate) fn collect(
         }
     }
     out
+}
+
+/// **R622-1 / R628-2 (R416-5) — the callee parameters accessed past their
+/// first element**, whatever form they take: offset or indexed, cast from
+/// `c_void` to the type actually read, or handed bare to a parameter that is.
+/// The seam's `(Slice, Ref)` row reads this set: `core::slice::from_ref` /
+/// `from_mut` hands such a parameter ONE element, and its checked index
+/// panics where C read on.
+pub(crate) fn accessed_past_one_element(
+    tcx: TyCtxt<'_>,
+    subjects: &[Subject],
+    facts: &EmitabilityFacts,
+) -> rustc_hash::FxHashSet<(LocalDefId, usize)> {
+    let parameters: FxHashMap<(LocalDefId, usize), &Subject> = subjects
+        .iter()
+        .filter_map(|subject| match subject.kind {
+            SubjectKind::Param { hir_index } => Some(((subject.fn_did, hir_index), subject)),
+            SubjectKind::Local => None,
+        })
+        .collect();
+    let none_slice = FxHashMap::default();
+    let none_cursor = CursorCandidates::default();
+    parameters
+        .iter()
+        .filter(|(_, parameter)| {
+            parameter_access(
+                tcx,
+                parameter,
+                facts,
+                &none_slice,
+                &parameters,
+                &none_cursor,
+                None,
+                &mut vec![],
+                true,
+            )
+            .is_some()
+        })
+        .map(|(key, _)| *key)
+        .collect()
 }
 
 /// **R485-4(b) — the second pass, as a function.** Re-collects the holds with

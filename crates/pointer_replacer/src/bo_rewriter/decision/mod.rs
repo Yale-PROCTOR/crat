@@ -1138,6 +1138,11 @@ pub(crate) struct DecisionTable {
     /// requires a terminated string. A caller constructing a slice for one of
     /// these takes `strlen(p) + 1` instead of §77's fallback.
     pub(crate) nul_exact_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    /// **R622-1 / R628-2 (R416-5).** Callee parameters the body accesses past
+    /// their first element (offset / index, a `c_void` cast, or a bare
+    /// hand-on to one that does). The seam's `(Slice, Ref)` row refuses a
+    /// one-element `from_ref` / `from_mut` into any of them.
+    pub(crate) wide_access_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
     /// **R491-7's caller-side clause (relay 060).** Subjects whose OWN body
     /// hands the pointer to a libc string function, so the terminator is
     /// established at this caller even where the callee's walk licenses only
@@ -1472,6 +1477,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         slice_input_companions: Default::default(),
         slice_input_mask_companions: Default::default(),
         nul_exact_parameters: Default::default(),
+        wide_access_parameters: Default::default(),
         nul_exact_callers: Default::default(),
     }
 }
@@ -3143,6 +3149,7 @@ mod self_consistency_tests {
             slice_input_companions: Default::default(),
             slice_input_mask_companions: Default::default(),
             nul_exact_parameters: Default::default(),
+            wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),
             entries: entries
                 .into_iter()

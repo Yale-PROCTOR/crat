@@ -281,6 +281,29 @@ pub(crate) struct Arg {
     /// owner binding (`box_facts::box_element_address`). An element of `X`,
     /// never `X` itself.
     pub element_of: Option<HirId>,
+    /// **R641-2 (2)** — the argument borrows an ELEMENT of something larger:
+    /// see [`element_address`].
+    pub element_address: bool,
+}
+
+/// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
+/// `&mut place`, under any casts, whose place's OUTERMOST projection is an
+/// index (`buf[k]`, `(*s).buf[k]`) or a dereference (`*p`, `*p.offset(k)`):
+/// the borrow names one element of an allocation that may run on, so a
+/// one-element claim over it is narrower than its referent. A local or a field
+/// place is one whole object (golden g24): a UB-free input (§28) cannot index
+/// past it on that path.
+pub(crate) fn element_address(expr: &Expr<'_>) -> bool {
+    let ExprKind::AddrOf(_, _, mut place) = peel_casts(expr).kind else {
+        return false;
+    };
+    while let ExprKind::DropTemps(inner) = place.kind {
+        place = inner;
+    }
+    matches!(
+        place.kind,
+        ExprKind::Index(..) | ExprKind::Unary(rustc_hir::UnOp::Deref, _)
+    )
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -1444,6 +1467,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             .1,
                                             element_of: super::box_facts::box_element_address(arg)
                                                 .map(|(owner, _, _)| owner),
+                                            element_address: element_address(arg),
                                         }
                                     })
                                     .collect(),

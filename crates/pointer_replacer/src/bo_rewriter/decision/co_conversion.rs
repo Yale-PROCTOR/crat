@@ -2140,6 +2140,7 @@ mod a5_cast_role_tests {
                         address_root_local: false,
                         address_root_raw_pointer: false,
                         element_of: None,
+                        element_address: false,
                     }],
                 }],
             );
