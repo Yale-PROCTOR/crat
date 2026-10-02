@@ -594,7 +594,9 @@ pub(super) fn param_receives_nullable_actual(
     subject: &Subject,
 ) -> bool {
     let SubjectKind::Param { hir_index } = subject.kind else { return false };
-    if entry_dereferences(tcx, subject.fn_did, subject.hir_id) {
+    if entry_dereferences(tcx, subject.fn_did, subject.hir_id)
+        || !hands_on_only_to_pointee_formals(tcx, facts, subject.fn_did, subject.hir_id, 4)
+    {
         return false;
     }
     let caller_param_receives_null = |caller: LocalDefId, binding: HirId| {
@@ -627,6 +629,63 @@ pub(super) fn param_receives_nullable_actual(
                     || caller_param_receives_null(site.caller, binding)
             })
         })
+    })
+}
+
+/// Relay 127 (wave-6a 135's cascade): does every BARE hand-on of `binding`,
+/// followed through local callees up to `depth` levels, reach only formals that
+/// access their pointee alone? A reached formal with an extent-leaving raw use
+/// (`offset`, `add`, … — `*x.offset(k)`) wants a slice, and an optional made
+/// above it would meet that slice formal; such a formal is left to the flow rule
+/// that treats it as an array use (main's 55). Foreign callees are not walked:
+/// a thin reference at a foreign C-string position is `thin_extent`'s.
+fn hands_on_only_to_pointee_formals(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    function: LocalDefId,
+    binding: HirId,
+    depth: usize,
+) -> bool {
+    const EXTENT_LEAVING: &[&str] = &[
+        "offset",
+        "wrapping_offset",
+        "add",
+        "sub",
+        "wrapping_add",
+        "wrapping_sub",
+        "offset_from",
+    ];
+    if facts
+        .raw_only_uses
+        .get(&(function, binding))
+        .is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| EXTENT_LEAVING.contains(&op.as_str()))
+        })
+    {
+        return false;
+    }
+    if depth == 0 {
+        return true;
+    }
+    facts.call_args.iter().all(|(callee, sites)| {
+        sites
+            .iter()
+            .filter(|site| site.caller == function)
+            .all(|site| {
+                site.args.iter().all(|arg| {
+                    if !matches!(arg.shape, ArgShape::BareLocal(b) if b == binding) {
+                        return true;
+                    }
+                    let Some(param) = tcx
+                        .hir_maybe_body_owned_by(*callee)
+                        .and_then(|body| body.params.get(arg.index).map(|p| p.pat.hir_id))
+                    else {
+                        return true;
+                    };
+                    hands_on_only_to_pointee_formals(tcx, facts, *callee, param, depth - 1)
+                })
+            })
     })
 }
 
