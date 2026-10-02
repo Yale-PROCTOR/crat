@@ -131,6 +131,8 @@ mod pair_static_root_tests;
 mod pair_view_of_formal_tests;
 pub(crate) mod plan;
 #[cfg(test)]
+mod r674_line53_tests;
+#[cfg(test)]
 mod raw_initializer_tests;
 #[cfg(test)]
 mod raw_place_values_tests;
