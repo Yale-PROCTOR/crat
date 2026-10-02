@@ -4082,8 +4082,10 @@ fn twin_owner_of(expected: &BridgeExpectation) -> String {
 /// INPUT's arguments (`__crat_raw_kmVec3Add(pOut, pOut, &mut uuv)`, brotli's
 /// `__crat_raw_ProcessSingleCodeLength(code_len, &mut (*h).symbol, ..)`). The argument is
 /// then the input's own expression at the input's own raw formal: no safe value crosses,
-/// so no raw view is owed. Matched only when (1) the call is to the declared twin, bare or
-/// crate-qualified, and exactly one such call carries this argument; (2) the twin's formal
+/// so no raw view is owed. Matched only when (1) the call is to the declared twin by its
+/// crate-qualified spelling (the redirect's; a bare or relative name is not proven to resolve
+/// to it), exactly one such call carries this argument, and exactly one input invocation in
+/// the caller carries it; (2) the twin's formal
 /// is raw; (3) the argument's expression equals the original's (or is R460-1(a)'s named
 /// intermediate of it); (4) every binding it reads pairs one to one with the original's;
 /// and (5) the argument is not a BARE path (casts peeled) naming a binding whose
@@ -4115,12 +4117,27 @@ fn twin_call_input_argument<'a>(
     ) {
         return None;
     }
-    let bare = twin_owner.rsplit("::").next()?.to_owned();
-    let spellings = [format!("crate::{twin_owner}"), twin_owner.clone(), bare]
-        .iter()
-        .filter_map(|text| expression(text).ok().map(|callee| expression_key(&callee)))
-        .collect::<BTreeSet<_>>();
+    let spelling = expression_key(&*expression(&format!("crate::{twin_owner}")).ok()?);
     let source = expression(&original.arguments.get(index)?.text).ok()?;
+    // (2) The receipt pairs with ONE input invocation: no other call to this callee in
+    // the original caller carries the same argument at this index.
+    let original_callee = expression_key(&*expression(&original.callee_text).ok()?);
+    let invocations = input
+        .original
+        .calls
+        .iter()
+        .filter(|call| {
+            call.owner == original.owner
+                && call.arguments.len() == original.arguments.len()
+                && expression(&call.callee_text)
+                    .is_ok_and(|callee| expression_key(&callee) == original_callee)
+                && expression(&call.arguments[index].text)
+                    .is_ok_and(|argument| expression_key(&argument) == expression_key(&source))
+        })
+        .count();
+    if invocations != 1 {
+        return None;
+    }
     let mut matched = Vec::new();
     for call in input
         .emitted
@@ -4130,7 +4147,7 @@ fn twin_call_input_argument<'a>(
     {
         let Ok(callee) = expression(&call.callee_text) else { continue };
         let argument = &call.arguments[index];
-        if !spellings.contains(&expression_key(&callee))
+        if expression_key(&callee) != spelling
             || input
                 .emitted_source
                 .get(argument.span.lo as usize..argument.span.hi as usize)
@@ -4189,16 +4206,11 @@ fn twin_call_input_argument<'a>(
     ))
 }
 
-/// R460-1(a)'s rename and nothing else: `{ let __crat_raw: T = <e> as T; __crat_raw }`
-/// whose initializer, casts peeled, is the original argument's expression, casts peeled.
+/// R460-1(a)'s rename and nothing else: `{ let __crat_raw: *mut T = <e> as *mut T; __crat_raw }`,
+/// a BY-VALUE binding annotated with a raw pointer type, whose initializer is the original
+/// argument's expression with raw-pointer casts only peeled, cast (if at all) to exactly the
+/// annotation. A `ref` binding, an integer annotation or a cast through an integer refuses.
 fn named_intermediate_of(emitted: &ast::Expr, source: &ast::Expr) -> bool {
-    let peel = |mut expression: &ast::Expr| {
-        expression = unparen(expression);
-        while let ast::ExprKind::Cast(inner, _) = &expression.kind {
-            expression = unparen(inner);
-        }
-        expression_key(expression)
-    };
     let ast::ExprKind::Block(block, None) = &unparen(emitted).kind else {
         return false;
     };
@@ -4209,13 +4221,22 @@ fn named_intermediate_of(emitted: &ast::Expr, source: &ast::Expr) -> bool {
     else {
         return false;
     };
-    let (ast::PatKind::Ident(_, name, None), Some(initializer)) =
-        (&local.pat.kind, local.kind.init())
+    let (ast::PatKind::Ident(mode, name, None), Some(annotation), Some(initializer)) =
+        (&local.pat.kind, &local.ty, local.kind.init())
     else {
         return false;
     };
+    if !matches!(mode.0, ast::ByRef::No) || !matches!(annotation.kind, ast::TyKind::Ptr(_)) {
+        return false;
+    }
+    if let ast::ExprKind::Cast(_, target) = &unparen(initializer).kind
+        && pprust::ty_to_string(target) != pprust::ty_to_string(annotation)
+    {
+        return false;
+    }
     path(unparen(tail)).is_some_and(|tail| tail == name.name.as_str())
-        && peel(initializer) == peel(source)
+        && expression_key(peel_raw_pointer_casts(initializer))
+            == expression_key(peel_raw_pointer_casts(source))
 }
 
 fn twin_inline_raw_view<'a>(
