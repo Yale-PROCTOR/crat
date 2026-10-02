@@ -5940,6 +5940,24 @@ fn terminal_parameter_form(
     terminal_interface_form(input, placed, live)
 }
 
+/// **R761-2** — the calls routed to the raw twin, located `(caller, file, lo, hi)`.
+fn raw_twin_calls_located(
+    table: &decision::DecisionTable,
+    locate: impl Fn(rustc_span::Span) -> Result<(plan::FileKey, usize, usize), &'static str>,
+) -> Vec<(rustc_span::def_id::LocalDefId, plan::FileKey, usize, usize)> {
+    table
+        .seams
+        .counted_void_calls
+        .iter()
+        .filter(|call| call.route == decision::counted_void::Route::RawTwin)
+        .filter_map(|call| {
+            locate(call.call_span)
+                .ok()
+                .map(|(file, lo, hi)| (call.caller, file, lo, hi))
+        })
+        .collect()
+}
+
 fn seal_terminal_outbound_calls(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
@@ -7220,6 +7238,9 @@ fn prepare_plan_files<'tcx>(
             break;
         }
     }
+    // R761-2: on the sealed plan, the raw twin's A5 receipts follow the call
+    // that is emitted.
+    planned.withdraw_unbridged_twin_a5_receipts(&raw_twin_calls_located(table, span_to_loc));
     let ready_a5_classes = planned
         .class_finalization
         .classes

@@ -2371,6 +2371,63 @@ impl Plan {
         Ok(())
     }
 
+    /// **R761-2 (main 146 STOP 2 (ii)) — the receipt follows the call that is
+    /// emitted.** A call routed to the raw twin passes the input's own
+    /// arguments, and R499-1 discharges the A5 pair's T2 proof sites there as
+    /// zero syntax. After terminal sealing, such a site is withdrawn (plan and
+    /// terminal rows) unless the emitted call still bridges at its interval: a
+    /// `c` site that converts the argument (brotli's `&mut (*h).repeat` into the
+    /// twin's raw formal, its `typed-raw-temporary`). heman's
+    /// `kmVec3Add(pOut, pOut, ..)` passes the raw `pOut` into a raw formal
+    /// (`outbound-input-form`): nothing bridges, and two receipts were
+    /// over-issued at frame 13. `twins` are the raw-twin calls, located
+    /// `(caller, file, lo, hi)`. Returns the number withdrawn.
+    pub(crate) fn withdraw_unbridged_twin_a5_receipts(
+        &mut self,
+        twins: &[(rustc_span::def_id::LocalDefId, FileKey, usize, usize)],
+    ) -> usize {
+        if twins.is_empty() {
+            return 0;
+        }
+        let siblings = self
+            .class_finalization
+            .classes
+            .values()
+            .flat_map(|class| class.sites.iter().map(|site| site.key.clone()))
+            .chain(self.preclass_sites.iter().map(|site| site.key.clone()))
+            .collect::<Vec<_>>();
+        let withdraw = |key: &BridgeSiteKey| {
+            key.arm == "pair"
+                && key.bridge_kind == "a5-site-proof-t2-fallback"
+                && !key.position.starts_with("args=")
+                && twins.iter().any(|(caller, file, lo, hi)| {
+                    key.caller == *caller
+                        && key.file == file_key_label(file)
+                        && *lo <= key.lo as usize
+                        && key.hi as usize <= *hi
+                })
+                && !twin_position_still_bridges(siblings.iter(), key)
+        };
+        let mut withdrawn = 0;
+        for class in self.class_finalization.classes.values_mut() {
+            let before = class.sites.len();
+            class.sites.retain(|site| !withdraw(&site.key));
+            if class.sites.len() != before {
+                withdrawn += before - class.sites.len();
+                class.site_keys = class.sites.iter().map(|site| site.key.clone()).collect();
+                class.edit_keys = class
+                    .sites
+                    .iter()
+                    .filter(|site| site.edit_key != "-")
+                    .map(|site| site.edit_key.clone())
+                    .collect();
+            }
+        }
+        let before = self.preclass_sites.len();
+        self.preclass_sites.retain(|site| !withdraw(&site.key));
+        withdrawn + (before - self.preclass_sites.len())
+    }
+
     /// Hold exactly one terminally stale owner class, then apply the already
     /// declared dependency rule and remove every edit belonging to the newly
     /// held closure. This is class recovery, never a program-level failure.
@@ -7393,4 +7450,22 @@ mod wave3_class_tests {
             assert!(!strict_recovery_subset(&ready, &ready));
         });
     }
+}
+
+/// **R761-2.** Does the emitted call still bridge at an A5 T2 proof site of a
+/// raw-twin call? Yes when a caller-side `c` site at the same interval converts
+/// the argument (anything but the input's own form, `outbound-input-form`).
+pub(crate) fn twin_position_still_bridges<'a>(
+    mut sites: impl Iterator<Item = &'a BridgeSiteKey>,
+    t2: &BridgeSiteKey,
+) -> bool {
+    sites.any(|other| {
+        other.arm == "c"
+            && other.caller == t2.caller
+            && other.file == t2.file
+            && other.lo == t2.lo
+            && other.hi == t2.hi
+            && other.position == t2.position
+            && other.bridge_kind != "outbound-input-form"
+    })
 }

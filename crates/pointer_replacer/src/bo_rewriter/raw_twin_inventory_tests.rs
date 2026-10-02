@@ -177,3 +177,169 @@ fn r738_1_a_mutably_borrowed_computed_view_stays_mutable_under_a_writable_bridge
     );
     assert_eq!(reverted, 0, "{source}");
 }
+
+/// **R761-2 (main 146 STOP 2 (ii)) — the receipt follows the call that is
+/// emitted.** heman's `kmVec3Add(pOut, pOut, &mut uuv)`: the callee's `pOut`
+/// is delivered `&mut`, the caller's stays raw, so the second `pOut` aliases
+/// the first and the call is routed to the raw twin with the input's own
+/// arguments. R499-1 discharged the A5 pair's T2 fallback at `arg1` as
+/// zero-syntax, and it was receipted `applied`, but nothing bridges there:
+/// raw `pOut` into a raw formal (`outbound-input-form`). Two such receipts were
+/// over-issued at frame 13 (`459:322`, `460:263`). They are withdrawn.
+const HEMAN_TWIN: &str = "#![allow(dead_code, mutable_transmutes, non_camel_case_types, non_snake_case, non_upper_case_globals, unused_assignments, unused_mut)]\n\
+pub mod src {\n\
+    pub mod kazmath {\n\
+        pub mod vec3 {\n\
+            #[derive(Copy, Clone)]\n\
+            #[repr(C)]\n\
+            pub struct kmVec3 {\n\
+                pub x: f32,\n\
+                pub y: f32,\n\
+                pub z: f32,\n\
+            }\n\
+            #[no_mangle]\n\
+            pub unsafe extern \"C\" fn kmVec3Add(mut pOut: *mut kmVec3, mut pV1: *const kmVec3,\n\
+                mut pV2: *const kmVec3) -> *mut kmVec3 {\n\
+                let mut v = kmVec3 { x: 0., y: 0., z: 0. };\n\
+                v.x = (*pV1).x + (*pV2).x;\n\
+                v.y = (*pV1).y + (*pV2).y;\n\
+                v.z = (*pV1).z + (*pV2).z;\n\
+                (*pOut).x = v.x;\n\
+                (*pOut).y = v.y;\n\
+                (*pOut).z = v.z;\n\
+                return pOut;\n\
+            }\n\
+        }\n\
+        pub mod quaternion {\n\
+            #[no_mangle]\n\
+            pub unsafe extern \"C\" fn kmQuaternionMultiplyVec3(\n\
+                mut pOut: *mut crate::src::kazmath::vec3::kmVec3,\n\
+                mut v: *const crate::src::kazmath::vec3::kmVec3,\n\
+            ) -> *mut crate::src::kazmath::vec3::kmVec3 {\n\
+                let mut uv = crate::src::kazmath::vec3::kmVec3 { x: 0., y: 0., z: 0. };\n\
+                let mut uuv = crate::src::kazmath::vec3::kmVec3 { x: 1., y: 1., z: 1. };\n\
+                crate::src::kazmath::vec3::kmVec3Add(pOut, v, &mut uv);\n\
+                crate::src::kazmath::vec3::kmVec3Add(pOut, pOut, &mut uuv);\n\
+                return pOut;\n\
+            }\n\
+        }\n\
+    }\n\
+}\n\
+";
+
+#[test]
+fn r761_2_a_raw_twin_position_with_nothing_to_bridge_issues_no_a5_receipt() {
+    let dir = std::env::temp_dir().join(format!("crat-r761-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, HEMAN_TWIN).unwrap();
+    let config = super::EmissionRunConfig {
+        configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
+            "standing-raw-boundary-launch:Config::default.c_exposed_fns",
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap(),
+    };
+    let capture = super::rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(&root),
+        Some(&root),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        false,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+        &config,
+    )
+    .into_e1_capture()
+    .expect("the one-iteration capture");
+    std::fs::remove_dir_all(dir).unwrap();
+    let call = "kmVec3Add(pOut, pOut, &mut uuv)";
+    let lo = HEMAN_TWIN.find(call).expect("the twin call") as u32;
+    let hi = lo + call.len() as u32;
+    let rows = capture
+        .raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|e| lo <= e.site.lo && e.site.hi <= hi)
+        .map(|e| {
+            format!(
+                "{}:{}:{}:{:?}",
+                e.site.arm, e.site.bridge_kind, e.site.position, e.state
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("c:outbound-input-form:arg1:")),
+        "the twin call passes the input's raw pOut at arg1: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.starts_with("pair:a5-site-proof-t2-fallback:")),
+        "nothing bridges at the twin's arg1, so no A5 receipt is issued: {rows:?}"
+    );
+}
+
+/// **R761-2 — the keep / withdraw predicate, on frame 13's own rows.** brotli's
+/// twin call (`556:559`) keeps its T2 receipts: each has a `c` conversion at
+/// the same interval (`ref-mut-to-raw-mut`, `typed-raw-temporary`). heman's
+/// (`459:322`) has only the input's own form beside it and is withdrawn, as is
+/// a receipt with no sibling at all.
+#[test]
+fn r761_2_a_twin_position_keeps_its_receipt_only_where_the_call_still_bridges() {
+    use super::bridge_receipt::{BridgeCalleeId, BridgeSiteKey, SignatureClassId};
+    let did = |n: u32| rustc_span::def_id::LocalDefId {
+        local_def_index: rustc_span::def_id::DefIndex::from_u32(n),
+    };
+    let key = |arm: &str, kind: &str, lo: u32, hi: u32| BridgeSiteKey {
+        owner_class: SignatureClassId::of(did(559)),
+        caller: did(556),
+        callee: BridgeCalleeId::Local(did(559)),
+        arm: arm.to_owned(),
+        position: "arg2".to_owned(),
+        file: "<program>/lib.rs".to_owned(),
+        lo,
+        hi,
+        bridge_kind: kind.to_owned(),
+    };
+    let t2 = key("pair", "a5-site-proof-t2-fallback", 6925755, 6925771);
+    let still = |siblings: Vec<BridgeSiteKey>| {
+        let mut all = siblings;
+        all.push(t2.clone());
+        super::plan::twin_position_still_bridges(all.iter(), &t2)
+    };
+    // brotli: a conversion at the same interval keeps the receipt.
+    assert!(still(vec![key(
+        "c",
+        "ref-mut-to-raw-mut",
+        6925755,
+        6925771
+    )]));
+    assert!(still(vec![key(
+        "c",
+        "typed-raw-temporary",
+        6925755,
+        6925771
+    )]));
+    // heman: the input's own raw argument, nothing bridges.
+    assert!(!still(vec![key(
+        "c",
+        "outbound-input-form",
+        6925755,
+        6925771
+    )]));
+    // No sibling at all; a conversion at another interval does not count.
+    assert!(!still(vec![]));
+    assert!(!still(vec![key(
+        "c",
+        "ref-mut-to-raw-mut",
+        6925773,
+        6925788
+    )]));
+}
