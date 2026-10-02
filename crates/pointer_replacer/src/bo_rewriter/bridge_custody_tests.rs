@@ -2767,10 +2767,11 @@ fn r568_1_a_retained_replay_recompared_under_this_matcher() {
         for row in &report.rows {
             if before.get(&row.identity) != Some(&row.status) {
                 out += &format!(
-                    "  moved {} {:?} -> {:?}\n",
+                    "  moved {} {:?} -> {:?} {}\n",
                     row.identity,
                     before.get(&row.identity),
-                    row.status
+                    row.status,
+                    row.reason
                 );
             }
         }
