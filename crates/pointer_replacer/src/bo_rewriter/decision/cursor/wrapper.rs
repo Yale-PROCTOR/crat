@@ -862,6 +862,46 @@ impl Uses<'_, '_> {
         Some((destination, read.hir_id))
     }
 
+    /// **R645-6 (R641-5 STOP 2), re-cut on L01¹³ (R761-1 (4)) — the receiver an
+    /// offset view is taken on.** `offset_by` takes `self`, and a
+    /// `SliceCursorMut` is not `Copy`: taken on the binding itself it MOVES the
+    /// cursor before its later uses. A mutable cursor is reborrowed first; a
+    /// shared one is `Copy` and is taken as it is. The tail view at a slice
+    /// formal (brotli `BrotliTransformDictionaryWord::dst`) is wave-6a's `lend`
+    /// (R738-1); this covers the other offset views of the family — the
+    /// foreign callee's cast argument, the chain to a raw formal, the libc
+    /// contract argument, and the address views ([`Self::cursor_address`]).
+    fn offset_receiver(&self) -> String {
+        if self.subject.mutable {
+            format!("{}.as_deref_mut()", self.view())
+        } else {
+            self.view()
+        }
+    }
+
+    /// The cursor's address, `derived` being empty or an `.offset_by(d)`: the
+    /// same reborrow as [`Self::offset_receiver`] where an offset is taken.
+    fn cursor_address(&self, derived: &str) -> String {
+        let reborrow = if self.subject.mutable && !derived.is_empty() {
+            ".as_deref_mut()"
+        } else {
+            ""
+        };
+        if self.optional {
+            let access = if reborrow.is_empty() {
+                "as_ref"
+            } else {
+                "as_mut"
+            };
+            format!(
+                "{}.{access}().map_or(core::ptr::null(), |cursor| cursor{reborrow}{derived}.addr())",
+                self.name
+            )
+        } else {
+            format!("{}{reborrow}{derived}.addr()", self.name)
+        }
+    }
+
     fn view(&self) -> String {
         if self.optional {
             format!(
@@ -879,14 +919,7 @@ impl Uses<'_, '_> {
     /// `*mut T` operands, and Rust will not order `*const` against `*mut`. The
     /// value is consumed by the comparison/difference, never retained.
     fn address_view(&self, derived: &str) -> String {
-        let value = if self.optional {
-            format!(
-                "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
-                self.name
-            )
-        } else {
-            format!("{}{derived}.addr()", self.name)
-        };
+        let value = self.cursor_address(derived);
         let mutable_pointer = matches!(
             self.ctx
                 .tcx
@@ -1218,16 +1251,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                 self.hold.get_or_insert(CursorHold::BorrowedElementUnbuilt);
                 return;
             }
-            let address = |derived: &str| {
-                if self.optional {
-                    format!(
-                        "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor{derived}.addr())",
-                        self.name
-                    )
-                } else {
-                    format!("{}{derived}.addr()", self.name)
-                }
-            };
+            let address = |derived: &str| self.cursor_address(derived);
             match self.index(chain) {
                 Ok(_) if local(chain) == Some(self.subject.hir_id) => {
                     let value = address("");
@@ -1487,7 +1511,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                             let text = if local(operand) == Some(self.subject.hir_id) {
                                 format!("{}.{view}()", self.view())
                             } else {
-                                format!("{}.offset_by({d}).{view}()", self.view())
+                                format!("{}.offset_by({d}).{view}()", self.offset_receiver())
                             };
                             self.push(operand, text, "raw-op-cursor-t1");
                             self.bridges.push(super::CursorBridge {
@@ -1528,7 +1552,11 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                             )
                         }) =>
                         {
-                            self.push(arg, format!("{}.offset_by({d})", self.name), "cursor-advance");
+                            self.push(
+                                arg,
+                                format!("{}.offset_by({d})", self.offset_receiver()),
+                                "cursor-advance",
+                            );
                         }
                         Ok(_) => {
                             self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
@@ -1577,7 +1605,7 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                             let text = if local(arg) == Some(self.subject.hir_id) {
                                 format!("{}.{view}()", self.view())
                             } else {
-                                format!("{}.offset_by({d}).{view}()", self.view())
+                                format!("{}.offset_by({d}).{view}()", self.offset_receiver())
                             };
                             self.push(arg, text, "raw-op-cursor-t1");
                             self.bridges.push(super::CursorBridge {

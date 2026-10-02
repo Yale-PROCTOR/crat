@@ -2600,3 +2600,37 @@ pub unsafe fn many(contents: *const i8) -> i32 {
         ),
     );
 }
+
+/// **R645-6 — the same reborrow where a mutable cursor's address is ordered or
+/// differenced at an offset.** `p.offset(k) < end` and `p.offset(k).offset_from(base)`
+/// render the cursor's address at the derived position; taken on the binding
+/// itself, `offset_by` moves the `SliceCursorMut` before `*p = ..` below it.
+#[test]
+fn slicecursor_a_mutable_cursor_ordered_or_differenced_at_an_offset_is_reborrowed() {
+    let source = emitted(
+        "pub unsafe fn mark_before(mut p: *mut u8, end: *mut u8, k: isize) -> i32 { if p.offset(k) < end { *p.offset(k) = 1; return 1; } *p = 2; 0 }
+         pub unsafe fn distance(mut p: *mut u8, base: *const u8, k: isize) -> isize { let d = p.offset(k).offset_from(base); *p.offset(k) = 3; d }",
+    );
+    assert!(
+        source.matches(".as_deref_mut().offset_by(").count() >= 2,
+        "both addresses reborrow the cursor: {source}"
+    );
+}
+
+/// **R645-6 — the same reborrow at a FOREIGN callee's raw formal**, both arms:
+/// a cast argument (`memset(p.offset(k) as *mut c_void, ..)`, the boundary's
+/// arm) and an uncast one at a symbol the pinned libc table models
+/// (`strlen(p.offset(k))`, R513-5). The raw view at the derived position is
+/// taken on a reborrow, so the writes after the call still compile.
+#[test]
+fn slicecursor_a_mutable_cursor_into_a_foreign_callee_at_an_offset_is_reborrowed() {
+    let source = emitted(
+        "unsafe extern \"C\" { fn memset(s: *mut core::ffi::c_void, c: i32, n: u64) -> *mut core::ffi::c_void; fn strlen(s: *const i8) -> u64; }
+         pub unsafe fn clear_at(mut p: *mut u8, k: isize) -> u8 { memset(p.offset(k) as *mut core::ffi::c_void, 0, 1); *p.offset(k) = 7; *p.offset(k) }
+         pub unsafe fn length_at(mut s: *mut i8, k: isize) -> u64 { let n = strlen(s.offset(k)); *s.offset(k) = 0; n }",
+    );
+    assert!(
+        source.matches(".as_deref_mut().offset_by(").count() >= 2,
+        "both foreign arguments reborrow the cursor: {source}"
+    );
+}
