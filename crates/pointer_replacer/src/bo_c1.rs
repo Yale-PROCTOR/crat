@@ -26275,7 +26275,8 @@ fn raw_boundary_wave2_corpus_census() {
 }
 
 /// **R760-1 (R443 / D2; (B′), R619-3 item 1)** — each emitted tree's allocator
-/// verdict, one line per program in `census-receipt.txt`: the System global allocator
+/// verdict and its declared panic strategy (R620-2), one line per program in
+/// `census-receipt.txt`: the System global allocator
 /// the (B′) item declares, checked against the tree's own patch. `declared` is one
 /// declaration in a tree with an edit, `absent` none in a tree with no edit (it keeps
 /// its input bytes, R216); anything else is named (`missing`, `unexpected`,
@@ -26298,8 +26299,9 @@ fn raw_boundary_allocator_lines(ledger_dir: &std::path::Path) -> String {
             )
             .map(|patch| raw_boundary_patch_edits(&patch));
             format!(
-                "tree={} global_allocator={}\n",
+                "tree={} panic_strategy={} global_allocator={}\n",
                 program.name,
+                crate::bo_rewriter::verify::EMITTED_PANIC_STRATEGY,
                 raw_boundary_allocator_verdict(declarations.ok(), edited.ok())
             )
         })

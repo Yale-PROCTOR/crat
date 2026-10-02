@@ -889,6 +889,11 @@ fn box_d4_unreceipted_implicit_drop_is_rejected() {
     assert!(error.contains("unreceipted"), "wrong failure: {error}");
 }
 
+/// MIGRATED under R217-2 by R620-2 (`panic=abort`): the emitted crate is
+/// compiled with `-C panic=abort`, so its MIR has no cleanup edge and no
+/// unwind close. The overwrite and scope-exit closes keep their distinct
+/// receipts; the unwind receipt is now asserted ABSENT (the name keeps
+/// `unwind` so the migration stays traceable).
 #[test]
 fn box_d4_overwrite_scope_and_unwind_drops_receive_distinct_receipts() {
     let source = "#![allow(dead_code, unused_assignments)]\n\
@@ -909,7 +914,11 @@ fn box_d4_overwrite_scope_and_unwind_drops_receive_distinct_receipts() {
     .expect("all implicit drops are authorized");
     assert!(receipt.contains("waiver-drop(overwrite)"), "{receipt}");
     assert!(receipt.contains("waiver-drop(scope-exit)"), "{receipt}");
-    assert!(receipt.contains("waiver-drop(unwind)"), "{receipt}");
+    assert!(!receipt.contains("waiver-drop(unwind)"), "{receipt}");
+    assert!(
+        drops.iter().all(|drop| !drop.cleanup),
+        "an abort crate has no cleanup Drop: {drops:#?}"
+    );
     assert!(receipt.contains("<original>:2:57"), "{receipt}");
 }
 

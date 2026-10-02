@@ -299,8 +299,11 @@ pub(crate) fn reconcile_box_mir_drop_policies(
 
 #[cfg(test)]
 pub(crate) fn box_mir_drops_str(source: &str) -> Result<Vec<BoxMirDrop>, String> {
-    ::utils::compilation::run_compiler_on_str(source, |tcx| collect_box_mir_drops(tcx, None))
-        .map_err(|_| "emitted source failed before the Box MIR drop observer".to_owned())
+    ::utils::compilation::run_compiler(
+        emitted_crate_config(::utils::compilation::str_to_input(source)),
+        |tcx| collect_box_mir_drops(tcx, None),
+    )
+    .map_err(|_| "emitted source failed before the Box MIR drop observer".to_owned())
 }
 
 #[allow(
@@ -318,9 +321,12 @@ pub(crate) fn box_mir_drops_path(
     if functions.is_empty() {
         return Ok(Vec::new());
     }
-    ::utils::compilation::run_compiler_on_path(root, |tcx| {
-        collect_box_mir_drops(tcx, Some(&functions))
-    })
+    // R620-2: the emitted crate's own configuration, so the observed drops are
+    // those of the program as declared (no unwind cleanup blocks).
+    ::utils::compilation::run_compiler(
+        emitted_crate_config(::utils::compilation::path_to_input(root)),
+        |tcx| collect_box_mir_drops(tcx, Some(&functions)),
+    )
     .map_err(|_| "emitted crate failed before the Box MIR drop observer".to_owned())
 }
 
@@ -867,12 +873,30 @@ pub(crate) fn diagnose_crate(root: &Path) -> Diagnosis {
     diagnose_input(::utils::compilation::path_to_input(root))
 }
 
+/// **R620-2 (the user, 09-28): every emitted program's declared configuration is
+/// `panic=abort`.** A panic aborts the process with no destructor running -- C's
+/// behaviour on the same path -- so no cleanup block exists and no implicit release
+/// happens on unwind. Every compile of an EMITTED crate uses it; the analysis's
+/// compile of the input keeps its own configuration (it is a frame input).
+pub(crate) fn emitted_crate_config(input: rustc_session::config::Input) -> rustc_interface::Config {
+    let mut config = ::utils::compilation::make_config(input);
+    debug_assert_eq!(
+        rustc_target::spec::PanicStrategy::Abort.desc(),
+        EMITTED_PANIC_STRATEGY
+    );
+    config.opts.cg.panic = Some(rustc_target::spec::PanicStrategy::Abort);
+    config
+}
+
+/// The panic strategy [`emitted_crate_config`] sets, as the census receipt states it.
+pub(crate) const EMITTED_PANIC_STRATEGY: &str = "abort";
+
 fn diagnose_input(input: rustc_session::config::Input) -> Diagnosis {
     let diags = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let errors = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let unrenderable = std::sync::Arc::new(std::sync::Mutex::new(0usize));
 
-    let mut config = ::utils::compilation::make_config(input);
+    let mut config = emitted_crate_config(input);
     let (d, e, u) = (diags.clone(), errors.clone(), unrenderable.clone());
     config.psess_created = Some(Box::new(move |psess| {
         let source_map = psess.clone_source_map();
