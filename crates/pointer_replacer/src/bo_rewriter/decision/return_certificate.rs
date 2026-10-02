@@ -3483,6 +3483,34 @@ fn receiver_plan(
     if !retained_sink {
         receipts.push("waiver-drop(scope-exit)".to_owned());
     }
+    // R619-3 (2): a sink on SOME path does not reach the exits that run
+    // before it.
+    let definitions: Vec<Span> = if assignments.is_empty() {
+        init_span.into_iter().collect()
+    } else {
+        assignments
+            .iter()
+            .map(|(_, statement)| *statement)
+            .collect()
+    };
+    // A call sink consumes at the call itself (its arguments evaluate first);
+    // a value sink (a raw store, `return owner`) at the owner's read.
+    let call_sinks: Vec<Span> = frees
+        .iter()
+        .map(|(call, _)| *call)
+        .chain(uses.transfers.iter().map(|(_, _, call)| *call))
+        .collect();
+    let value_sinks: Vec<Span> = uses
+        .stores
+        .iter()
+        .chain(uses.returns.iter())
+        .copied()
+        .collect();
+    let exit_close =
+        retained_sink && live_at_an_exit(tcx, receiver, &definitions, &call_sinks, &value_sinks);
+    if exit_close {
+        receipts.push(format!("waiver-drop(scope-exit) exit-path receiver={name}"));
+    }
     // An edit inside a deleted statement goes with it.
     expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
     let transfers = uses.transfers.clone();
@@ -3498,8 +3526,253 @@ fn receiver_plan(
             inferred_binding: receiver.ty_span.is_none(),
             overwrite_spans: Vec::new(),
             retained_sink,
-            implicit_scope_close: !retained_sink,
+            implicit_scope_close: !retained_sink || exit_close,
         },
         transfers,
     ))
+}
+
+/// **R619-3 (2) — an exit at which the receiver still owns.** `retained_sink`
+/// says a C free, a raw store or a transfer consumes the owner on SOME path;
+/// it does not say every exit of the owner's scope runs after one. Over the
+/// input's MIR, the end of the owner's scope (`StorageDead` of its local, or
+/// the function's `return`) reachable from one of its definitions without
+/// passing a sink or a re-seat of the owner, and without taking the null edge
+/// of the owner's own `is_null` test (the owner is `None` there), drops a live
+/// owner where C leaked it: quadtree `split_node_`'s `nw` at `ne`'s null
+/// return, or a `continue` ahead of a loop body's store. That close is
+/// addendum 101's, and it carries its receipt.
+fn live_at_an_exit(
+    tcx: TyCtxt<'_>,
+    receiver: &Subject,
+    definitions: &[Span],
+    call_sinks: &[Span],
+    value_sinks: &[Span],
+) -> bool {
+    use rustc_middle::mir::{
+        BasicBlock, Operand, Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
+    };
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(receiver.fn_did)
+        .borrow();
+    let owner = receiver.local;
+    let inside = |span: Span, spans: &[Span]| spans.iter().any(|outer| outer.contains(span));
+    let bare = |place: &rustc_middle::mir::Place<'_>| place.as_local();
+    let reseats = |statement: &Statement<'_>| matches!(&statement.kind, StatementKind::Assign(assign) if bare(&assign.0) == Some(owner));
+    // **The owner's own null tests**, by the block that switches on one: the
+    // return block of an `is_null` call whose argument is this generation of
+    // the owner (the owner, or its copy made in the call's block after the
+    // owner's last re-seat there), switching on the call's result or its
+    // negation with no re-seat between. A test cached across a re-seat
+    // describes an older generation and prunes nothing.
+    let mut null_switches = FxHashMap::<BasicBlock, bool>::default();
+    let predecessors = body.basic_blocks.predecessors();
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            target: Some(target),
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        let Some((callee, _)) = func.const_fn_def() else {
+            continue;
+        };
+        let (Some(result), [argument]) = (bare(destination), &args[..]) else {
+            continue;
+        };
+        let Some(argument) = argument.node.place().and_then(|place| bare(&place)) else {
+            continue;
+        };
+        // core's inherent `<*const T>::is_null` / `<*mut T>::is_null` only; a
+        // same-named helper says nothing about the owner.
+        let raw_is_null = tcx.item_name(callee).as_str() == "is_null"
+            && tcx.crate_name(callee.krate).as_str() == "core"
+            && matches!(
+                tcx.type_of(tcx.parent(callee))
+                    .instantiate_identity()
+                    .kind(),
+                TyKind::RawPtr(..)
+            );
+        if !raw_is_null {
+            continue;
+        }
+        let current = argument == owner
+            || data
+                .statements
+                .iter()
+                .rev()
+                .find_map(|statement| {
+                    if reseats(statement) {
+                        return Some(false);
+                    }
+                    match &statement.kind {
+                        StatementKind::Assign(assign) if bare(&assign.0) == Some(argument) => {
+                            Some(matches!(
+                                &assign.1,
+                                Rvalue::Use(Operand::Copy(from) | Operand::Move(from))
+                                    if bare(from) == Some(owner)
+                            ))
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or(false);
+        // The call's return block is entered from the call alone, so every
+        // path through its switch ran this test.
+        if !current || predecessors[*target].len() != 1 {
+            continue;
+        }
+        let switch = &body.basic_blocks[*target];
+        let mut tests = FxHashMap::default();
+        tests.insert(result, false);
+        let mut reseated = false;
+        for statement in &switch.statements {
+            reseated |= reseats(statement);
+            match &statement.kind {
+                StatementKind::StorageLive(_) | StatementKind::Nop => {}
+                StatementKind::StorageDead(local) => {
+                    tests.remove(local);
+                }
+                // A write to a bare local replaces what it tested; only a
+                // `Not` of a still-valid test carries a fact over. A write
+                // through a place (`*r = flag`) may reach a tested boolean:
+                // nothing is known any more.
+                StatementKind::Assign(assign) => {
+                    let Some(written) = bare(&assign.0) else {
+                        tests.clear();
+                        continue;
+                    };
+                    let carried = match &assign.1 {
+                        Rvalue::UnaryOp(UnOp::Not, operand) => operand
+                            .place()
+                            .and_then(|place| bare(&place))
+                            .and_then(|tested| tests.get(&tested).copied())
+                            .map(|negated| !negated),
+                        _ => None,
+                    };
+                    tests.remove(&written);
+                    if let Some(negated) = carried {
+                        tests.insert(written, negated);
+                    }
+                }
+                _ => tests.clear(),
+            }
+        }
+        if !reseated
+            && let TerminatorKind::SwitchInt { discr, .. } = &switch.terminator().kind
+            && let Some(&negated) = discr
+                .place()
+                .and_then(|place| bare(&place))
+                .and_then(|test| tests.get(&test))
+        {
+            null_switches.insert(*target, negated);
+        }
+    }
+    // Every point just after a definition.
+    let mut work: Vec<(BasicBlock, usize)> = Vec::new();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (index, statement) in data.statements.iter().enumerate() {
+            if reseats(statement) && inside(statement.source_info.span, definitions) {
+                work.push((block, index + 1));
+            }
+        }
+        if let TerminatorKind::Call {
+            destination,
+            target: Some(target),
+            ..
+        } = &data.terminator().kind
+            && bare(destination) == Some(owner)
+            && inside(data.terminator().source_info.span, definitions)
+        {
+            work.push((*target, 0));
+        }
+    }
+    let mut seen = FxHashSet::default();
+    'paths: while let Some((block, from)) = work.pop() {
+        if from == 0 && !seen.insert(block) {
+            continue;
+        }
+        let data = &body.basic_blocks[block];
+        if data.is_cleanup {
+            continue;
+        }
+        for statement in data.statements.iter().skip(from) {
+            // A value sink consumes this generation; a re-seat ends it (an
+            // overwrite close is receipted as one, and a new definition walks
+            // itself).
+            if inside(statement.source_info.span, value_sinks) || reseats(statement) {
+                continue 'paths;
+            }
+            if matches!(statement.kind, StatementKind::StorageDead(local) if local == owner) {
+                return true;
+            }
+        }
+        let terminator = data.terminator();
+        match &terminator.kind {
+            TerminatorKind::Return => return true,
+            TerminatorKind::Call { destination, .. }
+                if bare(destination) == Some(owner)
+                    || call_sinks.iter().any(|call| {
+                        let at = terminator.source_info.span;
+                        call.lo() == at.lo() && call.hi() == at.hi()
+                    }) =>
+            {
+                continue;
+            }
+            TerminatorKind::SwitchInt { targets, .. } if null_switches.contains_key(&block) => {
+                // `is_null` true is the owner's `None`: not a live path.
+                let negated = null_switches[&block];
+                for (value, next) in targets.iter() {
+                    if (value == 0) != negated {
+                        work.push((next, 0));
+                    }
+                }
+                if negated {
+                    work.push((targets.otherwise(), 0));
+                }
+            }
+            _ => work.extend(terminator.successors().map(|next| (next, 0))),
+        }
+    }
+    false
+}
+
+/// **R619-3 (2) — the receivers' own implicit-close receipts**, published
+/// under the receiver's function (the certificate's rows are keyed by the
+/// callee). Only a receiver the settled table still delivers as `Box`.
+pub(crate) fn receiver_receipts_tsv(tcx: TyCtxt<'_>, table: &DecisionTable) -> String {
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let plan = match decision {
+            Decision::Box(plan) => plan,
+            Decision::Cursor { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Degraded(_) => continue,
+        };
+        if !table
+            .return_certificates
+            .plans
+            .contains_key(&(subject.fn_did, subject.hir_id))
+        {
+            continue;
+        }
+        let function = tcx.def_path_str(subject.fn_did.to_def_id());
+        for receipt in plan
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.starts_with("waiver-drop("))
+        {
+            rows.push(format!("{function}\treceiver\t{receipt}\n"));
+        }
+    }
+    rows.sort();
+    rows.concat()
 }

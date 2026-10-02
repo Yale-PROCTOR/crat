@@ -9384,7 +9384,8 @@ fn finish_decide<'tcx>(
             flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
             counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
             box_param_receipts: table.box_params.receipts_tsv(),
-            return_certificate_receipts: table.return_certificates.receipts_tsv(),
+            return_certificate_receipts: table.return_certificates.receipts_tsv()
+                + &decision::return_certificate::receiver_receipts_tsv(tcx, &table),
             field_load_exemption_receipts: field_load_exemption_receipts_tsv(
                 tcx,
                 &table.seams.field_load_exemptions,

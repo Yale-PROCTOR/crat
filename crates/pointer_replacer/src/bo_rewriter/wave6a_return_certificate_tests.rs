@@ -889,6 +889,80 @@ fn w6a_a1b_quadtree_assignment_receivers_stores_and_the_stored_call_deliver() {
     }
 }
 
+/// **R619-3 (2) — a receiver live at an early exit is receipted** (wave-6o
+/// 081 STOP 2). In the chain, `nw` still owns at `ne`'s null return: C leaked
+/// it there, and the emitted `Option<Box>` drops it at scope exit. The stores
+/// that make both receivers `retained_sink` do not reach that exit. `ne` is
+/// stored before every exit its owner reaches (its own null edge holds
+/// `None`), so exactly one row, under `split_node_`, names `nw`.
+#[test]
+fn r619_3_a_receiver_live_at_an_early_exit_is_receipted() {
+    let out = emitted("cert-quadtree-exit-close", QUADTREE_CHAIN);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let exit_rows = receipts
+        .lines()
+        .filter(|line| line.contains("exit-path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exit_rows,
+        ["split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=nw"],
+        "{receipts}"
+    );
+}
+
+/// **R619-3 (2), a loop body's scope exit.** `it` is a `let` receiver inside a
+/// loop: on the odd-id `continue` its scope ends before the store, so the
+/// emitted owner is dropped there with no `return` anywhere on the path. Its
+/// null `continue` holds `None` and is not a close.
+const LOOP_EXIT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct item { pub id: i32 }
+#[repr(C)]
+pub struct slot { pub it: *mut item }
+pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
+    let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
+    if it.is_null() {
+        return 0 as *mut item;
+    }
+    (*it).id = id;
+    return it;
+}
+pub unsafe extern "C" fn fill(mut s: *mut slot, mut n: i32) {
+    let mut i = 0 as i32;
+    while i < n {
+        let mut it = item_new(i);
+        i += 1;
+        if it.is_null() {
+            continue;
+        }
+        if (*it).id % 2 as i32 != 0 as i32 {
+            continue;
+        }
+        (*s).it = it;
+    }
+}
+"#;
+
+#[test]
+fn r619_3_a_receiver_live_at_a_loop_scope_exit_is_receipted() {
+    let out = emitted("cert-loop-exit-close", LOOP_EXIT);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    let exit_rows = receipts
+        .lines()
+        .filter(|line| line.contains("exit-path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exit_rows,
+        ["fill\treceiver\twaiver-drop(scope-exit) exit-path receiver=it"],
+        "{receipts}\n{}",
+        out.source
+    );
+}
+
 /// **A1-b, buffer's direct return**: `buffer_new() { return buffer_new_with_size(64) }`
 /// chains without a local; its receiver frees.
 const BUFFER_DIRECT_RETURN: &str = r#"

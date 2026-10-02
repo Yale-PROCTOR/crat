@@ -50,6 +50,10 @@ use crate::{
 const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
 const BOC1_EFFECTIVE_MEMORY_MIB_ENV: &str = "CRAT_BOC1_EFFECTIVE_MEM_MB";
 
+/// R619-3 (1): the wave-2 unified control's sealed "production unmatched"
+/// value (`2026-09-02-raw-boundary-wave2-census`), carried as that seal.
+const WAVE2_UNIFIED_PRODUCTION_UNMATCHED: usize = 0;
+
 fn raw_boundary_pair_control_member(prior_verdict: &str, fact_verdict: &str) -> bool {
     prior_verdict == "a5-unknown" && fact_verdict == "overlapping"
 }
@@ -12958,6 +12962,17 @@ mod run {
         let mut subject_outcomes = String::from(
             "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\temitted_form\n",
         );
+        // **R622-1 (1) — `realized-by-owner-view`.** A degraded subject whose
+        // emitted declaration another plan's surviving edit typed safe (heman's
+        // `convex_hull#258`: the view `hull_buffer`'s Box class writes as
+        // `&mut [kmVec3]`) is delivered in the tree, so it counts delivered, under
+        // its own receipt. The tree-truth measure (R455-3) is the control that
+        // reads 0 after it. The row's `delivery` stays the sealed
+        // `realized-as-predicted` so every counter and comparator agrees; the
+        // attribution is its own table.
+        let owner_view_written =
+            super::owner_view_subjects(&artifact.edit_keys, &artifact.final_reverts);
+        let mut owner_view_receipts = String::from("subject_key\towner_fn\tfamily\treceipt\n");
         let mut realized_model_raw = 0usize;
         let mut tally = super::RawBoundarySubjectTally::default();
         let mut delivered_by_ledger = BTreeSet::new();
@@ -12967,13 +12982,22 @@ mod run {
             let family = subject.get("family").map_or("-", String::as_str);
             let placed = subject.get("placed").is_some_and(|value| value == "1");
             let exclusion = subject.get("exclusion").map_or("-", String::as_str);
-            let delivery = super::raw_boundary_subject_delivery_with_exclusion(
+            let mut delivery = super::raw_boundary_subject_delivery_with_exclusion(
                 program_outcome,
                 placed,
                 exclusion,
                 reverted_functions.contains(owner_fn),
                 false,
             );
+            let owner_view = delivery == super::RawBoundarySubjectDelivery::Degraded
+                && owner_view_written.contains(subject_key)
+                && !reverted_functions.contains(owner_fn);
+            if owner_view {
+                delivery = super::RawBoundarySubjectDelivery::Realized;
+                owner_view_receipts.push_str(&format!(
+                    "{subject_key}\t{owner_fn}\t{family}\trealized-by-owner-view\n"
+                ));
+            }
             if delivery == super::RawBoundarySubjectDelivery::Realized {
                 delivered_by_ledger.insert(subject_key.to_owned());
             }
@@ -12989,6 +13013,13 @@ mod run {
                 subject.get("decision").map_or("-", String::as_str)
             } else {
                 "unchanged"
+            };
+            // R641-2 (5): the subject's own decision is `degraded`; the tree
+            // carries the declaration the owner's surviving edit wrote.
+            let emitted_form = if owner_view {
+                "owner-view"
+            } else {
+                emitted_form
             };
             subject_outcomes.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -13007,6 +13038,11 @@ mod run {
             stamp(&subject_outcomes),
         )
         .expect("write raw-boundary subject outcomes");
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-owner-view-attributions.tsv")),
+            stamp(&owner_view_receipts),
+        )
+        .expect("write owner-view attributions");
         row.set(raw_schema::REALIZED_SUBJECTS, tally.realized);
         row.set(raw_schema::DEGRADED_SUBJECTS, tally.degraded);
         row.set(
@@ -13544,7 +13580,11 @@ mod run {
         let mut unified_control_rows = 0usize;
         let mut unified_production_matched = 0usize;
         let mut unified_control_unmatched = 0usize;
-        let unified_production_unmatched = 0usize;
+        // R619-3 (1): the sealed wave-2 value, not a measurement. The arm
+        // table now carries every subject (6,015 at batch 49), not wave 2's
+        // market, so "production rows the 1,291-row control does not name"
+        // has no production side to count at this frame.
+        let unified_production_unmatched = super::WAVE2_UNIFIED_PRODUCTION_UNMATCHED;
         let mut masked_reasons = BTreeMap::<String, usize>::new();
         if let Some(path) = std::env::var_os("CRAT_RAW_BOUNDARY_UNIFIED_CONTROL") {
             let control_text = std::fs::read_to_string(&path)
@@ -13606,7 +13646,7 @@ mod run {
             )
             .expect("write unified market ledger");
         }
-        let mut diagnostic_control_matched = 0usize;
+        let mut diagnostic_control_ledgered = 0usize;
         if let Some(path) = std::env::var_os("CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL") {
             let control_text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("read diagnostic control: {error}"));
@@ -13625,7 +13665,7 @@ mod run {
                     revert.function == function
                         && (code == "-" || e1_code(revert.diagnostic.code.as_deref()) == code)
                 });
-                diagnostic_control_matched += 1;
+                diagnostic_control_ledgered += 1;
                 ledger.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\n",
                     name,
@@ -13809,8 +13849,8 @@ mod run {
             unified_production_unmatched,
         );
         row.set(
-            raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
-            diagnostic_control_matched,
+            raw_schema::DIAGNOSTIC_CONTROL_LEDGERED,
+            diagnostic_control_ledgered,
         );
         let masked_reason_count = |reason: &str| masked_reasons.get(reason).copied().unwrap_or(0);
         row.set(
@@ -22572,7 +22612,7 @@ struct RawBoundaryControlReconciliation {
     libc_subjects: usize,
     libc_edges: usize,
     free_rows: usize,
-    t2_rows: usize,
+    tier2_bridge_rows: usize,
     box_rows: usize,
     crown_rows: usize,
     arm_b_rows: usize,
@@ -23070,7 +23110,7 @@ fn reconcile_raw_boundary_controls(
         libc_subjects: 0,
         libc_edges: 0,
         free_rows: 0,
-        t2_rows: 0,
+        tier2_bridge_rows: 0,
         box_rows: 0,
         crown_rows: 0,
         arm_b_rows: 0,
@@ -23300,7 +23340,7 @@ fn reconcile_raw_boundary_controls(
             | (_, "arg-stays-raw/raw-caller-boundary")
             | (_, "class-collateral/flows-into-raw-param")
             | (_, "class-collateral/arg-stays-raw") => {
-                counts.t2_rows += 1;
+                counts.tier2_bridge_rows += 1;
                 let Some(subject) = subject else {
                     divergences.push_str(&format!(
                         "t2\t{program}\t{identity}\tmissing-production-subject\t{subkind}\n"
@@ -24346,7 +24386,7 @@ const RAW_BOUNDARY_AGGREGATE_SUM_KEYS: &[&str] = &[
     raw_schema::ADDR_NEITHER,
     raw_schema::ATOM_KEYED_EDITS,
     raw_schema::ATOM_BISECT_ATTEMPTS,
-    raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
+    raw_schema::DIAGNOSTIC_CONTROL_LEDGERED,
     raw_schema::R1_CLASS_BLOCKED,
     raw_schema::R1_ARG_STAYS_RAW,
     raw_schema::R1_DUPLICATE_PLACE_ROOT,
@@ -25781,7 +25821,7 @@ fn raw_boundary_wave2_corpus_census() {
             controls.libc_subjects,
             controls.libc_edges,
             controls.free_rows,
-            controls.t2_rows,
+            controls.tier2_bridge_rows,
             controls.box_rows,
             controls.crown_rows,
             controls.arm_b_rows,
@@ -26131,7 +26171,7 @@ fn raw_boundary_wave2_corpus_census() {
     assert_eq!(total(raw_schema::UNIFIED_PRODUCTION_MATCHED), 1_291);
     assert_eq!(total(raw_schema::UNIFIED_CONTROL_UNMATCHED), 0);
     assert_eq!(total(raw_schema::UNIFIED_PRODUCTION_UNMATCHED), 0);
-    assert_eq!(total(raw_schema::DIAGNOSTIC_CONTROL_MATCHED), 358);
+    assert_eq!(total(raw_schema::DIAGNOSTIC_CONTROL_LEDGERED), 358);
     assert_eq!(
         [
             total(raw_schema::R1_CLASS_BLOCKED),
@@ -26150,16 +26190,32 @@ fn raw_boundary_wave2_corpus_census() {
     aggregate.set(raw_schema::CONTROL_LIBC_SUBJECTS, controls.libc_subjects);
     aggregate.set(raw_schema::CONTROL_LIBC_EDGES, controls.libc_edges);
     aggregate.set(raw_schema::CONTROL_FREE_ROWS, controls.free_rows);
-    aggregate.set(raw_schema::CONTROL_T2_ROWS, controls.t2_rows);
+    aggregate.set(
+        raw_schema::CONTROL_TIER2_BRIDGE_ROWS,
+        controls.tier2_bridge_rows,
+    );
     aggregate.set(raw_schema::CONTROL_BOX_ROWS, controls.box_rows);
     aggregate.set(raw_schema::CONTROL_CROWN_ROWS, controls.crown_rows);
     aggregate.set(
         raw_schema::CONTROL_DIAGNOSTIC_ROWS,
         diagnostic_recon.baseline,
     );
-    aggregate.set(raw_schema::CONTROL_PAIR_SUBJECT_ROWS, 122);
-    aggregate.set(raw_schema::CONTROL_PAIR_SITE_ROWS, 73);
-    aggregate.set(raw_schema::CONTROL_DIVERGENCES, 0);
+    // R619-3 (1). Each control count is read from the table it counts; the
+    // asserts above pin the values. The PAIR subjects are wave 2's R1
+    // `duplicate-place-root` reason (its 122), the sites are the pair-site
+    // control's members, and the divergences are the fatal stream's rows.
+    aggregate.set(
+        raw_schema::CONTROL_PAIR_SUBJECT_ROWS,
+        total(raw_schema::R1_DUPLICATE_PLACE_ROOT),
+    );
+    aggregate.set(
+        raw_schema::CONTROL_PAIR_SITE_ROWS,
+        expected_pair_sites.len(),
+    );
+    aggregate.set(
+        raw_schema::CONTROL_DIVERGENCES,
+        pair_divergences.lines().skip(1).count(),
+    );
     aggregate.set(raw_schema::ARM_B_ROWS, controls.arm_b_rows);
     aggregate.set(raw_schema::ARM_B_BOX_ROWS, controls.box_rows);
     aggregate.set(raw_schema::ARM_B_CROWN_ROWS, controls.crown_rows);
@@ -26221,7 +26277,7 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\ngate_baseline_sha256={}\ngate_regressed_programs={}\ngate_waived_programs={}\nera4_reported_regressed_programs={}\npair_site_retirement_sha256={}\npair_site_retired={}\ngate_lost_identities={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_current={}/{}/{}/{}/{}\nsubject_frame_corrected={}/{}/{}/{}\npromote_rate_current={}/{}\npromote_rate_corrected={}/{}\nmembership_gained={}\nmembership_lost={}\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\ntier2_bridge_rows={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\nlibc_hold_control_sha256={}\nlibc_hold_rows={}\nregression_waiver_sha256={}\nregression_waiver_audit_rows={}\ngate_baseline_sha256={}\ngate_regressed_programs={}\ngate_waived_programs={}\nera4_reported_regressed_programs={}\npair_site_retirement_sha256={}\npair_site_retired={}\ngate_lost_identities={}\n",
             delivery.key(),
             20 - degraded_programs.len(),
             degraded_programs.len(),
@@ -26247,7 +26303,7 @@ fn raw_boundary_wave2_corpus_census() {
             controls.libc_edges,
             controls.free_rows,
             controls.free_arm_b_rows,
-            controls.t2_rows,
+            controls.tier2_bridge_rows,
             controls.arm_b_rows,
             diagnostic_recon.baseline,
             diagnostic_recon.unchanged,
@@ -26359,6 +26415,70 @@ fn r760_1_the_allocator_line_reads_the_declaration_against_the_patch() {
         "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n"
     ));
     assert!(!raw_boundary_patch_edits(""));
+}
+
+/// **R622-1 (1) / R641-2 (5) — the subjects a SURVIVING declaration edit
+/// types safe.** `edit_keys` is the plan BEFORE the revert loop, so a
+/// `declaration-explicit-type` edit counts only when its OWNING class
+/// (`owner=class#N`) is not among the final reverts (`function` rows, whose
+/// `class_id` is `local-def-index:N`, the same order key). A program with any
+/// `atom` revert attributes nothing: an atom names no class this join can
+/// read, so the rule fails closed there.
+fn owner_view_subjects(edit_keys: &str, final_reverts: &str) -> std::collections::BTreeSet<String> {
+    let mut reverted_classes = std::collections::BTreeSet::new();
+    for line in final_reverts.lines().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        match fields.as_slice() {
+            ["atom", ..] => return std::collections::BTreeSet::new(),
+            ["function", _, class, ..] => {
+                if let Some(index) = class.strip_prefix("local-def-index:") {
+                    reverted_classes.insert(format!("class#{index}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    edit_keys
+        .lines()
+        .skip(1)
+        .filter(|line| line.contains("|kind=declaration-explicit-type|"))
+        .filter(|line| {
+            line.split('|')
+                .find_map(|field| field.split_once("owner=").map(|(_, class)| class))
+                .is_some_and(|class| !reverted_classes.contains(class))
+        })
+        .filter_map(|line| {
+            let at = line.find("subject=")? + "subject=".len();
+            line[at..].split('|').next().map(str::to_owned)
+        })
+        .collect()
+}
+
+/// **R641-2 (5)** — RED first: the pre-revert rule counted `g#3`, whose owning
+/// class `class#12` is in the final reverts (main 131 §6 item 5).
+#[test]
+fn r641_2_an_owner_view_counts_only_under_an_owning_class_that_survives() {
+    let keys = "edit_key\n\
+        owner=class#776|subject=src::a::f#258|arms=-|kind=declaration-explicit-type|interval=x|replacement_sha256=y\n\
+        owner=class#12|subject=src::a::g#3|arms=-|kind=declaration-explicit-type|interval=x|replacement_sha256=y\n\
+        owner=class#776|subject=src::a::h#4|arms=-|kind=argument-bridge|interval=x|replacement_sha256=y\n";
+    let reverts = "kind\tidentity\tclass_id\tattribution\n\
+        function\tsrc::a::other\tlocal-def-index:12\theld:x\n";
+    assert_eq!(
+        owner_view_subjects(keys, reverts),
+        std::collections::BTreeSet::from(["src::a::f#258".to_owned()]),
+        "only the declaration edit of a class that survives the reverts counts"
+    );
+    let with_atom = format!("{reverts}atom\tsome-atom\t-\tatom-reverted\n");
+    assert!(
+        owner_view_subjects(keys, &with_atom).is_empty(),
+        "an atom revert names no class, so the attribution fails closed"
+    );
+    assert_eq!(
+        owner_view_subjects(keys, "kind\tidentity\tclass_id\n").len(),
+        2,
+        "no revert: both declaration edits count"
+    );
 }
 
 /// **R541-5** — one program's rows of `gate-lost-identities.tsv`: every identity
@@ -28093,7 +28213,7 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     assert_eq!(result.libc_subjects, 1);
     assert_eq!(result.libc_edges, 1);
     assert_eq!(result.free_rows, 1);
-    assert_eq!(result.t2_rows, 4);
+    assert_eq!(result.tier2_bridge_rows, 4);
     assert_eq!(result.box_rows, 1);
     assert_eq!(result.crown_rows, 1);
     assert_eq!(result.arm_b_rows, 2);
@@ -28212,7 +28332,7 @@ fn raw_boundary_market_labels_cross_tab_and_free_params_receipt_without_relabeli
         "{}",
         result.divergences
     );
-    assert_eq!(result.t2_rows, 2);
+    assert_eq!(result.tier2_bridge_rows, 2);
     assert!(
         result.t2_cross_tab.contains(
             "p\tflows-into-raw-param/retention-unknown-local\ttiers=T1|class=-|node=-\t1"

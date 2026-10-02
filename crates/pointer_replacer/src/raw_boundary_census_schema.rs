@@ -146,7 +146,9 @@ pub(crate) const ADDR_BOTH: &str = "raw_boundary_addr_both";
 pub(crate) const ADDR_NEITHER: &str = "raw_boundary_addr_neither";
 pub(crate) const ATOM_KEYED_EDITS: &str = "raw_boundary_atom_keyed_edits";
 pub(crate) const ATOM_BISECT_ATTEMPTS: &str = "raw_boundary_atom_bisect_attempts";
-pub(crate) const DIAGNOSTIC_CONTROL_MATCHED: &str = "raw_boundary_diagnostic_control_matched";
+// R619-3 (1): the wave-2 diagnostic control rows written to the ledger, each
+// with its current disposition; a row count, not a match.
+pub(crate) const DIAGNOSTIC_CONTROL_LEDGERED: &str = "raw_boundary_diagnostic_control_ledgered";
 pub(crate) const R1_CLASS_BLOCKED: &str = "raw_boundary_r1_class_blocked";
 pub(crate) const R1_ARG_STAYS_RAW: &str = "raw_boundary_r1_arg_stays_raw";
 pub(crate) const R1_DUPLICATE_PLACE_ROOT: &str = "raw_boundary_r1_duplicate_place_root";
@@ -168,7 +170,9 @@ pub(crate) const FREE_ARM_B_ROWS: &str = "raw_boundary_free_arm_b_rows";
 pub(crate) const CONTROL_LIBC_SUBJECTS: &str = "raw_boundary_control_libc_subjects";
 pub(crate) const CONTROL_LIBC_EDGES: &str = "raw_boundary_control_libc_edges";
 pub(crate) const CONTROL_FREE_ROWS: &str = "raw_boundary_control_free_rows";
-pub(crate) const CONTROL_T2_ROWS: &str = "raw_boundary_control_t2_rows";
+// R619-3 (9): wave 2's tier-2 bridge control rows (the retention-unknown and
+// raw-caller-boundary sub-kinds), not T2 endpoints.
+pub(crate) const CONTROL_TIER2_BRIDGE_ROWS: &str = "raw_boundary_control_tier2_bridge_rows";
 pub(crate) const CONTROL_BOX_ROWS: &str = "raw_boundary_control_box_rows";
 pub(crate) const CONTROL_CROWN_ROWS: &str = "raw_boundary_control_crown_rows";
 pub(crate) const CONTROL_DIAGNOSTIC_ROWS: &str = "raw_boundary_control_diagnostic_rows";
@@ -362,7 +366,7 @@ pub(crate) const ALL: &[&str] = &[
     ADDR_NEITHER,
     ATOM_KEYED_EDITS,
     ATOM_BISECT_ATTEMPTS,
-    DIAGNOSTIC_CONTROL_MATCHED,
+    DIAGNOSTIC_CONTROL_LEDGERED,
     R1_CLASS_BLOCKED,
     R1_ARG_STAYS_RAW,
     R1_DUPLICATE_PLACE_ROOT,
@@ -384,7 +388,7 @@ pub(crate) const ALL: &[&str] = &[
     CONTROL_LIBC_SUBJECTS,
     CONTROL_LIBC_EDGES,
     CONTROL_FREE_ROWS,
-    CONTROL_T2_ROWS,
+    CONTROL_TIER2_BRIDGE_ROWS,
     CONTROL_BOX_ROWS,
     CONTROL_CROWN_ROWS,
     CONTROL_DIAGNOSTIC_ROWS,

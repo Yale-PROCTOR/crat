@@ -910,8 +910,15 @@ pub unsafe fn check(chunk: *const u8, out: *mut u8, n: usize) {
         // relay 012. The guard's own observable is unchanged there, which is
         // why it is what this witness asserts.)
         let exclusion = column(&got.subjects, "copy_bytes::dst#1", "exclusion");
+        // Restated (R641-2, R217-2): `copy_bytes` reads `n` elements through
+        // `src`, so `&*chunk.offset(4)` glued `from_ref` is one element into a
+        // wider reader (R416-5); the row's extent conjunct now refuses it
+        // before the A5 fallback plans its view. The property is unchanged: the
+        // callee's class holds, TYPED, and no stale text is emitted. RED first:
+        // at `a5d46f6d4` the typed reason was the A5 fallback's.
         assert!(
-            exclusion.contains("a5-fallback-unrenderable:nested-caller-edit"),
+            exclusion.contains("a5-fallback-unrenderable:nested-caller-edit")
+                || exclusion.contains("seam-one-element-into-wider-formal"),
             "the callee's class holds on the typed reason, not a revert: {exclusion}\n{}",
             got.subjects
         );
