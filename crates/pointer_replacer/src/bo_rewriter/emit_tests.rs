@@ -14355,7 +14355,11 @@ fn opt_w1_nested_raw_result_preserves_the_inner_outbound_adapter() {
     };
     // Returning the input pointer is the positive-retention OUT contrast.
     // This non-retaining callee isolates construction/inner-adapter ownership.
-    let input = "type Ptr = *const i32; static RESULT: i32 = 7; unsafe fn raw_result(_q: Ptr) -> Ptr { &RESULT }\n\
+    // Wave-6o R744-1 (relay 125): the callee READS `*_q` so that `_q` stays a
+    // required reference; an unused `_q` would take the optional form under
+    // forward nullability (`target` null-tests `p`), and the required inner call
+    // this test composes would disappear.
+    let input = "type Ptr = *const i32; static RESULT: i32 = 7; unsafe fn raw_result(_q: Ptr) -> Ptr { if *_q == 0 { return &RESULT; } &RESULT }\n\
         pub unsafe fn target(p: *const i32) -> i32 { if p.is_null() { return 0; }\n\
             let q: *const i32 = raw_result(p); if q.is_null() { 0 } else { *q }\n\
         }";
