@@ -269,3 +269,174 @@ fn w6b_a_whole_call_receipt_is_not_read_through_the_twin() {
         "{report:#?}"
     );
 }
+
+/// **R757-1 (main 146) — a raw-twin call handed the input's own argument.** wave-5d's
+/// `eefb63fa9` sends the call to the twin with the input's arguments: here `pint` is not
+/// delivered, so the emitted call reads `pint as *mut libc::c_void` exactly as the input
+/// did, at a crate-qualified twin call. No safe value crosses; the row is matched.
+/// Controls: the same text over a DELIVERED `pint` (its declaration changed), and the same
+/// raw argument at a call to a function that is not the twin, are not.
+fn raw_caller(callee: &str, pint_type: &str) -> String {
+    format!(
+        "pub mod src {{\npub mod binn {{\n\
+pub struct binn {{ pub ptr: *mut libc::c_void, pub type_0: libc::c_int }}\n\
+unsafe extern \"C\" fn copy_int_value(mut psource: &[u8],\n    mut pdest: *mut libc::c_void, mut source_type: libc::c_int,\n    mut dest_type: libc::c_int) -> BOOL {{ return 1 as libc::c_int; }}\n\
+{TWIN_DECL}\
+unsafe extern \"C\" fn other(mut psource: *mut libc::c_void,\n    mut pdest: *mut libc::c_void, mut source_type: libc::c_int,\n    mut dest_type: libc::c_int) -> BOOL {{ return 1 as libc::c_int; }}\n\
+pub unsafe extern \"C\" fn binn_get_int32(mut value: *mut binn,\n    mut pint: {pint_type}) -> BOOL {{\n    if value.is_null() || pint.is_null() {{ return 0 as libc::c_int; }}\n    return {callee}((*value).ptr, pint as *mut libc::c_void,\n            (*value).type_0, 0x61 as libc::c_int);\n}}\n\
+}}\n}}\n"
+    )
+}
+
+#[test]
+fn r757_1_a_raw_twin_call_with_the_inputs_own_argument_is_matched() {
+    let report = check(
+        &raw_caller(
+            "crate::src::binn::__crat_raw_copy_int_value",
+            "*mut libc::c_int",
+        ),
+        &[expectation(BridgeKind::A5SiteProofT2Fallback)],
+    );
+    assert!(report.data, "{report:#?}");
+    assert_eq!(
+        report.rows[0].status,
+        ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+    assert!(
+        report.rows[0]
+            .reason
+            .starts_with("twin-call-input-argument:arg=1"),
+        "{report:#?}"
+    );
+
+    // A delivered binding under the same argument text is not the input's argument.
+    let report = check(
+        &raw_caller(
+            "crate::src::binn::__crat_raw_copy_int_value",
+            "Option<&mut libc::c_int>",
+        ),
+        &[expectation(BridgeKind::A5SiteProofT2Fallback)],
+    );
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+
+    // The same raw argument at a call to another function is not this callee's twin.
+    let report = check(
+        &raw_caller("crate::src::binn::other", "*mut libc::c_int"),
+        &[expectation(BridgeKind::A5SiteProofT2Fallback)],
+    );
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+}
+
+/// **R757-1 (main 146) — brotli's `SafeReadSymbolCodeLengths` shape.** The caller's `h` is
+/// delivered (`&mut Arena`) and the call goes to the raw twin with the input's arguments:
+/// `&mut (*h).repeat` (a place borrowed through the delivered binding, the pointer the
+/// stamped view `from_mut(&mut (*h).repeat)` would bind) and R460-1(a)'s named intermediate
+/// of `(*h).symbol_lists` (the field's own raw value). Both are matched, and the reason
+/// names the delivered binding. Controls: a PAIR receipt at the same site is not read
+/// through the twin, and the same text at a call to a function that is not the twin is not.
+const ORIGINAL_H: &str = "pub mod src {\npub mod dec {\n\
+pub struct Arena { pub repeat: u32, pub symbol_lists: *mut u16 }\n\
+unsafe extern \"C\" fn process(mut repeat: *mut u32, mut lists: *mut u16) -> u32 { return 0; }\n\
+unsafe extern \"C\" fn other(mut repeat: *mut u32, mut lists: *mut u16) -> u32 { return 0; }\n\
+pub unsafe extern \"C\" fn caller(mut h: *mut Arena) -> u32 {\n    return process(&mut (*h).repeat, (*h).symbol_lists);\n}\n\
+}\n}\n";
+
+fn delivered_caller(callee: &str) -> String {
+    format!(
+        "pub mod src {{\npub mod dec {{\n\
+pub struct Arena {{ pub repeat: u32, pub symbol_lists: *mut u16 }}\n\
+unsafe extern \"C\" fn process(mut repeat: &mut u32, mut lists: *mut u16) -> u32 {{ return 0; }}\n\
+unsafe extern \"C\" fn __crat_raw_process(mut repeat: *mut u32, mut lists: *mut u16) -> u32 {{ return 0; }}\n\
+unsafe extern \"C\" fn other(mut repeat: *mut u32, mut lists: *mut u16) -> u32 {{ return 0; }}\n\
+pub unsafe extern \"C\" fn caller(mut h: &mut Arena) -> u32 {{\n    return {callee}(&mut (*h).repeat,\n        {{ let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16; __crat_raw }});\n}}\n\
+}}\n}}\n"
+    )
+}
+
+fn expectation_h(kind: BridgeKind, argument: &str, argument_index: usize) -> BridgeExpectation {
+    let lo = ORIGINAL_H.find(argument).unwrap() as u32;
+    BridgeExpectation {
+        identity: format!("556:559:local:556:pair:arg{argument_index}"),
+        kind,
+        caller: "src::dec::caller".into(),
+        callee: "src::dec::process".into(),
+        anchor: SiteAnchor::Argument {
+            span: ByteSpan {
+                lo,
+                hi: lo + argument.len() as u32,
+            },
+            argument_index,
+        },
+        c9_stamp: None,
+        pending_source: None,
+        tier: "T2".into(),
+        waiver_id: Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.into()),
+    }
+}
+
+fn check_h(output: &str, rows: &[BridgeExpectation]) -> BridgeCustodyReport {
+    let original = syntax::inventory_source("original.rs", ORIGINAL_H).unwrap();
+    let emitted = syntax::inventory_source("emitted.rs", output).unwrap();
+    compare(BridgeCustodyInput {
+        original: &original,
+        emitted: &emitted,
+        original_source: ORIGINAL_H,
+        emitted_source: output,
+        expectations: rows,
+        context: &BridgeCustodyContext::default(),
+    })
+}
+
+#[test]
+fn r757_1_b_places_through_a_delivered_binding_at_a_raw_twin_call_are_matched() {
+    let rows = [
+        expectation_h(BridgeKind::A5SiteProofT2Fallback, "&mut (*h).repeat", 0),
+        expectation_h(BridgeKind::A5SiteProofT2Fallback, "(*h).symbol_lists", 1),
+    ];
+    let report = check_h(
+        &delivered_caller("crate::src::dec::__crat_raw_process"),
+        &rows,
+    );
+    assert!(report.data, "{report:#?}");
+    for (row, index) in report.rows.iter().zip(0..) {
+        assert_eq!(row.status, ReceiptStatus::MatchedRaw, "{report:#?}");
+        assert!(
+            row.reason.starts_with(&format!(
+                "twin-call-input-argument:arg={index};twin=src::dec::__crat_raw_process;through-delivered=h;"
+            )),
+            "{report:#?}"
+        );
+    }
+
+    // A PAIR receipt at the same site is not read through the twin.
+    let report = check_h(
+        &delivered_caller("crate::src::dec::__crat_raw_process"),
+        &[expectation_h(
+            BridgeKind::PairT2RawView,
+            "&mut (*h).repeat",
+            0,
+        )],
+    );
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+
+    // The same arguments at a call to another function are not this callee's twin.
+    let report = check_h(&delivered_caller("crate::src::dec::other"), &rows);
+    assert!(
+        !report.data
+            && report
+                .rows
+                .iter()
+                .all(|row| row.status != ReceiptStatus::MatchedRaw),
+        "{report:#?}"
+    );
+}
