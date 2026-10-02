@@ -579,6 +579,57 @@ pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Su
 /// to receive the null they may pass (binn's `binn_list_add(NULL, ..)` →
 /// `binn_list_add_raw`'s `item == NULL`). An unexported function's callers are
 /// all in the program, so their actuals stay the evidence there.
+/// Wave-6o (relay 125, R744-1): forward nullability, actual → formal (§29's
+/// "propagated to the formal"). A formal that some caller passes a binding
+/// carrying its OWN nullability evidence — an `is_null` use, a null literal at
+/// its construction or an assignment, or (for a caller parameter) a
+/// null-literal argument of its own — is nullable by that evidence, unless the
+/// callee dereferences the formal itself: a NULL there is the input's UB (§28),
+/// and the formal keeps its plain form.
+pub(super) fn param_receives_nullable_actual(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
+    null_initialized: &dyn Fn((LocalDefId, HirId)) -> bool,
+    subject: &Subject,
+) -> bool {
+    let SubjectKind::Param { hir_index } = subject.kind else { return false };
+    if entry_dereferences(tcx, subject.fn_did, subject.hir_id) {
+        return false;
+    }
+    let caller_param_receives_null = |caller: LocalDefId, binding: HirId| {
+        let Some(body) = tcx.hir_maybe_body_owned_by(caller) else { return false };
+        let Some(index) = body.params.iter().position(|p| p.pat.hir_id == binding) else {
+            return false;
+        };
+        facts.call_args.get(&caller).is_some_and(|sites| {
+            sites.iter().any(|site| {
+                site.args
+                    .iter()
+                    .any(|arg| arg.index == index && matches!(arg.shape, ArgShape::NullLit))
+            })
+        })
+    };
+    facts.call_args.get(&subject.fn_did).is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site.args.iter().any(|arg| {
+                let ArgShape::BareLocal(binding) = arg.shape else { return false };
+                if arg.index != hir_index {
+                    return false;
+                }
+                let node = (site.caller, binding);
+                facts
+                    .raw_only_uses
+                    .get(&node)
+                    .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+                    || opt_uses.get(&node).is_some_and(|uses| uses.null_assigned)
+                    || null_initialized(node)
+                    || caller_param_receives_null(site.caller, binding)
+            })
+        })
+    })
+}
+
 /// Does `function`'s own body dereference `binding` (`*x`, `(*x).f`)? An
 /// entry that does is not written to receive NULL: a NULL actual is already
 /// the input's UB there (§28), so a callee's null test is no evidence for it.

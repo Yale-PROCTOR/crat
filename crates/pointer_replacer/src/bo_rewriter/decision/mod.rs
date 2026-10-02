@@ -2414,7 +2414,20 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             || raw_field_null.contains(&(subject.fn_did, subject.hir_id))
             // Wave-6o (relay 113): an exported formal handed on to a callee
             // that null-tests it carries that test one call down.
-            || option_ops::exported_param_handed_to_null_tested_formal(tcx, facts, subject));
+            || option_ops::exported_param_handed_to_null_tested_formal(tcx, facts, subject)
+            // Wave-6o (relay 125): a caller's actual with its own nullability
+            // evidence, at a formal the callee does not dereference itself.
+            || option_ops::param_receives_nullable_actual(
+                tcx,
+                facts,
+                opt_uses,
+                &|node| {
+                    constructions.init_hirs.get(&node).is_some_and(|hir| {
+                        emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+                    })
+                },
+                subject,
+            ));
     let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
