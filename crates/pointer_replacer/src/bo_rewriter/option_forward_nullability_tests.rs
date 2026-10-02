@@ -122,3 +122,51 @@ fn wave6o_dereferenced_formal_receiving_a_nullable_actual_stays_plain() {
     );
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+/// Relay 127 (wave-6a 135's cascade): the hand-on target indexes the formal
+/// one level down (`*indent.offset(1)`), so an optional made here would meet a
+/// slice formal. The rule leaves the formal to main's 55 flow rule (a flow into
+/// a fat formal is an array use): `pretty_value::indent` is not made optional.
+#[test]
+fn wave6o_hand_on_into_an_indexing_formal_is_left_alone() {
+    let input = PRETTY.replace(
+        "    if !indent.is_null() { return *indent as i32; }\n",
+        "    let mut k: isize = 0 as isize;\n    while *indent.offset(k) != 0 as i8 { k += 1 as isize; }\n    return k as i32;\n",
+    );
+    assert!(verify::type_checks_str(&input));
+    let output = ast_emitted_source_of(&input).expect("native emission");
+    let flat = output.split_whitespace().collect::<String>();
+    assert!(
+        !flat.contains("fnpretty_value(mutdepth:i32,mutindent:Option<&i8>"),
+        "{output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}
+
+/// The same, two levels down (brotli F2's chain: `BuildAndStoreBlockSwitchEntropyCodes`
+/// → `BuildAndStoreBlockSplitCode` → the tree builders' `*tree.offset(k)`).
+#[test]
+fn wave6o_hand_on_into_an_indexing_formal_two_levels_down_is_left_alone() {
+    let input = PRETTY
+        .replace(
+            "    if !indent.is_null() { return *indent as i32; }\n",
+            "    let mut k: isize = 0 as isize;\n    while *indent.offset(k) != 0 as i8 { k += 1 as isize; }\n    return k as i32;\n",
+        )
+        .replace(
+            "unsafe fn pretty_value(",
+            "unsafe fn mid(mut indent: *const i8) -> i32 {\n    return write_indent(indent);\n}\nunsafe fn pretty_value(",
+        )
+        .replace("    return write_indent(indent);\n}\nunsafe fn write_pretty", "    return mid(indent);\n}\nunsafe fn write_pretty");
+    assert!(verify::type_checks_str(&input));
+    let output = ast_emitted_source_of(&input).expect("native emission");
+    let flat = output.split_whitespace().collect::<String>();
+    assert!(
+        flat.contains("returnmid(indent)"),
+        "fixture shape: {output}"
+    );
+    assert!(
+        !flat.contains("fnpretty_value(mutdepth:i32,mutindent:Option<&i8>"),
+        "{output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}
