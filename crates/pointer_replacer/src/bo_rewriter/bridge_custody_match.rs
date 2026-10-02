@@ -1311,6 +1311,7 @@ fn emitted_candidates<'a>(
     // declares that function, so a call to an unrelated `__crat_raw_*` cannot
     // be mistaken for this callee's.
     let twin_key = twin_callee_key(input, callee_text)?;
+    let twin_crate_key = twin_crate_callee_key(input, expected);
     let exposure_key = exposure_callee_key(input, expected, callee_text)?;
     let mut candidates = Vec::new();
     for call in input
@@ -1322,6 +1323,7 @@ fn emitted_candidates<'a>(
         let call_key = expression_key(&*expression(&call.callee_text)?);
         if call_key == key
             || twin_key.as_ref() == Some(&call_key)
+            || twin_crate_key.as_ref() == Some(&call_key)
             || exposure_key.as_ref() == Some(&call_key)
         {
             candidates.push(call);
@@ -4009,6 +4011,18 @@ fn match_receipt(
         row.reason = reason;
         return Ok(());
     }
+    if let (BridgeKind::A5SiteProofT2Fallback, SiteAnchor::Argument { argument_index, .. }) =
+        (&expected.kind, &expected.anchor)
+    {
+        if let Some((call, reason)) =
+            twin_call_input_argument(input, expected, original, *argument_index)
+        {
+            row.emitted_call = Some(call.span);
+            row.status = ReceiptStatus::MatchedRaw;
+            row.reason = reason;
+            return Ok(());
+        }
+    }
     row.status = ReceiptStatus::Missing;
     row.reason = "no-stamped-raw-view-or-matched-c9-at-original-site".into();
     Ok(())
@@ -4032,6 +4046,178 @@ fn match_receipt(
 /// the relations in force and is not the original text (a zero-syntax twin site is
 /// R499-1's, not this arm's); its bindings are the original argument's, one to one; and
 /// exactly one call qualifies.
+/// **R757-1 (main 146) — the crate-qualified spelling of this callee's raw twin.** The
+/// emission names a twin by its crate path (`crate::src::kazmath::vec3::__crat_raw_kmVec3Add`),
+/// which R447-1's key (built from the original call's own spelling) does not read. Only a
+/// twin the emitted tree declares under this very callee's module is followed.
+fn twin_crate_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+) -> Option<String> {
+    let twin_owner = twin_owner_of(expected);
+    input
+        .emitted
+        .functions
+        .iter()
+        .any(|function| function.owner == twin_owner)
+        .then(|| expression(&format!("crate::{twin_owner}")).ok())
+        .flatten()
+        .map(|callee| expression_key(&callee))
+}
+
+fn twin_owner_of(expected: &BridgeExpectation) -> String {
+    match expected.callee.rsplit_once("::") {
+        Some((module, name)) => {
+            format!(
+                "{module}::{}",
+                super::decision::counted_void::raw_twin_name(name)
+            )
+        }
+        None => super::decision::counted_void::raw_twin_name(&expected.callee),
+    }
+}
+
+/// **R757-1 (main 146) — a raw-twin call handed the input's own argument.** wave-5d's
+/// `eefb63fa9` (R738-1 (i)) sends a call it cannot adapt to the callee's raw twin with the
+/// INPUT's arguments (`__crat_raw_kmVec3Add(pOut, pOut, &mut uuv)`, brotli's
+/// `__crat_raw_ProcessSingleCodeLength(code_len, &mut (*h).symbol, ..)`). The argument is
+/// then the input's own expression at the input's own raw formal: no safe value crosses,
+/// so no raw view is owed. Matched only when (1) the call is to the declared twin, bare or
+/// crate-qualified, and exactly one such call carries this argument; (2) the twin's formal
+/// is raw; (3) the argument's expression equals the original's (or is R460-1(a)'s named
+/// intermediate of it); (4) every binding it reads pairs one to one with the original's;
+/// and (5) the argument is not a BARE path (casts peeled) naming a binding whose
+/// declaration the emission changed: a delivered binding handed bare is a raw view of the
+/// subject and owes its stamp. A borrow of a place through a delivered binding
+/// (`&mut (*h).repeat`, `h: &mut _`) is the same pointer the stamped view
+/// `from_mut(&mut (*h).repeat)` would bind, and a field read through it (`(*h).symbol_lists`)
+/// is the field's own raw value.
+fn twin_call_input_argument<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    index: usize,
+) -> Option<(&'a Call, String)> {
+    let owner = mapped_owner(&expected.caller, input.context).ok()?;
+    let twin_owner = twin_owner_of(expected);
+    let [declared] = input
+        .emitted
+        .functions
+        .iter()
+        .filter(|function| function.owner == twin_owner)
+        .collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if !matches!(
+        pointer_type(&declared.parameters.get(index)?.type_text).ok()?,
+        PointerType::Raw(_)
+    ) {
+        return None;
+    }
+    let bare = twin_owner.rsplit("::").next()?.to_owned();
+    let spellings = [format!("crate::{twin_owner}"), twin_owner.clone(), bare]
+        .iter()
+        .filter_map(|text| expression(text).ok().map(|callee| expression_key(&callee)))
+        .collect::<BTreeSet<_>>();
+    let source = expression(&original.arguments.get(index)?.text).ok()?;
+    let mut matched = Vec::new();
+    for call in input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
+    {
+        let Ok(callee) = expression(&call.callee_text) else { continue };
+        let argument = &call.arguments[index];
+        if !spellings.contains(&expression_key(&callee))
+            || input
+                .emitted_source
+                .get(argument.span.lo as usize..argument.span.hi as usize)
+                != Some(argument.text.as_str())
+        {
+            continue;
+        }
+        let Ok(emitted) = expression(&argument.text) else { continue };
+        let mut bare = unparen(&emitted);
+        while let ast::ExprKind::Cast(inner, _) = &bare.kind {
+            bare = unparen(inner);
+        }
+        let mut changed = BTreeSet::new();
+        let mut unresolved = false;
+        for usage in input.emitted.uses.iter().filter(|usage| {
+            usage.owner == call.owner
+                && argument.span.lo <= usage.span.lo
+                && usage.span.hi <= argument.span.hi
+        }) {
+            match input.emitted.bindings.get(usage.binding_id) {
+                Some(binding)
+                    if original_binding(input, binding)
+                        || (argument.span.lo <= binding.declaration_span.lo
+                            && binding.declaration_span.hi <= argument.span.hi) => {}
+                Some(binding) => {
+                    changed.insert(binding.name.clone());
+                }
+                None => unresolved = true,
+            }
+        }
+        let bare_changed = path(bare).is_some_and(|name| changed.contains(&name));
+        if (expression_key(&emitted) == expression_key(&source)
+            || named_intermediate_of(&emitted, &source))
+            && !unresolved
+            && !bare_changed
+            && argument_bindings_correspond_beside(input, original, call, index, true)
+        {
+            matched.push((call, changed));
+        }
+    }
+    let [(call, changed)] = &matched[..] else { return None };
+    let through = if changed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ";through-delivered={}",
+            changed.iter().cloned().collect::<Vec<_>>().join(",")
+        )
+    };
+    Some((
+        call,
+        format!(
+            "twin-call-input-argument:arg={index};twin={twin_owner}{through};argument={}",
+            call.arguments[index].text
+        ),
+    ))
+}
+
+/// R460-1(a)'s rename and nothing else: `{ let __crat_raw: T = <e> as T; __crat_raw }`
+/// whose initializer, casts peeled, is the original argument's expression, casts peeled.
+fn named_intermediate_of(emitted: &ast::Expr, source: &ast::Expr) -> bool {
+    let peel = |mut expression: &ast::Expr| {
+        expression = unparen(expression);
+        while let ast::ExprKind::Cast(inner, _) = &expression.kind {
+            expression = unparen(inner);
+        }
+        expression_key(expression)
+    };
+    let ast::ExprKind::Block(block, None) = &unparen(emitted).kind else {
+        return false;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return false;
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(tail)) = (&statement.kind, &tail.kind)
+    else {
+        return false;
+    };
+    let (ast::PatKind::Ident(_, name, None), Some(initializer)) =
+        (&local.pat.kind, local.kind.init())
+    else {
+        return false;
+    };
+    path(unparen(tail)).is_some_and(|tail| tail == name.name.as_str())
+        && peel(initializer) == peel(source)
+}
+
 fn twin_inline_raw_view<'a>(
     input: &'a BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -4109,6 +4295,18 @@ fn argument_bindings_correspond(
     call: &Call,
     index: usize,
 ) -> bool {
+    argument_bindings_correspond_beside(input, original, call, index, false)
+}
+
+/// As [`argument_bindings_correspond`]; with `skip_inner`, a binding the emitted argument
+/// itself declares (R460-1(a)'s `__crat_raw`) is the argument's own name, not a caller's.
+fn argument_bindings_correspond_beside(
+    input: &BridgeCustodyInput<'_>,
+    original: &Call,
+    call: &Call,
+    index: usize,
+    skip_inner: bool,
+) -> bool {
     let within = |owner: &str, span: ByteSpan, usage: &super::bridge_custody_syntax::BindingUse| {
         usage.owner == owner && span.lo <= usage.span.lo && usage.span.hi <= span.hi
     };
@@ -4119,12 +4317,20 @@ fn argument_bindings_correspond(
         .filter(|usage| within(&original.owner, original.arguments[index].span, usage))
         .map(|usage| usage.binding_id)
         .collect::<BTreeSet<_>>();
+    let span = call.arguments[index].span;
     let emitted_ids = input
         .emitted
         .uses
         .iter()
-        .filter(|usage| within(&call.owner, call.arguments[index].span, usage))
+        .filter(|usage| within(&call.owner, span, usage))
         .map(|usage| usage.binding_id)
+        .filter(|id| {
+            !skip_inner
+                || input.emitted.bindings.get(*id).is_none_or(|binding| {
+                    !(span.lo <= binding.declaration_span.lo
+                        && binding.declaration_span.hi <= span.hi)
+                })
+        })
         .collect::<BTreeSet<_>>();
     let pairs =
         |original: &Binding, emitted: &Binding| same_source_binding(input, original, emitted);
