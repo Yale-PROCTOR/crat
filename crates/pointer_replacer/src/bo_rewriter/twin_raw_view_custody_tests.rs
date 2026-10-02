@@ -440,3 +440,108 @@ fn r757_1_b_places_through_a_delivered_binding_at_a_raw_twin_call_are_matched() 
         "{report:#?}"
     );
 }
+
+/// **R757-1 tightening (main 146 STOP 2; Codex findings 2–4).** Each case below is one the
+/// arm must refuse; at `a5ffb2e05` each was matched.
+/// (2) The input calls the callee twice with the same argument at this index, and the
+/// emission keeps one twin call: the receipt cannot be paired with an invocation.
+#[test]
+fn r757_1_c_two_original_calls_with_this_argument_are_not_one_site() {
+    let original = ORIGINAL_H.replace(
+        "    return process(&mut (*h).repeat, (*h).symbol_lists);",
+        "    process(&mut (*h).repeat, 0 as *mut u16);\n    return process(&mut (*h).repeat, (*h).symbol_lists);",
+    );
+    let rows = [expectation_on(
+        &original,
+        BridgeKind::A5SiteProofT2Fallback,
+        "&mut (*h).repeat, (*h).symbol_lists",
+        "&mut (*h).repeat",
+        0,
+    )];
+    let report = check_on(
+        &original,
+        &delivered_caller("crate::src::dec::__crat_raw_process"),
+        &rows,
+    );
+    assert!(
+        !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+        "{report:#?}"
+    );
+}
+
+/// (3) A block that binds by reference, or binds an integer, or casts through an
+/// integer, is not R460-1(a)'s by-value raw intermediate of the original.
+#[test]
+fn r757_1_d_only_a_by_value_raw_temporary_is_a_named_intermediate() {
+    let row = [expectation_h(
+        BridgeKind::A5SiteProofT2Fallback,
+        "(*h).symbol_lists",
+        1,
+    )];
+    for block in [
+        "{ let ref mut __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16; __crat_raw }",
+        "{ let __crat_raw: usize = ((*h).symbol_lists) as usize; __crat_raw }",
+        "{ let __crat_raw: *mut u16 = ((*h).symbol_lists) as usize as *mut u16; __crat_raw }",
+        "{ let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u8; __crat_raw }",
+    ] {
+        let output = delivered_caller("crate::src::dec::__crat_raw_process").replace(
+            "{ let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16; __crat_raw }",
+            block,
+        );
+        let report = check_h(&output, &row);
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "{block}: {report:#?}"
+        );
+    }
+}
+
+/// (4) A bare or module-relative spelling of the twin's name is not proven to resolve to
+/// the declared twin: only the crate-qualified spelling the redirect emits is read.
+#[test]
+fn r757_1_e_only_the_crate_qualified_twin_spelling_is_read() {
+    let rows = [expectation_h(
+        BridgeKind::A5SiteProofT2Fallback,
+        "&mut (*h).repeat",
+        0,
+    )];
+    for callee in ["__crat_raw_process", "src::dec::__crat_raw_process"] {
+        let report = check_h(&delivered_caller(callee), &rows);
+        assert!(
+            !report.data && report.rows[0].status != ReceiptStatus::MatchedRaw,
+            "{callee}: {report:#?}"
+        );
+    }
+}
+
+fn expectation_on(
+    original: &str,
+    kind: BridgeKind,
+    anchor_after: &str,
+    argument: &str,
+    argument_index: usize,
+) -> BridgeExpectation {
+    let lo = (original.rfind(anchor_after).unwrap() + anchor_after.find(argument).unwrap()) as u32;
+    let mut expected = expectation_h(kind, argument, argument_index);
+    expected.anchor = SiteAnchor::Argument {
+        span: ByteSpan {
+            lo,
+            hi: lo + argument.len() as u32,
+        },
+        argument_index,
+    };
+    expected
+}
+
+fn check_on(original: &str, output: &str, rows: &[BridgeExpectation]) -> BridgeCustodyReport {
+    let inventory = syntax::inventory_source("original.rs", original).unwrap();
+    let emitted = syntax::inventory_source("emitted.rs", output).unwrap();
+    compare(BridgeCustodyInput {
+        original: &inventory,
+        emitted: &emitted,
+        original_source: original,
+        emitted_source: output,
+        expectations: rows,
+        context: &BridgeCustodyContext::default(),
+    })
+}
