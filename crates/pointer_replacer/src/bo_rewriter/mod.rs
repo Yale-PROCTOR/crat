@@ -195,6 +195,8 @@ mod wave6a_fixture_tulip;
 #[cfg(test)]
 mod wave6a_held_callee_tests;
 #[cfg(test)]
+mod wave6a_leak_parity_receipt_tests;
+#[cfg(test)]
 mod wave6a_moved_owner_tests;
 #[cfg(test)]
 mod wave6a_receiver_handover_tests;

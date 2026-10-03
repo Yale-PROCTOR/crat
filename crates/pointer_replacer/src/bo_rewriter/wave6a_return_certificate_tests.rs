@@ -889,6 +889,26 @@ fn w6a_a1b_quadtree_assignment_receivers_stores_and_the_stored_call_deliver() {
     }
 }
 
+/// R792-4: the receivers' close rows as `function\tline\towner` (one row per
+/// exit that holds the owner; the site's path is the fixture's temp dir).
+fn receiver_closes(receipts: &str) -> Vec<String> {
+    receipts
+        .lines()
+        .filter(|line| line.contains("\treceiver\t"))
+        .map(|line| {
+            let (function, detail) = line.split_once("\treceiver\t").unwrap();
+            let rest = detail
+                .strip_prefix("waiver-drop(scope-exit) site=")
+                .unwrap_or_else(|| panic!("a close names its site: {line}"));
+            let (site, owner) = rest
+                .rsplit_once(" receiver=")
+                .unwrap_or_else(|| panic!("a close names its owner: {line}"));
+            let line_no = site.split(':').nth(1).unwrap();
+            format!("{function}\t{line_no}\t{owner}")
+        })
+        .collect()
+}
+
 /// **R619-3 (2) — a receiver live at an early exit is receipted** (wave-6o
 /// 081 STOP 2). In the chain, `nw` still owns at `ne`'s null return: C leaked
 /// it there, and the emitted `Option<Box>` drops it at scope exit. The stores
@@ -899,15 +919,12 @@ fn w6a_a1b_quadtree_assignment_receivers_stores_and_the_stored_call_deliver() {
 fn r619_3_a_receiver_live_at_an_early_exit_is_receipted() {
     let out = emitted("cert-quadtree-exit-close", QUADTREE_CHAIN);
     let receipts = &out.artifacts.return_certificate_receipts;
-    let exit_rows = receipts
-        .lines()
-        .filter(|line| line.contains("exit-path"))
+    // R792-4: the row names its exit, `ne`'s null return (line 66).
+    let exit_rows = receiver_closes(receipts)
+        .into_iter()
+        .filter(|row| row.starts_with("split_node_\t"))
         .collect::<Vec<_>>();
-    assert_eq!(
-        exit_rows,
-        ["split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=nw"],
-        "{receipts}"
-    );
+    assert_eq!(exit_rows, ["split_node_\t66\tnw"], "{receipts}");
 }
 
 /// **R645-12 (b), wave-6o 085 STOP 1 — the corpus's four, on its full
@@ -955,19 +972,23 @@ unsafe extern "C" fn test_node() {
     assert_eq!(source.matches("pub se: *mut quadtree_node").count(), 1);
     let out = emitted("r645-quadtree-four-closes", &source);
     let receipts = &out.artifacts.return_certificate_receipts;
-    let receiver_rows = receipts
-        .lines()
-        .filter(|line| line.contains("\treceiver\t"))
-        .collect::<Vec<_>>();
+    // R792-4: one row per exit that holds an owner. `split_node_`'s three
+    // null returns (72, 76, 80) hold one, two and three children: six closes.
+    // `test_node`'s `node` is live at both its exits.
+    let receiver_rows = receiver_closes(receipts);
     assert_eq!(
         receiver_rows,
         [
             // The fixture's own `driver` never frees its `tree` either.
-            "driver\treceiver\twaiver-drop(scope-exit)",
-            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=ne",
-            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=nw",
-            "split_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=sw",
-            "test_node\treceiver\twaiver-drop(scope-exit)",
+            "driver\t107\ttree",
+            "split_node_\t72\tnw",
+            "split_node_\t76\tne",
+            "split_node_\t76\tnw",
+            "split_node_\t80\tne",
+            "split_node_\t80\tnw",
+            "split_node_\t80\tsw",
+            "test_node\t116\tnode",
+            "test_node\t118\tnode",
         ],
         "{receipts}\n{}",
         out.source
@@ -1180,17 +1201,66 @@ pub unsafe extern "C" fn fill(mut s: *mut slot, mut n: i32) {
 }
 "#;
 
+/// LOOP_EXIT with a second `continue` that holds `it`: two path ends, two
+/// rows (R792-4).
+const LOOP_EXIT_TWICE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct item { pub id: i32 }
+#[repr(C)]
+pub struct slot { pub it: *mut item }
+pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
+    let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
+    if it.is_null() {
+        return 0 as *mut item;
+    }
+    (*it).id = id;
+    return it;
+}
+pub unsafe extern "C" fn fill(mut s: *mut slot, mut n: i32) {
+    let mut i = 0 as i32;
+    while i < n {
+        let mut it = item_new(i);
+        i += 1;
+        if it.is_null() {
+            continue;
+        }
+        if (*it).id % 2 as i32 != 0 as i32 {
+            continue;
+        }
+        if (*it).id % 3 as i32 != 0 as i32 {
+            continue;
+        }
+        (*s).it = it;
+    }
+}
+"#;
+
 #[test]
 fn r619_3_a_receiver_live_at_a_loop_scope_exit_is_receipted() {
     let out = emitted("cert-loop-exit-close", LOOP_EXIT);
     let receipts = &out.artifacts.return_certificate_receipts;
-    let exit_rows = receipts
-        .lines()
-        .filter(|line| line.contains("exit-path"))
-        .collect::<Vec<_>>();
+    // R792-4: the row names its exit, the holding `continue` (line 27).
     assert_eq!(
-        exit_rows,
-        ["fill\treceiver\twaiver-drop(scope-exit) exit-path receiver=it"],
+        receiver_closes(receipts),
+        ["fill\t27\tit"],
+        "{receipts}\n{}",
+        out.source
+    );
+}
+
+/// **R792-4** — two `continue`s that hold the owner are two path ends: two
+/// rows, not one per loop body.
+#[test]
+fn w6a_r792_two_holding_continues_are_two_closes() {
+    let out = emitted("r792-loop-exit-twice", LOOP_EXIT_TWICE);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        receiver_closes(receipts),
+        ["fill\t27\tit", "fill\t30\tit"],
         "{receipts}\n{}",
         out.source
     );
