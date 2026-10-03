@@ -675,3 +675,97 @@ fn w6l_window_a_raw_address_of_the_view_keeps_the_receiver_raw() {
         "q",
     );
 }
+
+/// **R791-4 (b):** the view is dereferenced on SOME non-null paths only
+/// (`if n > 2 { *q = 2 }`), so `as_mut()` at the declaration would assert a
+/// dereferenceability the input does not rely on where `n <= 2`. (buffer's
+/// `test_buffer_slice__range_error::a`, never dereferenced at all, is the
+/// corpus row of this class.)
+const PARTIAL_DEREFERENCE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct holder {
+    pub n: i32,
+    pub p: *mut i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn get(mut h: *mut holder) -> *mut i32 {
+    if (*h).n == 0 as i32 {
+        return 0 as *mut i32;
+    }
+    return (*h).p;
+}
+#[no_mangle]
+pub unsafe extern "C" fn probe(mut n: i32) -> i32 {
+    let mut buf: [i32; 4] = [0 as i32; 4];
+    let mut h = holder { n: n, p: buf.as_mut_ptr() };
+    let mut q = get(&mut h);
+    if q.is_null() {
+        return 1 as i32;
+    }
+    if n > 2 as i32 {
+        *q = 2 as i32;
+    }
+    return 0 as i32;
+}
+"#;
+
+/// **R791-4 (a), lil `lil_get_var_or`'s shape:** a `char` pointer (the type
+/// rule's wildcard: it may point into the view's pointee) is live across the
+/// declaration — used after it — so the declaration's whole-`T` retag may
+/// freeze what it points through.
+const LIVE_CHAR_POINTER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct var_t {
+    pub v: usize,
+    pub env: usize,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil {
+    pub rootenv: usize,
+    pub vars: *mut *mut var_t,
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_find_var(mut l: *mut lil) -> *mut var_t {
+    if (*l).rootenv == 0 as usize {
+        return 0 as *mut var_t;
+    }
+    return *((*l).vars).offset(0 as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn first_byte(mut s: *const i8) -> usize {
+    return *s as usize;
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_get_var_or(mut l: *mut lil, mut name: *const i8, mut defvalue: usize) -> usize {
+    let mut var = lil_find_var(l);
+    let mut retval = if !var.is_null() { (*var).v } else { defvalue };
+    return retval + first_byte(name);
+}
+"#;
+
+/// **RED (R791-4 (b)).**
+#[test]
+fn w6l_window_a_view_not_dereferenced_on_every_non_null_path_keeps_the_receiver_raw() {
+    view_not_typed(
+        "partial-dereference",
+        PARTIAL_DEREFERENCE,
+        &["get", "probe"],
+        "q",
+    );
+}
+
+/// **RED (R791-4 (a)).**
+#[test]
+fn w6l_window_a_live_char_pointer_keeps_the_receiver_raw() {
+    view_not_typed(
+        "live-char-pointer",
+        LIVE_CHAR_POINTER,
+        &["lil_find_var", "first_byte", "lil_get_var_or"],
+        "var",
+    );
+}
