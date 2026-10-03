@@ -1012,3 +1012,40 @@ fn w6l_r072_a_walk_through_a_converted_callee_does_not_hold_its_thin_callers() {
         assert!(!held.iter().any(|l| l == label), "{label}: {held:?}");
     }
 }
+
+/// D1 (relay 075 review, finding 1a) — a forwarding DIAMOND outside guard mode:
+/// `top` hands `w` to `p`, which hands it bare to a cast forwarder and to a bare one; the cast one hands
+/// it to `f` through a redundant cast, the bare one hands it bare; `f` hands it
+/// bare to `g`, which writes five elements past it. Outside guard mode a cast
+/// hop continues only a counted chain, so the cast path is discarded — and the
+/// forwarders it visited must not be left marked, or the all-bare path finds
+/// `f` visited and `top` loses its hold, by hash order. Every definition order
+/// and call order is pinned.
+#[test]
+fn w6l_seethrough_d1_a_discarded_cast_hop_does_not_hide_a_bare_path() {
+    const CAST: &str = "unsafe fn via_cast(mut x: *mut i8) {\n    f(x as *mut i8);\n}\n";
+    const BARE: &str = "unsafe fn via_bare(mut y: *mut i8) {\n    f(y);\n}\n";
+    for (defs, calls) in [
+        ([CAST, BARE], ["via_cast", "via_bare"]),
+        ([CAST, BARE], ["via_bare", "via_cast"]),
+        ([BARE, CAST], ["via_cast", "via_bare"]),
+        ([BARE, CAST], ["via_bare", "via_cast"]),
+    ] {
+        let input = format!(
+            "#![allow(dead_code, unused_mut, unused_variables, non_snake_case)]\n\
+             unsafe fn g(mut r: *mut i8) {{\n    *r.offset(5 as i32 as isize) = 0 as i32 as i8;\n}}\n\
+             unsafe fn f(mut q: *mut i8) {{\n    g(q);\n}}\n\
+             {}{}\
+             unsafe fn p(mut z: *mut i8) {{\n    {}(z);\n    {}(z);\n}}\n\
+             pub unsafe fn top(mut w: *mut i8) {{\n    p(w);\n}}\n",
+            defs[0], defs[1], calls[0], calls[1]
+        );
+        let map = access_map(&input);
+        // `top::w` is the thin caller whose hold is decided by ONE exploration
+        // of `p::z` (`collect` classifies each callee parameter afresh).
+        assert!(
+            map.iter().any(|(l, _)| l == "top::w"),
+            "{defs:?} {calls:?}: {map:#?}"
+        );
+    }
+}
