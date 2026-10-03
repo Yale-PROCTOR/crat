@@ -3061,6 +3061,40 @@ mod nested {
     );
 }
 
+/// **R760-1 x R605-2 (main 160d) — the emitted crate's `#[global_allocator]` does not
+/// hide its modules' bindings.** Every emitted tree declares `#[global_allocator] static
+/// __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` at its root (R760-1, batch 54), and the
+/// inventory reads any attribute it does not know as one that may add items, so the
+/// root went opaque and R605-2's alias resolution failed closed crate-wide: brotli's
+/// `BrotliBuildMetaBlockGreedyInternal(.., literal_context_lut: ContextLut, ..)` read
+/// `pending-target-is-not-raw` again on the 54-prime candidate (two pending
+/// sibling-overlap rows, `data=false`). The builtin expands to the allocator shims
+/// inside an anonymous `const _`: no type name, no module-level function. An unknown
+/// attribute macro at the root still makes it opaque (the control).
+#[test]
+fn r760_1_a_global_allocator_at_the_root_leaves_the_raw_alias_raw() {
+    use crate::bo_rewriter::bridge_custody_match::pending_target_check_for_test as check;
+    const EMITTED: &str = "mod metablock {
+    pub type ContextLut = *const u8;
+    pub unsafe fn callee(lut: ContextLut) {}
+}
+mod histogram {
+    use crate::metablock::ContextLut;
+    pub unsafe fn imported(lut: ContextLut) {}
+}
+#[global_allocator]
+static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;
+";
+    assert_eq!(check(EMITTED, "metablock::callee", 0), Ok(()));
+    assert_eq!(check(EMITTED, "histogram::imported", 0), Ok(()));
+    let unknown = EMITTED.replace("#[global_allocator]", "#[some_attribute_macro]");
+    assert_eq!(
+        check(&unknown, "histogram::imported", 0),
+        Err("pending-target-is-not-raw".to_owned()),
+        "an attribute that may add items still makes the root opaque"
+    );
+}
+
 /// **R605-2, the controls (Codex's two reviews of the first forms).** A callee formal
 /// resolves only through its own module's explicit binding; every formal below is
 /// not provably a raw pointer, so each fails closed as not raw.
