@@ -1233,9 +1233,10 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
 /// planned `from_raw_parts_mut(chunk.offset(..), (CRC) as usize)`. A sibling
 /// argument is a length only with evidence: a count position of the callee's
 /// own pinned contract that names it (D1's op-fact discipline); otherwise the
-/// construction takes the fallback extent and its receipt. R707: `set32bit`'s
+/// construction takes the fallback extent and its receipt. R677-6: `set32bit`'s
 /// straight-line body writes exactly four bytes, so the length is `4`
-/// (`len-callee-bound:must:4`) — still never the value `crc`.
+/// (`len-callee-access`, ahead of R707's bound, R780-2) — still never the
+/// value `crc`.
 const CE_L01_VALUE_IS_NOT_A_LENGTH: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_assignments)]
 static mut SAVED: *mut u8 = 0 as *mut u8;

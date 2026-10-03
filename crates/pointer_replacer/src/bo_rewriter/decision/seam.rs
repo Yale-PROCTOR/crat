@@ -6116,36 +6116,60 @@ pub(crate) fn synthesize_with_raw_boundary(
                             Some(elements) => {
                                 (Some(elements.to_string()), Some(LenEvidence::ArrayType))
                             }
-                            // **R677-6** — nor an array: the callee's own
-                            // straight-line accesses, where they prove one
-                            // (`element_extent`), rather than the fabricated extent.
-                            None => match super::element_extent::constant_access_extent(
-                                tcx, *callee, pos.index,
-                            ) {
-                                Some(elements) => {
-                                    (Some(elements.to_string()), Some(LenEvidence::CalleeAccess))
-                                }
-                                // wave-6l relay 071 (R697-7): nor a constant
-                                // access extent: a licensed field's allocation
-                                // length, read from the same object.
-                                None => match site
-                                    .args
-                                    .iter()
-                                    .find(|argument| argument.index == pos.index)
-                                    .and_then(|argument| {
-                                        table.field_alloc_lengths.get(&(site.caller, argument.span))
-                                    }) {
-                                    Some(length) => {
-                                        (Some(length.clone()), Some(LenEvidence::FieldAlloc))
-                                    }
-                                    // wave-6l relay 077 (R776-4): nor a field's
-                                    // allocation: a C string's `strlen + 1`.
-                                    None => match &nul_walk_len {
-                                        Some(len) => {
-                                            nul_walk_used.set(true);
-                                            (Some(len.clone()), Some(LenEvidence::NulWalk))
+                            // **R763-2** (first, R780-2 / R788-5) — a struct field
+                            // whose element count is a sibling field, proven from
+                            // every write of the pair (`field_count`).
+                            None => match site
+                                .args
+                                .iter()
+                                .find(|argument| argument.index == pos.index)
+                                .and_then(|argument| {
+                                    super::field_count::length_at_span(
+                                        tcx,
+                                        site.caller,
+                                        argument.span,
+                                    )
+                                }) {
+                                Some((text, key)) => (
+                                    Some(text),
+                                    Some(LenEvidence::FieldCount {
+                                        key: super::callee_bound::intern(key),
+                                    }),
+                                ),
+                                // **R677-6** — nor an array: the callee's own
+                                // straight-line accesses, where they prove one
+                                // (`element_extent`), rather than the fabricated extent.
+                                None => match super::element_extent::constant_access_extent(
+                                    tcx, *callee, pos.index,
+                                ) {
+                                    Some(elements) => (
+                                        Some(elements.to_string()),
+                                        Some(LenEvidence::CalleeAccess),
+                                    ),
+                                    // wave-6l relay 071 (R697-7): nor a constant
+                                    // access extent: a licensed field's allocation
+                                    // length, read from the same object.
+                                    None => match site
+                                        .args
+                                        .iter()
+                                        .find(|argument| argument.index == pos.index)
+                                        .and_then(|argument| {
+                                            table
+                                                .field_alloc_lengths
+                                                .get(&(site.caller, argument.span))
+                                        }) {
+                                        Some(length) => {
+                                            (Some(length.clone()), Some(LenEvidence::FieldAlloc))
                                         }
-                                        None => (None, len_evidence),
+                                        // wave-6l relay 077 (R776-4): nor a field's
+                                        // allocation: a C string's `strlen + 1`.
+                                        None => match &nul_walk_len {
+                                            Some(len) => {
+                                                nul_walk_used.set(true);
+                                                (Some(len.clone()), Some(LenEvidence::NulWalk))
+                                            }
+                                            None => (None, len_evidence),
+                                        },
                                     },
                                 },
                             },
@@ -6279,10 +6303,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     pos.index,
                     len_text,
                 );
-                // **R707** — no companion, contract, region, C string, array or
-                // tail companion: the callee's own accesses, instantiated with
-                // this call's arguments, rather than the fabricated extent. Last
-                // of the evidence arms, so it replaces only a fallback.
+                // **R707** — no companion, contract, region, C string, array,
+                // field count, callee access (R677-6) or tail companion: the
+                // callee's own accesses, instantiated with this call's
+                // arguments, rather than the fabricated extent. Last of the
+                // evidence arms (R780-2), so it replaces only a fallback.
                 let (len_text, len_evidence) = match len_text {
                     None if pos.found == Form::Raw
                         && matches!(
@@ -6290,29 +6315,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                             Form::Slice { .. } | Form::Opt { slice: true, .. }
                         ) =>
                     {
-                        // R763-2 first (a proven `must`), then the callee's bound.
-                        let field = site
-                            .args
-                            .iter()
-                            .find(|argument| argument.index == pos.index)
-                            .and_then(|argument| {
-                                super::field_count::length_at_span(tcx, site.caller, argument.span)
-                            });
-                        match field {
-                            Some((text, key)) => (
-                                Some(text),
-                                Some(LenEvidence::FieldCount {
-                                    key: super::callee_bound::intern(key),
-                                }),
-                            ),
-                            None => match super::callee_bound::at_call_site(
-                                tcx, *callee, pos.index, &site.args, sm,
-                            ) {
-                                Some((text, key)) => {
-                                    (Some(text), Some(LenEvidence::CalleeBound { key }))
-                                }
-                                None => (None, len_evidence),
-                            },
+                        match super::callee_bound::at_call_site(
+                            tcx, *callee, pos.index, &site.args, sm,
+                        ) {
+                            Some((text, key)) => {
+                                (Some(text), Some(LenEvidence::CalleeBound { key }))
+                            }
+                            None => (None, len_evidence),
                         }
                     }
                     text => (text, len_evidence),
