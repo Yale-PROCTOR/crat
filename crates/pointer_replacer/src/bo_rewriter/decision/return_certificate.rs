@@ -212,31 +212,50 @@ pub(crate) fn confirm_transfers(
     for c in certificates.callees.values_mut() {
         let ready = std::mem::take(&mut c.handover_ready);
         let mut kept = Vec::new();
-        for (did, index, owner) in std::mem::take(&mut c.transfers) {
-            let handover = ready
-                .iter()
-                .find(|(key, d, i, _)| *key == owner && *d == did && *i == index);
-            match handover {
-                Some((_, _, _, argument)) if !confirmed(did, index) => {
-                    let name = tcx
-                        .sess
-                        .source_map()
-                        .span_to_snippet(*argument)
-                        .unwrap_or_default();
-                    handed.push((
-                        owner,
-                        BoxExprEdit {
-                            span: *argument,
-                            replacement: format!("Box::into_raw({name})"),
-                            receipt: "return-certificate-receiver-handover",
-                        },
-                    ));
-                    c.receipts.push(format!(
-                        "return-certificate-receiver-handover callee={} index={index}",
-                        tcx.def_path_str(did)
-                    ));
+        let transfers = std::mem::take(&mut c.transfers);
+        // Codex (R776-5 review): an occurrence, not a formal — every
+        // unconfirmed transfer of this owner into this formal needs its own
+        // ready hand-over, or none is made and the certificate withdraws.
+        let mut done: Vec<((LocalDefId, HirId), DefId, usize)> = Vec::new();
+        for &(did, index, owner) in &transfers {
+            if confirmed(did, index) || done.contains(&(owner, did, index)) {
+                if confirmed(did, index) {
+                    kept.push((did, index, owner));
                 }
-                _ => kept.push((did, index, owner)),
+                continue;
+            }
+            done.push((owner, did, index));
+            let occurrences = transfers
+                .iter()
+                .filter(|t| **t == (did, index, owner))
+                .count();
+            let arguments: Vec<Span> = ready
+                .iter()
+                .filter(|(key, d, i, _)| *key == owner && *d == did && *i == index)
+                .map(|(_, _, _, argument)| *argument)
+                .collect();
+            if arguments.len() != occurrences {
+                kept.extend(std::iter::repeat_n((did, index, owner), occurrences));
+                continue;
+            }
+            for argument in arguments {
+                let name = tcx
+                    .sess
+                    .source_map()
+                    .span_to_snippet(argument)
+                    .unwrap_or_default();
+                handed.push((
+                    owner,
+                    BoxExprEdit {
+                        span: argument,
+                        replacement: format!("Box::into_raw({name})"),
+                        receipt: "return-certificate-receiver-handover",
+                    },
+                ));
+                c.receipts.push(format!(
+                    "return-certificate-receiver-handover callee={} index={index}",
+                    tcx.def_path_str(did)
+                ));
             }
         }
         c.transfers = kept;
@@ -1291,9 +1310,10 @@ impl<'tcx> UseWalk<'_, 'tcx> {
 
     /// **R776-5** — may the owner be handed over at `call`: a sized,
     /// non-optional owner whose last use it is? No use of the binding later
-    /// in the text, and no enclosing loop the binding outlives (its next pass
-    /// would use the moved owner).
-    fn handover(&self, call: &Expr<'_>) -> bool {
+    /// in the text than this `argument` (a sibling argument after it counts),
+    /// and no enclosing loop the binding outlives (its next pass would use
+    /// the moved owner).
+    fn handover(&self, call: &Expr<'_>, argument: Span) -> bool {
         if self.optional || self.shape != BoxShape::Sized {
             return false;
         }
@@ -1331,7 +1351,7 @@ impl<'tcx> UseWalk<'_, 'tcx> {
         };
         let mut later = Later {
             binding: self.binding,
-            after: call.span.hi(),
+            after: argument.hi(),
             found: false,
         };
         later.visit_expr(self.tcx.hir_body(body).value);
@@ -1669,7 +1689,7 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     // A1-c: moved into the consuming formal; the chain
                     // confirms it (`confirm_transfers`) or this owner withdraws
                     // — or, R776-5, is handed over where the formal stays raw.
-                    let ready = self.raw_formal.is_some() && self.handover(parent);
+                    let ready = self.raw_formal.is_some() && self.handover(parent, e.span);
                     if let Ok(uses) = &mut self.out {
                         uses.transfers.push((did, index, parent.span));
                         if ready {
@@ -1685,7 +1705,7 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     // it again. No drop is added and none removed.
                     if let Some(did) = callee_def
                         && self.raw_formal.is_some_and(|raw| raw(did, index))
-                        && self.handover(parent)
+                        && self.handover(parent, e.span)
                     {
                         self.push(
                             e.span,

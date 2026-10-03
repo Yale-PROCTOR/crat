@@ -145,6 +145,9 @@ fn run(name: &str, body: &str) -> super::wave6a_allocation_tests::Emitted {
         "keep_c::h",
         "keep_c::b",
         "p_take::p",
+        "keep_two::h",
+        "keep_two::a",
+        "keep_two::b",
     ]
     .into_iter()
     .map(|l| (l.to_owned(), SlotKind::Raw))
@@ -336,5 +339,49 @@ pub unsafe extern "C" fn go(mut h: *mut *mut i8) {
     assert!(
         receipts.contains("call-argument-not-a-lend:keep_c(h, b, 0 as i32)"),
         "{receipts}"
+    );
+}
+
+/// Codex (R776-5 review, high): two transfers into the same formal on two
+/// paths — only the second is a last use in the text — are two occurrences;
+/// one ready hand-over does not cover both, so the certificate withdraws.
+#[test]
+fn w6a_r776_two_transfers_into_one_formal_need_two_hand_overs() {
+    held(
+        "r776-two-transfers",
+        r#"
+pub unsafe extern "C" fn go(mut n: i32) {
+    let mut q = p_new(2.0f64);
+    if n > 0 as i32 {
+        p_free(q);
+    } else {
+        p_free(q);
+    }
+}
+"#,
+        "return-certificate-transfer-unconfirmed",
+    );
+}
+
+/// Codex (R776-5 review, medium): the receiver passed twice in one call is
+/// used after its first argument; neither occurrence is a last use.
+#[test]
+fn w6a_r776_a_receiver_passed_twice_in_one_call_is_held() {
+    held(
+        "r776-twice",
+        r#"
+unsafe extern "C" fn keep_two(mut h: *mut H, mut a: *mut P, mut b: *mut P, mut depth: i32) -> i32 {
+    if depth > 0 as i32 {
+        return keep_two(h, a, b, depth - 1 as i32);
+    }
+    (*h).p = a;
+    return 1 as i32;
+}
+pub unsafe extern "C" fn go(mut h: *mut H) {
+    let mut p = p_new(1.0f64);
+    keep_two(h, p, p, 0 as i32);
+}
+"#,
+        "call-argument-not-a-lend:keep_two(h, p, p, 0 as i32)",
     );
 }
