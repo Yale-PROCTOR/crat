@@ -22,9 +22,17 @@
 //! a deref, a field access — so a returned, stored or handed-on local is
 //! refused rather than manufactured. That keeps the untied view inside the
 //! frame that created it, which is what makes it safe on a UB-free input.
+//!
+//! **Review r1 of R785: the view must also be QUIET.** The frame is not
+//! enough: the view exists from the declaration on, where the input had only
+//! a raw pointer, so a write to the pointee through another pointer before a
+//! use (or a read through another pointer between two writes through the
+//! view) makes the output's access UB under Tree Borrows. [`quiet_window`]
+//! refuses both.
 
+use rustc_hash::FxHashSet;
 use rustc_hir::{
-    Expr, ExprKind, HirId, Node, PatKind, QPath, UnOp,
+    Expr, ExprKind, HirId, LetStmt, Node, PatKind, QPath, StmtKind, UnOp,
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
@@ -123,6 +131,302 @@ fn uses_are_closed(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
     uses.ok && uses.seen_null_test
 }
 
+/// Every use of `binding` in a body, by a walk that never stops early, and the
+/// locals whose address the body takes (their memory may be the pointee).
+struct AllUses {
+    binding: HirId,
+    spans: Vec<Span>,
+    closure: bool,
+    borrowed: FxHashSet<HirId>,
+}
+
+impl<'tcx> Visitor<'tcx> for AllUses {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match expr.kind {
+            ExprKind::Closure(..) => self.closure = true,
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Local(hir) = path.res
+                    && hir == self.binding
+                {
+                    self.spans.push(expr.span);
+                }
+            }
+            ExprKind::AddrOf(_, _, inner) => {
+                if let Some(hir) = place_root_local(inner) {
+                    self.borrowed.insert(hir);
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+/// The local a place expression is rooted at, through fields and indexing
+/// only (`x`, `x.f`, `x[i].g`) — not through a dereference.
+fn place_root_local(mut expr: &Expr<'_>) -> Option<HirId> {
+    loop {
+        match expr.kind {
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => expr = base,
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                return match path.res {
+                    Res::Local(hir) => Some(hir),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// A place written THROUGH the local: `*l`, `(*l).f`, `(*l).a[i]`.
+fn through(binding: HirId, mut expr: &Expr<'_>) -> bool {
+    loop {
+        match expr.kind {
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => expr = base,
+            ExprKind::Unary(UnOp::Deref, inner) => {
+                return matches!(inner.kind, ExprKind::Path(QPath::Resolved(_, path))
+                    if matches!(path.res, Res::Local(hir) if hir == binding));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Raw-pointer methods that compute an address and touch no memory.
+const ADDRESS_METHODS: &[&str] = &[
+    "is_null",
+    "offset",
+    "add",
+    "sub",
+    "wrapping_offset",
+    "wrapping_add",
+    "wrapping_sub",
+    "offset_from",
+    "cast",
+    "cast_mut",
+    "cast_const",
+];
+
+/// The window's checker: what may run between the declaration and the last
+/// use, and where the view's writes and the other memory reads lie.
+struct Window<'a, 'tcx> {
+    typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+    binding: HirId,
+    borrowed: &'a FxHashSet<HirId>,
+    ok: bool,
+    /// The point (end of the assignment) of each write through the view.
+    writes: Vec<rustc_span::BytePos>,
+    /// Each read of memory the view may share: a dereference of another
+    /// pointer, or an address-taken local.
+    foreign_reads: Vec<Span>,
+}
+
+impl<'a, 'tcx> Window<'a, 'tcx> {
+    fn is_the_local(&self, expr: &Expr<'_>) -> bool {
+        matches!(expr.kind, ExprKind::Path(QPath::Resolved(_, path))
+            if matches!(path.res, Res::Local(hir) if hir == self.binding))
+    }
+
+    fn pure_method(
+        &self,
+        expr: &Expr<'tcx>,
+        segment: &rustc_hir::PathSegment<'_>,
+        receiver: &Expr<'tcx>,
+    ) -> bool {
+        let Some(method) = self.typeck.type_dependent_def_id(expr.hir_id) else { return false };
+        if method.is_local() {
+            return false;
+        }
+        let ty = self.typeck.expr_ty_adjusted(receiver);
+        if ty.is_raw_ptr() {
+            return ADDRESS_METHODS.contains(&segment.ident.name.as_str());
+        }
+        ty.is_integral() || ty.is_floating_point() || ty.is_bool() || ty.is_char()
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
+    fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
+        if let StmtKind::Item(..) = stmt.kind {
+            self.ok = false;
+            return;
+        }
+        intravisit::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if !self.ok {
+            return;
+        }
+        match expr.kind {
+            ExprKind::Loop(..) | ExprKind::Closure(..) | ExprKind::InlineAsm(..) => {
+                self.ok = false;
+            }
+            ExprKind::Call(function, args) => {
+                // A constructor (`Some(..)`) runs no code; every other call may
+                // write anything.
+                let constructor = matches!(function.kind, ExprKind::Path(QPath::Resolved(_, path))
+                    if matches!(path.res, Res::Def(DefKind::Ctor(..), _)));
+                if !constructor {
+                    self.ok = false;
+                    return;
+                }
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+            }
+            ExprKind::MethodCall(segment, receiver, args, _) => {
+                if self.is_the_local(receiver) && segment.ident.name.as_str() == "is_null" {
+                    return;
+                }
+                if !self.pure_method(expr, segment, receiver) {
+                    self.ok = false;
+                    return;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+            ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) => {
+                self.visit_expr(rhs);
+                if through(self.binding, lhs) {
+                    // The place's own index expressions are reads like any other.
+                    self.visit_place_operands(lhs);
+                    self.writes.push(expr.span.hi());
+                } else if let Some(hir) = place_root_local(lhs)
+                    && hir != self.binding
+                    && !self.borrowed.contains(&hir)
+                {
+                    self.visit_place_operands(lhs);
+                } else {
+                    self.ok = false;
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, inner) => {
+                if !self.is_the_local(inner) {
+                    self.foreign_reads.push(expr.span);
+                    self.visit_expr(inner);
+                }
+            }
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Local(hir) = path.res
+                    && hir != self.binding
+                    && self.borrowed.contains(&hir)
+                {
+                    self.foreign_reads.push(expr.span);
+                }
+            }
+            _ => intravisit::walk_expr(self, expr),
+        }
+    }
+}
+
+impl<'a, 'tcx> Window<'a, 'tcx> {
+    /// The operands of a written place other than its root: index expressions.
+    fn visit_place_operands(&mut self, mut expr: &'tcx Expr<'tcx>) {
+        loop {
+            match expr.kind {
+                ExprKind::Field(base, _) => expr = base,
+                ExprKind::Index(base, index, _) => {
+                    self.visit_expr(index);
+                    expr = base;
+                }
+                ExprKind::Unary(UnOp::Deref, _) | ExprKind::Path(..) => return,
+                _ => {
+                    self.visit_expr(expr);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// **The quiet window (review r1 of R785).**
+///
+/// `as_mut()` makes the `&mut T` at the DECLARATION; the input made no
+/// reference at all, only accesses through the raw pointer where it is used.
+/// Under Tree Borrows that early reference is disabled by a write to its
+/// pointee through any other pointer, and frozen by a read through another
+/// pointer once it has been written through — after which an access through
+/// it is UB although the input's accesses were defined. So the view is
+/// admitted only when every use of the local lies in its `let`'s block, in the
+/// statements from the `let` to the last statement that uses it, and that
+/// window
+/// - runs no call but a constructor, and no method but an address
+///   computation on a raw pointer, arithmetic on a scalar, or the local's own
+///   null test;
+/// - assigns only through the local, or to a local whose address the body
+///   never takes;
+/// - does not loop (so the window's text order is its execution order); and
+/// - reads no other pointer's memory between two writes through the view.
+///
+/// Then nothing but the view itself writes the pointee while the view lives,
+/// and nothing reads it while the view is Active and about to be written.
+fn quiet_window(tcx: TyCtxt<'_>, subject: &Subject, local: &LetStmt<'_>) -> bool {
+    let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else { return false };
+    let mut all = AllUses {
+        binding: subject.hir_id,
+        spans: Vec::new(),
+        closure: false,
+        borrowed: FxHashSet::default(),
+    };
+    all.visit_body(tcx.hir_body(body_id));
+    if all.closure || all.borrowed.contains(&subject.hir_id) {
+        return false;
+    }
+    let Node::Stmt(stmt) = tcx.parent_hir_node(local.hir_id) else { return false };
+    let Node::Block(block) = tcx.parent_hir_node(stmt.hir_id) else { return false };
+    let Some(position) = block.stmts.iter().position(|s| s.hir_id == stmt.hir_id) else {
+        return false;
+    };
+    enum Item<'hir> {
+        Stmt(&'hir rustc_hir::Stmt<'hir>),
+        Tail(&'hir Expr<'hir>),
+    }
+    let items = block.stmts[position + 1..]
+        .iter()
+        .map(Item::Stmt)
+        .chain(block.expr.map(Item::Tail))
+        .collect::<Vec<_>>();
+    let span_of = |item: &Item<'_>| match item {
+        Item::Stmt(stmt) => stmt.span,
+        Item::Tail(expr) => expr.span,
+    };
+    let Some(last) = items
+        .iter()
+        .rposition(|item| all.spans.iter().any(|use_| span_of(item).contains(*use_)))
+    else {
+        return false;
+    };
+    let window = &items[..=last];
+    if !all
+        .spans
+        .iter()
+        .all(|use_| window.iter().any(|item| span_of(item).contains(*use_)))
+    {
+        return false;
+    }
+    let typeck = tcx.typeck(subject.fn_did);
+    let mut checker = Window {
+        typeck,
+        binding: subject.hir_id,
+        borrowed: &all.borrowed,
+        ok: true,
+        writes: Vec::new(),
+        foreign_reads: Vec::new(),
+    };
+    for item in window {
+        match item {
+            Item::Stmt(stmt) => checker.visit_stmt(stmt),
+            Item::Tail(expr) => checker.visit_expr(expr),
+        }
+    }
+    checker.ok
+        && !checker.foreign_reads.iter().any(|read| {
+            checker.writes.iter().any(|&w| w <= read.lo())
+                && checker.writes.iter().any(|&w| w >= read.hi())
+        })
+}
+
 pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValue> {
     if subject.kind != SubjectKind::Local
         || subject.ty_span.is_some()
@@ -157,7 +461,7 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
     if !matches!(signature.output().kind(), TyKind::RawPtr(..)) {
         return None;
     }
-    if !uses_are_closed(tcx, subject) {
+    if !uses_are_closed(tcx, subject) || !quiet_window(tcx, subject, local) {
         return None;
     }
     Some(CallResultValue {
