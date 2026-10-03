@@ -25121,7 +25121,8 @@ fn raw_boundary_wave2_corpus_census() {
                 failures.len(),
                 aborts.len(),
                 crate::bo_rewriter::decision::seam::fallback_slice_extent(),
-            ) + &raw_boundary_allocator_lines(&ledger_dir),
+            ) + &raw_boundary_allocator_lines(&ledger_dir)
+                + &raw_boundary_overcount_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25165,7 +25166,8 @@ fn raw_boundary_wave2_corpus_census() {
                     "fallback_slice_extent={}\n",
                     crate::bo_rewriter::decision::seam::fallback_slice_extent()
                 )
-                + &raw_boundary_allocator_lines(&ledger_dir),
+                + &raw_boundary_allocator_lines(&ledger_dir)
+                + &raw_boundary_overcount_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26419,10 +26421,73 @@ fn raw_boundary_wave2_corpus_census() {
             retirement_receipt.lines().count() - 1,
             gate_lost.lines().count() - 1,
         ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent())
-            + &raw_boundary_allocator_lines(&ledger_dir),
+            + &raw_boundary_allocator_lines(&ledger_dir)
+                + &raw_boundary_overcount_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
+/// **R761-2 (i) — the over-issued receipts, a status beside `data`.** A bridge-custody
+/// row the R757-1 arm matched as a raw-twin call handed the input's OWN argument with
+/// no delivered binding read through it (`twin-call-input-argument:` without
+/// `;through-delivered=`) is a receipt the ledger issued for a view the tree never
+/// made: heman's two at frame 13. `data=true` stands for it (the seat's ruling); the
+/// census receipt counts it: `overcount=<n>` and, where non-zero,
+/// `overcount_by_program=<p>:<n>,..`.
+fn raw_boundary_overcount_lines(ledger_dir: &std::path::Path) -> String {
+    let mut total = 0usize;
+    let mut by_program = Vec::new();
+    for program in CORPUS {
+        let path = ledger_dir.join(format!("{}.raw-boundary-bridge-custody.json", program.name));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let count = raw_boundary_overcount_of(&json);
+        if count > 0 {
+            by_program.push(format!("{}:{count}", program.name));
+        }
+        total += count;
+    }
+    let mut out = format!("overcount={total}\n");
+    if !by_program.is_empty() {
+        out += &format!("overcount_by_program={}\n", by_program.join(","));
+    }
+    out
+}
+
+fn raw_boundary_overcount_of(custody: &serde_json::Value) -> usize {
+    custody["comparison"]["files"]
+        .as_object()
+        .into_iter()
+        .flat_map(|files| files.values())
+        .filter_map(|file| file["rows"].as_array())
+        .flatten()
+        .filter(|row| {
+            row["status"].as_str() == Some("MatchedRaw")
+                && row["reason"].as_str().is_some_and(|reason| {
+                    reason.starts_with("twin-call-input-argument:")
+                        && !reason.contains(";through-delivered=")
+                })
+        })
+        .count()
+}
+
+/// R761-2 (i): only a passthrough row counts; a row read through a delivered binding,
+/// another status or another arm does not.
+#[test]
+fn r761_2_the_overcount_reads_passthrough_rows_only() {
+    let custody = serde_json::json!({"comparison": {"files": {"lib.rs": {"rows": [
+        {"status": "MatchedRaw", "reason": "twin-call-input-argument:arg=1;twin=t;argument=pOut"},
+        {"status": "MatchedRaw", "reason": "twin-call-input-argument:arg=2;twin=t;through-delivered=h;argument=&mut (*h).x"},
+        {"status": "Missing", "reason": "twin-call-input-argument:arg=1;twin=t;argument=p"},
+        {"status": "MatchedRaw", "reason": "twin-call-inline-raw-view:arg=1;twin=t;argument=v"},
+    ]}}}});
+    assert_eq!(raw_boundary_overcount_of(&custody), 1);
+    assert_eq!(raw_boundary_overcount_of(&serde_json::json!({})), 0);
 }
 
 /// **R760-1 (R443 / D2; (B′), R619-3 item 1)** — each emitted tree's allocator
