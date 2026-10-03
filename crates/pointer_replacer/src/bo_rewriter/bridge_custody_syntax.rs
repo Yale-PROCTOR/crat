@@ -940,6 +940,10 @@ fn inert(attr: &ast::Attribute, crate_level: bool) -> bool {
                 | "used"
                 | "track_caller"
                 | "automatically_derived"
+                // R760-1 x R605-2 (main 160d): the builtin expands to the
+                // allocator shims inside an anonymous `const _`, which binds no
+                // type name and declares no module-level function.
+                | "global_allocator"
                 | "link_section"
                 | "macro_use"
         ),
