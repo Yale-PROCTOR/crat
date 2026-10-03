@@ -41,6 +41,10 @@ use crate::utils::rustc::RustProgram;
 /// changes after this commit do not advance this identity.
 pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p14-v1";
 
+/// The hosts the era5a worker admits (R766-4, era-5c 123): the RQ5 variant off the L01¹³ seal
+/// admits lambda9 beside lambda7, and the identity names the list a model was solved under.
+pub(crate) const WORKER_HOSTS: [&str; 2] = ["lambda7", "lambda9"];
+
 const CACHE_SCHEMA: &str = "bo-model-cache-v2";
 const A14_MARKER: &str = "positive-opacity-v1";
 const A16_MARKER: &str = "modeled-origin-one-way-v1";
@@ -137,6 +141,7 @@ pub(crate) fn solver_identity(
         A5World::ClosedWorldFrozenGraph.label().to_owned(),
     );
     fields.insert("analysis_frame", ANALYSIS_FRAME.to_owned());
+    fields.insert("era5_worker_hosts", WORKER_HOSTS.join(","));
     // R374-1: an experiment arm must be in the identity before its cache is
     // kept, so two arms cannot compute one semantic key.
     fields.insert(
@@ -1285,6 +1290,7 @@ mod tests {
         );
         for required in [
             "analysis_frame=era5c-l01p14-v1",
+            "era5_worker_hosts=lambda7,lambda9",
             "era5_schema=era5b-model-cache-v1",
             "local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1",
             "retirement_receipts=r253-three-dispositions-v1",

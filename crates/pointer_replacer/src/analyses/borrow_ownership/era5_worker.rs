@@ -89,7 +89,7 @@ fn validate(job: &Job) -> Result<BTreeMap<String, String>, String> {
         || job.admission != "era5a-freeze-seat-accepted"
         || !REQUIRED_PROGRAMS.contains(&job.program.as_str())
         || job.host_role != "evaluation"
-        || job.host != "lambda7"
+        || !model_cache::WORKER_HOSTS.contains(&job.host.as_str())
         || job.cache_namespace != "era5a-candidate"
         || !job.cache_dir.is_absolute()
         || !job.receipt.is_absolute()
@@ -451,4 +451,50 @@ fn era5_model_worker() {
         .expect("write worker receipt");
     file.sync_all().expect("sync worker receipt");
     assert!(outcome.is_ok(), "worker failed: {receipt}");
+}
+
+/// A job naming `host`, admissible in every other field of the first check.
+fn job_naming(host: &str) -> Job {
+    let seal = serde_json::json!({"path": "/nonexistent/sealed", "sha256": "0".repeat(64)});
+    serde_json::from_value(serde_json::json!({
+        "schema": "era5a-model-job-v1", "admission": "era5a-freeze-seat-accepted",
+        "program": "bst", "host": host, "host_role": "evaluation",
+        "input": seal, "input_root": "/nonexistent", "input_manifest": seal, "source": seal,
+        "toolchain": seal, "dependencies": seal, "launch": seal, "binary": seal,
+        "semantic": {"analysis": "0".repeat(64), "toolchain": "0".repeat(64),
+            "dependencies": "0".repeat(64), "configuration": "0".repeat(64)},
+        "expected_inputs": null, "expected_key": null,
+        "resources": {"host": host, "physical_mib": 1, "headroom_mib": 0,
+            "guards": {"worker_seconds": 21_600, "query_seconds": 600, "emission_seconds": 900},
+            "reservations": [{"id": "bst", "host": host, "class": "heavy", "cap_mib": 1}]},
+        "reservation": "bst", "environment": {}, "cache_dir": "/nonexistent/cache",
+        "cache_namespace": "era5a-candidate", "receipt": "/nonexistent/receipt.json"
+    }))
+    .expect("job schema")
+}
+
+/// W86 (era-5c 123, R766-4): the RQ5 variant's worker admits lambda9, so lambda9 solves with
+/// the frame's analysis. The job still fails later (the actual host, memory, the seals); what is
+/// witnessed is that the sealed host admission no longer refuses it.
+#[test]
+fn e5c_w86_worker_admits_lambda9() {
+    for host in ["lambda7", "lambda9"] {
+        let refused = validate(&job_naming(host)).expect_err("a dummy job never validates");
+        assert_ne!(
+            refused, "job lacks the sealed evaluation-host admission",
+            "{host} is admitted"
+        );
+    }
+}
+
+/// W86's control (R766-4): a job naming any other host is still refused at the admission.
+#[test]
+fn e5c_w86_worker_refuses_another_host() {
+    for host in ["lambda8", "lambda9 ", "Lambda9", "", "lambda7,lambda9"] {
+        let refused = validate(&job_naming(host)).expect_err("refused");
+        assert_eq!(
+            refused, "job lacks the sealed evaluation-host admission",
+            "{host:?} is refused"
+        );
+    }
 }
