@@ -14985,7 +14985,9 @@ fn r674_9_a_parameter_used_otherwise_proves_no_extent() {
 /// length took `FALLBACK_SLICE_EXTENT` (a §77 row). The callee's straight-line
 /// body reads exactly elements `0..4` on every call, so the raw arm takes `4`,
 /// receipted `len-callee-access`. The control: a callee that loops over its
-/// count proves nothing, and keeps the fallback.
+/// count proves nothing, and keeps the fallback. (Its argument is a raw
+/// expression: on 54's line a bare `histogram` is decided a thin reference and
+/// handed on by another arm, so the raw arm would not be asked.)
 #[test]
 fn r677_6_a_raw_argument_takes_the_callee_s_straight_line_extent() {
     let src = format!(
@@ -15003,7 +15005,8 @@ fn r677_6_a_raw_argument_takes_the_callee_s_straight_line_extent() {
          pub unsafe fn caller(in_0: *mut u8, histogram: *mut u32) -> u32 {{\n\
          \x20   let _address = in_0 as usize;\n\
          \x20   let _histogram = histogram as usize;\n\
-         \x20   read32(in_0) + read32(in_0.offset(4 as i32 as isize)) + tree(histogram, 64)\n\
+         \x20   read32(in_0) + read32(in_0.offset(4 as i32 as isize))\n\
+         \x20       + tree(histogram.offset(0 as i32 as isize), 64)\n\
          }}\n"
     );
     let seams = e_adapt_seams(&src);

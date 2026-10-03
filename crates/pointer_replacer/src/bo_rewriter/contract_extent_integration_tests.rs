@@ -1215,9 +1215,13 @@ fn ce_l01_an_adjacent_value_is_not_licensed_as_the_length() {
         !flat.contains("(crc) as usize"),
         "the value `crc` is not a length:\n{source}"
     );
+    // R677-6: `set32bit`'s straight-line body writes exactly four bytes, so
+    // the raw argument takes that extent, not the waived fallback.
     assert!(
-        flat.contains("core::slice::from_raw_parts_mut(chunk.offset(8 + length as isize), crate::FALLBACK_SLICE_EXTENT)"),
-        "the raw argument takes the waived fallback extent:\n{source}"
+        flat.contains(
+            "core::slice::from_raw_parts_mut(chunk.offset(8 + length as isize), (4) as usize)"
+        ),
+        "the raw argument takes the callee's own extent:\n{source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
