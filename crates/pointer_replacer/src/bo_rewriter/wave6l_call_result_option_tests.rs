@@ -461,3 +461,71 @@ fn w6l_window_foreign_read_between_writes_keeps_the_receiver_raw() {
         "cmd",
     );
 }
+
+/// lil `lil_find_var` + `lil_get_var_or` (subject `lil_get_var_or::var#5`,
+/// delivered `optional` at batch 54): the view is only read, and the call
+/// through the callback runs after its last use.
+const GET_VAR_OR: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct var_t {
+    pub v: usize,
+    pub env: usize,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil {
+    pub rootenv: usize,
+    pub vars: *mut *mut var_t,
+    pub callback: [Option<unsafe extern "C" fn(*mut lil, *mut usize) -> i32>; 8],
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_find_var(mut l: *mut lil) -> *mut var_t {
+    if (*l).rootenv == 0 as usize {
+        return 0 as *mut var_t;
+    }
+    return *((*l).vars).offset(0 as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_get_var_or(mut l: *mut lil, mut defvalue: usize) -> usize {
+    let mut var = lil_find_var(l);
+    let mut retval = if !var.is_null() { (*var).v } else { defvalue };
+    if ((*l).callback[7 as usize]).is_some() && (var.is_null() || (*var).env == (*l).rootenv) {
+        let mut proc_0 = (*l).callback[7 as usize];
+        let mut newretval = retval;
+        if proc_0.expect("non-null function pointer")(l, &mut newretval) != 0 {
+            retval = newretval;
+        }
+    }
+    return retval;
+}
+"#;
+
+/// **Precision (review r1 of R785), from the corpus row:** what runs after the
+/// view's last use cannot reach it, so the window ends there; a read-only
+/// view beside foreign reads stays typed.
+#[test]
+fn w6l_window_ends_at_the_last_use() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(
+        "get-var-or",
+        GET_VAR_OR,
+        &["lil_find_var", "lil_get_var_or"],
+    )
+    else {
+        panic!("get-var-or degraded to a non-emitting outcome");
+    };
+    println!("W6L-WINDOW-GETVAR\n{source}\nW6L-WINDOW-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        text.contains("letmutvar:Option<&mutcrate::var_t>=")
+            || text.contains("letmutvar:Option<&crate::var_t>="),
+        "the read-only view was not typed: {text}"
+    );
+}
