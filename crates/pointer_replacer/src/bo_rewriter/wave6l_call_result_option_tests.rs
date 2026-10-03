@@ -529,3 +529,149 @@ fn w6l_window_ends_at_the_last_use() {
         "the read-only view was not typed: {text}"
     );
 }
+
+/// **Review of the quiet window, finding 1:** a local ARRAY decayed with
+/// `as_mut_ptr()` (c2rust's form) is never `&`-borrowed in HIR, yet the view
+/// points into it: `buf[0] = 1` in the window is a foreign write.
+const ARRAY_DECAY_WRITE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct holder {
+    pub n: i32,
+    pub p: *mut i32,
+}
+#[no_mangle]
+pub unsafe extern "C" fn get(mut h: *mut holder) -> *mut i32 {
+    if (*h).n == 0 as i32 {
+        return 0 as *mut i32;
+    }
+    return (*h).p;
+}
+#[no_mangle]
+pub unsafe extern "C" fn fill(mut n: i32) -> i32 {
+    let mut buf: [i32; 4] = [0 as i32; 4];
+    let mut h = holder { n: n, p: buf.as_mut_ptr() };
+    let mut q = get(&mut h);
+    if q.is_null() {
+        return 0 as i32;
+    }
+    buf[0 as usize] = 1 as i32;
+    *q = 2 as i32;
+    return buf[0 as usize];
+}
+"#;
+
+/// **Finding 2:** a STATIC read between two writes through the view freezes
+/// it when the view points into the static.
+const STATIC_READ_BETWEEN_WRITES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments, static_mut_refs)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct entry {
+    pub a: i32,
+}
+pub static mut TABLE: [entry; 4] = [entry { a: 0 }; 4];
+#[no_mangle]
+pub unsafe extern "C" fn get(mut i: i32) -> *mut entry {
+    if i < 0 as i32 {
+        return 0 as *mut entry;
+    }
+    return TABLE.as_mut_ptr().offset(i as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn bump(mut i: i32) -> i32 {
+    let mut q = get(i);
+    if q.is_null() {
+        return 0 as i32;
+    }
+    (*q).a = 1 as i32;
+    let mut n = TABLE[i as usize].a;
+    (*q).a = n + 1 as i32;
+    return n;
+}
+"#;
+
+/// **Finding 3:** a raw pointer taken from the view (`addr_of_mut!`) outlives
+/// the cut and carries the view's tag; a foreign write after the last use
+/// disables it and the later write through the raw pointer is UB.
+const RAW_ADDRESS_OF_VIEW: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct holder {
+    pub n: i32,
+    pub p: *mut holder,
+}
+#[no_mangle]
+pub unsafe extern "C" fn get(mut h: *mut holder) -> *mut holder {
+    if (*h).n == 0 as i32 {
+        return 0 as *mut holder;
+    }
+    return (*h).p;
+}
+#[no_mangle]
+pub unsafe extern "C" fn poke(mut target: *mut holder) -> i32 {
+    let mut h = holder { n: 1 as i32, p: target };
+    let mut q = get(&mut h);
+    if q.is_null() {
+        return 0 as i32;
+    }
+    let mut r = core::ptr::addr_of_mut!((*q).n);
+    (*target).n = 5 as i32;
+    *r = 7 as i32;
+    return (*target).n;
+}
+"#;
+
+fn view_not_typed(name: &str, source: &str, exposed: &[&str], local: &str) {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(name, source, exposed)
+    else {
+        panic!("{name} degraded to a non-emitting outcome");
+    };
+    println!("W6L-WINDOW2-{name}\n{source}\nW6L-WINDOW2-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        !text.contains(&format!("letmut{local}:Option<")),
+        "{name}: the view was typed: {text}"
+    );
+}
+
+/// **RED (review of the quiet window, finding 1).**
+#[test]
+fn w6l_window_a_write_to_a_decayed_local_array_keeps_the_receiver_raw() {
+    view_not_typed(
+        "array-decay-write",
+        ARRAY_DECAY_WRITE,
+        &["get", "fill"],
+        "q",
+    );
+}
+
+/// **RED (finding 2).**
+#[test]
+fn w6l_window_a_static_read_between_writes_keeps_the_receiver_raw() {
+    view_not_typed(
+        "static-read-between-writes",
+        STATIC_READ_BETWEEN_WRITES,
+        &["get", "bump"],
+        "q",
+    );
+}
+
+/// **RED (finding 3).**
+#[test]
+fn w6l_window_a_raw_address_of_the_view_keeps_the_receiver_raw() {
+    view_not_typed(
+        "raw-address-of-view",
+        RAW_ADDRESS_OF_VIEW,
+        &["get", "poke"],
+        "q",
+    );
+}
