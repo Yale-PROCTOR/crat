@@ -234,3 +234,16 @@ fn w4fc_c6_a_writing_function_does_not_read_the_pair() {
     assert!(writes(HT, "create", "Ht", "entries", "capacity"));
     assert!(!writes(HT, "set", "Ht", "entries", "capacity"));
 }
+
+/// **W4FC-4 — the element type is compared as a type, not as text.** ht's
+/// shape inside a module (the corpus layout): the field's pointee prints as
+/// `m::Entry` while the allocation spells `size_of::<Entry>()`. The text
+/// comparison refused the real ht (`1fa9fa24e`, corpus probe).
+#[test]
+fn w4fc_4_a_module_pointee_proves_the_pair() {
+    let module = format!("pub mod m {{\nuse super::{{malloc, calloc}};\n{HT}}}\n");
+    assert_eq!(
+        proven(&module, "Ht", "entries").as_deref(),
+        Some("capacity:alloc")
+    );
+}

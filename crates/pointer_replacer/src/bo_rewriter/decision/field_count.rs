@@ -226,16 +226,24 @@ impl<'tcx> Visitor<'tcx> for Scan<'_, 'tcx> {
 fn allocation_count<'tcx>(
     cx: &Ctx<'tcx>,
     e: &'tcx Expr<'tcx>,
-    pointee: &str,
+    pointee: Ty<'tcx>,
 ) -> Option<&'tcx Expr<'tcx>> {
     let ExprKind::Call(callee, args) = peel(e).kind else { return None };
     let name = cx.text(callee)?;
     let name = name.rsplit("::").next()?.to_owned();
-    let sized = |e: &Expr<'_>| {
-        cx.text(e).is_some_and(|t| {
-            let t = t.replace(' ', "");
-            t.contains(&format!("size_of::<{}>()", pointee.replace(' ', "")))
-        })
+    // `size_of::<T>()` (under casts) with `T` the field's pointee, compared
+    // as types: a pointee's printed path need not match the spelling.
+    let sized = |e: &Expr<'tcx>| {
+        let ExprKind::Call(f, []) = peel(e).kind else { return false };
+        // `core::mem::size_of::<T>`: the turbofish follows the name.
+        cx.text(f).is_some_and(|t| t.contains("size_of::<"))
+            && cx
+                .tcx
+                .typeck(cx.owner)
+                .node_args(f.hir_id)
+                .types()
+                .next()
+                .is_some_and(|t| t == pointee)
     };
     match (name.as_str(), args) {
         ("calloc", [n, size]) if sized(size) => Some(n),
@@ -378,7 +386,7 @@ pub(crate) fn proven_count(
     let f = variant.fields.iter().find(|x| x.name == field)?;
     let fty = tcx.type_of(f.did).instantiate_identity();
     let TyKind::RawPtr(pointee, _) = fty.kind() else { return None };
-    let pointee = pointee.to_string();
+    let pointee = *pointee;
     let is_count = |name: Symbol| {
         variant
             .fields
@@ -416,10 +424,10 @@ pub(crate) fn proven_count(
                 let rhs = (*rhs)?;
                 let block_ref = block_of(tcx, *block)?;
                 // (E1) the allocation, directly or through a once-defined local
-                let allocation = allocation_count(&cx, rhs, &pointee).or_else(|| {
+                let allocation = allocation_count(&cx, rhs, pointee).or_else(|| {
                     local_of(rhs)
                         .and_then(|l| single_definition(&cx, body, l))
-                        .and_then(|init| allocation_count(&cx, init, &pointee))
+                        .and_then(|init| allocation_count(&cx, init, pointee))
                 });
                 let established = if let Some(n) = allocation {
                     if let Some(count) = cx
