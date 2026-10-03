@@ -382,16 +382,22 @@ fn extent_leaving_op<'a>(
 }
 
 /// **wave-6l (relay 064 review, finding 2) — the NUL walk's arithmetic gate
-/// is this arm's test, in guard mode:** a parameter that leaves its first
-/// element has its thin callers held here as `pointer-arithmetic`, and one
-/// that does not (C's `if (!s[0])` preamble) carries the walk on, so no
-/// caller falls between the two sets.
+/// is the hold's own arithmetic test:** a parameter that leaves its first
+/// element does not carry the walk on. The hold (`collect`) runs WITHOUT guard
+/// mode for 54 (R761-1), so the test is the non-guard one and counts C's
+/// `p[0]` in place as arithmetic. **Without guard mode a caller CAN fall
+/// between the two sets**: `f(p) { while *p != 0 { p = p.offset(1) } }` steps,
+/// so the walk stops at `f::p`, and R491-7's C-string exemption keeps the hold
+/// off its caller (the relay 074 review). It is inert while the call-site edge
+/// stays dropped (relay 072): the walk then reaches no caller. If that edge
+/// returns, this gate must be "`collect` holds the caller", not this bare
+/// test.
 pub(super) fn leaves_its_extent(
     tcx: TyCtxt<'_>,
     key: (LocalDefId, HirId),
     facts: &EmitabilityFacts,
 ) -> bool {
-    extent_leaving_op(tcx, key, facts, true).is_some()
+    extent_leaving_op(tcx, key, facts, false).is_some()
 }
 
 /// **R641-2 — C's `p[0]` stays within the first element.** The arithmetic use

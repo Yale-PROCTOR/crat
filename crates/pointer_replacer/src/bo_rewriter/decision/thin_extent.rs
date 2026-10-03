@@ -88,11 +88,13 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 /// fact. A counted footprint behind a local callee is
 /// `local_callee_extent`'s contract arm, not this set's.
 ///
-/// A parameter with pointer arithmetic of its own (`offset`, `add`, … but
-/// not C's `p[0]` in place) does not carry the walk to its callers: its extent
-/// is its own, and a thin caller of it is `local_callee_extent`'s (a raw
-/// callee: `pointer-arithmetic`, the same test) or main's
-/// one-element-into-wider guard's (a slice callee, R365-2). **A model-`Raw`
+/// A parameter with pointer arithmetic of its own (`offset`, `add`, … C's
+/// `p[0]` in place included) does not carry the walk to its callers: its extent
+/// is its own, and a thin caller of it is meant to be `local_callee_extent`'s
+/// (a raw callee: `pointer-arithmetic`, the same test) or main's
+/// one-element-into-wider guard's (a slice callee, R365-2) — though without
+/// main's guard-mode hold (R761-1) a C-string walker that steps is neither's
+/// (see `local_callee_extent::leaves_its_extent`). **A model-`Raw`
 /// callee does carry it** (Codex 062 finding 1): keeping the callee raw does
 /// not protect a caller that converts, and wave-4's CE-D06 emitted exactly
 /// that, `find(name: &mut i8)` into `find_local`'s `strcmp`. **The call-site
@@ -101,7 +103,9 @@ pub(crate) fn byte_count_is_one_element(fact: &super::raw_boundary::ForeignCallA
 pub(crate) fn collect(tcx: TyCtxt<'_>, facts: &EmitabilityFacts) -> FxHashSet<(LocalDefId, HirId)> {
     // The arithmetic gate is a PARAMETER's: its thin callers are the local
     // callee hold's, so the gate is that hold's own arithmetic test (relay 064
-    // review: C's `p[0]` in place carries the walk, as the hold exempts it). A
+    // review; without main's guard-mode hold, R761-1, `p[0]` counts). Since the
+    // call-site edge was dropped (relay 072) `walked` reaches no caller, so this
+    // gate decides nothing until the edge returns (the relay 074 review). A
     // LOCAL copy that steps (`q = q.offset(1)`) before the walk carries it on
     // to its source (the line A review).
     let carries = |(function, binding): (LocalDefId, HirId)| {

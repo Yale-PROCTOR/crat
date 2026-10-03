@@ -610,9 +610,9 @@ fn w6l_seethrough_g2_a_literal_void_footprint_is_not_the_guards_to_judge() {
 }
 
 /// X4 (relay 064 review, finding 2) — C's `if (!s[0])` preamble
-/// (`*p.offset(0)`, R641-2) is not arithmetic for the walk either: main's
-/// guard exempts it, so a parameter that only reads element 0 in place
-/// carries its NUL walk to its caller, which no other set holds.
+/// (`*p.offset(0)`, R641-2). Written when main's guard-mode hold exempted it
+/// and the walk carried to callers; neither holds for 54 (R761-1, relay 072),
+/// so what remains pinned is `f::p` held and `g::name` not carried.
 #[test]
 fn w6l_seethrough_x4_element_zero_in_place_carries_the_walk() {
     let input = r#"
@@ -781,12 +781,16 @@ fn w6l_seethrough_k1_k1c_the_counted_arm_through_a_copy() {
 }
 
 /// K2 (relay 065, STOP 2) — the arithmetic arm through a copy: `let q = p;
-/// q[5]` holds `stepper::a`. K2c — `q[0]` in place (R641-2) holds nothing.
+/// q[5]` holds `stepper::a`. K2c — `q[0]` in place: RE-PIN (relay 074,
+/// R761-1). R641-2's exemption of C's `p[0]` in place is guard mode's, and the
+/// hold runs without it for 54; the hold's arithmetic test counts the in-place
+/// `offset(0)` (51's test), and line A's copy walk carries it to `first`'s
+/// caller: `firster::b` is held (the conservative side: the caller stays raw).
 #[test]
 fn w6l_seethrough_k2_k2c_the_arithmetic_arm_through_a_copy() {
     let map = access_map(HOLD_COPIES);
     assert!(map.iter().any(|(l, _)| l == "stepper::a"), "{map:#?}");
-    assert!(!map.iter().any(|(l, _)| l == "firster::b"), "{map:#?}");
+    assert!(map.iter().any(|(l, _)| l == "firster::b"), "{map:#?}");
 }
 
 /// K3 (relay 065, STOP 2) — the copies are followed transitively: `let q =
