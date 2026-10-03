@@ -215,3 +215,51 @@ fn r766_2_control_an_a5_raw_view_of_inner_storage_keeps_the_npo_view() {
     .expect("the view renders");
     assert!(view.template.contains("depth2-npo"), "{view:#?}");
 }
+
+/// R784-2 (main 160): lodepng's `lodepng_crc32` reduced. `inspect` hands `crc32` an
+/// element address of a RAW root (`&*in_0.offset(12)`), which the seam row refuses
+/// (one element into a formal read past it); `check_crc` hands it an element address
+/// of a root decided SLICE (`&*chunk.offset(4)`), the slice's own element spine.
+const CRC_CALLERS: &str = r#"#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+unsafe fn crc32(mut data: *const u8, mut length: usize) -> u32 {
+    let mut r: u32 = 0 as u32;
+    let mut i: usize = 0 as usize;
+    while i < length {
+        r = r.wrapping_add(*data.offset(i as isize) as u32);
+        i = i.wrapping_add(1 as usize);
+    }
+    r
+}
+pub unsafe fn inspect(mut in_0: *mut u8, mut insize: usize) -> u32 {
+    if insize < 33 as usize {
+        return 0 as u32;
+    }
+    let mut w = in_0 as *mut u32;
+    *w = 7 as u32;
+    crc32(&*in_0.offset(12 as isize), 17 as usize)
+}
+pub unsafe fn check_crc(mut chunk: *const u8) -> u32 {
+    let mut length = *chunk.offset(0 as isize) as usize;
+    crc32(&*chunk.offset(4 as isize), length.wrapping_add(4 as usize))
+}
+"#;
+
+/// The row's refusal at `inspect` (`in_0` model-Raw: a write through a cast) must not
+/// strand `check_crc`: at the head the refusal holds `crc32::data` raw
+/// (`dropped-site:seam-one-element-into-wider-formal`), `check_crc`'s argument is
+/// bridged over its unrewritten `chunk.offset(4)` (E0599), and recovery reverts every
+/// class: lodepng's census failure at batch 54.
+#[test]
+fn r784_2_a_seam_row_refusal_does_not_strand_a_slice_rooted_caller() {
+    assert!(verify::type_checks_str(CRC_CALLERS));
+    let out = emitted("r784_crc_callers", CRC_CALLERS);
+    assert_eq!(out.reverted, 0, "{:#?}\n{}", out.degradations, out.source);
+    assert!(verify::type_checks_str(&out.source), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "check_crc::chunk"),
+        None,
+        "{:#?}\n{}",
+        out.degradations,
+        out.source
+    );
+}
