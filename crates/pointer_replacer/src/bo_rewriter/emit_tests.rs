@@ -5897,6 +5897,13 @@ const E_ADAPT_PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused
 /// callee now delivers `base` itself as a slice and the suffix view carries
 /// the base's own extent (no fallback), so the raw expressions this pins are
 /// kept raw by a signed delta, which the forward view refuses (R394-2).
+///
+/// RE-PIN (wave-6l relay 076): since R677-6 the second callee's straight-line
+/// reads `p[0] + p[1]` prove the length `2` (`len-callee-access`), and the
+/// extent prover (wave-6l relay 067) licenses `with_len`'s `n` (`while i < n`
+/// bounds every read); the test passed between them only because `with_len`
+/// fell back. The fallback arm is now witnessed by a second callee no
+/// producer proves: a loop to a zero element (R677-6's "a loop proves nothing").
 #[test]
 fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
     let src = format!(
@@ -5905,7 +5912,10 @@ fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
          \x20   let mut out = 0; let mut i = 0;\n\
          \x20   while i < n {{ out += *p.offset(i as isize); i += 1; }} out\n\
          }}\n\
-         pub unsafe fn without_len(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
+         pub unsafe fn without_len(p: *const i32) -> i32 {{\n\
+         \x20   let mut out = 0; let mut i = 0;\n\
+         \x20   while *p.offset(i) != 0 {{ out += *p.offset(i); i += 1; }} out\n\
+         }}\n\
          pub unsafe fn caller(base: *const i32, n: usize, k: isize) -> i32 {{\n\
          \x20   with_len(base.offset(k), n) + without_len(base.offset(k + 1))\n\
          }}\n"
