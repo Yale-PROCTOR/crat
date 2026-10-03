@@ -29,6 +29,9 @@ use crate::analyses::borrow_ownership::{
 };
 
 pub(crate) mod a5_site_proof;
+pub(crate) mod aliased_by_test;
+#[cfg(test)]
+mod aliased_by_test_tests;
 pub(crate) mod allocator_contract;
 pub(crate) mod array_start;
 #[cfg(test)]
