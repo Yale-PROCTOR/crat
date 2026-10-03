@@ -4170,8 +4170,23 @@ pub(crate) fn replan_a5_raw_view(
         let source_decision =
             decision_for_safe_form(terminal_found).ok_or(SeamBlock::A5RawViewUnavailable)?;
         let negative_write = view.negative_write.is_some();
+        // **R766-2 / R784-2 (main 159 §2a).** A BARE local at a depth-2 formal is
+        // the outer pointer itself, so its raw view is the depth-1 one. The
+        // depth-2 NPO view (`from_mut(&mut p).cast()`) is for an INNER pointer's
+        // `&mut p` storage; over a bare `&mut *mut T` it takes one address too
+        // many (brotli's `next_out#6`, E0308 `*mut *mut *mut u8`).
+        let outer_view;
+        let target = if view.argument_shape == "bare-local" && view.target.depth2.is_some() {
+            outer_view = super::raw_boundary::RawTargetType {
+                depth2: None,
+                ..view.target.clone()
+            };
+            &outer_view
+        } else {
+            &view.target
+        };
         let template =
-            super::raw_boundary::template_for(&source_decision, &view.target, None, negative_write)
+            super::raw_boundary::template_for(&source_decision, target, None, negative_write)
                 .map_err(|reason| match reason {
                     RawBoundaryBlockReason::SharedToMut => SeamBlock::A5NegativeWriteAbsent,
                     _ => SeamBlock::A5RawViewUnavailable,
@@ -4179,9 +4194,9 @@ pub(crate) fn replan_a5_raw_view(
         let rendered = match template
             .render_explicit(
                 &view.argument_expression,
-                view.target.mutability,
+                target.mutability,
                 false,
-                Some(view.target.pointee.as_str()),
+                Some(target.pointee.as_str()),
             )
             .map_err(|_| SeamBlock::A5RawViewUnavailable)?
         {
