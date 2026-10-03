@@ -295,3 +295,48 @@ fn r761_1_a_refused_element_address_of_a_raw_base_takes_the_fabricated_extent() 
         out.artifacts.subjects
     );
 }
+
+/// The reduction of brotli's `mb#12` (class 2772, `BrotliBuildMetaBlockGreedyInternal`,
+/// 46 rows behind it at batch 54): `build`'s `mb` is a thin subject, and
+/// `init_splitter` takes the ADDRESS of one of its raw-pointer fields as a depth-2
+/// out-param and stores a new allocation into it, beside a depth-1 scalar out-param.
+const FIELD_OUT_PARAM: &str = r#"#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
+extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Split {
+    pub histograms: *mut u32,
+    pub histograms_size: usize,
+}
+unsafe fn init_splitter(mut n: usize, mut histograms: *mut *mut u32, mut histograms_size: *mut usize) {
+    *histograms_size = n;
+    *histograms = malloc(n.wrapping_mul(4 as usize)) as *mut u32;
+}
+pub unsafe fn build(mut mb: *mut Split, mut n: usize) -> usize {
+    init_splitter(n, &mut (*mb).histograms, &mut (*mb).histograms_size);
+    (*mb).histograms_size
+}
+"#;
+
+/// **R785 (relay 263) — a raw-pointer field's address takes the depth-1 view.** At
+/// the head the depth-2 arm reads `&mut (*mb).histograms` as an inner pointer's
+/// out-param storage and refuses it (`depth2-storage-shape-held`: not a direct
+/// variable local), and `mb` degrades `borrowed-into-raw-param`. The storage is the
+/// struct's raw field, not a subject's binding: the argument's own type is the
+/// formal's, as at the depth-1 position beside it.
+#[test]
+fn r785_a_raw_pointer_field_of_a_thin_subject_takes_the_depth_one_view_at_a_depth_two_formal() {
+    assert!(verify::type_checks_str(FIELD_OUT_PARAM));
+    let out = emitted("r785_field_out_param", FIELD_OUT_PARAM);
+    assert_eq!(
+        reason_of(&out.degradations, "build::mb"),
+        None,
+        "{:#?}\n{}",
+        out.degradations,
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+    assert!(verify::type_checks_str(&out.source), "{}", out.source);
+}
