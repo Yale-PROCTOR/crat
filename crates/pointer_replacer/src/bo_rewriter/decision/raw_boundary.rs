@@ -269,6 +269,56 @@ fn bridge_type_path(tcx: TyCtxt<'_>, ty: Ty<'_>) -> String {
     }
 }
 
+/// **R766-2 (main 150)** — [`RawBoundarySiteFact::depth2_outer_view`]: the
+/// argument is the bare outer subject itself at a pointer-to-pointer formal (no
+/// `&mut p` storage), and its binding is never re-seated in its owner's body.
+fn depth2_outer_view(
+    tcx: TyCtxt<'_>,
+    target: &RawTargetType,
+    shape: &str,
+    direct_storage: bool,
+    owner: LocalDefId,
+    root: Option<HirId>,
+) -> bool {
+    target.depth2.is_some()
+        && !direct_storage
+        && shape == "bare-local"
+        && root.is_some_and(|root| binding_never_assigned(tcx, owner, root))
+}
+
+/// **R766-2** — the binding is never the left side of an assignment in its
+/// owner's body. A re-seated outer subject (`next_out = 0 as *mut *mut u8`,
+/// wave-6a 133's decoder-loop shape) keeps the depth-2 storage hold.
+fn binding_never_assigned(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> bool {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct Assigned {
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Assigned {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(lhs, ..) | rustc_hir::ExprKind::AssignOp(_, lhs, _) =
+                expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
+                && let rustc_hir::def::Res::Local(local) = path.res
+                && local == self.binding
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    if !tcx.hir_body_owners().any(|did| did == owner) {
+        return false;
+    }
+    let mut assigned = Assigned {
+        binding,
+        found: false,
+    };
+    assigned.visit_body(tcx.hir_body_owned_by(owner));
+    !assigned.found
+}
+
 pub(crate) fn raw_target_type(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RawTargetType> {
     let TyKind::RawPtr(pointee, mutability) = ty.kind() else {
         return None;
@@ -736,6 +786,12 @@ pub(crate) struct RawBoundarySiteFact {
     pub source_shape: &'static str,
     pub source_type: String,
     pub target: RawTargetType,
+    /// **R766-2 (main 150).** A bare OUTER subject at a depth-2 formal, never
+    /// re-seated in its owner's body ([`binding_never_assigned`]). The depth-2
+    /// arm reads an argument at a pointer-to-pointer formal as the `&mut p`
+    /// storage of an INNER pointer; this one is the outer pointer itself, and the
+    /// disposition decides per site whether it takes the depth-1 view.
+    pub depth2_outer_view: bool,
     pub direct_storage_span: Option<Span>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
@@ -916,6 +972,14 @@ impl RawBoundarySiteFacts {
                     source_shape: fact.shape,
                     source_type: fact.source_type.clone(),
                     target: fact.target.clone(),
+                    depth2_outer_view: depth2_outer_view(
+                        tcx,
+                        &fact.target,
+                        fact.shape,
+                        fact.direct_storage.is_some(),
+                        fact.caller,
+                        fact.root,
+                    ),
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
@@ -950,6 +1014,14 @@ impl RawBoundarySiteFacts {
                     let Some(target) = argument.target.clone() else {
                         continue;
                     };
+                    let depth2_outer_view = depth2_outer_view(
+                        tcx,
+                        &target,
+                        argument.shape.key(),
+                        argument.direct_storage.is_some(),
+                        call.caller,
+                        argument.shape.place_root(),
+                    );
                     let candidates = mir_candidates(
                         tcx,
                         &program.functions,
@@ -1024,6 +1096,7 @@ impl RawBoundarySiteFacts {
                             source_shape: argument.shape.key(),
                             source_type: argument.source_type.clone(),
                             target,
+                            depth2_outer_view,
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
@@ -6113,6 +6186,28 @@ impl RawBoundaryDispositionIndex {
                     })
                     .unwrap_or(true)
             });
+            // **R766-2 (main 150) — the depth-1 view, decided per SITE.** A bare
+            // outer subject decided a thin reference takes the depth-1 view at a
+            // depth-2 formal that STAYS raw: its own type is the formal's, so the
+            // depth-1 templates yield it, and the depth-2 storage hold (an inner
+            // pointer's `&mut p`) is not its question. A formal that converts
+            // keeps the fact's target: its family presents the subject there.
+            let depth1_view = (site.depth2_outer_view
+                && target_stays_raw
+                && site
+                    .node
+                    .and_then(|node| decisions.get(&node))
+                    .is_some_and(|(_, decision)| {
+                        matches!(
+                            decision,
+                            super::Decision::Ref { .. } | super::Decision::InferredRef { .. }
+                        )
+                    }))
+            .then(|| RawTargetType {
+                depth2: None,
+                ..site.target.clone()
+            });
+            let target = depth1_view.as_ref().unwrap_or(&site.target);
             // R575-5: what the R481-2 arm would grant with the target raw.
             let mut held_callee: Option<RawBoundaryDisposition> = None;
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
@@ -6123,7 +6218,7 @@ impl RawBoundaryDispositionIndex {
                             "site has no subject root".to_owned(),
                         )
                     })?;
-                    if site.target.depth2.is_some() && site.direct_storage_span.is_none() {
+                    if target.depth2.is_some() && site.direct_storage_span.is_none() {
                         return Err((
                             RawBoundaryBlockReason::Depth2StorageShape,
                             "depth-2 out-param storage is not a direct variable local".to_owned(),
@@ -6159,9 +6254,9 @@ impl RawBoundaryDispositionIndex {
                     };
                     if source_stays_raw
                         && let Some(source_mutability) = site.adapter_operand_mutability
-                        && source_mutability != site.target.mutability
+                        && source_mutability != target.mutability
                     {
-                        let template = if site.target.mutability == RawMutability::Mut {
+                        let template = if target.mutability == RawMutability::Mut {
                             BridgeTemplate::RawCastMut
                         } else {
                             BridgeTemplate::RawCastConst
@@ -6178,7 +6273,7 @@ impl RawBoundaryDispositionIndex {
                         decision,
                         &site.key.callee,
                         site.key.argument_index,
-                        &site.target,
+                        target,
                     );
                     let returned_child = contract
                         .as_ref()
@@ -6356,7 +6451,7 @@ impl RawBoundaryDispositionIndex {
                     } else {
                         template_for(
                             reference_view.as_ref().unwrap_or(decision),
-                            &site.target,
+                            target,
                             ownership,
                             negative_write.is_some(),
                         )
@@ -6373,7 +6468,7 @@ impl RawBoundaryDispositionIndex {
                         template,
                         site.source_shape,
                         &site.source_type,
-                        &site.target,
+                        target,
                     );
                     let independent_return =
                         (matches!(
@@ -6392,7 +6487,7 @@ impl RawBoundaryDispositionIndex {
                     {
                         let selected = returned_child_template(
                             reference_view.as_ref().unwrap_or(decision),
-                            &site.target,
+                            target,
                             returned.child.as_ref().ok().map(|child| &child.access),
                             template,
                         )
@@ -6420,19 +6515,13 @@ impl RawBoundaryDispositionIndex {
                         // every shared subject holds on "no evidence"; with it,
                         // an unused or read-only child stays admitted.
                         let child_access = retention.type_backed_child_access(node.0, &site.key);
-                        if site.target.mutability == RawMutability::Const
-                            && is_mutable_safe_source(view)
+                        if target.mutability == RawMutability::Const && is_mutable_safe_source(view)
                         {
                             // (1) A writable derivation satisfies the const
                             // parameter type and keeps write permission, so the
                             // mutable case costs no hold at all. The shared
                             // presentation of a mutable subject is retired here.
-                            match returned_child_template(
-                                view,
-                                &site.target,
-                                child_access,
-                                template,
-                            ) {
+                            match returned_child_template(view, target, child_access, template) {
                                 Ok(selected) => {
                                     template = selected.template;
                                     mutable_binding_required = selected.mutable_binding_required;
@@ -6748,7 +6837,7 @@ impl RawBoundaryDispositionIndex {
                     direct_storage_span: site.direct_storage_span,
                     adapter_operand_span: site.adapter_operand_span,
                     call_span: site.call_span,
-                    target: site.target.clone(),
+                    target: target.clone(),
                     box_slice,
                     source_shape: site.source_shape,
                     source_site: site.source_site.clone(),
