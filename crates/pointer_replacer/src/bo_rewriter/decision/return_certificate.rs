@@ -1688,8 +1688,12 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                 {
                     // A1-c: moved into the consuming formal; the chain
                     // confirms it (`confirm_transfers`) or this owner withdraws
-                    // — or, R776-5, is handed over where the formal stays raw.
-                    let ready = self.raw_formal.is_some() && self.handover(parent, e.span);
+                    // — or, R776-5, is handed over where the formal stays raw:
+                    // a model-raw formal whose chain does not confirm. A formal
+                    // the model decides Ref keeps the withdrawal
+                    // (`w6a_a1_receiver_handed_to_a_keeping_raw_callee_holds`).
+                    let ready = self.raw_formal.is_some_and(|raw| raw(did, index))
+                        && self.handover(parent, e.span);
                     if let Ok(uses) = &mut self.out {
                         uses.transfers.push((did, index, parent.span));
                         if ready {
