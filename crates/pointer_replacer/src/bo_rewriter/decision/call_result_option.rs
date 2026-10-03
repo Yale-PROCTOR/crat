@@ -503,6 +503,296 @@ fn quiet_window(tcx: TyCtxt<'_>, subject: &Subject, local: &LetStmt<'_>) -> bool
         })
 }
 
+/// The `null` test of `binding`: `binding.is_null()`.
+fn is_null_test(binding: HirId, expr: &Expr<'_>) -> bool {
+    let expr = peel(expr);
+    matches!(expr.kind, ExprKind::MethodCall(segment, receiver, [], _)
+        if segment.ident.name.as_str() == "is_null"
+            && matches!(receiver.kind, ExprKind::Path(QPath::Resolved(_, path))
+                if matches!(path.res, Res::Local(hir) if hir == binding)))
+}
+
+/// A block that never falls through: it ends in `return`.
+fn diverges(block: &rustc_hir::Block<'_>) -> bool {
+    match block.expr {
+        Some(expr) => matches!(peel(expr).kind, ExprKind::Ret(..)),
+        None => block.stmts.last().is_some_and(|stmt| {
+            matches!(stmt.kind, StmtKind::Semi(expr) | StmtKind::Expr(expr)
+                if matches!(peel(expr).kind, ExprKind::Ret(..)))
+        }),
+    }
+}
+
+/// The expression an item of a block evaluates (a `let`'s initializer).
+fn item_expr<'hir>(stmt: &'hir rustc_hir::Stmt<'hir>) -> Option<&'hir Expr<'hir>> {
+    match stmt.kind {
+        StmtKind::Let(local) => local.init,
+        StmtKind::Expr(expr) | StmtKind::Semi(expr) => Some(expr),
+        StmtKind::Item(..) => None,
+    }
+}
+
+/// Whether `expr` can leave its block (`return`, `break`, `continue`) anywhere.
+fn may_exit(expr: &Expr<'_>) -> bool {
+    struct Exits(bool);
+    impl<'tcx> Visitor<'tcx> for Exits {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if matches!(
+                expr.kind,
+                ExprKind::Ret(..) | ExprKind::Break(..) | ExprKind::Continue(..)
+            ) {
+                self.0 = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut exits = Exits(false);
+    exits.visit_expr(expr);
+    exits.0
+}
+
+/// **R791-4 (b): a dereference of `binding` that `expr` evaluates on EVERY
+/// path through it** — not under an `if` / `match` arm, the right side of
+/// `&&` / `||`, a loop or a closure, and not after a statement that may leave.
+/// A whole-argument hand-off to a local callee (R785) counts: the call's
+/// reborrow dereferences.
+struct Unconditional<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    binding: HirId,
+    found: bool,
+    stopped: bool,
+}
+
+impl<'tcx> Unconditional<'tcx> {
+    fn is_the_local(&self, expr: &Expr<'_>) -> bool {
+        matches!(expr.kind, ExprKind::Path(QPath::Resolved(_, path))
+            if matches!(path.res, Res::Local(hir) if hir == self.binding))
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for Unconditional<'tcx> {
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if self.found || self.stopped {
+            return;
+        }
+        match expr.kind {
+            ExprKind::Unary(UnOp::Deref, inner) if self.is_the_local(inner) => self.found = true,
+            ExprKind::Call(_, args)
+                if local_callee(self.tcx, expr).is_some()
+                    && args.iter().any(|arg| self.is_the_local(arg)) =>
+            {
+                self.found = true;
+            }
+            ExprKind::If(cond, ..) => self.visit_expr(cond),
+            ExprKind::Match(scrutinee, ..) => self.visit_expr(scrutinee),
+            ExprKind::Binary(op, left, _)
+                if matches!(
+                    op.node,
+                    rustc_hir::BinOpKind::And | rustc_hir::BinOpKind::Or
+                ) =>
+            {
+                self.visit_expr(left);
+            }
+            ExprKind::Loop(..) | ExprKind::Closure(..) => {}
+            ExprKind::Block(block, _) => {
+                for stmt in block.stmts {
+                    let Some(item) = item_expr(stmt) else { continue };
+                    self.visit_expr(item);
+                    if self.found || may_exit(item) {
+                        self.stopped = !self.found;
+                        return;
+                    }
+                }
+                if let Some(tail) = block.expr {
+                    self.visit_expr(tail);
+                }
+            }
+            _ => intravisit::walk_expr(self, expr),
+        }
+    }
+}
+
+fn dereferences_unconditionally<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    binding: HirId,
+    expr: &'tcx Expr<'tcx>,
+) -> bool {
+    let mut walk = Unconditional {
+        tcx,
+        binding,
+        found: false,
+        stopped: false,
+    };
+    walk.visit_expr(expr);
+    walk.found
+}
+
+/// **R791-4 (b), ruled without a premise.** `as_mut()` asserts that the pointer
+/// is dereferenceable at the DECLARATION, on every non-null path; the input
+/// only dereferences where it does. So the view is kept only where every
+/// non-null path dereferences it before anything else can run (the quiet
+/// window refuses calls): either
+/// - the item right after the `let` is `if q.is_null() { .. return .. }` and
+///   the next item dereferences `q` unconditionally, or
+/// - the item right after the `let` holds, where it is evaluated
+///   unconditionally, an `if` on `q`'s own null test whose non-null branch
+///   dereferences `q` unconditionally.
+fn dereferenced_on_every_non_null_path(
+    tcx: TyCtxt<'_>,
+    subject: &Subject,
+    local: &LetStmt<'_>,
+) -> bool {
+    let binding = subject.hir_id;
+    let Node::Stmt(stmt) = tcx.parent_hir_node(local.hir_id) else { return false };
+    let Node::Block(block) = tcx.parent_hir_node(stmt.hir_id) else { return false };
+    let Some(position) = block.stmts.iter().position(|s| s.hir_id == stmt.hir_id) else {
+        return false;
+    };
+    let items = block.stmts[position + 1..]
+        .iter()
+        .filter_map(item_expr)
+        .chain(block.expr)
+        .collect::<Vec<_>>();
+    let Some(first) = items.first() else { return false };
+    // Shape (i): the early-returning null test, then a dereference.
+    if let ExprKind::If(cond, then, None) = peel(first).kind
+        && is_null_test(binding, cond)
+        && matches!(then.kind, ExprKind::Block(then, _) if diverges(then))
+    {
+        return items
+            .get(1)
+            .is_some_and(|next| dereferences_unconditionally(tcx, binding, next));
+    }
+    // Shape (ii): an unconditionally evaluated `if` on the null test.
+    struct GuardedIf<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        ok: bool,
+        done: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for GuardedIf<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.done {
+                return;
+            }
+            match expr.kind {
+                ExprKind::If(cond, then, otherwise) => {
+                    let cond = peel(cond);
+                    let non_null = if is_null_test(self.binding, cond) {
+                        otherwise
+                    } else if let ExprKind::Unary(UnOp::Not, inner) = cond.kind
+                        && is_null_test(self.binding, inner)
+                    {
+                        Some(then)
+                    } else {
+                        // An `if` on anything else: its branches are
+                        // conditional; only its condition is evaluated.
+                        self.visit_expr(cond);
+                        return;
+                    };
+                    self.done = true;
+                    self.ok = non_null.is_some_and(|arm| {
+                        dereferences_unconditionally(self.tcx, self.binding, arm)
+                    });
+                }
+                ExprKind::Match(scrutinee, ..) => self.visit_expr(scrutinee),
+                ExprKind::Binary(op, left, _)
+                    if matches!(
+                        op.node,
+                        rustc_hir::BinOpKind::And | rustc_hir::BinOpKind::Or
+                    ) =>
+                {
+                    self.visit_expr(left);
+                }
+                ExprKind::Loop(..) | ExprKind::Closure(..) => {}
+                _ => intravisit::walk_expr(self, expr),
+            }
+        }
+    }
+    let mut guarded = GuardedIf {
+        tcx,
+        binding,
+        ok: false,
+        done: false,
+    };
+    guarded.visit_expr(first);
+    guarded.ok
+}
+
+/// **R791-4 (a), ruled without a premise (until the retained-alias phase 2).**
+/// The declaration's retag reads the WHOLE pointee; the input read only the
+/// fields it touched. A live pointer into the pointee may therefore be frozen
+/// (or, written later, invalidated) by the declaration alone. So no other
+/// binding declared before the view, of pointer type, whose pointee the type
+/// route (`disjoint_pointees`, R609-3 under R542) does not prove disjoint from
+/// the view's, may be used after the declaration.
+fn no_other_pointer_live_across<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    subject: &Subject,
+    local: &LetStmt<'_>,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+) -> bool {
+    let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else { return false };
+    let body = tcx.hir_body(body_id);
+    let typeck = tcx.typeck(subject.fn_did);
+    struct Bindings(Vec<(HirId, Span)>);
+    impl<'tcx> Visitor<'tcx> for Bindings {
+        fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
+            if let PatKind::Binding(_, hir, ..) = pat.kind {
+                self.0.push((hir, pat.span));
+            }
+            intravisit::walk_pat(self, pat);
+        }
+    }
+    let mut bindings = Bindings(Vec::new());
+    bindings.visit_body(body);
+    let declared = local.span.lo();
+    let after = local.span.hi();
+    let suspects = bindings
+        .0
+        .into_iter()
+        .filter(|&(hir, span)| {
+            hir != subject.hir_id
+                && span.lo() < declared
+                && match typeck.node_type(hir).kind() {
+                    TyKind::RawPtr(other, _) | TyKind::Ref(_, other, _) => {
+                        crate::analyses::borrow_ownership::retirement::discharge::disjoint_pointees(
+                            tcx, *other, pointee,
+                        )
+                        .is_none()
+                    }
+                    _ => false,
+                }
+        })
+        .map(|(hir, _)| hir)
+        .collect::<FxHashSet<_>>();
+    struct UsedAfter<'a> {
+        suspects: &'a FxHashSet<HirId>,
+        after: rustc_span::BytePos,
+        used: bool,
+    }
+    impl<'a, 'tcx> Visitor<'tcx> for UsedAfter<'a> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind
+                && let Res::Local(hir) = path.res
+                && self.suspects.contains(&hir)
+                && expr.span.lo() >= self.after
+            {
+                self.used = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut used = UsedAfter {
+        suspects: &suspects,
+        after,
+        used: false,
+    };
+    used.visit_body(body);
+    !used.used
+}
+
 pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValue> {
     if subject.kind != SubjectKind::Local
         || subject.ty_span.is_some()
@@ -537,7 +827,11 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
     if !matches!(signature.output().kind(), TyKind::RawPtr(..)) {
         return None;
     }
-    if !uses_are_closed(tcx, subject) || !quiet_window(tcx, subject, local) {
+    if !uses_are_closed(tcx, subject)
+        || !quiet_window(tcx, subject, local)
+        || !dereferenced_on_every_non_null_path(tcx, subject, local)
+        || !no_other_pointer_live_across(tcx, subject, local, *pointee)
+    {
         return None;
     }
     Some(CallResultValue {
