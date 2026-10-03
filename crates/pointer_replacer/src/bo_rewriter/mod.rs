@@ -147,6 +147,8 @@ pub(crate) mod plan;
 #[cfg(test)]
 mod r674_line53_tests;
 #[cfg(test)]
+mod r763_free_fn_tests;
+#[cfg(test)]
 mod raw_initializer_tests;
 #[cfg(test)]
 mod raw_place_values_tests;
