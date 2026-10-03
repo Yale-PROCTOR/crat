@@ -481,3 +481,32 @@ fn w6l_nulwalk_r9_a_wide_string_conversion_keeps_the_fallback() {
     ));
     assert!(!out.contains("nul-walk:A:contract"), "{out}");
 }
+
+/// Review 6 (`argv`): an element replaced before the call by a buffer with no
+/// NUL is not the command line's string.
+#[test]
+fn w6l_nulwalk_r6b_a_replaced_argv_element_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "if argc > 1 { parse_int(*argv.offset(1)) } else { 0 }",
+        "let mut b: [c_char; 4] = [49, 50, 51, 52];\n    *argv.offset(1) = b.as_mut_ptr();\n    if argc > 1 { parse_int(*argv.offset(1)) } else { 0 }",
+    ));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// A callee that writes through the pointer (`*p = 0`) is not bounded.
+#[test]
+fn w6l_nulwalk_c_a_callee_that_writes_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn zap(p: *mut c_char) -> c_int {\n    if strcmp(p, b\"x\\0\" as *const u8 as *const c_char) == 0 { *p = 0; }\n    0\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "zap(*argv.offset(1))"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
