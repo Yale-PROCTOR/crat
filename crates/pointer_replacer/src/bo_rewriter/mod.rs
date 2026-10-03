@@ -12409,6 +12409,8 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         out: &'a mut FreeSites,
+        /// R763 — the program's deallocator function pointers ([`deallocator_statics`]).
+        dealloc_statics: &'a rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
     }
     impl V<'_, '_> {
         fn unresolved(
@@ -12436,9 +12438,12 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
             if let rustc_hir::ExprKind::Call(callee, args) = &e.kind
-                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, p)) = &callee.kind
-                && let Some(seg) = p.segments.last()
-                && DEALLOCATORS.contains(&seg.ident.name.to_string().as_str())
+                && (matches!(&callee.kind,
+                rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, p))
+                    if p.segments.last().is_some_and(|seg| {
+                        DEALLOCATORS.contains(&seg.ident.name.to_string().as_str())
+                    }))
+                    || deallocator_pointer_call(callee, self.dealloc_statics))
                 && let Some(arg) = args.first()
             {
                 let mut inner = arg;
@@ -12468,6 +12473,7 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
         resolved: Vec::new(),
         unresolved: Vec::new(),
     };
+    let dealloc_statics = deallocator_statics(tcx, fns);
     for &fn_did in fns {
         let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
             continue;
@@ -12475,10 +12481,109 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
         let mut v = V {
             tcx,
             out: &mut sites,
+            dealloc_statics: &dealloc_statics,
         };
         v.visit_body(tcx.hir_body(body_id));
     }
     sites
+}
+
+/// **R763 (relay 252 item 2; wave-6o 095 STOP 1) — the program's deallocator
+/// function pointers.** A `static` every assignment of which, in the bodies walked,
+/// is a deallocator: `Some(free [as ..])` (a [`DEALLOCATORS`] name) or a bare formal
+/// of the assigning function (an allocator setter's formal: binn's
+/// `binn_set_alloc_functions(.., new_free)` → `free_fn = new_free`, the role the
+/// program's API gives it). At least one assignment is required; one assignment of
+/// anything else disqualifies the static. binn's `free_fn`.
+fn deallocator_statics(
+    tcx: TyCtxt<'_>,
+    fns: &[rustc_hir::def_id::LocalDefId],
+) -> rustc_hash::FxHashSet<rustc_hir::def_id::DefId> {
+    use rustc_hir::intravisit::Visitor;
+
+    fn static_of(expr: &rustc_hir::Expr<'_>) -> Option<rustc_hir::def_id::DefId> {
+        match &expr.kind {
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) => match path.res {
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Static { .. }, did) => Some(did),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn deallocator_value(expr: &rustc_hir::Expr<'_>, params: &[rustc_hir::HirId]) -> bool {
+        let mut expr = expr;
+        while let rustc_hir::ExprKind::Cast(inner, _) = &expr.kind {
+            expr = inner;
+        }
+        match &expr.kind {
+            rustc_hir::ExprKind::Call(ctor, [value]) => {
+                matches!(&ctor.kind,
+                    rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                        if path.segments.last().is_some_and(|seg| seg.ident.name.as_str() == "Some"))
+                    && deallocator_value(value, &[])
+            }
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                rustc_hir::def::Res::Local(local) => params.contains(&local),
+                _ => path
+                    .segments
+                    .last()
+                    .is_some_and(|seg| DEALLOCATORS.contains(&seg.ident.name.as_str())),
+            },
+            _ => false,
+        }
+    }
+    struct Assignments<'a> {
+        params: Vec<rustc_hir::HirId>,
+        verdicts: &'a mut rustc_hash::FxHashMap<rustc_hir::def_id::DefId, bool>,
+    }
+    impl<'tcx> Visitor<'tcx> for Assignments<'_> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = &e.kind
+                && let Some(did) = static_of(lhs)
+            {
+                let ok = deallocator_value(rhs, &self.params);
+                *self.verdicts.entry(did).or_insert(true) &= ok;
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+    let mut verdicts = rustc_hash::FxHashMap::default();
+    for &fn_did in fns {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut walk = Assignments {
+            params: body.params.iter().map(|param| param.pat.hir_id).collect(),
+            verdicts: &mut verdicts,
+        };
+        walk.visit_body(body);
+    }
+    verdicts
+        .into_iter()
+        .filter_map(|(did, ok)| ok.then_some(did))
+        .collect()
+}
+
+/// **R763** — a call through one of [`deallocator_statics`]: `S.expect(..)(arg)`,
+/// `S.unwrap()(arg)` or `S(arg)`.
+fn deallocator_pointer_call(
+    callee: &rustc_hir::Expr<'_>,
+    dealloc_statics: &rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+) -> bool {
+    let receiver = match &callee.kind {
+        rustc_hir::ExprKind::MethodCall(segment, receiver, _, _)
+            if matches!(segment.ident.name.as_str(), "expect" | "unwrap") =>
+        {
+            receiver
+        }
+        _ => callee,
+    };
+    matches!(&receiver.kind,
+        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path))
+            if matches!(path.res,
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Static { .. }, did)
+                    if dealloc_statics.contains(&did)))
 }
 
 /// **The unresolved-overlap check.** Does any M1 subject hide inside a free
