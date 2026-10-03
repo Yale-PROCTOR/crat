@@ -93,3 +93,144 @@ fn w4fc_2_an_allocation_sizes_a_field_passed_beside_its_count() {
         "{out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The proof itself, and the controls: each refuses the pair.
+// ---------------------------------------------------------------------------
+
+/// `<count>:<form>` for `strukt.field`, or `None`.
+fn proven(src: &str, strukt: &str, field: &str) -> Option<String> {
+    let mut out = None;
+    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
+        let adt = tcx
+            .hir_crate_items(())
+            .definitions()
+            .find(|d| {
+                matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Struct)
+                    && tcx.item_name(d.to_def_id()).as_str() == strukt
+            })
+            .unwrap_or_else(|| panic!("{strukt} in the fixture"));
+        out = super::decision::field_count::proven_count(
+            tcx,
+            adt.to_def_id(),
+            rustc_span::Symbol::intern(field),
+        )
+        .map(|p| format!("{}:{}", p.count, p.form));
+    })
+    .expect("fixture compiles");
+    out
+}
+
+/// Does fn `function` write `strukt.field` or `strukt.count` itself?
+fn writes(src: &str, function: &str, strukt: &str, field: &str, count: &str) -> bool {
+    let mut out = false;
+    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
+        let adt = tcx
+            .hir_crate_items(())
+            .definitions()
+            .find(|d| {
+                matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Struct)
+                    && tcx.item_name(d.to_def_id()).as_str() == strukt
+            })
+            .expect("struct");
+        let owner = tcx
+            .hir_body_owners()
+            .find(|d| tcx.item_name(d.to_def_id()).as_str() == function)
+            .expect("function");
+        out = super::decision::field_count::writes_either(
+            tcx,
+            owner,
+            adt.to_def_id(),
+            rustc_span::Symbol::intern(field),
+            rustc_span::Symbol::intern(count),
+        );
+    })
+    .expect("fixture compiles");
+    out
+}
+
+/// **W4FC-3 — both forms prove their pair.**
+#[test]
+fn w4fc_3_both_forms_prove_the_pair() {
+    assert_eq!(
+        proven(GENANN, "Ann", "weight").as_deref(),
+        Some("total:offset")
+    );
+    assert_eq!(
+        proven(HT, "Ht", "entries").as_deref(),
+        Some("capacity:alloc")
+    );
+}
+
+/// **W4FC-C1 — a count written alone elsewhere refuses** (the relay's control:
+/// a count changed between the allocation and the use stays §77).
+#[test]
+fn w4fc_c1_a_lone_count_write_refuses() {
+    let src = format!("{HT}pub unsafe fn shrink(t: *mut Ht) {{ (*t).capacity = 4; }}\n");
+    assert_eq!(proven(&src, "Ht", "entries"), None);
+    let out = flat(&emitted(&format!("{PRE}{src}")));
+    assert!(
+        out.contains("from_raw_parts_mut((*table).entries, crate::FALLBACK_SLICE_EXTENT)"),
+        "{out}"
+    );
+}
+
+/// **W4FC-C2 — the field written with an unproven pointer refuses.**
+#[test]
+fn w4fc_c2_an_adopted_pointer_refuses() {
+    let src = format!(
+        "{HT}pub unsafe fn adopt(t: *mut Ht, e: *mut Entry) {{ let ref mut f = (*t).entries; *f = e; }}\n"
+    );
+    assert_eq!(proven(&src, "Ht", "entries"), None);
+}
+
+/// **W4FC-C3 — an allocation of a different element size refuses.**
+#[test]
+fn w4fc_c3_a_mismatched_element_size_refuses() {
+    let src = HT.replace(
+        "calloc((*table).capacity, core::mem::size_of::<Entry>())",
+        "calloc((*table).capacity, core::mem::size_of::<u8>())",
+    );
+    assert!(
+        src.contains("size_of::<u8>()"),
+        "the control's edit applied"
+    );
+    assert_eq!(proven(&src, "Ht", "entries"), None);
+}
+
+/// **W4FC-C4 — the count local reassigned before it is stored refuses.**
+#[test]
+fn w4fc_c4_a_reassigned_count_local_refuses() {
+    // (`\` continuations strip each line's indentation: match without it.)
+    let src = HT
+        .replace(
+            "let new_capacity = ((*table).capacity).wrapping_mul(2);",
+            "let mut new_capacity = ((*table).capacity).wrapping_mul(2);",
+        )
+        .replace(
+            "(*table).capacity = new_capacity;",
+            "new_capacity += 1; (*table).capacity = new_capacity;",
+        );
+    assert!(
+        src.contains("new_capacity += 1;"),
+        "the control's edit applied"
+    );
+    assert_eq!(proven(&src, "Ht", "entries"), None);
+}
+
+/// **W4FC-C5 — the count's address taken refuses.**
+#[test]
+fn w4fc_c5_an_address_taken_count_refuses() {
+    let src =
+        format!("{HT}pub unsafe fn peek(t: *mut Ht) -> *mut usize {{ &mut (*t).capacity }}\n");
+    assert_eq!(proven(&src, "Ht", "entries"), None);
+}
+
+/// **W4FC-C6 — a construction inside a function that writes the pair refuses**
+/// (an establishing sequence may be in flight there).
+#[test]
+fn w4fc_c6_a_writing_function_does_not_read_the_pair() {
+    assert!(writes(HT, "expand", "Ht", "entries", "capacity"));
+    assert!(writes(HT, "create", "Ht", "entries", "capacity"));
+    assert!(!writes(HT, "set", "Ht", "entries", "capacity"));
+}
