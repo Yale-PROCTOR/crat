@@ -109,6 +109,9 @@ pub(crate) struct Certificate {
     /// `site_edits` while its field is delivered and returns when it is not
     /// (`withdraw_delivered_owned_fields` recomputes, R583-7).
     pub(crate) store_transfers: Vec<(LocalDefId, BoxExprEdit)>,
+    /// **R776-5**: transfers whose receiver is handed over should the formal
+    /// stay raw (`confirm_transfers`): (the owner, callee, index, argument).
+    pub(crate) handover_ready: Vec<((LocalDefId, HirId), DefId, usize, Span)>,
     pub(crate) receipts: Vec<String>,
 }
 
@@ -202,6 +205,49 @@ pub(crate) fn confirm_transfers(
     subjects: &[Subject],
     confirmed: &dyn Fn(DefId, usize) -> bool,
 ) {
+    // **R776-5** — an unconfirmed transfer leaves its formal raw; a receiver
+    // whose last use it is hands the owner over there (`Box::into_raw`), C's
+    // own call, rather than withdrawing the certificate.
+    let mut handed: Vec<((LocalDefId, HirId), BoxExprEdit)> = Vec::new();
+    for c in certificates.callees.values_mut() {
+        let ready = std::mem::take(&mut c.handover_ready);
+        let mut kept = Vec::new();
+        for (did, index, owner) in std::mem::take(&mut c.transfers) {
+            let handover = ready
+                .iter()
+                .find(|(key, d, i, _)| *key == owner && *d == did && *i == index);
+            match handover {
+                Some((_, _, _, argument)) if !confirmed(did, index) => {
+                    let name = tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(*argument)
+                        .unwrap_or_default();
+                    handed.push((
+                        owner,
+                        BoxExprEdit {
+                            span: *argument,
+                            replacement: format!("Box::into_raw({name})"),
+                            receipt: "return-certificate-receiver-handover",
+                        },
+                    ));
+                    c.receipts.push(format!(
+                        "return-certificate-receiver-handover callee={} index={index}",
+                        tcx.def_path_str(did)
+                    ));
+                }
+                _ => kept.push((did, index, owner)),
+            }
+        }
+        c.transfers = kept;
+        c.handover_ready = ready;
+    }
+    for (owner, edit) in handed {
+        if let Some(plan) = certificates.plans.get_mut(&owner) {
+            plan.expr_edits.push(edit);
+            plan.expr_edits.sort_by_key(|e| (e.span.lo(), e.span.hi()));
+        }
+    }
     withdraw(certificates, subjects, &|c| {
         let unconfirmed = c
             .transfers
@@ -1194,6 +1240,12 @@ pub(crate) struct OwnerUses {
     pub(crate) returns: Vec<Span>,
     /// Lends admitted: (callee, index, the call).
     pub(crate) lends: Vec<(DefId, usize, Span)>,
+    /// **R776-5**: the owner handed to a local callee's raw formal at its
+    /// last use, `Box::into_raw(x)`: (callee, index, the call).
+    pub(crate) handovers: Vec<(DefId, usize, Span)>,
+    /// **R776-5**: transfers that, should their chain leave the formal raw,
+    /// are a hand-over: (callee, index, the argument).
+    pub(crate) handover_ready: Vec<(DefId, usize, Span)>,
 }
 
 struct UseWalk<'a, 'tcx> {
@@ -1216,6 +1268,9 @@ struct UseWalk<'a, 'tcx> {
     /// A certificate's receiver says no: a copy into a local is a second
     /// owner.
     move_ok: &'a dyn Fn(HirId) -> bool,
+    /// **R776-5**: is the callee's formal at this index a local formal the
+    /// model leaves raw? `None` where the owner is not a certificate receiver.
+    raw_formal: Option<&'a dyn Fn(DefId, usize) -> bool>,
     out: Result<OwnerUses, String>,
 }
 
@@ -1232,6 +1287,55 @@ impl<'tcx> UseWalk<'_, 'tcx> {
         if self.out.is_ok() {
             self.out = Err(form);
         }
+    }
+
+    /// **R776-5** — may the owner be handed over at `call`: a sized,
+    /// non-optional owner whose last use it is? No use of the binding later
+    /// in the text, and no enclosing loop the binding outlives (its next pass
+    /// would use the moved owner).
+    fn handover(&self, call: &Expr<'_>) -> bool {
+        if self.optional || self.shape != BoxShape::Sized {
+            return false;
+        }
+        let declared = self.tcx.hir_span(self.binding);
+        for (_, node) in self.tcx.hir_parent_iter(call.hir_id) {
+            if let rustc_hir::Node::Expr(outer) = node
+                && matches!(outer.kind, ExprKind::Loop(..))
+                && !outer.span.contains(declared)
+            {
+                return false;
+            }
+        }
+        struct Later {
+            binding: HirId,
+            after: rustc_span::BytePos,
+            found: bool,
+        }
+        impl<'v> Visitor<'v> for Later {
+            fn visit_expr(&mut self, e: &'v Expr<'v>) {
+                if let ExprKind::Path(QPath::Resolved(_, path)) = e.kind
+                    && path.res == Res::Local(self.binding)
+                    && e.span.lo() > self.after
+                {
+                    self.found = true;
+                }
+                intravisit::walk_expr(self, e);
+            }
+        }
+        let Some(body) = self
+            .tcx
+            .hir_node_by_def_id(self.binding.owner.def_id)
+            .body_id()
+        else {
+            return false;
+        };
+        let mut later = Later {
+            binding: self.binding,
+            after: call.span.hi(),
+            found: false,
+        };
+        later.visit_expr(self.tcx.hir_body(body).value);
+        !later.found
     }
 
     fn push(&mut self, span: Span, replacement: String, receipt: &'static str) {
@@ -1563,13 +1667,36 @@ impl<'tcx> UseWalk<'_, 'tcx> {
                     && (self.transfer_ok)(did, index)
                 {
                     // A1-c: moved into the consuming formal; the chain
-                    // confirms it (`confirm_transfers`) or this owner withdraws.
+                    // confirms it (`confirm_transfers`) or this owner withdraws
+                    // — or, R776-5, is handed over where the formal stays raw.
+                    let ready = self.raw_formal.is_some() && self.handover(parent);
                     if let Ok(uses) = &mut self.out {
                         uses.transfers.push((did, index, parent.span));
+                        if ready {
+                            uses.handover_ready.push((did, index, e.span));
+                        }
                     }
                     return;
                 }
                 let Some(did) = callee_def.filter(|did| (self.lend_ok)(*did, index)) else {
+                    // **R776-5 — the hand-over.** A local callee's raw formal
+                    // takes the owner at its last use: C's own call, the owner
+                    // giving the pointer to a raw consumer and never touching
+                    // it again. No drop is added and none removed.
+                    if let Some(did) = callee_def
+                        && self.raw_formal.is_some_and(|raw| raw(did, index))
+                        && self.handover(parent)
+                    {
+                        self.push(
+                            e.span,
+                            format!("Box::into_raw({name})"),
+                            "return-certificate-receiver-handover",
+                        );
+                        if let Ok(uses) = &mut self.out {
+                            uses.handovers.push((did, index, parent.span));
+                        }
+                        return;
+                    }
                     self.refuse(format!(
                         "call-argument-not-a-lend:{}",
                         self.snippet(parent.span)
@@ -1671,6 +1798,35 @@ pub(crate) fn owner_uses(
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
     move_ok: &dyn Fn(HirId) -> bool,
 ) -> Result<OwnerUses, String> {
+    receiver_uses(
+        tcx,
+        subject,
+        shape,
+        optional,
+        never_null,
+        frees,
+        lend_ok,
+        transfer_ok,
+        move_ok,
+        None,
+    )
+}
+
+/// [`owner_uses`] for a certificate's receiver, which may hand its owner
+/// over at a raw formal (R776-5).
+#[allow(clippy::too_many_arguments)]
+fn receiver_uses(
+    tcx: TyCtxt<'_>,
+    subject: &Subject,
+    shape: BoxShape,
+    optional: bool,
+    never_null: bool,
+    frees: &[(Span, Span)],
+    lend_ok: &dyn Fn(DefId, usize) -> bool,
+    transfer_ok: &dyn Fn(DefId, usize) -> bool,
+    move_ok: &dyn Fn(HirId) -> bool,
+    raw_formal: Option<&dyn Fn(DefId, usize) -> bool>,
+) -> Result<OwnerUses, String> {
     let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
     let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else {
         return Err("no-body".to_owned());
@@ -1686,6 +1842,7 @@ pub(crate) fn owner_uses(
         lend_ok,
         transfer_ok,
         move_ok,
+        raw_formal,
         out: Ok(OwnerUses {
             edits: Vec::new(),
             dead_guards: Vec::new(),
@@ -1694,6 +1851,8 @@ pub(crate) fn owner_uses(
             transfers: Vec::new(),
             returns: Vec::new(),
             lends: Vec::new(),
+            handovers: Vec::new(),
+            handover_ready: Vec::new(),
         }),
     };
     walk.visit_body(tcx.hir_body(body_id));
@@ -2592,6 +2751,33 @@ fn certify<'tcx, 's>(
     // callee), if there is one.
     let mut plans: Vec<((LocalDefId, HirId), BoxPlan)> = Vec::new();
     let mut transfers: Vec<(DefId, usize, (LocalDefId, HirId))> = Vec::new();
+    // R776-5: hand-overs made, and ready (see `confirm_transfers`).
+    let mut handover_receipts: Vec<String> = Vec::new();
+    let mut handover_ready: Vec<((LocalDefId, HirId), DefId, usize, Span)> = Vec::new();
+    let raw_formal = |did: DefId, index: usize| -> bool {
+        did.as_local().is_some_and(|f| {
+            subjects.iter().any(|s| {
+                s.fn_did == f
+                    && s.kind == SubjectKind::Param { hir_index: index }
+                    && slot_of(s).and_then(|slot| model.get(&slot)) == Some(&SlotKind::Raw)
+            })
+        })
+    };
+    let mut record_sinks = |key: (LocalDefId, HirId), sinks: ReceiverSinks| {
+        for (did, index, _) in &sinks.handovers {
+            handover_receipts.push(format!(
+                "return-certificate-receiver-handover callee={} index={index}",
+                tcx.def_path_str(*did)
+            ));
+        }
+        handover_ready.extend(
+            sinks
+                .handover_ready
+                .iter()
+                .map(|(did, index, argument)| (key, *did, *index, *argument)),
+        );
+        sinks.transfers
+    };
     let mut owner_shape: Option<(BoxShape, bool)> = None;
     let mut owner_plan_optional = false;
     let mut source_receipt = String::from("calls");
@@ -2683,7 +2869,7 @@ fn certify<'tcx, 's>(
                         if !chained_from.contains(source) {
                             chained_from.push(*source);
                         }
-                        let (plan, owner_transfers) = receiver_plan(
+                        let (plan, owner_sinks) = receiver_plan(
                             tcx,
                             subject,
                             source_certificate,
@@ -2692,12 +2878,14 @@ fn certify<'tcx, 's>(
                             None,
                             lend_ok,
                             transfer_ok,
+                            &raw_formal,
                             &format!(
                                 "return-certificate-chained source={}",
                                 source_certificate.callee_path
                             ),
                         )
                         .map_err(|reason| hold(reason))?;
+                        let owner_transfers = record_sinks(key, owner_sinks);
                         transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                         (
                             plan,
@@ -2748,7 +2936,7 @@ fn certify<'tcx, 's>(
                 if !chained_from.contains(&source) {
                     chained_from.push(source);
                 }
-                let (plan, owner_transfers) = receiver_plan(
+                let (plan, owner_sinks) = receiver_plan(
                     tcx,
                     subject,
                     source_certificate,
@@ -2760,12 +2948,14 @@ fn certify<'tcx, 's>(
                     constructions.init_spans.get(&key).copied(),
                     lend_ok,
                     transfer_ok,
+                    &raw_formal,
                     &format!(
                         "return-certificate-chained-assignment source={}",
                         source_certificate.callee_path
                     ),
                 )
                 .map_err(|reason| hold(reason))?;
+                let owner_transfers = record_sinks(key, owner_sinks);
                 transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                 (
                     plan,
@@ -3268,6 +3458,7 @@ fn certify<'tcx, 's>(
         store_fields: Vec::new(),
         field_moves: Vec::new(),
         store_transfers: Vec::new(),
+        handover_ready: Vec::new(),
         receipts: Vec::new(),
     };
     let let_receivers = receivers_of.get(&callee).map(Vec::as_slice).unwrap_or(&[]);
@@ -3365,7 +3556,7 @@ fn certify<'tcx, 's>(
             returned_receivers.push(rkey);
             continue;
         }
-        let (mut rplan, rtransfers) = receiver_plan(
+        let (mut rplan, rsinks) = receiver_plan(
             tcx,
             receiver,
             &certificate_stub,
@@ -3374,14 +3565,18 @@ fn certify<'tcx, 's>(
             constructions.init_spans.get(&rkey).copied(),
             lend_ok,
             transfer_ok,
+            &raw_formal,
             &format!("return-certificate-receiver callee={callee_path} model={rkind:?}"),
         )
         .map_err(|reason| (rkey, receiver.label.clone(), reason))?;
+        let handed_over: Vec<Span> = rsinks.handovers.iter().map(|(_, _, call)| *call).collect();
+        let rtransfers = record_sinks(rkey, rsinks);
         if !reseats.is_empty() {
             let consumes: Vec<Span> = rfrees
                 .iter()
                 .map(|(call, _)| *call)
                 .chain(rtransfers.iter().map(|(_, _, span)| *span))
+                .chain(handed_over.iter().copied())
                 .collect();
             reseat_generations_consumed(
                 tcx,
@@ -3556,6 +3751,8 @@ fn certify<'tcx, 's>(
     certificate.site_edits = site_edits;
     certificate.store_fields = store_fields;
     certificate.transfers = transfers;
+    certificate.handover_ready = handover_ready;
+    certificate.receipts.extend(handover_receipts);
     certificate.receipts.extend(dead_guard_receipts);
     if !sources.adopted.is_empty() {
         certificate.receipts.push(format!(
@@ -3665,8 +3862,9 @@ fn receiver_plan(
     init_span: Option<Span>,
     lend_ok: &dyn Fn(DefId, usize) -> bool,
     transfer_ok: &dyn Fn(DefId, usize) -> bool,
+    raw_formal: &dyn Fn(DefId, usize) -> bool,
     receipt: &str,
-) -> Result<(BoxPlan, Vec<(DefId, usize, Span)>), String> {
+) -> Result<(BoxPlan, ReceiverSinks), String> {
     let name = receiver
         .param_name
         .clone()
@@ -3683,7 +3881,7 @@ fn receiver_plan(
     };
     let optional = certificate.optional || (!assignments.is_empty() && !folded);
     let never_null = !optional;
-    let uses = owner_uses(
+    let uses = receiver_uses(
         tcx,
         receiver,
         certificate.shape,
@@ -3693,6 +3891,7 @@ fn receiver_plan(
         lend_ok,
         transfer_ok,
         &|_| false,
+        Some(raw_formal),
     )
     .map_err(|form| format!("return-certificate-receiver-use:{form}"))?;
     let mut expr_edits = uses.edits;
@@ -3759,7 +3958,10 @@ fn receiver_plan(
     for span in &uses.dead_null_returns {
         receipts.push(format!("dead-null-return {}", span.lo().0));
     }
-    let retained_sink = !frees.is_empty() || !uses.stores.is_empty() || !uses.transfers.is_empty();
+    let retained_sink = !frees.is_empty()
+        || !uses.stores.is_empty()
+        || !uses.transfers.is_empty()
+        || !uses.handovers.is_empty();
     // R619-3 (2): a sink on SOME path does not reach the exits that run
     // before it.
     let definitions: Vec<Span> = if assignments.is_empty() {
@@ -3776,6 +3978,7 @@ fn receiver_plan(
         .iter()
         .map(|(call, _)| *call)
         .chain(uses.transfers.iter().map(|(_, _, call)| *call))
+        .chain(uses.handovers.iter().map(|(_, _, call)| *call))
         .collect();
     let value_sinks: Vec<Span> = uses
         .stores
@@ -3801,7 +4004,11 @@ fn receiver_plan(
     }
     // An edit inside a deleted statement goes with it.
     expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
-    let transfers = uses.transfers.clone();
+    let sinks = ReceiverSinks {
+        transfers: uses.transfers.clone(),
+        handovers: uses.handovers.clone(),
+        handover_ready: uses.handover_ready.clone(),
+    };
     Ok((
         BoxPlan {
             shape: certificate.shape,
@@ -3816,8 +4023,17 @@ fn receiver_plan(
             retained_sink,
             implicit_scope_close: !retained_sink || exit_close,
         },
-        transfers,
+        sinks,
     ))
+}
+
+/// A receiver's consuming calls: transfers into consuming formals (A1-c), and
+/// R776-5's hand-overs at raw formals — made, and ready should a transfer's
+/// formal stay raw.
+struct ReceiverSinks {
+    transfers: Vec<(DefId, usize, Span)>,
+    handovers: Vec<(DefId, usize, Span)>,
+    handover_ready: Vec<(DefId, usize, Span)>,
 }
 
 /// **R619-3 (2) — an exit at which the receiver still owns.** `retained_sink`
