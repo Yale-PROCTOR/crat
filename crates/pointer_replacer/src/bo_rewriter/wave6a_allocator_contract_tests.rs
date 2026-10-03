@@ -1471,13 +1471,15 @@ fn w6a_r555_an_element_address_of_a_box_owner_passes_as_written() {
     );
     // The array start of an element's array field is the array-start seam's
     // own rendering (W-C6: `from_raw_parts(A.as_mut_ptr(), LEN)`, here at the
-    // array field's own length, `data_: [u32; 4]` (R625) — no companion is
-    // licensed), not a one-element slice; the `&mut self` `as_mut_ptr` opens
-    // the owner mutably.
+    // array field's own length, `data_: [u32; 4]`), not a one-element slice;
+    // the `&mut self` `as_mut_ptr` opens the owner mutably. The length is 4,
+    // spelled by R625's array arm (`(4) as usize`) or, where wave-6l's extent
+    // prover licenses the companion `size`, as its proven `(4 as usize) as
+    // usize` (wave-6l 067 / 073 STOP 1; R776-5).
     assert!(
-        text.contains(
-            "BitsEntropy(core::slice::from_raw_parts((combined.as_deref_mut().unwrap()[(0)asusize].data_).as_mut_ptr(),(4)asusize),4asusize);"
-        ),
+        ["(4)asusize", "(4asusize)asusize"].iter().any(|len| text.contains(&format!(
+            "BitsEntropy(core::slice::from_raw_parts((combined.as_deref_mut().unwrap()[(0)asusize].data_).as_mut_ptr(),{len}),4asusize);"
+        ))),
         "{}",
         out.source
     );
