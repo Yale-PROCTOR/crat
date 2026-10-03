@@ -1493,21 +1493,26 @@ impl GlueSpec {
         match self.len.as_ref() {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
             Some(SeamLen::Proven { .. }) => "evidence-backed:extent-proof",
-            // The arm and the provenance kind; the receipt carries the rest
-            // (an `sscanf` site's test).
+            // The whole receipt (`nul-walk:<arm>:<provenance>`, the contract
+            // function and position included, R780-3), interned: the set of
+            // receipts is finite, and the row is audited by it.
             Some(SeamLen::NulWalk { receipt, .. }) => {
-                const KEYS: &[&str] = &[
-                    "evidence-backed:nul-walk:A:contract",
-                    "evidence-backed:nul-walk:B:argv",
-                    "evidence-backed:nul-walk:B:literal",
-                    "evidence-backed:nul-walk:B:strdup",
-                    "evidence-backed:nul-walk:B:getenv",
-                    "evidence-backed:nul-walk:B:sscanf",
-                ];
-                KEYS.iter()
-                    .find(|key| receipt.starts_with(&key["evidence-backed:".len()..]))
-                    .copied()
-                    .unwrap_or("evidence-backed:nul-walk")
+                static INTERNED: std::sync::OnceLock<
+                    std::sync::Mutex<rustc_hash::FxHashSet<&'static str>>,
+                > = std::sync::OnceLock::new();
+                let key = format!("evidence-backed:{receipt}");
+                let mut interned = INTERNED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match interned.get(key.as_str()) {
+                    Some(found) => found,
+                    None => {
+                        let leaked: &'static str = Box::leak(key.into_boxed_str());
+                        interned.insert(leaked);
+                        leaked
+                    }
+                }
             }
             Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
             Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",

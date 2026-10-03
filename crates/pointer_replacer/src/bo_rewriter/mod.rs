@@ -8658,9 +8658,15 @@ fn finish_decide<'tcx>(
             decision::local_callee_extent::accessed_past_one_element(tcx, &subjects, &facts);
         // R491-7's caller-side clause: the subjects whose own body establishes
         // the terminator.
+        // R780-3 item 3: only where nothing writes through the subject (or a
+        // copy) in the caller — the NUL its own `strlen` saw is still there
+        // at the call.
         table.nul_exact_callers = subjects
             .iter()
             .filter(|subject| decision::local_callee_extent::caller_establishes_nul(tcx, subject))
+            .filter(|subject| {
+                decision::nul_walk_arm::only_read(tcx, &facts, subject.fn_did, subject.hir_id)
+            })
             .map(|subject| (subject.fn_did, subject.hir_id))
             .collect();
         // Surface policies are provisional until the full ladder settles. A raw

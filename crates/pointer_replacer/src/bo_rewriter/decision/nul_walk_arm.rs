@@ -144,7 +144,10 @@ pub(crate) fn sites(
                 let site = if class.reaches {
                     Some(Site {
                         arm: "A",
-                        provenance: "contract".to_owned(),
+                        provenance: format!(
+                            "contract:{}",
+                            class.contract.as_deref().unwrap_or("?")
+                        ),
                     })
                 } else {
                     // The callee's reads must stop at or before the NUL for
@@ -241,12 +244,15 @@ fn argument_expr<'tcx>(
 
 // ---- the callee: bounded / reaches ----
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Class {
     /// Every read through the parameter stops at or before its NUL.
     bounded: bool,
     /// ...and a string-contract position reads it on every path.
     reaches: bool,
+    /// The position that makes `reaches` hold: `<fn>:<index>` (R780-3: the
+    /// receipt names it, so the count per function can be audited).
+    contract: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,8 +274,13 @@ struct Classes {
 
 enum Use {
     /// A string-contract or counted string read; `terminated` = C requires a
-    /// string there; `every` = it runs on every path through the callee.
-    Read { terminated: bool, every: bool },
+    /// string there; `every` = it runs on every path through the callee, as
+    /// its first effect; `contract` = `<fn>:<index>`.
+    Read {
+        terminated: bool,
+        every: bool,
+        contract: String,
+    },
     /// Handed to a local callee's parameter.
     Forward {
         callee: LocalDefId,
@@ -298,7 +309,7 @@ impl Classes {
     ) -> Option<Class> {
         let key = (callee, index);
         if let Some(class) = self.done.get(&key) {
-            return Some(*class);
+            return Some(class.clone());
         }
         if !self.open.insert(key) {
             // A cycle (`snocString` forwards to itself): it adds no read of
@@ -307,15 +318,16 @@ impl Classes {
             return Some(Class {
                 bounded: true,
                 reaches: false,
+                contract: None,
             });
         }
         let before = self.placeholders;
         let class = self.compute(tcx, facts, callee, index);
         self.open.remove(&key);
-        if let Some(class) = class
+        if let Some(class) = &class
             && self.placeholders == before
         {
-            self.done.insert(key, class);
+            self.done.insert(key, class.clone());
         }
         class
     }
@@ -378,6 +390,7 @@ impl Classes {
         let mut class = Class {
             bounded: true,
             reaches: false,
+            contract: None,
         };
         let mut walk_indexes: FxHashSet<HirId> = FxHashSet::default();
         let mut cursor_uses = false;
@@ -405,7 +418,16 @@ impl Classes {
                     index: Index::Other,
                     ..
                 } => class.bounded = false,
-                Use::Read { terminated, every } => class.reaches |= terminated && every,
+                Use::Read {
+                    terminated,
+                    every,
+                    contract,
+                } => {
+                    if terminated && every && !class.reaches {
+                        class.reaches = true;
+                        class.contract = Some(contract);
+                    }
+                }
                 Use::Forward {
                     callee: next,
                     index: at,
@@ -413,7 +435,10 @@ impl Classes {
                 } => match self.of(tcx, facts, next, at) {
                     Some(inner) => {
                         class.bounded &= inner.bounded;
-                        class.reaches |= every && inner.reaches;
+                        if every && inner.reaches && !class.reaches {
+                            class.reaches = true;
+                            class.contract = inner.contract;
+                        }
                     }
                     None => class.bounded = false,
                 },
@@ -574,6 +599,7 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
                     return Use::Read {
                         terminated: *terminated,
                         every,
+                        contract: format!("{name}:{position}"),
                     };
                 }
                 if name == "sscanf" && position >= 2 {
@@ -588,6 +614,7 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
                     return Use::Read {
                         terminated: true,
                         every,
+                        contract: format!("{name}:{position}"),
                     };
                 }
                 Use::Other
@@ -764,6 +791,32 @@ fn read_only(
         Use::ScanfDest => scanf_ok,
         Use::Step | Use::Other => false,
     })
+}
+
+/// **R780-3 item 3 — R491-7's caller-side clause.** The subject `local` of
+/// `function` (and every copy of it) is only read there: no write through it
+/// can lie between the caller's own `strlen` and the call. The same proof as
+/// arm (B)'s provenance (`read_only`).
+pub(crate) fn only_read(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    function: LocalDefId,
+    local: HirId,
+) -> bool {
+    let mut set: FxHashSet<HirId> = std::iter::once(local).collect();
+    let copies = super::thin_extent::copy_edges_in(tcx, function);
+    loop {
+        let before = set.len();
+        for (copy, source) in &copies {
+            if set.contains(source) {
+                set.insert(*copy);
+            }
+        }
+        if set.len() == before {
+            break;
+        }
+    }
+    read_only(tcx, &mut Classes::default(), facts, function, &set, false)
 }
 
 /// Is the place at `place` written (`*p = ..`, `*p += ..`) or borrowed?
