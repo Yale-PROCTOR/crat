@@ -128,3 +128,90 @@ fn r763_c_the_null_literal_member_keeps_its_option_once_next_out_takes_the_depth
     assert!(flat.contains("Stream(s,&mutnext_out,None)"), "{output}");
     assert!(verify::type_checks_str(output), "{output}");
 }
+
+/// The A5 site-proof fallback's raw view of one argument (`replan_a5_raw_view`),
+/// as the census planned it at brotli's `ProcessMetadata(.., next_out, total_out)`
+/// (batch 54: `a5-site-proof-t2-fallback`, `depth2-npo-bridge`, E0308 `*mut *mut *mut u8`).
+fn a5_view(shape: &'static str, argument: &str) -> super::decision::seam::A5RawViewTemp {
+    use rustc_hir::def_id::CRATE_DEF_ID;
+
+    use super::decision::{
+        a5_site_proof::A5ProofSiteKey,
+        raw_boundary::{Depth2Target, RawMutability, RawTargetType},
+        seam::{A5RawViewTemp, Form},
+    };
+    use crate::analyses::borrow_ownership::l2::MirLocationKey;
+    let target = RawTargetType {
+        rendered: "*mut *mut u8".to_owned(),
+        pointee: "*mut u8".to_owned(),
+        mutability: RawMutability::Mut,
+        depth2: Some(Depth2Target {
+            inner_pointee: "u8".to_owned(),
+            inner_mutability: RawMutability::Mut,
+            thin: true,
+        }),
+    };
+    A5RawViewTemp {
+        argument_index: 4,
+        argument_expression: argument.to_owned(),
+        argument_shape: shape,
+        raw_expression: String::new(),
+        target_type: target.rendered.clone(),
+        target,
+        adapted_expression: String::new(),
+        extent_expression: None,
+        template: String::new(),
+        proof_site_key: A5ProofSiteKey {
+            caller: CRATE_DEF_ID,
+            location: MirLocationKey::new(12, 15),
+            callee: CRATE_DEF_ID.to_def_id(),
+            argument_index: 4,
+            slot_depth: 0,
+        },
+        unsafe_context: None,
+        negative_write: None,
+        expected_form: Form::Raw,
+        found_form: Form::Ref { mutable: true },
+        source_node: None,
+        enclosing_unsafe_fn: true,
+        input_rendering: None,
+    }
+}
+
+/// R766-2's corpus failure (main 159 §2a): a BARE outer subject (`next_out`,
+/// delivered `&mut *mut u8`) at a depth-2 formal is the outer pointer itself, so its
+/// A5 raw view is the depth-1 one. The NPO view of its binding
+/// (`from_mut(&mut next_out).cast::<*mut *mut u8>()`, a `*mut *mut *mut u8`) is the
+/// view of an INNER pointer's `&mut p` storage, which a bare local is not.
+#[test]
+fn r766_2_an_a5_raw_view_of_a_bare_outer_subject_is_the_depth_one_view() {
+    use super::decision::seam::{Form, replan_a5_raw_view};
+    let view = replan_a5_raw_view(
+        &a5_view("bare-local", "next_out"),
+        Form::Raw,
+        Form::Ref { mutable: true },
+    )
+    .expect("the view renders");
+    assert!(
+        !view.raw_expression.contains("&mut next_out") && !view.template.contains("depth2-npo"),
+        "{view:#?}"
+    );
+    assert_eq!(
+        view.raw_expression, "core::ptr::from_mut(&mut *next_out)",
+        "{view:#?}"
+    );
+}
+
+/// The control: an `&mut p` argument (an INNER pointer subject's storage) keeps the
+/// depth-2 NPO view.
+#[test]
+fn r766_2_control_an_a5_raw_view_of_inner_storage_keeps_the_npo_view() {
+    use super::decision::seam::{Form, replan_a5_raw_view};
+    let view = replan_a5_raw_view(
+        &a5_view("addr-of-mut", "slot"),
+        Form::Raw,
+        Form::Ref { mutable: true },
+    )
+    .expect("the view renders");
+    assert!(view.template.contains("depth2-npo"), "{view:#?}");
+}
