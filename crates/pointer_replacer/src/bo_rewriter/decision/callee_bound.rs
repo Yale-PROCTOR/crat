@@ -336,7 +336,7 @@ fn effect_free_text(text: &str) -> bool {
 
 /// The receipt keys, interned once each (a few hundred distinct strings per
 /// program) so [`super::seam::LenEvidence`] stays `Copy`.
-fn intern(key: String) -> &'static str {
+pub(crate) fn intern(key: String) -> &'static str {
     use std::sync::{Mutex, OnceLock};
     static KEYS: OnceLock<Mutex<FxHashSet<&'static str>>> = OnceLock::new();
     let mut keys = KEYS

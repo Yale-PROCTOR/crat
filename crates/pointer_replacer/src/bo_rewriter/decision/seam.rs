@@ -245,6 +245,9 @@ pub(crate) enum LenEvidence {
     /// arguments. `key` is the full receipt,
     /// `len-callee-bound:<must|may>:<expr>`.
     CalleeBound { key: &'static str },
+    /// **R763-2 (wave-4 build 2)** — the argument is a field whose element
+    /// count is a proven sibling field (`field_count`), read at the same base.
+    FieldCount { key: &'static str },
 }
 
 impl LenEvidence {
@@ -259,7 +262,7 @@ impl LenEvidence {
             LenEvidence::CalleeAccess => "len-callee-access",
             LenEvidence::FieldAlloc => "len-field-alloc",
             LenEvidence::NulWalk => "len-nul-walk",
-            LenEvidence::CalleeBound { key } => key,
+            LenEvidence::CalleeBound { key } | LenEvidence::FieldCount { key } => key,
         }
     }
 }
@@ -5880,7 +5883,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                         | LenEvidence::CalleeAccess
                         | LenEvidence::FieldAlloc
                         | LenEvidence::NulWalk
-                        | LenEvidence::CalleeBound { .. } => None,
+                        | LenEvidence::CalleeBound { .. }
+                        | LenEvidence::FieldCount { .. } => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -6286,13 +6290,29 @@ pub(crate) fn synthesize_with_raw_boundary(
                             Form::Slice { .. } | Form::Opt { slice: true, .. }
                         ) =>
                     {
-                        match super::callee_bound::at_call_site(
-                            tcx, *callee, pos.index, &site.args, sm,
-                        ) {
-                            Some((text, key)) => {
-                                (Some(text), Some(LenEvidence::CalleeBound { key }))
-                            }
-                            None => (None, len_evidence),
+                        // R763-2 first (a proven `must`), then the callee's bound.
+                        let field = site
+                            .args
+                            .iter()
+                            .find(|argument| argument.index == pos.index)
+                            .and_then(|argument| {
+                                super::field_count::length_at_span(tcx, site.caller, argument.span)
+                            });
+                        match field {
+                            Some((text, key)) => (
+                                Some(text),
+                                Some(LenEvidence::FieldCount {
+                                    key: super::callee_bound::intern(key),
+                                }),
+                            ),
+                            None => match super::callee_bound::at_call_site(
+                                tcx, *callee, pos.index, &site.args, sm,
+                            ) {
+                                Some((text, key)) => {
+                                    (Some(text), Some(LenEvidence::CalleeBound { key }))
+                                }
+                                None => (None, len_evidence),
+                            },
                         }
                     }
                     text => (text, len_evidence),

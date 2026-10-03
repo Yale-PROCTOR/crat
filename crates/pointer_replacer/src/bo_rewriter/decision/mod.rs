@@ -79,6 +79,7 @@ mod extent_proof_tests;
 pub(crate) mod field_alloc;
 #[cfg(test)]
 mod field_alloc_tests;
+pub(crate) mod field_count;
 pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod global_or_integer;
