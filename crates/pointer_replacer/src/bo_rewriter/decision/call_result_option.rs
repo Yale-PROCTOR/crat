@@ -108,6 +108,13 @@ impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
             }
             ExprKind::Unary(UnOp::Deref, inner) if self.is_the_local(inner) => return,
             ExprKind::Field(base, _) if self.is_the_local(base) => return,
+            // Review of the quiet window, finding 3: a pointer taken from the
+            // view (`&raw mut (*q).f`, `addr_of_mut!`, `&mut (*q).f as *mut _`)
+            // carries the view's tag past its last use.
+            ExprKind::AddrOf(_, _, inner) if through(self.binding, inner) => {
+                self.ok = false;
+                return;
+            }
             _ => {}
         }
         if self.is_the_local(expr) {
@@ -241,6 +248,19 @@ struct Window<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Window<'a, 'tcx> {
+    /// A local whose memory the view cannot reach: never address-taken and of
+    /// a scalar type (an array or a struct can decay or be referenced without
+    /// an `&` in HIR).
+    fn private_scalar(&self, hir: HirId) -> bool {
+        let ty = self.typeck.node_type(hir);
+        !self.borrowed.contains(&hir)
+            && (ty.is_integral()
+                || ty.is_floating_point()
+                || ty.is_bool()
+                || ty.is_char()
+                || ty.is_raw_ptr())
+    }
+
     fn is_the_local(&self, expr: &Expr<'_>) -> bool {
         matches!(expr.kind, ExprKind::Path(QPath::Resolved(_, path))
             if matches!(path.res, Res::Local(hir) if hir == self.binding))
@@ -289,6 +309,23 @@ impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
         if !self.ok || expr.span.lo() >= self.cut {
             return;
         }
+        // Review of the quiet window, findings 4 and 5: a macro expansion's
+        // span is not in the window's text order, and an overloaded operator
+        // runs code.
+        if matches!(
+            expr.span.ctxt().outer_expn_data().kind,
+            rustc_span::hygiene::ExpnKind::Macro(..)
+        ) || (matches!(
+            expr.kind,
+            ExprKind::Binary(..)
+                | ExprKind::AssignOp(..)
+                | ExprKind::Unary(..)
+                | ExprKind::Index(..)
+        ) && self.typeck.is_method_call(expr))
+        {
+            self.ok = false;
+            return;
+        }
         match expr.kind {
             ExprKind::Loop(..) | ExprKind::Closure(..) | ExprKind::InlineAsm(..) => {
                 self.ok = false;
@@ -324,7 +361,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
                     self.writes.push(expr.span.hi());
                 } else if let Some(hir) = place_root_local(lhs)
                     && hir != self.binding
-                    && !self.borrowed.contains(&hir)
+                    && self.private_scalar(hir)
                 {
                     self.visit_place_operands(lhs);
                 } else {
@@ -337,14 +374,17 @@ impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
                     self.visit_expr(inner);
                 }
             }
-            ExprKind::Path(QPath::Resolved(_, path)) => {
-                if let Res::Local(hir) = path.res
-                    && hir != self.binding
-                    && self.borrowed.contains(&hir)
-                {
+            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                // Review of the quiet window, finding 1: memory the view may
+                // point into — an address-taken local, any non-scalar local
+                // (an array decays by `as_mut_ptr()` with no `&` in HIR), or a
+                // static (finding 2).
+                Res::Local(hir) if hir != self.binding && !self.private_scalar(hir) => {
                     self.foreign_reads.push(expr.span);
                 }
-            }
+                Res::Def(DefKind::Static { .. }, _) => self.foreign_reads.push(expr.span),
+                _ => {}
+            },
             _ => intravisit::walk_expr(self, expr),
         }
     }
