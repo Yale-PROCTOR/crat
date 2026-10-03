@@ -286,6 +286,29 @@ fn depth2_outer_view(
         && root.is_some_and(|root| binding_never_assigned(tcx, owner, root))
 }
 
+/// **R785 (relay 263, main 160b)** — [`RawBoundarySiteFact::depth2_field_place`]:
+/// `&mut (*s).f`, the address of a FIELD reached through the subject `s`, at a
+/// pointer-to-pointer formal. An element (`&mut *p`, `&mut a[k]`) names a pointee,
+/// not a field, and is not one.
+fn depth2_field_view(
+    target: &RawTargetType,
+    shape: super::emitability::ArgShape,
+    element_address: bool,
+    direct_storage: bool,
+) -> bool {
+    target.depth2.is_some()
+        && !direct_storage
+        && !element_address
+        && matches!(
+            shape,
+            super::emitability::ArgShape::AddrOf {
+                through_deref: true,
+                base: Some(_),
+                ..
+            }
+        )
+}
+
 /// **R766-2** — the binding is never the left side of an assignment in its
 /// owner's body. A re-seated outer subject (`next_out = 0 as *mut *mut u8`,
 /// wave-6a 133's decoder-loop shape) keeps the depth-2 storage hold.
@@ -792,6 +815,13 @@ pub(crate) struct RawBoundarySiteFact {
     /// storage of an INNER pointer; this one is the outer pointer itself, and the
     /// disposition decides per site whether it takes the depth-1 view.
     pub depth2_outer_view: bool,
+    /// **R785 (relay 263, main 160b).** The address of a raw-pointer FIELD of the
+    /// subject's referent at a depth-2 formal (brotli's
+    /// `InitBlockSplitterLiteral(.., &mut (*mb).literal_histograms, ..)`, class
+    /// 2772). The storage the callee writes a new pointer into is the struct's
+    /// field, not a subject's binding, and the argument's own type is the formal's,
+    /// so it takes the depth-1 view whether or not the formal converts.
+    pub depth2_field_place: bool,
     pub direct_storage_span: Option<Span>,
     pub adapter_operand_span: Span,
     pub adapter_operand_mutability: Option<RawMutability>,
@@ -980,6 +1010,7 @@ impl RawBoundarySiteFacts {
                         fact.caller,
                         fact.root,
                     ),
+                    depth2_field_place: false,
                     direct_storage_span: fact.direct_storage.map(|(_, span)| span),
                     adapter_operand_span: fact.adapter_operand_span,
                     adapter_operand_mutability: fact.adapter_operand_mutability,
@@ -1021,6 +1052,12 @@ impl RawBoundarySiteFacts {
                         argument.direct_storage.is_some(),
                         call.caller,
                         argument.shape.place_root(),
+                    );
+                    let depth2_field_place = depth2_field_view(
+                        &target,
+                        argument.shape,
+                        argument.element_address,
+                        argument.direct_storage.is_some(),
                     );
                     let candidates = mir_candidates(
                         tcx,
@@ -1097,6 +1134,7 @@ impl RawBoundarySiteFacts {
                             source_type: argument.source_type.clone(),
                             target,
                             depth2_outer_view,
+                            depth2_field_place,
                             direct_storage_span: argument.direct_storage.map(|(_, span)| span),
                             adapter_operand_span: argument.adapter_operand_span,
                             adapter_operand_mutability: argument.adapter_operand_mutability,
@@ -6192,21 +6230,21 @@ impl RawBoundaryDispositionIndex {
             // depth-1 templates yield it, and the depth-2 storage hold (an inner
             // pointer's `&mut p`) is not its question. A formal that converts
             // keeps the fact's target: its family presents the subject there.
-            let depth1_view = (site.depth2_outer_view
-                && target_stays_raw
-                && site
-                    .node
-                    .and_then(|node| decisions.get(&node))
-                    .is_some_and(|(_, decision)| {
-                        matches!(
-                            decision,
-                            super::Decision::Ref { .. } | super::Decision::InferredRef { .. }
-                        )
-                    }))
-            .then(|| RawTargetType {
-                depth2: None,
-                ..site.target.clone()
-            });
+            // R785 (relay 263): a raw-pointer field's address takes it at either.
+            let depth1_view =
+                (((site.depth2_outer_view && target_stays_raw) || site.depth2_field_place)
+                    && site.node.and_then(|node| decisions.get(&node)).is_some_and(
+                        |(_, decision)| {
+                            matches!(
+                                decision,
+                                super::Decision::Ref { .. } | super::Decision::InferredRef { .. }
+                            )
+                        },
+                    ))
+                .then(|| RawTargetType {
+                    depth2: None,
+                    ..site.target.clone()
+                });
             let target = depth1_view.as_ref().unwrap_or(&site.target);
             // R575-5: what the R481-2 arm would grant with the target raw.
             let mut held_callee: Option<RawBoundaryDisposition> = None;
