@@ -217,6 +217,8 @@ mod wave6l_nested_composition_tests;
 #[cfg(test)]
 mod wave6l_nul_contract_tests;
 #[cfg(test)]
+mod wave6l_nul_walk_arm_tests;
+#[cfg(test)]
 mod wave6l_return_origin_tests;
 #[cfg(test)]
 mod wave6o_callee_frame_bounded_tests;
