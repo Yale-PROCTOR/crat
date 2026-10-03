@@ -2400,6 +2400,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // enough. It runs opposite to -2's conjunction on purpose: there the unsafe
     // direction was ADOPTING a form (fatness alone would invent a length), here
     // it is REFUSING one (an optional costs ergonomics, never soundness).
+    // Relay 139: the slot is used as an array (pointer arithmetic among its raw uses).
+    let indexed = raw_uses.is_some_and(|uses| {
+        uses.iter()
+            .any(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&&**op))
+    });
     let nullable_value = option_enabled
         && (constructions
             .init_hirs
@@ -2411,25 +2416,32 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             // Wave-6o: a caller's null-literal argument is the parameter's
             // construction-site null literal.
             || option_ops::param_receives_null_literal(facts, subject)
-            // Wave-6o (relay 096): a read of a raw field the program writes
-            // null into carries that null literal one field away.
-            || raw_field_null.contains(&(subject.fn_did, subject.hir_id))
-            // Wave-6o (relay 113): an exported formal handed on to a callee
-            // that null-tests it carries that test one call down.
-            || option_ops::exported_param_handed_to_null_tested_formal(tcx, facts, subject)
-            // Wave-6o (relay 125): a caller's actual with its own nullability
-            // evidence, at a formal the callee does not dereference itself.
-            || option_ops::param_receives_nullable_actual(
-                tcx,
-                facts,
-                opt_uses,
-                &|node| {
-                    constructions.init_hirs.get(&node).is_some_and(|hir| {
-                        emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
-                    })
-                },
-                subject,
-            ));
+            // Wave-6o (relay 139, R785-10): nullability CARRIED from elsewhere
+            // never makes a slot that is used as an array optional: no
+            // optional-slice arm renders its `.offset` or its index (batch 54:
+            // lodepng `palette#51`, brotli `literal_costs#5` / `cost_dist#7`).
+            // Such a slot keeps the form its own evidence gives it; a NULL
+            // reaching its indexing is the input's UB (§28).
+            || (!indexed
+                // Wave-6o (relay 096): a read of a raw field the program writes
+                // null into carries that null literal one field away.
+                && (raw_field_null.contains(&(subject.fn_did, subject.hir_id))
+                // Wave-6o (relay 113): an exported formal handed on to a callee
+                // that null-tests it carries that test one call down.
+                || option_ops::exported_param_handed_to_null_tested_formal(tcx, facts, subject)
+                // Wave-6o (relay 125): a caller's actual with its own nullability
+                // evidence, at a formal the callee does not dereference itself.
+                || option_ops::param_receives_nullable_actual(
+                    tcx,
+                    facts,
+                    opt_uses,
+                    &|node| {
+                        constructions.init_hirs.get(&node).is_some_and(|hir| {
+                            emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+                        })
+                    },
+                    subject,
+                ))));
     let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
