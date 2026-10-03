@@ -4010,21 +4010,28 @@ fn receiver_plan(
         .chain(uses.returns.iter())
         .copied()
         .collect();
-    let exit_close =
-        retained_sink && live_at_an_exit(tcx, receiver, &definitions, &call_sinks, &value_sinks);
-    if exit_close {
-        receipts.push(format!("waiver-drop(scope-exit) exit-path receiver={name}"));
-    }
+    // **R792-4** — one receipt per exit that holds the owner: each is one
+    // implicit close (addendum 101), named by its site and its owner.
+    let close_receipt = |exit: Span| {
+        format!(
+            "waiver-drop(scope-exit) site={} receiver={name}",
+            super::emitability::EmitabilityFacts::site(tcx, exit)
+        )
+    };
+    let exit_close = retained_sink && {
+        let exits = exits_holding(tcx, receiver, &definitions, &call_sinks, &value_sinks);
+        receipts.extend(exits.iter().map(|exit| close_receipt(*exit)));
+        !exits.is_empty()
+    };
     // **R710-5 S2** — a receiver with no sink is RECEIPTED as closing at scope
     // exit only where an exit is reached holding it: the same walk, its own
     // null edges pruned (buffer's `a`, tested null with an aborting other
     // branch, holds `None` at the one exit, and its drop is a no-op). Receipt
     // only: `implicit_scope_close` stays the MIR drop count D4 reconciles
     // (the drop of a `None` is still a `Drop` terminator).
-    let sinkless_close =
-        !retained_sink && live_at_an_exit(tcx, receiver, &definitions, &[], &value_sinks);
-    if sinkless_close {
-        receipts.push("waiver-drop(scope-exit)".to_owned());
+    if !retained_sink {
+        let exits = exits_holding(tcx, receiver, &definitions, &[], &value_sinks);
+        receipts.extend(exits.iter().map(|exit| close_receipt(*exit)));
     }
     // An edit inside a deleted statement goes with it.
     expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
@@ -4070,13 +4077,18 @@ struct ReceiverSinks {
 /// owner where C leaked it: quadtree `split_node_`'s `nw` at `ne`'s null
 /// return, or a `continue` ahead of a loop body's store. That close is
 /// addendum 101's, and it carries its receipt.
-fn live_at_an_exit(
+///
+/// **R792-4** — every such exit, not whether one exists: an exit reached
+/// through a `return`, `break` or `continue` is named by that jump, and one
+/// reached by falling off the owner's scope by the scope's end (the owner's
+/// `StorageDead`, or the function's `return`).
+fn exits_holding(
     tcx: TyCtxt<'_>,
     receiver: &Subject,
     definitions: &[Span],
     call_sinks: &[Span],
     value_sinks: &[Span],
-) -> bool {
+) -> Vec<Span> {
     use rustc_middle::mir::{
         BasicBlock, Operand, Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
     };
@@ -4200,12 +4212,13 @@ fn live_at_an_exit(
             null_switches.insert(*target, negated);
         }
     }
-    // Every point just after a definition.
-    let mut work: Vec<(BasicBlock, usize)> = Vec::new();
+    // Every point just after a definition. Each path carries the jump it is
+    // taking, if any.
+    let mut work: Vec<(BasicBlock, usize, Option<Span>)> = Vec::new();
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (index, statement) in data.statements.iter().enumerate() {
             if reseats(statement) && inside(statement.source_info.span, definitions) {
-                work.push((block, index + 1));
+                work.push((block, index + 1, None));
             }
         }
         if let TerminatorKind::Call {
@@ -4216,14 +4229,62 @@ fn live_at_an_exit(
             && bare(destination) == Some(owner)
             && inside(data.terminator().source_info.span, definitions)
         {
-            work.push((*target, 0));
+            work.push((*target, 0, None));
         }
     }
+    // The jumps: `return`, `break`, `continue`. Jumps share the exit path's
+    // blocks (the `StorageDead`s, the `return`), so the exit a path reaches is
+    // the jump whose code it ran last, else the scope's end. Any other code
+    // run after a jump (a loop's head after a `continue`) means the jump did
+    // not leave the owner's scope. A jump alone in an `if`'s then-block leaves
+    // no code of its own once the CFG is simplified (`if c { continue; }`
+    // branches straight into the exit path): the `if`'s branch hands the jump
+    // to its edges, and the first code an edge runs outside the exit path
+    // takes it back.
+    struct Returns(Vec<Span>, Vec<(Span, Span, Span)>);
+    impl<'tcx> Visitor<'tcx> for Returns {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            // A desugared jump (a `while`'s `break`) spans the whole loop.
+            let jump = |e: &Expr<'_>| {
+                matches!(
+                    e.kind,
+                    ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)
+                ) && e.span.desugaring_kind().is_none()
+            };
+            if jump(expr) {
+                self.0.push(expr.span);
+            }
+            if let ExprKind::If(_, then, _) = expr.kind
+                && let ExprKind::Block(block, _) = then.kind
+                && block.expr.is_none()
+                && let [statement] = block.stmts
+                && let rustc_hir::StmtKind::Semi(last) | rustc_hir::StmtKind::Expr(last) =
+                    statement.kind
+                && jump(last)
+            {
+                self.1.push((expr.span, then.span, last.span));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut returns = Returns(Vec::new(), Vec::new());
+    returns.visit_body(tcx.hir_body_owned_by(receiver.fn_did));
+    let mut exits: Vec<Span> = Vec::new();
     let mut seen = FxHashSet::default();
-    'paths: while let Some((block, from)) = work.pop() {
-        if from == 0 && !seen.insert(block) {
+    'paths: while let Some((block, from, mut via)) = work.pop() {
+        if from == 0 && !seen.insert((block, via)) {
             continue;
         }
+        let mut within = |span: Span, exit_path: bool| match returns
+            .0
+            .iter()
+            .filter(|ret| ret.contains(span))
+            .min_by_key(|ret| ret.hi() - ret.lo())
+        {
+            Some(ret) => via = Some(*ret),
+            None if !exit_path => via = None,
+            None => {}
+        };
         let data = &body.basic_blocks[block];
         if data.is_cleanup {
             continue;
@@ -4236,12 +4297,29 @@ fn live_at_an_exit(
                 continue 'paths;
             }
             if matches!(statement.kind, StatementKind::StorageDead(local) if local == owner) {
-                return true;
+                exits.push(via.unwrap_or(statement.source_info.span));
+                continue 'paths;
             }
+            within(
+                statement.source_info.span,
+                matches!(
+                    statement.kind,
+                    StatementKind::StorageDead(_)
+                        | StatementKind::StorageLive(_)
+                        | StatementKind::Nop
+                ),
+            );
         }
         let terminator = data.terminator();
+        within(
+            terminator.source_info.span,
+            matches!(
+                terminator.kind,
+                TerminatorKind::Goto { .. } | TerminatorKind::Return | TerminatorKind::Drop { .. }
+            ),
+        );
         match &terminator.kind {
-            TerminatorKind::Return => return true,
+            TerminatorKind::Return => exits.push(via.unwrap_or(terminator.source_info.span)),
             TerminatorKind::Call { destination, .. }
                 if bare(destination) == Some(owner)
                     || call_sinks.iter().any(|call| {
@@ -4256,17 +4334,30 @@ fn live_at_an_exit(
                 let negated = null_switches[&block];
                 for (value, next) in targets.iter() {
                     if (value == 0) != negated {
-                        work.push((next, 0));
+                        work.push((next, 0, via));
                     }
                 }
                 if negated {
-                    work.push((targets.otherwise(), 0));
+                    work.push((targets.otherwise(), 0, via));
                 }
             }
-            _ => work.extend(terminator.successors().map(|next| (next, 0))),
+            TerminatorKind::SwitchInt { .. } => {
+                let at = terminator.source_info.span;
+                let branch = returns
+                    .1
+                    .iter()
+                    .filter(|(whole, then, _)| whole.contains(at) && !then.contains(at))
+                    .min_by_key(|(whole, _, _)| whole.hi() - whole.lo())
+                    .map(|(_, _, jump)| *jump);
+                let via = branch.or(via);
+                work.extend(terminator.successors().map(|next| (next, 0, via)));
+            }
+            _ => work.extend(terminator.successors().map(|next| (next, 0, via))),
         }
     }
-    false
+    exits.sort_by_key(|span| (span.lo(), span.hi()));
+    exits.dedup();
+    exits
 }
 
 /// **R619-3 (2) — the receivers' own implicit-close receipts**, published
