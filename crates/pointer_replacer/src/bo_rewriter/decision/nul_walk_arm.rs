@@ -99,6 +99,12 @@ const STRING_READS: &[(&str, usize, bool)] = &[
     ("strncpy", 1, false),
 ];
 
+/// String functions that return a pointer INTO their argument.
+const DERIVING: &[&str] = &["strchr", "strrchr", "strstr", "strpbrk"];
+/// String functions that store a pointer into their argument through their
+/// second argument (the end pointer), unless it is null.
+const END_POINTER: &[&str] = &["strtol", "strtoul", "strtod"];
+
 /// The `printf` family: the format's argument index.
 const PRINTF_FORMAT: &[(&str, usize)] = &[
     ("printf", 0),
@@ -129,6 +135,12 @@ pub(crate) fn sites(
                 if !byte_pointer(tcx.typeck(call.caller).expr_ty(expr)) {
                     continue;
                 }
+                // The construction (and its `strlen`) runs while argument
+                // `index` is built: an argument after it that writes would
+                // run between the walk and the callee's read (the review's 2).
+                if !later_arguments_pure(tcx, expr) {
+                    continue;
+                }
                 let site = if class.reaches {
                     Some(Site {
                         arm: "A",
@@ -139,7 +151,7 @@ pub(crate) fn sites(
                     // every provenance: an `argv` or `strdup` string the
                     // program shortened, or a callee that writes through it
                     // (`strcpy`'s destination), runs past `strlen + 1`.
-                    provenance(tcx, call.caller, expr)
+                    provenance(tcx, &mut classes, facts, call.caller, expr)
                         .filter(|_| class.bounded)
                         .map(|provenance| Site {
                             arm: "B",
@@ -249,6 +261,9 @@ enum Index {
 struct Classes {
     done: FxHashMap<(LocalDefId, usize), Class>,
     open: FxHashSet<(LocalDefId, usize)>,
+    /// How many times a cycle's placeholder was handed out: a class computed
+    /// while one was is partial, and is not cached (the review's 3).
+    placeholders: usize,
 }
 
 enum Use {
@@ -267,6 +282,8 @@ enum Use {
     Deref { index: Index, write: bool },
     /// `p = p.offset(literal)`: a cursor step.
     Step,
+    /// A `%s`/`%[`-style destination of `sscanf`: written by it.
+    ScanfDest,
     /// Anything else: not provably bounded.
     Other,
 }
@@ -284,15 +301,20 @@ impl Classes {
             return Some(*class);
         }
         if !self.open.insert(key) {
-            // A cycle (`snocString` forwards to itself): it adds no read.
+            // A cycle (`snocString` forwards to itself): it adds no read of
+            // its own; the members' own uses decide. Partial: not cached.
+            self.placeholders += 1;
             return Some(Class {
                 bounded: true,
                 reaches: false,
             });
         }
+        let before = self.placeholders;
         let class = self.compute(tcx, facts, callee, index);
         self.open.remove(&key);
-        if let Some(class) = class {
+        if let Some(class) = class
+            && self.placeholders == before
+        {
             self.done.insert(key, class);
         }
         class
@@ -371,11 +393,14 @@ impl Classes {
                 } => {
                     walk_indexes.insert(i);
                 }
+                // `*p.offset(5)`: a constant past element 0 proves nothing
+                // about the NUL (the review's 4), cursor walk or not.
                 Use::Deref {
                     index: Index::Literal,
                     ..
-                }
-                | Use::Step => cursor_uses = true,
+                } => class.bounded = false,
+                Use::Step => cursor_uses = true,
+                Use::ScanfDest => class.bounded = false,
                 Use::Deref {
                     index: Index::Other,
                     ..
@@ -442,15 +467,22 @@ fn uses(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>) -> Vec<Use>
 }
 
 fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: HirId) -> Use {
-    // Up through the casts the C spelling puts around the pointer.
+    // Up through the casts the C spelling puts around the pointer. A cast to
+    // an integer reads the address only.
     let mut child = at;
     let mut parent = tcx.parent_hir_node(child);
-    while let Node::Expr(Expr {
-        kind: ExprKind::Cast(..) | ExprKind::DropTemps(..),
-        hir_id,
-        ..
-    }) = parent
+    while let Node::Expr(
+        cast @ Expr {
+            kind: ExprKind::Cast(..) | ExprKind::DropTemps(..),
+            hir_id,
+            ..
+        },
+    ) = parent
     {
+        if matches!(cast.kind, ExprKind::Cast(..)) && tcx.typeck(callee).expr_ty(cast).is_integral()
+        {
+            return Use::Neutral;
+        }
         child = *hir_id;
         parent = tcx.parent_hir_node(child);
     }
@@ -509,7 +541,10 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
                 let Some(position) = args.iter().position(|a| a.hir_id == child) else {
                     return Use::Other;
                 };
-                let every = every_path(tcx, callee, e.hir_id);
+                // `every`: on every path through the callee, AND its first
+                // effect — nothing that could write the string (a call, a
+                // store, an exit) runs before it (the review's 1 and 2).
+                let every = every_path(tcx, callee, e.hir_id) && first_effect(tcx, callee, e);
                 if let Some(next) = local_callee(tcx, function) {
                     return Use::Forward {
                         callee: next,
@@ -524,10 +559,25 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
                     .iter()
                     .find(|(n, i, _)| *n == name.as_str() && *i == position)
                 {
+                    // A pointer the call derives INTO the string (`strchr`,
+                    // `strtol`'s end pointer) may be read or written past its
+                    // NUL: only a discarded or null-tested result is a read
+                    // (the review's 7).
+                    if DERIVING.contains(&name.as_str()) && !result_only_tested(tcx, e) {
+                        return Use::Other;
+                    }
+                    if END_POINTER.contains(&name.as_str())
+                        && !args.get(1).is_some_and(|end| null_pointer(end))
+                    {
+                        return Use::Other;
+                    }
                     return Use::Read {
                         terminated: *terminated,
                         every,
                     };
+                }
+                if name == "sscanf" && position >= 2 {
+                    return Use::ScanfDest;
                 }
                 if let Some((_, format_at)) =
                     PRINTF_FORMAT.iter().find(|(n, _)| *n == name.as_str())
@@ -553,6 +603,17 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
             {
                 Use::Neutral
             }
+            // The target of a cursor step `p = p.offset(1)` (its right side is
+            // the `Step`).
+            ExprKind::Assign(left, right, _)
+                if left.hir_id == child
+                    && matches!(peel(right).kind, ExprKind::MethodCall(segment, receiver, [step], _)
+                        if matches!(segment.ident.name.as_str(), "offset" | "add")
+                            && local_of(receiver).is_some_and(|r| set.contains(&r))
+                            && matches!(peel(step).kind, ExprKind::Lit(_))) =>
+            {
+                Use::Neutral
+            }
             _ => Use::Other,
         },
         Node::LetStmt(local)
@@ -563,6 +624,146 @@ fn classify(tcx: TyCtxt<'_>, callee: LocalDefId, set: &FxHashSet<HirId>, at: Hir
         }
         _ => Use::Other,
     }
+}
+
+/// The call's value is discarded (`strchr(s, c);`) or only null-tested.
+fn result_only_tested(tcx: TyCtxt<'_>, call: &Expr<'_>) -> bool {
+    match tcx.parent_hir_node(call.hir_id) {
+        Node::Stmt(_) => true,
+        Node::Expr(Expr {
+            kind: ExprKind::MethodCall(segment, receiver, [], _),
+            ..
+        }) => receiver.hir_id == call.hir_id && segment.ident.name.as_str() == "is_null",
+        _ => false,
+    }
+}
+
+/// `0 as *mut T`, `ptr::null()` / `null_mut()`, under casts.
+fn null_pointer(e: &Expr<'_>) -> bool {
+    match peel(e).kind {
+        ExprKind::Lit(lit) => matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0),
+        ExprKind::Call(function, []) => {
+            callee_name(function).is_some_and(|n| matches!(n.as_str(), "null" | "null_mut"))
+        }
+        _ => false,
+    }
+}
+
+/// Could evaluating `e` write memory or leave the function: a call (other
+/// than pointer arithmetic, `is_null` and the like), a store, an exit, a loop
+/// or a closure.
+fn impure(e: &Expr<'_>) -> bool {
+    match e.kind {
+        ExprKind::Call(..)
+        | ExprKind::Assign(..)
+        | ExprKind::AssignOp(..)
+        | ExprKind::Ret(_)
+        | ExprKind::Break(..)
+        | ExprKind::Continue(_)
+        | ExprKind::Loop(..)
+        | ExprKind::Closure(..)
+        | ExprKind::InlineAsm(_) => true,
+        ExprKind::MethodCall(segment, ..) => !matches!(
+            segment.ident.name.as_str(),
+            "is_null"
+                | "offset"
+                | "add"
+                | "sub"
+                | "wrapping_add"
+                | "wrapping_sub"
+                | "wrapping_offset"
+                | "as_ptr"
+                | "as_mut_ptr"
+                | "cast"
+                | "cast_mut"
+                | "cast_const"
+        ),
+        _ => false,
+    }
+}
+
+/// Nothing impure is evaluated in `function` before `read` (the read's own
+/// arguments included): no call, store, exit or loop runs ahead of it. The
+/// expressions that CONTAIN the read (its `if`, an enclosing call) run after
+/// it.
+fn first_effect(tcx: TyCtxt<'_>, function: LocalDefId, read: &Expr<'_>) -> bool {
+    struct Before {
+        read: HirId,
+        span: Span,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Before {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if e.hir_id != self.read
+                && impure(e)
+                && e.span.lo() < self.span.hi()
+                && !e.span.contains(self.span)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut before = Before {
+        read: read.hir_id,
+        span: read.span,
+        found: false,
+    };
+    before.visit_body(tcx.hir_body_owned_by(function));
+    !before.found
+}
+
+/// The arguments after `argument` in its call write nothing and call
+/// nothing.
+fn later_arguments_pure(tcx: TyCtxt<'_>, argument: &Expr<'_>) -> bool {
+    struct Any(bool);
+    impl<'tcx> Visitor<'tcx> for Any {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            self.0 |= impure(e);
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let Node::Expr(Expr {
+        kind: ExprKind::Call(_, args),
+        ..
+    }) = tcx.parent_hir_node(argument.hir_id)
+    else {
+        return false;
+    };
+    let Some(at) = args.iter().position(|a| a.hir_id == argument.hir_id) else {
+        return false;
+    };
+    args[at + 1..].iter().all(|later| {
+        let mut any = Any(false);
+        any.visit_expr(later);
+        !any.0
+    })
+}
+
+/// Every use of `set` in `function` only reads: a string read, a null test,
+/// an address, a copy into the set, a read of an element, a forward to a
+/// bounded callee parameter, or (`scanf_ok`) the `sscanf` that fills it.
+fn read_only(
+    tcx: TyCtxt<'_>,
+    classes: &mut Classes,
+    facts: &EmitabilityFacts,
+    function: LocalDefId,
+    set: &FxHashSet<HirId>,
+    scanf_ok: bool,
+) -> bool {
+    uses(tcx, function, set).into_iter().all(|u| match u {
+        Use::Read { .. } | Use::Neutral => true,
+        Use::Deref { write, .. } => !write,
+        Use::Forward {
+            callee: next,
+            index: at,
+            ..
+        } => classes
+            .of(tcx, facts, next, at)
+            .is_some_and(|class| class.bounded),
+        Use::ScanfDest => scanf_ok,
+        Use::Step | Use::Other => false,
+    })
 }
 
 /// Is the place at `place` written (`*p = ..`, `*p += ..`) or borrowed?
@@ -592,7 +793,7 @@ fn indexed_walk(tcx: TyCtxt<'_>, function: LocalDefId, set: &FxHashSet<HirId>, i
         set: &'a FxHashSet<HirId>,
         i: HirId,
         ok: bool,
-        increments: usize,
+        declared: bool,
     }
     fn zero(e: &Expr<'_>) -> bool {
         matches!(peel(e).kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0))
@@ -604,9 +805,13 @@ fn indexed_walk(tcx: TyCtxt<'_>, function: LocalDefId, set: &FxHashSet<HirId>, i
         fn visit_local(&mut self, l: &'tcx rustc_hir::LetStmt<'tcx>) {
             if let PatKind::Binding(_, id, _, None) = l.pat.kind
                 && id == self.i
-                && !l.init.is_some_and(zero)
             {
-                self.ok = false;
+                // `let i = 0`: a local of this body starting at the first
+                // element, not a parameter (the review's 5a).
+                self.declared = true;
+                if !l.init.is_some_and(zero) {
+                    self.ok = false;
+                }
             }
             intravisit::walk_local(self, l);
         }
@@ -625,7 +830,6 @@ fn indexed_walk(tcx: TyCtxt<'_>, function: LocalDefId, set: &FxHashSet<HirId>, i
                     {
                         self.ok = false;
                     }
-                    self.increments += 1;
                 }
                 ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, inner)
                     if local_of(inner) == Some(self.i) =>
@@ -642,33 +846,82 @@ fn indexed_walk(tcx: TyCtxt<'_>, function: LocalDefId, set: &FxHashSet<HirId>, i
         set,
         i,
         ok: true,
-        increments: 0,
+        declared: false,
     };
     defs.visit_body(tcx.hir_body_owned_by(function));
-    defs.ok
+    defs.ok && defs.declared
 }
 
-/// The statement holding `increment` is preceded, in its block, by `if R == 0
-/// { break | return .. }` where `R` reads `s[i]`.
+/// The statement holding `increment` is preceded, in its block and since the
+/// last change of `i`, by `if R == 0 { break | return .. }` where `R` reads
+/// `s[i]` inline or through a `let c = *s.offset(i)` bound since that change
+/// (the review's 5b: a second increment needs its own test; 5c: a byte read
+/// before the loop is not `s[i]`).
 fn tested_before(tcx: TyCtxt<'_>, set: &FxHashSet<HirId>, i: HirId, increment: HirId) -> bool {
+    struct Changes {
+        i: HirId,
+        locals: FxHashSet<HirId>,
+        changes_i: bool,
+        assigned: Vec<HirId>,
+    }
+    impl<'tcx> Visitor<'tcx> for Changes {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(left, ..) | ExprKind::AssignOp(_, left, _) = e.kind
+                && let Some(l) = local_of(left)
+            {
+                if l == self.i {
+                    self.changes_i = true;
+                }
+                if self.locals.contains(&l) {
+                    self.assigned.push(l);
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
     let mut child = increment;
     for (_, node) in tcx.hir_parent_iter(increment) {
         if let Node::Block(block) = node {
+            let mut tested = false;
+            let mut fresh: FxHashSet<HirId> = FxHashSet::default();
             for stmt in block.stmts {
                 let holds = stmt.hir_id == child
                     || matches!(stmt.kind, rustc_hir::StmtKind::Expr(e) | rustc_hir::StmtKind::Semi(e) if e.hir_id == child);
                 if holds {
-                    return false;
+                    return tested;
                 }
+                let mut changes = Changes {
+                    i,
+                    locals: fresh.clone(),
+                    changes_i: false,
+                    assigned: Vec::new(),
+                };
+                changes.visit_stmt(stmt);
+                if changes.changes_i {
+                    tested = false;
+                    fresh.clear();
+                    continue;
+                }
+                for l in changes.assigned {
+                    fresh.remove(&l);
+                }
+                if let rustc_hir::StmtKind::Let(l) = stmt.kind
+                    && let PatKind::Binding(_, c, _, None) = l.pat.kind
+                    && l.init.is_some_and(|init| reads_s_at_i(set, i, init))
+                {
+                    fresh.insert(c);
+                }
+                let reads = |e: &Expr<'_>| {
+                    reads_s_at_i(set, i, e) || local_of(e).is_some_and(|c| fresh.contains(&c))
+                };
                 if let rustc_hir::StmtKind::Expr(e) | rustc_hir::StmtKind::Semi(e) = stmt.kind
                     && let ExprKind::If(condition, then, None) = e.kind
                     && leaves(then)
                     && let ExprKind::Binary(op, left, right) = peel(condition).kind
                     && op.node == BinOpKind::Eq
-                    && ((reads_s_at_i(tcx, set, i, left) && is_zero_lit(right))
-                        || (reads_s_at_i(tcx, set, i, right) && is_zero_lit(left)))
+                    && ((reads(left) && is_zero_lit(right)) || (reads(right) && is_zero_lit(left)))
                 {
-                    return true;
+                    tested = true;
                 }
             }
             return false;
@@ -704,8 +957,8 @@ fn leaves(e: &Expr<'_>) -> bool {
     }
 }
 
-/// `*s.offset(i)`, or a local bound once to it (`let c = *s.offset(i)`).
-fn reads_s_at_i(tcx: TyCtxt<'_>, set: &FxHashSet<HirId>, i: HirId, e: &Expr<'_>) -> bool {
+/// `*s.offset(i)` inline, under casts.
+fn reads_s_at_i(set: &FxHashSet<HirId>, i: HirId, e: &Expr<'_>) -> bool {
     let e = peel(e);
     if let ExprKind::Unary(UnOp::Deref, inner) = e.kind
         && let ExprKind::MethodCall(segment, receiver, [step], _) = peel(inner).kind
@@ -715,13 +968,7 @@ fn reads_s_at_i(tcx: TyCtxt<'_>, set: &FxHashSet<HirId>, i: HirId, e: &Expr<'_>)
     {
         return true;
     }
-    let Some(local) = local_of(e) else {
-        return false;
-    };
-    let owner = tcx.hir_get_parent_item(local);
-    single_definition(tcx, owner.def_id, local).is_some_and(|init| {
-        !matches!(peel(init).kind, ExprKind::Path(..)) && reads_s_at_i(tcx, set, i, init)
-    })
+    false
 }
 
 /// The bytes of a `b"..."` literal under casts.
@@ -752,7 +999,7 @@ fn plain_s_conversion(format: &[u8], n: usize) -> bool {
             continue;
         }
         let start = i;
-        while i < format.len() && b"-+ #0123456789.lhzjtLq*".contains(&format[i]) {
+        while i < format.len() && b"-+ #'I0123456789.lhzjtLq*".contains(&format[i]) {
             i += 1;
         }
         let spec = &format[start..i];
@@ -763,8 +1010,14 @@ fn plain_s_conversion(format: &[u8], n: usize) -> bool {
         if spec.contains(&b'*') {
             return false;
         }
+        // `%m` takes no argument (the review's 9).
+        if conversion == b'm' {
+            continue;
+        }
         if seen == n {
-            return conversion == b's' && !spec.contains(&b'.');
+            // A plain `%s`: no precision, and no length modifier (`%ls` reads
+            // a wide string).
+            return conversion == b's' && !spec.iter().any(|c| b".lhzjtLq".contains(c));
         }
         seen += 1;
     }
@@ -844,24 +1097,146 @@ fn preceding_exit_free(block: &rustc_hir::Block<'_>, child: HirId) -> bool {
 
 // ---- the base: provenance ----
 
-fn provenance(tcx: TyCtxt<'_>, caller: LocalDefId, arg: &Expr<'_>) -> Option<String> {
+/// The base's provenance, where the string cannot have been changed before
+/// the call: a literal (writing one is undefined on the input), or a base
+/// every use of which in the caller only reads (the review's 6).
+fn provenance(
+    tcx: TyCtxt<'_>,
+    classes: &mut Classes,
+    facts: &EmitabilityFacts,
+    caller: LocalDefId,
+    arg: &Expr<'_>,
+) -> Option<String> {
     let e = peel(arg);
-    if let Some(p) = direct(tcx, caller, e) {
-        return Some(p.to_owned());
+    let read_only_argv = |classes: &mut Classes| argv_read_only(tcx, classes, facts, caller);
+    match direct(tcx, caller, e) {
+        Some("literal") => return Some("literal".to_owned()),
+        Some(p) => return read_only_argv(classes).then(|| p.to_owned()),
+        None => {}
     }
     let local = local_of(e)?;
     let init = single_definition(tcx, caller, local)?;
-    if let Some(p) = direct(tcx, caller, peel(init)) {
-        return Some(p.to_owned());
+    let only = std::iter::once(local).collect::<FxHashSet<_>>();
+    match direct(tcx, caller, peel(init)) {
+        Some("literal") => return Some("literal".to_owned()),
+        Some(p) => {
+            return (read_only_argv(classes)
+                && read_only(tcx, classes, facts, caller, &only, false))
+            .then(|| p.to_owned());
+        }
+        None => {}
     }
     if let ExprKind::Call(function, _) = peel(init).kind
         && let Some(name) = callee_name(function)
         && matches!(name.as_str(), "strdup" | "getenv")
         && null_tested_before(tcx, local, arg.hir_id)
     {
-        return Some(name);
+        return read_only(tcx, classes, facts, caller, &only, false).then_some(name);
     }
-    sscanf_checked(tcx, caller, local, arg.hir_id).map(|test| format!("sscanf({test})"))
+    let test = sscanf_checked(tcx, caller, local, arg.hir_id)?;
+    read_only(tcx, classes, facts, caller, &only, true).then(|| format!("sscanf({test})"))
+}
+
+/// `main_0`'s `argv` is used only to load elements, and every element (and
+/// every local copy of one) is only read: no element string is changed or
+/// replaced before any call.
+fn argv_read_only(
+    tcx: TyCtxt<'_>,
+    classes: &mut Classes,
+    facts: &EmitabilityFacts,
+    main: LocalDefId,
+) -> bool {
+    let Some(argv) = tcx
+        .hir_body_owned_by(main)
+        .params
+        .get(1)
+        .and_then(|p| match p.pat.kind {
+            PatKind::Binding(_, id, _, None) => Some(id),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    // Every use of `argv` is `*argv.offset(k)` read (an element load).
+    struct Loads {
+        argv: HirId,
+        loads: Vec<HirId>,
+        paths: usize,
+    }
+    impl<'tcx> Visitor<'tcx> for Loads {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if local_of(e) == Some(self.argv) && matches!(e.kind, ExprKind::Path(..)) {
+                self.paths += 1;
+            }
+            if let ExprKind::Unary(UnOp::Deref, inner) = e.kind
+                && let ExprKind::MethodCall(segment, receiver, [_], _) = peel(inner).kind
+                && matches!(segment.ident.name.as_str(), "offset" | "add")
+                && matches!(receiver.kind, ExprKind::Path(..))
+                && local_of(receiver) == Some(self.argv)
+            {
+                self.loads.push(e.hir_id);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let body = tcx.hir_body_owned_by(main);
+    let mut loads = Loads {
+        argv,
+        loads: Vec::new(),
+        paths: 0,
+    };
+    loads.visit_body(body);
+    if loads.paths != loads.loads.len() || loads.loads.iter().any(|load| assigned(tcx, *load)) {
+        return false;
+    }
+    // The locals an element is copied into.
+    struct Copies<'a> {
+        loads: &'a [HirId],
+        copies: FxHashSet<HirId>,
+    }
+    impl<'tcx> Visitor<'tcx> for Copies<'_> {
+        fn visit_local(&mut self, l: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if let PatKind::Binding(_, id, _, None) = l.pat.kind
+                && l.init.is_some_and(|i| self.loads.contains(&peel(i).hir_id))
+            {
+                self.copies.insert(id);
+            }
+            intravisit::walk_local(self, l);
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(left, right, _) = e.kind
+                && self.loads.contains(&peel(right).hir_id)
+                && let Some(l) = local_of(left)
+            {
+                self.copies.insert(l);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut copies = Copies {
+        loads: &loads.loads,
+        copies: FxHashSet::default(),
+    };
+    copies.visit_body(body);
+    let copies = copies.copies;
+    let element_uses_read =
+        loads
+            .loads
+            .iter()
+            .all(|load| match classify(tcx, main, &copies, *load) {
+                Use::Read { .. } | Use::Neutral => true,
+                Use::Deref { write, .. } => !write,
+                Use::Forward {
+                    callee: next,
+                    index: at,
+                    ..
+                } => classes
+                    .of(tcx, facts, next, at)
+                    .is_some_and(|class| class.bounded),
+                Use::ScanfDest | Use::Step | Use::Other => false,
+            });
+    element_uses_read && read_only(tcx, classes, facts, main, &copies, false)
 }
 
 /// `*argv.offset(k)` of `main_0`'s `argv`, or a string literal (or a choice
