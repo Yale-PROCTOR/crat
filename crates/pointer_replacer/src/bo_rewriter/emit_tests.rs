@@ -14893,14 +14893,18 @@ fn r674_9_an_element_address_takes_the_callee_s_straight_line_extent() {
     );
 }
 
-/// **R674-9 controls — no proven extent, no rendering.** Each callee reads its
-/// parameter past element 0, and each call passes an element address, so the
-/// refusal stands (and no extent is fabricated) wherever the body does not
-/// prove what every call reads: a branch, a short-circuit, a non-literal
+/// **R674-9 controls — no proven extent, the FABRICATED extent (R761-1 as
+/// ruled, relay 263).** Each callee reads its parameter past element 0, and
+/// each call passes an element address of a raw pointer, where the body does
+/// not prove what every call reads: a branch, a short-circuit, a non-literal
 /// offset, an access after an early return, and brotli's
 /// `BrotliCreateHuffmanTree(&*histogram.offset(64), 64)` (a count companion,
-/// which no licence yet bounds every index by). An element address over a
-/// REFERENCE is not a raw pointer's element and is refused too.
+/// which no licence yet bounds every index by, so it is not taken). R761-1
+/// ruled shape (ii) fabricates at the site under §77; the refusal this control
+/// pinned dropped the site and held the callee's formal raw (brotli's six held
+/// callees at batch 54). Restated: each is placed with the fabricated extent.
+/// An element address over a REFERENCE is not a raw pointer's element and is
+/// still refused.
 #[test]
 fn r674_9_an_element_address_without_a_proven_extent_stays_refused() {
     let src = format!(
@@ -14941,19 +14945,27 @@ fn r674_9_an_element_address_without_a_proven_extent_stays_refused() {
          }}\n"
     );
     let seams = e_adapt_seams(&src);
-    for callee in ["upper", "both", "at", "dead", "tree", "read32"] {
+    for callee in ["upper", "both", "at", "dead", "tree"] {
         assert_eq!(
             (
                 r674_placed(&seams, callee, "caller"),
                 r674_blocked(&seams, callee, "caller")
             ),
-            (
-                Vec::<String>::new(),
-                vec!["seam-one-element-into-wider-formal".to_owned()]
-            ),
-            "{callee}: no proven extent, the refusal stands:\n{seams}"
+            (vec!["len-fabricated".to_owned()], Vec::<String>::new()),
+            "{callee}: no proven extent, the fabricated extent:\n{seams}"
         );
     }
+    assert_eq!(
+        (
+            r674_placed(&seams, "read32", "caller"),
+            r674_blocked(&seams, "read32", "caller")
+        ),
+        (
+            Vec::<String>::new(),
+            vec!["seam-one-element-into-wider-formal".to_owned()]
+        ),
+        "read32: an element of a reference, the refusal stands:\n{seams}"
+    );
 }
 
 /// **R674-9 — any other use of the parameter proves nothing.** Passed on

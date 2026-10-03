@@ -5756,9 +5756,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // past it. The pointer under the `&*` carries the allocation, so
                 // the raw arm takes it where the callee's own straight-line body
                 // proves the extent (`element_extent`: it reads or writes
-                // elements `0..N` on every call). Otherwise the refusal stands:
-                // no extent is fabricated, and a count companion waits for a
-                // licence that bounds every index by it (relay 067).
+                // elements `0..N` on every call). A count companion still waits
+                // for a licence that bounds every index by it (relay 067).
+                //
+                // **R761-1 as ruled (relay 263) — otherwise the site FABRICATES
+                // (§77).** The refusal used to stand, and a refused site is
+                // dropped: the callee's formal is held raw, its class with it,
+                // and every other caller of that formal is stranded (lodepng's
+                // whole-program revert at batch 54; brotli's six held callees and
+                // the 227 rows behind them). The pointer under the `&*` carries
+                // the allocation, and the input dereferenced it, so it is not
+                // null (R517-10): the raw arm takes it with the fabricated
+                // extent, receipted as every other fabricated extent is.
                 let element_pointer = (one_element_into_wide(
                     table.wide_access_parameters.contains(&(*callee, pos.index)),
                     pos.source_shape,
@@ -5773,9 +5782,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                 .flatten()
                 .and_then(|argument| argument.deref_pointer)
                 .and_then(|span| sm.span_to_snippet(span).ok())
-                .and_then(|pointer| {
-                    super::element_extent::constant_access_extent(tcx, *callee, pos.index)
-                        .map(|elements| (pointer, elements.to_string()))
+                .map(|pointer| {
+                    let elements =
+                        super::element_extent::constant_access_extent(tcx, *callee, pos.index)
+                            .map(|elements| elements.to_string());
+                    (pointer, elements)
                 });
                 // **R674-6 (iii-a) — the exemption belongs to the decided form
                 // only.** For a SLICE root the decided candidate is the root's
@@ -5835,9 +5846,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                             pointer,
                             &pos.source_type,
                             false,
-                            Some(elements.as_str()),
+                            elements.as_deref(),
                             false,
-                            Some(LenEvidence::CalleeAccess),
+                            elements
+                                .as_ref()
+                                .map_or(len_evidence, |_| Some(LenEvidence::CalleeAccess)),
                             enclosing_unsafe_fn,
                             retention,
                             *callee,
@@ -5848,6 +5861,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             field_tied_params.contains(&pos.index),
                             None,
                         )
+                        .map(|candidate| candidate.map(mark_refused))
                     } else {
                         build_candidate(
                             pos.expected,
@@ -5932,9 +5946,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                             pointer,
                             &pos.source_type,
                             false,
-                            Some(elements.as_str()),
+                            elements.as_deref(),
                             false,
-                            Some(LenEvidence::CalleeAccess),
+                            elements
+                                .as_ref()
+                                .map_or(len_evidence, |_| Some(LenEvidence::CalleeAccess)),
                             enclosing_unsafe_fn,
                             retention,
                             *callee,
@@ -5945,6 +5961,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             field_tied_params.contains(&pos.index),
                             None,
                         )
+                        .map(|candidate| candidate.map(mark_refused))
                     } else {
                         build_candidate(
                             pos.expected,
