@@ -95,6 +95,7 @@ pub(crate) mod mixed_boundary;
 mod mixed_boundary_tests;
 pub(crate) mod native_result_expression;
 pub(crate) mod nested_slice;
+pub(crate) mod nul_walk_arm;
 pub(crate) mod null_init_declaration;
 pub(crate) mod option;
 mod option_ops;
@@ -1173,6 +1174,10 @@ pub(crate) struct DecisionTable {
     /// (`field_alloc::Licences::length_at`) of a call argument, keyed by the
     /// caller and the argument's span: the seam's `len-field-alloc` arm.
     pub(crate) field_alloc_lengths: rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), String>,
+    /// **wave-6l relay 077 (R776-4).** Call-site arguments whose C string the
+    /// NUL-walk arm licenses `strlen + 1` for (`nul_walk_arm::sites`).
+    pub(crate) nul_walk_sites:
+        rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), nul_walk_arm::Site>,
     /// **wave-6l relay 063 (R645-5 item 2).** The parameters the KX list names
     /// (`kx_refusals::KX_LIST`), keyed as `slice_input_companions`, with the row
     /// the receipt names. The seam refuses their adjacency licence.
@@ -1536,6 +1541,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         slice_input_mask_companions: Default::default(),
         extent_proof_companions: Default::default(),
         field_alloc_lengths: Default::default(),
+        nul_walk_sites: Default::default(),
         kx_refused: Default::default(),
         nul_exact_parameters: Default::default(),
         wide_access_parameters: Default::default(),
@@ -3276,6 +3282,7 @@ mod self_consistency_tests {
             slice_input_mask_companions: Default::default(),
             extent_proof_companions: Default::default(),
             field_alloc_lengths: Default::default(),
+            nul_walk_sites: Default::default(),
             kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),

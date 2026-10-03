@@ -236,6 +236,10 @@ pub(crate) enum LenEvidence {
     /// field whose every allocation holds `length + k` elements past it
     /// (`field_alloc`): the length is that field's, read from the same object.
     FieldAlloc,
+    /// **wave-6l relay 077 (R776-4)** — a C string the callee reads no further
+    /// than its NUL, with the arm and provenance that prove it terminated
+    /// (`nul_walk_arm`): the length is `strlen + 1`.
+    NulWalk,
 }
 
 impl LenEvidence {
@@ -249,6 +253,7 @@ impl LenEvidence {
             LenEvidence::ArrayType => "len-array-type",
             LenEvidence::CalleeAccess => "len-callee-access",
             LenEvidence::FieldAlloc => "len-field-alloc",
+            LenEvidence::NulWalk => "len-nul-walk",
         }
     }
 }
@@ -339,7 +344,15 @@ pub(crate) enum SeamLen {
     /// the receipt names the proof and its premises:
     /// `evidence(extent-proof:<premises>:<text>)`.
     Proven { text: String, premises: String },
+    /// **wave-6l relay 077 (R776-4).** `strlen + 1` of a C string the NUL-walk
+    /// arm licensed (`nul_walk_arm`), rendered as a licensed length; the
+    /// receipt names the arm and the provenance: `evidence(nul-walk:<arm>:<provenance>)`.
+    NulWalk { text: String, receipt: String },
 }
+
+/// **wave-6l relay 077.** The binding a NUL-walk construction gives its base,
+/// which its `strlen + 1` length reads.
+pub(crate) const NUL_WALK_BASE: &str = "__crat_nul_walk_base";
 
 impl SeamLen {
     /// The length's source text. **The single place both emitters read it
@@ -348,7 +361,9 @@ impl SeamLen {
     pub(crate) fn text(&self) -> &str {
         match self {
             SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
-            SeamLen::PositionalSibling { text, .. } | SeamLen::Proven { text, .. } => text,
+            SeamLen::PositionalSibling { text, .. }
+            | SeamLen::Proven { text, .. }
+            | SeamLen::NulWalk { text, .. } => text,
             SeamLen::Fabricated | SeamLen::Refused(_) => FABRICATED_LEN_PATH,
         }
     }
@@ -1478,6 +1493,22 @@ impl GlueSpec {
         match self.len.as_ref() {
             Some(SeamLen::Licensed(_)) => "evidence-backed",
             Some(SeamLen::Proven { .. }) => "evidence-backed:extent-proof",
+            // The arm and the provenance kind; the receipt carries the rest
+            // (an `sscanf` site's test).
+            Some(SeamLen::NulWalk { receipt, .. }) => {
+                const KEYS: &[&str] = &[
+                    "evidence-backed:nul-walk:A:contract",
+                    "evidence-backed:nul-walk:B:argv",
+                    "evidence-backed:nul-walk:B:literal",
+                    "evidence-backed:nul-walk:B:strdup",
+                    "evidence-backed:nul-walk:B:getenv",
+                    "evidence-backed:nul-walk:B:sscanf",
+                ];
+                KEYS.iter()
+                    .find(|key| receipt.starts_with(&key["evidence-backed:".len()..]))
+                    .copied()
+                    .unwrap_or("evidence-backed:nul-walk")
+            }
             Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
             Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",
             Some(SeamLen::Fabricated) | Some(SeamLen::Refused(_)) => "fallback-1024",
@@ -1782,9 +1813,19 @@ impl GlueSpec {
                     // R477-6: the masked companion's text is a call-site
                     // expression like the licensed one and is rendered the same
                     // way; only the receipt tells them apart.
+                    // wave-6l relay 077: a length that reads the NUL-walk's
+                    // bound base binds it, whichever variant carries it.
+                    SeamLen::Licensed(len) | SeamLen::NulWalk { text: len, .. }
+                        if len.contains(NUL_WALK_BASE) =>
+                    {
+                        format!(
+                            "{{ let {NUL_WALK_BASE} = {base}; core::slice::{ctor}({NUL_WALK_BASE}, ({len}) as usize) }}"
+                        )
+                    }
                     SeamLen::Licensed(len)
                     | SeamLen::MaskDerived(len)
                     | SeamLen::Proven { text: len, .. }
+                    | SeamLen::NulWalk { text: len, .. }
                     // R500-8: a positional count is a call-site expression too;
                     // only the receipt tells it from a licensed one.
                     | SeamLen::PositionalSibling { text: len, .. } => {
@@ -3595,6 +3636,7 @@ pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
         Some(SeamLen::Proven { text, premises }) => {
             BridgeExtentKind::Evidence(format!("extent-proof:{premises}:{text}"))
         }
+        Some(SeamLen::NulWalk { receipt, .. }) => BridgeExtentKind::Evidence(receipt.clone()),
         Some(SeamLen::MaskDerived(source)) => BridgeExtentKind::MaskPlusOne(source.clone()),
         // R500-8: the text is the caller's own argument, the receipt is a fallback.
         Some(SeamLen::PositionalSibling { .. }) => BridgeExtentKind::Fallback,
@@ -5592,7 +5634,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                         | LenEvidence::None
                         | LenEvidence::ArrayType
                         | LenEvidence::CalleeAccess
-                        | LenEvidence::FieldAlloc => None,
+                        | LenEvidence::FieldAlloc
+                        | LenEvidence::NulWalk => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -5756,6 +5799,25 @@ pub(crate) fn synthesize_with_raw_boundary(
                 } else {
                     (None, false, None)
                 };
+                // wave-6l relay 077 (R776-4): the NUL-walk extent, where nothing
+                // above licensed a length; `nul_walk_used` records that the arm
+                // below chose it, so the receipt names it (R491-7's own exact
+                // extent renders the same text and keeps its receipt).
+                let nul_walk = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .and_then(|argument| table.nul_walk_sites.get(&(site.caller, argument.span)));
+                // The length names the BOUND base (`NUL_WALK_BASE`), not the
+                // argument's input spelling: the argument may itself be
+                // rewritten (`*argv.offset(1)` → `argv[1]`), and the construction
+                // binds it once (`{ let base = ARG; from_raw_parts(base, LEN) }`).
+                let nul_walk_len = nul_walk.map(|_| {
+                    format!(
+                        "core::ffi::CStr::from_ptr({NUL_WALK_BASE} as *const core::ffi::c_char).to_bytes().len().wrapping_add(1)"
+                    )
+                });
+                let nul_walk_used = std::cell::Cell::new(false);
                 // Relay 063: a fallback a refusal caused says so, on the
                 // candidate and on its input-form twin alike.
                 let mark_refused = |mut candidate: Candidate| {
@@ -5771,6 +5833,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                         candidate.spec.len = Some(SeamLen::Proven {
                             text,
                             premises: premises.clone(),
+                        });
+                    }
+                    if nul_walk_used.get()
+                        && let Some(site) = nul_walk
+                        && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                        && Some(&text) == nul_walk_len.as_ref()
+                    {
+                        candidate.spec.len = Some(SeamLen::NulWalk {
+                            text,
+                            receipt: site.receipt(),
                         });
                     }
                     candidate
@@ -5816,7 +5888,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                                     Some(length) => {
                                         (Some(length.clone()), Some(LenEvidence::FieldAlloc))
                                     }
-                                    None => (None, len_evidence),
+                                    // wave-6l relay 077 (R776-4): nor a field's
+                                    // allocation: a C string's `strlen + 1`.
+                                    None => match &nul_walk_len {
+                                        Some(len) => {
+                                            nul_walk_used.set(true);
+                                            (Some(len.clone()), Some(LenEvidence::NulWalk))
+                                        }
+                                        None => (None, len_evidence),
+                                    },
                                 },
                             },
                         }
@@ -6034,6 +6114,20 @@ pub(crate) fn synthesize_with_raw_boundary(
                         })
                     },
                 );
+                // wave-6l relay 077: every branch above that took the NUL-walk
+                // length (an owner view reads `len_text` too) names it in its
+                // receipt.
+                if nul_walk_used.get()
+                    && let Some(site) = nul_walk
+                    && let Some(Ok(Some(candidate))) = candidates.last_mut()
+                    && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                    && Some(&text) == nul_walk_len.as_ref()
+                {
+                    candidate.spec.len = Some(SeamLen::NulWalk {
+                        text,
+                        receipt: site.receipt(),
+                    });
+                }
                 // Only a place of the caller's OWN object (`&mut local.f`, no
                 // deref): a place through a pointer root (`&mut (*s).f`) is
                 // wave-6r's shared-root bridge shape, whose address edit sits
@@ -6086,15 +6180,31 @@ pub(crate) fn synthesize_with_raw_boundary(
                         )
                         .map(|candidate| candidate.map(mark_refused))
                     } else {
+                        // wave-6l relay 077: a position decided in a safe form
+                        // never reached the raw length chain; its INPUT form is
+                        // raw, and the NUL-walk extent is the base's own, so the
+                        // twin a revert activates takes it too (urlparser's
+                        // literal-bound locals, decided thin and reverted).
+                        let (input_len, input_evidence) = match (&len_text, &nul_walk_len) {
+                            (None, Some(len))
+                                if wants_len
+                                    && pos.found != Form::Raw
+                                    && input_found == Form::Raw =>
+                            {
+                                nul_walk_used.set(true);
+                                (Some(len.clone()), Some(LenEvidence::NulWalk))
+                            }
+                            _ => (len_text.clone(), len_evidence),
+                        };
                         build_candidate(
                             pos.expected,
                             input_found,
                             text,
                             &pos.source_type,
                             pos.literal_null,
-                            len_text.as_deref(),
+                            input_len.as_deref(),
                             len_masked,
-                            len_evidence,
+                            input_evidence,
                             enclosing_unsafe_fn,
                             retention,
                             *callee,

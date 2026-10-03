@@ -55,11 +55,14 @@ fn emitted(body: &str) -> String {
     }
 }
 
-/// The emitted call `<callee>(…)` carries `strlen + 1` of `<base>`.
+/// The emitted call `<callee>(…)` binds `<base>` once and takes the
+/// binding's `strlen + 1`.
 fn takes_strlen(out: &str, callee: &str, base: &str) -> bool {
     let flat = out.split_whitespace().collect::<String>();
     let base = base.split_whitespace().collect::<String>();
-    flat.contains(&format!("{callee}(")) && flat.contains(&format!("CStr::from_ptr({base}"))
+    flat.contains(&format!("{callee}("))
+        && flat.contains(&format!("let__crat_nul_walk_base={base};"))
+        && flat.contains("CStr::from_ptr(__crat_nul_walk_baseas*constcore::ffi::c_char)")
 }
 
 fn takes_fallback(out: &str) -> bool {
@@ -138,8 +141,12 @@ fn w6l_nulwalk_b_a_literal_bound_local_takes_strlen() {
     let literal = b_literal();
     assert_ne!(literal, B_ARGV, "the literal caller is in");
     let out = emitted(&literal);
+    // `url` is decided thin and reverted (its literal initializer does not
+    // type at `&c_char`); the construction is the input-form twin's, which
+    // only the binding form (`SeamLen::NulWalk`, receipt
+    // `nul-walk:B:literal`) renders. The decision-time row is the thin one.
     assert!(takes_strlen(&out, "parse_int", "url"), "{out}");
-    assert!(out.contains("nul-walk:B:literal"), "{out}");
+    assert!(!takes_fallback(&out), "{out}");
 }
 
 /// An `sscanf` `%[` destination, read only where that `sscanf` returned 1 —
@@ -158,7 +165,12 @@ pub unsafe fn get(url: *const c_char) -> c_int {
 #[test]
 fn w6l_nulwalk_b_a_checked_sscanf_destination_takes_strlen() {
     let out = emitted(B_SSCANF_CHECKED);
-    assert!(takes_strlen(&out, "is_proto", "p"), "{out}");
+    // An optional formal: the checked adapter binds `p` first, and the
+    // NUL-walk binds the checked pointer.
+    assert!(
+        takes_strlen(&out, "is_proto", "__crat_call_adapter_ptr"),
+        "{out}"
+    );
     assert!(out.contains("nul-walk:B:sscanf"), "{out}");
 }
 

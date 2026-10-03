@@ -630,6 +630,8 @@ pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc
         | SeamLen::MaskDerived(_)
         // wave-6l relay 067: a proven companion is a licensed one.
         | SeamLen::Proven { .. }
+        // wave-6l relay 077: the NUL-walk's `strlen + 1` is a licensed length.
+        | SeamLen::NulWalk { .. }
         // R500-8: rendered as the companion it is; the receipt carries the guess.
         | SeamLen::PositionalSibling { .. } => expr(rustc_ast::ExprKind::Cast(
             expr(rustc_ast::ExprKind::Paren(P(parsed))),
@@ -2054,6 +2056,54 @@ fn checked_optional(
     (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
 }
 
+/// **wave-6l relay 077.** `{ let __crat_nul_walk_base = ARGUMENT; PAYLOAD }`:
+/// the argument node moves in once, and the payload's `strlen + 1` reads the
+/// binding.
+fn nul_walk_bound(
+    argument: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_NUL_WALK_ARG";
+    const PAYLOAD: &str = "__CRAT_NUL_WALK_PAYLOAD";
+    let text = format!(
+        "{{ let {base} = {ARG}; {PAYLOAD} }}",
+        base = crate::bo_rewriter::decision::seam::NUL_WALK_BASE
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if let rustc_ast::ExprKind::Path(None, path) = &expr.kind
+                && path.segments.len() == 1
+            {
+                let name = path.segments[0].ident.name;
+                if name == Symbol::intern(ARG) {
+                    *expr = self.argument.clone();
+                    self.hits += 1;
+                    return;
+                }
+                if name == Symbol::intern(PAYLOAD) {
+                    *expr = self.payload.clone();
+                    self.hits += 1;
+                    return;
+                }
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace {
+        argument,
+        payload,
+        hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 2).then_some(parsed.kind)
+}
+
 /// Wrap one already-built inbound bridge payload in an explicit `unsafe`
 /// block while retaining that payload as an AST subtree. Only the fixed block
 /// syntax is parsed; the operand is neither printed nor reparsed.
@@ -2557,6 +2607,25 @@ impl<'a> SeamGraftVisitor<'a> {
         } else {
             arg
         };
+        // wave-6l relay 077: a NUL-walk length reads the bound base, so the
+        // construction binds it once around the call (the text renderer does
+        // the same).
+        let nul_walk_base = spec
+            .len
+            .as_ref()
+            .is_some_and(|len| {
+                len.text()
+                    .contains(crate::bo_rewriter::decision::seam::NUL_WALK_BASE)
+            })
+            .then(|| core_arg.clone());
+        let core_arg = if nul_walk_base.is_some() {
+            P(
+                graft_expr(crate::bo_rewriter::decision::seam::NUL_WALK_BASE)
+                    .expect("fixed binding path parses"),
+            )
+        } else {
+            core_arg
+        };
         let core = match shape {
             None => core_arg,
             Some(shape) => {
@@ -2568,6 +2637,10 @@ impl<'a> SeamGraftVisitor<'a> {
                 };
                 expr(kind)
             }
+        };
+        let core = match nul_walk_base {
+            Some(base) => expr(nul_walk_bound((*base).clone(), (*core).clone())?),
+            None => core,
         };
         let core = if matches!(spec.core, GlueCore::Reborrow | GlueCore::FromRawParts) {
             P(unsafe_payload((*core).clone(), self.current_unsafe_fn)?)

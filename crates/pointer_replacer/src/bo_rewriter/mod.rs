@@ -8879,6 +8879,8 @@ fn finish_decide<'tcx>(
                 })
             })
             .collect();
+        // wave-6l relay 077 (R776-4): the C strings the NUL-walk arm licenses.
+        table.nul_walk_sites = decision::nul_walk_arm::sites(tcx, &facts);
         // wave-6l relay 063 (R645-5 item 2): the parameters the KX list names.
         // The seam refuses their adjacency licence whatever produced it.
         table.kx_refused = table
