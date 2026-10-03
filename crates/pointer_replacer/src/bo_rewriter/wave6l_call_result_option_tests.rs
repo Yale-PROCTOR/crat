@@ -343,3 +343,121 @@ fn w6l_a8_foreign_callee_result_is_refused() {
         "a foreign callee's result was typed by the A8 arm: {text}"
     );
 }
+
+/// **Review r1 (R785), the base arm's own hazard.** `as_mut()` makes the
+/// `&mut T` at the declaration; the input had no reference until each deref.
+/// A write to the pointee through ANOTHER pointer in between (here `(*l).cmd`'s
+/// element, which is the same object when `add_func` returns it) disables
+/// that reference under Tree Borrows, and the later write through it is UB.
+const WRITE_BETWEEN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil_func {
+    pub proc_0: usize,
+    pub name: *mut i8,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil {
+    pub cmds: usize,
+    pub cmd: *mut *mut lil_func,
+}
+#[no_mangle]
+pub unsafe extern "C" fn add_func(mut l: *mut lil, mut name: *mut i8) -> *mut lil_func {
+    if (*l).cmds == 0 as usize {
+        return 0 as *mut lil_func;
+    }
+    return *((*l).cmd).offset(0 as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_register(mut l: *mut lil, mut name: *mut i8, mut proc_0: usize) -> i32 {
+    let mut cmd = add_func(l, name);
+    if cmd.is_null() {
+        return 0 as i32;
+    }
+    (**((*l).cmd).offset(0 as isize)).proc_0 = 0 as usize;
+    (*cmd).proc_0 = proc_0;
+    return 1 as i32;
+}
+"#;
+
+/// **Review r1 (R785), the second Tree Borrows case.** A write through the
+/// view makes it Active; a read of the same object through another pointer
+/// then freezes it, and the next write through the view is UB.
+const READ_BETWEEN_WRITES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil_func {
+    pub proc_0: usize,
+    pub name: *mut i8,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct lil {
+    pub cmds: usize,
+    pub cmd: *mut *mut lil_func,
+}
+#[no_mangle]
+pub unsafe extern "C" fn add_func(mut l: *mut lil, mut name: *mut i8) -> *mut lil_func {
+    if (*l).cmds == 0 as usize {
+        return 0 as *mut lil_func;
+    }
+    return *((*l).cmd).offset(0 as isize);
+}
+#[no_mangle]
+pub unsafe extern "C" fn lil_register(mut l: *mut lil, mut name: *mut i8, mut proc_0: usize) -> usize {
+    let mut cmd = add_func(l, name);
+    if cmd.is_null() {
+        return 0 as usize;
+    }
+    (*cmd).proc_0 = proc_0;
+    let mut seen = (**((*l).cmd).offset(0 as isize)).proc_0;
+    (*cmd).proc_0 = seen.wrapping_add(1 as usize);
+    return seen;
+}
+"#;
+
+fn receiver_stays_held(name: &str, source: &str, subject: &str, local: &str) {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        ..
+    } = emitted(name, source, &["add_func", "lil_register"])
+    else {
+        panic!("{name} degraded to a non-emitting outcome");
+    };
+    println!("W6L-WINDOW-{name}\n{source}\nW6L-WINDOW-END\n{degradations:?}");
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        !text.contains(&format!("letmut{local}:Option<")),
+        "{name}: the receiver was typed across a foreign access: {text}"
+    );
+    assert!(
+        degradations.iter().any(|d| d.subject == subject
+            && format!("{:?}", d.reason).contains("ReturnNotAdapted")),
+        "{degradations:?}"
+    );
+}
+
+/// **RED (review r1):** a foreign write between the declaration and a deref
+/// keeps the receiver raw.
+#[test]
+fn w6l_window_foreign_write_before_the_deref_keeps_the_receiver_raw() {
+    receiver_stays_held("write-between", WRITE_BETWEEN, "lil_register::cmd", "cmd");
+}
+
+/// **RED (review r1):** a foreign read between two writes through the view
+/// keeps the receiver raw.
+#[test]
+fn w6l_window_foreign_read_between_writes_keeps_the_receiver_raw() {
+    receiver_stays_held(
+        "read-between-writes",
+        READ_BETWEEN_WRITES,
+        "lil_register::cmd",
+        "cmd",
+    );
+}
