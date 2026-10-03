@@ -93,9 +93,10 @@ fn w6l_nulwalk_a_an_unconditional_contract_read_takes_strlen() {
     let out = emitted(A_CONTRACT);
     assert!(takes_strlen(&out, "equal", "(*buf).data"), "{out}");
     assert!(!takes_fallback(&out), "{out}");
+    // R780-3: the receipt names the contract function and position.
     assert!(
-        out.contains("nul-walk:A:"),
-        "the receipt names the arm: {out}"
+        out.contains("nul-walk:A:contract:strcmp:1"),
+        "the receipt names the arm, the function and the position: {out}"
     );
 }
 
@@ -509,4 +510,33 @@ fn w6l_nulwalk_c_a_callee_that_writes_keeps_the_fallback() {
         takes_fallback(&out),
         "the control constructs the slice with the fallback: {out}"
     );
+}
+
+// ---- R780-3 item 3: R491-7's caller-side clause ----
+
+/// The caller's own `strlen(s)` licenses `strlen + 1` (R491-7, relay 060)
+/// only where nothing writes through `s` before the call: here the NUL is
+/// overwritten after it (review r6's first shape), and the walk would run past
+/// the old end.
+#[test]
+fn w6l_nulwalk_s3_a_nul_overwritten_after_the_callers_strlen_keeps_the_fallback() {
+    let out = emitted(&format!(
+        "unsafe fn first(p: *mut c_char) -> c_int {{\n    if p.is_null() {{ 0 }} else {{ strcmp(p, {LIT}) }}\n}}\npub unsafe fn caller(x: *const c_char) -> c_int {{\n    let mut s: *mut c_char = strdup(x);\n    if s.is_null() {{ return 0; }}\n    *s.offset(strlen(s) as isize) = '/' as i32 as c_char;\n    first(s)\n}}\n"
+    ));
+    assert!(!out.contains("len-elsewhere"), "{out}");
+    assert!(!out.contains("CStr::from_ptr("), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// The clause still holds where the caller only reads the string.
+#[test]
+fn w6l_nulwalk_s3_the_callers_strlen_without_a_write_still_licenses() {
+    let out = emitted(&format!(
+        "unsafe fn first(p: *mut c_char) -> c_int {{\n    if p.is_null() {{ 0 }} else {{ strcmp(p, {LIT}) }}\n}}\npub unsafe fn caller(x: *const c_char) -> c_int {{\n    let mut s: *mut c_char = strdup(x);\n    if s.is_null() {{ return 0; }}\n    let mut n = strlen(s);\n    first(s)\n}}\n"
+    ));
+    assert!(out.contains("CStr::from_ptr("), "{out}");
+    assert!(!takes_fallback(&out), "{out}");
 }
