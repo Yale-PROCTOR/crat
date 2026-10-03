@@ -523,6 +523,13 @@ fn forwarded(
             // guard mode (R622-1 / R628-2) every cast hop is followed (brotli
             // `Hash14(data)`: `BrotliUnalignedRead32(data as *const c_void)`);
             // outside it, a cast hop continues only a counted-contract chain.
+            // Relay 075 review (finding 1a): a non-guard cast hop is explored
+            // on a COPY of `visited`, adopted only when its access is kept —
+            // a discarded exploration must not leave the forwarders it reached
+            // marked, or a bare path through the same forwarder (a diamond)
+            // finds it visited and its caller loses the hold, by hash order.
+            let discardable = cast && !guard;
+            let mut scratch = discardable.then(|| visited.clone());
             if let Some(access) = parameter_access(
                 tcx,
                 target,
@@ -531,10 +538,13 @@ fn forwarded(
                 parameters,
                 cursor_candidates,
                 decided,
-                visited,
+                scratch.as_mut().unwrap_or(visited),
                 guard,
             ) && (!cast || guard || access.reason.counted())
             {
+                if let Some(scratch) = scratch {
+                    *visited = scratch;
+                }
                 accesses.push(access);
             }
         }
