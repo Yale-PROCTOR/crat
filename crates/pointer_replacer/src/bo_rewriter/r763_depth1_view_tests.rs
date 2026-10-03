@@ -263,3 +263,35 @@ fn r784_2_a_seam_row_refusal_does_not_strand_a_slice_rooted_caller() {
         out.source
     );
 }
+
+/// **R761-1 as ruled — shape (ii) fabricates at the site (§77).** `inspect`'s
+/// `&*in_0.offset(12)` is one element of `in_0`'s allocation, handed to a formal
+/// `crc32` reads `length` elements of. The row refuses the one-element view, and
+/// R674-9's arm takes the pointer under the `&*` only where the callee proves a
+/// constant extent; `crc32` proves none, so at the head the site is dropped and
+/// holds `crc32::data` raw (brotli's six held callees at batch 54, 227 rows behind
+/// them). Ruled: the pointer carries the allocation, so the site takes the raw arm
+/// with the fabricated extent, receipted, and nothing is dropped.
+#[test]
+fn r761_1_a_refused_element_address_of_a_raw_base_takes_the_fabricated_extent() {
+    let out = emitted("r761_1_fabricate", CRC_CALLERS);
+    let text = compact(&out.source);
+    // The spelling of the pointer is R674-9's arm's: on the census path it keeps
+    // C2Rust's `&*` over the element (`from_raw_parts(&*in_0.offset(16), 4)` at
+    // lodepng's proven sites), on `rewrite_m1` it is peeled. Either way the slice is
+    // built over the element's own raw pointer with the fabricated extent.
+    assert!(
+        text.contains("crc32(core::slice::from_raw_parts(")
+            && text.contains("in_0.offset(12asisize),crate::FALLBACK_SLICE_EXTENT)"),
+        "{}",
+        out.source
+    );
+    assert!(!text.contains("from_ref(&*in_0"), "{}", out.source);
+    assert!(
+        !out.artifacts
+            .subjects
+            .contains("seam-one-element-into-wider-formal"),
+        "{}",
+        out.artifacts.subjects
+    );
+}
