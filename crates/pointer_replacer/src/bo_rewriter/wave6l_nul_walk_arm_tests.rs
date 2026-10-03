@@ -26,6 +26,11 @@ extern "C" {
     fn sscanf(s: *const c_char, f: *const c_char, ...) -> c_int;
     fn malloc(n: usize) -> *mut c_void;
     fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
+    fn strncmp(a: *const c_char, b: *const c_char, n: usize) -> c_int;
+    fn strchr(s: *const c_char, c: c_int) -> *mut c_char;
+    fn strdup(s: *const c_char) -> *mut c_char;
+    fn printf(f: *const c_char, ...) -> c_int;
+    fn exit(code: c_int) -> !;
 }
 "#;
 
@@ -323,4 +328,156 @@ fn w6l_nulwalk_c_a_cursor_without_a_nul_test_keeps_the_fallback() {
         takes_fallback(&out),
         "the control constructs the slice with the fallback: {out}"
     );
+}
+
+// ---- the relay 077 review's findings, as controls ----
+
+const LIT: &str = "b\"x\\0\" as *const u8 as *const c_char";
+
+/// Review 1: a call that never returns (`exit`) before the read.
+#[test]
+fn w6l_nulwalk_r1_an_exit_before_the_read_keeps_the_fallback() {
+    let out = emitted(&A_CONTRACT.replace(
+        "if strcmp(a, b) != 0 { 1 } else { 0 }",
+        "if a.is_null() { exit(1); }\n    if strcmp(a, b) != 0 { 1 } else { 0 }",
+    ));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 2: the callee writes the string through an alias (a global) before
+/// it reads it; at the call the bytes may be uninitialized.
+#[test]
+fn w6l_nulwalk_r2_a_write_through_an_alias_before_the_read_keeps_the_fallback() {
+    let out = emitted(&format!(
+        "static mut G: *mut c_char = 0 as *mut c_char;\nunsafe fn f(v: *mut c_char) -> c_int {{\n    strcpy(G, {LIT});\n    if strcmp(v, {LIT}) != 0 {{ 1 }} else {{ 0 }}\n}}\npub struct Buf {{ pub data: *mut c_char }}\npub unsafe fn caller(buf: *mut Buf) -> c_int {{\n    G = (*buf).data;\n    f((*buf).data)\n}}\n"
+    ));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 2 (the call site): a later argument writes the string after the
+/// walk would have read it.
+#[test]
+fn w6l_nulwalk_r2b_a_later_argument_that_writes_keeps_the_fallback() {
+    let out = emitted(&format!(
+        "unsafe fn g(v: *mut c_char, n: c_int) -> c_int {{\n    if strcmp(v, {LIT}) != 0 {{ 1 }} else {{ n }}\n}}\nunsafe fn fill(p: *mut c_char) -> c_int {{\n    *p = 0;\n    0\n}}\npub struct Buf {{ pub data: *mut c_char }}\npub unsafe fn caller(buf: *mut Buf) -> c_int {{\n    g((*buf).data, fill((*buf).data))\n}}\n"
+    ));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 3: a forwarding cycle whose other member writes past the NUL.
+#[test]
+fn w6l_nulwalk_r3_a_cycle_with_a_writing_member_keeps_the_fallback() {
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let out = emitted(&format!(
+            "unsafe fn {first}(p: *mut c_char, n: c_int) -> c_int {{\n    if n > 0 {{ {second}(p, n - 1); }}\n    *p.offset(7) = 1;\n    if strncmp(p, {LIT}, 1) == 0 {{ 1 }} else {{ 0 }}\n}}\nunsafe fn {second}(p: *mut c_char, n: c_int) -> c_int {{\n    {first}(p, n)\n}}\nunsafe fn main_0(argc: c_int, argv: *mut *mut c_char) -> c_int {{\n    if argc > 1 {{ b(*argv.offset(1), 1) + a(*argv.offset(1), 0) }} else {{ 0 }}\n}}\n"
+        ));
+        assert!(!out.contains("nul-walk:"), "{first}/{second}: {out}");
+        assert!(
+            takes_fallback(&out),
+            "the control constructs the slice with the fallback: {out}"
+        );
+    }
+}
+
+/// Review 4: a read at a literal offset after a NUL test of element 0.
+#[test]
+fn w6l_nulwalk_r4_a_literal_offset_after_a_nul_test_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn sixth(s: *const c_char, n: c_int) -> c_int {\n    if *s as c_int == 0 { return 0; }\n    if n > 0 { *s.offset(5) as c_int } else { 0 }\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "sixth(*argv.offset(1), argc)"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 5 (a): the index is a parameter, never tested.
+#[test]
+fn w6l_nulwalk_r5a_a_parameter_index_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn get(s: *const c_char, i: c_int) -> c_int {\n    *s.offset(i as isize) as c_int\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "get(*argv.offset(1), 3)"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 5 (b): two increments after one test step over the NUL.
+#[test]
+fn w6l_nulwalk_r5b_a_double_increment_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace("        i += 1;\n", "        i += 1;\n        i += 1;\n"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 5 (c): the test reads a byte read once, before the loop.
+#[test]
+fn w6l_nulwalk_r5c_a_stale_test_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn stale(s: *const c_char) -> c_int {\n    let mut i = 0;\n    let c = *s.offset(i as isize);\n    loop {\n        if c as c_int == 0 { break; }\n        i += 1;\n        if i > 9 { break; }\n    }\n    *s.offset(i as isize) as c_int\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "stale(*argv.offset(1))"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 6: the `strdup` string is written before the call (byte 3 is its
+/// NUL when it is three bytes long).
+#[test]
+fn w6l_nulwalk_r6_a_strdup_string_written_before_the_call_keeps_the_fallback() {
+    let out = emitted(&format!(
+        "unsafe fn first(p: *mut c_char) -> c_int {{\n    if p.is_null() {{ 0 }} else {{ strcmp(p, {LIT}) }}\n}}\npub unsafe fn caller(x: *const c_char) -> c_int {{\n    let mut s: *mut c_char = strdup(x);\n    if s.is_null() {{ return 0; }}\n    *s.offset(3) = '/' as i32 as c_char;\n    first(s)\n}}\n"
+    ));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 7: a pointer `strchr` derives from the string is read past the NUL.
+#[test]
+fn w6l_nulwalk_r7_a_strchr_result_read_past_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn after(s: *const c_char) -> c_int {\n    let q = strchr(s, '=' as i32);\n    if q.is_null() { 0 } else { *q.offset(3) as c_int }\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "after(*argv.offset(1))"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// Review 9: `%ls` is not a byte string.
+#[test]
+fn w6l_nulwalk_r9_a_wide_string_conversion_keeps_the_fallback() {
+    let out = emitted(&A_CONTRACT.replace(
+        "if strcmp(a, b) != 0 { 1 } else { 0 }",
+        "printf(b\"%ls\\0\" as *const u8 as *const c_char, b);\n    if strcmp(a, a) != 0 { 1 } else { 0 }",
+    ));
+    assert!(!out.contains("nul-walk:A:contract"), "{out}");
 }
