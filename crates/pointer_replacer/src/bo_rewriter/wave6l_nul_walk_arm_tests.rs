@@ -261,3 +261,66 @@ fn w6l_nulwalk_c_a_strcpy_destination_keeps_the_fallback() {
         "the control constructs the slice with the fallback: {out}"
     );
 }
+
+/// `argv` is `main_0`'s only: the same shape in another function has no
+/// provenance.
+#[test]
+fn w6l_nulwalk_c_an_argv_shaped_parameter_outside_main_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace("unsafe fn main_0(", "unsafe fn other_0("));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// A test of the `sscanf` result that does not cover the conversion (`== 0`:
+/// nothing was written).
+#[test]
+fn w6l_nulwalk_c_an_sscanf_test_that_misses_the_conversion_keeps_the_fallback() {
+    let out =
+        emitted(&B_SSCANF_CHECKED.replace(") == 1 { is_proto(p) }", ") == 0 { is_proto(p) }"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// A literal with a NUL inside it is longer than its `strlen + 1`.
+#[test]
+fn w6l_nulwalk_c_a_literal_with_an_inner_nul_keeps_the_fallback() {
+    let literal = b_literal().replace("b\"12\\0\"", "b\"1\\02\\0\"");
+    assert_ne!(literal, b_literal(), "the inner NUL is in");
+    let out = emitted(&literal);
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// An indexed walk that steps without testing for the NUL reads past it.
+#[test]
+fn w6l_nulwalk_c_an_indexed_walk_without_a_nul_test_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace("        if c as c_int == 0 { break; }\n", ""));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
+
+/// A cursor that steps without testing for the NUL is not R491-7's walk.
+#[test]
+fn w6l_nulwalk_c_a_cursor_without_a_nul_test_keeps_the_fallback() {
+    let out = emitted(&B_ARGV.replace(
+        "unsafe fn parse_int(s: *const c_char) -> c_int {",
+        "unsafe fn skip3(mut s: *const c_char) -> c_int {\n    let mut n = 0;\n    while n < 3 {\n        s = s.offset(1);\n        n += 1;\n    }\n    *s as c_int\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
+    ).replace("parse_int(*argv.offset(1))", "skip3(*argv.offset(1))"));
+    assert!(!out.contains("nul-walk:"), "{out}");
+    assert!(
+        takes_fallback(&out),
+        "the control constructs the slice with the fallback: {out}"
+    );
+}
