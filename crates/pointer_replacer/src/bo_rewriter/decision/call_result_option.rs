@@ -138,6 +138,11 @@ struct AllUses {
     spans: Vec<Span>,
     closure: bool,
     borrowed: FxHashSet<HirId>,
+    /// The end of the assignment whose written place is being walked: a use
+    /// there takes effect when the assignment does, after its right side.
+    in_written_place: Option<rustc_span::BytePos>,
+    /// Where the view's last use takes effect.
+    last_point: rustc_span::BytePos,
 }
 
 impl<'tcx> Visitor<'tcx> for AllUses {
@@ -149,12 +154,21 @@ impl<'tcx> Visitor<'tcx> for AllUses {
                     && hir == self.binding
                 {
                     self.spans.push(expr.span);
+                    let point = self.in_written_place.unwrap_or(expr.span.hi());
+                    self.last_point = self.last_point.max(point);
                 }
             }
             ExprKind::AddrOf(_, _, inner) => {
                 if let Some(hir) = place_root_local(inner) {
                     self.borrowed.insert(hir);
                 }
+            }
+            ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) => {
+                self.visit_expr(rhs);
+                let outer = self.in_written_place.replace(expr.span.hi());
+                self.visit_expr(lhs);
+                self.in_written_place = outer;
+                return;
             }
             _ => {}
         }
@@ -211,6 +225,7 @@ const ADDRESS_METHODS: &[&str] = &[
 /// The window's checker: what may run between the declaration and the last
 /// use, and where the view's writes and the other memory reads lie.
 struct Window<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
     typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
     binding: HirId,
     borrowed: &'a FxHashSet<HirId>,
@@ -220,6 +235,9 @@ struct Window<'a, 'tcx> {
     /// Each read of memory the view may share: a dereference of another
     /// pointer, or an address-taken local.
     foreign_reads: Vec<Span>,
+    /// Where the view's last use takes effect: what starts after it cannot
+    /// reach the view.
+    cut: rustc_span::BytePos,
 }
 
 impl<'a, 'tcx> Window<'a, 'tcx> {
@@ -238,9 +256,18 @@ impl<'a, 'tcx> Window<'a, 'tcx> {
         if method.is_local() {
             return false;
         }
-        let ty = self.typeck.expr_ty_adjusted(receiver);
+        let ty = self.typeck.expr_ty(receiver);
+        let name = segment.ident.name.as_str();
         if ty.is_raw_ptr() {
-            return ADDRESS_METHODS.contains(&segment.ident.name.as_str());
+            return ADDRESS_METHODS.contains(&name);
+        }
+        // `Option::is_some` / `is_none` read their receiver only.
+        if let TyKind::Adt(adt, _) = ty.kind()
+            && self
+                .tcx
+                .is_diagnostic_item(rustc_span::sym::Option, adt.did())
+        {
+            return matches!(name, "is_some" | "is_none");
         }
         ty.is_integral() || ty.is_floating_point() || ty.is_bool() || ty.is_char()
     }
@@ -248,6 +275,9 @@ impl<'a, 'tcx> Window<'a, 'tcx> {
 
 impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
     fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
+        if stmt.span.lo() >= self.cut {
+            return;
+        }
         if let StmtKind::Item(..) = stmt.kind {
             self.ok = false;
             return;
@@ -256,7 +286,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if !self.ok {
+        if !self.ok || expr.span.lo() >= self.cut {
             return;
         }
         match expr.kind {
@@ -350,10 +380,12 @@ impl<'a, 'tcx> Window<'a, 'tcx> {
 /// it is UB although the input's accesses were defined. So the view is
 /// admitted only when every use of the local lies in its `let`'s block, in the
 /// statements from the `let` to the last statement that uses it, and that
-/// window
+/// window — cut where the last use takes effect (a use in an assignment's
+/// written place takes effect at the assignment's end, after its right side),
+/// since nothing after that can reach the view —
 /// - runs no call but a constructor, and no method but an address
-///   computation on a raw pointer, arithmetic on a scalar, or the local's own
-///   null test;
+///   computation on a raw pointer, arithmetic on a scalar, an `Option`'s
+///   discriminant test, or the local's own null test;
 /// - assigns only through the local, or to a local whose address the body
 ///   never takes;
 /// - does not loop (so the window's text order is its execution order); and
@@ -368,6 +400,8 @@ fn quiet_window(tcx: TyCtxt<'_>, subject: &Subject, local: &LetStmt<'_>) -> bool
         spans: Vec::new(),
         closure: false,
         borrowed: FxHashSet::default(),
+        in_written_place: None,
+        last_point: rustc_span::BytePos(0),
     };
     all.visit_body(tcx.hir_body(body_id));
     if all.closure || all.borrowed.contains(&subject.hir_id) {
@@ -407,6 +441,8 @@ fn quiet_window(tcx: TyCtxt<'_>, subject: &Subject, local: &LetStmt<'_>) -> bool
     }
     let typeck = tcx.typeck(subject.fn_did);
     let mut checker = Window {
+        tcx,
+        cut: all.last_point,
         typeck,
         binding: subject.hir_id,
         borrowed: &all.borrowed,
