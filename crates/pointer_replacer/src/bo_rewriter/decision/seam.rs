@@ -5681,6 +5681,35 @@ pub(crate) fn synthesize_with_raw_boundary(
                         .contains(site.span.source_callsite())
                     && pair.role != super::co_conversion::PairRole::Blocked
             });
+            // R785-6: the twin check is root-granular; the A5 site proof is
+            // per pair. A raw argument proven disjoint from a converted one
+            // (`Clear`) does not alias it, so it does not send the call to the
+            // twin (brotli's `InitializeHx(&mut (*hasher).common,
+            // &mut (*hasher).privat._Hx, ..)`, `InitBlockSplitter*(.., &mut
+            // (*mb).literal_split, &mut (*mb).literal_histograms, ..)`). An
+            // unavailable or unproved pair stays an alias.
+            let proven_disjoint = |converted: usize, other: usize| {
+                let span = |index: usize| {
+                    positions
+                        .iter()
+                        .find(|pos| pos.index == index)
+                        .map(|pos| pos.span)
+                };
+                let (Some(left), Some(right)) = (span(converted), span(other)) else {
+                    return false;
+                };
+                a5_site_proofs
+                    .lookup(
+                        site.caller.local_def_index.as_u32(),
+                        callee.local_def_index.as_u32(),
+                        converted,
+                        other,
+                        left,
+                        right,
+                    )
+                    .verdict
+                    == A5SiteProofVerdict::Clear
+            };
             let aliased_twin = (!pair_owned_call)
                 .then(|| {
                     super::counted_void::aliased_storage_twin(
@@ -5692,6 +5721,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             .iter()
                             .map(|pos| (pos.index, pos.expected, pos.found))
                             .collect::<Vec<_>>(),
+                        &proven_disjoint,
                     )
                 })
                 .flatten();

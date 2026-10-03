@@ -1578,6 +1578,7 @@ pub(crate) fn aliased_storage_twin(
     site: &super::emitability::CallSite,
     callee: LocalDefId,
     positions: &[(usize, super::seam::Form, super::seam::Form)],
+    proven_disjoint: &dyn Fn(usize, usize) -> bool,
 ) -> Option<Result<Vec<usize>, super::seam::SeamBlock>> {
     use super::seam::Form;
     // A position whose callee parameter stays raw is not a view: only a
@@ -1605,6 +1606,11 @@ pub(crate) fn aliased_storage_twin(
                 // R538-7: a pointer LOADED from a field of the root is not the
                 // root's alias when the load provably cannot reach its storage.
                 && field_load_exemption(tcx, site, root, other).is_none()
+                // R785-6: a raw argument the A5 site proof shows disjoint from
+                // the converted one is not its alias either: one root, two
+                // disjoint places (brotli's `&mut (*mb).literal_split` beside
+                // `&mut (*mb).literal_histograms`).
+                && !proven_disjoint(*i, other.index)
         })
     });
     if !aliased {
