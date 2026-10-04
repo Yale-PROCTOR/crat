@@ -2305,6 +2305,136 @@ mod audit_tests {
         .unwrap();
     }
 
+    /// **R813 (Codex, wave-6a relay 150): a failed refresh withdraws its
+    /// owner.** The proof of a selected bundle goes stale (its callee's class
+    /// held, so the formal resolves raw), and re-deriving the bundle fails
+    /// (here: no construction facts). The stale `Decision::Box` must not
+    /// survive the stage: the owner is reported invalid, exactly as when no
+    /// refresh is tried.
+    #[test]
+    fn r813_a_failed_refresh_withdraws_its_owner() {
+        use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+
+        let input =
+            bo::ownership_fields_native_tests::native_fixture_source("edt", "edt(pl1,pl2);");
+        ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+            let (mut table, ctx) = bo::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    bo::A5Mode::PreciseReplay,
+                    Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .unwrap();
+            let original_model = ctx.model.clone();
+            let program = bo::collect_program(tcx);
+            let callee = *program
+                .functions
+                .iter()
+                .find(|id| tcx.def_path_str(id.to_def_id()) == "edt")
+                .unwrap();
+            let mut classes =
+                bo::prepare_plan_files(tcx, &table, &FxHashSet::default(), &ctx.retained_c9_plans)
+                    .unwrap()
+                    .plan
+                    .class_finalization;
+            // Mechanical terminal-class snapshot only: source identities,
+            // ownership model, native effects, T1 and A5 remain real. These
+            // inserted Slice decisions are not native slice grants.
+            let mut changed = 0;
+            for (subject, decision) in &mut table.entries {
+                if subject.fn_did == callee && matches!(subject.kind, SubjectKind::Param { .. }) {
+                    *decision = Decision::Slice {
+                        mutable: true,
+                        uses: Vec::new(),
+                    };
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 2);
+            let id = SignatureClassId::of(callee);
+            classes.classes.insert(
+                id,
+                bo::plan::SignatureClassPlan {
+                    id,
+                    required_arms: Default::default(),
+                    site_keys: Vec::new(),
+                    edit_keys: Vec::new(),
+                    depends_on: Vec::new(),
+                    disposition: bo::plan::SignatureClassDisposition::Ready,
+                    sites: Vec::new(),
+                    hold_ordinals: Vec::new(),
+                },
+            );
+            let inputs = Inputs {
+                program: &program,
+                slots: &ctx.slots,
+                model: &ctx.model,
+                constructions: &ctx.constructions,
+                sites: &ctx.raw_boundary_sites,
+                retention: &ctx.retention,
+                a5: &ctx.a5_site_proofs,
+            };
+            let effects = NativeEffects::derive(&program);
+            let mut candidates = Candidates::default();
+            let mut arguments = std::collections::BTreeMap::new();
+            let mut owners = FxHashSet::default();
+            for (subject, _) in &table.entries {
+                let Some(name @ ("pl1" | "pl2")) = subject.param_name.as_deref() else {
+                    continue;
+                };
+                assert!(outer_owning(&ctx.slots, &ctx.model, subject));
+                let source =
+                    source::derive(&program, subject, &ctx.constructions, &|_, _| None).unwrap();
+                let bundle =
+                    derive_bundle(&inputs, &table, &classes, &effects, subject, &source, false)
+                        .unwrap();
+                assert_eq!(bundle.formals.len(), 1);
+                assert_eq!(bundle.formals[0].emitted(), FormalForm::MutableReference);
+                assert_eq!(
+                    bundle.formals[0].terminal(),
+                    super::super::seam::Form::Slice { mutable: true }
+                );
+                let edits: Vec<_> = bundle
+                    .plan
+                    .expr_edits
+                    .iter()
+                    .filter(|edit| edit.receipt == "native-box-lend-t1")
+                    .collect();
+                assert_eq!(edits.len(), 1);
+                assert_eq!(edits[0].replacement, format!("&mut *({name})"));
+                arguments.insert(name.to_owned(), edits[0].replacement.clone());
+                owners.insert(subject.fn_did);
+                candidates
+                    .bundles
+                    .insert((subject.fn_did, subject.hir_id), bundle);
+            }
+            assert_eq!(candidates.bundles.len(), 2);
+            for (subject, decision) in &mut table.entries {
+                if let Some(bundle) = candidates.bundles.get(&(subject.fn_did, subject.hir_id)) {
+                    *decision = Decision::Box(bundle.plan.clone());
+                }
+            }
+            assert!(
+                candidates
+                    .invalid_owners(&inputs, &table, &classes)
+                    .is_empty()
+            );
+            classes.classes.get_mut(&id).unwrap().disposition =
+                bo::plan::SignatureClassDisposition::Held(vec!["synthetic-slice-recovery".into()]);
+            assert_eq!(candidates.invalid_owners(&inputs, &table, &classes), owners);
+            let empty = ConstructionFacts::default();
+            let failing = Inputs {
+                constructions: &empty,
+                ..inputs
+            };
+            let (invalid, refreshed) = candidates.refresh_or_invalidate(&failing, &table, &classes);
+            assert!(!refreshed);
+            assert_eq!(invalid, owners);
+        })
+        .unwrap();
+    }
+
     #[test]
     fn r376_synthetic_terminal_slice_renders_lend_and_recovery_invalidates_owner() {
         use crate::bo_rewriter::bridge_receipt::SignatureClassId;
