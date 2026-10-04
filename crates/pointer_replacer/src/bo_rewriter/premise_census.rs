@@ -78,6 +78,8 @@ pub(crate) struct Reading {
     pub(crate) held_b: BTreeMap<SiteKind, usize>,
     /// Constructions inside an exposure wrapper: (b) by the family's shape.
     pub(crate) exempt_exposure: usize,
+    /// Constructions over a string literal: static storage nothing releases.
+    pub(crate) exempt_literal: usize,
     /// References from raw pointers with no input binding to read (b) on.
     pub(crate) unread: usize,
     /// Distinct `call-bridge` formals behind the rows.

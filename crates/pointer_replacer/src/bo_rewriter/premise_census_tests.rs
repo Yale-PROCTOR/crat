@@ -326,3 +326,47 @@ fn r801_2_a_reborrow_of_an_already_safe_element_has_no_row() {
     );
     assert_eq!(reading, Reading::default());
 }
+
+/// brotli `FindLongestMatchH42::key`: `let key = HashBytesH42(from_raw_parts(..))`
+/// makes the slice at the CALL, not at the declaration of `key`.
+#[test]
+fn r801_2_a_construction_inside_an_initializers_call_is_not_the_declarations() {
+    let source = |init: &str| {
+        format!(
+            "pub mod m {{ pub unsafe fn f(data: *const u8, ix: usize) -> u32 {{
+                let mut key = {init};
+                log_it();
+                key
+            }} }}"
+        )
+    };
+    let reading = read(
+        &source("HashBytes(&*data.offset(ix as isize))"),
+        &source(
+            "HashBytes(core::slice::from_raw_parts(&*data.offset(ix as isize), crate::FALLBACK_SLICE_EXTENT))",
+        ),
+        &[],
+    );
+    assert_eq!(reading, Reading::default());
+}
+
+/// json.h `json_write_number::{inf, nan}`: a slice over a string literal points
+/// at static storage nothing releases. Counted apart, no row.
+#[test]
+fn r801_2_a_construction_over_a_string_literal_has_no_row() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f() -> u8 {
+            let mut inf: *const i8 = b\"Infinity\\0\" as *const u8 as *const i8;
+            let mut k: usize = 0;
+            *inf.offset(k as isize) as u8
+        } }",
+        "pub mod m { pub unsafe fn f() -> u8 {
+            let mut inf: &[i8] = core::slice::from_raw_parts(b\"Infinity\\0\" as *const u8 as *const i8, crate::FALLBACK_SLICE_EXTENT);
+            let mut k: usize = 0;
+            inf[k] as u8
+        } }",
+        &[],
+    );
+    assert!(reading.rows.is_empty(), "{reading:?}");
+    assert_eq!(reading.exempt_literal, 1);
+}
