@@ -344,3 +344,52 @@ pub unsafe extern "C" fn n_new(mut depth: i32) -> *mut N {
         "{closes:?}"
     );
 }
+
+/// **R802-3, the probe's quadtree reading** — a receiver closed at two exits
+/// has two drops. `split_node_`'s `ne` is live at `sw`'s and `se`'s null
+/// returns (two `waiver-drop(scope-exit)` rows, report 143), and the emitted
+/// MIR keeps a drop at each: the policy built from the corpus table allows
+/// two scope-exit drops of `ne`, not one.
+#[test]
+fn w6a_r802_a_receiver_closed_at_two_exits_is_allowed_two_drops() {
+    let _frame = super::test_model_override::frame_lock();
+    let policies = ::utils::compilation::run_compiler_on_str(QUADTREE, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        super::box_mir_drop_policies(tcx, &table, &[])
+    })
+    .unwrap();
+    let ne = policies
+        .iter()
+        .find(|p| p.function.ends_with("::split_node_") && p.local_name.as_deref() == Some("ne"))
+        .expect("ne's policy")
+        .clone();
+    let drop = |line| super::verify::BoxMirDrop {
+        function: ne.function.clone(),
+        local: 5,
+        local_name: Some("ne".to_owned()),
+        file: "lib.rs".to_owned(),
+        site: format!("lib.rs:{line}:1: {line}:2"),
+        line,
+        cleanup: false,
+        optional: true,
+        overwrite: false,
+    };
+    let receipt =
+        super::verify::reconcile_box_mir_drop_policies(&[drop(369), drop(374)], &[ne.clone()]);
+    assert!(receipt.is_ok(), "{receipt:?}\n{ne:?}");
+    let three = super::verify::reconcile_box_mir_drop_policies(
+        &[drop(364), drop(369), drop(374)],
+        &[ne.clone()],
+    );
+    assert!(
+        three.is_err(),
+        "a third drop of ne is unauthorized: {three:?}"
+    );
+}
