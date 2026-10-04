@@ -8,8 +8,8 @@ pub unsafe fn g25_total(buf: &[i32], n: usize) -> i32 {
     }
     s
 }
-pub unsafe fn g25_caller(data: &mut i32, n: usize) -> i32 {
-    let t = g25_total(core::slice::from_ref(data), n);
-    *data = t;
+pub unsafe fn g25_caller(data: &mut [i32], n: usize) -> i32 {
+    let t = g25_total(data, n);
+    data[0] = t;
     t
 }

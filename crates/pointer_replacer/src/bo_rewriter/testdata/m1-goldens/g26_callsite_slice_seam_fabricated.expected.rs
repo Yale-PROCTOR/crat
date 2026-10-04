@@ -8,8 +8,8 @@ pub unsafe fn g26_sum(buf: &[i32]) -> i32 {
     }
     s
 }
-pub unsafe fn g26_caller(data: &mut i32) -> i32 {
-    let t = g26_sum(core::slice::from_ref(data));
-    *data = t;
+pub unsafe fn g26_caller(data: &mut [i32]) -> i32 {
+    let t = g26_sum(data);
+    data[0] = t;
     t
 }
