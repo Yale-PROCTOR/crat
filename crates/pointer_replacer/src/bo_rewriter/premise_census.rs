@@ -554,6 +554,23 @@ fn value_construction(expr: &Expr) -> Option<String> {
             }
             _ => None,
         },
+        // The Option family's fat view: `p.as_ref().map(|p| from_raw_parts(p, n))`.
+        Expr::MethodCall(call) if call.method == "map" && call.args.len() == 1 => {
+            match peel(&call.args[0]) {
+                Expr::Closure(closure) => {
+                    value_construction(&closure.body).map(|_| match peel(&call.receiver) {
+                        Expr::MethodCall(view)
+                            if (view.method == "as_ref" || view.method == "as_mut")
+                                && view.args.is_empty() =>
+                        {
+                            tokens(&view.receiver)
+                        }
+                        other => tokens(other),
+                    })
+                }
+                _ => None,
+            }
+        }
         Expr::Block(block) => tail(&block.block),
         Expr::Unsafe(block) => tail(&block.block),
         Expr::If(branch) => tail(&branch.then_branch).or_else(|| {

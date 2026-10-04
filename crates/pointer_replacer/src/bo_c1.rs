@@ -12797,6 +12797,15 @@ mod run {
             )
             .unwrap_or_else(|error| panic!("write raw-boundary {suffix}: {error}"));
         }
+        // **R792-4 (relay 267 item 2)** — D4's emitted-MIR Box drop reconciliation:
+        // one row per drop of a Box local with its addendum-101 receipt. Built on
+        // every census run (`census_once`) and, until now, written only by the E1
+        // census; the leak-parity lines read it.
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-box-drops.tsv")),
+            &capture.box_drop_receipt,
+        )
+        .expect("write raw-boundary Box drop receipt");
         if !artifact.shared_pair_receipts.is_empty() {
             std::fs::write(
                 directory.join(format!("{name}.shared-pair-permissions.tsv")),
@@ -25126,7 +25135,8 @@ fn raw_boundary_wave2_corpus_census() {
                 crate::bo_rewriter::decision::seam::fallback_slice_extent(),
             ) + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
-                + &raw_boundary_premise_lines(&ledger_dir),
+                + &raw_boundary_premise_lines(&ledger_dir)
+                + &raw_boundary_leak_parity_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25172,7 +25182,8 @@ fn raw_boundary_wave2_corpus_census() {
                 )
                 + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
-                + &raw_boundary_premise_lines(&ledger_dir),
+                + &raw_boundary_premise_lines(&ledger_dir)
+                + &raw_boundary_leak_parity_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26428,7 +26439,8 @@ fn raw_boundary_wave2_corpus_census() {
         ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent())
             + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
-                + &raw_boundary_premise_lines(&ledger_dir),
+                + &raw_boundary_premise_lines(&ledger_dir)
+                + &raw_boundary_leak_parity_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
@@ -26507,8 +26519,61 @@ fn r761_2_the_overcount_reads_passthrough_rows_only() {
 /// `panic=abort` no unwind edge is emitted, which is the ground of a zero
 /// `unwind` count.
 fn raw_boundary_leak_parity_lines(ledger_dir: &std::path::Path) -> String {
-    let _ = ledger_dir;
-    String::new()
+    let read = |suffix: &str, program: &str| {
+        std::fs::read_to_string(ledger_dir.join(format!("{program}.{suffix}"))).unwrap_or_default()
+    };
+    let mut total = ImplicitCloses::default();
+    let mut by_program = Vec::new();
+    let mut statuses = Vec::new();
+    for program in CORPUS {
+        let box_drops = read("raw-boundary-box-drops.tsv", program.name);
+        let closes = raw_boundary_implicit_closes(
+            &box_drops,
+            &read("return-certificate-receipts.tsv", program.name),
+            &read("raw-boundary-field-transactions.tsv", program.name),
+        );
+        let status = box_drops
+            .lines()
+            .find_map(|line| line.strip_prefix("status="))
+            .unwrap_or("missing");
+        if status != "ok" {
+            statuses.push(format!("{}:{status}", program.name));
+        }
+        if closes.any() {
+            by_program.push(format!("{}:{}", program.name, closes.render()));
+        }
+        total.add(&closes);
+    }
+    let mut out = String::new();
+    for (index, kind) in IMPLICIT_CLOSE_KINDS.iter().enumerate() {
+        out += &format!(
+            "implicit_close_{}={}\n",
+            kind.replace('-', "_"),
+            total.of(index)
+        );
+    }
+    out += &format!(
+        "implicit_close_sources=box-drops:{},return-certificate:{},field-transaction:{}\n",
+        total.box_drops.iter().sum::<usize>(),
+        total.certificates.iter().sum::<usize>(),
+        total.fields.iter().sum::<usize>(),
+    );
+    out += &format!(
+        "implicit_close_by_program={}\n",
+        if by_program.is_empty() {
+            "-".to_owned()
+        } else {
+            by_program.join(",")
+        }
+    );
+    if !statuses.is_empty() {
+        out += &format!("implicit_close_box_drop_status={}\n", statuses.join(","));
+    }
+    out += &format!(
+        "implicit_close_panic_strategy={}\n",
+        crate::bo_rewriter::verify::EMITTED_PANIC_STRATEGY
+    );
+    out
 }
 
 const IMPLICIT_CLOSE_KINDS: [&str; 3] = ["scope-exit", "overwrite", "unwind"];
@@ -26554,8 +26619,57 @@ fn raw_boundary_implicit_closes(
     certificates: &str,
     fields: &str,
 ) -> ImplicitCloses {
-    let _ = (box_drops, certificates, fields);
-    ImplicitCloses::default()
+    let kind_of = |text: &str| {
+        IMPLICIT_CLOSE_KINDS
+            .iter()
+            .position(|kind| text.starts_with(&format!("waiver-drop({kind})")))
+    };
+    let column = |header: &str, name: &str| header.split('\t').position(|column| column == name);
+    let mut closes = ImplicitCloses::default();
+    // The Box drop receipt: `status=`/`data=`/`rows=` lines, then a table.
+    let mut lines = box_drops.lines().skip_while(|line| !line.contains('\t'));
+    if let Some(header) = lines.next()
+        && let Some(receipt) = column(header, "receipt")
+    {
+        for line in lines {
+            if let Some(kind) = line.split('\t').nth(receipt).and_then(kind_of) {
+                closes.box_drops[kind] += 1;
+            }
+        }
+    }
+    let mut lines = certificates.lines();
+    if let Some(header) = lines.next()
+        && let Some(detail) = column(header, "detail")
+    {
+        for line in lines {
+            if let Some(kind) = line.split('\t').nth(detail).and_then(kind_of) {
+                closes.certificates[kind] += 1;
+            }
+        }
+    }
+    let mut lines = fields.lines();
+    if let Some(header) = lines.next()
+        && let (Some(bridges), Some(status)) =
+            (column(header, "bridges"), column(header, "revert_status"))
+    {
+        for line in lines {
+            let row = line.split('\t').collect::<Vec<_>>();
+            if row.get(status) != Some(&"active") {
+                continue;
+            }
+            for item in row.get(bridges).copied().unwrap_or("").split(';') {
+                for (index, kind) in IMPLICIT_CLOSE_KINDS.iter().enumerate() {
+                    if let Some(count) = item
+                        .strip_prefix(&format!("waiver-drop-{kind}="))
+                        .and_then(|count| count.parse::<usize>().ok())
+                    {
+                        closes.fields[index] += count;
+                    }
+                }
+            }
+        }
+    }
+    closes
 }
 
 /// R792-4: each family counts its own closes by kind; a withdrawn field
