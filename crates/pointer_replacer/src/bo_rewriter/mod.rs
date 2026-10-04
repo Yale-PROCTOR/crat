@@ -4674,8 +4674,12 @@ fn render_raw_boundary_final_reverts(
 pub(crate) const A5_HOLD_VIEW_HEADER: &str = "caller\tcallee\tcall_span\targ\tshape\targument\troot\troot_terminal_form\ttarget_terminal_form";
 
 fn render_a5_hold_views(rows: &[String]) -> String {
-    let _ = rows;
-    String::new()
+    let mut out = format!("{A5_HOLD_VIEW_HEADER}\n");
+    for row in rows {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
 }
 
 #[test]
