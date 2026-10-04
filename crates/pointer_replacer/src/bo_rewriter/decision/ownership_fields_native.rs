@@ -1791,6 +1791,24 @@ fn derive_bundle(
                     FormalForm::SharedReference,
                     super::seam::Form::Ref { mutable: false },
                 ) if out_owner => format!("{name}.as_deref().unwrap()"),
+                // R800-4: an optional reference formal takes the optional
+                // owner as it is — `None` where C passes null.
+                (
+                    BoxShape::Sized,
+                    FormalForm::MutableReference,
+                    super::seam::Form::Opt {
+                        mutable: true,
+                        slice: false,
+                    },
+                ) if out_owner => format!("{name}.as_deref_mut()"),
+                (
+                    BoxShape::Sized,
+                    FormalForm::SharedReference,
+                    super::seam::Form::Opt {
+                        mutable: false,
+                        slice: false,
+                    },
+                ) if out_owner => format!("{name}.as_deref()"),
                 (BoxShape::Sized, FormalForm::MutableRaw, super::seam::Form::Raw)
                     if out_owner && raw_is_final(callee, argument) =>
                 {

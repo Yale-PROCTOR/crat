@@ -581,10 +581,10 @@ fn plain_local(operand: &Operand<'_>) -> Option<Local> {
 // The original call's scalar arguments introduce no reference, effect or
 // trap between the generated peer borrows. Count operands are a different
 // phase: they remain evaluated once at their original allocation site.
-fn scalar_arguments(
-    tcx: TyCtxt<'_>,
+fn scalar_arguments<'tcx>(
+    tcx: TyCtxt<'tcx>,
     expression: &Expr<'_>,
-    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
 ) -> Result<BTreeSet<usize>, SourceHold> {
     let ExprKind::Call(_, arguments) = expression.kind else { return Err(SourceHold::Identity) };
     let mut scalars = BTreeSet::new();
@@ -601,10 +601,10 @@ fn scalar_arguments(
 }
 /// A side-effect-free scalar read: literals, locals, casts, arithmetic and
 /// comparisons over those.
-fn pure(
-    tcx: TyCtxt<'_>,
+fn pure<'tcx>(
+    tcx: TyCtxt<'tcx>,
     expression: &Expr<'_>,
-    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
 ) -> bool {
     {
         if !matches!(
@@ -622,6 +622,15 @@ fn pure(
             // fresh allocation, and a raw read is not a borrow, so the read
             // commutes with the owner's lend (E5C-3: nothing to hoist).
             ExprKind::Field(base, _) => {
+                // **R800-4** — a scalar field of a LOCAL aggregate value
+                // (`p.x`, heman's planet): a read of the local's own storage,
+                // which the fresh allocation cannot be.
+                if let ExprKind::Path(QPath::Resolved(_, path)) = base.kind
+                    && matches!(path.res, Res::Local(_))
+                    && matches!(typeck.expr_ty(base).kind(), TyKind::Adt(..))
+                {
+                    return true;
+                }
                 let ExprKind::Unary(rustc_hir::UnOp::Deref, through) = base.kind else {
                     return false;
                 };
@@ -669,6 +678,32 @@ fn pure(
             }
             ExprKind::Unary(rustc_hir::UnOp::Neg | rustc_hir::UnOp::Not, inner) => {
                 pure(tcx, inner, typeck)
+            }
+            // **R800-4** — an element of a LOCAL fixed-size array at a
+            // constant index inside its length (`freqs[0 as libc::c_int as
+            // usize]`, heman's island noise): a read of the local's own
+            // storage, and no bounds trap.
+            ExprKind::Index(base, index, _) => {
+                let ExprKind::Path(QPath::Resolved(_, path)) = base.kind else {
+                    return false;
+                };
+                let TyKind::Array(_, length) = typeck.expr_ty(base).kind() else {
+                    return false;
+                };
+                let mut constant = index;
+                while let ExprKind::Cast(inner, _) = constant.kind {
+                    constant = inner;
+                }
+                let ExprKind::Lit(literal) = constant.kind else {
+                    return false;
+                };
+                let rustc_ast::LitKind::Int(value, _) = literal.node else {
+                    return false;
+                };
+                matches!(path.res, Res::Local(_))
+                    && length
+                        .try_to_target_usize(tcx)
+                        .is_some_and(|length| value.get() < u128::from(length))
             }
             _ => false,
         }

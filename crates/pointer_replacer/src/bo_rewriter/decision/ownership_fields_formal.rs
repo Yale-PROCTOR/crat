@@ -156,6 +156,17 @@ pub(crate) fn resolve(
             super::seam::Form::Cursor { mutable: true } if wrapper_cursor_parameter => {
                 FormalForm::MutableReference
             }
+            // **R800-4** — an optional reference formal (`Option<&T>`): lent
+            // as a reference; the caller's arm keeps the `Option` (only an
+            // out-parameter's optional owner has one, `ownership_fields_native`).
+            super::seam::Form::Opt {
+                mutable: true,
+                slice: false,
+            } => FormalForm::MutableReference,
+            super::seam::Form::Opt {
+                mutable: false,
+                slice: false,
+            } => FormalForm::SharedReference,
             _ => return Err(Hold::Lend(LendHold::Formal)),
         }
     };
