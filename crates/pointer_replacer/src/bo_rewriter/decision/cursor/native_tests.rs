@@ -524,3 +524,57 @@ fn native_admission_leaves_a_variable_parameter_root_underived() {
     )
     .unwrap();
 }
+
+/// **R800-2 (relay 109).** bzip2 `BZ2_bzDecompress::strm`, reduced: a stream
+/// formal null-tested and compared for equality against the pointer its state
+/// keeps (`(*s).strm != strm`), with no arithmetic. wave-6o's stop-gap holds it
+/// `held:retained-alias`; the cursor family must not plan a cursor over the
+/// hold (wave-6o's bzip2 probe of `83d17ccfb` realized it as one).
+/// `obs_BZ2_bzCompress` is a row of the stop-gap's fixture table.
+#[test]
+fn slicecursor_r800_a_held_formal_is_never_planned_as_a_cursor() {
+    let input = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub struct bz_stream {
+    pub state: *mut DState,
+    pub avail_in: u32,
+}
+pub struct DState {
+    pub strm: *mut bz_stream,
+    pub mode: i32,
+}
+pub unsafe fn obs_BZ2_bzCompress(mut strm: *mut bz_stream, mut action: i32) -> i32 {
+    let mut s: *mut DState = 0 as *mut DState;
+    if strm.is_null() {
+        return -2;
+    }
+    s = (*strm).state;
+    if s.is_null() {
+        return -2;
+    }
+    if (*s).strm != strm {
+        return -2;
+    }
+    (*strm).avail_in = (*strm).avail_in.wrapping_sub(1);
+    0
+}
+pub unsafe fn caller(mut strm: *mut bz_stream) -> i32 {
+    obs_BZ2_bzCompress(strm, 0)
+}
+"###;
+    let rows = crate::bo_rewriter::emit_tests::artifact_rows_of(input);
+    let held = rows
+        .iter()
+        .find(|r| {
+            r.fn_path.ends_with("obs_BZ2_bzCompress") && r.param_name.as_deref() == Some("strm")
+        })
+        .and_then(|r| r.degrade_reason.clone());
+    let decisions = cursor_decisions(input);
+    let cursor = decisions
+        .iter()
+        .filter(|(label, _)| label.contains("obs_BZ2_bzCompress") && label.contains("strm"))
+        .any(|(_, cursor)| *cursor);
+    assert!(
+        !cursor && held.as_deref() == Some("held:retained-alias"),
+        "the held formal must stay held, never a cursor: reason {held:?}; {decisions:?}"
+    );
+}
