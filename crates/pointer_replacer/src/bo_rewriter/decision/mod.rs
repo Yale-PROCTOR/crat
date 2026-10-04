@@ -121,14 +121,15 @@ mod pinned_local_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_field_null;
-#[cfg(test)]
-mod retained_alias_observed_tests;
 pub(crate) mod raw_initializer;
 pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
 #[cfg(test)]
 mod reader_chain_tests;
 pub(crate) mod receiver_input;
+pub(crate) mod retained_alias_observed;
+#[cfg(test)]
+mod retained_alias_observed_tests;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
@@ -917,6 +918,13 @@ pub(crate) enum DegradeReason {
     AliasedStorageWithdrawn {
         seams: String,
     },
+    /// Wave-6o relay 146 (R796-1, USER): the retained-alias stop-gap. A formal
+    /// whose Tree Borrows report a Miri run has shown (the program also reaches
+    /// its pointee through a pointer it keeps in memory) is held raw. `detail` is
+    /// `observed:<run>` ([`retained_alias_observed`]).
+    RetainedAlias {
+        detail: String,
+    },
 }
 
 impl DegradeReason {
@@ -963,6 +971,7 @@ impl DegradeReason {
             DegradeReason::OptLocalConstruction => "opt-local-construction",
             DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
             DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
+            DegradeReason::RetainedAlias { .. } => "held:retained-alias",
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
             // Names the indirection: the class's key is payload, reported by
@@ -984,6 +993,7 @@ impl DegradeReason {
             DegradeReason::BoxFailure { failure } => failure.detail(),
             DegradeReason::SignatureClassHeld { reason } => reason.clone(),
             DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
+            DegradeReason::RetainedAlias { detail } => detail.clone(),
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
             }
@@ -1945,6 +1955,22 @@ fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
 /// is not a guard.
 fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let decision = decide_one_ladder(ctx, subject);
+    // Wave-6o relay 146 (R796-1): the retained-alias stop-gap. A listed formal
+    // the ladder would deliver (or leaves at the gate mode's
+    // `call-site-not-adapted`) is held raw; one the ladder already leaves raw
+    // keeps its own reason.
+    if !matches!(
+        &decision,
+        Decision::Degraded(Degradation { reason, .. })
+            if !matches!(reason, DegradeReason::CallSiteNotAdapted)
+    ) && let Some(detail) = retained_alias_observed::held(ctx.tcx, subject)
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::RetainedAlias { detail },
+        );
+    }
     if subject.ty_span.is_some() {
         return decision;
     }
