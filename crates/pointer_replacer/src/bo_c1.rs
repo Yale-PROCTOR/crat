@@ -26533,15 +26533,17 @@ fn raw_boundary_leak_parity_lines(ledger_dir: &std::path::Path) -> String {
     let mut statuses = Vec::new();
     for program in CORPUS {
         let box_drops = read("raw-boundary-box-drops.tsv", program.name);
-        let closes = raw_boundary_implicit_closes(
-            &box_drops,
-            &read("return-certificate-receipts.tsv", program.name),
-            &read("raw-boundary-field-transactions.tsv", program.name),
-        );
         let status = box_drops
             .lines()
             .find_map(|line| line.strip_prefix("status="))
             .unwrap_or("missing");
+        // R802-4 item 3: the Box share is published only where the
+        // reconciliation reads `ok`; elsewhere it is not counted at all.
+        let closes = raw_boundary_implicit_closes(
+            if status == "ok" { &box_drops } else { "" },
+            &read("return-certificate-receipts.tsv", program.name),
+            &read("raw-boundary-field-transactions.tsv", program.name),
+        );
         if status != "ok" {
             statuses.push(format!("{}:{status}", program.name));
         }
@@ -26573,7 +26575,10 @@ fn raw_boundary_leak_parity_lines(ledger_dir: &std::path::Path) -> String {
         }
     );
     if !statuses.is_empty() {
-        out += &format!("implicit_close_box_drop_status={}\n", statuses.join(","));
+        out += &format!(
+            "implicit_close_box_share_unpublished={}\n",
+            statuses.join(",")
+        );
     }
     out += &format!(
         "implicit_close_panic_strategy={}\n",
@@ -26735,10 +26740,15 @@ fn r792_4_the_census_publishes_implicit_closes_per_program() {
     let _ = std::fs::remove_dir_all(&dir);
     // R802-4 item 3: a program whose Box drop receipt is not ok has no Box
     // share published; the line says so and the totals do not count it.
+    let unpublished = lines
+        .lines()
+        .find_map(|line| line.strip_prefix("implicit_close_box_share_unpublished="))
+        .unwrap_or_else(|| panic!("{lines}"));
     assert!(
-        lines.contains("implicit_close_box_share_unpublished=avl:error\n"),
+        unpublished.split(',').any(|entry| entry == "avl:error"),
         "{lines}"
     );
+    assert!(!unpublished.contains("quadtree"), "{lines}");
     assert!(lines.contains("implicit_close_scope_exit=1\n"), "{lines}");
     assert!(lines.contains("implicit_close_unwind=0\n"));
     assert!(
