@@ -186,6 +186,7 @@ fn policy(
         retained_sink,
         optional,
         implicit_scope_close,
+        scope_exit_closes: 0,
     }
 }
 

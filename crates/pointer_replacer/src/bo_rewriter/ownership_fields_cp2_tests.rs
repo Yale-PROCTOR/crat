@@ -196,6 +196,7 @@ fn require_emitted(input: &str, element: &str) -> String {
             retained_sink: true,
             optional: false,
             implicit_scope_close: false,
+            scope_exit_closes: 0,
         })
         .collect();
     let receipt = super::verify::reconcile_box_mir_drop_policies(&drops, &policies).unwrap();

@@ -62,6 +62,9 @@ pub(crate) struct BoxMirDropPolicy {
     pub(crate) retained_sink: bool,
     pub(crate) optional: bool,
     pub(crate) implicit_scope_close: bool,
+    /// **R802-3** — the subject's receipted scope-exit closes (one per exit
+    /// that holds it, report 143): distinct exits may keep distinct drops.
+    pub(crate) scope_exit_closes: usize,
 }
 
 fn box_container_kind(
@@ -217,7 +220,8 @@ pub(crate) fn reconcile_box_mir_drop_policies(
             .cloned()
             .collect::<Vec<_>>();
         let terminal_close =
-            usize::from(policy.implicit_scope_close || (policy.optional && policy.retained_sink));
+            usize::from(policy.implicit_scope_close || (policy.optional && policy.retained_sink))
+                .max(policy.scope_exit_closes);
         let expected_normal = policy.overwrite_sites.len() + terminal_close;
         // **R802-3** — the policy is an ALLOWANCE, per kind: every
         // compiler-inserted normal-path drop must be authorized by an

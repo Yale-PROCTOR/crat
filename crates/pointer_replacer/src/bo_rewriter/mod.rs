@@ -11161,6 +11161,25 @@ fn box_mir_drop_policies(
                 retained_sink: plan.retained_sink,
                 optional: plan.optional,
                 implicit_scope_close: plan.implicit_scope_close,
+                // R802-3: a receiver's exit rows are on its plan; a
+                // certificate's returned owner's live null returns are on the
+                // certificate (its plan's own line was stripped).
+                scope_exit_closes: plan
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.starts_with("waiver-drop(scope-exit)"))
+                    .count()
+                    + table
+                        .return_certificates
+                        .callees
+                        .get(&subject.fn_did)
+                        .filter(|c| c.returned == Some((subject.fn_did, subject.hir_id)))
+                        .map_or(0, |c| {
+                            c.receipts
+                                .iter()
+                                .filter(|receipt| receipt.starts_with("waiver-drop(scope-exit)"))
+                                .count()
+                        }),
             })
         })
         .collect::<Vec<_>>();
