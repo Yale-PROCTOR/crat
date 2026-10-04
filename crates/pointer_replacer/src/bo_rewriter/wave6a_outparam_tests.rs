@@ -94,36 +94,7 @@ const HEMAN_NOISE_CALLERS: &str = include_str!("testdata/w6a-r800-heman-noise-ca
 /// local struct's scalar field were not side-effect-free reads).
 #[test]
 fn w6a_r800_heman_out_parameter_callers_deliver_at_the_frame() {
-    let marker = "r800-heman-noise-callers";
-    let out = {
-        let _frame = super::test_model_override::frame_lock();
-        let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        super::test_model_override::set(
-            marker,
-            vec![],
-            vec![
-                (
-                    "heman_generate_simplex_fbm::ctx".to_owned(),
-                    SlotKind::Owning,
-                ),
-                (
-                    "heman_internal_generate_island_noise::ctx".to_owned(),
-                    SlotKind::Owning,
-                ),
-                (
-                    "heman_generate_planet_heightmap::ctx".to_owned(),
-                    SlotKind::Owning,
-                ),
-                ("open_simplex_noise::ctx".to_owned(), SlotKind::Ref),
-                ("open_simplex_noise_free::ctx".to_owned(), SlotKind::Owning),
-            ],
-        );
-        let out = emitted(marker, &format!("// {marker}\n{HEMAN_NOISE_CALLERS}"));
-        super::test_model_override::clear();
-        out
-    };
+    let out = callers_at_the_frame("r800-heman-noise-callers", HEMAN_NOISE_CALLERS);
     let rows = out
         .artifacts
         .ownership_native
@@ -161,4 +132,65 @@ fn w6a_r800_heman_out_parameter_callers_deliver_at_the_frame() {
         "{context}"
     );
     assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// The three callers' emission with the frame's decisions pinned.
+fn callers_at_the_frame(marker: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
+    let _frame = super::test_model_override::frame_lock();
+    let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    super::test_model_override::set(
+        marker,
+        vec![],
+        vec![
+            (
+                "heman_generate_simplex_fbm::ctx".to_owned(),
+                SlotKind::Owning,
+            ),
+            (
+                "heman_internal_generate_island_noise::ctx".to_owned(),
+                SlotKind::Owning,
+            ),
+            (
+                "heman_generate_planet_heightmap::ctx".to_owned(),
+                SlotKind::Owning,
+            ),
+            ("open_simplex_noise::ctx".to_owned(), SlotKind::Ref),
+            ("open_simplex_noise_free::ctx".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted(marker, &format!("// {marker}\n{source}"));
+    super::test_model_override::clear();
+    out
+}
+
+/// **Control (R800-4):** an index that is not a constant (`freqs[k]`) may
+/// trap between the generated borrows, so island's scalar argument is still
+/// not a side-effect-free read and its owner holds; the other two deliver.
+#[test]
+fn w6a_r800_a_computed_index_is_not_a_pure_read() {
+    let source = HEMAN_NOISE_CALLERS.replacen(
+        "(u * freqs[0 as libc::c_int as usize]) as libc::c_double",
+        "(u * freqs[(x % 5 as libc::c_int) as usize]) as libc::c_double",
+        1,
+    );
+    assert_ne!(source, HEMAN_NOISE_CALLERS);
+    let out = callers_at_the_frame("r800-computed-index", &source);
+    let row = out
+        .artifacts
+        .ownership_native
+        .lines()
+        .find(|l| l.starts_with("heman_internal_generate_island_noise::ctx#"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(row.contains("\tSource::UnsupportedOwnerUse\t"), "{row}");
+    assert_eq!(
+        compact(&out.source)
+            .matches("letmutctx:::std::option::Option<::std::boxed::Box<crate::osn_context>>=None;")
+            .count(),
+        2,
+        "{}",
+        out.source
+    );
 }
