@@ -10,7 +10,21 @@ pub struct BrotliBitReader {
     pub avail_in: usize,
 }
 #[repr(C)]
+pub struct HuffmanCode {
+    pub bits: u8,
+    pub value: u16,
+}
+#[repr(C)]
+pub struct BrotliMetablockHeaderArena {
+    pub context_map_table: [HuffmanCode; 8],
+}
+#[repr(C)]
+pub struct BrotliMetablockBodyArena {
+    pub header: BrotliMetablockHeaderArena,
+}
+#[repr(C)]
 pub struct BrotliDecoderStateInternal {
+    pub arena: BrotliMetablockBodyArena,
     pub state: i32,
     pub br: BrotliBitReader,
     pub window_bits: u32,
@@ -64,6 +78,18 @@ unsafe fn ReadDistanceInternal(mut safe: i32, mut s: *mut BrotliDecoderStateInte
 unsafe fn ReadDistance(mut s: *mut BrotliDecoderStateInternal, mut br: *mut BrotliBitReader) {
     ReadDistanceInternal(0, s, br);
 }
+// relay 165 item 2: the table is an array inside the state (through the
+// header local), and the callee reborrows the whole state.
+unsafe fn ReadCodeLengthCodeLengths(mut s: *mut BrotliDecoderStateInternal) -> i32 {
+    (*s).state += 1;
+    1
+}
+unsafe fn ReadHuffmanCode(mut alphabet_size: u32, mut table: *mut HuffmanCode, mut s: *mut BrotliDecoderStateInternal) -> i32 {
+    let mut result = ReadCodeLengthCodeLengths(s);
+    (*table.offset(0)).bits = alphabet_size as u8;
+    (*table.offset(1)).value = 2;
+    result
+}
 #[no_mangle]
 pub unsafe extern "C" fn BrotliDecoderDecompressStream(mut s: *mut BrotliDecoderStateInternal) -> i32 {
     let mut result = 0;
@@ -77,6 +103,10 @@ pub unsafe extern "C" fn BrotliDecoderDecompressStream(mut s: *mut BrotliDecoder
     }
     if (*s).state == 2 {
         ReadDistance(s, br);
+    }
+    if (*s).state == 3 {
+        let mut h: *mut BrotliMetablockHeaderArena = &mut (*s).arena.header;
+        result = ReadHuffmanCode(4, ((*h).context_map_table).as_mut_ptr(), s);
     }
     result
 }

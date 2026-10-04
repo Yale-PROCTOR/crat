@@ -162,16 +162,20 @@ fn r808_5_a_reader_inside_its_state_is_not_handed_beside_the_state_as_mut() {
                 "DecodeMetaBlockLength",
                 "ReadDistance",
                 "ReadDistanceInternal",
+                // relay 165 item 2: the table inside the state, through `h`.
+                "ReadHuffmanCode",
             ] {
                 let signature = flat
                     .split(&format!("fn {callee}("))
                     .nth(1)
                     .and_then(|rest| rest.split(')').next())
                     .unwrap_or_else(|| panic!("no {callee}:\n{source}"));
+                // Both positions of a proven overlap stay raw (R810-2): neither
+                // the state nor the object inside it is a protected `&mut`.
                 assert!(
-                    !signature.contains("s: &mut BrotliDecoderStateInternal"),
-                    "{callee} takes the state as a protected reference while its reader \
-                     argument lies inside it: ({signature})\n{source}"
+                    !signature.contains("&mut"),
+                    "{callee} takes a protected `&mut` beside an argument that lies \
+                     inside another: ({signature})\n{source}"
                 );
             }
         }
