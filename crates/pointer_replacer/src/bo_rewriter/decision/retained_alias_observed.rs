@@ -118,19 +118,30 @@ mod tests {
     }
 
     /// The table: the six observed, brotli's `symbol_lists` pair (one observed,
-    /// one on the fixture), the two overlapping `s` / `br` argument pairs Miri
-    /// reported, and the local `h` that stores `symbol_lists` (R808-5): 13 rows.
+    /// one on the fixture), the local `h` that stores `symbol_lists`, and every
+    /// overlapping pair the decoder run reported until it was clean (R810):
+    /// 20 rows.
     #[test]
-    fn w6o_r808_the_table_is_the_thirteen_rows() {
-        assert_eq!(TABLE.lines().count(), 13);
-        for function in ["DecodeWindowBits", "DecodeMetaBlockLength"] {
-            for formal in ["s", "br"] {
-                let detail = observed_in(TABLE, "brotli", function, formal);
-                assert!(
-                    detail.is_some_and(|d| d.starts_with("observed-pair:")),
-                    "{function}::{formal}: {detail:?}"
-                );
-            }
+    fn w6o_r810_the_table_is_the_twenty_rows() {
+        assert_eq!(TABLE.lines().count(), 20);
+        for (function, formal) in [
+            ("DecodeWindowBits", "s"),
+            ("DecodeWindowBits", "br"),
+            ("DecodeMetaBlockLength", "s"),
+            ("DecodeMetaBlockLength", "br"),
+            ("ReadCommand", "s"),
+            ("ReadCommand", "br"),
+            ("ReadDistance", "s"),
+            ("ReadDistance", "br"),
+            ("ReadCommandInternal", "s"),
+            ("ReadDistanceInternal", "s"),
+            ("ReadHuffmanCode", "table"),
+        ] {
+            let detail = observed_in(TABLE, "brotli", function, formal);
+            assert!(
+                detail.is_some_and(|d| d.starts_with("observed-pair:")),
+                "{function}::{formal}: {detail:?}"
+            );
         }
         assert!(
             observed_in(TABLE, "brotli", "ReadSymbolCodeLengths", "s")
@@ -142,7 +153,11 @@ mod tests {
         );
         assert!(observed_in(TABLE, "brotli", "BrotliDecoderDecompressStream", "h#488").is_some());
         assert_eq!(observed_in(TABLE, "brotli", "ReadHuffmanCode", "s"), None);
-        assert_eq!(observed_in(TABLE, "brotli", "ReadDistance", "br"), None);
+        assert_eq!(observed_in(TABLE, "brotli", "SafeReadDistance", "br"), None);
+        assert_eq!(
+            observed_in(TABLE, "brotli", "ReadCommandInternal", "br"),
+            None
+        );
     }
 
     /// A local is keyed `name#<MIR local>`, as the census keys it; a formal by
