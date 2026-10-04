@@ -302,7 +302,11 @@ pub(crate) fn promote(
                 | Decision::Box(_)
                 | Decision::Cursor { .. } => false,
             };
-            if held {
+            // ... whatever the degrade reason the subject arrives with: the final
+            // pass's raw fallbacks re-degrade a subject under their own reason, and
+            // the bzip2 re-probe showed the cursor planned over that (the subject
+            // index: held in the hypothetical table, a cursor in the settled one).
+            if held || super::retained_alias_observed::held(ctx.tcx, subject).is_some() {
                 return None;
             }
             if !ctx.family_policy.enabled_for(
