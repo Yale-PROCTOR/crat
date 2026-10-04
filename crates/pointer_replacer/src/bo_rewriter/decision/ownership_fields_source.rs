@@ -72,6 +72,17 @@ pub(crate) struct LentLocal {
     pub(crate) is_view_alias: bool,
 }
 
+/// **R805-3** — a LEND alias: `let mut p = root;` whose every use is a read
+/// through it (`*p` as a value). The owner renders it as a shared reference
+/// reborrowed from the Box (`&(*root)[0]` / `&*(root)`), so no second raw
+/// copy of the allocation's address stays in the function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LendAlias {
+    pub(crate) hir_id: HirId,
+    pub(crate) spelling: String,
+    pub(crate) initializer_span: Span,
+}
+
 /// `let mut a = root.offset(start);` — a per-iteration alias of the owner
 /// whose every use is an element access or a raw argument to a local callee.
 /// Emitted as a runtime-checked mutable view `&mut (*root)[(start) as usize..]`
@@ -199,6 +210,7 @@ pub(crate) struct SourcePlan {
     allocation_local: u32,
     element_spelling: String,
     view_aliases: Vec<ViewAlias>,
+    lend_aliases: Vec<LendAlias>,
     /// R641-6 (4a): the owner is born by this out-parameter call.
     out_parameter: Option<OutParameterPlan>,
 }
@@ -222,6 +234,10 @@ impl SourcePlan {
 
     pub(crate) fn view_aliases(&self) -> &[ViewAlias] {
         &self.view_aliases
+    }
+
+    pub(crate) fn lend_aliases(&self) -> &[LendAlias] {
+        &self.lend_aliases
     }
 
     pub(crate) fn element_spelling(&self) -> &str {
@@ -985,6 +1001,39 @@ pub(crate) fn derive<'tcx>(
             alias_bindings.push((alias, init, start));
         }
     }
+    // **R805-3** — lend aliases: `let mut p = root;`, a plain binding with
+    // no annotation, every use of which is checked below to be a read
+    // through it. The root use in the initializer is covered here.
+    let mut lend_bindings: Vec<(HirId, &Expr<'_>)> = Vec::new();
+    {
+        struct Lets<'tcx>(Vec<&'tcx rustc_hir::LetStmt<'tcx>>);
+        impl<'tcx> Visitor<'tcx> for Lets<'tcx> {
+            fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+                self.0.push(local);
+                intravisit::walk_local(self, local);
+            }
+        }
+        let mut lets = Lets(Vec::new());
+        lets.visit_body(tcx.hir_body(body_id));
+        for local in lets.0 {
+            let Some(init) = local.init else { continue };
+            if !root_path(init, binding) || local.els.is_some() || local.ty.is_some() {
+                continue;
+            }
+            let rustc_hir::PatKind::Binding(
+                rustc_hir::BindingMode::NONE | rustc_hir::BindingMode::MUT,
+                alias,
+                _,
+                None,
+            ) = local.pat.kind
+            else {
+                continue;
+            };
+            covered.insert(init.hir_id.local_id.as_u32());
+            alias_receivers.insert((init.hir_id.local_id.as_u32(), init.span));
+            lend_bindings.push((alias, init));
+        }
+    }
     // A SIZED owner's field projections (`(*x).right = y`, `(*x).height`)
     // need no rewriting at all: `*x` derefs the Box to the same struct, so
     // the source text is already valid against the delivered type. They are
@@ -1152,6 +1201,44 @@ pub(crate) fn derive<'tcx>(
         .collect();
     if all_uses != covered {
         return Err(SourceHold::UnsupportedOwnerUse);
+    }
+    // **R805-3** — each lend alias: every use is `*p` read as a value of the
+    // owner's element type (no write through it, no address of it, no copy,
+    // no argument, no return), and it is never re-seated: the only shape the
+    // shared reborrow renders. Anything else holds.
+    let mut lend_aliases = Vec::new();
+    for (alias, init) in lend_bindings {
+        let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
+        let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
+            return Err(SourceHold::Identity);
+        };
+        for &expression in &expressions.0 {
+            if !root_path(expression, alias) {
+                continue;
+            }
+            let Node::Expr(read) = tcx.parent_hir_node(expression.hir_id) else {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            };
+            let read_only = matches!(read.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                && typeck.expr_ty(read) == *element
+                && !matches!(
+                    tcx.parent_hir_node(read.hir_id),
+                    Node::Expr(Expr {
+                        kind: ExprKind::Assign(target, ..)
+                            | ExprKind::AssignOp(_, target, _)
+                            | ExprKind::AddrOf(_, _, target),
+                        ..
+                    }) if target.hir_id == read.hir_id
+                );
+            if !read_only {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            }
+        }
+        lend_aliases.push(LendAlias {
+            hir_id: alias,
+            spelling: ident.name.to_string(),
+            initializer_span: init.span,
+        });
     }
     // Each view alias: every use is an element access the slice walker
     // rewrites or a raw argument to a LOCAL callee (a call obligation with
@@ -1666,6 +1753,7 @@ pub(crate) fn derive<'tcx>(
         allocation_local: allocator_destination.as_u32(),
         element_spelling: constructor.element_spelling,
         view_aliases,
+        lend_aliases,
         out_parameter,
     })
 }

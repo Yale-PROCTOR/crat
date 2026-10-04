@@ -31,6 +31,11 @@ fn variant(name: &str) -> String {
             "    free(buf as *mut ::core::ffi::c_void);\n    return v;",
             "    free(buf as *mut ::core::ffi::c_void);\n    return v + *p;",
         ),
+        // One element: a sized owner.
+        "sized" => edit(
+            "        (4 as size_t)\n            .wrapping_mul(::core::mem::size_of::<::core::ffi::c_int>() as size_t),\n",
+            "        ::core::mem::size_of::<::core::ffi::c_int>() as size_t,\n",
+        ),
         // A write through `p`: not a shared lend.
         "write-through" => edit(
             "    let mut v = *p;\n",
@@ -120,6 +125,23 @@ fn w6a_r805_s3_lends_its_owner_as_a_shared_reference() {
     );
     assert!(text.contains("letmutp:&i32=&(*(buf))[0];"), "{context}");
     assert!(text.contains("letmutv=*p;"), "{context}");
+    assert!(text.contains("::std::mem::drop(buf);"), "{context}");
+    assert!(!text.contains("*mut"), "{context}");
+    assert_eq!(reverted, 0, "{context}");
+}
+
+/// **R805-3, a sized owner:** one element allocated, `Box<i32>`, and the
+/// lend is `&*(buf)`.
+#[test]
+fn w6a_r805_a_sized_owner_lends_by_reborrow() {
+    let (function, reverted, native) = emitted_with_copy_lend("sized");
+    let text = compact(&function);
+    let context = format!("{native}\n{function}");
+    assert!(
+        text.contains("letmutbuf:::std::boxed::Box<i32>="),
+        "{context}"
+    );
+    assert!(text.contains("letmutp:&i32=&*(buf);"), "{context}");
     assert!(text.contains("::std::mem::drop(buf);"), "{context}");
     assert!(!text.contains("*mut"), "{context}");
     assert_eq!(reverted, 0, "{context}");

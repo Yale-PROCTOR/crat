@@ -1545,6 +1545,28 @@ fn derive_bundle(
             alias.access_edits.len()
         ));
     }
+    // **R805-3** — a lend alias (`let mut p = root;`, read only through it):
+    // a shared reference reborrowed from the owner, declared `&T`.
+    for alias in source.lend_aliases() {
+        edits.push(BoxExprEdit {
+            span: alias.initializer_span,
+            replacement: match source.shape() {
+                BoxShape::Slice => format!("&(*({name}))[0]"),
+                BoxShape::Sized => format!("&*({name})"),
+            },
+            receipt: "native-box-lend-alias",
+        });
+        receipts.push(format!(
+            "{VIEW_ALIAS_TYPE_RECEIPT} {} &{}",
+            alias.hir_id.local_id.as_u32(),
+            source.element_spelling()
+        ));
+        receipts.push(format!(
+            "native-box-lend-alias alias={} form=&{} reads-only=yes owner-live-while-lent=borrow-checker (R805-3)",
+            alias.spelling,
+            source.element_spelling()
+        ));
+    }
     receipts.push(format!("native-box-slice-uses count={} element={} length-unchanged=closed-root-uses source-aliases={:?} indexing=delivered-slice-walker",source.count(),source.element(),source.mir_aliases()));
     receipts.push(format!("native-generated-unwind-permit operations=allocation-helpers-and-slice-bounds-checks all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));
     let mut formals = Vec::new();
