@@ -4078,10 +4078,11 @@ struct ReceiverSinks {
 /// return, or a `continue` ahead of a loop body's store. That close is
 /// addendum 101's, and it carries its receipt.
 ///
-/// **R792-4** — every such exit, not whether one exists: an exit reached
-/// through a `return`, `break` or `continue` is named by that jump, and one
-/// reached by falling off the owner's scope by the scope's end (the owner's
-/// `StorageDead`, or the function's `return`).
+/// **R792-4** — every such exit, not whether one exists. The exits are the
+/// function's `return`s, each its own site, and the end of the owner's scope
+/// (its `StorageDead`, or the function's `return` block): one site, whichever
+/// way it is reached, falling off the scope or by a `break` / `continue`
+/// leaving it, as the emitted program drops the owner there once.
 fn exits_holding(
     tcx: TyCtxt<'_>,
     receiver: &Subject,
@@ -4212,8 +4213,8 @@ fn exits_holding(
             null_switches.insert(*target, negated);
         }
     }
-    // Every point just after a definition. Each path carries the jump it is
-    // taking, if any.
+    // Every point just after a definition. Each path carries the `return` it
+    // is taking, if any.
     let mut work: Vec<(BasicBlock, usize, Option<Span>)> = Vec::new();
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (index, statement) in data.statements.iter().enumerate() {
@@ -4232,42 +4233,20 @@ fn exits_holding(
             work.push((*target, 0, None));
         }
     }
-    // The jumps: `return`, `break`, `continue`. Jumps share the exit path's
-    // blocks (the `StorageDead`s, the `return`), so the exit a path reaches is
-    // the jump whose code it ran last, else the scope's end. Any other code
-    // run after a jump (a loop's head after a `continue`) means the jump did
-    // not leave the owner's scope. A jump alone in an `if`'s then-block leaves
-    // no code of its own once the CFG is simplified (`if c { continue; }`
-    // branches straight into the exit path): the `if`'s branch hands the jump
-    // to its edges, and the first code an edge runs outside the exit path
-    // takes it back.
-    struct Returns(Vec<Span>, Vec<(Span, Span, Span)>);
+    // The `return`s. Early returns share the exit path's blocks (the
+    // `StorageDead`s, the `return`), so a path's exit is the `return` whose
+    // code it ran (a `return`'s value is assigned in its own block, which the
+    // CFG keeps), else the scope's end.
+    struct Returns(Vec<Span>);
     impl<'tcx> Visitor<'tcx> for Returns {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            // A desugared jump (a `while`'s `break`) spans the whole loop.
-            let jump = |e: &Expr<'_>| {
-                matches!(
-                    e.kind,
-                    ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Continue(_)
-                ) && e.span.desugaring_kind().is_none()
-            };
-            if jump(expr) {
+            if let ExprKind::Ret(_) = expr.kind {
                 self.0.push(expr.span);
-            }
-            if let ExprKind::If(_, then, _) = expr.kind
-                && let ExprKind::Block(block, _) = then.kind
-                && block.expr.is_none()
-                && let [statement] = block.stmts
-                && let rustc_hir::StmtKind::Semi(last) | rustc_hir::StmtKind::Expr(last) =
-                    statement.kind
-                && jump(last)
-            {
-                self.1.push((expr.span, then.span, last.span));
             }
             intravisit::walk_expr(self, expr);
         }
     }
-    let mut returns = Returns(Vec::new(), Vec::new());
+    let mut returns = Returns(Vec::new());
     returns.visit_body(tcx.hir_body_owned_by(receiver.fn_did));
     let mut exits: Vec<Span> = Vec::new();
     let mut seen = FxHashSet::default();
@@ -4275,15 +4254,10 @@ fn exits_holding(
         if from == 0 && !seen.insert((block, via)) {
             continue;
         }
-        let mut within = |span: Span, exit_path: bool| match returns
-            .0
-            .iter()
-            .filter(|ret| ret.contains(span))
-            .min_by_key(|ret| ret.hi() - ret.lo())
-        {
-            Some(ret) => via = Some(*ret),
-            None if !exit_path => via = None,
-            None => {}
+        let mut within = |span: Span| {
+            if let Some(ret) = returns.0.iter().find(|ret| ret.contains(span)) {
+                via = Some(*ret);
+            }
         };
         let data = &body.basic_blocks[block];
         if data.is_cleanup {
@@ -4300,24 +4274,10 @@ fn exits_holding(
                 exits.push(via.unwrap_or(statement.source_info.span));
                 continue 'paths;
             }
-            within(
-                statement.source_info.span,
-                matches!(
-                    statement.kind,
-                    StatementKind::StorageDead(_)
-                        | StatementKind::StorageLive(_)
-                        | StatementKind::Nop
-                ),
-            );
+            within(statement.source_info.span);
         }
         let terminator = data.terminator();
-        within(
-            terminator.source_info.span,
-            matches!(
-                terminator.kind,
-                TerminatorKind::Goto { .. } | TerminatorKind::Return | TerminatorKind::Drop { .. }
-            ),
-        );
+        within(terminator.source_info.span);
         match &terminator.kind {
             TerminatorKind::Return => exits.push(via.unwrap_or(terminator.source_info.span)),
             TerminatorKind::Call { destination, .. }
@@ -4340,17 +4300,6 @@ fn exits_holding(
                 if negated {
                     work.push((targets.otherwise(), 0, via));
                 }
-            }
-            TerminatorKind::SwitchInt { .. } => {
-                let at = terminator.source_info.span;
-                let branch = returns
-                    .1
-                    .iter()
-                    .filter(|(whole, then, _)| whole.contains(at) && !then.contains(at))
-                    .min_by_key(|(whole, _, _)| whole.hi() - whole.lo())
-                    .map(|(_, _, jump)| *jump);
-                let via = branch.or(via);
-                work.extend(terminator.successors().map(|next| (next, 0, via)));
             }
             _ => work.extend(terminator.successors().map(|next| (next, 0, via))),
         }
