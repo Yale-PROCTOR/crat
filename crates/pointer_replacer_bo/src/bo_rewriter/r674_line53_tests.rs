@@ -157,15 +157,16 @@ pub unsafe extern "C" fn entry(mut buf: *const u8) -> u32 {
 fn r674_iii_a_control_a_placed_slice_root_keeps_its_tail_view() {
     let out = emitted("r674-h5-placed-root", H5_PLACED_ROOT);
     let flat = compact(&out.source);
-    // Restated for 54 (R761-1, R217-2): the one one-element adapter left is
+    // Restated for 54 (R761-1, R217-2): the one one-element adapter left was
     // `entry`'s thin `buf` handed on whole, `StoreH5(core::slice::from_ref(buf), ..)`
-    // — shape (i), which 53 held through the thin-caller hold that R761-1 leaves out
-    // and 55's thin-into-fat rule delivers as a slice. The element address under test
-    // takes no adapter (below). RED first: at `89f4c0046` the count read 1, not 0.
-    assert_eq!(one_element_adapters(&out.source), 1, "{}", out.source);
+    // — shape (i), which 53 held through the thin-caller hold that R761-1 leaves out.
+    // Restated for 55 (main 170): the thin-into-fat rule delivers `buf` as a slice
+    // handed whole, so no one-element adapter is left. The element address under
+    // test takes no adapter (below). RED first: at `89f4c0046` the count read 1.
+    assert_eq!(one_element_adapters(&out.source), 0, "{}", out.source);
     assert!(
-        flat.contains("StoreH5(core::slice::from_ref(buf),63,7)"),
-        "the one adapter is shape (i)'s, at the thin caller\n{}",
+        flat.contains("fnentry(mutbuf:&[u8])") && flat.contains("StoreH5(buf,63,7)"),
+        "shape (i)'s thin caller is a slice handed whole\n{}",
         out.source
     );
     assert!(

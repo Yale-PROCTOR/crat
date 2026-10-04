@@ -932,8 +932,14 @@ fn wave6s_generate_crc_faithful_delivers() {
         flat.contains("fnlodepng_chunk_generate_crc(mutchunk:&mut[libc::c_uchar])"),
         "{source}"
     );
+    // RESTATED (main 170, the gate of 55): `lodepng_chunk_length::chunk` was
+    // thin and handed `chunk.first().unwrap()`, then reached
+    // `lodepng_read32bitInt`'s four-byte read as a one-element view. Handed
+    // bare to that array formal it takes the fat twin (R758-1 (2), R763-1 (a)),
+    // and the pass-on is the slice itself.
     assert!(
-        flat.contains("lodepng_chunk_length(chunk.first().unwrap())"),
+        flat.contains("fnlodepng_chunk_length(mutchunk:&[libc::c_uchar])")
+            && flat.contains("lodepng_chunk_length(chunk)"),
         "{source}"
     );
     assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");

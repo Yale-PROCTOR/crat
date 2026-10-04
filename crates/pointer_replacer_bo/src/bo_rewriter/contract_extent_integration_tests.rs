@@ -1225,7 +1225,13 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
     // for 54, so `find::name` is not carried to `find_local`'s walk and 52's
     // thin `name: &mut i8` returns — the class Codex 062 finding 1 named (a
     // one-element claim reaching a NUL walk), re-admitted by the ruling's (b).
-    assert!(source.contains("name: &mut i8"), "{source}");
+    // RE-PIN (main 170, the gate of 55): `find::name` is handed BARE to
+    // `find_local`'s array formal, so the thin-into-fat rule (R758-1 (2),
+    // R763-1 (a)) gives it the fat twin and the caller hands `KEY` whole: the
+    // one-element claim into the NUL walk is gone. What this test protects
+    // still holds: no contract promotion through the raw callee.
+    assert!(source.contains("name: &mut [i8]"), "{source}");
+    assert!(!source.contains("name: &mut i8"), "{source}");
 }
 
 /// R408-1 (relay 028 §1): ruling B's adjacency arm licensed a VALUE as a slice

@@ -1,5 +1,12 @@
 //! Actual ordinary-call target/source input-form combinations. No decision,
 //! model, atom, or retention evidence is synthesized by these controls.
+//!
+//! RESTATED (main 170, the gate of 55): the authoring premise was "target
+//! Slice, caller Ref" — `caller::q` handed thin to `target::p`, which reads
+//! `p[1]` and walks it to the NUL, through a one-element view. Under the
+//! thin-into-fat rule (R758-1 (2), R763-1 (a)) `q` is handed bare to that
+//! array formal and takes the fat twin, so the kept caller is a slice: the
+//! kept/kept call is slice into slice, and a raw target takes `q.as_mut_ptr()`.
 
 use std::collections::BTreeSet;
 
@@ -60,11 +67,8 @@ fn check(target_input: bool, source_input: bool) {
                 .and_then(|slots| slots.slot_for_local_depth(subject.local, 0))
                 .and_then(|slot| ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)));
             assert_eq!(kind, Some(&super::SlotKind::Ref), "AUTHORING PREMISE: actual model-Ref: {}", subject.label);
-            assert!(if subject.fn_did == p.fn_did {
-                matches!(decision, Decision::Slice { mutable: true, .. })
-            } else {
-                matches!(decision, Decision::Ref { mutable: true })
-            }, "AUTHORING PREMISE: actual target Slice and caller Ref: {}, {decision:?}", subject.label);
+            assert!(matches!(decision, Decision::Slice { mutable: true, .. }),
+                "AUTHORING PREMISE: actual target Slice and caller Slice: {}, {decision:?}", subject.label);
         }
         let target = SignatureClassId::of(p.fn_did);
         let caller = SignatureClassId::of(q.fn_did);
@@ -174,7 +178,7 @@ fn check(target_input: bool, source_input: bool) {
                 )
             } else {
                 matches!(&declaration.type_shape, TypeShape::Reference { mutable: true, pointee }
-                if (owner == "target") == matches!(pointee.as_ref(), TypeShape::Slice { .. }))
+                if matches!(pointee.as_ref(), TypeShape::Slice { .. }))
             },
             "actual terminal {owner}::{binding} form: {declaration:?}"
         );
@@ -191,7 +195,7 @@ fn check(target_input: bool, source_input: bool) {
     if !target_input && !source_input {
         assert_eq!(old.state, BridgeReceiptState::Applied);
         assert_eq!(old.expected_form, "slice-mut");
-        assert_eq!(old.found_form, "ref-mut");
+        assert_eq!(old.found_form, "slice-mut");
         return;
     }
     assert_eq!(
@@ -237,7 +241,7 @@ fn check(target_input: bool, source_input: bool) {
         );
         assert_eq!(
             replacement.found_form,
-            if source_input { "raw" } else { "ref-mut" }
+            if source_input { "raw" } else { "slice-mut" }
         );
         assert_eq!(replacement.retention, output.expected_retention);
         assert_eq!(
@@ -247,7 +251,7 @@ fn check(target_input: bool, source_input: bool) {
         );
         if target_input {
             assert!(
-                output.source.contains("ptr::from_mut(&mut *q)"),
+                output.source.contains("target(q.as_mut_ptr())"),
                 "the kept reference source must have its explicit outbound view"
             );
         }
