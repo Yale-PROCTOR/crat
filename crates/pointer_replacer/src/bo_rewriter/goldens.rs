@@ -159,14 +159,6 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // companion is the right length -- that is the registered
     // bound-verification follow-up's concern, and the exposure is recorded in
     // the micro-plan.
-    //
-    // **g25 and g26 restated (R758-1 (2) / R763-1 (a), main 164).** Their caller's
-    // `data` is a thin subject handed bare to an array formal: the thin-into-fat
-    // hand-on now gives it the slice form, so the seam's `(Slice, Ref)` row no
-    // longer fires there and neither golden pins the `len-following` /
-    // fabricated arm any more. What they pinned was the one-element view itself
-    // (`from_ref(data)` into a formal read past element 0; g26 summed four
-    // elements over one): the restated expectations are its cure.
     "g22_callsite_reborrow_bridge",
     "g23_callsite_optional_wrap",
     "g24_callsite_slice_from_ref",
