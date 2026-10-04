@@ -3984,6 +3984,33 @@ fn receiver_plan(
             "assignment-receiver assignments={}",
             assignments.len()
         ));
+        // **R802-3 (Codex, round 3)** — the first assignment overwrites the
+        // declared `None`: its drop releases nothing. A later assignment, or
+        // one a loop repeats over the previous iteration's generation, may
+        // overwrite a live one; no such drop is a no-op re-seat.
+        let declared = match tcx.parent_hir_node(receiver.hir_id) {
+            rustc_hir::Node::LetStmt(local) => Some(local.span),
+            _ => None,
+        };
+        struct Loops(Vec<Span>);
+        impl<'tcx> Visitor<'tcx> for Loops {
+            fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                if let ExprKind::Loop(..) = expr.kind {
+                    self.0.push(expr.span);
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut loops = Loops(Vec::new());
+        loops.visit_body(tcx.hir_body_owned_by(receiver.fn_did));
+        let repeated = assignments.iter().any(|(_, statement)| {
+            loops.0.iter().any(|outer| {
+                outer.contains(*statement) && declared.is_none_or(|d| !outer.contains(d))
+            })
+        });
+        if declared.is_some() && !repeated {
+            receipts.push(RESEAT_OVER_DECLARED_NONE.to_owned());
+        }
     }
     for span in &uses.dead_guards {
         receipts.push(format!(
@@ -4326,6 +4353,10 @@ fn exits_holding(
 
 /// **R619-3 (2) — the receivers' own implicit-close receipts**, published
 /// under the receiver's function (the certificate's rows are keyed by the
+/// **R802-3** — an assignment receiver's first assignment overwrites its
+/// declared `None` (the D4 reconciliation allows that one drop).
+pub(crate) const RESEAT_OVER_DECLARED_NONE: &str = "receiver-reseat-over-declared-none";
+
 /// callee). Only a receiver the settled table still delivers as `Box`.
 pub(crate) fn receiver_receipts_tsv(tcx: TyCtxt<'_>, table: &DecisionTable) -> String {
     let mut rows = Vec::new();
