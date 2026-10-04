@@ -1358,6 +1358,7 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
         )
         .unwrap();
         let mut delivered = 0;
+        let mut delivered_names = Vec::new();
         for name in ["ff", "dd", "zz", "ww"] {
             let (subject, decision) = table
                 .entries
@@ -1391,6 +1392,7 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
                     "{name}: selected but not delivered: {decision:?}"
                 );
                 delivered += 1;
+                delivered_names.push(name);
             } else {
                 // This base's reading: no family takes the aliases, they stay
                 // `Degraded(copy-source-coupled)` siblings, and the class hold
@@ -1405,9 +1407,14 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
                 );
             }
         }
+        // **R800-4 (wave-6a relay 145)** — a third reading: wave-5d's
+        // narrowing withdraws only the owners a blocked view is carved from
+        // (`zz` / `ww`, whose views reach `edt`'s raw `z` / `w`), and the
+        // native refresh re-derives `ff` / `dd` against `edt`'s restored
+        // formals: those two deliver, the other two stay held.
         assert!(
-            delivered == 0 || delivered == 4,
-            "the four owners share one frame, {delivered} delivered"
+            delivered == 0 || delivered == 4 || delivered_names == ["ff", "dd"],
+            "the four owners share one frame, or the blocked views' owners alone are held: {delivered_names:?}"
         );
         let ownership_receipts = ctx
             .raw_boundary_artifacts

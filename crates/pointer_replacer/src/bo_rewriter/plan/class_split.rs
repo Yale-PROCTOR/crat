@@ -1354,20 +1354,22 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
 }
 "####;
 
+    /// **Re-pinned (R800-4, wave-6a relay 145).** With wave-5d's narrowing
+    /// and the native producer's refresh of a stale formal proof, the owners
+    /// no blocked view is carved from deliver (`r798_b_…`); the two the views
+    /// are carved from, `zz` / `ww`, stay held until the box-owner raw view.
     #[test]
     fn the_negative_offset_twin_holds_every_owner() {
         let got = run(COORDFIELD_NEGATIVE_OFFSET);
         eprintln!("NEGATIVE-OFFSET\n{}", got.subjects);
         for key in [
-            "transform_to_coordfield::ff#8",
-            "transform_to_coordfield::dd#14",
             "transform_to_coordfield::zz#20",
             "transform_to_coordfield::ww#32",
         ] {
             assert_eq!(
                 column(&got.subjects, key, "decision"),
                 "degraded",
-                "the census frame, reproduced: every owner is held:\n{}",
+                "the owners the blocked views are carved from are held:\n{}",
                 got.subjects
             );
             assert_eq!(

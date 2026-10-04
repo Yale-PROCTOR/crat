@@ -59,9 +59,17 @@ struct Bundle {
 pub(crate) struct Candidates {
     bundles: FxHashMap<Node, Bundle>,
     pub(crate) holds: FxHashMap<Node, NativeHold>,
-    /// Owners whose bundle was re-derived once at the ownership stage after
-    /// a callee's interface class was restored beneath the return-stage proof.
+    /// Owners whose bundle was re-derived at the ownership stage after a
+    /// callee's interface class was restored beneath the return-stage proof.
     refreshed: FxHashSet<Node>,
+    /// **R800-4** — how many times each owner's bundle was re-derived. A
+    /// bundle is re-derived again only when a formal it was proved against
+    /// changed form since (each formal changes form at most once per stage),
+    /// so the count stays within `1 + proofs`; past it nothing is refreshed and
+    /// the owner is invalidated as before, so a loop is a count, never a hang.
+    refresh_counts: FxHashMap<Node, usize>,
+    /// Owners that reached that bound (`native-refresh-bound`).
+    refresh_bound: FxHashSet<Node>,
     /// **R579-4 C3, the reverse direction.** Owners re-derived because their
     /// bundle rendered a certified return (`return temp`) that the enclosing
     /// function's certificate no longer adopts — `confirm_adopted` withdraws a
@@ -146,6 +154,14 @@ impl Candidates {
                 };
                 if selected {
                     (true, "selected", "-", "-".to_owned())
+                } else if self.refresh_bound.contains(&node) {
+                    (
+                        true,
+                        "not-selected",
+                        "RefreshBound",
+                        "native-refresh-bound: re-derived 1 + proofs times, a formal still stale"
+                            .to_owned(),
+                    )
                 } else {
                     (
                         true,
@@ -390,10 +406,15 @@ impl Candidates {
 
     /// The ownership stage's recheck. A formal proof taken at the return
     /// stage can be stale here when a callee's interface class was restored
-    /// (its formal is raw again): the bundle is re-derived ONCE against the
+    /// (its formal is raw again): the bundle is re-derived against the
     /// current table and classes — the lend bridge changes text, nothing else
     /// — and the stage re-runs with the refreshed plan; a bundle that cannot
     /// be re-derived invalidates its owner exactly as before.
+    ///
+    /// **R800-4 (wave-5d 121)** — re-derived ONCE, and again whenever a
+    /// formal it was proved against no longer resolves to that proof: a
+    /// narrowed class restores its callee after the first refresh was spent
+    /// (heman's `edt_with_payload` formals, `Raw` → `Slice`).
     pub(crate) fn refresh_or_invalidate(
         &mut self,
         inputs: &Inputs<'_, '_>,
@@ -405,7 +426,10 @@ impl Candidates {
         let mut stale: Vec<Node> = self
             .invalid_owner_nodes(inputs, table, classes)
             .into_iter()
-            .filter(|node| !self.refreshed.contains(node))
+            .filter(|node| {
+                !self.refreshed.contains(node)
+                    || self.proof_went_stale(inputs, table, classes, node)
+            })
             .collect();
         for node in self.decertified_returns(table) {
             if self.decertified.insert(node) && !stale.contains(&node) {
@@ -420,6 +444,13 @@ impl Candidates {
             else {
                 continue;
             };
+            let bound = 1 + self.bundles.get(&node).map_or(0, |b| b.formals.len());
+            let count = self.refresh_counts.entry(node).or_default();
+            if *count >= bound {
+                self.refresh_bound.insert(node);
+                continue;
+            }
+            *count += 1;
             let read = std::cell::RefCell::new(Vec::new());
             let bundle = source::derive(
                 inputs.program,
@@ -546,6 +577,32 @@ impl Candidates {
             .collect();
         nodes.sort_by_key(|(f, h)| (f.local_def_index.as_u32(), h.local_id.as_u32()));
         nodes
+    }
+
+    /// A formal this owner's bundle was proved against no longer resolves
+    /// to that proof: it changed form since the bundle was derived.
+    fn proof_went_stale(
+        &self,
+        inputs: &Inputs<'_, '_>,
+        table: &DecisionTable,
+        classes: &ClassFinalization,
+        node: &Node,
+    ) -> bool {
+        self.bundles.get(node).is_some_and(|bundle| {
+            bundle.formals.iter().any(|proof| {
+                let (callee, argument) = proof.identity();
+                formal::resolve(
+                    inputs.program.tcx,
+                    inputs.slots,
+                    inputs.model,
+                    table,
+                    classes,
+                    callee,
+                    argument,
+                )
+                .map_or(true, |current| current != *proof)
+            })
+        })
     }
 
     fn invalid_owner_nodes(
