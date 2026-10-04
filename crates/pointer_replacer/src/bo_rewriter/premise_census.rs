@@ -23,7 +23,6 @@
 //! wrappers (`ti_*` handing whole views to `__crat_safe_ti_*`) hold (b) by their
 //! shape and are counted apart. The `quiet_prefix` column is the dominance
 //! reading the seat may prefer: a dereference reached before any call or exit.
-#![allow(dead_code)] // RED: the reader is stubbed
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -618,14 +617,156 @@ pub(crate) fn read_program(
     emitted: &syn::File,
     bridged: &[BridgedCall],
 ) -> Reading {
-    let _ = (input, emitted, bridged);
-    Reading::default()
+    let mut reading = Reading::default();
+    let inputs = functions(input);
+    let local_fns = function_names(input);
+    for (path, function) in functions(emitted) {
+        let input_path = match path.rsplit_once("::") {
+            Some((prefix, name)) => {
+                format!("{prefix}::{}", name.strip_prefix(SAFE_TWIN).unwrap_or(name))
+            }
+            None => path.strip_prefix(SAFE_TWIN).unwrap_or(&path).to_owned(),
+        };
+        let wrapper = calls_safe_twin(function);
+        let input_fn = inputs.get(&input_path).copied();
+        let input_lets = input_fn.map(lets).unwrap_or_default();
+        let mut ordinals = BTreeMap::<String, usize>::new();
+        for (name, local, _) in lets(function) {
+            let ordinal = {
+                let next = ordinals.entry(name.clone()).or_default();
+                *next += 1;
+                *next
+            };
+            let Some(init) = &local.init else { continue };
+            let Some((kind, pointer)) = reference_from_raw(&init.expr) else {
+                continue;
+            };
+            if wrapper && kind == SiteKind::DeclarationConstruction {
+                reading.exempt_exposure += 1;
+                continue;
+            }
+            let declared = input_lets
+                .iter()
+                .filter(|(other, ..)| *other == name)
+                .nth(ordinal - 1);
+            let after = match (declared, input_fn) {
+                (Some((_, declared, after)), _) => {
+                    match binding_of(&declared.pat).and_then(|(_, ty)| ty) {
+                        Some(ty) if is_raw_pointer(ty) => items(after),
+                        // The input's binding is not a raw pointer: the
+                        // reference is not one the generator made from one.
+                        Some(_) => continue,
+                        None => {
+                            reading.unread += 1;
+                            continue;
+                        }
+                    }
+                }
+                (None, Some(input_fn)) if raw_formal(input_fn, &name) => {
+                    items(&input_fn.block.stmts)
+                }
+                _ => {
+                    reading.unread += 1;
+                    continue;
+                }
+            };
+            match rule_b(&after, &name, &local_fns) {
+                Ok(_) => *reading.held_b.entry(kind).or_default() += 1,
+                Err(why) => reading.rows.push(Row {
+                    kind,
+                    function: input_path.clone(),
+                    binding: name.clone(),
+                    ordinal,
+                    pointer,
+                    site: "-".to_owned(),
+                    rule_b: why,
+                    quiet_prefix: quiet_prefix(&after, &name, &local_fns),
+                }),
+            }
+        }
+    }
+    let emitted_fns = functions(emitted);
+    let mut formals = BTreeSet::new();
+    for call in bridged {
+        let Some(input_fn) = inputs.get(&call.callee) else {
+            reading.unread += 1;
+            continue;
+        };
+        let emitted_fn = call.callee.rsplit_once("::").map_or_else(
+            || emitted_fns.get(&format!("{SAFE_TWIN}{}", call.callee)),
+            |(prefix, name)| emitted_fns.get(&format!("{prefix}::{SAFE_TWIN}{name}")),
+        );
+        let Some(emitted_fn) = emitted_fn.or_else(|| emitted_fns.get(&call.callee)) else {
+            continue;
+        };
+        let Some((_, delivered)) = formal_name(emitted_fn, call.formal) else {
+            continue;
+        };
+        if !is_thin_reference(delivered) {
+            continue;
+        }
+        let Some((name, _)) = formal_name(input_fn, call.formal) else {
+            continue;
+        };
+        let after = items(&input_fn.block.stmts);
+        match rule_b(&after, &name, &local_fns) {
+            Ok(_) => *reading.held_b.entry(SiteKind::CallBridge).or_default() += 1,
+            Err(why) => {
+                formals.insert((call.callee.clone(), call.formal));
+                reading.rows.push(Row {
+                    kind: SiteKind::CallBridge,
+                    function: call.callee.clone(),
+                    binding: name.clone(),
+                    ordinal: call.formal,
+                    pointer: "-".to_owned(),
+                    site: format!("{}@{}", call.caller, call.site),
+                    rule_b: why,
+                    quiet_prefix: quiet_prefix(&after, &name, &local_fns),
+                });
+            }
+        }
+    }
+    reading.call_bridge_formals = formals.len();
+    reading
 }
 
 /// The placed raw-to-reference adapters of a census `adapters` table.
 pub(crate) fn bridged_calls(adapters_tsv: &str) -> Vec<BridgedCall> {
-    let _ = adapters_tsv;
-    Vec::new()
+    let mut lines = adapters_tsv.lines();
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let column = |name: &str| header.split('\t').position(|column| column == name);
+    let (Some(kind), Some(callee), Some(caller), Some(index), Some(template), Some(site)) = (
+        column("kind"),
+        column("owner_fn"),
+        column("caller"),
+        column("param_index"),
+        column("template"),
+        column("site"),
+    ) else {
+        return Vec::new();
+    };
+    lines
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let get = |at: usize| fields.get(at).copied().unwrap_or("");
+            (get(kind) == "placed"
+                && matches!(
+                    get(template),
+                    "c-raw-reborrow-mut" | "c-raw-reborrow-shared"
+                ))
+            .then(|| {
+                Some(BridgedCall {
+                    callee: get(callee).to_owned(),
+                    formal: get(index).parse().ok()?,
+                    caller: get(caller).to_owned(),
+                    site: get(site).to_owned(),
+                })
+            })
+            .flatten()
+        })
+        .collect()
 }
 
 pub(crate) const HEADER: &str =

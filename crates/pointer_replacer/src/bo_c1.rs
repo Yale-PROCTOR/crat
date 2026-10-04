@@ -25125,7 +25125,8 @@ fn raw_boundary_wave2_corpus_census() {
                 aborts.len(),
                 crate::bo_rewriter::decision::seam::fallback_slice_extent(),
             ) + &raw_boundary_allocator_lines(&ledger_dir)
-                + &raw_boundary_overcount_lines(&ledger_dir),
+                + &raw_boundary_overcount_lines(&ledger_dir)
+                + &raw_boundary_premise_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25170,7 +25171,8 @@ fn raw_boundary_wave2_corpus_census() {
                     crate::bo_rewriter::decision::seam::fallback_slice_extent()
                 )
                 + &raw_boundary_allocator_lines(&ledger_dir)
-                + &raw_boundary_overcount_lines(&ledger_dir),
+                + &raw_boundary_overcount_lines(&ledger_dir)
+                + &raw_boundary_premise_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26425,7 +26427,8 @@ fn raw_boundary_wave2_corpus_census() {
             gate_lost.lines().count() - 1,
         ) + &format!("fallback_slice_extent={}\n", crate::bo_rewriter::decision::seam::fallback_slice_extent())
             + &raw_boundary_allocator_lines(&ledger_dir)
-                + &raw_boundary_overcount_lines(&ledger_dir),
+                + &raw_boundary_overcount_lines(&ledger_dir)
+                + &raw_boundary_premise_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
@@ -26491,6 +26494,73 @@ fn r761_2_the_overcount_reads_passthrough_rows_only() {
     ]}}}});
     assert_eq!(raw_boundary_overcount_of(&custody), 1);
     assert_eq!(raw_boundary_overcount_of(&serde_json::json!({})), 0);
+}
+
+/// **R801-2 (USER), main 163** — premise P7's receipt, read over the FINAL trees
+/// beside their inputs: one `<p>.raw-boundary-premise-bridge-dereferenceable.tsv`
+/// per program in the ledger directory and the counts in `census-receipt.txt`
+/// (`bo_rewriter::premise_census`). An instrument: it reads files the census has
+/// already written and changes no emitted byte.
+fn raw_boundary_premise_lines(ledger_dir: &std::path::Path) -> String {
+    let Some(dir) =
+        std::env::var_os("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR").map(std::path::PathBuf::from)
+    else {
+        return "premise_bridge_dereferenceable_check=unreadable\n".to_owned();
+    };
+    raw_boundary_premise_lines_over(
+        ledger_dir,
+        &dir,
+        &orchestrate::workspace_root().join(substrate_dir()),
+    )
+}
+
+fn raw_boundary_premise_lines_over(
+    ledger_dir: &std::path::Path,
+    emitted_dir: &std::path::Path,
+    input_dir: &std::path::Path,
+) -> String {
+    let readings = CORPUS
+        .iter()
+        .map(|program| {
+            (
+                program.name,
+                crate::bo_rewriter::premise_census::read_and_write(
+                    program.name,
+                    &input_dir.join(program.name).join(program.lib_root),
+                    &emitted_dir.join(program.name).join(program.lib_root),
+                    ledger_dir,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::bo_rewriter::premise_census::census_lines(&readings)
+}
+
+/// R801-2: P7's receipt re-read offline over an existing census directory
+/// (`CRAT_PREMISE_REREAD_DIR`, its `emitted-trees/` and tables), written to
+/// `CRAT_PREMISE_REREAD_OUT`; the adapters tables are copied there first, so the
+/// census directory is never written.
+#[test]
+#[ignore]
+fn r801_2_premise_receipt_reread() {
+    let source = std::path::PathBuf::from(
+        std::env::var_os("CRAT_PREMISE_REREAD_DIR").expect("CRAT_PREMISE_REREAD_DIR"),
+    );
+    let out = std::path::PathBuf::from(
+        std::env::var_os("CRAT_PREMISE_REREAD_OUT").expect("CRAT_PREMISE_REREAD_OUT"),
+    );
+    std::fs::create_dir_all(&out).expect("output directory");
+    for program in CORPUS {
+        let adapters = format!("{}.raw-boundary-adapters.tsv", program.name);
+        let _ = std::fs::copy(source.join(&adapters), out.join(&adapters));
+    }
+    let lines = raw_boundary_premise_lines_over(
+        &out,
+        &source.join("emitted-trees"),
+        &orchestrate::workspace_root().join(substrate_dir()),
+    );
+    std::fs::write(out.join("premise-lines.txt"), &lines).expect("write lines");
+    println!("{lines}");
 }
 
 /// **R760-1 (R443 / D2; (B′), R619-3 item 1)** — each emitted tree's allocator
