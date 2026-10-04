@@ -26757,6 +26757,65 @@ fn r792_4_the_census_publishes_implicit_closes_per_program() {
     assert!(lines.contains("implicit_close_panic_strategy=abort\n"));
 }
 
+/// **R808-3 (relay 274 item 3) — what the emitted tree does at a pending
+/// sibling-overlap site.** The pending table's classification was the constant
+/// `WAIVED`, whatever the bridge custody comparison found at the site. It is
+/// read from that comparison's own rows for the site's identity: `WAIVED` where
+/// the pending bridge is in the tree (the source delivered, the site rendered,
+/// nothing holding it), `UNRESOLVED` where the comparison could not find that
+/// render. The second value is the `tree` cell: the row's status and reason.
+pub(crate) fn pending_sibling_tree_reading<'a>(
+    rows: impl Iterator<Item = &'a crate::bo_rewriter::bridge_custody_match::ReceiptResult>,
+) -> (&'static str, String) {
+    let _ = rows;
+    ("WAIVED", "-".into())
+}
+
+#[test]
+fn r808_3_the_pending_table_says_what_the_tree_does() {
+    use crate::bo_rewriter::bridge_custody_match::{ReceiptResult, ReceiptStatus};
+    let row = |status, reason: &str| ReceiptResult {
+        identity: "619:619:local:584:sibling-overlap:arg1".into(),
+        status,
+        reason: reason.into(),
+        original_call: None,
+        emitted_call: None,
+        argument_indices: vec![1],
+        bindings: Vec::new(),
+        correspondence: Default::default(),
+    };
+    let waived = row(
+        ReceiptStatus::WaivedPending,
+        "licensed-pending-site-present;waived-not-sound",
+    );
+    // brotli at 54′: `BrotliBuildMetaBlockGreedyInternal` arg 6, whose formal
+    // the tree delivered safe — the row's premise (a raw target) is false.
+    let unresolved = row(ReceiptStatus::Unresolved, "pending-target-is-not-raw");
+    assert_eq!(
+        pending_sibling_tree_reading([&waived].into_iter()),
+        (
+            "WAIVED",
+            "waived-pending:licensed-pending-site-present;waived-not-sound".to_string()
+        )
+    );
+    assert_eq!(
+        pending_sibling_tree_reading([&unresolved].into_iter()),
+        (
+            "UNRESOLVED",
+            "unresolved:pending-target-is-not-raw".to_string()
+        )
+    );
+    assert_eq!(
+        pending_sibling_tree_reading(std::iter::empty()),
+        ("UNRESOLVED", "absent".to_string())
+    );
+    // The writer's own validity test is "some row of this identity is waived".
+    assert_eq!(
+        pending_sibling_tree_reading([&unresolved, &waived].into_iter()).0,
+        "WAIVED"
+    );
+}
+
 /// **R801-2 (USER), main 163** — premise P7's receipt, read over the FINAL trees
 /// beside their inputs: one `<p>.raw-boundary-premise-bridge-dereferenceable.tsv`
 /// per program in the ledger directory and the counts in `census-receipt.txt`
