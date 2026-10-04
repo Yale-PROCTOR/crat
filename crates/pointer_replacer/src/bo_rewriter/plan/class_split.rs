@@ -1388,6 +1388,104 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
         );
     }
 
+    /// **R798-3 — one blocked view withholds only the owner it is carved
+    /// from.** The negative-offset twin's census reading: `z`/`w` (views of
+    /// `zz`/`ww`) cannot pay the Glue arm their owners' Box plans put on them
+    /// (the callee's `z`/`w` stay raw), so the class is held
+    /// `blocked-subject:call-site-not-adapted`. The Ownership refusal used to
+    /// retire every owner of the class — `ff`, `dd` and the four payload
+    /// buffers included, though no edit of theirs touches `z` or `w`.
+    /// Narrowed, it retires exactly the owners whose plans edit a blocked
+    /// subject: `zz` renders `z`'s initializer as its view and lends `z` at the
+    /// call, `ww` likewise.
+    #[test]
+    fn r798_a_blocked_view_withdraws_only_its_own_owner() {
+        let got = run(COORDFIELD_NEGATIVE_OFFSET);
+        let receipt = got
+            .family_receipts
+            .split("FamilyFallbackReceipt")
+            .find(|receipt| {
+                receipt.contains("family: \"Ownership\"")
+                    && receipt.contains("owner_path: \"transform_to_coordfield\"")
+            })
+            .unwrap_or_else(|| panic!("no Ownership withdrawal:\n{}", got.family_receipts));
+        assert!(
+            receipt.contains("blocked-subject:call-site-not-adapted:blocked-dependents"),
+            "the refusal is narrowed to its blockers' dependents:\n{receipt}"
+        );
+        for key in ["::zz#20\"", "::ww#32\""] {
+            assert!(
+                receipt.contains(key),
+                "the owner a blocked view is carved from is retired ({key}):\n{receipt}"
+            );
+        }
+        for key in [
+            "::ff#8\"",
+            "::dd#14\"",
+            "::pl1#45\"",
+            "::pl2#53\"",
+            "::pl1_0#238\"",
+            "::pl2_0#246\"",
+        ] {
+            assert!(
+                !receipt.contains(key),
+                "an owner no blocked view depends on is not retired ({key}):\n{receipt}"
+            );
+        }
+    }
+
+    /// **R798-3, the delivery — owed by the native producer.** With the
+    /// refusal narrowed, the class is no longer blocked, so the callee's class
+    /// (which waited on it) is restored and `edt_with_payload`'s formals become
+    /// slices. The kept owners' bundles were proved against those formals as
+    /// raw (`NativeFormal { emitted: MutableRaw, terminal: Raw }`), and a node
+    /// is refreshed once only, so `Candidates::invalid_owners` withdraws the
+    /// whole function at the next round. Re-deriving a bundle whose formal
+    /// proof went stale is the Box family's rule to change (asked by file,
+    /// wave-5d report 121).
+    #[test]
+    #[ignore = "owed: the native producer re-derives a bundle whose formal proof went stale (wave-5d 121)"]
+    fn r798_b_the_owners_no_blocked_view_depends_on_deliver() {
+        let got = run(COORDFIELD_NEGATIVE_OFFSET);
+        for key in [
+            "transform_to_coordfield::ff#8",
+            "transform_to_coordfield::dd#14",
+            "transform_to_coordfield::pl1#45",
+            "transform_to_coordfield::pl2#53",
+            "transform_to_coordfield::pl1_0#238",
+            "transform_to_coordfield::pl2_0#246",
+        ] {
+            assert_eq!(
+                column(&got.subjects, key, "decision"),
+                "box",
+                "an owner no blocked view depends on delivers ({key}):\n{}",
+                got.subjects
+            );
+            assert_eq!(
+                column(&got.subjects, key, "placed"),
+                "1",
+                "and it is placed ({key}):\n{}",
+                got.subjects
+            );
+        }
+        for key in [
+            "transform_to_coordfield::zz#20",
+            "transform_to_coordfield::ww#32",
+        ] {
+            assert_ne!(
+                column(&got.subjects, key, "decision"),
+                "box",
+                "the owner a blocked view is carved from stays withdrawn ({key}):\n{}",
+                got.subjects
+            );
+        }
+        assert!(
+            !got.tree().contains("(*(zz))") && !got.tree().contains("(*(ww))"),
+            "no view is carved from a withdrawn owner:\n{}",
+            got.tree()
+        );
+    }
+
     /// **The corpus-faithful shape** (ownership-fields' `clean-stub.rs`, the
     /// fixture their packet
     /// `2026-09-17-ownership-fields-fixture-vs-corpus/control/` names as the
