@@ -1,43 +1,53 @@
-//! **Wave-6o relay 146 (R796-1, USER): the retained-alias STOP-GAP for batch 55.**
+//! **Wave-6o relays 146 / 153 / 155 (R796-1, R805-2, R808-5): the STOP-GAP
+//! for batch 55. It is not the rule.**
 //!
-//! The input-repair pass ran bzip2 and libtree past the input's own reports and
-//! found output-only Tree Borrows reports of one class: a formal delivered as a
-//! reference whose pointee the program also reaches through a pointer it keeps
-//! in memory (bzip2's state keeps `s->strm`; libtree's small vector keeps
-//! `v->p` into its own buffer). The RULE for that class (relay 140, R787-1) is
-//! being refined (points-to first); until it replaces this line, exactly the
-//! formals whose report a Miri run has shown are held raw.
+//! The table holds the formals (and the one local) that Miri has shown
+//! undefined on the record's tree, of two classes of ours:
+//! - **retained aliases:** a reference whose pointee the program also reaches
+//!   through a pointer it keeps in memory (bzip2's state keeps `s->strm`;
+//!   libtree's small vector keeps `v->p` into its own buffer; brotli's decoder
+//!   keeps `h->symbol_lists` into its own header);
+//! - **overlapping argument pairs:** two reference formals of one call where the
+//!   caller passes a field of the one as the other (brotli's `s` and
+//!   `br = &(*s).br`).
 //!
-//! **What this is NOT:** it is not the rule. It holds what was observed, nothing
-//! more; a formal of the same class that no run has reached is not held here.
+//! Each row carries its receipt detail: `observed:<run>` (a retained alias a
+//! run showed), `observed-pair:<run>` (a pair a run showed), or `fixture:<name>`
+//! (a Miri fixture of the record's own emitted signature, where the corpus run
+//! had not yet reached the call). A formal is keyed by its name, a local by
+//! `name#<MIR local>` as the census keys it. Receipt `held:retained-alias`;
+//! rows are `side-condition` in the audit.
 //!
-//! Receipt `held:retained-alias`, detail `observed:<run>`; rows are
-//! `side-condition` in the audit. A formal joins the table only with the run
-//! that showed it, or (R805-2) with a Miri fixture of the record's own emitted
-//! signature when the corpus run cannot reach the call: brotli's decoder pair,
-//! whose `s` reaches the state's own `symbol_lists` (era-5c 132 §3).
+//! **What this is NOT:** the rule (relay 140's R787-1, era-5c's relation, and
+//! wave-5d's pair rule replace it). A subject of the same class that no run has
+//! reached is not held here.
 use rustc_middle::ty::TyCtxt;
 
 use super::{Subject, SubjectKind};
 
-/// `program  function  formal  run`
+/// `program  function  formal|local#N  detail`
 const TABLE: &str = "\
-bzip2\thandle_compress\tstrm\tpass-D:bzip2/compress-1
-bzip2\tBZ2_bzCompress\tstrm\tpass-D:bzip2/compress-1
-bzip2\tBZ2_bzDecompress\tstrm\tpass-D:bzip2/decompress-1
-libtree\tsmall_vec_u64_init\tv\tpass-D:libtree/bin-ls
-libtree\tsmall_vec_u64_append\tv\tpass-D:libtree/bin-ls
-libtree\tapply_exclude_list\tneeded_buf_offsets\thold-validation-H2:libtree/bin-ls
-brotli\tReadSymbolCodeLengths\ts\tfixture:era5c-132-miri-symlists
+bzip2\thandle_compress\tstrm\tobserved:pass-D:bzip2/compress-1
+bzip2\tBZ2_bzCompress\tstrm\tobserved:pass-D:bzip2/compress-1
+bzip2\tBZ2_bzDecompress\tstrm\tobserved:pass-D:bzip2/decompress-1
+libtree\tsmall_vec_u64_init\tv\tobserved:pass-D:libtree/bin-ls
+libtree\tsmall_vec_u64_append\tv\tobserved:pass-D:libtree/bin-ls
+libtree\tapply_exclude_list\tneeded_buf_offsets\tobserved:hold-validation-H2:libtree/bin-ls
+brotli\tReadSymbolCodeLengths\ts\tobserved:pass-C-enum:brotli/encode.c-q6-decompress
 brotli\tSafeReadSymbolCodeLengths\ts\tfixture:era5c-132-miri-symlists
+brotli\tDecodeWindowBits\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tDecodeWindowBits\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tDecodeMetaBlockLength\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tDecodeMetaBlockLength\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tBrotliDecoderDecompressStream\th#488\tobserved:pass-C-enum:brotli/encode.c-q6-decompress
 ";
 
 #[cfg(test)]
 const FIXTURE_TABLE: &str = "\
--\tobs_handle_compress\tstrm\tfixture-w1
--\tobs_BZ2_bzCompress\tstrm\tfixture-w1
--\tobs_small_vec_u64_init\tv\tfixture-w2
--\tobs_small_vec_u64_append\tv\tfixture-w2
+-\tobs_handle_compress\tstrm\tobserved:fixture-w1
+-\tobs_BZ2_bzCompress\tstrm\tobserved:fixture-w1
+-\tobs_small_vec_u64_init\tv\tobserved:fixture-w2
+-\tobs_small_vec_u64_append\tv\tobserved:fixture-w2
 ";
 
 #[cfg(test)]
@@ -70,19 +80,23 @@ pub(crate) fn observed_in<'t>(
 /// The table's key for a subject: a formal by its name, a local by
 /// `name#<MIR local>` as the census keys it (R808-5).
 pub(crate) fn table_key(name: &str, local: Option<u32>) -> String {
-    let _ = local;
-    name.to_owned()
+    match local {
+        Some(local) => format!("{name}#{local}"),
+        None => name.to_owned(),
+    }
 }
 
-/// The receipt detail (`observed:<run>`) for a listed formal.
+/// The receipt detail (the row's own: `observed:<run>`, `observed-pair:<run>` or
+/// `fixture:<name>`) for a listed subject.
 pub(crate) fn held(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {
-    if !matches!(subject.kind, SubjectKind::Param { .. }) {
-        return None;
-    }
     let program = std::env::var("CRAT_ERA5_PROGRAM").unwrap_or_else(|_| "-".to_owned());
     let function = tcx.item_name(subject.fn_did.to_def_id());
-    let formal = subject.param_name.as_deref()?;
-    observed_in(table(), &program, function.as_str(), formal).map(|run| format!("observed:{run}"))
+    let name = subject.param_name.as_deref()?;
+    let key = match subject.kind {
+        SubjectKind::Param { .. } => table_key(name, None),
+        SubjectKind::Local => table_key(name, Some(subject.local.as_u32())),
+    };
+    observed_in(table(), &program, function.as_str(), &key).map(str::to_owned)
 }
 
 #[cfg(test)]
