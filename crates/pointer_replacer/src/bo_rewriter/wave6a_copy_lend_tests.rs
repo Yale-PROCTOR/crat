@@ -7,15 +7,23 @@ use super::wave6a_allocation_tests::{compact, emitted};
 
 const S3: &str = include_str!("testdata/w6a-r805-s3-copy-read.rs");
 
-/// S3, or one of its variants, by name.
+/// S3, or one of its variants, by name; `sized+<form>` applies `<form>` to
+/// the single-object owner (relay 148).
 fn variant(name: &str) -> String {
+    match name.split_once('+') {
+        Some((first, rest)) => edited(&edited(S3, first), rest),
+        None => edited(S3, name),
+    }
+}
+
+fn edited(base: &str, name: &str) -> String {
     let edit = |from: &str, to: &str| {
-        let edited = S3.replacen(from, to, 1);
-        assert_ne!(edited, S3, "{name}");
+        let edited = base.replacen(from, to, 1);
+        assert_ne!(edited, base, "{name}");
         edited
     };
     match name {
-        "declaration" => S3.to_owned(),
+        "declaration" => base.to_owned(),
         // `p = buf;` after a declaration.
         "assignment" => edit(
             "    let mut p = buf;\n",
@@ -101,6 +109,24 @@ fn w6a_r805_inner_emit() {
     );
     println!("R805-REVERTED {}", out.reverted);
     for row in out
+        .degradations
+        .iter()
+        .filter(|d| d.subject.starts_with("copy_read::"))
+    {
+        println!("R805-DEGRADED {} {}", row.subject, row.reason.key());
+    }
+    for line in out
+        .artifacts
+        .edit_keys
+        .lines()
+        .filter(|l| l.contains("copy_read::"))
+    {
+        println!("R805-EDIT {line}");
+    }
+    for line in out.artifacts.final_reverts.lines().skip(1) {
+        println!("R805-FINAL-REVERT {line}");
+    }
+    for row in out
         .artifacts
         .ownership_native
         .lines()
@@ -113,10 +139,13 @@ fn w6a_r805_inner_emit() {
 /// `copy_read` emitted with the copy-lend arm on (a child process: the
 /// switch is read from the environment), and the owner's native row.
 fn emitted_with_copy_lend(name: &str) -> (String, usize, String) {
-    emitted_pinned(name, None)
+    let (function, reverted, native, _) = emitted_pinned(name, None);
+    (function, reverted, native)
 }
 
-fn emitted_pinned(name: &str, pin: Option<&str>) -> (String, usize, String) {
+/// The function, its revert count, the owner's native row, and what the
+/// census reads (`R805-DEGRADED` / `R805-EDIT` / `R805-FINAL-REVERT` lines).
+fn emitted_pinned(name: &str, pin: Option<&str>) -> (String, usize, String, String) {
     let exe = std::env::current_exe().expect("current_exe");
     let output = std::process::Command::new(exe)
         .args([
@@ -153,7 +182,45 @@ fn emitted_pinned(name: &str, pin: Option<&str>) -> (String, usize, String) {
         .find_map(|l| l.strip_prefix("R805-NATIVE "))
         .unwrap_or_default()
         .to_owned();
-    (function, reverted, native)
+    let census = text
+        .lines()
+        .filter(|l| {
+            l.starts_with("R805-DEGRADED ")
+                || l.starts_with("R805-EDIT ")
+                || l.starts_with("R805-FINAL-REVERT ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (function, reverted, native, census)
+}
+
+/// **Relay 148: what the census reads.** The owner carries no degradation,
+/// and the lent local — whose own row stays `copy-source-coupled` — has a
+/// `declaration-explicit-type` edit under the owner's class with no final
+/// revert: `owner_view_subjects` (`bo_c1.rs`) counts it
+/// `realized-by-owner-view`.
+fn assert_census_reads_both_delivered(name: &str) {
+    let (function, _, _, census) = emitted_pinned(name, None);
+    let context = format!("{name}:\n{census}\n{function}");
+    assert!(
+        !census.contains("R805-DEGRADED copy_read::buf "),
+        "{context}"
+    );
+    assert!(!census.contains("R805-FINAL-REVERT"), "{context}");
+    assert!(
+        census
+            .lines()
+            .any(|l| l.starts_with("R805-EDIT owner=class#")
+                && l.contains("|subject=src::s3_copy_read::copy_read::p#")
+                && l.contains("|kind=declaration-explicit-type|")),
+        "{context}"
+    );
+}
+
+#[test]
+fn w6a_r806_the_census_reads_owner_and_lent_local_delivered() {
+    assert_census_reads_both_delivered("declaration");
+    assert_census_reads_both_delivered("sized");
 }
 
 /// **The RED (R805-3), S3 as the fork translates it.** `buf` covers the
@@ -205,6 +272,12 @@ fn w6a_r805_what_the_model_does_not_decide_is_not_delivered() {
         "after-release",
         "write-through",
         "argument",
+        // Relay 148: the same forms on the single-object owner.
+        "sized+assignment",
+        "sized+optional",
+        "sized+after-release",
+        "sized+write-through",
+        "sized+argument",
     ] {
         let (function, reverted, native) = emitted_with_copy_lend(name);
         let text = compact(&function);
@@ -222,7 +295,7 @@ fn w6a_r805_what_the_model_does_not_decide_is_not_delivered() {
 /// `p` is a reference — and be UB: the owner is not delivered.
 #[test]
 fn w6a_r805_a_raw_pointer_derived_from_the_lend_holds_the_owner() {
-    let (function, reverted, native) = emitted_pinned("raw-cast", Some("ref"));
+    let (function, reverted, native, _) = emitted_pinned("raw-cast", Some("ref"));
     assert!(native.contains("\theld\t"), "{native}\n{function}");
     assert!(
         !compact(&function).contains("::std::boxed::Box"),
@@ -236,7 +309,7 @@ fn w6a_r805_a_raw_pointer_derived_from_the_lend_holds_the_owner() {
 /// lend the analysis validated: the owner is not delivered as a lender.
 #[test]
 fn w6a_r805_a_copy_the_model_keeps_raw_is_not_a_lend() {
-    let (function, _, native) = emitted_pinned("declaration", Some("raw"));
+    let (function, _, native, _) = emitted_pinned("declaration", Some("raw"));
     assert!(
         !compact(&function).contains(":&i32="),
         "{native}\n{function}"
