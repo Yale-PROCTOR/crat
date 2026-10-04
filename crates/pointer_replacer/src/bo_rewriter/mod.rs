@@ -195,6 +195,8 @@ mod wave6a_allocator_contract_tests;
 #[cfg(test)]
 mod wave6a_box_param_tests;
 #[cfg(test)]
+mod wave6a_copy_lend_tests;
+#[cfg(test)]
 mod wave6a_fixture_tulip;
 #[cfg(test)]
 mod wave6a_held_callee_tests;
