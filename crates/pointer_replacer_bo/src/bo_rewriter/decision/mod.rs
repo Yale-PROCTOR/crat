@@ -1431,6 +1431,22 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
     decide_with_raw_fallbacks(ctx, subjects, &FxHashMap::default())
 }
 
+/// **R802-6's restore hold, narrowed (relay 273 R807-1, relay 275; main 170a).**
+/// The op the hold's receipt carries: the subject would have rendered the
+/// seam's one-element view into a wider formal.
+pub(crate) const RESTORE_HOLD_OP: &str = "seam-one-element-into-wider-formal";
+
+/// The subjects R802-6's restore hold must release: it holds a subject only
+/// where its callee formal is delivered fat in the same table. Where that formal
+/// is raw or thin, the hand-on renders no one-element view: a thin reference
+/// into a raw formal is g25's class, which R763-1 (b) does not hold.
+pub(crate) fn restore_holds_to_release(
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    let _ = entries;
+    rustc_hash::FxHashSet::default()
+}
+
 /// Emission-only fallback requests. The accepted model and its facts remain
 /// unchanged; every dependent form is decided again with these subjects raw.
 pub(crate) fn decide_with_raw_fallbacks(

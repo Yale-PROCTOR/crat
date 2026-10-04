@@ -259,3 +259,78 @@ fn r805_7_the_rule_respects_a_subject_scoped_withdrawal_of_the_slice_stage() {
     })
     .unwrap();
 }
+
+/// **R802-6's restore hold, narrowed (relay 273 R807-1, relay 275; main 170a).**
+/// The hold is in scope only where the hand-on renders a one-element view: the
+/// callee formal is delivered fat. p55b measured three subjects it moved into
+/// formals that stay raw (binn `binn_map_get_pair::value`,
+/// `binn_object_get_pair::value`, lodepng `auto_choose_color::mode_out`).
+const MID: &str = r#"
+unsafe fn reads(p: *const i32) -> i32 { *p.offset(1) }
+unsafe fn mid(x: *const i32) -> i32 { reads(x) }
+pub unsafe fn top() -> i32 { let a: [i32; 2] = [1, 2]; mid(a.as_ptr()) }
+"#;
+
+#[test]
+fn r808_6_the_restore_hold_releases_a_subject_whose_formal_is_not_fat() {
+    use super::local_callee_extent::{AccessReason, LocalCalleeAccess};
+    let input = format!("{ALLOW}{MID}");
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let table = crate::bo_rewriter::decide_table(tcx).unwrap();
+        let mut entries = table.entries.clone();
+        let at = |label: &str| {
+            entries
+                .iter()
+                .position(|(subject, _)| subject.label == label)
+                .unwrap_or_else(|| panic!("{label}"))
+        };
+        let (mid, reads) = (at("mid::x"), at("reads::p"));
+        let held =
+            |entries: &[(super::Subject, super::Decision)], subject: usize, formal: usize| {
+                super::degrade(
+                    &entries[subject].0,
+                    "test".into(),
+                    super::DegradeReason::LocalCalleeAccessExtent {
+                        access: Box::new(LocalCalleeAccess {
+                            callee_id: entries[formal].0.fn_did,
+                            parameter_index: 0,
+                            callee: "reads".into(),
+                            parameter: "p".into(),
+                            access: "read",
+                            reason: AccessReason::PointerArithmetic {
+                                op: super::RESTORE_HOLD_OP.into(),
+                            },
+                            footprint_bytes: None,
+                        }),
+                        count: None,
+                    },
+                )
+            };
+        entries[mid].1 = held(&entries, mid, reads);
+        let key = (entries[mid].0.fn_did, entries[mid].0.hir_id);
+        assert!(
+            is_slice(&entries[reads].1),
+            "the formal is delivered fat: {:?}",
+            entries[reads].1
+        );
+        assert!(
+            super::restore_holds_to_release(&entries).is_empty(),
+            "a fat formal keeps the hold"
+        );
+        entries[reads].1 = super::degrade(
+            &entries[reads].0,
+            "test".into(),
+            super::DegradeReason::KindRaw,
+        );
+        assert!(
+            super::restore_holds_to_release(&entries).contains(&key),
+            "a raw formal releases it"
+        );
+        entries[reads].1 = super::Decision::Ref { mutable: false };
+        assert!(
+            super::restore_holds_to_release(&entries).contains(&key),
+            "a thin formal releases it"
+        );
+    })
+    .unwrap();
+}
