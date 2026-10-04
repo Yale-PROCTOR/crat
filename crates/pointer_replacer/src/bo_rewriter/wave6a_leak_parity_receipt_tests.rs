@@ -76,3 +76,96 @@ fn w6a_r792_split_node_receipts_each_live_owner_at_each_exit() {
     );
     assert_eq!(out.reverted, 0, "{}", out.source);
 }
+
+const ITEM: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct item { pub id: i32 }
+#[repr(C)]
+pub struct slot { pub it: *mut item }
+pub unsafe extern "C" fn item_new(mut id: i32) -> *mut item {
+    let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
+    if it.is_null() {
+        return 0 as *mut item;
+    }
+    (*it).id = id;
+    return it;
+}
+"#;
+
+/// The Codex review's `break` (R792-4): the owner outlives the loop, so the
+/// `break` does not leave its scope. The stored path's `return` holds
+/// nothing (`it` moved), the null guard's holds `None`, and the final
+/// `return` (line 33), reached through the `break` or the loop's end, holds
+/// `it`: one row.
+#[test]
+fn w6a_r792_a_break_inside_the_owners_scope_is_not_an_exit() {
+    let source = format!(
+        "{ITEM}{}",
+        r#"pub unsafe extern "C" fn f(mut s: *mut slot, mut c: i32) -> i32 {
+    let mut it = item_new(c);
+    if it.is_null() {
+        return 0 as i32;
+    }
+    while c > 0 as i32 {
+        if c == 3 as i32 {
+            break;
+        }
+        if c == 5 as i32 {
+            (*s).it = it;
+            return 1 as i32;
+        }
+        c -= 1;
+    }
+    return 2 as i32;
+}
+"#
+    );
+    let out = emitted("r792-break", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        closes(receipts)
+            .into_iter()
+            .map(|(_, line, owner)| (line, owner))
+            .collect::<Vec<_>>(),
+        [(33, "it".to_owned())],
+        "{receipts}\n{}",
+        out.source
+    );
+}
+
+/// The Codex review's negated guard (R792-4): `if !it.is_null() { continue; }`
+/// keeps `it` on the `continue` edge only; the loop body's end (line 27)
+/// closes it, and the `return` after the guard holds `None`.
+#[test]
+fn w6a_r792_a_negated_own_guard_closes_at_the_body_end() {
+    let source = format!(
+        "{ITEM}{}",
+        r#"pub unsafe extern "C" fn f(mut n: i32) {
+    let mut i = 0 as i32;
+    while i < n {
+        let mut it = item_new(i);
+        i += 1;
+        if !it.is_null() {
+            continue;
+        }
+        return;
+    }
+}
+"#
+    );
+    let out = emitted("r792-negated", &source);
+    let receipts = &out.artifacts.return_certificate_receipts;
+    assert_eq!(
+        closes(receipts)
+            .into_iter()
+            .map(|(_, line, owner)| (line, owner))
+            .collect::<Vec<_>>(),
+        [(27, "it".to_owned())],
+        "{receipts}\n{}",
+        out.source
+    );
+}

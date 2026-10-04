@@ -1201,8 +1201,7 @@ pub unsafe extern "C" fn fill(mut s: *mut slot, mut n: i32) {
 }
 "#;
 
-/// LOOP_EXIT with a second `continue` that holds `it`: two path ends, two
-/// rows (R792-4).
+/// LOOP_EXIT with a second `continue` that holds `it` (R792-4).
 const LOOP_EXIT_TWICE: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_camel_case_types)]
 extern "C" {
@@ -1243,24 +1242,26 @@ pub unsafe extern "C" fn fill(mut s: *mut slot, mut n: i32) {
 fn r619_3_a_receiver_live_at_a_loop_scope_exit_is_receipted() {
     let out = emitted("cert-loop-exit-close", LOOP_EXIT);
     let receipts = &out.artifacts.return_certificate_receipts;
-    // R792-4: the row names its exit, the holding `continue` (line 27).
+    // R792-4: the row names its exit, the loop body's end (line 30), which
+    // the holding `continue` leaves through.
     assert_eq!(
         receiver_closes(receipts),
-        ["fill\t27\tit"],
+        ["fill\t30\tit"],
         "{receipts}\n{}",
         out.source
     );
 }
 
-/// **R792-4** — two `continue`s that hold the owner are two path ends: two
-/// rows, not one per loop body.
+/// **R792-4** — two `continue`s that hold the owner leave its scope at one
+/// end, the loop body's, where the emitted program drops it: one row. A
+/// `return` is its own exit; a `break` / `continue` is not.
 #[test]
-fn w6a_r792_two_holding_continues_are_two_closes() {
+fn w6a_r792_two_holding_continues_close_once_at_the_body_end() {
     let out = emitted("r792-loop-exit-twice", LOOP_EXIT_TWICE);
     let receipts = &out.artifacts.return_certificate_receipts;
     assert_eq!(
         receiver_closes(receipts),
-        ["fill\t27\tit", "fill\t30\tit"],
+        ["fill\t33\tit"],
         "{receipts}\n{}",
         out.source
     );
