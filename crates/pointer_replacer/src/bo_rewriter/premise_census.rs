@@ -498,7 +498,12 @@ fn reference_from_raw(init: &Expr) -> Option<(SiteKind, String)> {
     let init = peel(init);
     match init {
         Expr::Reference(reference) => match peel(&reference.expr) {
-            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+            // `&mut *outputs[0]` reborrows an element of an already-safe
+            // slice: a raw pointer is never indexed.
+            Expr::Unary(unary)
+                if matches!(unary.op, UnOp::Deref(_))
+                    && !matches!(peel(&unary.expr), Expr::Index(_)) =>
+            {
                 Some((SiteKind::DeclarationReborrow, tokens(&unary.expr)))
             }
             _ => None,
@@ -656,10 +661,22 @@ pub(crate) fn read_program(
                         // The input's binding is not a raw pointer: the
                         // reference is not one the generator made from one.
                         Some(_) => continue,
-                        None => {
-                            reading.unread += 1;
-                            continue;
-                        }
+                        // No type written (`let mut buckets = (*s).buckets_;`):
+                        // the input's initializer is the pointer itself unless
+                        // it already makes the reference.
+                        None => match &declared.init {
+                            Some(init)
+                                if matches!(peel(&init.expr), Expr::Reference(_))
+                                    || reference_from_raw(&init.expr).is_some() =>
+                            {
+                                continue;
+                            }
+                            Some(_) => items(after),
+                            None => {
+                                reading.unread += 1;
+                                continue;
+                            }
+                        },
                     }
                 }
                 (None, Some(input_fn)) if raw_formal(input_fn, &name) => {
@@ -793,6 +810,7 @@ pub(crate) fn render(program: &str, reading: &Reading) -> String {
 /// The census receipt's P7 lines over the programs read.
 pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> String {
     let mut kinds = BTreeMap::<SiteKind, usize>::new();
+    let mut held_kinds = BTreeMap::<SiteKind, usize>::new();
     let (mut total, mut clears, mut held, mut exempt, mut unread, mut formals) = (0, 0, 0, 0, 0, 0);
     let mut by_program = Vec::new();
     let mut unreadable = Vec::new();
@@ -810,6 +828,9 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
         }
         total += reading.rows.len();
         held += reading.held_b.values().sum::<usize>();
+        for (kind, count) in &reading.held_b {
+            *held_kinds.entry(*kind).or_default() += count;
+        }
         exempt += reading.exempt_exposure;
         unread += reading.unread;
         formals += reading.call_bridge_formals;
@@ -837,6 +858,18 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
     out += &format!("premise_bridge_dereferenceable_call_bridge_formals={formals}\n");
     out += &format!("premise_bridge_dereferenceable_quiet_prefix_clears={clears}\n");
     out += &format!("premise_bridge_dereferenceable_held_b={held}\n");
+    out += &format!(
+        "premise_bridge_dereferenceable_held_b_kinds={}\n",
+        SiteKind::ALL
+            .iter()
+            .map(|kind| format!(
+                "{}:{}",
+                kind.key(),
+                held_kinds.get(kind).copied().unwrap_or(0)
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     out += &format!("premise_bridge_dereferenceable_exempt_exposure={exempt}\n");
     out += &format!("premise_bridge_dereferenceable_unread={unread}\n");
     if !unreadable.is_empty() {
