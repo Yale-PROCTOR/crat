@@ -290,9 +290,19 @@ pub(crate) fn promote(
             // is planned over a formal the program also reaches through a pointer
             // it keeps (the bzip2 probe: `BZ2_bzDecompress::strm` came back as a
             // cursor after the stop-gap held it).
-            if matches!(decision, Decision::Degraded(record)
-                if matches!(record.reason, DegradeReason::RetainedAlias { .. }))
-            {
+            let held = match decision {
+                Decision::Degraded(record) => {
+                    matches!(record.reason, DegradeReason::RetainedAlias { .. })
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. } => false,
+            };
+            if held {
                 return None;
             }
             if !ctx.family_policy.enabled_for(
