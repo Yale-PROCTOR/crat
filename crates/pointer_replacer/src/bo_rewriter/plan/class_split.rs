@@ -1444,7 +1444,6 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
     /// proof went stale is the Box family's rule to change (asked by file,
     /// wave-5d report 121).
     #[test]
-    #[ignore = "owed: the native producer re-derives a bundle whose formal proof went stale (wave-5d 121)"]
     fn r798_b_the_owners_no_blocked_view_depends_on_deliver() {
         let got = run(COORDFIELD_NEGATIVE_OFFSET);
         for key in [
