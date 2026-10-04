@@ -423,3 +423,54 @@ fn w6a_r802_an_overwrite_after_a_conditional_move_is_an_overwrite() {
     );
     assert!(scope_only.is_err(), "{scope_only:?}");
 }
+
+/// **R802-3, the probe's next quadtree reading** — an assignment receiver
+/// (`let mut se = None; se = callee(..)`) re-seats over its declared `None`:
+/// the emitted MIR keeps an overwrite drop at the assignment (C2b: `none`,
+/// line 356) and an empty-`Option` drop at the scope's end. The re-seat rule
+/// (R561-4 W1: every re-seat follows the previous generation's consumption)
+/// makes the overwrite drop a no-op: it is allowed, and it is not the
+/// waiver's overwrite close.
+#[test]
+fn w6a_r802_an_assignment_receivers_reseat_drop_is_allowed_and_not_a_waiver() {
+    let _frame = super::test_model_override::frame_lock();
+    let policies = ::utils::compilation::run_compiler_on_str(QUADTREE, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        super::box_mir_drop_policies(tcx, &table, &[])
+    })
+    .unwrap();
+    let se = policies
+        .iter()
+        .find(|p| p.function.ends_with("::split_node_") && p.local_name.as_deref() == Some("se"))
+        .expect("se's policy")
+        .clone();
+    let drop = |line, overwrite| super::verify::BoxMirDrop {
+        function: se.function.clone(),
+        local: 7,
+        local_name: Some("se".to_owned()),
+        file: "lib.rs".to_owned(),
+        site: format!("lib.rs:{line}:1: {line}:2"),
+        line,
+        cleanup: false,
+        optional: true,
+        overwrite,
+    };
+    let receipt = super::verify::reconcile_box_mir_drop_policies(
+        &[drop(356, true), drop(370, false)],
+        &[se.clone()],
+    );
+    let rows = receipt.unwrap_or_else(|error| panic!("{error}\n{se:?}"));
+    assert!(!rows.contains("waiver-drop(overwrite)"), "{rows}");
+    let twice = super::verify::reconcile_box_mir_drop_policies(
+        &[drop(350, true), drop(356, true), drop(370, false)],
+        &[se.clone()],
+    );
+    assert!(twice.is_err(), "one assignment, one re-seat: {twice:?}");
+}
