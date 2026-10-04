@@ -1431,10 +1431,25 @@ fn derive_bundle(
             "::core::ptr::from_mut(&mut {name}).cast::<*mut {}>()",
             source.element_spelling()
         );
+        // **R798-3** — at the final frame heman's out formal is a reference
+        // at its own level (`&mut *mut T`; its pointee stays Raw). Unless the
+        // formal is a stable raw one, the slot's storage is handed as that
+        // reference: the same `*mut T`-layout view, borrowed for the call,
+        // which a raw formal also takes (`&mut T` coerces to `*mut T`), so a
+        // later restoration of the callee's class cannot break the call.
+        let argument = if out
+            .callee
+            .as_local()
+            .is_some_and(|callee| stable_raw_formal(table, callee, out.index))
+        {
+            bridge.clone()
+        } else {
+            format!("&mut *{bridge}")
+        };
         edits.push(BoxExprEdit {
             span: out.call_span,
             replacement: format!(
-                "{{ let __crat_rc = {}{bridge}{}; if __crat_rc != 0 {{ *{bridge} = ::core::ptr::null_mut(); }} __crat_rc }}",
+                "{{ let __crat_rc = {}{argument}{}; if __crat_rc != 0 {{ *{bridge} = ::core::ptr::null_mut(); }} __crat_rc }}",
                 out.before_argument, out.after_argument
             ),
             receipt: "native-out-parameter-call",
