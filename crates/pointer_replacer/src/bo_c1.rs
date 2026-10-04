@@ -12758,6 +12758,9 @@ mod run {
             // all -- no revert row, no receipt, no diagnostic, just a
             // byte-identical function.
             ("class-held-drops", artifact.class_held_drops.as_str()),
+            // main 166: which view of a call the terminal replan held
+            // `nested-caller-edit` (the hold's reason does not say).
+            ("a5-hold-views", artifact.a5_hold_views.as_str()),
             ("interface-inventory", artifact.interface_inventory.as_str()),
             ("subjects", capture.subject_receipt.as_str()),
             // **wave-6r (reports 017 / 036)** — the lane's two instrument strings

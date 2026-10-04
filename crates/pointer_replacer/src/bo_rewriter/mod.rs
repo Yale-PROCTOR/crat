@@ -672,6 +672,8 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **R517-8** — one row per held class whose edits the placement layer
     /// dropped: the reason and how many edits it cost.
     pub(crate) class_held_drops: String,
+    /// main 166: the views the terminal replan held `nested-caller-edit`.
+    pub(crate) a5_hold_views: String,
     /// R397-6(b): contract candidates declined at the selection input.
     pub(crate) contract_candidate_declines: String,
     /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
@@ -2101,6 +2103,7 @@ fn verify_and_revert(
             .insert(subject.owner_path.clone());
     }
     raw_boundary_artifacts.class_held_drops = render_class_held_drops(&emission_plan, &class_paths);
+    raw_boundary_artifacts.a5_hold_views = render_a5_hold_views(&emission_plan.a5_hold_views);
     let all_ready_classes = ready_classes(&emission_plan);
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
     // introduced, not what the input already reported: brotli's frozen
@@ -4667,6 +4670,27 @@ fn render_raw_boundary_final_reverts(
 }
 
 /// **R517-8** — the class-hold receipt table.
+/// The columns of `<p>.raw-boundary-a5-hold-views.tsv` (main 166).
+pub(crate) const A5_HOLD_VIEW_HEADER: &str = "caller\tcallee\tcall_span\targ\tshape\targument\troot\troot_terminal_form\ttarget_terminal_form";
+
+fn render_a5_hold_views(rows: &[String]) -> String {
+    let _ = rows;
+    String::new()
+}
+
+#[test]
+fn main_166_a5_hold_views_render_one_row_per_held_view_under_the_header() {
+    let rows = vec!["c\tf\t1..2\t0\taddr-of-mut\t&mut *p.offset(i)\tp\tSlice\tRaw".to_owned()];
+    assert_eq!(
+        render_a5_hold_views(&rows),
+        format!("{A5_HOLD_VIEW_HEADER}\n{}\n", rows[0])
+    );
+    assert_eq!(
+        render_a5_hold_views(&[]),
+        format!("{A5_HOLD_VIEW_HEADER}\n")
+    );
+}
+
 fn render_class_held_drops(
     plan: &plan::Plan,
     class_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
@@ -7120,6 +7144,29 @@ fn prepare_plan_files<'tcx>(
                     })
                 })
             {
+                let root = view
+                    .source_node
+                    .and_then(|(owner, hir)| {
+                        table.entries.iter().find_map(|(subject, _)| {
+                            (subject.fn_did == owner && subject.hir_id == hir)
+                                .then(|| subject.param_name.clone())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or_default();
+                planned.a5_hold_views.push(format!(
+                    "{}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}",
+                    tcx.def_path_str(pending.call.caller.to_def_id()),
+                    tcx.def_path_str(pending.call.callee.to_def_id()),
+                    pending.call.call_span.lo().0,
+                    pending.call.call_span.hi().0,
+                    view.argument_index,
+                    view.argument_shape,
+                    view.argument_expression.replace(['\t', '\n'], " "),
+                    root,
+                    terminal_subject,
+                    terminal_target,
+                ));
                 terminal_hold = Some("a5-fallback-unrenderable:nested-caller-edit".into());
                 break;
             }
@@ -9578,6 +9625,7 @@ fn finish_decide<'tcx>(
             ),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
             premise_view_sites: String::new(),
+            a5_hold_views: String::new(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),

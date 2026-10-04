@@ -2006,6 +2006,11 @@ pub(crate) struct Plan {
     /// (reports 056/057 spent three windows finding one). One row per held
     /// class that owned edits, written unconditionally.
     pub class_held_drops: Vec<ClassHeldDrop>,
+    /// **main 164 §4 / 166** — one row per A5 view the terminal replan holds
+    /// `a5-fallback-unrenderable:nested-caller-edit`, naming the view (caller,
+    /// callee, call span, argument, its text, the root and both terminal forms):
+    /// the hold's own reason does not say which view of a call it was.
+    pub(crate) a5_hold_views: Vec<String>,
     /// **The crate ROOT file** — where a crate-level item must go, and the only
     /// place `crate::FALLBACK_SLICE_EXTENT` resolves from.
     ///
@@ -6008,6 +6013,7 @@ pub(crate) fn plan(
         sibling_receipt_plans: sibling_overlap::plans(table, &span_to_loc),
         by_file,
         class_held_drops: Vec::new(),
+        a5_hold_views: Vec::new(),
         unplaceable,
         // Both filled by the caller; `plan` has no `TyCtxt`, so it can ask
         // neither which file is the crate root nor the parser for an item.
