@@ -3019,6 +3019,25 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if (counted.is_some() || supplied.is_some()) && matches!(form, Form::Plain | Form::Slice) {
         form = Form::Slice;
     }
+    // **The gate of 55 (main 169) — the rule and its hold stand aside where an
+    // earlier arm owns the subject:** the local-callee and thin-extent holds
+    // (wave-4's licensed lifts give such a subject an exact width where the
+    // rule would fabricate one), and W-C7's declines on refuting evidence (a
+    // companion that does not bound the indexes, R423-6; a measured count that
+    // does not fit the array, the thin-count rule's `caller-count`).
+    let owned_elsewhere = || {
+        let key = (subject.fn_did, subject.hir_id);
+        local_callee_extent.contains_key(&key)
+            || thin_extent.contains(&key)
+            || matches!(
+                slice_input::prove(tcx, subject, facts, fat),
+                Err(slice_input::Hold::CompanionNotIndexBound)
+            )
+            || matches!(
+                thin_counted::prove(tcx, subject, facts),
+                Err(thin_counted::Hold::CallerCount)
+            )
+    };
     // **R758-1 (2) / R763-1 (a) — the thin-into-fat hand-on** (main 147 §2):
     // a subject handed bare to an array formal is used as an array, so its
     // thin form takes the fat twin. Not where the counted route owns it.
@@ -3026,6 +3045,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && supplied.is_none()
         && matches!(form, Form::Plain | Form::Opt { slice: false })
         && slice_input::hands_on_to_fat(subject, facts, fat, family_policy)
+        && !owned_elsewhere()
     {
         form = match form {
             Form::Opt { .. } => Form::Opt { slice: true },
@@ -3045,6 +3065,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && matches!(form, Form::Plain | Form::Opt { slice: false })
         && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
         && let Some((callee, index)) = slice_input::fat_hand_on(subject, facts, fat)
+        && !owned_elsewhere()
     {
         let formal = ctx
             .subjects
