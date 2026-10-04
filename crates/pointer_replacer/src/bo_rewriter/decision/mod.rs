@@ -121,6 +121,8 @@ mod pinned_local_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_field_null;
+#[cfg(test)]
+mod retained_alias_observed_tests;
 pub(crate) mod raw_initializer;
 pub(crate) mod raw_place_values;
 pub(crate) mod raw_receiver;
