@@ -648,6 +648,69 @@ pub(crate) fn fat_hand_on(
         .min_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index))
 }
 
+/// **Narrowing 2 (c) of the gate of 55 (main 170).** The local a binding
+/// VIEWS: its one definition is `root.offset(e)` (through casts) on another
+/// local of the same function, and nothing in the body assigns the binding.
+/// `None` for any other shape. heman's `z_0 = zz.offset(..)` is such a view of
+/// the allocation `zz`.
+pub(crate) fn offset_view_root(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    binding: HirId,
+) -> Option<HirId> {
+    let rustc_hir::Node::Pat(pat) = tcx.hir_node(binding) else {
+        return None;
+    };
+    let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(pat.hir_id) else {
+        return None;
+    };
+    let mut init = local.init?;
+    while let ExprKind::Cast(inner, _) = init.kind {
+        init = inner;
+    }
+    let ExprKind::MethodCall(segment, receiver, [_], _) = init.kind else {
+        return None;
+    };
+    if segment.ident.as_str() != "offset" {
+        return None;
+    }
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = receiver.kind else {
+        return None;
+    };
+    let Res::Local(root) = path.res else {
+        return None;
+    };
+    struct Assigned<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Assigned<'tcx> {
+        type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) = expr.kind
+                && let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.binding)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut assigned = Assigned {
+        tcx,
+        binding,
+        found: false,
+    };
+    assigned.visit_body(tcx.hir_body_owned_by(owner));
+    (root != binding && !assigned.found).then_some(root)
+}
+
 /// **Does the accessing callee index this parameter under its OWN adjacent
 /// companion, and nothing else?**
 ///

@@ -3038,6 +3038,59 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 Err(thin_counted::Hold::CallerCount)
             )
     };
+    // **Narrowing 2 of the gate of 55 (main 170) — the rule alone stands
+    // aside:**
+    // (b) at a parameter of a function whose callers it cannot see (W-C7's
+    //     `IncompleteCallers`: exported, public, address-taken or never
+    //     called) where no exposure surface owns the function. A slice formal
+    //     there changes a signature that callers outside the program call
+    //     (wave-6v's driver, `slerp(&q, 0.5)`). In the census world every
+    //     function with a converting parameter has a surface plan, so this
+    //     reads the open world; a pass with no exposure policy reads nothing.
+    // (c) at a view `root.offset(e)` of an allocation the model calls
+    //     Owning, handed to a formal that takes the slice form. The
+    //     ownership-fields native bundle renders that view from its Box owner
+    //     itself, and a slice view costs the owner its Box (class_split's clean
+    //     twin; wave-5d2 026 measured the same trade for R453-4's arm). Where
+    //     the formal stays raw (a negative or unknown offset: heman's
+    //     `edt_with_payload::z`) the bundle cannot deliver, and the rule keeps
+    //     the view.
+    let rule_stands_aside = || {
+        let unseen_entry = matches!(subject.kind, SubjectKind::Param { .. })
+            && thin_counted::closed_calls(tcx, subject.fn_did, facts).is_err()
+            && exposure.is_some_and(|policy| {
+                matches!(
+                    policy.plan(subject.fn_did),
+                    exposure::ExposureSurfacePlan::NotApplicable
+                )
+            });
+        let bundle_view = matches!(subject.kind, SubjectKind::Local)
+            && slice_input::fat_hand_on(subject, facts, fat).is_some_and(|(callee, index)| {
+                let formal = Local::from_usize(index + 1);
+                !sign.may_be_negative(callee, formal)
+                    || compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                        tcx, callee, formal,
+                    )
+                    .is_ok()
+            })
+            && slice_input::offset_view_root(tcx, subject.fn_did, subject.hir_id).is_some_and(
+                |root| {
+                    subjects.iter().any(|owner| {
+                        owner.fn_did == subject.fn_did
+                            && owner.hir_id == root
+                            && slots
+                                .fn_local_slots
+                                .get(&owner.fn_did)
+                                .and_then(|universe| universe.slot_for_local_depth(owner.local, 0))
+                                .is_some_and(|slot| {
+                                    model.get(&SlotRef::Local(owner.fn_did, slot))
+                                        == Some(&SlotKind::Owning)
+                                })
+                    })
+                },
+            );
+        unseen_entry || bundle_view
+    };
     // **R758-1 (2) / R763-1 (a) — the thin-into-fat hand-on** (main 147 §2):
     // a subject handed bare to an array formal is used as an array, so its
     // thin form takes the fat twin. Not where the counted route owns it.
@@ -3046,6 +3099,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && matches!(form, Form::Plain | Form::Opt { slice: false })
         && slice_input::hands_on_to_fat(subject, facts, fat, family_policy)
         && !owned_elsewhere()
+        && !rule_stands_aside()
     {
         form = match form {
             Form::Opt { .. } => Form::Opt { slice: true },
