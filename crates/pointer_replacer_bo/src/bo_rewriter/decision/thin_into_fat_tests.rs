@@ -193,3 +193,43 @@ pub unsafe fn top() -> u32 {{ let x = 5u32; fwd(&x) }}
         decision(&table, "fwd::q")
     );
 }
+
+/// R805-7 (relay 272 item 3, the review of wave-5d's `7e95b112f`): the rule
+/// asks the same gate as the hold that complements it — the subject's own
+/// (`enabled_for`), not its owner's. A subject whose slice stage alone is
+/// withdrawn (an exclusion re-derivation's subject-scoped transaction) is not
+/// made fat by the rule; the hold takes it.
+#[test]
+fn r805_7_the_rule_respects_a_subject_scoped_withdrawal_of_the_slice_stage() {
+    use crate::bo_rewriter::additive::{FamilyPolicy, FamilyStage};
+    let input = format!("{ALLOW}{MATCHES}");
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let table = crate::bo_rewriter::decide_table(tcx).unwrap();
+        let functions = tcx
+            .hir_body_owners()
+            .filter(|d| matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Fn))
+            .collect::<Vec<_>>();
+        let facts = super::emitability::collect(tcx, &functions);
+        let program = crate::bo_rewriter::collect_program(tcx);
+        let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+        let (subject, _) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label == "FindAll::matches")
+            .expect("FindAll::matches");
+        let open = FamilyPolicy::at(FamilyStage::SliceUse);
+        assert!(super::slice_input::hands_on_to_fat(
+            subject, &facts, &fat, &open
+        ));
+        let mut withdrawn = FamilyPolicy::at(FamilyStage::SliceUse);
+        withdrawn.withdrawn_subjects.insert((
+            FamilyStage::SliceUse,
+            crate::bo_rewriter::bridge_receipt::SignatureClassId::of(subject.fn_did),
+            subject.hir_id.local_id.as_u32(),
+        ));
+        assert!(!super::slice_input::hands_on_to_fat(
+            subject, &facts, &fat, &withdrawn
+        ));
+    })
+    .unwrap();
+}
