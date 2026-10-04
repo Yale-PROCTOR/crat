@@ -194,3 +194,40 @@ fn w6a_r800_a_computed_index_is_not_a_pure_read() {
         out.source
     );
 }
+
+/// **R800-4, the probe's third wall.** heman's corpus lives in modules
+/// (`src::src::noise`), and the release arm cast the owner to
+/// `*mut src::src::noise::osn_context`: a path that does not resolve from
+/// inside the crate's own modules (E0433, the class reverts). The callers'
+/// fixture nested in a module, as the corpus is: the release names its type
+/// from the crate root.
+#[test]
+fn w6a_r800_in_a_module_the_release_names_its_type_from_the_crate_root() {
+    let at = HEMAN_NOISE_CALLERS
+        .find("#[repr(C)]\n#[derive(Copy, Clone)]\npub struct osn_context")
+        .expect("the fixture's first struct");
+    let source = format!(
+        // Explicit imports, as the corpus's modules: a glob would bring
+        // `noise` itself into scope and hide the unrooted path.
+        // (single `use` lines: the AST mapper takes no nested use list).
+        "{}pub mod noise {{\nuse super::free;\nuse super::int16_t;\nuse super::int64_t;\nuse super::libc;\nuse super::malloc;\n{}\n}}\n",
+        &HEMAN_NOISE_CALLERS[..at],
+        &HEMAN_NOISE_CALLERS[at..]
+    );
+    let out = callers_at_the_frame("r800-heman-noise-module", &source);
+    let text = compact(&out.source);
+    let context = format!("{:#?}\n{}", out.degradations, out.source);
+    assert_eq!(
+        text.matches(
+            "letmutctx:::std::option::Option<::std::boxed::Box<crate::noise::osn_context>>=None;"
+        )
+        .count(),
+        3,
+        "{context}"
+    );
+    assert!(
+        text.contains("::std::boxed::Box::into_raw)as*mutcrate::noise::osn_context)"),
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+}
