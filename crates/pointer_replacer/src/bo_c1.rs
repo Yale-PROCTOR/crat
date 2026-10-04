@@ -26726,8 +26726,19 @@ fn r792_4_the_census_publishes_implicit_closes_per_program() {
         "status=ok\ndata=provisional\nrows=0\nfunction\tlocal\tlocal_name\temitted_site\temitted_line\tcleanup\toptional\treceipt\tplan_site\n",
     )
     .expect("write");
+    std::fs::write(
+        dir.join("avl.raw-boundary-box-drops.tsv"),
+        "status=error\ndata=false\ndetail=unreceipted Box MIR Drop population\n",
+    )
+    .expect("write");
     let lines = raw_boundary_leak_parity_lines(&dir);
     let _ = std::fs::remove_dir_all(&dir);
+    // R802-4 item 3: a program whose Box drop receipt is not ok has no Box
+    // share published; the line says so and the totals do not count it.
+    assert!(
+        lines.contains("implicit_close_box_share_unpublished=avl:error\n"),
+        "{lines}"
+    );
     assert!(lines.contains("implicit_close_scope_exit=1\n"), "{lines}");
     assert!(lines.contains("implicit_close_unwind=0\n"));
     assert!(
