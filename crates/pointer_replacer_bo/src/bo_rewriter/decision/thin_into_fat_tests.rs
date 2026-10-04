@@ -15,6 +15,17 @@ fn emitted(input: &str) -> String {
     }
 }
 
+/// The census world (the frozen benchmark graph): every function with a
+/// converting parameter has an exposure surface plan there. The witnesses of
+/// corpus forwarders that are entries (`#[no_mangle]`, `pub`) emit here; in the
+/// open world narrowing 2 (b) keeps such an entry's signature (main 170).
+fn emitted_census(input: &str) -> String {
+    match crate::bo_rewriter::rewrite_m1_census_world(input) {
+        crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("fixture must emit: {other:#?}"),
+    }
+}
+
 fn is_slice(decision: &super::Decision) -> bool {
     matches!(
         decision,
@@ -64,10 +75,25 @@ fn r758_1_a_parameter_handed_bare_to_an_array_formal_is_a_slice() {
         "{:?}",
         decision(&table, "FindAll::matches")
     );
-    let source = emitted(&input);
+    let source = emitted_census(&input);
     assert!(
         !source.contains("from_mut(matches)"),
         "no one-element view of the forwarder:\n{source}"
+    );
+}
+
+/// **Narrowing 2 (b), main 170.** In the open world nothing owns an exported
+/// entry's surface: its callers are outside the program, so the rule does not
+/// change `FindAll`'s signature there (wave-6v's driver, `slerp(&q, 0.5)`, is
+/// the same shape).
+#[test]
+fn r808_5_the_open_world_keeps_an_unseen_entrys_signature() {
+    let input = format!("{ALLOW}{MATCHES}");
+    let source = emitted(&input);
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("matches:&mutu32)->i32"),
+        "the exported entry keeps a thin formal in the open world:\n{source}"
     );
 }
 
@@ -168,7 +194,7 @@ fn r758_1_json_h_indent_and_newline_are_not_one_element_views() {
             "{label}: {decided:?}"
         );
     }
-    let source = emitted(&input);
+    let source = emitted_census(&input);
     assert!(
         !source.contains("from_ref(indent)") && !source.contains("from_ref(newline)"),
         "no one-element view:\n{source}"
