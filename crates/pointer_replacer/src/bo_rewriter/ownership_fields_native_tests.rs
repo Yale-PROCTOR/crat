@@ -264,6 +264,7 @@ fn check_r365_emitted(callee: &str, calls: &str) {
             optional: false,
             implicit_scope_close: false,
             scope_exit_closes: 0,
+            reseats: 0,
         })
         .collect();
     // The native source/T1 proof supplied authorization before emission. This

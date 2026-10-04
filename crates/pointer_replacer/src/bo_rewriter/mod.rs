@@ -11164,6 +11164,12 @@ fn box_mir_drop_policies(
                 // R802-3: a receiver's exit rows are on its plan; a
                 // certificate's returned owner's live null returns are on the
                 // certificate (its plan's own line was stripped).
+                reseats: plan
+                    .receipts
+                    .iter()
+                    .find_map(|receipt| receipt.strip_prefix("assignment-receiver assignments="))
+                    .and_then(|count| count.parse().ok())
+                    .unwrap_or(0),
                 scope_exit_closes: plan
                     .receipts
                     .iter()

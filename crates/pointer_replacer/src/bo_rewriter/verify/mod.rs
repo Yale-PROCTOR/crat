@@ -65,6 +65,10 @@ pub(crate) struct BoxMirDropPolicy {
     /// **R802-3** — the subject's receipted scope-exit closes (one per exit
     /// that holds it, report 143): distinct exits may keep distinct drops.
     pub(crate) scope_exit_closes: usize,
+    /// **R802-3** — an assignment receiver's re-seats: each assignment
+    /// overwrites the declared `None` or a consumed generation (R561-4 W1),
+    /// so its overwrite drop is a no-op, not the waiver's close.
+    pub(crate) reseats: usize,
 }
 
 fn box_container_kind(
@@ -245,7 +249,9 @@ pub(crate) fn reconcile_box_mir_drop_policies(
         // `core::mem::drop` (a call), so no empty-`Option` shell is left to
         // drop; an owner moved out on every path leaves no close either.
         let overwrites = normal.iter().filter(|drop| drop.overwrite).count();
-        if overwrites > policy.overwrite_sites.len() || normal.len() - overwrites > terminal_close {
+        if overwrites > policy.overwrite_sites.len() + policy.reseats
+            || normal.len() - overwrites > terminal_close
+        {
             return Err(format!(
                 "unreceipted Box MIR Drop population: subject={} function={} name={} expected_normal={} got_normal={} overwrites={} terminal_close={}",
                 policy.subject,
@@ -260,8 +266,13 @@ pub(crate) fn reconcile_box_mir_drop_policies(
         let mut overwrite_sites = policy.overwrite_sites.iter();
         for drop in &normal {
             let (reason, plan_site) = if drop.overwrite {
-                let site = overwrite_sites.next().expect("counted above");
-                ("waiver-drop(overwrite)", site.clone())
+                match overwrite_sites.next() {
+                    Some(site) => ("waiver-drop(overwrite)", site.clone()),
+                    None => (
+                        "receiver-reseat(previous-generation-consumed)",
+                        "receiver-reseat".to_owned(),
+                    ),
+                }
             } else if policy.implicit_scope_close {
                 ("waiver-drop(scope-exit)", "function-exit".to_owned())
             } else {

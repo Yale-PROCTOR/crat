@@ -910,6 +910,7 @@ fn box_d4_overwrite_scope_and_unwind_drops_receive_distinct_receipts() {
             optional: false,
             implicit_scope_close: true,
             scope_exit_closes: 0,
+            reseats: 0,
         }],
     )
     .expect("all implicit drops are authorized");

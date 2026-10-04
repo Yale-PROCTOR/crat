@@ -187,6 +187,7 @@ fn policy(
         optional,
         implicit_scope_close,
         scope_exit_closes: 0,
+        reseats: 0,
     }
 }
 
