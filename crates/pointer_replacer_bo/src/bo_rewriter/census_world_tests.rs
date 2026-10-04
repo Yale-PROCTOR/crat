@@ -635,3 +635,28 @@ fn r145c_raw_local_copies_of_one_pointer_are_not_delivered() {
         "add5:\n{source}"
     );
 }
+
+/// **R802-6 (wave-5d `7e95b112f`), its witness reduced on the census-world
+/// entry (R805-7).** bzip2's `blocksort`, reduced (`testdata/r802_blocksort_reduced.rs`):
+/// `mainSimpleSort` hands `block` and `quadrant` bare to `mainGtU`'s array
+/// formals. Without the hold the exclusion re-derivation after `mainQSort3`'s
+/// A5 site restored them thin, rendered `from_ref(block)` /
+/// `from_ref(quadrant)`, three of each (measured on `eb7304897`: the harness's
+/// three panics). ≈ 3 min in a debug build (it solves the reduction's model).
+#[test]
+fn r802_6_bzip2_blocksort_hands_no_one_element_view_to_main_gt_u() {
+    let input = include_str!("testdata/r802_blocksort_reduced.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            assert_eq!(
+                (
+                    source.matches("from_ref(block)").count(),
+                    source.matches("from_ref(quadrant)").count()
+                ),
+                (0, 0),
+                "{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
