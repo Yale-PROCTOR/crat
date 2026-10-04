@@ -1213,10 +1213,12 @@ pub(crate) fn derive<'tcx>(
         let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
             return Err(SourceHold::Identity);
         };
+        let mut reads = 0usize;
         for &expression in &expressions.0 {
             if !root_path(expression, alias) {
                 continue;
             }
+            reads += 1;
             let Node::Expr(read) = tcx.parent_hir_node(expression.hir_id) else {
                 return Err(SourceHold::UnsupportedOwnerUse);
             };
@@ -1234,6 +1236,10 @@ pub(crate) fn derive<'tcx>(
             if !read_only {
                 return Err(SourceHold::UnsupportedOwnerUse);
             }
+        }
+        // A copy never read is no lend: it stays the uncovered copy it was.
+        if reads == 0 {
+            return Err(SourceHold::UnsupportedOwnerUse);
         }
         lend_aliases.push(LendAlias {
             hir_id: alias,
