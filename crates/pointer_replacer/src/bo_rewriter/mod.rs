@@ -145,6 +145,10 @@ mod pair_type_rule_yield_tests;
 mod pair_view_of_formal_tests;
 pub(crate) mod plan;
 #[cfg(test)]
+pub(crate) mod premise_census;
+#[cfg(test)]
+mod premise_census_tests;
+#[cfg(test)]
 mod r674_line53_tests;
 #[cfg(test)]
 mod r763_depth1_view_tests;
