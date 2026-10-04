@@ -110,6 +110,20 @@ fn collect_box_mir_drops(
             let TerminatorKind::Drop { place, target, .. } = &data.terminator().kind else {
                 continue;
             };
+            // Drop elaboration may set a drop flag (a bool compiler temporary
+            // with no source name, assigned a constant) before the store
+            // (Codex, round 2): flags are skipped like storage markers.
+            let named = |local: rustc_middle::mir::Local| {
+                body.var_debug_info.iter().any(|info| {
+                    matches!(info.value, VarDebugInfoContents::Place(p) if p.as_local() == Some(local))
+                })
+            };
+            let drop_flag = |statement: &rustc_middle::mir::Statement<'_>| {
+                matches!(&statement.kind, StatementKind::Assign(assign)
+                    if assign.0.as_local().is_some_and(|local| {
+                        body.local_decls[local].ty.is_bool() && !named(local)
+                    }) && matches!(assign.1, rustc_middle::mir::Rvalue::Use(rustc_middle::mir::Operand::Constant(_))))
+            };
             let overwrite = body.basic_blocks[*target]
                 .statements
                 .iter()
@@ -117,7 +131,7 @@ fn collect_box_mir_drops(
                     !matches!(
                         statement.kind,
                         StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop
-                    )
+                    ) && !drop_flag(statement)
                 })
                 .is_some_and(|statement| {
                     matches!(&statement.kind, StatementKind::Assign(assign) if assign.0 == *place)
