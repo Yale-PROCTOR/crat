@@ -213,6 +213,8 @@ mod wave6a_leak_parity_receipt_tests;
 #[cfg(test)]
 mod wave6a_moved_owner_tests;
 #[cfg(test)]
+mod wave6a_outparam_tests;
+#[cfg(test)]
 mod wave6a_receiver_handover_tests;
 #[cfg(test)]
 mod wave6a_return_certificate_tests;
