@@ -748,14 +748,62 @@ pub unsafe extern "C" fn lil_get_var_or(mut l: *mut lil, mut name: *const i8, mu
 }
 "#;
 
-/// **RED (R791-4 (b)).**
+/// **RED (R801-2, USER: P7 extended).** Rule (b) of R791-4 is no longer a
+/// refusal: a view that a non-null path does not dereference is delivered,
+/// and its declaration carries the premise's receipt
+/// (`premise=bridge-dereferenceable`, site kind `declaration-view`).
 #[test]
-fn w6l_window_a_view_not_dereferenced_on_every_non_null_path_keeps_the_receiver_raw() {
-    view_not_typed(
+fn w6l_window_a_view_not_dereferenced_on_every_non_null_path_rides_p7() {
+    let RewriteOutcome::Emitted {
+        source,
+        reverted_count,
+        degradations,
+        raw_boundary_artifacts,
+        ..
+    } = emitted(
         "partial-dereference",
         PARTIAL_DEREFERENCE,
         &["get", "probe"],
-        "q",
+    )
+    else {
+        panic!("partial-dereference degraded to a non-emitting outcome");
+    };
+    assert_eq!(reverted_count, 0, "{degradations:?}");
+    let text = compact(&source);
+    assert!(
+        text.contains("letmutq:Option<&muti32>="),
+        "the view was not delivered: {text}"
+    );
+    let receipts = &raw_boundary_artifacts.premise_receipts;
+    assert!(
+        receipts.lines().any(|row| row.contains("probe::q")
+            && row.contains("premise=bridge-dereferenceable")
+            && row.contains("declaration-view")),
+        "no P7 receipt for the view: {receipts}"
+    );
+}
+
+/// **Control (R801-2):** a view every non-null path dereferences carries no
+/// receipt (lil `lil_register::cmd`'s shape).
+#[test]
+fn w6l_window_a_dereferenced_view_carries_no_p7_receipt() {
+    let RewriteOutcome::Emitted {
+        raw_boundary_artifacts,
+        ..
+    } = emitted(
+        "lil-register-p7",
+        LIL_REGISTER,
+        &["add_func", "lil_register"],
+    )
+    else {
+        panic!("lil_register fixture degraded to a non-emitting outcome");
+    };
+    assert!(
+        !raw_boundary_artifacts
+            .premise_receipts
+            .contains("premise=bridge-dereferenceable"),
+        "{}",
+        raw_boundary_artifacts.premise_receipts
     );
 }
 

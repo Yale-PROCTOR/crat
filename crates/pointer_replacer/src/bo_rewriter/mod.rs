@@ -660,6 +660,10 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
     /// licensed width, one row each.
     pub(crate) licensed_lifts: String,
+    /// **R801-2 (USER: P7 extended)**: one row per site whose delivered form
+    /// rides a stated premise (`premise=…`, site kind), so the census counts
+    /// them per program.
+    pub(crate) premise_receipts: String,
     /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
     /// their evidence, or HELD with what the root said and why.
     pub(crate) root_extents: String,
@@ -9613,6 +9617,7 @@ fn finish_decide<'tcx>(
             contract_candidate_declines: contract_extent_candidates
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
+            premise_receipts: String::new(),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
             sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),
