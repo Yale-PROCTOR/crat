@@ -424,6 +424,10 @@ impl Candidates {
     ) -> (FxHashSet<LocalDefId>, bool) {
         let effects = NativeEffects::derive(inputs.program);
         let mut refreshed = false;
+        // R813 (Codex): a stale bundle that cannot be re-derived is removed
+        // below, so `invalid_owners` no longer sees it; its owner is reported
+        // here instead, or its stale `Decision::Box` survives the stage.
+        let mut failed = FxHashSet::default();
         let mut stale: Vec<Node> = self
             .invalid_owner_nodes(inputs, table, classes)
             .into_iter()
@@ -492,13 +496,16 @@ impl Candidates {
                 Err(hold) => {
                     self.bundles.remove(&node);
                     self.holds.insert(node, hold);
+                    failed.insert(node.0);
                 }
             }
         }
         if refreshed {
             self.compose_nested_accesses(inputs.program.tcx);
         }
-        (self.invalid_owners(inputs, table, classes), refreshed)
+        let mut invalid = self.invalid_owners(inputs, table, classes);
+        invalid.extend(failed);
+        (invalid, refreshed)
     }
 
     /// **R536-3 — plan-commit, not ask time.** A selected Box plan built from
