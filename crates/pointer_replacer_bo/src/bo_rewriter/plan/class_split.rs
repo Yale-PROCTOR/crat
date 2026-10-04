@@ -1822,6 +1822,45 @@ pub unsafe fn recurse(excluded: i32) -> i32 {
         }
     }
 
+    /// **R802-6 (main 166 §2) — a restore never hands back a thin form a fat
+    /// hand-on refuses.** bzip2's real crate: `mainSimpleSort` hands `block`
+    /// and `quadrant` bare to `mainGtU`'s array formals, which read past one
+    /// element. The thin-into-fat rule makes them slices; when the exclusion
+    /// re-derivation withdraws the slice stage from `mainSimpleSort`
+    /// (`restore-prior-family-disposition`, after `mainQSort3`'s A5 site drops
+    /// `a5-raw-view-template-unavailable`), the predecessor profile used to be
+    /// the thin `Ref`, rendered `from_ref(block)` — a one-element view the
+    /// callee indexes past (three harness panics). Without the fat stage the
+    /// subject is held raw instead. Ignored by default: unlike the census,
+    /// the fixture solves bzip2's model, which takes 40+ minutes in a debug
+    /// build. The corpus RED is main's `p55a` probe by identity (wave-5d 123).
+    #[test]
+    #[ignore = "solves the real bzip2 crate (40+ min debug); --ignored"]
+    fn r802_a_restored_hand_on_to_a_fat_formal_is_not_thin() {
+        let path = std::path::Path::new(
+            "/home/p51lee/dev/crat/benchmarks/rs-crown-derived/bzip2/c2rust-lib.rs",
+        );
+        let src = std::fs::read_to_string(path).expect("derived bzip2");
+        let got = run(&src);
+        for row in ["mainSimpleSort::block#2", "mainSimpleSort::quadrant#3"] {
+            let line = got
+                .subjects
+                .lines()
+                .find(|line| line.contains(row))
+                .unwrap_or_else(|| panic!("no row {row}:\n{}", got.subjects));
+            eprintln!("R802 {line}");
+            let decision = line.split('\t').nth(7).unwrap_or_default();
+            assert_ne!(
+                decision, "ref",
+                "a subject handed bare to an array formal is never decided thin ({row}):\n{line}"
+            );
+        }
+        assert!(
+            !got.tree().contains("from_ref(block)") && !got.tree().contains("from_ref(quadrant)"),
+            "no one-element view of block / quadrant reaches mainGtU"
+        );
+    }
+
     /// **wave-6s W6S-8 on the real crate (relay 033).** The same 75-second
     /// run, over the rows the foreign-call bridge was built for.
     ///
