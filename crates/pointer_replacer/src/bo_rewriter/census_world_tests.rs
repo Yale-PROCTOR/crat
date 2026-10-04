@@ -140,3 +140,41 @@ fn e5c_148_control_two_locals() {
         "pub unsafe fn entry() { let mut x = 1i32; let mut y = 2i32; add(&mut x, &mut y); }\n",
     );
 }
+
+/// **R808-5 (wave-6o 110a, brotli's decoder) — a pair PROVEN to overlap is
+/// not two references.** The driver takes `br = &mut (*s).br` and hands `s`
+/// and `br` to callees that write through both. At the record (54′) both
+/// formals converted: `DecodeMetaBlockLength(&mut *s, &mut *br)` into
+/// `(s: &mut State, br: &mut BrotliBitReader)`, two protected references over
+/// the reader's bytes. A raw view of `br` beside `s: &mut` is not a remedy:
+/// a write through the view is a foreign write to `s`'s protected range. With
+/// one argument a place inside the other's referent, both stay raw.
+#[test]
+fn r808_5_a_reader_inside_its_state_is_not_handed_beside_the_state_as_mut() {
+    let input = include_str!("testdata/r808_decoder_reader_in_state.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            // `ReadDistanceInternal` is the `…Internal` shape (relay 164 item 2):
+            // it receives both one call down, from `ReadDistance`'s formals.
+            for callee in [
+                "DecodeWindowBits",
+                "DecodeMetaBlockLength",
+                "ReadDistance",
+                "ReadDistanceInternal",
+            ] {
+                let signature = flat
+                    .split(&format!("fn {callee}("))
+                    .nth(1)
+                    .and_then(|rest| rest.split(')').next())
+                    .unwrap_or_else(|| panic!("no {callee}:\n{source}"));
+                assert!(
+                    !signature.contains("s: &mut BrotliDecoderStateInternal"),
+                    "{callee} takes the state as a protected reference while its reader \
+                     argument lies inside it: ({signature})\n{source}"
+                );
+            }
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
