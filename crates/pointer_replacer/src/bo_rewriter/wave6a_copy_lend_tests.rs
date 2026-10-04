@@ -46,6 +46,16 @@ fn variant(name: &str) -> String {
             "unsafe extern \"C\" fn peek(mut q: *mut ::core::ffi::c_int) -> ::core::ffi::c_int {\n    return *q;\n}\nunsafe fn main_0()",
             1,
         ),
+        // Codex: a raw pointer derived from the copy, read after the owner's write.
+        "raw-cast" => edit(
+            "    let mut v = *p;\n",
+            "    let mut q = p as *const ::core::ffi::c_int;\n    *buf = 9 as ::core::ffi::c_int;\n    let mut v = *q;\n",
+        ),
+        // Codex: an address comparison through the copy.
+        "compare" => edit(
+            "    let mut v = *p;\n",
+            "    let mut v = *p + (p == buf) as ::core::ffi::c_int;\n",
+        ),
         // A write through `p`: not a shared lend.
         "write-through" => edit(
             "    let mut v = *p;\n",
@@ -59,7 +69,28 @@ fn variant(name: &str) -> String {
 #[ignore = "run by w6a_r805_* in a child with the copy-lend arm on"]
 fn w6a_r805_inner_emit() {
     let name = std::env::var("R805_VARIANT").expect("R805_VARIANT");
-    let out = emitted("r805-s3", &variant(&name));
+    let source = format!("// r805-s3\n{}", variant(&name));
+    // `R805_PIN=<p kind>`: the model pinned (`buf` Owning, `p` as named), to
+    // reach the arm with a shape the model does not decide today.
+    let _frame = super::test_model_override::frame_lock();
+    if let Ok(kind) = std::env::var("R805_PIN") {
+        use crate::analyses::borrow_ownership::SlotKind;
+        let kind = match kind.as_str() {
+            "ref" => SlotKind::Ref,
+            "raw" => SlotKind::Raw,
+            other => panic!("R805_PIN {other}"),
+        };
+        super::test_model_override::set(
+            "r805-s3",
+            vec![],
+            vec![
+                ("copy_read::buf".to_owned(), SlotKind::Owning),
+                ("copy_read::p".to_owned(), kind),
+            ],
+        );
+    }
+    let out = emitted("r805-s3", &source);
+    super::test_model_override::clear();
     let start = out.source.find("fn copy_read").expect("copy_read");
     let end = out.source[start..]
         .find("\n}\n")
@@ -82,6 +113,10 @@ fn w6a_r805_inner_emit() {
 /// `copy_read` emitted with the copy-lend arm on (a child process: the
 /// switch is read from the environment), and the owner's native row.
 fn emitted_with_copy_lend(name: &str) -> (String, usize, String) {
+    emitted_pinned(name, None)
+}
+
+fn emitted_pinned(name: &str, pin: Option<&str>) -> (String, usize, String) {
     let exe = std::env::current_exe().expect("current_exe");
     let output = std::process::Command::new(exe)
         .args([
@@ -93,6 +128,7 @@ fn emitted_with_copy_lend(name: &str) -> (String, usize, String) {
         ])
         .env("CRAT_ERA5C_COPY_LEND", "on")
         .env("R805_VARIANT", name)
+        .envs(pin.map(|kind| ("R805_PIN", kind)))
         .output()
         .expect("child test");
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -178,4 +214,31 @@ fn w6a_r805_what_the_model_does_not_decide_is_not_delivered() {
         );
         assert_eq!(reverted, 0, "{name}: {function}");
     }
+}
+
+/// **R805-3 (Codex): the alias is admitted only when every use is a read
+/// through it.** With the model pinned (`buf` Owning, `p` Ref), a raw pointer
+/// derived from the copy and read after the owner's write would compile once
+/// `p` is a reference — and be UB: the owner is not delivered.
+#[test]
+fn w6a_r805_a_raw_pointer_derived_from_the_lend_holds_the_owner() {
+    let (function, reverted, native) = emitted_pinned("raw-cast", Some("ref"));
+    assert!(native.contains("\theld\t"), "{native}\n{function}");
+    assert!(
+        !compact(&function).contains("::std::boxed::Box"),
+        "{function}"
+    );
+    assert_eq!(reverted, 0, "{function}");
+}
+
+/// **R805-3 (Codex): the alias is admitted only when the model decides it
+/// Ref.** With the model pinned (`buf` Owning, `p` Raw), the copy is not a
+/// lend the analysis validated: the owner is not delivered as a lender.
+#[test]
+fn w6a_r805_a_copy_the_model_keeps_raw_is_not_a_lend() {
+    let (function, _, native) = emitted_pinned("declaration", Some("raw"));
+    assert!(
+        !compact(&function).contains(":&i32="),
+        "{native}\n{function}"
+    );
 }
