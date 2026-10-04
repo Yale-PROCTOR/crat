@@ -3437,6 +3437,10 @@ pub(crate) struct AliasedTwinRefusal {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    /// **R801-2 (USER: P7 extended)**: sites whose delivered form rides a
+    /// stated premise, one receipt each (`call_result_option`'s declaration
+    /// views without a dereference on every non-null path).
+    pub(crate) premise_receipts: Vec<super::call_result_option::PremiseReceipt>,
     /// **R544-3** — degraded partners whose blocked-class D4 was paid by a pair
     /// certificate against every converting sibling, set where the arm
     /// requirements are derived (after the seam):

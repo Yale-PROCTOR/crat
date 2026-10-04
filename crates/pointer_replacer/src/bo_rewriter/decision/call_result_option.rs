@@ -47,6 +47,40 @@ pub(crate) struct CallResultValue {
     pub(crate) initializer: Span,
     pub(crate) pointee: String,
     pub(crate) callee: LocalDefId,
+    /// R801-2: the premise the view rides — `Some` where no dereference lies on
+    /// every non-null path (R791-4 (b) fails), so `as_mut()` asserts a
+    /// dereferenceability the input does not use.
+    pub(crate) premise: Option<&'static str>,
+}
+
+/// **R801-2 (USER, P7 extended): one per declaration view delivered on the
+/// premise.** P7 (R758) is extended to references made from a raw pointer
+/// before the input dereferences it; each such site is receipted and counted.
+#[derive(Clone, Debug)]
+pub(crate) struct PremiseReceipt {
+    pub(crate) owner: String,
+    pub(crate) subject: String,
+    pub(crate) site: String,
+    pub(crate) premise: &'static str,
+    pub(crate) site_kind: &'static str,
+}
+
+/// The census table: `owner subject site premise site_kind`, one row each.
+pub(crate) fn premise_receipts_tsv(receipts: &[PremiseReceipt]) -> String {
+    let mut rows = receipts
+        .iter()
+        .map(|receipt| {
+            format!(
+                "{}\t{}\t{}\tpremise={}\t{}\n",
+                receipt.owner, receipt.subject, receipt.site, receipt.premise, receipt.site_kind
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.dedup();
+    std::iter::once("owner\tsubject\tsite\tpremise\tsite_kind\n".to_owned())
+        .chain(rows)
+        .collect()
 }
 
 fn peel<'a>(mut expr: &'a Expr<'a>) -> &'a Expr<'a> {
@@ -829,7 +863,6 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
     }
     if !uses_are_closed(tcx, subject)
         || !quiet_window(tcx, subject, local)
-        || !dereferenced_on_every_non_null_path(tcx, subject, local)
         || !no_other_pointer_live_across(tcx, subject, local, *pointee)
     {
         return None;
@@ -838,6 +871,9 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
         initializer: initializer.span,
         pointee: declaration::pointee_source(tcx, *pointee),
         callee,
+        // R801-2: (b) no longer refuses; it decides the receipt.
+        premise: (!dereferenced_on_every_non_null_path(tcx, subject, local))
+            .then_some("bridge-dereferenceable"),
     })
 }
 
@@ -890,6 +926,19 @@ pub(super) fn complete(tcx: TyCtxt<'_>, table: &super::DecisionTable, plan: &mut
         }
         let owner_class = SignatureClassId::of(subject.fn_did);
         let _ = (mutable, value.callee);
+        if let Some(premise) = value.premise {
+            plan.premise_receipts.push(PremiseReceipt {
+                owner: tcx.def_path_str(subject.fn_did.to_def_id()),
+                subject: subject.label.clone(),
+                site: format!(
+                    "{}..{}",
+                    subject.binding_span.lo().0,
+                    subject.binding_span.hi().0
+                ),
+                premise,
+                site_kind: "declaration-view",
+            });
+        }
         plan.explicit_declarations
             .push(seam::ExplicitDeclarationSite {
                 owner_class,

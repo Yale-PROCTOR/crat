@@ -9617,7 +9617,9 @@ fn finish_decide<'tcx>(
             contract_candidate_declines: contract_extent_candidates
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
-            premise_receipts: String::new(),
+            premise_receipts: decision::call_result_option::premise_receipts_tsv(
+                &table.seams.premise_receipts,
+            ),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
             sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),

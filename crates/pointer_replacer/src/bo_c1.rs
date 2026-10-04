@@ -12733,6 +12733,9 @@ mod run {
             // W4-LIFT (R475-2): one row per caller lifted by an exact licensed
             // width, so the census counts what the table already carried.
             ("licensed-lifts", artifact.licensed_lifts.as_str()),
+            // R801-2 (USER: P7 extended): one row per site that rides a stated
+            // premise, so the census counts them per program.
+            ("premise-receipts", artifact.premise_receipts.as_str()),
             // W4-B1 (R480-2, relay 056 STOP 2): the root-extent rows, whose
             // HELD count is the seat's Decision A input.
             ("root-extent", artifact.root_extents.as_str()),
