@@ -36,6 +36,9 @@ pub(crate) struct BoxMirDrop {
     pub(crate) line: usize,
     pub(crate) cleanup: bool,
     pub(crate) optional: bool,
+    /// **R802-3 (Codex)** — the drop of an overwrite: its target block first
+    /// assigns the dropped place (`x = v` lowers to `drop(x)` then the store).
+    pub(crate) overwrite: bool,
 }
 
 /// One production authorization for a compiler-inserted Box drop.
@@ -81,7 +84,7 @@ fn collect_box_mir_drops(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     functions: Option<&std::collections::BTreeSet<String>>,
 ) -> Vec<BoxMirDrop> {
-    use rustc_middle::mir::{TerminatorKind, VarDebugInfoContents};
+    use rustc_middle::mir::{StatementKind, TerminatorKind, VarDebugInfoContents};
 
     let mut rows = Vec::new();
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
@@ -101,9 +104,21 @@ fn collect_box_mir_drops(
         }
         let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
         for (block, data) in body.basic_blocks.iter_enumerated() {
-            let TerminatorKind::Drop { place, .. } = &data.terminator().kind else {
+            let TerminatorKind::Drop { place, target, .. } = &data.terminator().kind else {
                 continue;
             };
+            let overwrite = body.basic_blocks[*target]
+                .statements
+                .iter()
+                .find(|statement| {
+                    !matches!(
+                        statement.kind,
+                        StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop
+                    )
+                })
+                .is_some_and(|statement| {
+                    matches!(&statement.kind, StatementKind::Assign(assign) if assign.0 == *place)
+                });
             let Some(optional) = box_container_kind(tcx, body.local_decls[place.local].ty) else {
                 continue;
             };
@@ -130,6 +145,7 @@ fn collect_box_mir_drops(
                 line: pos.line,
                 cleanup: body.basic_blocks[block].is_cleanup,
                 optional,
+                overwrite,
             });
         }
     }
@@ -203,12 +219,15 @@ pub(crate) fn reconcile_box_mir_drop_policies(
         let terminal_close =
             usize::from(policy.implicit_scope_close || (policy.optional && policy.retained_sink));
         let expected_normal = policy.overwrite_sites.len() + terminal_close;
-        // **R802-3** — the policy is an ALLOWANCE: every compiler-inserted
-        // normal-path drop must be authorized, and fewer is not an error. A
+        // **R802-3** — the policy is an ALLOWANCE, per kind: every
+        // compiler-inserted normal-path drop must be authorized by an
+        // allowance of its own kind (an overwrite's by an overwrite site, a
+        // scope exit's by the terminal close), and fewer is not an error. A
         // release at the C free site is `drop(x)`, which moves `x` into
         // `core::mem::drop` (a call), so no empty-`Option` shell is left to
         // drop; an owner moved out on every path leaves no close either.
-        if normal.len() > expected_normal {
+        let overwrites = normal.iter().filter(|drop| drop.overwrite).count();
+        if overwrites > policy.overwrite_sites.len() || normal.len() - overwrites > terminal_close {
             return Err(format!(
                 "unreceipted Box MIR Drop population: subject={} function={} name={} expected_normal={} got_normal={} overwrites={} terminal_close={}",
                 policy.subject,
@@ -220,8 +239,10 @@ pub(crate) fn reconcile_box_mir_drop_policies(
                 terminal_close,
             ));
         }
-        for (index, drop) in normal.iter().enumerate() {
-            let (reason, plan_site) = if let Some(site) = policy.overwrite_sites.get(index) {
+        let mut overwrite_sites = policy.overwrite_sites.iter();
+        for drop in &normal {
+            let (reason, plan_site) = if drop.overwrite {
+                let site = overwrite_sites.next().expect("counted above");
                 ("waiver-drop(overwrite)", site.clone())
             } else if policy.implicit_scope_close {
                 ("waiver-drop(scope-exit)", "function-exit".to_owned())

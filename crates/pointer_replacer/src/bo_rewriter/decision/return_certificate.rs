@@ -2803,6 +2803,8 @@ fn certify<'tcx, 's>(
         sinks.transfers
     };
     let mut owner_shape: Option<(BoxShape, bool)> = None;
+    // The keys of the certificate's own owner plans (not its receivers').
+    let mut owner_keys: Vec<(LocalDefId, HirId)> = Vec::new();
     let mut owner_plan_optional = false;
     let mut source_receipt = String::from("calls");
     let mut kind: Option<SlotKind> = None;
@@ -2825,6 +2827,7 @@ fn certify<'tcx, 's>(
         owner_plan_optional = plan.optional;
         owner_shape = Some((plan.shape, plan.optional));
         source_receipt = "owner-parameter".to_owned();
+        owner_keys.push(key);
         plans.push((key, plan));
     } else if let Some(subject) = owner_subject {
         let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
@@ -3341,6 +3344,7 @@ fn certify<'tcx, 's>(
         owner_plan_optional = plan.optional;
         owner_shape = Some((plan.shape, plan.optional));
         source_receipt = receipt;
+        owner_keys.push(key);
         plans.push((key, plan));
     }
     // 3. One shape across the sources.
@@ -3808,9 +3812,10 @@ fn certify<'tcx, 's>(
             super::emitability::EmitabilityFacts::site(tcx, *span)
         ));
         // **R802-3** — that close is a compiler-inserted `Drop` of the owner
-        // in the callee: its plan allows it, for the MIR reconciliation (D4).
+        // in the callee: the owner's own plan allows it, for the MIR
+        // reconciliation (D4); no other plan of the callee is widened.
         for (key, plan) in plans.iter_mut() {
-            if key.0 == callee {
+            if owner_keys.contains(key) {
                 plan.implicit_scope_close = true;
             }
         }
