@@ -7,9 +7,13 @@
 //!   through a pointer it keeps in memory (bzip2's state keeps `s->strm`;
 //!   libtree's small vector keeps `v->p` into its own buffer; brotli's decoder
 //!   keeps `h->symbol_lists` into its own header);
-//! - **overlapping argument pairs:** two reference formals of one call where the
-//!   caller passes a field of the one as the other (brotli's `s` and
-//!   `br = &(*s).br`).
+//! - **overlapping argument pairs:** two pointer formals of one call where one
+//!   lies inside the other's object and the call writes through one while the
+//!   other is a protected reference — both formals references (brotli's `s` and
+//!   `br = &(*s).br`), or the state a raw view and the field a reference
+//!   (`ReadHuffmanCode::table`, inside the state), or the state a reference and
+//!   the field a raw view (the `…Internal` callees' `s`: wave-6o's fixture (b),
+//!   relay 155, is undefined too).
 //!
 //! Each row carries its receipt detail: `observed:<run>` (a retained alias a
 //! run showed), `observed-pair:<run>` (a pair a run showed), or `fixture:<name>`
@@ -40,6 +44,13 @@ brotli\tDecodeWindowBits\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decom
 brotli\tDecodeMetaBlockLength\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
 brotli\tDecodeMetaBlockLength\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
 brotli\tBrotliDecoderDecompressStream\th#488\tobserved:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadHuffmanCode\ttable\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadCommand\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadCommand\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadCommandInternal\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadDistance\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadDistance\tbr\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
+brotli\tReadDistanceInternal\ts\tobserved-pair:pass-C-enum:brotli/encode.c-q6-decompress
 ";
 
 #[cfg(test)]
