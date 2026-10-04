@@ -67,6 +67,13 @@ pub(crate) fn observed_in<'t>(
     })
 }
 
+/// The table's key for a subject: a formal by its name, a local by
+/// `name#<MIR local>` as the census keys it (R808-5).
+pub(crate) fn table_key(name: &str, local: Option<u32>) -> String {
+    let _ = local;
+    name.to_owned()
+}
+
 /// The receipt detail (`observed:<run>`) for a listed formal.
 pub(crate) fn held(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {
     if !matches!(subject.kind, SubjectKind::Param { .. }) {
@@ -80,14 +87,14 @@ pub(crate) fn held(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TABLE, observed_in};
+    use super::{TABLE, observed_in, table_key};
 
     /// F1 — the fault: the list emptied holds nothing, so W1 / W2 catch it.
     #[test]
     fn w6o_r796_f1_an_emptied_list_holds_nothing() {
         assert_eq!(
             observed_in(TABLE, "bzip2", "handle_compress", "strm"),
-            Some("pass-D:bzip2/compress-1")
+            Some("observed:pass-D:bzip2/compress-1")
         );
         assert_eq!(observed_in("", "bzip2", "handle_compress", "strm"), None);
         assert_eq!(
@@ -96,17 +103,39 @@ mod tests {
         );
     }
 
-    /// The table holds exactly the eight formals: the six observed, and brotli's
-    /// decoder pair whose `s` reaches the state's own `symbol_lists` (R805-2).
+    /// The table: the six observed, brotli's `symbol_lists` pair (one observed,
+    /// one on the fixture), the two overlapping `s` / `br` argument pairs Miri
+    /// reported, and the local `h` that stores `symbol_lists` (R808-5): 13 rows.
     #[test]
-    fn w6o_r805_the_table_is_the_eight_formals() {
-        assert_eq!(TABLE.lines().count(), 8);
-        for function in ["ReadSymbolCodeLengths", "SafeReadSymbolCodeLengths"] {
-            assert!(
-                observed_in(TABLE, "brotli", function, "s").is_some(),
-                "{function}"
-            );
+    fn w6o_r808_the_table_is_the_thirteen_rows() {
+        assert_eq!(TABLE.lines().count(), 13);
+        for function in ["DecodeWindowBits", "DecodeMetaBlockLength"] {
+            for formal in ["s", "br"] {
+                let detail = observed_in(TABLE, "brotli", function, formal);
+                assert!(
+                    detail.is_some_and(|d| d.starts_with("observed-pair:")),
+                    "{function}::{formal}: {detail:?}"
+                );
+            }
         }
+        assert!(
+            observed_in(TABLE, "brotli", "ReadSymbolCodeLengths", "s")
+                .is_some_and(|d| d.starts_with("observed:"))
+        );
+        assert!(
+            observed_in(TABLE, "brotli", "SafeReadSymbolCodeLengths", "s")
+                .is_some_and(|d| d.starts_with("fixture:"))
+        );
+        assert!(observed_in(TABLE, "brotli", "BrotliDecoderDecompressStream", "h#488").is_some());
         assert_eq!(observed_in(TABLE, "brotli", "ReadHuffmanCode", "s"), None);
+        assert_eq!(observed_in(TABLE, "brotli", "ReadDistance", "br"), None);
+    }
+
+    /// A local is keyed `name#<MIR local>`, as the census keys it; a formal by
+    /// its name.
+    #[test]
+    fn w6o_r808_a_local_is_keyed_by_name_and_mir_local() {
+        assert_eq!(table_key("h", Some(488)), "h#488");
+        assert_eq!(table_key("strm", None), "strm");
     }
 }
