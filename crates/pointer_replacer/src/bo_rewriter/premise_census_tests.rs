@@ -370,3 +370,29 @@ fn r801_2_a_construction_over_a_string_literal_has_no_row() {
     assert!(reading.rows.is_empty(), "{reading:?}");
     assert_eq!(reading.exempt_literal, 1);
 }
+
+/// buffer `buffer_indexof::sub` / libtree `interpolate_variables::dollar` (162
+/// §1): the Option family's fat view, `p.as_ref().map(|p| from_raw_parts(p, n))`.
+#[test]
+fn r801_2_a_construction_mapped_over_an_option_view_is_read() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(data: *mut i8, s: *const i8) -> i64 {
+            let mut sub: *mut i8 = strstr(data, s);
+            if sub.is_null() { return -1; }
+            return sub.offset_from(data) as i64;
+        } }",
+        "pub mod m { pub unsafe fn f(data: *mut i8, s: *const i8) -> i64 {
+            let mut sub: Option<&[i8]> = {
+                let __crat_slice_ptr_4: *const _ = strstr(data, s);
+                __crat_slice_ptr_4.as_ref().map(|p| core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT))
+            };
+            if sub.is_none() { return -1; }
+            return sub.unwrap().as_ptr().offset_from(data) as i64;
+        } }",
+        &[],
+    );
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::DeclarationConstruction, "m::f", "sub")]
+    );
+}

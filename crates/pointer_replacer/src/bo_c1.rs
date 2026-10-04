@@ -26496,6 +26496,126 @@ fn r761_2_the_overcount_reads_passthrough_rows_only() {
     assert_eq!(raw_boundary_overcount_of(&serde_json::json!({})), 0);
 }
 
+/// **R792-4 (relay 267 item 2) — the leak-parity waiver's implicit closes, per
+/// program, from receipts alone.** Three receipt families carry addendum 101's
+/// `waiver-drop(<kind>)`: the emitted-MIR Box drop reconciliation
+/// (`<p>.raw-boundary-box-drops.tsv`, one row per drop of a Box local — the
+/// counters the separate Box census computed until now), the return-certificate
+/// receipts (one row per close, `detail` = `waiver-drop(<kind>) ..`) and the
+/// ACTIVE field transactions' `waiver-drop-<kind>=N` counters. Each kind is
+/// published per program, with the emitted panic strategy beside it: under
+/// `panic=abort` no unwind edge is emitted, which is the ground of a zero
+/// `unwind` count.
+fn raw_boundary_leak_parity_lines(ledger_dir: &std::path::Path) -> String {
+    let _ = ledger_dir;
+    String::new()
+}
+
+const IMPLICIT_CLOSE_KINDS: [&str; 3] = ["scope-exit", "overwrite", "unwind"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImplicitCloses {
+    box_drops: [usize; 3],
+    certificates: [usize; 3],
+    fields: [usize; 3],
+}
+
+impl ImplicitCloses {
+    fn of(&self, kind: usize) -> usize {
+        self.box_drops[kind] + self.certificates[kind] + self.fields[kind]
+    }
+
+    fn any(&self) -> bool {
+        (0..3).any(|kind| self.of(kind) > 0)
+    }
+
+    fn add(&mut self, other: &Self) {
+        for kind in 0..3 {
+            self.box_drops[kind] += other.box_drops[kind];
+            self.certificates[kind] += other.certificates[kind];
+            self.fields[kind] += other.fields[kind];
+        }
+    }
+
+    fn render(&self) -> String {
+        IMPLICIT_CLOSE_KINDS
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| format!("{kind}={}", self.of(index)))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// The closes of one program, from its three receipt tables (an absent table
+/// reads as empty).
+fn raw_boundary_implicit_closes(
+    box_drops: &str,
+    certificates: &str,
+    fields: &str,
+) -> ImplicitCloses {
+    let _ = (box_drops, certificates, fields);
+    ImplicitCloses::default()
+}
+
+/// R792-4: each family counts its own closes by kind; a withdrawn field
+/// transaction and a non-waiver Box drop (`retained-c-sink`) count nothing.
+#[test]
+fn r792_4_implicit_closes_are_counted_by_kind_from_receipts() {
+    let box_drops = "status=ok\ndata=provisional\nrows=4\n\
+        function\tlocal\tlocal_name\temitted_site\temitted_line\tcleanup\toptional\treceipt\tplan_site\n\
+        f\t1\tp\ts\t3\t0\t0\twaiver-drop(overwrite)\ta\n\
+        f\t1\tp\ts\t9\t0\t0\twaiver-drop(scope-exit)\tfunction-exit\n\
+        f\t1\tp\ts\t9\t1\t0\twaiver-drop(unwind)\tcompiler-cleanup-edge\n\
+        g\t2\tq\ts\t4\t0\t1\tretained-c-sink(empty-option-close)\tretained-c-sink\n";
+    let certificates = "program\tcallee\tkind\tdetail\n\
+        quadtree\tsplit_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=ne\n\
+        quadtree\tquadtree_new\tadmitted\twaiver-drop(scope-exit) site=lib.rs:1\n\
+        quadtree\tquadtree_new\tadmitted\tlend\n";
+    let fields = "program\tstruct\tfield\tbridges\trevert_status\n\
+        p\tS\ta\traw-move=1;waiver-drop-scope-exit=2;waiver-drop-overwrite=0\tactive\n\
+        p\tS\tb\twaiver-drop-scope-exit=5\twithdrawn\n";
+    let closes = raw_boundary_implicit_closes(box_drops, certificates, fields);
+    assert_eq!(
+        closes,
+        ImplicitCloses {
+            box_drops: [1, 1, 1],
+            certificates: [2, 0, 0],
+            fields: [2, 0, 0],
+        }
+    );
+    assert_eq!(closes.render(), "scope-exit=5/overwrite=1/unwind=1");
+    assert_eq!(
+        raw_boundary_implicit_closes("", "", ""),
+        ImplicitCloses::default()
+    );
+}
+
+/// R792-4: the census lines, per program and in total, with the panic strategy.
+#[test]
+fn r792_4_the_census_publishes_implicit_closes_per_program() {
+    let dir = std::env::temp_dir().join(format!("r792-4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(
+        dir.join("quadtree.return-certificate-receipts.tsv"),
+        "program\tcallee\tkind\tdetail\nquadtree\tsplit_node_\treceiver\twaiver-drop(scope-exit) exit-path receiver=ne\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("quadtree.raw-boundary-box-drops.tsv"),
+        "status=ok\ndata=provisional\nrows=0\nfunction\tlocal\tlocal_name\temitted_site\temitted_line\tcleanup\toptional\treceipt\tplan_site\n",
+    )
+    .expect("write");
+    let lines = raw_boundary_leak_parity_lines(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(lines.contains("implicit_close_scope_exit=1\n"), "{lines}");
+    assert!(lines.contains("implicit_close_unwind=0\n"));
+    assert!(
+        lines.contains("implicit_close_by_program=quadtree:scope-exit=1/overwrite=0/unwind=0\n")
+    );
+    assert!(lines.contains("implicit_close_panic_strategy=abort\n"));
+}
+
 /// **R801-2 (USER), main 163** — premise P7's receipt, read over the FINAL trees
 /// beside their inputs: one `<p>.raw-boundary-premise-bridge-dereferenceable.tsv`
 /// per program in the ledger directory and the counts in `census-receipt.txt`
