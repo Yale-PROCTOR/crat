@@ -611,22 +611,39 @@ pub(crate) fn hands_on_to_fat(
     fat: &FatFacts,
     policy: &crate::bo_rewriter::additive::FamilyPolicy,
 ) -> bool {
-    subject.ptr_depth == 1
-        && fat.is_array(subject.fn_did, subject.local)
-        && policy.enabled(
-            subject.fn_did,
-            crate::bo_rewriter::additive::FamilyStage::SliceUse,
-        )
-        && facts.call_args.iter().any(|(&callee, calls)| {
+    policy.enabled(
+        subject.fn_did,
+        crate::bo_rewriter::additive::FamilyStage::SliceUse,
+    ) && fat_hand_on(subject, facts, fat).is_some()
+}
+
+/// **R802-6 (main 166 §2).** The array formal a subject is handed BARE to —
+/// [`hands_on_to_fat`]'s fact without its family-stage condition, so the
+/// decision can tell "no fat stage here" apart from "no fat hand-on". The
+/// lowest `(callee, index)`, for a stable receipt.
+pub(crate) fn fat_hand_on(
+    subject: &Subject,
+    facts: &EmitabilityFacts,
+    fat: &FatFacts,
+) -> Option<(LocalDefId, usize)> {
+    if subject.ptr_depth != 1 || !fat.is_array(subject.fn_did, subject.local) {
+        return None;
+    }
+    facts
+        .call_args
+        .iter()
+        .flat_map(|(&callee, calls)| {
             calls
                 .iter()
                 .filter(|call| call.caller == subject.fn_did)
                 .flat_map(|call| &call.args)
-                .any(|arg| {
+                .filter(move |arg| {
                     matches!(arg.shape, ArgShape::BareLocal(argument) if argument == subject.hir_id)
                         && fat.is_array(callee, Local::from_usize(arg.index + 1))
                 })
+                .map(move |arg| (callee, arg.index))
         })
+        .min_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index))
 }
 
 /// **Does the accessing callee index this parameter under its OWN adjacent

@@ -3032,6 +3032,50 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             _ => Form::Slice,
         };
     }
+    // **R802-6 (main 166 §2) — the thin form is no fallback for a fat
+    // hand-on.** Where the slice stage is not available to this subject (a
+    // stage before it, or the exclusion re-derivation's withdrawal of it), the
+    // rule above cannot give the fat twin, and the predecessor profile's thin
+    // form is the one-element view the array formal reads past (bzip2's
+    // `mainSimpleSort::{block, quadrant}` restored to `from_ref(block)` into
+    // `mainGtU`). The subject is held raw under the local-callee extent hold,
+    // the same claim as its sibling below.
+    if counted.is_none()
+        && supplied.is_none()
+        && matches!(form, Form::Plain | Form::Opt { slice: false })
+        && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
+        && let Some((callee, index)) = slice_input::fat_hand_on(subject, facts, fat)
+    {
+        let formal = ctx
+            .subjects
+            .iter()
+            .find(|formal| formal.fn_did == callee && formal.local.as_usize() == index + 1);
+        let parameter = formal
+            .and_then(|formal| formal.param_name.clone())
+            .unwrap_or_else(|| "<unnamed>".to_owned());
+        let parameter_index = match formal.map(|formal| formal.kind) {
+            Some(SubjectKind::Param { hir_index }) => hir_index,
+            _ => index,
+        };
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::LocalCalleeAccessExtent {
+                access: Box::new(local_callee_extent::LocalCalleeAccess {
+                    callee_id: callee,
+                    parameter_index,
+                    callee: tcx.def_path_str(callee.to_def_id()),
+                    parameter,
+                    access: if subject.mutable { "write" } else { "read" },
+                    reason: local_callee_extent::AccessReason::PointerArithmetic {
+                        op: "array-formal-without-the-slice-stage".to_owned(),
+                    },
+                    footprint_bytes: None,
+                }),
+                count: None,
+            },
+        );
+    }
     if let Some(receiver) = return_receivers
         .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
     {
