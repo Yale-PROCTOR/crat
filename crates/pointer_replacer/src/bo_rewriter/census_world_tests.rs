@@ -178,3 +178,26 @@ fn r808_5_a_reader_inside_its_state_is_not_handed_beside_the_state_as_mut() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R808-5's control: the same proven overlap at a callee that only READS
+/// through both keeps its references (two shared references may overlap).
+#[test]
+fn r808_5_control_a_read_only_overlap_keeps_its_references() {
+    let input = include_str!("testdata/r808_decoder_reader_in_state.rs").replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn BrotliDecoderDecompressStream(",
+        "unsafe fn Peek(mut s: *const BrotliDecoderStateInternal, mut br: *const BrotliBitReader) -> u32 {\n    (*br).bit_pos_.wrapping_add((*s).state as u32)\n}\n#[no_mangle]\npub unsafe extern \"C\" fn BrotliDecoderPeek(mut s: *const BrotliDecoderStateInternal) -> u32 {\n    let mut br: *const BrotliBitReader = &(*s).br;\n    Peek(s, br)\n}\n#[no_mangle]\npub unsafe extern \"C\" fn BrotliDecoderDecompressStream(",
+    );
+    assert!(input.contains("fn Peek("), "the control edit applied");
+    match super::rewrite_m1_census_world(&input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains(
+                    "fn Peek(mut s: &BrotliDecoderStateInternal, mut br: &BrotliBitReader)"
+                ),
+                "a read-only overlap keeps both shared references:\n{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
