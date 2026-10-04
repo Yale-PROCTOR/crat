@@ -790,8 +790,47 @@ pub(crate) fn read_program(
 /// this reader's own view rows and held count give way, so nothing is counted
 /// twice. An empty or header-less table changes nothing.
 pub(crate) fn merge_lane_views(reading: &mut Reading, lane_tsv: &str) -> bool {
-    let _ = (reading, lane_tsv);
-    false
+    let mut lines = lane_tsv.lines();
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let column = |name: &str| header.split('\t').position(|column| column == name);
+    let (Some(function), Some(binding), Some(site), Some(rule_b), Some(quiet)) = (
+        column("function"),
+        column("binding"),
+        column("site"),
+        column("rule_b"),
+        column("quiet_prefix"),
+    ) else {
+        return false;
+    };
+    let rows = lines
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let get = |at: usize| fields.get(at).copied().unwrap_or("-").to_owned();
+            Row {
+                kind: SiteKind::DeclarationView,
+                function: get(function),
+                binding: get(binding),
+                ordinal: 0,
+                pointer: "-".to_owned(),
+                site: get(site),
+                rule_b: get(rule_b),
+                quiet_prefix: get(quiet) == "clears",
+            }
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return false;
+    }
+    reading
+        .rows
+        .retain(|row| row.kind != SiteKind::DeclarationView);
+    reading.held_b.remove(&SiteKind::DeclarationView);
+    reading.rows.extend(rows);
+    reading.lane_views = true;
+    true
 }
 
 /// The placed raw-to-reference adapters of a census `adapters` table.
@@ -905,6 +944,17 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
         }
     );
     out += &format!("premise_bridge_dereferenceable_call_bridge_formals={formals}\n");
+    out += &format!(
+        "premise_bridge_dereferenceable_view_source=lanes:{},reader:{}\n",
+        readings
+            .iter()
+            .filter(|(_, reading)| reading.as_ref().is_ok_and(|reading| reading.lane_views))
+            .count(),
+        readings
+            .iter()
+            .filter(|(_, reading)| reading.as_ref().is_ok_and(|reading| !reading.lane_views))
+            .count(),
+    );
     out += &format!("premise_bridge_dereferenceable_quiet_prefix_clears={clears}\n");
     out += &format!("premise_bridge_dereferenceable_held_b={held}\n");
     out += &format!(
