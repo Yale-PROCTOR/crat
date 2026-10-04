@@ -73,7 +73,8 @@ pub(crate) struct LentLocal {
 }
 
 /// **R805-3** — a LEND alias: `let mut p = root;`, the copy the model decides
-/// Ref beside its Owning root under the copy-lend arm. The owner renders it
+/// Ref beside its Owning root under the copy-lend arm, read only through it
+/// (`*p` as a value). The owner renders it
 /// as a shared reference reborrowed from the Box (`&(*root)[0]` /
 /// `&*(root)`), so no second raw copy of the allocation's address stays in
 /// the function.
@@ -1202,17 +1203,38 @@ pub(crate) fn derive<'tcx>(
     if all_uses != covered {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
-    // **R805-3** — each lend alias, as the model decided it (`p` Ref beside
-    // the owner, copy-lend validation): rendered a shared reference, so every
-    // use of `p` is then checked by the borrow checker against the owner (a
-    // write, a re-seat or an escape through it does not compile, and the
-    // class reverts).
+    // **R805-3** — each lend alias: every use is `*p` read as a value of the
+    // owner's element type. The borrow checker alone is not enough (Codex): a
+    // raw pointer derived from the reference (`p as *const T`) or an address
+    // comparison through it compiles and changes meaning. Anything else holds.
     let mut lend_aliases = Vec::new();
     for (alias, init) in lend_bindings {
         let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
         let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
             return Err(SourceHold::Identity);
         };
+        for &expression in &expressions.0 {
+            if !root_path(expression, alias) {
+                continue;
+            }
+            let Node::Expr(read) = tcx.parent_hir_node(expression.hir_id) else {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            };
+            let read_only = matches!(read.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                && typeck.expr_ty(read) == *element
+                && !matches!(
+                    tcx.parent_hir_node(read.hir_id),
+                    Node::Expr(Expr {
+                        kind: ExprKind::Assign(target, ..)
+                            | ExprKind::AssignOp(_, target, _)
+                            | ExprKind::AddrOf(_, _, target),
+                        ..
+                    }) if target.hir_id == read.hir_id
+                );
+            if !read_only {
+                return Err(SourceHold::UnsupportedOwnerUse);
+            }
+        }
         lend_aliases.push(LendAlias {
             hir_id: alias,
             spelling: ident.name.to_string(),

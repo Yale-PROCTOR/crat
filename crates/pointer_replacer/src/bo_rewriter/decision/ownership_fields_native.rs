@@ -1546,8 +1546,27 @@ fn derive_bundle(
         ));
     }
     // **R805-3** — a lend alias (`let mut p = root;`, read only through it):
-    // a shared reference reborrowed from the owner, declared `&T`.
+    // a shared reference reborrowed from the owner, declared `&T`. Only a copy
+    // the model decides Ref — the analysis's copy-lend validation — is lent.
     for alias in source.lend_aliases() {
+        let lent_ref = table
+            .entries
+            .iter()
+            .find(|(candidate, _)| {
+                candidate.fn_did == subject.fn_did && candidate.hir_id == alias.hir_id
+            })
+            .and_then(|(candidate, _)| {
+                inputs
+                    .slots
+                    .fn_local_slots
+                    .get(&candidate.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(candidate.local, 0))
+                    .map(|slot| SlotRef::Local(candidate.fn_did, slot))
+            })
+            .is_some_and(|slot| inputs.model.get(&slot) == Some(&SlotKind::Ref));
+        if !lent_ref {
+            return Err(NativeHold::Missing("native-lend-alias-not-ref"));
+        }
         edits.push(BoxExprEdit {
             span: alias.initializer_span,
             replacement: match source.shape() {
