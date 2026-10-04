@@ -1443,8 +1443,69 @@ pub(crate) const RESTORE_HOLD_OP: &str = "seam-one-element-into-wider-formal";
 pub(crate) fn restore_holds_to_release(
     entries: &[(Subject, Decision)],
 ) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
-    let _ = entries;
-    rustc_hash::FxHashSet::default()
+    // A formal the cursor family may still promote (its offsets may be
+    // negative) counts as fat: the hold stays where the view could render.
+    let fat = |decision: &Decision| match decision {
+        Decision::Slice { .. }
+        | Decision::Opt { slice: true, .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. } => true,
+        Decision::Degraded(record) => matches!(
+            record.reason,
+            DegradeReason::SliceNegOrUnknownOffset | DegradeReason::SliceCursorUse
+        ),
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Opt { slice: false, .. }
+        | Decision::Box(_) => false,
+    };
+    entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let Decision::Degraded(record) = decision else {
+                return None;
+            };
+            let DegradeReason::LocalCalleeAccessExtent { access, .. } = &record.reason else {
+                return None;
+            };
+            let local_callee_extent::AccessReason::PointerArithmetic { op } = &access.reason else {
+                return None;
+            };
+            if op != RESTORE_HOLD_OP {
+                return None;
+            }
+            let formal_is_fat = entries.iter().any(|(formal, decision)| {
+                formal.fn_did == access.callee_id
+                    && matches!(formal.kind, SubjectKind::Param { hir_index } if hir_index == access.parameter_index)
+                    && fat(decision)
+            });
+            (!formal_is_fat).then_some((subject.fn_did, subject.hir_id))
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The subjects [`restore_holds_to_release`] released in the running
+    /// [`decide_with_raw_fallbacks`]; the hold in `decide_one_ladder` skips
+    /// them. Empty outside that call.
+    static RESTORE_HOLD_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+}
+
+/// Clears [`RESTORE_HOLD_RELEASED`] when the decision pass begins and ends.
+struct RestoreHoldRelease;
+
+impl RestoreHoldRelease {
+    fn begin() -> Self {
+        RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+        Self
+    }
+}
+
+impl Drop for RestoreHoldRelease {
+    fn drop(&mut self) {
+        RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+    }
 }
 
 /// Emission-only fallback requests. The accepted model and its facts remain
@@ -1454,6 +1515,7 @@ pub(crate) fn decide_with_raw_fallbacks(
     subjects: &[Subject],
     fallbacks: &FxHashMap<(LocalDefId, rustc_hir::HirId), DegradeReason>,
 ) -> DecisionTable {
+    let _released = RestoreHoldRelease::begin();
     let mut entries = subjects
         .iter()
         .map(|subject| {
@@ -1468,6 +1530,25 @@ pub(crate) fn decide_with_raw_fallbacks(
             (subject.clone(), decision)
         })
         .collect::<Vec<_>>();
+    // **R802-6's restore hold, narrowed (relay 273 R807-1; main 170a).** A
+    // held subject whose callee formal is not delivered fat is decided again
+    // without the hold, to a fixpoint: a released formal is thin, so the
+    // subjects handed to it are released in turn. Each round releases at least
+    // one subject the hold held, so it ends.
+    loop {
+        let release = restore_holds_to_release(&entries);
+        if release.is_empty() {
+            break;
+        }
+        RESTORE_HOLD_RELEASED
+            .with(|released| released.borrow_mut().extend(release.iter().copied()));
+        for (subject, decision) in entries.iter_mut() {
+            let key = (subject.fn_did, subject.hir_id);
+            if release.contains(&key) && !fallbacks.contains_key(&key) {
+                *decision = decide_one(ctx, subject);
+            }
+        }
+    }
     option::inherit_wrapped_payloads(ctx, &mut entries);
     construction_values::settle(ctx, &mut entries);
     let cursor_receipts = cursor_native::promote(ctx, &mut entries);
@@ -3129,13 +3210,20 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // form is the one-element view the array formal reads past (bzip2's
     // `mainSimpleSort::{block, quadrant}` restored to `from_ref(block)` into
     // `mainGtU`). The subject is held raw under the local-callee extent hold,
-    // the same claim as its sibling below.
+    // the same claim as its sibling below. Narrowed (relay 273 R807-1; main
+    // 170a): only where the formal is delivered fat, so the view would render;
+    // `decide_with_raw_fallbacks` releases the others.
     if counted.is_none()
         && supplied.is_none()
         && matches!(form, Form::Plain | Form::Opt { slice: false })
         && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
         && let Some((callee, index)) = slice_input::fat_hand_on(subject, facts, fat)
         && !owned_elsewhere()
+        && !RESTORE_HOLD_RELEASED.with(|released| {
+            released
+                .borrow()
+                .contains(&(subject.fn_did, subject.hir_id))
+        })
     {
         let formal = ctx
             .subjects
@@ -3159,7 +3247,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                     parameter,
                     access: if subject.mutable { "write" } else { "read" },
                     reason: local_callee_extent::AccessReason::PointerArithmetic {
-                        op: "array-formal-without-the-slice-stage".to_owned(),
+                        op: RESTORE_HOLD_OP.to_owned(),
                     },
                     footprint_bytes: None,
                 }),

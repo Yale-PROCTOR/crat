@@ -648,10 +648,15 @@ fn r802_6_bzip2_blocksort_hands_no_one_element_view_to_main_gt_u() {
     let input = include_str!("testdata/r802_blocksort_reduced.rs");
     match super::rewrite_m1_census_world(input) {
         super::RewriteOutcome::Emitted { source, .. } => {
+            // The one-element SLICE view. Since the hold's narrowing (main
+            // 170a) `mainQSort3::quadrant` is released: its formal
+            // (`mainSimpleSort::quadrant`) is held raw, so it hands a thin
+            // reference into a raw formal, `core::ptr::from_ref(quadrant)`
+            // (g25's class, which R763-1 (b) does not hold).
             assert_eq!(
                 (
-                    source.matches("from_ref(block)").count(),
-                    source.matches("from_ref(quadrant)").count()
+                    source.matches("slice::from_ref(block)").count(),
+                    source.matches("slice::from_ref(quadrant)").count()
                 ),
                 (0, 0),
                 "{source}"
