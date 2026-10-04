@@ -1957,14 +1957,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let decision = decide_one_ladder(ctx, subject);
     // Wave-6o relay 146 (R796-1): the retained-alias stop-gap. A listed formal
     // the ladder would deliver (or leaves at the gate mode's
-    // `call-site-not-adapted`) is held raw; one the ladder already leaves raw
-    // keeps its own reason.
-    if !matches!(
-        &decision,
-        Decision::Degraded(Degradation { reason, .. })
-            if !matches!(reason, DegradeReason::CallSiteNotAdapted)
-    ) && let Some(detail) = retained_alias_observed::held(ctx.tcx, subject)
-    {
+    // `call-site-not-adapted`) is held raw. So is one the ladder leaves raw
+    // (R800-2, slicecursor 103): a pass that degrades it `ptr-comparison` or
+    // `opt-use-unsupported` is one the cursor family selects, so a formal that
+    // kept its own reason came back as a cursor (bzip2 `BZ2_bzDecompress::strm`).
+    if let Some(detail) = retained_alias_observed::held(ctx.tcx, subject) {
         return degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
