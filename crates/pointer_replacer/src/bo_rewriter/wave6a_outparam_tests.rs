@@ -231,3 +231,74 @@ fn w6a_r800_in_a_module_the_release_names_its_type_from_the_crate_root() {
     );
     assert_eq!(out.reverted, 0, "{context}");
 }
+
+/// The native table row of `caller`'s `ctx`.
+fn ctx_row(out: &super::wave6a_allocation_tests::Emitted, caller: &str) -> String {
+    out.artifacts
+        .ownership_native
+        .lines()
+        .find(|l| l.starts_with(&format!("{caller}::ctx#")))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// **Control (R800-4, Codex):** `p.x` through a user `Deref` wrapper reads
+/// through a call, not the local's own storage: the planet's owner is not
+/// selected. (It is held before the read is weighed — the call join meets the
+/// `deref` call — and a local `Box` is outside the analysis's input domain;
+/// the read's own guard is that the field base carries no adjustment.)
+#[test]
+fn w6a_r800_a_field_through_deref_is_not_selected() {
+    let source = HEMAN_NOISE_CALLERS
+        .replacen(
+            "let mut p = kmVec3 { x: 0., y: 0., z: 0. };",
+            "let mut p = Wrap(kmVec3 { x: 0., y: 0., z: 0. });",
+            1,
+        )
+        .replacen(
+            "sphere(u, v, freq, &mut p);",
+            "sphere(u, v, freq, &mut p.0);",
+            1,
+        )
+        + r#"
+pub static mut DEREFS: libc::c_int = 0;
+pub struct Wrap(pub kmVec3);
+impl ::core::ops::Deref for Wrap {
+    type Target = kmVec3;
+    fn deref(&self) -> &kmVec3 {
+        unsafe { DEREFS += 1; }
+        &self.0
+    }
+}
+"#;
+    assert_eq!(source.matches("Wrap(kmVec3").count(), 1);
+    let out = callers_at_the_frame("r800-field-through-deref", &source);
+    let row = ctx_row(&out, "heman_generate_planet_heightmap");
+    assert!(
+        row.contains("\theld\t") && !row.contains("\tselected\t"),
+        "{row}"
+    );
+}
+
+/// **Control (R800-4, Codex):** an index literal that does not survive its
+/// casts (`200 as i8` is `-56`, then a huge `usize`) is not inside the
+/// array's length however small the literal: island's owner holds.
+#[test]
+fn w6a_r800_an_index_that_changes_under_its_casts_is_not_a_pure_read() {
+    let source = HEMAN_NOISE_CALLERS
+        .replacen("#![allow(", "#![allow(unconditional_panic, ", 1)
+        .replacen(
+            "let mut freqs: [libc::c_float; 5] =",
+            "let mut big: [libc::c_double; 300] = [0.0f64; 300];\n    let mut freqs: [libc::c_float; 5] =",
+            1,
+        )
+        .replacen(
+            "(u * freqs[0 as libc::c_int as usize]) as libc::c_double",
+            "big[(200 as libc::c_int as i8) as usize]",
+            1,
+        );
+    assert_eq!(source.matches("big[(200").count(), 1);
+    let out = callers_at_the_frame("r800-index-under-casts", &source);
+    let row = ctx_row(&out, "heman_internal_generate_island_noise");
+    assert!(row.contains("\tSource::UnsupportedOwnerUse\t"), "{row}");
+}
