@@ -271,6 +271,64 @@ pub(crate) fn replan_delivered_table_elements(
     receipts
 }
 
+/// **R800-2 (relay 109).** The dispositions this family never plans a cursor
+/// over, by any path (`promote`, its boundary retry, nested's re-base through
+/// `wrapper::plan_with`): every `held:*` hold and the freed-slot veto. Each is
+/// a decision that the subject keeps its raw form because a reference form —
+/// a cursor's `&mut [T]` included — would claim what the hold denies. The match
+/// is exhaustive, so a new reason is a compile error here, not a silent `false`.
+pub(crate) fn hold_is_final(decision: &Decision) -> bool {
+    let reason = match decision {
+        Decision::Degraded(record) => &record.reason,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => return false,
+    };
+    match reason {
+        DegradeReason::AddressObservationOnly
+        | DegradeReason::IoDomainType
+        | DegradeReason::VoidPointee
+        | DegradeReason::ThinExtent
+        | DegradeReason::LocalCalleeAccessExtent { .. }
+        | DegradeReason::MaskedIndexRuntimeLength { .. }
+        | DegradeReason::RetainedAlias { .. }
+        | DegradeReason::FreedSlot => true,
+        DegradeReason::RevertedAfterVerifyFailure
+        | DegradeReason::SignatureClassHeld { .. }
+        | DegradeReason::KindRaw
+        | DegradeReason::PairRawView
+        | DegradeReason::KindOwning
+        | DegradeReason::BoxFailure { .. }
+        | DegradeReason::RawPointerOperation { .. }
+        | DegradeReason::CallSiteNotAdapted
+        | DegradeReason::PtrComparison
+        | DegradeReason::PendingSiblingOverlap
+        | DegradeReason::NoSlot
+        | DegradeReason::UnsupportedDeclShape { .. }
+        | DegradeReason::ReturnNotAdapted
+        | DegradeReason::PlaceReadPointee
+        | DegradeReason::CopySourceCoupled
+        | DegradeReason::SliceUseUnsupported
+        | DegradeReason::SliceCursorUse
+        | DegradeReason::CursorBaseModelRaw
+        | DegradeReason::CursorBaseUnavailable
+        | DegradeReason::NestedUseEdits
+        | DegradeReason::SliceNegOrUnknownOffset
+        | DegradeReason::SliceLocalConstruction
+        | DegradeReason::NullInit
+        | DegradeReason::OptUseUnsupported
+        | DegradeReason::OptLocalConstruction
+        | DegradeReason::OptNeedsMutBinding
+        | DegradeReason::AliasedStorageWithdrawn { .. }
+        | DegradeReason::SilentCoercion { .. }
+        | DegradeReason::ClassBlocked { .. } => false,
+    }
+}
+
 pub(crate) fn promote(
     ctx: &Ctx<'_, '_>,
     entries: &mut [(Subject, Decision)],
@@ -286,23 +344,12 @@ pub(crate) fn promote(
         .iter()
         .enumerate()
         .filter_map(|(index, (subject, decision))| {
-            // Wave-6o relay 146 (R796-1): a retained-alias hold is final; no cursor
-            // is planned over a formal the program also reaches through a pointer
-            // it keeps (the bzip2 probe: `BZ2_bzDecompress::strm` came back as a
-            // cursor after the stop-gap held it).
-            let held = match decision {
-                Decision::Degraded(record) => {
-                    matches!(record.reason, DegradeReason::RetainedAlias { .. })
-                }
-                Decision::Ref { .. }
-                | Decision::InferredRef { .. }
-                | Decision::Slice { .. }
-                | Decision::NestedSlice { .. }
-                | Decision::Opt { .. }
-                | Decision::Box(_)
-                | Decision::Cursor { .. } => false,
-            };
-            if held {
+            // Wave-6o relay 146 (R796-1), generalized at R800-2: a hold is final;
+            // no cursor is planned over a held subject (the bzip2 probe:
+            // `BZ2_bzDecompress::strm` came back as a cursor after the stop-gap
+            // held it). `wrapper::plan_with` asks the same question, so the
+            // nested re-base and the boundary retry cannot plan one either.
+            if hold_is_final(decision) {
                 return None;
             }
             if !ctx.family_policy.enabled_for(

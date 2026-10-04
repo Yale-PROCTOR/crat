@@ -2053,6 +2053,10 @@ pub(crate) fn plan_with<'a>(
     if prospective.is_some() && already_taken {
         return Some(build(ctx, subject, entries, prospective));
     }
+    // R800-2: a held subject is never planned, through any caller of this door.
+    if super::hold_is_final(decision) {
+        return None;
+    }
     if (!selected(ctx, subject, decision)
         && !derives_cursor(ctx, subject, decision, entries)
         && !derived_from_cursor_root(ctx, subject, decision, entries)
