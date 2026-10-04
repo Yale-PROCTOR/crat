@@ -545,11 +545,22 @@ fn w6a_r802_a_second_assignment_is_not_a_reseat_over_none() {
 fn w6a_r802_an_assignment_in_a_loop_is_not_a_reseat_over_none() {
     let source = format!(
         "{ITEM}{}",
-        r#"pub unsafe extern "C" fn fill_all(mut s: *mut slot, mut n: i32) {
+        r#"pub unsafe extern "C" fn item_maybe(mut id: i32) -> *mut item {
+    let mut it = malloc(::std::mem::size_of::<item>()) as *mut item;
+    if it.is_null() {
+        return 0 as *mut item;
+    }
+    if id < 0 as i32 {
+        return 0 as *mut item;
+    }
+    (*it).id = id;
+    return it;
+}
+pub unsafe extern "C" fn fill_all(mut s: *mut slot, mut n: i32) {
     let mut it = 0 as *mut item;
     let mut i = 0 as i32;
     while i < n {
-        it = item_new(i);
+        it = item_maybe(i);
         i += 1;
         if it.is_null() {
             continue;
@@ -561,5 +572,9 @@ fn w6a_r802_an_assignment_in_a_loop_is_not_a_reseat_over_none() {
     );
     let policy =
         policy_of(&source, "fill_all", "it").expect("fill_all::it is a certified receiver");
+    assert!(
+        policy.optional,
+        "the assignment re-seats an Option: {policy:?}"
+    );
     assert_eq!(policy.reseats, 0, "{policy:?}");
 }
