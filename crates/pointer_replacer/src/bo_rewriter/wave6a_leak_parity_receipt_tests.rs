@@ -475,3 +475,91 @@ fn w6a_r802_an_assignment_receivers_reseat_drop_is_allowed_and_not_a_waiver() {
     );
     assert!(twice.is_err(), "one assignment, one re-seat: {twice:?}");
 }
+
+/// The D4 policy of `function::name` in `source`, from the decision table.
+fn policy_of(source: &str, function: &str, name: &str) -> Option<super::verify::BoxMirDropPolicy> {
+    let _frame = super::test_model_override::frame_lock();
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        super::box_mir_drop_policies(tcx, &table, &[])
+            .into_iter()
+            .find(|p| p.function == function && p.local_name.as_deref() == Some(name))
+    })
+    .unwrap()
+}
+
+/// **R802-3 control (Codex, round 3):** a second assignment re-seats over a
+/// LIVE generation (`it = item_new(1); it = item_new(2);` leaks the first in
+/// C, and Rust drops it): only the overwrite of the declared `None` is a
+/// re-seat that releases nothing.
+#[test]
+fn w6a_r802_a_second_assignment_is_not_a_reseat_over_none() {
+    let source = format!(
+        "{ITEM}{}",
+        r#"pub unsafe extern "C" fn twice(mut s: *mut slot) {
+    let mut it = 0 as *mut item;
+    it = item_new(1 as i32);
+    if it.is_null() {
+        return;
+    }
+    it = item_new(2 as i32);
+    if it.is_null() {
+        return;
+    }
+    (*s).it = it;
+}
+"#
+    );
+    let policy = policy_of(&source, "twice", "it").expect("twice::it is a certified receiver");
+    assert_eq!(policy.reseats, 1, "{policy:?}");
+    // Both assignments keep an overwrite drop: the second, over a live
+    // generation, is not authorized — D4 reads `error`, it does not call it
+    // a no-op.
+    let drop = |line| super::verify::BoxMirDrop {
+        function: "twice".to_owned(),
+        local: 2,
+        local_name: Some("it".to_owned()),
+        file: "lib.rs".to_owned(),
+        site: format!("lib.rs:{line}:1: {line}:2"),
+        line,
+        cleanup: false,
+        optional: true,
+        overwrite: true,
+    };
+    let receipt =
+        super::verify::reconcile_box_mir_drop_policies(&[drop(3), drop(7)], &[policy.clone()]);
+    assert!(receipt.is_err(), "{receipt:?}");
+}
+
+/// **R802-3 control (Codex, round 3):** an assignment inside a loop the
+/// receiver is declared outside of re-seats over the previous iteration's
+/// generation: no re-seat is a no-op there.
+#[test]
+fn w6a_r802_an_assignment_in_a_loop_is_not_a_reseat_over_none() {
+    let source = format!(
+        "{ITEM}{}",
+        r#"pub unsafe extern "C" fn fill_all(mut s: *mut slot, mut n: i32) {
+    let mut it = 0 as *mut item;
+    let mut i = 0 as i32;
+    while i < n {
+        it = item_new(i);
+        i += 1;
+        if it.is_null() {
+            continue;
+        }
+        (*s).it = it;
+    }
+}
+"#
+    );
+    let policy =
+        policy_of(&source, "fill_all", "it").expect("fill_all::it is a certified receiver");
+    assert_eq!(policy.reseats, 0, "{policy:?}");
+}
