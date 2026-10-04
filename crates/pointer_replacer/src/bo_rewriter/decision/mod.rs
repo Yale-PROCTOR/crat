@@ -2630,6 +2630,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if (counted.is_some() || supplied.is_some()) && matches!(form, Form::Plain | Form::Slice) {
         form = Form::Slice;
     }
+    // **R758-1 (2) / R763-1 (a) — the thin-into-fat hand-on** (main 147 §2):
+    // a subject handed bare to an array formal is used as an array, so its
+    // thin form takes the fat twin. Not where the counted route owns it.
+    if counted.is_none()
+        && supplied.is_none()
+        && matches!(form, Form::Plain | Form::Opt { slice: false })
+        && slice_input::hands_on_to_fat(subject, facts, fat, family_policy)
+    {
+        form = match form {
+            Form::Opt { .. } => Form::Opt { slice: true },
+            _ => Form::Slice,
+        };
+    }
     if let Some(receiver) = return_receivers
         .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
     {
