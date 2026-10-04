@@ -9817,7 +9817,13 @@ fn finish_decide<'tcx>(
         if let Some(prior) = &predecessor {
             // No soundness withdrawal is registered by this mechanical repair.
             // A future registration must prove its exact prior mis-rendering.
-            let requests = additive::withdrawals(prior, &candidate, &family_policy, &[]);
+            let requests = additive::withdrawals_narrowed(
+                prior,
+                &candidate,
+                &family_policy,
+                &[],
+                &|owner, binding| subject_footprint(tcx, owner, binding),
+            );
             if !requests.is_empty() {
                 let old_count = family_policy.exclusions();
                 for request in &requests {
@@ -14173,6 +14179,50 @@ mod session_receipts_tests {
 /// element stays raw arithmetic over that view. Applied to the decision table
 /// itself, which both the planner and the AST pass read, so the two cannot
 /// disagree; idempotent across re-syntheses.
+/// **R798-3** — where a local binding's value comes from and where it is
+/// read: the `let` initializer and every path that resolves to it, in its
+/// owner's body. Empty for a binding the walk does not find (a parameter has
+/// no initializer, and its uses are still found).
+fn subject_footprint(
+    tcx: TyCtxt<'_>,
+    owner: rustc_hir::def_id::LocalDefId,
+    binding: rustc_hir::HirId,
+) -> Vec<rustc_span::Span> {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct Footprint {
+        binding: rustc_hir::HirId,
+        spans: Vec<rustc_span::Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for Footprint {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if local.pat.hir_id == self.binding
+                && let Some(init) = local.init
+            {
+                self.spans.push(init.span);
+            }
+            intravisit::walk_local(self, local);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = expr.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+            {
+                self.spans.push(expr.span);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(owner) else {
+        return Vec::new();
+    };
+    let mut footprint = Footprint {
+        binding,
+        spans: Vec::new(),
+    };
+    footprint.visit_body(body);
+    footprint.spans
+}
+
 fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
     let retirements = table.seams.box_base_view_retirements.clone();
     for decision::seam::BoxBaseViewRetirement {

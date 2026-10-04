@@ -327,6 +327,12 @@ enum Anchor {
     /// position (wave-6v's `seam-site-overlap`) names every position, and
     /// excluding one of them would leave a live view beside a raw access.
     Direct(Vec<super::bridge_receipt::BridgeSiteKey>),
+    /// **R798-3.** An unwitnessed `blocked-subject:<reason>` refusal, carrying
+    /// the class's subjects degraded for that reason that still require an
+    /// arm. The refusal names no site, and the class used to be the
+    /// participant whole; the blockers let the re-derivation retire only the
+    /// candidates whose own edits touch them.
+    Blocked(Vec<HirId>),
     /// A prior delivery of this owner is lost and the owner itself has no
     /// transaction left to withdraw: the cause is elsewhere in its interface
     /// component.
@@ -811,6 +817,20 @@ pub(crate) fn withdrawals(
     policy: &FamilyPolicy,
     soundness: &[SoundnessWithdrawal],
 ) -> Vec<FamilyWithdrawal> {
+    withdrawals_narrowed(prior, candidate, policy, soundness, &|_, _| Vec::new())
+}
+
+/// [`withdrawals`], with the source footprint of a subject (its initializer and
+/// its uses) for R798-3's narrowing of a blocked-subject refusal. A subject
+/// with no footprint is never shown independent of anything, so an empty
+/// footprint is exactly [`withdrawals`].
+pub(crate) fn withdrawals_narrowed(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+    footprint: &dyn Fn(LocalDefId, HirId) -> Vec<Span>,
+) -> Vec<FamilyWithdrawal> {
     if policy.stage == FamilyStage::Core {
         return Vec::new();
     }
@@ -922,6 +942,35 @@ pub(crate) fn withdrawals(
                     request(*anchor, cause.clone(), Vec::new(), Some(*anchor));
                 } else {
                     unresolved(*anchor, format!("interface-path-unresolved:{cause}"));
+                }
+            }
+            Anchor::Blocked(blockers) => {
+                // **R798-3 — one blocked subject withholds only what depends on
+                // it.** The class is still the participant (a refusal names no
+                // site), but a moved candidate none of whose edits touch a
+                // blocker is not what made the class newly held: heman's
+                // `transform_to_coordfield` held every owner because the views
+                // `z`/`w` of two of them could not pay the arm the owners' Box
+                // plans put on them. Where no candidate can be shown
+                // independent, or none dependent, the class yields whole, as
+                // before.
+                let own = moved(prior, candidate, policy, *anchor);
+                let dependent = own
+                    .iter()
+                    .copied()
+                    .filter(|hir| touches_a_blocker(candidate, *anchor, *hir, blockers, footprint))
+                    .collect::<Vec<_>>();
+                if !dependent.is_empty() && dependent.len() < own.len() {
+                    request(
+                        *anchor,
+                        scoped_cause(*anchor, &format!("{cause}:blocked-dependents")),
+                        dependent,
+                        Some(*anchor),
+                    );
+                } else if !own.is_empty() {
+                    request(*anchor, scoped_cause(*anchor, cause), own, Some(*anchor));
+                } else {
+                    request(*anchor, cause.clone(), Vec::new(), Some(*anchor));
                 }
             }
             Anchor::Restore => {
@@ -1045,6 +1094,83 @@ pub(crate) fn withdrawals(
             }),
     );
     out
+}
+
+/// **R798-3.** The subjects of `owner` degraded for `key` that still require
+/// an arm — the population `plan::finalize_signature_classes` spells
+/// `blocked-subject:<key>` (read before its two discharges, so a discharged
+/// subject is over-counted: that only widens what the narrowing retires).
+fn blocking_subjects(candidate: &StageSnapshot, owner: SignatureClassId, key: &str) -> Vec<HirId> {
+    candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, decided)| {
+            subject.fn_did == owner.local_def_id()
+                && matches!(decided, decision::Decision::Degraded(degradation)
+                    if degradation.reason.key() == key)
+                && candidate
+                    .table
+                    .arm_requirements
+                    .get(&(subject.fn_did, subject.hir_id))
+                    .is_some_and(|required| !required.is_empty())
+        })
+        .map(|(subject, _)| subject.hir_id)
+        .collect()
+}
+
+/// **R798-3 — the dependency test.** Whether the candidate `hir` of `owner`
+/// touches one of `blockers`: it IS one, or one of its edits overlaps a
+/// blocker's initializer or a use of it (heman's `zz` renders `z`'s
+/// initializer as its view and lends `z` at the call). Only a Box plan's edits
+/// are read; any other candidate, and a blocker with no footprint, count as
+/// touching, so the test fails closed to the class-wide withdrawal.
+fn touches_a_blocker(
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+    hir: HirId,
+    blockers: &[HirId],
+    footprint: &dyn Fn(LocalDefId, HirId) -> Vec<Span>,
+) -> bool {
+    if blockers.contains(&hir) {
+        return true;
+    }
+    let Some((_, decided)) = candidate
+        .table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == owner.local_def_id() && subject.hir_id == hir)
+    else {
+        return true;
+    };
+    // Exhaustive by the import-denylist rule.
+    let plan = match decided {
+        decision::Decision::Box(plan) => plan,
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::Degraded(_) => return true,
+    };
+    let mut footprints = Vec::new();
+    for blocker in blockers {
+        let spans = footprint(owner.local_def_id(), *blocker);
+        if spans.is_empty() {
+            return true;
+        }
+        footprints.extend(spans);
+    }
+    let overlaps = |edit: Span| {
+        let edit = edit.source_callsite();
+        footprints.iter().any(|span| {
+            let span = span.source_callsite();
+            edit.lo() <= span.hi() && span.lo() <= edit.hi()
+        })
+    };
+    plan.expr_edits.iter().any(|edit| overlaps(edit.span))
+        || plan.delete_statements.iter().any(|span| overlaps(*span))
 }
 
 /// The R220 generator, unchanged in what it observes: which owners carry a new
@@ -1201,10 +1327,18 @@ fn anchors(
         });
         if let Some(reason) = new_refusal {
             root_seen = true;
+            let blockers = reason
+                .strip_prefix("blocked-subject:")
+                .map(|key| blocking_subjects(candidate, *owner, key))
+                .unwrap_or_default();
             requested.entry(*owner).or_insert_with(|| {
                 (
                     format!("unwitnessed-family-refusal:{reason}"),
-                    Anchor::Direct(Vec::new()),
+                    if blockers.is_empty() {
+                        Anchor::Direct(Vec::new())
+                    } else {
+                        Anchor::Blocked(blockers)
+                    },
                 )
             });
         }
