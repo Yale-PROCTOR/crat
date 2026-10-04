@@ -36,6 +36,16 @@ fn variant(name: &str) -> String {
             "        (4 as size_t)\n            .wrapping_mul(::core::mem::size_of::<::core::ffi::c_int>() as size_t),\n",
             "        ::core::mem::size_of::<::core::ffi::c_int>() as size_t,\n",
         ),
+        // `p` handed on to a local reader: a use that is not a read through it.
+        "argument" => edit(
+            "    let mut v = *p;\n",
+            "    let mut v = peek(p);\n",
+        )
+        .replacen(
+            "unsafe fn main_0()",
+            "unsafe extern \"C\" fn peek(mut q: *mut ::core::ffi::c_int) -> ::core::ffi::c_int {\n    return *q;\n}\nunsafe fn main_0()",
+            1,
+        ),
         // A write through `p`: not a shared lend.
         "write-through" => edit(
             "    let mut v = *p;\n",
@@ -149,11 +159,17 @@ fn w6a_r805_a_sized_owner_lends_by_reborrow() {
 
 /// **Controls (R805-3):** the shapes the model does not decide with the arm
 /// on — the assignment form, an owner tested against null, a lend still read
-/// after the release (the validation refuses it) — and a write through the
-/// copy (not a shared lend): none delivers the pair.
+/// after the release (the validation refuses it), a write through the copy,
+/// the copy handed on to a local reader: none delivers the pair.
 #[test]
 fn w6a_r805_what_the_model_does_not_decide_is_not_delivered() {
-    for name in ["assignment", "optional", "after-release", "write-through"] {
+    for name in [
+        "assignment",
+        "optional",
+        "after-release",
+        "write-through",
+        "argument",
+    ] {
         let (function, reverted, native) = emitted_with_copy_lend(name);
         let text = compact(&function);
         assert!(

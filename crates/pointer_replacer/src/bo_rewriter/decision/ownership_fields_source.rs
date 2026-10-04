@@ -72,10 +72,11 @@ pub(crate) struct LentLocal {
     pub(crate) is_view_alias: bool,
 }
 
-/// **R805-3** — a LEND alias: `let mut p = root;` whose every use is a read
-/// through it (`*p` as a value). The owner renders it as a shared reference
-/// reborrowed from the Box (`&(*root)[0]` / `&*(root)`), so no second raw
-/// copy of the allocation's address stays in the function.
+/// **R805-3** — a LEND alias: `let mut p = root;`, the copy the model decides
+/// Ref beside its Owning root under the copy-lend arm. The owner renders it
+/// as a shared reference reborrowed from the Box (`&(*root)[0]` /
+/// `&*(root)`), so no second raw copy of the allocation's address stays in
+/// the function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LendAlias {
     pub(crate) hir_id: HirId,
@@ -1002,8 +1003,7 @@ pub(crate) fn derive<'tcx>(
         }
     }
     // **R805-3** — lend aliases: `let mut p = root;`, a plain binding with
-    // no annotation, every use of which is checked below to be a read
-    // through it. The root use in the initializer is covered here.
+    // no annotation. The root use in the initializer is covered here.
     let mut lend_bindings: Vec<(HirId, &Expr<'_>)> = Vec::new();
     {
         struct Lets<'tcx>(Vec<&'tcx rustc_hir::LetStmt<'tcx>>);
@@ -1202,38 +1202,17 @@ pub(crate) fn derive<'tcx>(
     if all_uses != covered {
         return Err(SourceHold::UnsupportedOwnerUse);
     }
-    // **R805-3** — each lend alias: every use is `*p` read as a value of the
-    // owner's element type (no write through it, no address of it, no copy,
-    // no argument, no return), and it is never re-seated: the only shape the
-    // shared reborrow renders. Anything else holds.
+    // **R805-3** — each lend alias, as the model decided it (`p` Ref beside
+    // the owner, copy-lend validation): rendered a shared reference, so every
+    // use of `p` is then checked by the borrow checker against the owner (a
+    // write, a re-seat or an escape through it does not compile, and the
+    // class reverts).
     let mut lend_aliases = Vec::new();
     for (alias, init) in lend_bindings {
         let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
         let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
             return Err(SourceHold::Identity);
         };
-        for &expression in &expressions.0 {
-            if !root_path(expression, alias) {
-                continue;
-            }
-            let Node::Expr(read) = tcx.parent_hir_node(expression.hir_id) else {
-                return Err(SourceHold::UnsupportedOwnerUse);
-            };
-            let read_only = matches!(read.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
-                && typeck.expr_ty(read) == *element
-                && !matches!(
-                    tcx.parent_hir_node(read.hir_id),
-                    Node::Expr(Expr {
-                        kind: ExprKind::Assign(target, ..)
-                            | ExprKind::AssignOp(_, target, _)
-                            | ExprKind::AddrOf(_, _, target),
-                        ..
-                    }) if target.hir_id == read.hir_id
-                );
-            if !read_only {
-                return Err(SourceHold::UnsupportedOwnerUse);
-            }
-        }
         lend_aliases.push(LendAlias {
             hir_id: alias,
             spelling: ident.name.to_string(),
