@@ -92,9 +92,17 @@ mod tests {
         );
     }
 
-    /// The table holds exactly the six observed formals.
+    /// The table holds exactly the eight formals: the six observed, and brotli's
+    /// decoder pair whose `s` reaches the state's own `symbol_lists` (R805-2).
     #[test]
-    fn w6o_r796_the_table_is_the_six_observed_formals() {
-        assert_eq!(TABLE.lines().count(), 6);
+    fn w6o_r805_the_table_is_the_eight_formals() {
+        assert_eq!(TABLE.lines().count(), 8);
+        for function in ["ReadSymbolCodeLengths", "SafeReadSymbolCodeLengths"] {
+            assert!(
+                observed_in(TABLE, "brotli", function, "s").is_some(),
+                "{function}"
+            );
+        }
+        assert_eq!(observed_in(TABLE, "brotli", "ReadHuffmanCode", "s"), None);
     }
 }
