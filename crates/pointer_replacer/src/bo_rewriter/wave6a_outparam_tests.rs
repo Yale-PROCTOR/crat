@@ -58,5 +58,27 @@ fn w6a_r798_heman_out_parameter_at_the_frame_is_the_callers_box() {
         ),
         "{context}"
     );
+    // The call borrows the slot's own storage for the callee's reference
+    // formal; a nonzero return nulls the slot through the raw view.
+    assert!(
+        text.contains("open_simplex_noise(seedasint64_t,&mut*::core::ptr::from_mut(&mutctx).cast::<*mutcrate::osn_context>());if__crat_rc!=0{*::core::ptr::from_mut(&mutctx).cast::<*mutcrate::osn_context>()=::core::ptr::null_mut();}"),
+        "{context}"
+    );
+    // The callee keeps the frame's form: a reference to a raw pointer.
+    assert!(
+        text.contains("pubunsafeextern\"C\"fnopen_simplex_noise(mutseed:int64_t,mutctx:&mut*mutosn_context)->libc::c_int{"),
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise2(ctx.as_deref().unwrap(),"),
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise_free((ctx.map_or(::core::ptr::null_mut(),::std::boxed::Box::into_raw)"),
+        "{context}"
+    );
     assert_eq!(out.reverted, 0, "{context}");
+    if let Ok(dir) = std::env::var("CRAT_W6A_EMIT_DIR") {
+        std::fs::write(format!("{dir}/r798-heman-noise-emitted.rs"), &out.source).unwrap();
+    }
 }
