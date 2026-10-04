@@ -141,6 +141,12 @@ pub(crate) enum BlockReason {
     ///
     /// A shared place ROOT is a *may*-overlap, and an UNKNOWN root is treated
     /// as one: blocking costs yield and never soundness.
+    /// **R808-5 / R810-2.** At a call, one argument is provably a place
+    /// inside another argument's referent (`br = &mut (*s).br` beside `s`) and
+    /// the callee writes through one of them: a protected reference on either
+    /// side beside the other (`&mut` or a raw view) is undefined under Tree
+    /// Borrows (wave-6o 112b). Both positions stay raw, as in the input.
+    ProvenOverlap,
     DuplicatePlaceRoot,
 }
 
@@ -161,6 +167,7 @@ impl BlockReason {
             BlockReason::EscapesViaForeignArg => "escapes-via-foreign-arg",
             BlockReason::EscapesViaFieldStore => "escapes-via-field-store",
             BlockReason::EscapesViaStaticStore => "escapes-via-static-store",
+            BlockReason::ProvenOverlap => "pair-proven-overlap",
             BlockReason::DuplicatePlaceRoot => "duplicate-place-root",
         }
     }
@@ -897,6 +904,13 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
         }
     }
 
+    // R808-5: whether a parameter position is written in its callee's extent.
+    let param_written: FxHashMap<NodeKey, bool> = subjects
+        .iter()
+        .filter(|subject| matches!(subject.kind, SubjectKind::Param { .. }))
+        .map(|subject| ((subject.fn_did, subject.hir_id), subject.mutable))
+        .collect();
+
     let mut dsu = Dsu::new(order.len());
     let mut pending_unions = Vec::new();
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
@@ -934,6 +948,82 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             continue;
         };
         block(&mut node_block, escape.subject, reason);
+    }
+
+    // ---- 1c. R808-5 / R810-2 — a proven overlap blocks both positions ----
+    //
+    // At a call, one argument is provably a place inside the referent of
+    // another argument's local (brotli's decoder: `br = &mut (*s).br` beside
+    // `s`). Neither side may keep a reference while the callee writes through
+    // one of them: both `&mut`, or the state `&mut` beside the reader as a raw
+    // view, is undefined under Tree Borrows (wave-6o 112b), and a callee that
+    // reborrows the whole state conflicts a protected reader too. The fact is a
+    // fact about the callee's two FORMALS, so it travels with them when the
+    // callee hands both on bare (`ReadDistance(s, br)` → `ReadDistanceInternal
+    // (safe, s, br)`). Every position counts, converting or not.
+    let param_index: FxHashMap<NodeKey, usize> = subjects
+        .iter()
+        .filter_map(|subject| match subject.kind {
+            SubjectKind::Param { hir_index } => Some(((subject.fn_did, subject.hir_id), hir_index)),
+            SubjectKind::Local => None,
+        })
+        .collect();
+    let bare = |shape: ArgShape| match shape {
+        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => Some(binding),
+        _ => None,
+    };
+    // (callee, inner position, outer position): the inner formal lies inside
+    // the outer formal's referent at some call.
+    let mut proven_overlap = std::collections::BTreeSet::<(u32, usize, usize)>::new();
+    let mut proven_callees = FxHashMap::<u32, LocalDefId>::default();
+    loop {
+        let mut grew = false;
+        for (callee, sites) in &facts.call_args {
+            for site in sites {
+                for outer in &site.args {
+                    let Some(outer_root) = bare(outer.shape) else { continue };
+                    for inner in &site.args {
+                        if inner.index == outer.index {
+                            continue;
+                        }
+                        let carried = bare(inner.shape).is_some_and(|inner_root| {
+                            match (
+                                param_index.get(&(site.caller, inner_root)),
+                                param_index.get(&(site.caller, outer_root)),
+                            ) {
+                                (Some(&i), Some(&o)) => proven_overlap.contains(&(
+                                    site.caller.local_def_index.as_u32(),
+                                    i,
+                                    o,
+                                )),
+                                _ => false,
+                            }
+                        });
+                        if inner.inside_of == Some(outer_root) || carried {
+                            let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
+                            proven_callees.insert(key.0, *callee);
+                            grew |= proven_overlap.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for &(callee, inner, outer) in &proven_overlap {
+        let callee = proven_callees[&callee];
+        let keys = [outer, inner].map(|index| param_key.get(&(callee, index)).copied());
+        if keys
+            .iter()
+            .flatten()
+            .any(|key| param_written.get(key).copied().unwrap_or(true))
+        {
+            for key in keys.into_iter().flatten() {
+                block(&mut node_block, key, BlockReason::ProvenOverlap);
+            }
+        }
     }
 
     // ---- 2. edges and argument admissibility, in ONE pass over call sites ----
@@ -2142,6 +2232,7 @@ mod a5_cast_role_tests {
                         element_of: None,
                         element_address: false,
                         deref_pointer: None,
+                        inside_of: None,
                     }],
                 }],
             );

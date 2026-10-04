@@ -287,6 +287,11 @@ pub(crate) struct Arg {
     /// **R674-9** — the argument is `&*P` / `&mut *P` with `P` a raw pointer:
     /// the span of `P`. See [`deref_pointer`].
     pub deref_pointer: Option<Span>,
+    /// **R808-5 / R810-2** — the argument is provably a place INSIDE the
+    /// referent of this local: `&mut (*X).f…` (or `&mut *X`), or a bare local
+    /// whose one definition is such an address (brotli's decoder,
+    /// `br = &mut (*s).br`). See [`inside_of`].
+    pub inside_of: Option<HirId>,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -324,6 +329,68 @@ pub(crate) fn deref_pointer(
         return None;
     };
     typeck.expr_ty(pointer).is_raw_ptr().then_some(pointer.span)
+}
+
+/// **R808-5 / R810-2 — a place inside another's referent, proven by syntax.**
+/// The local `X` whose referent the argument lies inside: the argument is an
+/// address of a place reached by dereferencing `X` (`&mut (*X).f`, `&mut *X`,
+/// through casts), or a bare local whose only definition is its `let`
+/// initializer and that initializer is such an address. `None` otherwise;
+/// nothing here says two pointers do NOT overlap.
+pub(crate) fn inside_of(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<HirId> {
+    fn address_root(expr: &Expr<'_>) -> Option<HirId> {
+        let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, mut place) = peel_casts(expr).kind
+        else {
+            return None;
+        };
+        loop {
+            place = match place.kind {
+                ExprKind::Field(base, _) | ExprKind::DropTemps(base) => base,
+                ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) => {
+                    let ExprKind::Path(QPath::Resolved(None, path)) = peel_casts(pointer).kind
+                    else {
+                        return None;
+                    };
+                    let Res::Local(root) = path.res else { return None };
+                    return Some(root);
+                }
+                _ => return None,
+            };
+        }
+    }
+    if let Some(root) = address_root(expr) {
+        return Some(root);
+    }
+    let ExprKind::Path(QPath::Resolved(None, path)) = peel_casts(expr).kind else {
+        return None;
+    };
+    let Res::Local(binding) = path.res else { return None };
+    let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(binding) else {
+        return None;
+    };
+    let root = address_root(local.init?)?;
+    // The one definition: no assignment to the binding anywhere in the body.
+    struct Assigned {
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for Assigned {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
+                && path.res == Res::Local(self.binding)
+            {
+                self.found = true;
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut assigned = Assigned {
+        binding,
+        found: false,
+    };
+    rustc_hir::intravisit::Visitor::visit_body(&mut assigned, tcx.hir_body_owned_by(owner));
+    (!assigned.found).then_some(root)
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -1515,6 +1582,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 .map(|(owner, _, _)| owner),
                                             element_address: element_address(arg),
                                             deref_pointer: deref_pointer(typeck, arg),
+                                            inside_of: inside_of(self.tcx, self.fn_did, arg),
                                         }
                                     })
                                     .collect(),
