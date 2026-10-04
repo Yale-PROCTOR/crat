@@ -82,3 +82,83 @@ fn w6a_r798_heman_out_parameter_at_the_frame_is_the_callers_box() {
         std::fs::write(format!("{dir}/r798-heman-noise-emitted.rs"), &out.source).unwrap();
     }
 }
+
+const HEMAN_NOISE_CALLERS: &str = include_str!("testdata/w6a-r800-heman-noise-callers.rs");
+
+/// **R800-4 item 1, the census's two holds, RED from the corpus callers.**
+/// The readers' formals are optional at the frame. `simplex_fbm` lends its
+/// Box to them (`Call::Lend::Formal` at 54′: no arm lends a Box owner to an
+/// optional reference formal); `island_noise` passes `freqs[0]` and
+/// `planet_heightmap` passes `p.x` as the readers' scalar arguments
+/// (`Source::UnsupportedOwnerUse`: a constant index into a local array and a
+/// local struct's scalar field were not side-effect-free reads).
+#[test]
+fn w6a_r800_heman_out_parameter_callers_deliver_at_the_frame() {
+    let marker = "r800-heman-noise-callers";
+    let out = {
+        let _frame = super::test_model_override::frame_lock();
+        let _serialise = super::decision::ownership_fields_native::field_form_override::LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        super::test_model_override::set(
+            marker,
+            vec![],
+            vec![
+                (
+                    "heman_generate_simplex_fbm::ctx".to_owned(),
+                    SlotKind::Owning,
+                ),
+                (
+                    "heman_internal_generate_island_noise::ctx".to_owned(),
+                    SlotKind::Owning,
+                ),
+                (
+                    "heman_generate_planet_heightmap::ctx".to_owned(),
+                    SlotKind::Owning,
+                ),
+                ("open_simplex_noise::ctx".to_owned(), SlotKind::Ref),
+                ("open_simplex_noise_free::ctx".to_owned(), SlotKind::Owning),
+            ],
+        );
+        let out = emitted(marker, &format!("// {marker}\n{HEMAN_NOISE_CALLERS}"));
+        super::test_model_override::clear();
+        out
+    };
+    let rows = out
+        .artifacts
+        .ownership_native
+        .lines()
+        .filter(|l| l.contains("::ctx#"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let context = format!("{rows}\n{:#?}\n{}", out.degradations, out.source);
+    for caller in [
+        "heman_generate_simplex_fbm",
+        "heman_internal_generate_island_noise",
+        "heman_generate_planet_heightmap",
+    ] {
+        let row = rows
+            .lines()
+            .find(|l| l.starts_with(&format!("{caller}::ctx#")))
+            .unwrap_or_default();
+        assert!(row.contains("\tselected\t"), "{caller}: {context}");
+    }
+    let text = compact(&out.source);
+    assert_eq!(
+        text.matches(
+            "letmutctx:::std::option::Option<::std::boxed::Box<crate::osn_context>>=None;"
+        )
+        .count(),
+        3,
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise2(ctx.as_deref(),"),
+        "{context}"
+    );
+    assert!(
+        text.contains("open_simplex_noise3(ctx.as_deref(),"),
+        "{context}"
+    );
+    assert_eq!(out.reverted, 0, "{context}");
+}
