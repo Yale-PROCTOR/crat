@@ -275,6 +275,8 @@ mod callee_input_tests;
 #[cfg(test)]
 mod cast_of_local_bridge_tests;
 #[cfg(test)]
+mod census_world_tests;
+#[cfg(test)]
 mod contract_extent_integration_tests;
 #[cfg(test)]
 mod counted_void_tests;
@@ -1118,6 +1120,16 @@ pub(crate) fn two_captures_in_one_session(input: &str) -> Result<(bool, bool), S
     dead_code,
     reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
 )]
+/// **R805-7 (relay 272), main 167 remedy (a)** — [`rewrite_m1`] in the census's
+/// A5 world: the precise replay against the frozen benchmark graph, the world
+/// every census runs in. `rewrite_m1` runs the open world (no attestation),
+/// where an A5 shape's emission trips `unowned A5 proof-site receipt
+/// identities`; an emission witness of an A5 shape runs here instead.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_census_world(input: &str) -> RewriteOutcome {
+    rewrite_m1(input)
+}
+
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
     rewrite_core(
         ::utils::compilation::path_to_input(root),
