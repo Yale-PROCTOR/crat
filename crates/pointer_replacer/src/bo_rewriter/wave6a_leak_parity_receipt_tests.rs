@@ -394,3 +394,32 @@ fn w6a_r802_a_receiver_closed_at_two_exits_is_allowed_two_drops() {
         "a third drop of ne is unauthorized: {three:?}"
     );
 }
+
+/// **R802-3 control (Codex, round 2):** a conditionally moved owner is
+/// re-seated: drop elaboration guards the overwrite's drop with a flag, and
+/// the overwrite is still an overwrite — an overwrite allowance accepts it,
+/// a scope-exit allowance alone does not.
+#[test]
+fn w6a_r802_an_overwrite_after_a_conditional_move_is_an_overwrite() {
+    let source = "pub struct B { pub x: i32 }\n\
+                  pub unsafe fn f(c: bool) -> i32 {\n\
+                      let mut p: Box<B> = Box::new(B { x: 1 });\n\
+                      if c { drop(p); }\n\
+                      p = Box::new(B { x: 2 });\n\
+                      let v = p.x;\n\
+                      drop(p);\n\
+                      v\n\
+                  }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    let normal = drops.iter().filter(|d| !d.cleanup).count();
+    assert_eq!(normal, 1, "{drops:#?}");
+    let mut overwriting = policy("f", "p", false, true, false);
+    overwriting.overwrite_sites = vec!["<o1>".to_owned()];
+    let accepted = super::verify::reconcile_box_mir_drop_policies(&drops, &[overwriting]);
+    assert!(accepted.is_ok(), "{accepted:?}\n{drops:#?}");
+    let scope_only = super::verify::reconcile_box_mir_drop_policies(
+        &drops,
+        &[policy("f", "p", false, false, true)],
+    );
+    assert!(scope_only.is_err(), "{scope_only:?}");
+}
