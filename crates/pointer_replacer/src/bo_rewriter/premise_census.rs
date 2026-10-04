@@ -526,32 +526,43 @@ fn reference_from_raw(init: &Expr) -> Option<(SiteKind, String)> {
                 _ => None,
             }
         }
-        _ => {
-            struct Construction(Option<String>);
-            impl<'a> Visit<'a> for Construction {
-                fn visit_expr(&mut self, expr: &'a Expr) {
-                    if self.0.is_some() {
-                        return;
-                    }
-                    if let Expr::Call(call) = expr
-                        && let Expr::Path(path) = peel(&call.func)
-                        && path.path.segments.last().is_some_and(|segment| {
-                            segment.ident == "from_raw_parts"
-                                || segment.ident == "from_raw_parts_mut"
-                        })
-                    {
-                        self.0 = Some(call.args.first().map(tokens).unwrap_or_default());
-                        return;
-                    }
-                    syn::visit::visit_expr(self, expr);
-                }
-            }
-            let mut construction = Construction(None);
-            construction.visit_expr(init);
-            construction
-                .0
-                .map(|pointer| (SiteKind::DeclarationConstruction, pointer))
+        other => {
+            value_construction(other).map(|pointer| (SiteKind::DeclarationConstruction, pointer))
         }
+    }
+}
+
+/// A construction the declaration's VALUE is: the initializer itself, a block's
+/// tail, either arm of an `if`, or under `Some(..)` — never one inside a call's
+/// argument, which the call makes (`let key = HashBytes(from_raw_parts(..))`).
+fn value_construction(expr: &Expr) -> Option<String> {
+    let tail = |block: &Block| match block.stmts.last() {
+        Some(Stmt::Expr(expr, None)) => value_construction(expr),
+        _ => None,
+    };
+    match peel(expr) {
+        Expr::Call(call) => match peel(&call.func) {
+            Expr::Path(path)
+                if path.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "from_raw_parts" || segment.ident == "from_raw_parts_mut"
+                }) =>
+            {
+                Some(call.args.first().map(tokens).unwrap_or_default())
+            }
+            Expr::Path(path) if path.path.is_ident("Some") && call.args.len() == 1 => {
+                value_construction(&call.args[0])
+            }
+            _ => None,
+        },
+        Expr::Block(block) => tail(&block.block),
+        Expr::Unsafe(block) => tail(&block.block),
+        Expr::If(branch) => tail(&branch.then_branch).or_else(|| {
+            branch
+                .else_branch
+                .as_ref()
+                .and_then(|(_, otherwise)| value_construction(otherwise))
+        }),
+        _ => None,
     }
 }
 
@@ -650,6 +661,10 @@ pub(crate) fn read_program(
             };
             if wrapper && kind == SiteKind::DeclarationConstruction {
                 reading.exempt_exposure += 1;
+                continue;
+            }
+            if kind == SiteKind::DeclarationConstruction && pointer.starts_with("b\"") {
+                reading.exempt_literal += 1;
                 continue;
             }
             let declared = input_lets
@@ -814,6 +829,7 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
     let mut kinds = BTreeMap::<SiteKind, usize>::new();
     let mut held_kinds = BTreeMap::<SiteKind, usize>::new();
     let (mut total, mut clears, mut held, mut exempt, mut unread, mut formals) = (0, 0, 0, 0, 0, 0);
+    let mut literal = 0;
     let mut by_program = Vec::new();
     let mut unreadable = Vec::new();
     for (program, reading) in readings {
@@ -834,6 +850,7 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
             *held_kinds.entry(*kind).or_default() += count;
         }
         exempt += reading.exempt_exposure;
+        literal += reading.exempt_literal;
         unread += reading.unread;
         formals += reading.call_bridge_formals;
         if !reading.rows.is_empty() {
@@ -873,6 +890,7 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
             .join(",")
     );
     out += &format!("premise_bridge_dereferenceable_exempt_exposure={exempt}\n");
+    out += &format!("premise_bridge_dereferenceable_exempt_literal={literal}\n");
     out += &format!("premise_bridge_dereferenceable_unread={unread}\n");
     if !unreadable.is_empty() {
         out += &format!(
