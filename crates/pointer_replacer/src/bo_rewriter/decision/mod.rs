@@ -166,6 +166,8 @@ pub(crate) mod thin_counted_entropy;
 #[cfg(test)]
 pub(crate) mod thin_counted_tests;
 pub(crate) mod thin_extent;
+#[cfg(test)]
+mod thin_into_fat_tests;
 pub(crate) mod universe;
 pub(crate) mod void_pointee;
 pub(crate) mod void_region;
