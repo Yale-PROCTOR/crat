@@ -611,8 +611,10 @@ pub(crate) fn hands_on_to_fat(
     fat: &FatFacts,
     policy: &crate::bo_rewriter::additive::FamilyPolicy,
 ) -> bool {
-    policy.enabled(
-        subject.fn_did,
+    // The subject's own gate (R805-7): a subject-scoped withdrawal of the
+    // slice stage stops the rule exactly where the hold below takes over.
+    policy.enabled_for(
+        (subject.fn_did, subject.hir_id),
         crate::bo_rewriter::additive::FamilyStage::SliceUse,
     ) && fat_hand_on(subject, facts, fat).is_some()
 }
