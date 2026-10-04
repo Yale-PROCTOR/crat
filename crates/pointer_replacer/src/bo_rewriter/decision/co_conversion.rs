@@ -999,7 +999,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                                 _ => false,
                             }
                         });
-                        if inner.inside_of == Some(outer_root) || carried {
+                        if inner.inside_of.contains(&outer_root) || carried {
                             let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
                             proven_callees.insert(key.0, *callee);
                             grew |= proven_overlap.insert(key);
@@ -2232,7 +2232,7 @@ mod a5_cast_role_tests {
                         element_of: None,
                         element_address: false,
                         deref_pointer: None,
-                        inside_of: None,
+                        inside_of: Vec::new(),
                     }],
                 }],
             );
