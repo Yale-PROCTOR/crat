@@ -13,7 +13,9 @@
 //!
 //! Receipt `held:retained-alias`, detail `observed:<run>`; rows are
 //! `side-condition` in the audit. A formal joins the table only with the run
-//! that showed it.
+//! that showed it, or (R805-2) with a Miri fixture of the record's own emitted
+//! signature when the corpus run cannot reach the call: brotli's decoder pair,
+//! whose `s` reaches the state's own `symbol_lists` (era-5c 132 §3).
 use rustc_middle::ty::TyCtxt;
 
 use super::{Subject, SubjectKind};
@@ -26,6 +28,8 @@ bzip2\tBZ2_bzDecompress\tstrm\tpass-D:bzip2/decompress-1
 libtree\tsmall_vec_u64_init\tv\tpass-D:libtree/bin-ls
 libtree\tsmall_vec_u64_append\tv\tpass-D:libtree/bin-ls
 libtree\tapply_exclude_list\tneeded_buf_offsets\thold-validation-H2:libtree/bin-ls
+brotli\tReadSymbolCodeLengths\ts\tfixture:era5c-132-miri-symlists
+brotli\tSafeReadSymbolCodeLengths\ts\tfixture:era5c-132-miri-symlists
 ";
 
 #[cfg(test)]
