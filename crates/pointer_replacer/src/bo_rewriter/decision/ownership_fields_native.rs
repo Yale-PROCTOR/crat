@@ -62,11 +62,12 @@ pub(crate) struct Candidates {
     /// Owners whose bundle was re-derived at the ownership stage after a
     /// callee's interface class was restored beneath the return-stage proof.
     refreshed: FxHashSet<Node>,
-    /// **R800-4** — how many times each owner's bundle was re-derived. A
-    /// bundle is re-derived again only when a formal it was proved against
-    /// changed form since (each formal changes form at most once per stage),
-    /// so the count stays within `1 + proofs`; past it nothing is refreshed and
-    /// the owner is invalidated as before, so a loop is a count, never a hang.
+    /// **R800-4** — how many times each owner's bundle was re-derived after
+    /// its first refresh. A bundle is re-derived again only when a formal it
+    /// was proved against changed form since (each formal changes form at
+    /// most once per stage), so the count stays within its proofs; past it
+    /// nothing is refreshed and the owner is invalidated as before, so a loop
+    /// is a count, never a hang.
     refresh_counts: FxHashMap<Node, usize>,
     /// Owners that reached that bound (`native-refresh-bound`).
     refresh_bound: FxHashSet<Node>,
@@ -431,9 +432,13 @@ impl Candidates {
                     || self.proof_went_stale(inputs, table, classes, node)
             })
             .collect();
+        let mut decertified_now = FxHashSet::default();
         for node in self.decertified_returns(table) {
-            if self.decertified.insert(node) && !stale.contains(&node) {
-                stale.push(node);
+            if self.decertified.insert(node) {
+                decertified_now.insert(node);
+                if !stale.contains(&node) {
+                    stale.push(node);
+                }
             }
         }
         for node in stale {
@@ -444,13 +449,18 @@ impl Candidates {
             else {
                 continue;
             };
-            let bound = 1 + self.bundles.get(&node).map_or(0, |b| b.formals.len());
-            let count = self.refresh_counts.entry(node).or_default();
-            if *count >= bound {
-                self.refresh_bound.insert(node);
-                continue;
+            // Only a RE-derivation is counted (Codex): a first refresh and a
+            // decertified return keep their own once-only bounds, and the
+            // decertified rebuild is mandatory.
+            if self.refreshed.contains(&node) && !decertified_now.contains(&node) {
+                let bound = self.bundles.get(&node).map_or(0, |b| b.formals.len());
+                let count = self.refresh_counts.entry(node).or_default();
+                if *count >= bound {
+                    self.refresh_bound.insert(node);
+                    continue;
+                }
+                *count += 1;
             }
-            *count += 1;
             let read = std::cell::RefCell::new(Vec::new());
             let bundle = source::derive(
                 inputs.program,

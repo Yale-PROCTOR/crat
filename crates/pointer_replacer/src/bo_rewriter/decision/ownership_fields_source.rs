@@ -628,6 +628,7 @@ fn pure<'tcx>(
                 if let ExprKind::Path(QPath::Resolved(_, path)) = base.kind
                     && matches!(path.res, Res::Local(_))
                     && matches!(typeck.expr_ty(base).kind(), TyKind::Adt(..))
+                    && typeck.expr_adjustments(base).is_empty()
                 {
                     return true;
                 }
@@ -690,17 +691,34 @@ fn pure<'tcx>(
                 let TyKind::Array(_, length) = typeck.expr_ty(base).kind() else {
                     return false;
                 };
+                // The literal must keep its value through every cast (Codex:
+                // `128u16 as i8 as usize` is a huge index): it fits its own
+                // type and each cast's target, as a nonnegative value.
+                let mut types = Vec::new();
                 let mut constant = index;
                 while let ExprKind::Cast(inner, _) = constant.kind {
+                    types.push(typeck.expr_ty(constant));
                     constant = inner;
                 }
+                types.push(typeck.expr_ty(constant));
                 let ExprKind::Lit(literal) = constant.kind else {
                     return false;
                 };
                 let rustc_ast::LitKind::Int(value, _) = literal.node else {
                     return false;
                 };
+                let pointer_bits = tcx.data_layout.pointer_size.bits();
+                let fits = |ty: Ty<'_>| {
+                    let (bits, signed) = match ty.kind() {
+                        TyKind::Uint(width) => (width.bit_width().unwrap_or(pointer_bits), false),
+                        TyKind::Int(width) => (width.bit_width().unwrap_or(pointer_bits), true),
+                        _ => return false,
+                    };
+                    let magnitude = if signed { bits - 1 } else { bits };
+                    magnitude >= 128 || value.get() < (1u128 << magnitude)
+                };
                 matches!(path.res, Res::Local(_))
+                    && types.into_iter().all(fits)
                     && length
                         .try_to_target_usize(tcx)
                         .is_some_and(|length| value.get() < u128::from(length))
