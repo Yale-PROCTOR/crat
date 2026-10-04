@@ -12789,6 +12789,9 @@ mod run {
                 "field-load-exemption-receipt",
                 artifact.field_load_exemption_receipts.as_str(),
             ),
+            // **R801-2 (main 165)** — the view families' P7 sites, read by P7's
+            // census reader as its `declaration-view` kind.
+            ("premise-view-sites", artifact.premise_view_sites.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(

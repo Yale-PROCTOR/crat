@@ -396,3 +396,36 @@ fn r801_2_a_construction_mapped_over_an_option_view_is_read() {
         vec![(SiteKind::DeclarationConstruction, "m::f", "sub")]
     );
 }
+
+/// wave-6o 106a (a): the view families' own table replaces this reader's view
+/// kind (rows and held count); an empty or header-less table changes nothing.
+#[test]
+fn r801_2_the_view_families_table_is_the_view_kind() {
+    let reading = || {
+        read(
+            "pub mod m { pub unsafe fn f(p: *mut i32) { let mut x: *mut i32 = p; log_it(); *x = 1; } }",
+            "pub mod m { pub unsafe fn f(p: *mut i32) { let mut x = p.as_mut().unwrap(); log_it(); *x = 1; } }",
+            &[],
+        )
+    };
+    let mut merged = reading();
+    let lane = "corpus\tprogram\tfunction\tbinding\tsite\trule_b\tquiet_prefix\n\
+        rs-crown\tlil\tsrc::lil::fnc_reflect\ttarget\tlib.rs:140:9: 140:40\tthe next item: if\tfails\n\
+        rs-crown\tlil\tsrc::lil::lil_get_var_or\tvar\tlib.rs:200:9: 200:30\tthe next item: x\tclears\n";
+    assert!(super::premise_census::merge_lane_views(&mut merged, lane));
+    assert!(merged.lane_views);
+    assert_eq!(
+        kinds(&merged),
+        vec![
+            (SiteKind::DeclarationView, "src::lil::fnc_reflect", "target"),
+            (SiteKind::DeclarationView, "src::lil::lil_get_var_or", "var")
+        ]
+    );
+    assert!(merged.rows[1].quiet_prefix);
+    let mut untouched = reading();
+    assert!(!super::premise_census::merge_lane_views(
+        &mut untouched,
+        "corpus\tprogram\t\n"
+    ));
+    assert_eq!(untouched, reading());
+}

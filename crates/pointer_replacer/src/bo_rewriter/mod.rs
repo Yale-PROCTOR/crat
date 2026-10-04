@@ -553,6 +553,11 @@ pub(crate) struct E2Timings {
     pub(crate) compiler_verification_wall_s: String,
 }
 
+/// The columns of [`RawBoundaryArtifacts::premise_view_sites`]: the function's
+/// path, the binding, the site's span, why (b) fails, and `clears` / `fails`
+/// under the dominance reading.
+pub(crate) const PREMISE_VIEW_SITES_HEADER: &str = "function\tbinding\tsite\trule_b\tquiet_prefix";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
     /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
@@ -603,6 +608,14 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **R538-7 / R541-6** — wave-6v's field-load alias exemption, one row per
     /// exempted site: `alias-exempt:field-load(<struct>.<field>-><pointee>)`.
     pub(crate) field_load_exemption_receipts: String,
+    /// **R801-2 (wave-6o 106a (a), main 165)** — premise P7's `declaration-view`
+    /// sites, pushed by the families that make a view of a raw pointer (the
+    /// Option family, wave-6l's A8-1 arm): a table with the header
+    /// [`PREMISE_VIEW_SITES_HEADER`], one row per TERMINAL site where (b) fails.
+    /// The census writes it as `<p>.raw-boundary-premise-view-sites.tsv`; P7's
+    /// census reader counts its rows as the view kind in place of its own view
+    /// reading. Empty: the reader's own view reading stands.
+    pub(crate) premise_view_sites: String,
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contract_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
@@ -9564,6 +9577,7 @@ fn finish_decide<'tcx>(
                 &table.seams.field_load_exemptions,
             ),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
+            premise_view_sites: String::new(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
             shared_pair_receipts: String::new(),

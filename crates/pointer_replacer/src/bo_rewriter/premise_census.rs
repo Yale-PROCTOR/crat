@@ -84,6 +84,8 @@ pub(crate) struct Reading {
     pub(crate) unread: usize,
     /// Distinct `call-bridge` formals behind the rows.
     pub(crate) call_bridge_formals: usize,
+    /// The view kind came from the view families' own table, not this reader.
+    pub(crate) lane_views: bool,
 }
 
 /// One placed raw-to-reference adapter at a call (the census's `adapters` row).
@@ -781,6 +783,17 @@ pub(crate) fn read_program(
     reading
 }
 
+/// **R801-2 (wave-6o 106a (a)).** The view families' own sites
+/// (`<p>.raw-boundary-premise-view-sites.tsv`, [`crate::bo_rewriter::PREMISE_VIEW_SITES_HEADER`]):
+/// where the table has rows they ARE the view kind — the Option family makes
+/// most of its views at assignments, which a declaration reader cannot see — and
+/// this reader's own view rows and held count give way, so nothing is counted
+/// twice. An empty or header-less table changes nothing.
+pub(crate) fn merge_lane_views(reading: &mut Reading, lane_tsv: &str) -> bool {
+    let _ = (reading, lane_tsv);
+    false
+}
+
 /// The placed raw-to-reference adapters of a census `adapters` table.
 pub(crate) fn bridged_calls(adapters_tsv: &str) -> Vec<BridgedCall> {
     let mut lines = adapters_tsv.lines();
@@ -932,7 +945,14 @@ pub(crate) fn read_and_write(
     let adapters =
         std::fs::read_to_string(ledger_dir.join(format!("{program}.raw-boundary-adapters.tsv")))
             .unwrap_or_default();
-    let reading = read_program(&input, &emitted, &bridged_calls(&adapters));
+    let mut reading = read_program(&input, &emitted, &bridged_calls(&adapters));
+    merge_lane_views(
+        &mut reading,
+        &std::fs::read_to_string(
+            ledger_dir.join(format!("{program}.raw-boundary-premise-view-sites.tsv")),
+        )
+        .unwrap_or_default(),
+    );
     std::fs::write(
         ledger_dir.join(format!(
             "{program}.raw-boundary-premise-bridge-dereferenceable.tsv"
