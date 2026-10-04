@@ -3807,6 +3807,13 @@ fn certify<'tcx, 's>(
             "waiver-drop(scope-exit) site={}",
             super::emitability::EmitabilityFacts::site(tcx, *span)
         ));
+        // **R802-3** — that close is a compiler-inserted `Drop` of the owner
+        // in the callee: its plan allows it, for the MIR reconciliation (D4).
+        for (key, plan) in plans.iter_mut() {
+            if key.0 == callee {
+                plan.implicit_scope_close = true;
+            }
+        }
     }
     certificate.receipts.push(format!(
         "return-certificate callee={callee_path} output={output_type} source={source_receipt} model={kind:?} null_returns={} receivers={} [{}] returned_receivers={} returning_callers={} store_sites={}",

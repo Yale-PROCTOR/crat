@@ -247,17 +247,23 @@ fn w6a_r802_a_certificate_owner_with_a_live_null_return_closes_at_scope_exit() {
             )),
         )
         .unwrap();
-        table.entries.iter().find_map(|(s, d)| match d {
-            Decision::Box(plan)
-                if s.param_name.as_deref() == Some("node")
-                    && tcx.item_name(s.fn_did.to_def_id()).as_str()
-                        == "quadtree_node_with_bounds" =>
-            {
-                Some((plan.implicit_scope_close, plan.retained_sink))
-            }
-            _ => None,
-        })
+        let close = |function: &str, name: &str| {
+            table.entries.iter().find_map(|(s, d)| match d {
+                Decision::Box(plan)
+                    if s.param_name.as_deref() == Some(name)
+                        && tcx.item_name(s.fn_did.to_def_id()).as_str() == function =>
+                {
+                    Some((plan.implicit_scope_close, plan.retained_sink))
+                }
+                _ => None,
+            })
+        };
+        (
+            close("quadtree_node_with_bounds", "node"),
+            // Control: an owner with no live null return closes nothing.
+            close("quadtree_point_new", "point"),
+        )
     })
     .unwrap();
-    assert_eq!(plan, Some((true, true)));
+    assert_eq!(plan, (Some((true, true)), Some((false, true))));
 }

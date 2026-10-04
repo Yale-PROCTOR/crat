@@ -203,7 +203,12 @@ pub(crate) fn reconcile_box_mir_drop_policies(
         let terminal_close =
             usize::from(policy.implicit_scope_close || (policy.optional && policy.retained_sink));
         let expected_normal = policy.overwrite_sites.len() + terminal_close;
-        if normal.len() != expected_normal {
+        // **R802-3** — the policy is an ALLOWANCE: every compiler-inserted
+        // normal-path drop must be authorized, and fewer is not an error. A
+        // release at the C free site is `drop(x)`, which moves `x` into
+        // `core::mem::drop` (a call), so no empty-`Option` shell is left to
+        // drop; an owner moved out on every path leaves no close either.
+        if normal.len() > expected_normal {
             return Err(format!(
                 "unreceipted Box MIR Drop population: subject={} function={} name={} expected_normal={} got_normal={} overwrites={} terminal_close={}",
                 policy.subject,
