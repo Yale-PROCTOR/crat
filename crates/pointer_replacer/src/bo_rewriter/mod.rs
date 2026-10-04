@@ -1127,7 +1127,19 @@ pub(crate) fn two_captures_in_one_session(input: &str) -> Result<(bool, bool), S
 /// identities`; an emission witness of an A5 shape runs here instead.
 #[cfg(test)]
 pub(crate) fn rewrite_m1_census_world(input: &str) -> RewriteOutcome {
-    rewrite_m1(input)
+    rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            A5Mode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    )
 }
 
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
