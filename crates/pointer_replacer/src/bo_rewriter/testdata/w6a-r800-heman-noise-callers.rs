@@ -1,7 +1,8 @@
 // wave-6a relay 145 (R800-4): heman's out-parameter at the frame, its three
 // caller shapes. The noise lines are relay 144's fixture
 // (w6a-r798-heman-noise.rs); the readers' formals are optional, as the final
-// frame decides them (here by a null test, there by the carried nullability);
+// frame decides them (here by a caller's null actual, there by the carried
+// nullability; a null test would be a foreign call on the formal);
 // `heman_internal_generate_island_noise` and `heman_generate_planet_heightmap`
 // are the derived corpus verbatim (rs-crown-derived/heman/lib.rs 6632-6712,
 // 6952-7012), `sphere` too (6938-6950); `heman_image_create`, `sin`, `cos`,
@@ -139,13 +140,11 @@ pub unsafe extern "C" fn open_simplex_noise_free(mut ctx:
 #[no_mangle]
 pub unsafe extern "C" fn open_simplex_noise2(mut ctx: *mut osn_context,
     mut x: libc::c_double, mut y: libc::c_double) -> libc::c_double {
-    if ctx.is_null() { return 0.0f64; }
     return *((*ctx).perm).offset(3 as libc::c_int as isize) as libc::c_double + x + y;
 }
 #[no_mangle]
 pub unsafe extern "C" fn open_simplex_noise3(mut ctx: *mut osn_context,
     mut x: libc::c_double, mut y: libc::c_double, mut z: libc::c_double) -> libc::c_double {
-    if ctx.is_null() { return 0.0f64; }
     return *((*ctx).permGradIndex3D).offset(3 as libc::c_int as isize) as libc::c_double + x + y + z;
 }
 #[no_mangle]
@@ -331,4 +330,10 @@ pub unsafe extern "C" fn heman_generate_planet_heightmap(mut width:
     }
     open_simplex_noise_free(ctx);
     return result;
+}
+// The readers' optional formals: a caller hands them C's null.
+#[no_mangle]
+pub unsafe extern "C" fn noise_of_nothing() -> libc::c_double {
+    return open_simplex_noise2(0 as *mut osn_context, 0.0f64, 0.0f64)
+        + open_simplex_noise3(0 as *mut osn_context, 0.0f64, 0.0f64, 0.0f64);
 }
