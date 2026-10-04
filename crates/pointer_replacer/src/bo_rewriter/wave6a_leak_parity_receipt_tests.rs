@@ -169,3 +169,95 @@ fn w6a_r792_a_negated_own_guard_closes_at_the_body_end() {
         out.source
     );
 }
+
+/// The D4 policy of an accepted Box subject, spelled for the reconciliation.
+fn policy(
+    function: &str,
+    name: &str,
+    optional: bool,
+    retained_sink: bool,
+    implicit_scope_close: bool,
+) -> super::verify::BoxMirDropPolicy {
+    super::verify::BoxMirDropPolicy {
+        subject: format!("{function}::{name}#1"),
+        function: function.to_owned(),
+        local_name: Some(name.to_owned()),
+        overwrite_sites: Vec::new(),
+        retained_sink,
+        optional,
+        implicit_scope_close,
+    }
+}
+
+/// **R802-3 (main 166 §3) — a release at the C free site leaves no `Drop`.**
+/// buffer's `buffer_free`, ht's `ht_destroy`, bst's `deleteNode`: the C free
+/// is `drop(x)` of the `Option<Box<T>>` formal, which MOVES it into
+/// `core::mem::drop` — a call, so the function's MIR has no `Drop` of `x`. The
+/// policy allowed the empty-`Option` shell `drop(x.take())` would leave; a
+/// moved `x` leaves none, and that is not an unauthorized drop.
+#[test]
+fn w6a_r802_a_release_by_drop_call_leaves_no_drop_terminator() {
+    let source = "pub struct B { pub x: i32 }\n\
+                  pub unsafe fn buffer_free(mut self_0: Option<Box<B>>) {\n\
+                      let _ = self_0.as_deref_mut().unwrap().x;\n\
+                      drop(self_0);\n\
+                  }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    assert!(drops.is_empty(), "{drops:#?}");
+    let receipt = super::verify::reconcile_box_mir_drop_policies(
+        &drops,
+        &[policy("buffer_free", "self_0", true, true, false)],
+    );
+    assert!(receipt.is_ok(), "{receipt:?}");
+}
+
+/// **Control:** a `Drop` the policy does not allow stays an error — the
+/// reconciliation still refuses every unauthorized compiler-inserted drop.
+#[test]
+fn w6a_r802_an_unauthorized_drop_is_still_an_error() {
+    let source = "pub struct B { pub x: i32 }\n\
+                  pub unsafe fn f(flag: bool) -> Option<Box<B>> {\n\
+                      let mut node: Box<B> = Box::new(B { x: 0 });\n\
+                      if flag { return None; }\n\
+                      return Some(node);\n\
+                  }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    assert_eq!(drops.iter().filter(|d| !d.cleanup).count(), 1, "{drops:#?}");
+    let receipt = super::verify::reconcile_box_mir_drop_policies(
+        &drops,
+        &[policy("f", "node", false, true, false)],
+    );
+    assert!(receipt.is_err(), "{receipt:?}");
+}
+
+/// **R802-3 — a certificate owner's live null return is its implicit
+/// close.** quadtree's `quadtree_node_with_bounds` returns `None` with `node`
+/// live (C leaks it; the callee row receipts `waiver-drop(scope-exit)`), so
+/// its plan allows that one `Drop`.
+#[test]
+fn w6a_r802_a_certificate_owner_with_a_live_null_return_closes_at_scope_exit() {
+    use super::decision::Decision;
+    let _frame = super::test_model_override::frame_lock();
+    let plan = ::utils::compilation::run_compiler_on_str(QUADTREE, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        table.entries.iter().find_map(|(s, d)| match d {
+            Decision::Box(plan)
+                if s.param_name.as_deref() == Some("node")
+                    && tcx.item_name(s.fn_did.to_def_id()).as_str()
+                        == "quadtree_node_with_bounds" =>
+            {
+                Some((plan.implicit_scope_close, plan.retained_sink))
+            }
+            _ => None,
+        })
+    })
+    .unwrap();
+    assert_eq!(plan, Some((true, true)));
+}
