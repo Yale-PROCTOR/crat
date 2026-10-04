@@ -5,7 +5,8 @@
 //! small vector (`small_vec_u64_init`, `small_vec_u64_append::v`,
 //! `apply_exclude_list::needed_buf_offsets`). It is not the rule (relay 140's
 //! R787-1); it holds what was observed, until the refined rule replaces it.
-//! The fixtures reuse the corpus names; their rows are the table's fixture rows.
+//! The fixtures carry the corpus names with an `obs_` prefix: the fixture table
+//! must match no other lane's fixture (libtree's `small_vec_u64_init` is CE-M06's).
 
 fn fixture(body: &str) -> String {
     format!(
@@ -24,28 +25,28 @@ pub struct EState {
     pub strm: *mut bz_stream,
     pub mode: i32,
 }
-unsafe fn copy_input_until_stop(mut s: *mut EState) {
+unsafe fn obs_copy_input_until_stop(mut s: *mut EState) {
     (*(*s).strm).avail_in = (*(*s).strm).avail_in.wrapping_sub(1);
     (*(*s).strm).total_in_lo32 = (*(*s).strm).total_in_lo32.wrapping_add(1);
 }
-unsafe fn handle_compress(mut strm: *mut bz_stream) -> u8 {
+unsafe fn obs_handle_compress(mut strm: *mut bz_stream) -> u8 {
     let mut s = (*strm).state;
-    copy_input_until_stop(s);
+    obs_copy_input_until_stop(s);
     (*strm).total_in_lo32 = (*strm).total_in_lo32.wrapping_add(0);
     1
 }
-pub unsafe fn BZ2_bzCompress(mut strm: *mut bz_stream, mut action: i32) -> i32 {
+pub unsafe fn obs_BZ2_bzCompress(mut strm: *mut bz_stream, mut action: i32) -> i32 {
     if strm.is_null() {
         return -2;
     }
-    handle_compress(strm) as i32
+    obs_handle_compress(strm) as i32
 }
 pub unsafe fn bump(mut c: *mut u32) {
     *c = (*c).wrapping_add(1);
 }
 pub unsafe fn caller(mut strm: *mut bz_stream, mut k: *mut u32) -> i32 {
     bump(k);
-    BZ2_bzCompress(strm, 0)
+    obs_BZ2_bzCompress(strm, 0)
 }
 "###;
 
@@ -57,18 +58,18 @@ pub struct small_vec_u64_t {
     pub p: *mut u64,
     pub n: usize,
 }
-unsafe fn small_vec_u64_init(mut v: *mut small_vec_u64_t) {
+unsafe fn obs_small_vec_u64_init(mut v: *mut small_vec_u64_t) {
     (*v).n = 0;
     (*v).p = ((*v).buf).as_mut_ptr();
 }
-unsafe fn small_vec_u64_append(mut v: *mut small_vec_u64_t, mut x: u64) {
+unsafe fn obs_small_vec_u64_append(mut v: *mut small_vec_u64_t, mut x: u64) {
     *(*v).p.offset((*v).n as isize) = x;
     (*v).n = (*v).n.wrapping_add(1);
 }
-pub unsafe fn use_vec() -> usize {
+pub unsafe fn obs_use_vec() -> usize {
     let mut v = small_vec_u64_t { buf: [0; 16], p: 0 as *mut u64, n: 0 };
-    small_vec_u64_init(&mut v);
-    small_vec_u64_append(&mut v, 1);
+    obs_small_vec_u64_init(&mut v);
+    obs_small_vec_u64_append(&mut v, 1);
     v.n
 }
 "###;
@@ -100,7 +101,7 @@ const HELD: &str = "held:retained-alias";
 /// W1 — bzip2: the stream formals of the observed functions are held.
 #[test]
 fn w6o_r796_w1_bzip2_observed_stream_formals_are_held() {
-    for f in ["handle_compress", "BZ2_bzCompress"] {
+    for f in ["obs_handle_compress", "obs_BZ2_bzCompress"] {
         let rows = reasons(BZIP2, f);
         assert_eq!(reason(&rows, "strm"), HELD, "{f}: {rows:?}");
     }
@@ -109,7 +110,7 @@ fn w6o_r796_w1_bzip2_observed_stream_formals_are_held() {
 /// W2 — libtree: the observed small-vector formals are held.
 #[test]
 fn w6o_r796_w2_libtree_observed_vector_formals_are_held() {
-    for f in ["small_vec_u64_init", "small_vec_u64_append"] {
+    for f in ["obs_small_vec_u64_init", "obs_small_vec_u64_append"] {
         let rows = reasons(LIBTREE, f);
         assert_eq!(reason(&rows, "v"), HELD, "{f}: {rows:?}");
     }

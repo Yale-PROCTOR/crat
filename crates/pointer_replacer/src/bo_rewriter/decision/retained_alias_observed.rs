@@ -30,10 +30,10 @@ libtree\tapply_exclude_list\tneeded_buf_offsets\thold-validation-H2:libtree/bin-
 
 #[cfg(test)]
 const FIXTURE_TABLE: &str = "\
--\thandle_compress\tstrm\tfixture-w1
--\tBZ2_bzCompress\tstrm\tfixture-w1
--\tsmall_vec_u64_init\tv\tfixture-w2
--\tsmall_vec_u64_append\tv\tfixture-w2
+-\tobs_handle_compress\tstrm\tfixture-w1
+-\tobs_BZ2_bzCompress\tstrm\tfixture-w1
+-\tobs_small_vec_u64_init\tv\tfixture-w2
+-\tobs_small_vec_u64_append\tv\tfixture-w2
 ";
 
 #[cfg(test)]

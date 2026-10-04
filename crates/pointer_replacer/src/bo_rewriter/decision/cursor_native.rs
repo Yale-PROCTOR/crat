@@ -286,6 +286,15 @@ pub(crate) fn promote(
         .iter()
         .enumerate()
         .filter_map(|(index, (subject, decision))| {
+            // Wave-6o relay 146 (R796-1): a retained-alias hold is final; no cursor
+            // is planned over a formal the program also reaches through a pointer
+            // it keeps (the bzip2 probe: `BZ2_bzDecompress::strm` came back as a
+            // cursor after the stop-gap held it).
+            if matches!(decision, Decision::Degraded(record)
+                if matches!(record.reason, DegradeReason::RetainedAlias { .. }))
+            {
+                return None;
+            }
             if !ctx.family_policy.enabled_for(
                 (subject.fn_did, subject.hir_id),
                 super::super::additive::FamilyStage::Return,
