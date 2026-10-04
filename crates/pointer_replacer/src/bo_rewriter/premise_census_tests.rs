@@ -282,3 +282,47 @@ fn r801_2_census_lines_count_by_kind_and_program() {
     assert!(lines.contains("premise_bridge_dereferenceable_by_program=p:1\n"));
     assert!(lines.contains("premise_bridge_dereferenceable_unreadable=q:missing\n"));
 }
+
+/// brotli `FindLongestMatchH2::buckets` (162 §1): the input declares the binding
+/// without a type (`let mut buckets = (*self_0).buckets_;`). The emitted
+/// construction is still a reference made from that raw pointer.
+#[test]
+fn r801_2_an_unannotated_input_declaration_is_read() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(self_0: *mut H, out: *mut R, key: usize) {
+            let mut buckets = (*self_0).buckets_;
+            let best = (*out).len;
+            *buckets.offset(key as isize) = best;
+        } }",
+        "pub mod m { pub unsafe fn f(self_0: &mut H, out: &mut R, key: usize) {
+            let mut buckets: &mut [u32] = core::slice::from_raw_parts_mut((*self_0).buckets_, crate::FALLBACK_SLICE_EXTENT);
+            let best = (*out).len;
+            buckets[key] = best;
+        } }",
+        &[],
+    );
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::DeclarationConstruction, "m::f", "buckets")]
+    );
+    assert!(reading.rows[0].quiet_prefix);
+    assert_eq!(reading.unread, 0);
+}
+
+/// tulip's `__crat_safe_ti_*`: `&mut *outputs[0]` reborrows an element of an
+/// already-safe slice; no reference is made from a raw pointer there (162 §0).
+#[test]
+fn r801_2_a_reborrow_of_an_already_safe_element_has_no_row() {
+    let reading = read(
+        "pub mod m { pub unsafe fn ti_x(outputs: *mut *mut f64) -> i32 {
+            let mut output: *mut f64 = *outputs.offset(0);
+            0
+        } }",
+        "pub mod m { pub unsafe fn ti_x(outputs: &mut [&mut [f64]]) -> i32 {
+            let mut output: &mut [f64] = &mut *outputs[0];
+            0
+        } }",
+        &[],
+    );
+    assert_eq!(reading, Reading::default());
+}
