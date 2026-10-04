@@ -4011,7 +4011,10 @@ fn receiver_plan(
         .copied()
         .collect();
     // **R792-4** — one receipt per exit that holds the owner: each is one
-    // implicit close (addendum 101), named by its site and its owner.
+    // implicit close (addendum 101), named by its site and its owner. The
+    // count is EXITS that hold an owner, not paths (R798-3): a `return` is its
+    // own exit; a `break` / `continue` leaving the owner's scope, and falling
+    // off it, close at the scope's end, one row however many paths reach it.
     let close_receipt = |exit: Span| {
         format!(
             "waiver-drop(scope-exit) site={} receiver={name}",
