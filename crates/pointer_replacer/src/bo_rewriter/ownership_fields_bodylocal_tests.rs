@@ -4160,7 +4160,8 @@ fn r641_a_heman_out_parameter_block_is_the_callers_box() {
         "{context}"
     );
     assert!(
-        text.contains("open_simplex_noise_free((ctx.map_or(::core::ptr::null_mut(),::std::boxed::Box::into_raw)as*mutosn_context));"),
+        // R800-4: the cast names its type from the crate root.
+        text.contains("open_simplex_noise_free((ctx.map_or(::core::ptr::null_mut(),::std::boxed::Box::into_raw)as*mutcrate::osn_context));"),
         "{context}"
     );
     // The callee is untouched: its signature and its failure path stay C's.

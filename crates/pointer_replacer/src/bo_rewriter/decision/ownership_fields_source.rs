@@ -1592,12 +1592,15 @@ pub(crate) fn derive<'tcx>(
                 call_span: expression.span,
                 scalar_arguments: scalar_arguments(tcx, expression, typeck)?,
                 deallocator_events,
-                raw_argument_type: typeck
-                    .expr_ty(match expression.kind {
+                // R800-4: rooted at `crate::` — the cast is written inside the
+                // caller's own module (heman's `src::src::noise`).
+                raw_argument_type: ::utils::ir::mir_ty_to_string(
+                    typeck.expr_ty(match expression.kind {
                         ExprKind::Call(_, args) => &args[argument],
                         _ => unreachable!(),
-                    })
-                    .to_string(),
+                    }),
+                    tcx,
+                ),
             });
         }
     }
