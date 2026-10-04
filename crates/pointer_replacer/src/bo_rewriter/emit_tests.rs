@@ -15290,9 +15290,12 @@ fn r645_4_a_byte_string_literal_takes_its_own_length() {
             .map(|l| l.split('\t').nth(4).unwrap_or("").to_owned())
             .collect::<Vec<_>>()
     };
+    // R707 (wave-4 build 1): `equal` reads `b[0]` and, behind `&&`, `b[1]`,
+    // so the field beside the literal takes the callee's own `may` bound —
+    // never the literal's length.
     assert_eq!(
         placed("equal", "caller"),
-        ["len-array-type", "len-fabricated"],
+        ["len-array-type", "len-callee-bound:may:2"],
         "the literal takes its length, the field beside it does not:\n{seams}"
     );
     assert_eq!(placed("strclone", "caller"), ["len-array-type"], "{seams}");
@@ -15307,13 +15310,22 @@ fn r645_4_a_byte_string_literal_takes_its_own_length() {
     );
     // Controls: bytes read as `u32` are not `N` elements, and a `[u32; 4]`
     // read as bytes is not 4. Their callees read under a branch, so R677-6's
-    // straight-line extent (tried before the fallback) proves nothing either,
-    // and each control still asks this arm alone.
-    assert_eq!(placed("words", "control"), ["len-fabricated"], "{seams}");
-    assert_eq!(placed("bytes", "control"), ["len-fabricated"], "{seams}");
+    // straight-line extent proves nothing; R707 (wave-4 build 1) gives each
+    // the callee's own `may` bound (`w[1]` → 2, `b[5]` → 6), never the
+    // literal's or the array's length.
+    assert_eq!(
+        placed("words", "control"),
+        ["len-callee-bound:may:2"],
+        "{seams}"
+    );
+    assert_eq!(
+        placed("bytes", "control"),
+        ["len-callee-bound:may:6"],
+        "{seams}"
+    );
     assert_eq!(
         flat.matches("FALLBACK_SLICE_EXTENT)").count(),
-        3,
-        "the controls keep the fallback:\n{emitted}"
+        0,
+        "the controls take their callees' own bounds:\n{emitted}"
     );
 }
