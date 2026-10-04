@@ -267,3 +267,80 @@ fn w6a_r802_a_certificate_owner_with_a_live_null_return_closes_at_scope_exit() {
     .unwrap();
     assert_eq!(plan, (Some((true, true)), Some((false, true))));
 }
+
+/// **R802-3 control (Codex):** an allowance authorizes only its own kind. A
+/// policy allowing two overwrite drops and no scope-exit close does not
+/// authorize a scope-exit drop — the count alone (1 ≤ 2) would.
+#[test]
+fn w6a_r802_an_overwrite_allowance_does_not_authorize_a_scope_exit_drop() {
+    let source = "pub struct B { pub x: i32 }\n\
+                  pub unsafe fn f(flag: bool) -> Option<Box<B>> {\n\
+                      let mut node: Box<B> = Box::new(B { x: 0 });\n\
+                      if flag { return None; }\n\
+                      return Some(node);\n\
+                  }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    let mut overwriting = policy("f", "node", false, false, false);
+    overwriting.overwrite_sites = vec!["<o1>".to_owned(), "<o2>".to_owned()];
+    let receipt = super::verify::reconcile_box_mir_drop_policies(&drops, &[overwriting]);
+    assert!(receipt.is_err(), "{receipt:?}");
+}
+
+/// **R802-3 control (Codex):** a live null return widens only the owner's
+/// own plan. A callee whose certificate has another Box plan of its own
+/// function — here the receiver of a recursive call — keeps that plan's
+/// allowance.
+#[test]
+fn w6a_r802_a_live_null_return_widens_only_the_owners_plan() {
+    use super::decision::Decision;
+    let source = r#"
+#![allow(dead_code, unused_mut, unused_unsafe)]
+extern "C" { fn malloc(n: usize) -> *mut core::ffi::c_void; }
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct N { pub v: i32, pub next: *mut N }
+pub unsafe extern "C" fn n_new(mut depth: i32) -> *mut N {
+    let mut n = malloc(::std::mem::size_of::<N>()) as *mut N;
+    if n.is_null() { return 0 as *mut N; }
+    (*n).v = depth;
+    (*n).next = 0 as *mut N;
+    if depth > 0 as i32 {
+        let mut inner = n_new(depth - 1 as i32);
+        if inner.is_null() { return 0 as *mut N; }
+        (*n).next = inner;
+    }
+    return n;
+}
+"#;
+    let _frame = super::test_model_override::frame_lock();
+    let closes = ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let (table, _ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let mut closes = table
+            .entries
+            .iter()
+            .filter_map(|(s, d)| match d {
+                Decision::Box(plan) => Some((
+                    s.param_name.clone().unwrap_or_default(),
+                    plan.implicit_scope_close,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        closes.sort();
+        closes
+    })
+    .unwrap();
+    // `n` is live at `inner`'s null return (C leaks it): its close. `inner`
+    // is `None` there and stored before the other exit: no close of its own.
+    assert!(
+        closes.iter().all(|(name, close)| *close == (name == "n")),
+        "{closes:?}"
+    );
+}
