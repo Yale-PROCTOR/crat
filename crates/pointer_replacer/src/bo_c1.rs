@@ -13262,7 +13262,7 @@ mod run {
             })
             .collect::<BTreeMap<_, _>>();
         let mut pending_rows = String::from(
-            "receipt_key\tcaller\tcallee\targument_index\tsource_file\tlo\thi\treason\ttier\twaiver\tclassification\tcustody_valid\n",
+            "receipt_key\tcaller\tcallee\targument_index\tsource_file\tlo\thi\treason\ttier\twaiver\tclassification\tsource_form\tpost_call\ttree\tcustody_valid\n",
         );
         for descriptor in &artifact.bridge_custody_export.pending {
             let crate::bo_rewriter::bridge_custody_match::SiteAnchor::Argument {
@@ -13280,8 +13280,28 @@ mod run {
             let valid = bridge_custody.files.values().flat_map(|file| &file.rows).any(|row|
                 row.identity == descriptor.receipt_key
                     && row.status == crate::bo_rewriter::bridge_custody_match::ReceiptStatus::WaivedPending);
+            // R808-3: the classification is what the tree does at the site,
+            // read from the comparison's own rows, beside the source's form
+            // and its post-call evidence.
+            let (classification, tree) = super::pending_sibling_tree_reading(
+                bridge_custody
+                    .files
+                    .values()
+                    .flat_map(|file| &file.rows)
+                    .filter(|row| row.identity == descriptor.receipt_key),
+            );
+            let subject = artifact
+                .bridge_custody_export
+                .pending_subject_records
+                .iter()
+                .find(|record| record.receipt_key.as_deref() == Some(&descriptor.receipt_key));
+            let source_form = subject.map_or("-", |record| record.source_form.as_str());
+            let post_call = subject
+                .and_then(|record| serde_json::to_value(&record.post_call).ok())
+                .and_then(|value| value["kind"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "-".into());
             pending_rows.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tWAIVED\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 full_tsv_field(&descriptor.receipt_key),
                 full_tsv_field(&descriptor.expectation.caller),
                 full_tsv_field(&descriptor.expectation.callee),
@@ -13292,6 +13312,10 @@ mod run {
                 crate::bo_rewriter::decision::sibling_overlap::PENDING_REASON,
                 full_tsv_field(&descriptor.expectation.tier),
                 full_tsv_field(descriptor.expectation.waiver_id.as_deref().unwrap_or("-")),
+                classification,
+                full_tsv_field(source_form),
+                full_tsv_field(&post_call),
+                full_tsv_field(&tree),
                 valid
             ));
         }
@@ -26767,8 +26791,27 @@ fn r792_4_the_census_publishes_implicit_closes_per_program() {
 pub(crate) fn pending_sibling_tree_reading<'a>(
     rows: impl Iterator<Item = &'a crate::bo_rewriter::bridge_custody_match::ReceiptResult>,
 ) -> (&'static str, String) {
-    let _ = rows;
-    ("WAIVED", "-".into())
+    use crate::bo_rewriter::bridge_custody_match::ReceiptStatus;
+    let rows = rows.collect::<Vec<_>>();
+    let row = rows
+        .iter()
+        .find(|row| row.status == ReceiptStatus::WaivedPending)
+        .or_else(|| rows.first());
+    match row {
+        None => ("UNRESOLVED", "absent".into()),
+        Some(row) => {
+            let status = serde_json::to_value(row.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{:?}", row.status));
+            let classification = if row.status == ReceiptStatus::WaivedPending {
+                "WAIVED"
+            } else {
+                "UNRESOLVED"
+            };
+            (classification, format!("{status}:{}", row.reason))
+        }
+    }
 }
 
 #[test]
