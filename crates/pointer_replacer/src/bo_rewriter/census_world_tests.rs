@@ -296,3 +296,27 @@ fn r815_6_control_an_unexported_function_is_not_certified() {
     let signature = r815_6_callee_signature(&input);
     assert!(signature.contains("psize: *mut i32"), "({signature})");
 }
+
+/// R819-1 item 1 (§29): a subject with nullability evidence, its own or
+/// carried, is never delivered as a non-optional reference. `map_pair::pid` is
+/// handed to a callee that null-tests it; when its Option stage is withdrawn it
+/// falls back to raw, not to its Core form `&mut i32`.
+#[test]
+fn r819_1_a_nullable_entry_formal_never_falls_back_to_a_plain_reference() {
+    let input = include_str!("testdata/r819_nullable_entry_formal_option_withdrawn.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            let signature = flat
+                .split("fn map_pair(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no map_pair:\n{source}"));
+            assert!(
+                !signature.contains("pid: &mut i32") && !signature.contains("pid: &i32"),
+                "a nullable formal is never a plain reference: ({signature})\n{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
