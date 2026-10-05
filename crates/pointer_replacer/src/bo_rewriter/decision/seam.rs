@@ -354,6 +354,10 @@ pub(crate) enum SeamLen {
 /// which its `strlen + 1` length reads.
 pub(crate) const NUL_WALK_BASE: &str = "__crat_nul_walk_base";
 
+/// **wave-6l R825-4a.** The binding a null-guarded field-allocated
+/// construction gives its base.
+pub(crate) const FIELD_BASE: &str = "__crat_field_base";
+
 impl SeamLen {
     /// The length's source text. **The single place both emitters read it
     /// from**, so the span layer's string and the AST layer's parsed node come
@@ -1302,6 +1306,11 @@ pub(crate) struct GlueSpec {
     /// — the owner's own view, `None` for `None`: the panic-free spelling the
     /// R422-5 owner-view glue lacked.
     pub(crate) option_view: Option<bool>,
+    /// **wave-6l R825-4a (R517-10).** A `FromRawParts` whose base may still
+    /// hold its field's null initializer: the construction binds the base
+    /// once and a null base is the empty slice (the declaration planner's
+    /// rendering), never a slice of the length on a null pointer.
+    pub(crate) null_base_empty: bool,
 }
 
 impl GlueSpec {
@@ -1338,6 +1347,7 @@ impl GlueSpec {
             nonempty_evidence: false,
             checked_binding_type: None,
             option_view: None,
+            null_base_empty: false,
         }
     }
 
@@ -1405,6 +1415,7 @@ impl GlueSpec {
             nonempty_evidence: false,
             checked_binding_type: None,
             option_view: None,
+            null_base_empty: false,
         }
     }
 
@@ -1436,6 +1447,7 @@ impl GlueSpec {
             nonempty_evidence: false,
             checked_binding_type: None,
             option_view: None,
+            null_base_empty: false,
         }
     }
 
@@ -1825,6 +1837,14 @@ impl GlueSpec {
                     {
                         format!(
                             "{{ let {NUL_WALK_BASE} = {base}; core::slice::{ctor}({NUL_WALK_BASE}, ({len}) as usize) }}"
+                        )
+                    }
+                    // wave-6l R825-4a: a field-allocated length over a base
+                    // that may hold the field's null initializer.
+                    SeamLen::Licensed(len) if self.null_base_empty => {
+                        let empty = if self.mutable { "&mut []" } else { "&[]" };
+                        format!(
+                            "{{ let {FIELD_BASE} = {base}; if {FIELD_BASE}.is_null() {{ {empty} }} else {{ core::slice::{ctor}({FIELD_BASE}, ({len}) as usize) }} }}"
                         )
                     }
                     SeamLen::Licensed(len)
@@ -4071,6 +4091,17 @@ fn build_candidate(
         spec
     };
     let mut spec = spec;
+    // **wave-6l R825-4a (R517-10).** A licensed field's length holds only
+    // while the field holds its allocation; the field's null initializer
+    // (brotli's `RingBufferInit`, before `InitBuffer`) can reach the use with
+    // the length still above zero, so a null base is the empty slice.
+    if len_evidence == Some(LenEvidence::FieldAlloc)
+        && spec.core == GlueCore::FromRawParts
+        && spec.null_arm == NullArm::None
+        && matches!(spec.len, Some(SeamLen::Licensed(_)))
+    {
+        spec.null_base_empty = true;
+    }
     // **R477-6.** The text came from the call site, so `glue` licensed it; the
     // chain also proved it is a MASK, which the receipt must say.
     if len_masked && let Some(SeamLen::Licensed(text)) = spec.len.clone() {

@@ -2056,6 +2056,56 @@ fn checked_optional(
     (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
 }
 
+/// **wave-6l R825-4a.** `{ let __crat_field_base = ARGUMENT; if
+/// __crat_field_base.is_null() { &[] } else { PAYLOAD } }`: the argument node
+/// moves in once, and a null base is the empty slice.
+fn field_base_guarded(
+    argument: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+    mutable: bool,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_FIELD_BASE_ARG";
+    const PAYLOAD: &str = "__CRAT_FIELD_BASE_PAYLOAD";
+    let text = format!(
+        "{{ let {base} = {ARG}; if {base}.is_null() {{ {empty} }} else {{ {PAYLOAD} }} }}",
+        base = crate::bo_rewriter::decision::seam::FIELD_BASE,
+        empty = if mutable { "&mut []" } else { "&[]" },
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if let rustc_ast::ExprKind::Path(None, path) = &expr.kind
+                && path.segments.len() == 1
+            {
+                let name = path.segments[0].ident.name;
+                if name == Symbol::intern(ARG) {
+                    *expr = self.argument.clone();
+                    self.hits += 1;
+                    return;
+                }
+                if name == Symbol::intern(PAYLOAD) {
+                    *expr = self.payload.clone();
+                    self.hits += 1;
+                    return;
+                }
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace {
+        argument,
+        payload,
+        hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 2).then_some(parsed.kind)
+}
+
 /// **wave-6l relay 077.** `{ let __crat_nul_walk_base = ARGUMENT; PAYLOAD }`:
 /// the argument node moves in once, and the payload's `strlen + 1` reads the
 /// binding.
@@ -2626,6 +2676,17 @@ impl<'a> SeamGraftVisitor<'a> {
         } else {
             core_arg
         };
+        // wave-6l R825-4a: a field-allocated construction binds its base once
+        // and renders a null base as the empty slice (the text renderer does
+        // the same).
+        let field_base =
+            (spec.null_base_empty && nul_walk_base.is_none()).then(|| core_arg.clone());
+        let core_arg = if field_base.is_some() {
+            P(graft_expr(crate::bo_rewriter::decision::seam::FIELD_BASE)
+                .expect("fixed binding path parses"))
+        } else {
+            core_arg
+        };
         let core = match shape {
             None => core_arg,
             Some(shape) => {
@@ -2640,6 +2701,14 @@ impl<'a> SeamGraftVisitor<'a> {
         };
         let core = match nul_walk_base {
             Some(base) => expr(nul_walk_bound((*base).clone(), (*core).clone())?),
+            None => core,
+        };
+        let core = match field_base {
+            Some(base) => expr(field_base_guarded(
+                (*base).clone(),
+                (*core).clone(),
+                spec.mutable,
+            )?),
             None => core,
         };
         let core = if matches!(spec.core, GlueCore::Reborrow | GlueCore::FromRawParts) {

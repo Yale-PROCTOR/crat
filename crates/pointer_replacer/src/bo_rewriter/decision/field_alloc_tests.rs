@@ -607,3 +607,23 @@ fn w6l_fa_n_a_null_field_base_is_the_empty_slice() {
         "{source}"
     );
 }
+
+/// FA-n's text-layer twin: the span renderer guards a null base the way the
+/// AST builder does (the two must not disagree), shared and mutable.
+#[test]
+fn w6l_fa_n_the_text_renderer_guards_the_null_base_too() {
+    use super::seam::{GlueCore, GlueSpec};
+    for (mutable, empty, ctor) in [
+        (false, "&[]", "from_raw_parts"),
+        (true, "&mut []", "from_raw_parts_mut"),
+    ] {
+        let mut spec = GlueSpec::core(GlueCore::FromRawParts, mutable).with_len("n + 7");
+        spec.null_base_empty = true;
+        assert_eq!(
+            flat(&spec.render_in_context("data", true).unwrap()),
+            format!(
+                "{{ let __crat_field_base = data; if __crat_field_base.is_null() {{ {empty} }} else {{ core::slice::{ctor}(__crat_field_base, (n + 7) as usize) }} }}"
+            )
+        );
+    }
+}
