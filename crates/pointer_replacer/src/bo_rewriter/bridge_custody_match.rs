@@ -1623,6 +1623,18 @@ fn same_source_binding_inner(
     // stronger evidence of that than comparing a type the input never wrote.
     // Annotated-vs-annotated still goes through the type test and an annotated
     // mismatch still refuses.
+    //
+    // **R833-4 (main 175a §5), RULED — an annotation that is a raw pointer only by
+    // name.** brotli's `let mut literal_context_lut: ContextLut = ..` (`pub type
+    // ContextLut = *const uint8_t;`) is delivered as `&u8`; the alias's pointee chain
+    // ends in `libc::c_uchar`, so no text comparison can pair it. A bare alias that
+    // R605-2's binding resolves to a raw pointer is matched as an unannotated local is:
+    // by identity, with the emitted form a reference whose mutability is not above the
+    // raw pointer's. The pointee is not compared.
+    let alias_raw = original
+        .type_text
+        .as_deref()
+        .and_then(|text| raw_alias_mutability(input, &original.owner, text));
     if input
         .original
         .bindings
@@ -1638,12 +1650,19 @@ fn same_source_binding_inner(
             .count()
             != 1
         || (original.type_text.is_some()
+            && alias_raw.is_none()
             && !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
                 .unwrap_or(false))
+        || alias_raw.is_some_and(|raw_mutable| {
+            !matches!(
+                emitted.type_text.as_deref().map(pointer_type),
+                Some(Ok(PointerType::Reference(mutable))) if raw_mutable || !mutable
+            )
+        })
     {
         return false;
     }
-    let by_identity = original.type_text.is_none();
+    let by_identity = original.type_text.is_none() || alias_raw.is_some();
     let pair = (original.id, emitted.id);
     if !visiting.insert(pair) {
         return false;
@@ -2019,6 +2038,22 @@ fn peeled_pointer_casts(original: &ast::Expr) -> &ast::Expr {
         expression = unparen(inner);
     }
     expression
+}
+
+/// R833-4: the mutability of the raw pointer a bare type alias names, where R605-2's
+/// module binding resolves it (in both inventories) to a raw pointer; `None` otherwise.
+fn raw_alias_mutability(input: &BridgeCustodyInput<'_>, owner: &str, text: &str) -> Option<bool> {
+    let parsed = parsed_type(text).ok()?;
+    let ast::TyKind::Path(None, path) = &parsed.kind else {
+        return None;
+    };
+    if !matches!(path.segments.as_slice(), [segment] if segment.args.is_none()) {
+        return None;
+    }
+    match formal_pointer_type(&[input.original, input.emitted], owner, text).ok()? {
+        PointerType::Raw(mutable) => Some(mutable),
+        _ => None,
+    }
 }
 
 /// The A5 raw temporary's target formal, classified as the raw-view check reads it:
