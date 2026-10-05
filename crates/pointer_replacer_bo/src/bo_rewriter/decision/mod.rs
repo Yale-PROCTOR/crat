@@ -1490,6 +1490,60 @@ thread_local! {
     /// them. Empty outside that call.
     static RESTORE_HOLD_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
         std::cell::RefCell::default();
+    /// The entry parameters [`entry_rule_releases`] released in the running
+    /// [`decide_with_raw_fallbacks`]: the thin-into-fat rule stands aside for
+    /// them (narrowing 2 (b), read on the settled table). Empty outside it.
+    static ENTRY_RULE_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+}
+
+/// **Narrowing 2 (b), read on the settled table (R815-7 item 3; main 173a).** A
+/// parameter of a function whose callers the rule cannot see (W-C7's
+/// `IncompleteCallers`), where a known exposure policy gives the function no
+/// surface (the open world), keeps its thin form unless the formal it is handed
+/// to is delivered as a slice in the same table: there the thin form would be
+/// the one-element view the rule cures (g25 / g26), elsewhere the slice only
+/// changes a signature callers outside the program call (wave-6v's driver) or
+/// costs a cursor (slicecursor's `walk`). The released entries are decided
+/// again with the rule standing aside, to a fixpoint.
+fn entry_rule_releases(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .filter(|(subject, decision)| {
+            let key = (subject.fn_did, subject.hir_id);
+            matches!(subject.kind, SubjectKind::Param { .. })
+                && takes_slice(decision)
+                && !ENTRY_RULE_RELEASED.with(|released| released.borrow().contains(&key))
+                && thin_counted::closed_calls(ctx.tcx, subject.fn_did, ctx.facts).is_err()
+                && ctx.exposure.is_some_and(|policy| {
+                    matches!(
+                        policy.plan(subject.fn_did),
+                        exposure::ExposureSurfacePlan::NotApplicable
+                    )
+                })
+                && slice_input::fat_hand_on(subject, ctx.facts, ctx.fat).is_some_and(
+                    |(callee, index)| {
+                        !entries.iter().any(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                    },
+                )
+        })
+        .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+        .collect()
 }
 
 /// Clears [`RESTORE_HOLD_RELEASED`] when the decision pass begins and ends.
@@ -1498,6 +1552,7 @@ struct RestoreHoldRelease;
 impl RestoreHoldRelease {
     fn begin() -> Self {
         RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+        ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
         Self
     }
 }
@@ -1505,6 +1560,7 @@ impl RestoreHoldRelease {
 impl Drop for RestoreHoldRelease {
     fn drop(&mut self) {
         RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+        ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
     }
 }
 
@@ -1535,13 +1591,25 @@ pub(crate) fn decide_with_raw_fallbacks(
     // without the hold, to a fixpoint: a released formal is thin, so the
     // subjects handed to it are released in turn. Each round releases at least
     // one subject the hold held, so it ends.
+    // The entry clause of the thin-into-fat rule is read on the same settled
+    // table (`entry_rule_releases`), in the same fixpoint.
     loop {
         let release = restore_holds_to_release(&entries);
-        if release.is_empty() {
+        let entries_released = entry_rule_releases(ctx, &entries);
+        if release.is_empty() && entries_released.is_empty() {
             break;
         }
         RESTORE_HOLD_RELEASED
             .with(|released| released.borrow_mut().extend(release.iter().copied()));
+        ENTRY_RULE_RELEASED.with(|released| {
+            released
+                .borrow_mut()
+                .extend(entries_released.iter().copied())
+        });
+        let release = release
+            .union(&entries_released)
+            .copied()
+            .collect::<rustc_hash::FxHashSet<_>>();
         for (subject, decision) in entries.iter_mut() {
             let key = (subject.fn_did, subject.hir_id);
             if release.contains(&key) && !fallbacks.contains_key(&key) {
@@ -3139,11 +3207,15 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // aside:**
     // (b) at a parameter of a function whose callers it cannot see (W-C7's
     //     `IncompleteCallers`: exported, public, address-taken or never
-    //     called) where no exposure surface owns the function. A slice formal
-    //     there changes a signature that callers outside the program call
-    //     (wave-6v's driver, `slerp(&q, 0.5)`). In the census world every
-    //     function with a converting parameter has a surface plan, so this
-    //     reads the open world; a pass with no exposure policy reads nothing.
+    //     called) where no exposure surface owns the function, and only where
+    //     the formal it is handed to is NOT delivered as a slice in the settled
+    //     table (`entry_rule_releases`, main 173a). A slice there would change a
+    //     signature that callers outside the program call (wave-6v's driver,
+    //     `slerp(&q, 0.5)`) or cost a cursor; where the formal is a slice, the
+    //     thin form is the one-element view the rule cures (g25 / g26). In the
+    //     census world every function with a converting parameter has a surface
+    //     plan, so this reads the open world; a pass with no exposure policy
+    //     reads nothing.
     // (c) at a view `root.offset(e)` of an allocation the model calls
     //     Owning, handed to a formal that takes the slice form. The
     //     ownership-fields native bundle renders that view from its Box owner
@@ -3153,14 +3225,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     //     `edt_with_payload::z`) the bundle cannot deliver, and the rule keeps
     //     the view.
     let rule_stands_aside = || {
-        let unseen_entry = matches!(subject.kind, SubjectKind::Param { .. })
-            && thin_counted::closed_calls(tcx, subject.fn_did, facts).is_err()
-            && exposure.is_some_and(|policy| {
-                matches!(
-                    policy.plan(subject.fn_did),
-                    exposure::ExposureSurfacePlan::NotApplicable
-                )
-            });
+        // (b) is read on the settled table (`entry_rule_releases`, main 173a).
+        let unseen_entry = ENTRY_RULE_RELEASED.with(|released| {
+            released
+                .borrow()
+                .contains(&(subject.fn_did, subject.hir_id))
+        });
         let bundle_view = matches!(subject.kind, SubjectKind::Local)
             && slice_input::fat_hand_on(subject, facts, fat).is_some_and(|(callee, index)| {
                 let formal = Local::from_usize(index + 1);

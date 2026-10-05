@@ -82,18 +82,20 @@ fn r758_1_a_parameter_handed_bare_to_an_array_formal_is_a_slice() {
     );
 }
 
-/// **Narrowing 2 (b), main 170.** In the open world nothing owns an exported
-/// entry's surface: its callers are outside the program, so the rule does not
-/// change `FindAll`'s signature there (wave-6v's driver, `slerp(&q, 0.5)`, is
-/// the same shape).
+/// **Narrowing 2 (b), read on the settled table (main 170, restated main 173a).**
+/// In the open world nothing owns an unseen entry's surface. Where the formal
+/// it hands on to stays RAW, a slice buys no view and only changes the
+/// signature external callers call, so the entry keeps its thin form: wave-6v's
+/// two `slerp` witnesses pin that half. Where the formal is a SLICE (`FindAll`
+/// → `AddMatch`), the thin form would be the one-element view, and the rule
+/// gives the entry the fat twin: this witness.
 #[test]
 fn r808_5_the_open_world_keeps_an_unseen_entrys_signature() {
-    let input = format!("{ALLOW}{MATCHES}");
-    let source = emitted(&input);
+    let source = emitted(&format!("{ALLOW}{MATCHES}"));
     let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("matches:&mutu32)->i32"),
-        "the exported entry keeps a thin formal in the open world:\n{source}"
+        flat.contains("matches:&mut[u32])->i32") && !source.contains("from_mut(matches)"),
+        "an entry handing on to a slice formal takes the fat twin:\n{source}"
     );
 }
 

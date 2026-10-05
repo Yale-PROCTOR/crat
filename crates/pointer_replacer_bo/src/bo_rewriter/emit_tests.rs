@@ -11748,9 +11748,16 @@ fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
                        pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
     let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
 
+    // RESTATED for 56 (main 173a): `fab_one::d` is handed bare to
+    // `fab_total`'s array formal, which reads four elements, so the
+    // thin-into-fat rule gives it the fat twin and the call takes it whole: no
+    // `from_ref(d)` one-element view, and still no fabricated-extent const.
     let ast = ast_emitted_source_of(SRC).expect("the AST layer emits");
     assert_eq!(ast.matches(decl).count(), 0, "{ast}");
-    assert!(ast.contains("core::slice::from_ref(d)"), "{ast}");
+    assert!(
+        !ast.contains("from_ref(d)") && ast.contains("fab_total(d)"),
+        "{ast}"
+    );
 
     // The span layer, on the SAME input, through the production entry point.
     let span = match super::rewrite_m1(SRC) {
@@ -11758,7 +11765,10 @@ fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
         other => panic!("the span layer must emit: {other:?}"),
     };
     assert_eq!(span.matches(decl).count(), 0, "{span}");
-    assert!(span.contains("core::slice::from_ref(d)"), "{span}");
+    assert!(
+        !span.contains("from_ref(d)") && span.contains("fab_total(d)"),
+        "{span}"
+    );
 }
 
 /// **CROSS-ARM PARITY — one function carrying BOTH a declaration edit and a
@@ -11788,7 +11798,7 @@ fn a_function_carrying_declaration_and_safe_glue_renders_identically_in_both_lay
                        \x20   s\n\
                        }\n\
                        pub unsafe fn cx_caller(p: *mut i32, out: *mut i32) -> i32 {\n\
-                       \x20   let t = cx_sum(p);\n\
+                       \x20   let t = cx_sum(p.offset(1));\n\
                        \x20   *out = t;\n\
                        \x20   t\n\
                        }\n";
@@ -11801,7 +11811,10 @@ fn a_function_carrying_declaration_and_safe_glue_renders_identically_in_both_lay
     // Without this the test would pass on a fixture where fabrication never
     // fired, or where the caller kept every raw parameter — which is exactly
     // the shape it exists to cover.
-    assert!(span.contains("core::slice::from_ref(p)"), "{span}");
+    // RESTATED for 56 (main 173a): handed bare, `p` would take the fat twin
+    // under the thin-into-fat rule and the glue arm would vanish; handed as
+    // `p.offset(1)`, the glue is the slice's own suffix view.
+    assert!(span.contains("cx_sum((&(p)[1..]))"), "{span}");
     assert!(
         span.contains("out: &mut i32"),
         "arm 2 (a declaration edit) must be present IN THE CALLER, or this is \
