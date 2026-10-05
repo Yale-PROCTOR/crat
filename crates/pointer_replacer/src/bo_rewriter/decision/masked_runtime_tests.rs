@@ -66,7 +66,8 @@ pub unsafe fn Compress(r: *mut Ring, n: usize) -> usize {
 "###;
 
 /// M1 — every reader of the chain is held, and the reason names it. (Relay
-/// 071: over brotli's raw field root; RING's array root is N1's.)
+/// 071: over brotli's raw field root; RING's array root is N1's, held too
+/// while the narrowing is reverted, R823-3.)
 #[test]
 fn w6l_mask_m1_a_read_past_a_masked_index_by_a_runtime_length_is_held() {
     let rows = crate::bo_rewriter::emit_tests::decisions_of(&ring_field_root());
@@ -224,7 +225,8 @@ fn w6l_mask_zc3_a_borrowed_zero_local_stays_licensed() {
 
 /// M2 — the runtime-length read inside a closure the function runs is the
 /// function's read. (Relay 071: the root is an entry's raw pointer, a
-/// fabricated length; an array root is N1's.)
+/// fabricated length; an array root is N1's — held too while the narrowing
+/// is reverted, R823-3.)
 #[test]
 fn w6l_mask_m2_a_read_in_a_closure_is_held() {
     let input = fixture(
@@ -309,13 +311,10 @@ fn ring_field_root() -> String {
     fixture(&field)
 }
 
-/// N1 (relay 071, R697-7 (b)) — the hold narrowed to chains whose root would
-/// take a fabricated length. With brotli's raw field root, the four readers
-/// stay held; with the array root (`[u8; 4224]`, R625's real length), the
-/// reader the root reaches directly, `FindAllMatches`, is released and gets
-/// the array, and no reader is handed the fallback extent: a masked reader
-/// whose call would take a fabricated length is not adapted (the seam's
-/// guard).
+/// N1, turned back (R823-3, main 174a): relay 071's narrowing is reverted for
+/// the frame head, so the hold keeps its pre-071 reach — with the array root
+/// (`[u8; 4224]`, a real length) the readers stay held too. The narrowing
+/// returns in batch 56 with the R822-3 fix.
 #[test]
 fn w6l_mask_n1_the_hold_is_kept_only_where_the_root_is_fabricated() {
     let field = crate::bo_rewriter::emit_tests::decisions_of(&ring_field_root());
@@ -324,18 +323,18 @@ fn w6l_mask_n1_the_hold_is_kept_only_where_the_root_is_fabricated() {
         .filter(|(n, p, r)| n == "data" && *p && r == "held:masked-index-runtime-length")
         .count();
     assert_eq!(held, 4, "field root: {field:#?}");
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&fixture(RING)).unwrap();
-    let flat_source = flat(&source);
-    assert!(
-        flat_source.contains("unsafe fn FindAllMatches(data: &[u8],"),
-        "{source}"
-    );
-    assert!(!flat_source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+    let array = crate::bo_rewriter::emit_tests::decisions_of(&fixture(RING));
+    let held = array
+        .iter()
+        .filter(|(n, p, r)| n == "data" && *p && r == "held:masked-index-runtime-length")
+        .count();
+    assert_eq!(held, 4, "array root (narrowing reverted): {array:#?}");
 }
 
-/// N2 (relay 071; fault FA13f's witness) — a root that is an array start
+/// N2, turned back by R823-3 (relay 071; fault FA13f's witness, inert while the narrowing is reverted) — a root that is an array start
 /// handed DIRECTLY (`buf.as_ptr()`, R625's `[T; N]`) is a real length: the
-/// reader is released and takes the array's length.
+/// reader was released and took the array's length; until the narrowing returns
+/// (batch 56) it is held.
 #[test]
 fn w6l_mask_n2_a_direct_array_start_is_a_real_root() {
     let input = fixture(
@@ -350,5 +349,10 @@ pub unsafe fn run(n: usize) -> u8 {
 "###,
     );
     let rows = crate::bo_rewriter::emit_tests::decisions_of(&input);
-    assert_eq!(reason(&rows, "data"), "<emitted>", "{rows:#?}");
+    // R823-3: turned back with the narrowing's revert — held, as before 071.
+    assert_eq!(
+        reason(&rows, "data"),
+        "held:masked-index-runtime-length",
+        "{rows:#?}"
+    );
 }

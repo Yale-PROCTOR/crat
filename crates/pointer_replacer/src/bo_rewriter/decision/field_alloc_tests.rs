@@ -139,21 +139,21 @@ fn w6l_fa1_the_ring_buffer_licence_is_inferred() {
     );
 }
 
-/// FA2 — the reader is released (its root now takes a real length) and the
-/// root's construction renders `cur_size_ + 7`, not the fallback.
+/// FA2, turned back (R823-3, main 174a): with relay 071's narrowing reverted
+/// for the frame head, the masked reader stays held although its root has the
+/// licensed field length (`len-field-alloc` itself stays: FA1), and no
+/// fallback extent reaches it. The release returns in batch 56 with the
+/// R822-3 fix.
 #[test]
 fn w6l_fa2_the_root_takes_the_field_length_and_the_reader_is_delivered() {
     let rows = reasons(RB);
-    assert_eq!(reason_of(&rows, "Reader", "data"), "<emitted>", "{rows:#?}");
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB).unwrap();
-    let flat = flat(&source);
-    assert!(
-        flat.contains(
-            "core::slice::from_raw_parts(data, ((*s).ringbuffer_.cur_size_ as usize + 7) as usize)"
-        ),
-        "{source}"
+    assert_eq!(
+        reason_of(&rows, "Reader", "data"),
+        "held:masked-index-runtime-length",
+        "{rows:#?}"
     );
-    assert!(!flat.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB).unwrap();
+    assert!(!flat(&source).contains("FALLBACK_SLICE_EXTENT"), "{source}");
 }
 
 /// FA-c — the licence's controls: each refuses `buffer_`'s. (`data_`'s, the
@@ -231,10 +231,20 @@ fn w6l_fa_u_the_use_controls_keep_the_hold() {
     ] {
         let input = RB.replacen(from, to, 1);
         assert_ne!(input, RB, "{label}: the variant is in");
-        let rows = reasons(&input);
-        let got = reason_of(&rows, "Reader", "data");
-        if got != "held:masked-index-runtime-length" {
-            wrong.push(format!("{label}: {got}"));
+        // R823-3: with relay 071's narrowing reverted the reader is held
+        // whatever the licence says, so the controls read the licence itself:
+        // no length is rendered at the refused use.
+        let got = lengths(&input);
+        let refused = |caller: &str, arg: &str| match label {
+            "direct read in a writer" => caller == "Refill" && arg.contains("ringbuffer_.buffer_"),
+            _ => caller == "Encode" && arg == "data",
+        };
+        let rendered = got
+            .iter()
+            .filter(|(caller, arg, _)| refused(caller, arg))
+            .collect::<Vec<_>>();
+        if !rendered.is_empty() {
+            wrong.push(format!("{label}: {rendered:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

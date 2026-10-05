@@ -1313,6 +1313,9 @@ impl DecisionTable {
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
     /// wave-6l relay 071: the field-carried allocation lengths.
+    // R823-3: unread while relay 071's narrowing is reverted (the masked hold
+    // reads it again in 56).
+    #[allow(dead_code)]
     pub(crate) field_alloc: &'a field_alloc::Licences,
     pub(crate) counted_void: &'a counted_void::Contracts,
     /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
@@ -2214,7 +2217,8 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
-        field_alloc,
+        // R823-3: read again by the masked hold when the narrowing returns.
+        field_alloc: _,
         io_domain,
         counted_void: _,
         flexible_tails: _,
@@ -2332,19 +2336,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             Some(SlotKind::Ref)
         )
         && let Some(reader) = masked_runtime::held(tcx, subject.fn_did, hir_index)
-        // Relay 071 (R697-7 (b)): only where a root would take a fabricated
-        // length; a root with a real one (an array, a licensed field) reaches
-        // the reader with it.
-        && masked_runtime::fabricated_root(
-            tcx,
-            facts,
-            field_alloc,
-            exposure.map_or(masked_runtime::World::Conservative, |policy| {
-                masked_runtime::World::Closed(Some(policy))
-            }),
-            subject.fn_did,
-            hir_index,
-        )
+    // R823-3 (main 174a): relay 071's narrowing (held only where a root
+    // would take a fabricated length) is reverted for the frame head — on
+    // brotli a reader released on a real root whose plan did not complete
+    // took its whole class down (net −18, five Box owners). The hold keeps
+    // its pre-071 reach; the narrowing returns in 56 with that fixed
+    // (R822-3). `len-field-alloc` stays.
     {
         return degrade(
             subject,

@@ -5918,6 +5918,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // not adapted. The hold keeps such readers raw where every root
                 // is fabricated; this is the guard for a reader released on a
                 // real root and reached through a forwarder that stayed raw.
+                // (R823-3: with the narrowing reverted no reader is released,
+                // so this guard does not fire; it stays for the narrowing's
+                // return in 56.)
                 // (The relay 071 review's (9): keyed on the length the reader
                 // would receive, whatever form it comes from, save a slice it
                 // already has; a byte region only where it has no exact length.)

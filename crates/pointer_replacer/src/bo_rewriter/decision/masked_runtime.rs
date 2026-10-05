@@ -54,6 +54,9 @@ pub(crate) fn held(tcx: TyCtxt<'_>, function: LocalDefId, parameter: usize) -> O
 /// or through a local defined once from one) or a licensed field read (the
 /// field-carried allocation length). Anything else, and a function whose
 /// callers are not all known, is a fabricated root: the reader is held.
+// R823-3: unused while relay 071's narrowing is reverted for the frame head;
+// the R822-3 fix (batch 56) rebuilds on it.
+#[allow(dead_code)]
 pub(crate) fn fabricated_root(
     tcx: TyCtxt<'_>,
     facts: &super::emitability::EmitabilityFacts,
@@ -80,6 +83,7 @@ pub(crate) fn fabricated_root(
 /// fn-pointer web, a configured entry, or one whose address is taken has
 /// callers the program does not see (`thin_counted::chain_gate`'s rule).
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum World<'a> {
     Conservative,
     Closed(Option<&'a super::exposure::ExposurePolicy>),
