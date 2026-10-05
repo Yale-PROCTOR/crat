@@ -205,3 +205,32 @@ fn r808_5_control_a_read_only_overlap_keeps_its_references() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R815-6 (P8 `OutsideByteViewDiscipline`, R814-2): binn's `binn_object_blob`
+/// hands on, bare, its byte formal `key` beside its typed formal `psize`. It is
+/// an exported entry with no caller in the program, so the two are views of
+/// different outside objects: the pair is disjoint under P8, `psize` is no raw
+/// view, and the callee keeps both its slice `key` and its optional `psize`.
+#[test]
+fn r815_6_an_entry_byte_formal_beside_its_typed_formal_is_disjoint_under_p8() {
+    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            let signature = flat
+                .split("fn binn_object_get(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no binn_object_get:\n{source}"));
+            assert!(
+                signature.contains("key: Option<&[i8]>") || signature.contains("key: &[i8]"),
+                "the callee's key keeps its slice beside the entry's typed formal: ({signature})\n{source}"
+            );
+            assert!(
+                signature.contains("psize: Option<&mut i32>"),
+                "psize is not a raw view of the entry's pair: ({signature})\n{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
