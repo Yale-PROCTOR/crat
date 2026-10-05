@@ -8223,6 +8223,9 @@ fn finish_decide<'tcx>(
     };
     let flexible_tails =
         decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects, &raw_surface);
+    // era-5c relay 182 (R826-1): the retained-access check of record, once per program.
+    let retained_access =
+        decision::retained_access::RetainedAccessCheck::compute(&program, &slots, &model);
     // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
     // read only to refuse a chain whose members are not all Owning).
     // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1),
@@ -8489,6 +8492,7 @@ fn finish_decide<'tcx>(
              $exposure:expr, $return_receivers:expr $(,)?) => {
                 decision::Ctx {
                     tcx,
+                    retained_access: &retained_access,
                     field_alloc: &field_alloc_licences,
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,

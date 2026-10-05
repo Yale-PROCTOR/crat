@@ -133,6 +133,9 @@ pub(crate) mod released_indirect;
 pub(crate) mod retained_alias_observed;
 #[cfg(test)]
 mod retained_alias_observed_tests;
+pub(crate) mod retained_access;
+#[cfg(test)]
+mod retained_access_tests;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
@@ -1343,6 +1346,9 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
+    /// era-5c relay 182 (R826-1): the retained-access check of record, (E) in the
+    /// closed world.
+    pub(crate) retained_access: &'a retained_access::RetainedAccessCheck,
     /// wave-6l relay 071: the field-carried allocation lengths.
     // R823-3: unread while relay 071's narrowing is reverted (the masked hold
     // reads it again in 56).
@@ -1997,6 +2003,23 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // `opt-use-unsupported` is one the cursor family selects, so a formal that
     // kept its own reason came back as a cursor (bzip2 `BZ2_bzDecompress::strm`).
     if let Some(detail) = retained_alias_observed::held(ctx.tcx, subject) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::RetainedAlias { detail },
+        );
+    }
+    // era-5c relay 182 (R826-1, USER): the retained-access check of record, the
+    // evident shapes by rule (a derived store, a self-reference, a cycle) in the closed
+    // world; P9 `RetainedAccessFreedom` stands for the rest. Receipt
+    // `held:retained-alias`, detail `evident:<rule>:<retaining place> | <witness>`.
+    let verdict = match subject.kind {
+        SubjectKind::Param { .. } => ctx
+            .retained_access
+            .formal(subject.fn_did, subject.local.as_usize()),
+        SubjectKind::Local => ctx.retained_access.local(subject.fn_did, subject.local),
+    };
+    if let Some(detail) = verdict.and_then(retained_access::Verdict::evident_receipt) {
         return degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
