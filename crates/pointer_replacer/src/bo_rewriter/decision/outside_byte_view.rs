@@ -14,7 +14,10 @@
 //!   separate).
 //!
 //! Not covered: an entry the program calls or names, an unexported function,
-//! an argument that is not the entry's own formal, a formal the body assigns or takes the address of,
+//! an argument that is not the entry's own formal (nor a place inside its own
+//! referent), a formal the body assigns or takes the address of, an entry
+//! with a closure or an extern declaration of its own symbol, a program whose
+//! R767 table is unknown,
 //! and (R767) a formal pair the program's provided test passes one object to.
 //!
 //! It is read where the seam's site gate looks the pair's A5 proof up: that
@@ -97,11 +100,15 @@ pub(crate) fn certifies(
         let argument = site.args.iter().find(|argument| argument.index == index)?;
         let root = match argument.shape {
             ArgShape::BareLocal(root) => root,
+            // A place inside the formal's own referent only: reached through a
+            // dereference of the formal itself, never of a pointer loaded from
+            // it (`&mut (*(*l).head).next` lies in another object). F2's
+            // `inside_of` stops at exactly that dereference.
             ArgShape::AddrOf {
                 base: Some(base),
                 through_deref: true,
                 ..
-            } => base,
+            } if argument.inside_of.first() == Some(&base) => base,
             _ => return None,
         };
         entry.by_binding.get(&root)
@@ -150,8 +157,17 @@ pub(crate) fn entry_formals(
             .instantiate_identity()
             .skip_binder()
             .inputs();
+        // R767's table is the program's: an unknown program fails closed.
+        let Some(test_aliased) = super::aliased_by_test::aliased_pairs(tcx, owner) else {
+            continue;
+        };
+        // A closure can assign a formal out of the visitor's sight, and an
+        // extern declaration of the entry's own symbol is a call from inside.
+        if has_closure(body) || declared_extern(tcx, owner) {
+            continue;
+        }
         let mut formals = EntryFormals {
-            test_aliased: super::aliased_by_test::aliased_pairs(tcx, owner),
+            test_aliased,
             ..Default::default()
         };
         for (position, param) in body.params.iter().enumerate() {
@@ -190,6 +206,29 @@ fn is_byte<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> bool {
         TyKind::Int(rustc_middle::ty::IntTy::I8) | TyKind::Uint(rustc_middle::ty::UintTy::U8)
     ) || pointee.is_c_void(tcx)
 }
+fn has_closure(body: &rustc_hir::Body<'_>) -> bool {
+    struct Closures(bool);
+    impl<'v> Visitor<'v> for Closures {
+        fn visit_expr(&mut self, expr: &'v rustc_hir::Expr<'v>) {
+            if matches!(expr.kind, rustc_hir::ExprKind::Closure(..)) {
+                self.0 = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut visitor = Closures(false);
+    visitor.visit_body(body);
+    visitor.0
+}
+
+/// Does the crate declare a foreign function with the entry's own name?
+fn declared_extern(tcx: TyCtxt<'_>, entry: LocalDefId) -> bool {
+    let name = tcx.item_name(entry.to_def_id());
+    tcx.hir_crate_items(())
+        .foreign_items()
+        .any(|item| tcx.item_name(item.owner_id.to_def_id()) == name)
+}
+
 fn assigned_or_addressed(body: &rustc_hir::Body<'_>, binding: HirId) -> bool {
     struct Assign {
         binding: HirId,

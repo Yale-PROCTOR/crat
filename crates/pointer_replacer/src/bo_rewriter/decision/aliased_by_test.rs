@@ -105,8 +105,13 @@ pub(crate) fn held(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {
 /// R819-1 item 2 (wave-5d): the formal position pairs of `entry` that the
 /// provided test passes one object to, whatever the members do. The scope's
 /// separate-object certificate does not hold for them.
-pub(crate) fn aliased_pairs(tcx: TyCtxt<'_>, entry: LocalDefId) -> Vec<(usize, usize)> {
+/// `None` when the program is unknown outside a unit test: the table cannot
+/// be read for it, and the caller fails closed.
+pub(crate) fn aliased_pairs(tcx: TyCtxt<'_>, entry: LocalDefId) -> Option<Vec<(usize, usize)>> {
     let program = std::env::var("CRAT_ERA5_PROGRAM").ok();
+    if program.is_none() && !cfg!(test) {
+        return None;
+    }
     let owned;
     let text: &str = match std::env::var(OVERRIDE) {
         Ok(path) => {
@@ -117,10 +122,12 @@ pub(crate) fn aliased_pairs(tcx: TyCtxt<'_>, entry: LocalDefId) -> Vec<(usize, u
     };
     let program = program.as_deref().unwrap_or("-");
     let name = tcx.item_name(entry.to_def_id());
-    rows(text)
-        .filter(|r| r.program == program && r.entry == name.as_str())
-        .map(|r| (r.formals[0].1, r.formals[1].1))
-        .collect()
+    Some(
+        rows(text)
+            .filter(|r| r.program == program && r.entry == name.as_str())
+            .map(|r| (r.formals[0].1, r.formals[1].1))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
