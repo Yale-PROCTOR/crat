@@ -242,6 +242,12 @@ pub(crate) enum Rule {
     /// may point into any object whose address the program converted to an integer, and
     /// is read as a pointer kept in memory.
     ExposedProvenance,
+    /// era-5c 146 (ii), Codex round 4: a pointer made from an integer also points where
+    /// the pointers the integer's bytes carry point (a pointer copied into integer memory).
+    IntegerBytes,
+    /// era-5c 146 (ii), Codex round 4: exposing a member's address exposes its whole
+    /// object (an integer may be moved to a sibling member on a UB-free input).
+    ExposedRoots,
 }
 
 /// The options of one computation: the witnesses' faults and the R1 measurement.
@@ -708,6 +714,9 @@ struct Relation<'tcx> {
     container_of: FxHashSet<(LocalDefId, Local)>,
     /// era-5c 146 (ii): the objects whose address the program converted to an integer.
     addr_exposed: FxHashSet<Obj>,
+    /// era-5c 146 (ii), Codex round 4: the formals a function's return derives from by
+    /// the one derivation relation (through aggregates too), over the call graph.
+    ret_from: FxHashMap<LocalDefId, FxHashSet<usize>>,
     anon: FxHashMap<AllocId, u32>,
     acc: FxHashMap<LocalDefId, FxHashSet<Access>>,
     param_acc: FxHashMap<(LocalDefId, usize), (bool, bool)>,
@@ -763,6 +772,7 @@ impl<'tcx> Relation<'tcx> {
             r1_lifted: std::cell::Cell::new(false),
             container_of: FxHashSet::default(),
             addr_exposed: FxHashSet::default(),
+            ret_from: FxHashMap::default(),
             anon: FxHashMap::default(),
             acc: FxHashMap::default(),
             param_acc: FxHashMap::default(),
@@ -806,7 +816,80 @@ impl<'tcx> Relation<'tcx> {
         }
         this.solve_accesses();
         mark("accesses");
+        if this.facts(Rule::OneDerivation) {
+            this.solve_returns();
+            mark("returns");
+        }
         this
+    }
+
+    /// era-5c 146 (ii), Codex round 4: which formals each function's return derives
+    /// from, by the one derivation relation, to a fixpoint over the call graph.
+    fn solve_returns(&mut self) {
+        let functions = self.functions.clone();
+        loop {
+            let mut changed = false;
+            for &f in &functions {
+                let body = self.body(f);
+                for j in 1..=body.arg_count {
+                    if self.ret_from.get(&f).is_some_and(|set| set.contains(&j)) {
+                        continue;
+                    }
+                    let family = self.derived_family(&body, &|l: Local| l.as_usize() == j);
+                    if family.contains(&Local::from_usize(0)) {
+                        self.ret_from.entry(f).or_default().insert(j);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// era-5c 146 (ii), Codex round 4: the pointers an integer's bytes may hold: those
+    /// kept in the memory its byte provenance names, and in its own memory.
+    fn int_pointers(
+        &mut self,
+        f: LocalDefId,
+        body: &Body<'tcx>,
+        op: &Operand<'tcx>,
+    ) -> FxHashSet<Obj> {
+        let mut holders = self.int_operand(f, body, op);
+        if let Some(l) = local_of(op) {
+            holders.insert(Obj::Stack(f, l));
+        }
+        let mut out = FxHashSet::default();
+        for holder in holders {
+            let root = self.root(holder);
+            for key in self.held.get(&root).into_iter().flatten() {
+                out.extend(self.contents.get(key).into_iter().flatten().copied());
+            }
+        }
+        out
+    }
+
+    /// era-5c 146 (ii): a pointer made from an integer (PNVI-ae): any exposed object (by
+    /// its root too), and any pointer whose bytes the integer may carry; read as kept in
+    /// memory.
+    fn from_integer(&mut self, f: LocalDefId, body: &Body<'tcx>, op: &Operand<'tcx>) -> Value {
+        let mut objs = self.addr_exposed.clone();
+        let carried = if self.facts(Rule::IntegerBytes) {
+            self.int_pointers(f, body, op)
+        } else {
+            FxHashSet::default()
+        };
+        if self.facts(Rule::ExposedRoots) {
+            objs.extend(self.roots(carried.iter().copied()));
+        }
+        objs.extend(carried);
+        Value {
+            objs,
+            retained: true,
+            vias: FxHashSet::from_iter([Via::Unknown]),
+            params: FxHashSet::default(),
+        }
     }
 
     fn body(&self, f: LocalDefId) -> impl std::ops::Deref<Target = Body<'tcx>> + 'tcx {
@@ -2306,8 +2389,13 @@ impl<'tcx> Relation<'tcx> {
                 && is_ptr(op.ty(body, tcx))
             {
                 let objs = self.operand_value(f, body, op).objs;
+                let roots = self.roots(objs.iter().copied());
                 let before = self.addr_exposed.len();
                 self.addr_exposed.extend(objs);
+                // Codex round 4: an exposed member exposes its object.
+                if self.facts(Rule::ExposedRoots) {
+                    self.addr_exposed.extend(roots);
+                }
                 changed |= self.addr_exposed.len() != before;
             }
             let sources = match rvalue {
@@ -2377,15 +2465,23 @@ impl<'tcx> Relation<'tcx> {
                         // era-5c 146 (ii), PNVI-ae: an integer made a pointer points into
                         // an object whose address was exposed, and is read as kept in
                         // memory (its integer may have been).
-                        _ if self.facts(Rule::ExposedProvenance) => Value {
-                            objs: self.addr_exposed.clone(),
-                            retained: true,
-                            vias: FxHashSet::from_iter([Via::Unknown]),
-                            params: FxHashSet::default(),
-                        },
+                        _ if self.facts(Rule::ExposedProvenance) => self.from_integer(f, body, op),
                         // An integer made a pointer: anything exposed.
                         _ => self.top(),
                     },
+                    // era-5c 146 (ii), Codex round 4: a transmute keeps a pointer's
+                    // objects, and makes an integer a pointer as a cast does.
+                    CastKind::Transmute
+                        if self.facts(Rule::OneDerivation) && is_ptr(op.ty(body, tcx)) =>
+                    {
+                        self.operand_value(f, body, op)
+                    }
+                    CastKind::Transmute
+                        if self.facts(Rule::ExposedProvenance)
+                            && op.ty(body, tcx).is_integral() =>
+                    {
+                        self.from_integer(f, body, op)
+                    }
                     CastKind::PointerExposeProvenance
                     | CastKind::IntToInt
                     | CastKind::FloatToInt
@@ -4367,6 +4463,7 @@ impl<'tcx> Relation<'tcx> {
                         | Rvalue::UnaryOp(_, op)
                         | Rvalue::WrapUnsafeBinder(op, _) => reads(op),
                         Rvalue::Aggregate(_, ops) => ops.iter().any(reads),
+                        Rvalue::Repeat(op, _) => reads(op),
                         Rvalue::BinaryOp(BinOp::Offset, box (base, _)) => reads(base),
                         Rvalue::BinaryOp(_, box (a, b)) => {
                             body.local_decls[dst.local].ty.is_integral() && (reads(a) || reads(b))
@@ -4410,6 +4507,7 @@ impl<'tcx> Relation<'tcx> {
                             .get(&(g, Local::from_usize(0)))
                             .into_iter()
                             .flatten()
+                            .chain(self.ret_from.get(&g).into_iter().flatten())
                             .any(|&j| j >= 1 && arg(j - 1))
                     }),
                 };
@@ -4450,6 +4548,7 @@ impl<'tcx> Relation<'tcx> {
                     Rvalue::Aggregate(_, ops) => {
                         ops.iter().any(|op| carries(op.ty(body, tcx)) && reads(op))
                     }
+                    Rvalue::Repeat(op, _) => carries(op.ty(body, tcx)) && reads(op),
                     Rvalue::BinaryOp(BinOp::Offset, box (base, _)) => reads(base),
                     Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
                         family.contains(&place.local)
@@ -4957,8 +5056,9 @@ impl Shapes {
                 Key::Field(_, did, index) => fields.contains(&(did, index)),
                 Key::Cell(..) | Key::Init(_) => false,
             };
-            let stored = !matches!(key, Key::Init(_));
-            if holder != Obj::Top && objs.contains(&holder) && (named || (facts && stored)) {
+            // Codex round 4: an initializer's self-pointer is the program's (a library or an
+            // unmodelled write puts library memory or `Top` there, never the holder).
+            if holder != Obj::Top && objs.contains(&holder) && (named || facts) {
                 self_holders.insert(holder);
             }
             children
@@ -5558,10 +5658,19 @@ impl RetainedAccessCheck {
                     && let CallKind::LibC(name) = &call.func
                     && name.as_str() == "exit"
                 {
-                    for g in relation.handed_callbacks.iter().filter(|&&g| g != f) {
-                        at.entry(block)
-                            .or_default()
-                            .extend(relation.acc.get(g).into_iter().flatten().copied());
+                    for &g in relation.handed_callbacks.iter() {
+                        // era-5c 146 (ii), Codex round 4: a callback activation is another
+                        // activation, the subject's own function included.
+                        if facts(Rule::SccExtents) {
+                            recursive_at
+                                .entry(block)
+                                .or_default()
+                                .extend(relation.acc.get(&g).into_iter().flatten().copied());
+                        } else if g != f {
+                            at.entry(block)
+                                .or_default()
+                                .extend(relation.acc.get(&g).into_iter().flatten().copied());
+                        }
                     }
                 }
                 if on(Rule::Callbacks)
@@ -5571,9 +5680,13 @@ impl RetainedAccessCheck {
                 {
                     for arg in call.args.iter() {
                         for d in relation.fn_items_in(&arg.node, &items) {
-                            if let Some(g) = d.as_local()
-                                && g != f
-                            {
+                            let Some(g) = d.as_local() else { continue };
+                            if facts(Rule::SccExtents) {
+                                recursive_at
+                                    .entry(block)
+                                    .or_default()
+                                    .extend(relation.acc.get(&g).into_iter().flatten().copied());
+                            } else if g != f {
                                 at.entry(block)
                                     .or_default()
                                     .extend(relation.acc.get(&g).into_iter().flatten().copied());

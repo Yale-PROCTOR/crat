@@ -577,7 +577,7 @@ fn e5c_hold_corpus_rows() {
         // `CRAT_E5C_HOLD_FAULT` names one rule to drop, for the price of each;
         // `CRAT_E5C_HOLD_BYTES=off` drops R1's premise.
         // CRAT_E5C_HOLD_FAULT=Rule[,Rule...]: the first is the fault; all are removed.
-        let rules: [Rule; 49] = [
+        let rules: [Rule; 51] = [
             Rule::OutsideLoad,
             Rule::AllocatorHook,
             Rule::CopyCarry,
@@ -627,6 +627,8 @@ fn e5c_hold_corpus_rows() {
             Rule::SccExtents,
             Rule::FactSelfStores,
             Rule::ExposedProvenance,
+            Rule::IntegerBytes,
+            Rule::ExposedRoots,
         ];
         let named: Vec<Rule> = std::env::var("CRAT_E5C_HOLD_FAULT")
             .unwrap_or_default()
@@ -2901,4 +2903,42 @@ fn e5c_evident_red_r4_transmute() {
 fn e5c_evident_red_r4_callback() {
     let v = of_record(R4_CALLBACK);
     assert!(v["cb::p"].withdraws(), "{v:#?}");
+}
+
+/// Codex round 4's fixes, their faults: each witness goes back to Clear without its rule.
+#[test]
+fn e5c_evident_faults_round4() {
+    let faulted = |code: &str, subject: &str, rule: Rule| {
+        verdicts_opts(
+            code,
+            &[],
+            Options {
+                fault: Some(rule),
+                ..Options::of_record()
+            },
+        )[subject]
+            .withdraws()
+    };
+    assert!(!faulted(R4_BYTES, "entry::p", Rule::IntegerBytes), "bytes");
+    assert!(
+        !faulted(R4_MEMBER, "entry::p", Rule::ExposedRoots),
+        "member"
+    );
+    assert!(
+        !faulted(R4_REPEAT, "entry::p", Rule::OneDerivation),
+        "repeat"
+    );
+    assert!(
+        !faulted(R4_RETURN, "entry::p", Rule::OneDerivation),
+        "return"
+    );
+    assert!(
+        !faulted(R4_STATIC, "entry::p", Rule::FactSelfStores),
+        "static"
+    );
+    assert!(
+        !faulted(R4_TRANSMUTE, "entry::p", Rule::OneDerivation),
+        "transmute"
+    );
+    assert!(!faulted(R4_CALLBACK, "cb::p", Rule::SccExtents), "callback");
 }
