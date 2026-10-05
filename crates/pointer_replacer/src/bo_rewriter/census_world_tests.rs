@@ -251,43 +251,6 @@ fn r815_6_callee_signature(input: &str) -> String {
     }
 }
 
-/// R819-1 item 2 (the scope's certificate, R816-1): two byte formals of an
-/// outside-only entry are separate objects too (`pair-disjoint:scope-closed-program`).
-#[test]
-fn r819_2_two_byte_formals_of_an_outside_entry_are_disjoint() {
-    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs")
-        .replace("psize: *mut i32", "psize: *mut u8")
-        .replace("*psize = value.size;", "*psize = value.size as u8;")
-        .replace("0 as *mut i32", "0 as *mut u8");
-    let signature = r815_6_callee_signature(&input);
-    assert!(signature.contains("psize: Option<&mut u8>"), "({signature})");
-}
-
-/// R819-1 item 2: a shared and a mutable formal of one pointee, which the type
-/// route cannot separate, are separate objects of an outside-only entry.
-#[test]
-fn r819_2_two_typed_formals_of_one_pointee_are_disjoint() {
-    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs")
-        .replace("key: *const i8", "key: *const i32")
-        .replace("*p.offset(i) as i8", "*p.offset(i) as i32");
-    let signature = r815_6_callee_signature(&input);
-    assert!(signature.contains("psize: Option<&mut i32>"), "({signature})");
-}
-
-/// R819-1 item 2's R767 exception: a formal pair the program's provided test
-/// passes one object to (the R767 fixture table's `crat_w6o_zsub` positions 0
-/// and 2) is not certified.
-#[test]
-fn r819_2_control_a_pair_the_provided_test_aliases_is_not_certified() {
-    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs").replace(
-        "pub unsafe extern \"C\" fn binn_object_blob(\n    mut obj: *mut core::ffi::c_void,\n    mut key: *const i8,\n    mut psize: *mut i32,",
-        "pub unsafe extern \"C\" fn crat_w6o_zsub(\n    mut key: *const i8,\n    mut obj: *mut core::ffi::c_void,\n    mut psize: *mut i32,",
-    );
-    assert!(input.contains("fn crat_w6o_zsub("));
-    let signature = r815_6_callee_signature(&input);
-    assert!(signature.contains("psize: *mut i32"), "({signature})");
-}
-
 /// Not covered by P8: an entry the program itself calls (its caller is not
 /// only outside).
 #[test]

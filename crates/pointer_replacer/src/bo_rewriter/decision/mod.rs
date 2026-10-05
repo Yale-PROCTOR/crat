@@ -105,6 +105,8 @@ mod option_ops;
 pub(crate) mod option_thin_extent;
 pub(crate) mod outbound_expression;
 pub(crate) mod outside_byte_view;
+#[cfg(test)]
+mod outside_byte_view_tests;
 pub(crate) mod overlapping_pairs;
 pub(crate) mod ownership_fields_cache_binding;
 pub(crate) mod ownership_fields_constructor;
