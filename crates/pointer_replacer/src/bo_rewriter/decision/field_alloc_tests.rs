@@ -627,3 +627,40 @@ fn w6l_fa_n_the_text_renderer_guards_the_null_base_too() {
         );
     }
 }
+
+/// FA-h (the Codex review of R825-4a) — the guard's binding captures nothing:
+/// with `Encode`'s state pointer itself named `__crat_field_base`, the length
+/// `(*__crat_field_base).ringbuffer_.cur_size_ + 7` must still read the state,
+/// not the bound base. The emission type-checks with either name.
+#[test]
+fn w6l_fa_h_the_null_guard_binds_no_name_the_length_reads() {
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB_NULL).unwrap();
+    assert!(
+        crate::bo_rewriter::verify::type_checks_str(&source),
+        "{source}"
+    );
+    let renamed = RB_NULL.replace(
+        "pub unsafe fn Encode(mut s: *mut State, mut bytes: u64) -> u32 {
+    let mut data = 0 as *mut u8;
+    data = (*s).ringbuffer_.buffer_;
+    let mut mask = (*s).ringbuffer_.mask_ as u64;
+    let mut h = Reader(data.offset(bytes as isize), mask, (*s).pos, bytes);
+    h.wrapping_add(Sum(data, (*s).pos, bytes))",
+        "pub unsafe fn Encode(mut __crat_field_base: *mut State, mut bytes: u64) -> u32 {
+    let mut data = 0 as *mut u8;
+    data = (*__crat_field_base).ringbuffer_.buffer_;
+    let mut mask = (*__crat_field_base).ringbuffer_.mask_ as u64;
+    let mut h = Reader(data.offset(bytes as isize), mask, (*__crat_field_base).pos, bytes);
+    h.wrapping_add(Sum(data, (*__crat_field_base).pos, bytes))",
+    );
+    assert_ne!(renamed, RB_NULL);
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&renamed).unwrap();
+    assert!(
+        flat(&source).contains("(*__crat_field_base).ringbuffer_.cur_size_ as usize + 7"),
+        "{source}"
+    );
+    assert!(
+        crate::bo_rewriter::verify::type_checks_str(&source),
+        "{source}"
+    );
+}
