@@ -14,6 +14,18 @@ const BLOB: &str = include_str!("../testdata/r815_entry_byte_view_beside_typed.r
 /// The proof at `entry`'s call into `binn_object_get` for arguments 1 and 4,
 /// after the certificate reads it.
 fn read(input: &str, entry: &str) -> (A5SiteProofVerdict, &'static str) {
+    read_at(input, "binn_object_get", entry, 1, 4)
+}
+
+/// The proof at `entry`'s call into `callee` for arguments `left` and `right`,
+/// after the certificate reads it.
+fn read_at(
+    input: &str,
+    callee: &str,
+    entry: &str,
+    left: usize,
+    right: usize,
+) -> (A5SiteProofVerdict, &'static str) {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let functions = tcx
             .hir_body_owners()
@@ -22,8 +34,8 @@ fn read(input: &str, entry: &str) -> (A5SiteProofVerdict, &'static str) {
         let facts = super::emitability::collect(tcx, &functions);
         let callee = functions
             .iter()
-            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == "binn_object_get")
-            .expect("binn_object_get");
+            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == callee)
+            .expect("the callee");
         let site = facts.call_args[callee]
             .iter()
             .find(|site| tcx.item_name(site.caller.to_def_id()).as_str() == entry)
@@ -36,7 +48,7 @@ fn read(input: &str, entry: &str) -> (A5SiteProofVerdict, &'static str) {
             left_site: None,
             right_site: None,
         };
-        super::outside_byte_view::read_under_p8(&facts, site, 1, 4, &mut proof);
+        super::outside_byte_view::read_under_p8(&facts, site, left, right, &mut proof);
         (proof.verdict, proof.reason)
     })
     .expect("input type-checks")
@@ -139,4 +151,44 @@ fn r819_2_control_an_assigned_formal_is_not_certified() {
     );
     assert!(input.contains("psize = psize.offset(0);"));
     not_certified(&input, "binn_object_blob");
+}
+
+const ROOTS: &str = include_str!("../testdata/r821_entry_formal_roots.rs");
+
+/// R821-3 item 1: two different formals of one pointee, both mutable, are
+/// certified (W4's instance) — the positive case beside the root controls.
+#[test]
+fn r821_3_two_different_formals_are_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "distinct", 0, 1),
+        (A5SiteProofVerdict::Clear, SAME_POINTEE_MUT)
+    );
+}
+
+/// R821-3 item 1: one formal handed twice is one outside object.
+#[test]
+fn r821_3_control_one_formal_handed_twice_is_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "twice", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
+}
+
+/// R821-3 item 1: two places inside one formal are one outside object.
+#[test]
+fn r821_3_control_two_places_inside_one_formal_are_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "fields", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
+}
+
+/// R821-3 item 1 (wave-6o 123 note 1): a formal whose address is taken may be
+/// reassigned through that address, so it is not the outside caller's pointer.
+#[test]
+fn r821_3_control_a_formal_whose_address_is_taken_is_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "address_taken", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
 }
