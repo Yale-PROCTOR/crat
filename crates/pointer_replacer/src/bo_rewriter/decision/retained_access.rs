@@ -254,18 +254,20 @@ pub(crate) struct Options {
     /// Relay 179, a measurement of N1's closure (off by default; N1 stays RED): a
     /// local's extent takes its own function's accesses at a recursive call to itself.
     pub(crate) close_n1: bool,
-    /// Relay 179, a measurement of N2's closure (off by default; N2 stays RED): `glob`
-    /// stores library memory into its fourth argument's memory.
+    /// `glob` stores library memory into its fourth argument's memory (relay 179's N2
+    /// closure; the contract row of record since relay 183 item 3).
     pub(crate) close_n2: bool,
 }
 
 impl Options {
-    /// The mode of record (R826-1): (E) in the closed world, M1 off.
+    /// The mode of record (R826-1): (E) in the closed world, M1 off, with `glob`'s
+    /// store row (relay 183 item 3).
     pub(crate) fn of_record() -> Self {
         Options {
             closed: true,
             evident: true,
             close_n1: true,
+            close_n2: true,
             faults: 1u64 << Rule::RoundTrip as u64,
             ..Options::default()
         }

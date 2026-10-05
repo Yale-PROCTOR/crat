@@ -2208,10 +2208,39 @@ fn of_record(code: &str) -> FxHashMap<String, Verdict> {
     verdicts_opts(code, &[], Options::of_record())
 }
 
+/// R833-2 (H3 is (b)): what the rule holds is a shape the program stores and uses within
+/// one call from outside, here through the program's own driver `run`.
+const W1_RUN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; }
+#[repr(C)] pub struct bz_stream { pub avail_in: u32, pub state: *mut EState }
+#[repr(C)] pub struct EState { pub strm: *mut bz_stream, pub mode: i32 }
+pub unsafe fn init(strm: *mut bz_stream) -> i32 {
+    let s = malloc(16) as *mut EState;
+    (*s).strm = strm;
+    (*strm).state = s;
+    0
+}
+unsafe fn copy_input(s: *mut EState) { (*(*s).strm).avail_in -= 1; }
+pub unsafe fn handle_compress(strm: *mut bz_stream) -> i32 {
+    let s = (*strm).state;
+    copy_input(s);
+    (*strm).avail_in as i32
+}
+pub unsafe fn run(strm: *mut bz_stream) -> i32 { init(strm); handle_compress(strm) }
+"#;
+
+const W2_RUN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+#[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
+pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
+pub unsafe fn append(v: *mut small_vec, x: u64) { *(*v).p.offset((*v).n as isize) = x; (*v).n += 1; }
+pub unsafe fn run(v: *mut small_vec) { init(v); append(v, 1); }
+"#;
+
 #[test]
-#[ignore = "era-5c 145 H3: both W1 entries are uncalled, so in the closed world the client's object is two fresh objects; the user's answer to H3 decides"]
 fn e5c_evident_record_holds_the_cycle() {
-    let v = of_record(W1_STREAM);
+    let v = of_record(W1_RUN);
     let receipt = of(&v, "handle_compress::strm").evident_receipt();
     assert!(
         receipt
@@ -2222,9 +2251,8 @@ fn e5c_evident_record_holds_the_cycle() {
 }
 
 #[test]
-#[ignore = "era-5c 145 H3: as above, for W2's init and append"]
 fn e5c_evident_record_holds_the_self_reference() {
-    let v = of_record(W2_SELF);
+    let v = of_record(W2_RUN);
     let receipt = of(&v, "append::v").evident_receipt();
     assert!(
         receipt
@@ -2232,6 +2260,35 @@ fn e5c_evident_record_holds_the_self_reference() {
             .is_some_and(|r| r.starts_with("evident:self-reference:small_vec.p")),
         "{receipt:?}"
     );
+}
+
+/// R833-2, (b) stated: each call from outside is taken on its own. A shape that one entry
+/// stores and another entry uses, both called only from outside, is not held (P9 covers it).
+#[test]
+fn e5c_evident_record_b_one_call_from_outside() {
+    let w1 = of_record(W1_STREAM);
+    assert_eq!(of(&w1, "handle_compress::strm"), &Verdict::Clear, "{w1:#?}");
+    let w2 = of_record(W2_SELF);
+    assert_eq!(of(&w2, "append::v"), &Verdict::Clear, "{w2:#?}");
+}
+
+/// Relay 183 item 3: `glob`'s contract row is in the facts of record (it stores library
+/// memory into its fourth argument's memory). Under (E) the write-back is no evident
+/// shape (Clear, P9); without (E) the same facts hold it.
+#[test]
+fn e5c_evident_record_glob_row() {
+    assert!(Options::of_record().close_n2);
+    assert_eq!(of(&of_record(N2_GLOB_WRITEBACK), "f::p"), &Verdict::Clear);
+    let facts = verdicts_opts(
+        N2_GLOB_WRITEBACK,
+        &[],
+        Options {
+            evident: false,
+            closed: false,
+            ..Options::of_record()
+        },
+    );
+    assert!(of(&facts, "f::p").withdraws(), "{facts:#?}");
 }
 
 #[test]
@@ -2487,4 +2544,106 @@ fn e5c_evident_faults_round2() {
             .withdraws(),
         "REC"
     );
+}
+
+// ---- The review of (E), round 3: Codex (2026-10-05, at 6ea2ad111). Four more variants of
+// ---- round 2's classes, as RED witnesses under the mode of record; open while the user
+// ---- chooses among (i) / (ii) / (iii) (era-5c 145a §4, relay 185).
+
+const R3_AGG: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct A { q: *mut i32 }
+static mut KEEP: *mut i32 = 0 as *mut i32;
+unsafe fn keep(q: *mut i32) { KEEP = q; }
+unsafe fn f(p: *mut i32) {
+    let a = A { q: p };
+    let q = a.q;
+    let r = q.offset(0);
+    keep(r);
+    *KEEP = 2;
+    *p = 3;
+}
+pub unsafe fn entry() {
+    let mut x = 0;
+    let p = &mut x as *mut i32;
+    f(p);
+    *p = 4;
+}
+"#;
+
+const R3_REC: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+unsafe fn f(h: *mut H, n: i32) {
+    let p = (*h).q;
+    *p = 1;
+    if n > 0 { g(h, n - 1); }
+    *p = 3;
+}
+unsafe fn g(h: *mut H, n: i32) { f(h, n); }
+pub unsafe fn entry() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    h.q = &mut h.x as *mut i32;
+    f(&mut h as *mut H, 1);
+}
+"#;
+
+const R3_SLOT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+unsafe fn f(p: *mut i32, h: *mut H) {
+    *p = 1;
+    let q = (*h).q;
+    *q = 2;
+    *p = 3;
+}
+pub unsafe fn entry() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    let b = &mut h as *mut H;
+    let slot = &mut (*b).q as *mut *mut i32;
+    let v = &mut (*b).x as *mut i32;
+    *slot = v;
+    f(v, b);
+}
+"#;
+
+const R3_TOP: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+unsafe fn f(p: *mut i32, h: *mut H) {
+    *p = 1;
+    let q = (*h).q;
+    let r = (q as usize) as *mut i32;
+    *r = 2;
+    *p = 3;
+}
+pub unsafe fn entry() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    h.q = &mut h.x as *mut i32;
+    let p = (&mut h.x as *mut i32 as usize) as *mut i32;
+    f(p, &mut h as *mut H);
+}
+"#;
+
+#[test]
+#[ignore = "RED: Codex round 3, AGG' (era-5c 146): a derivation after the extraction; open under the user's (i)/(ii)/(iii)"]
+fn e5c_evident_red_r3_agg() {
+    let v = of_record(R3_AGG);
+    assert!(v["f::p"].withdraws(), "{v:#?}");
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+#[ignore = "RED: Codex round 3, REC' (era-5c 146): mutual recursion; open under the user's (i)/(ii)/(iii)"]
+fn e5c_evident_red_r3_rec() {
+    assert!(of_record(R3_REC)["f::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: Codex round 3, SLOT' (era-5c 146): a field address through a pointer; open under the user's (i)/(ii)/(iii)"]
+fn e5c_evident_red_r3_slot() {
+    assert!(of_record(R3_SLOT)["f::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: Codex round 3, TOP' (era-5c 146): both endpoints Top through integer casts; open under the user's (i)/(ii)/(iii)"]
+fn e5c_evident_red_r3_top() {
+    assert!(of_record(R3_TOP)["f::p"].withdraws());
 }
