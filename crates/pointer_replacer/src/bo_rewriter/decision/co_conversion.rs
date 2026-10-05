@@ -1659,8 +1659,8 @@ fn escape_block_reason(
 
 /// R808-5 / R810-2 — the proven-overlap formal pairs: `(callee, inner, outer)`
 /// where, at some call, the inner argument provably lies inside the outer
-/// argument's referent, carried to a callee that receives both bare. With the
-/// callee of each key.
+/// argument's referent or is the same pointer (R819-1 item 4), carried to a
+/// callee that receives both bare. With the callee of each key.
 pub(crate) fn proven_overlaps(
     facts: &EmitabilityFacts,
     subjects: &[Subject],
@@ -1706,7 +1706,10 @@ pub(crate) fn proven_overlaps(
                                 _ => false,
                             }
                         });
-                        if inner.inside_of.contains(&outer_root) || carried {
+                        // R819-1 item 4: the same pointer at both positions
+                        // (`zmod(a, a, d)`) overlaps by identity.
+                        let same_pointer = bare(inner.shape) == Some(outer_root);
+                        if inner.inside_of.contains(&outer_root) || carried || same_pointer {
                             let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
                             proven_callees.insert(key.0, *callee);
                             grew |= proven_overlap.insert(key);
