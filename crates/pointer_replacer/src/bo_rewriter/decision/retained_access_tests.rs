@@ -2369,3 +2369,96 @@ fn e5c_evident_faults() {
         "N1"
     );
 }
+
+// ---- The review of (E), round 2: Codex (2026-10-05, at 5bb6cc7d1). Variants of round 1's
+// ---- classes the fixes do not cover, as RED witnesses under the mode of record.
+
+const CX_AGG: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct A { q: *mut i32 }
+static mut G: *mut i32 = 0 as *mut i32;
+unsafe fn keep(q: *mut i32) { G = q; }
+pub unsafe fn f(p: *mut i32) {
+    let a = A { q: p }; let q = a.q;
+    keep(q); *G = 1; *p = 2;
+}
+"#;
+
+const CX_REC: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+static mut G: *mut i32 = 0 as *mut i32;
+unsafe fn rec(n: u32) {
+    let p = G; *p = 1;
+    if n > 0 { rec(n - 1); }
+    *p = 2;
+}
+pub unsafe fn run() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    h.q = &raw mut h.x; G = h.q; rec(1);
+}
+"#;
+
+const CX_TOP: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+unsafe fn f(p: *mut H) {
+    let bits = (*p).q as usize;
+    let r = bits as *mut i32;
+    *r = 1; (*p).x = 2;
+}
+pub unsafe fn run() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    h.q = &raw mut h.x; f(&raw mut h);
+}
+"#;
+
+const CX_SLOT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+unsafe fn f(p: *mut H) {
+    let q = (*p).q; *q = 1; (*p).x = 2;
+}
+pub unsafe fn run() {
+    let mut h = H { x: 0, q: 0 as *mut i32 };
+    let slot = &raw mut h.q;
+    *slot = &raw mut h.x;
+    f(&raw mut h);
+}
+"#;
+
+const CX_RAW: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] struct H { x: i32, q: *mut i32 }
+pub unsafe fn f(p: *mut H, g: *mut H) {
+    (*g).q = &raw mut (*p).x;
+    *(*g).q = 1;
+    (*p).x = 2;
+}
+"#;
+
+#[test]
+#[ignore = "RED: era-5c 145a, Codex round 2, AGG"]
+fn e5c_evident_red_cx_agg() {
+    assert!(of_record(CX_AGG)["f::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: era-5c 145a, Codex round 2, REC"]
+fn e5c_evident_red_cx_rec() {
+    assert!(of_record(CX_REC)["rec::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: era-5c 145a, Codex round 2, TOP"]
+fn e5c_evident_red_cx_top() {
+    assert!(of_record(CX_TOP)["f::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: era-5c 145a, Codex round 2, SLOT"]
+fn e5c_evident_red_cx_slot() {
+    assert!(of_record(CX_SLOT)["f::p"].withdraws());
+}
+#[test]
+#[ignore = "RED: era-5c 145a, Codex round 2, RAW"]
+fn e5c_evident_red_cx_raw() {
+    assert!(of_record(CX_RAW)["f::p"].withdraws());
+}
