@@ -2021,6 +2021,20 @@ fn peeled_pointer_casts(original: &ast::Expr) -> &ast::Expr {
     expression
 }
 
+/// The A5 raw temporary's target formal, classified as the raw-view check reads it.
+fn raw_view_target_type(
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+) -> MatchResult<PointerType> {
+    pointer_type(
+        &target
+            .parameters
+            .get(index)
+            .ok_or("raw-target-parameter-absent")?
+            .type_text,
+    )
+}
+
 fn validate_raw(
     input: &BridgeCustodyInput<'_>,
     expected: &BridgeExpectation,
@@ -2045,13 +2059,7 @@ fn validate_raw(
                     .as_deref()
                     .ok_or("raw-temporary-type-absent")?,
             )?;
-            let target_type = pointer_type(
-                &target
-                    .parameters
-                    .get(index)
-                    .ok_or("raw-target-parameter-absent")?
-                    .type_text,
-            )?;
+            let target_type = raw_view_target_type(target, index)?;
             if !matches!(
                 (temporary_type, target_type),
                 (PointerType::Raw(_), PointerType::Raw(false))
@@ -3042,6 +3050,27 @@ fn bound_alias(scope: &Inventory, module: &str, name: &str, depth: usize) -> Opt
         }
         _ => None,
     }
+}
+
+/// R819-3 (main 174a): the raw-view target check on one emitted source, for the witness.
+#[cfg(test)]
+pub(crate) fn raw_view_target_check_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        match raw_view_target_type(target, index)? {
+            PointerType::Raw(_) => Ok(()),
+            _ => Err("raw-view-target-or-temporary-is-not-raw".into()),
+        }
+    })
 }
 
 /// R605-2: the pending-target check on one emitted source, for the witness.

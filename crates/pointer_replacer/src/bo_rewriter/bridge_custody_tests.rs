@@ -3061,6 +3061,57 @@ mod nested {
     );
 }
 
+/// **R819-3 (main 174a) — the A5 raw temporary's target formal, typed through a raw
+/// alias, is raw.** batch 55's combined brotli probe delivers `WriteMetaBlockInternal`'s
+/// `literal_context_lut` and passes it to `BrotliBuildMetaBlockGreedy(..,
+/// literal_context_lut: ContextLut, ..)` through `let __crat_a5_raw_11406714_6: *const u8
+/// = core::ptr::from_ref(literal_context_lut);`. The raw-view check classified the formal
+/// as written, so `ContextLut` read `raw-view-target-or-temporary-is-not-raw` and the two
+/// pair rows, their pending sibling and the temporary failed custody (`data=false`).
+/// R605-2's alias binding already served the pending check; the raw-view check reads the
+/// same binding. A non-pointer alias and a name the module does not bind stay not raw.
+#[test]
+fn r819_3_a_raw_view_target_typed_through_a_raw_alias_is_raw() {
+    use crate::bo_rewriter::bridge_custody_match::raw_view_target_check_for_test as check;
+    const EMITTED: &str = "mod metablock {
+    pub type ContextLut = *const u8;
+    pub type Count = usize;
+    pub unsafe fn greedy(lut: ContextLut, n: Count, written: *const u8, unbound: Lut) {}
+}
+mod encode {
+    use crate::metablock::ContextLut;
+    pub unsafe fn imported(lut: ContextLut) {}
+}
+#[global_allocator]
+static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;
+";
+    assert_eq!(
+        check(EMITTED, "metablock::greedy", 0),
+        Ok(()),
+        "the alias of a raw pointer"
+    );
+    assert_eq!(
+        check(EMITTED, "metablock::greedy", 1),
+        Err("raw-view-target-or-temporary-is-not-raw".to_owned()),
+        "a non-pointer alias is not raw"
+    );
+    assert_eq!(
+        check(EMITTED, "metablock::greedy", 2),
+        Ok(()),
+        "a written raw pointer"
+    );
+    assert_eq!(
+        check(EMITTED, "metablock::greedy", 3),
+        Err("raw-view-target-or-temporary-is-not-raw".to_owned()),
+        "a name its module does not bind"
+    );
+    assert_eq!(
+        check(EMITTED, "encode::imported", 0),
+        Ok(()),
+        "imported by its crate path"
+    );
+}
+
 /// **R760-1 x R605-2 (main 160d) — the emitted crate's `#[global_allocator]` does not
 /// hide its modules' bindings.** Every emitted tree declares `#[global_allocator] static
 /// __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` at its root (R760-1, batch 54), and the
