@@ -2021,12 +2021,16 @@ fn peeled_pointer_casts(original: &ast::Expr) -> &ast::Expr {
     expression
 }
 
-/// The A5 raw temporary's target formal, classified as the raw-view check reads it.
+/// The A5 raw temporary's target formal, classified as the raw-view check reads it:
+/// through its module's own alias binding (R605-2), as the pending check reads it.
 fn raw_view_target_type(
+    scopes: &[&Inventory],
     target: &super::bridge_custody_syntax::Function,
     index: usize,
 ) -> MatchResult<PointerType> {
-    pointer_type(
+    formal_pointer_type(
+        scopes,
+        &target.owner,
         &target
             .parameters
             .get(index)
@@ -2059,7 +2063,8 @@ fn validate_raw(
                     .as_deref()
                     .ok_or("raw-temporary-type-absent")?,
             )?;
-            let target_type = raw_view_target_type(target, index)?;
+            let target_type =
+                raw_view_target_type(&[input.emitted, input.original], target, index)?;
             if !matches!(
                 (temporary_type, target_type),
                 (PointerType::Raw(_), PointerType::Raw(false))
@@ -3066,7 +3071,7 @@ pub(crate) fn raw_view_target_check_for_test(
         .find(|function| function.owner == owner)
         .ok_or("owner-absent")?;
     rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
-        match raw_view_target_type(target, index)? {
+        match raw_view_target_type(&[&inventory], target, index)? {
             PointerType::Raw(_) => Ok(()),
             _ => Err("raw-view-target-or-temporary-is-not-raw".into()),
         }
