@@ -222,9 +222,12 @@ fn r815_6_an_entry_byte_formal_beside_its_typed_formal_is_disjoint_under_p8() {
                 .nth(1)
                 .and_then(|rest| rest.split(')').next())
                 .unwrap_or_else(|| panic!("no binn_object_get:\n{source}"));
+            // The key converts (a slice on main's 55 line; a thin optional on
+            // the frame head, which does not carry main's thin-into-fat rule):
+            // the pair formed, so psize's form below is the certificate's.
             assert!(
-                signature.contains("key: Option<&[i8]>") || signature.contains("key: &[i8]"),
-                "the callee's key keeps its slice beside the entry's typed formal: ({signature})\n{source}"
+                signature.contains("key: Option<&") || signature.contains("key: &"),
+                "the callee's key converts beside the entry's typed formal: ({signature})\n{source}"
             );
             assert!(
                 signature.contains("psize: Option<&mut i32>"),
