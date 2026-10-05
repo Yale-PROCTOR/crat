@@ -938,6 +938,12 @@ pub(crate) struct TerminalCallPlans {
     pub(crate) pair_raw_calls: Vec<PairRawViewCall>,
     pub(crate) seam_edits: Vec<SeamEdit>,
     pub(crate) revert_found_form_edits: Vec<RevertFoundFormEdit>,
+    /// **R815-7 item 2 (wave-6a 150, F1).** `(callee, caller)` for every
+    /// argument a caller's native Box plan renders itself (the seam's
+    /// `native-box-lend` zero-syntax sites). A native lend leaves no input twin
+    /// at that argument, so the callee follows the caller's reversion. An
+    /// ordinary interface site keeps its input alternative and is not here.
+    pub(crate) native_lend_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
 }
 
 impl TerminalCallPlans {
@@ -962,6 +968,28 @@ impl TerminalCallPlans {
             .effective_reverted_classes(classes, atoms);
         let mut reasons = BTreeMap::<SignatureClassId, BTreeSet<String>>::new();
         loop {
+            // R815-7 item 2: a reverted caller takes the callees of its
+            // native lends with it, to a fixpoint.
+            loop {
+                let followers = self
+                    .native_lend_dependencies
+                    .iter()
+                    .filter(|(callee, caller)| {
+                        effective.contains(caller) && !effective.contains(callee)
+                    })
+                    .map(|(callee, caller)| (*callee, *caller))
+                    .collect::<Vec<_>>();
+                if followers.is_empty() {
+                    break;
+                }
+                for (callee, caller) in followers {
+                    effective.insert(callee);
+                    reasons.entry(callee).or_default().insert(format!(
+                        "native-lend-caller-reverted:caller={}",
+                        caller.order_key()
+                    ));
+                }
+            }
             let mut owners = BTreeSet::new();
             for (&key, input) in &self.callee_parameter_inputs {
                 let Some(Err(reason)) = input.select(&effective, atoms) else { continue };
@@ -1021,6 +1049,18 @@ impl TerminalCallPlans {
             pair_raw_calls: seams.pair_raw_calls.clone(),
             seam_edits: seams.edits.clone(),
             revert_found_form_edits: seams.revert_found_form_edits.clone(),
+            native_lend_dependencies: {
+                let mut edges = seams
+                    .zero_bridges
+                    .iter()
+                    .filter(|site| site.found_form == "native-box-lend")
+                    .map(|site| (site.owner_class, SignatureClassId::of(site.caller)))
+                    .filter(|(callee, caller)| callee != caller)
+                    .collect::<Vec<_>>();
+                edges.sort();
+                edges.dedup();
+                edges
+            },
         }
     }
 }
