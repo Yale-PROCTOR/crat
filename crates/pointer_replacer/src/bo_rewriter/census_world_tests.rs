@@ -234,3 +234,65 @@ fn r815_6_an_entry_byte_formal_beside_its_typed_formal_is_disjoint_under_p8() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R815-6's controls: the signature of `binn_object_get` for a variant of the
+/// P8 reduction, in the census world.
+fn r815_6_callee_signature(input: &str) -> String {
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.split("fn binn_object_get(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no binn_object_get:\n{source}"))
+                .to_owned()
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
+
+/// Not covered by P8: two byte formals (`psize` a byte pointer too).
+#[test]
+fn r815_6_control_two_byte_formals_are_not_certified() {
+    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs")
+        .replace("psize: *mut i32", "psize: *mut u8")
+        .replace("*psize = value.size;", "*psize = value.size as u8;")
+        .replace("0 as *mut i32", "0 as *mut u8");
+    let signature = r815_6_callee_signature(&input);
+    assert!(signature.contains("psize: *mut u8"), "({signature})");
+}
+
+/// Not covered by P8: two typed formals (`key` a string of `i32`, the pointee
+/// of `psize`, so the type route does not separate them either).
+#[test]
+fn r815_6_control_two_typed_formals_are_not_certified() {
+    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs")
+        .replace("key: *const i8", "key: *const i32")
+        .replace("*p.offset(i) as i8", "*p.offset(i) as i32");
+    let signature = r815_6_callee_signature(&input);
+    assert!(signature.contains("psize: *mut i32"), "({signature})");
+}
+
+/// Not covered by P8: an entry the program itself calls (its caller is not
+/// only outside).
+#[test]
+fn r815_6_control_an_entry_called_in_the_program_is_not_certified() {
+    let input = format!(
+        "{}\npub unsafe fn blob_user(o: *mut core::ffi::c_void, k: *const i8, s: *mut i32) -> *mut core::ffi::c_void {{ binn_object_blob(o, k, s) }}\n",
+        include_str!("testdata/r815_entry_byte_view_beside_typed.rs")
+    );
+    let signature = r815_6_callee_signature(&input);
+    assert!(signature.contains("psize: *mut i32"), "({signature})");
+}
+
+/// Not covered by P8: an entry that is not exported (no `#[no_mangle]`).
+#[test]
+fn r815_6_control_an_unexported_function_is_not_certified() {
+    let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs").replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn binn_object_blob(",
+        "pub unsafe extern \"C\" fn binn_object_blob(",
+    );
+    assert!(input.contains("\npub unsafe extern \"C\" fn binn_object_blob("));
+    let signature = r815_6_callee_signature(&input);
+    assert!(signature.contains("psize: *mut i32"), "({signature})");
+}
