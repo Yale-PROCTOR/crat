@@ -1631,10 +1631,22 @@ fn same_source_binding_inner(
     // R605-2's binding resolves to a raw pointer is matched as an unannotated local is:
     // by identity, with the emitted form a reference whose mutability is not above the
     // raw pointer's. The pointee is not compared.
-    let alias_raw = original
-        .type_text
-        .as_deref()
-        .and_then(|text| raw_alias_mutability(input, &original.owner, text));
+    // It never takes away a match the type test already makes (the Codex review of
+    // R833-4): an undelivered local keeps the alias on both sides and pairs by type.
+    let type_ok = original.type_text.is_none()
+        || local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
+            .unwrap_or(false);
+    let alias_identity = !type_ok
+        && original
+            .type_text
+            .as_deref()
+            .and_then(|text| raw_alias_mutability(input, &original.owner, text))
+            .is_some_and(|raw_mutable| {
+                matches!(
+                    emitted.type_text.as_deref().map(pointer_type),
+                    Some(Ok(PointerType::Reference(mutable))) if raw_mutable || !mutable
+                )
+            });
     if input
         .original
         .bindings
@@ -1649,20 +1661,11 @@ fn same_source_binding_inner(
             .filter(|binding| binding.owner == emitted.owner && binding.name == emitted.name)
             .count()
             != 1
-        || (original.type_text.is_some()
-            && alias_raw.is_none()
-            && !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
-                .unwrap_or(false))
-        || alias_raw.is_some_and(|raw_mutable| {
-            !matches!(
-                emitted.type_text.as_deref().map(pointer_type),
-                Some(Ok(PointerType::Reference(mutable))) if raw_mutable || !mutable
-            )
-        })
+        || !(type_ok || alias_identity)
     {
         return false;
     }
-    let by_identity = original.type_text.is_none() || alias_raw.is_some();
+    let by_identity = original.type_text.is_none() || alias_identity;
     let pair = (original.id, emitted.id);
     if !visiting.insert(pair) {
         return false;

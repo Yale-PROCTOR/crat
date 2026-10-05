@@ -1239,7 +1239,10 @@ mod matcher {
         );
         assert_eq!(unchanged.rows[0].correspondence, Correspondence::ByType);
         // And an alias-identity candidate whose initializer differs refuses, claiming nothing.
-        let other_init = case("let mut p: Lut = seed;", "let mut p: &u8 = &*seed;");
+        let other_init = case(
+            "let mut p: Lut = seed;",
+            "let mut p: &u8 = &*seed.offset(1);",
+        );
         assert_eq!(
             other_init.rows[0].status,
             ReceiptStatus::Unresolved,
