@@ -320,3 +320,29 @@ fn r819_1_a_nullable_entry_formal_never_falls_back_to_a_plain_reference() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R819-1 item 1's control: without nullability evidence (the callee writes
+/// through `pid` unconditionally, no null test) the entry keeps its reference.
+#[test]
+fn r819_1_control_a_formal_without_nullability_evidence_keeps_its_reference() {
+    let input = include_str!("testdata/r819_nullable_entry_formal_option_withdrawn.rs").replace(
+        "    if !pid.is_null() {\n        *pid = pos;\n        keep(pid);\n    }\n",
+        "    *pid = pos;\n    keep(pid);\n",
+    );
+    assert!(!input.contains("pid.is_null()"));
+    match super::rewrite_m1_census_world(&input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            let signature = flat
+                .split("fn map_pair(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no map_pair:\n{source}"));
+            assert!(
+                signature.contains("pid: &mut i32"),
+                "({signature})\n{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
