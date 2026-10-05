@@ -324,3 +324,25 @@ fn r819_1_control_a_formal_without_nullability_evidence_keeps_its_reference() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R819-1 item 4's control: the same pointer at two positions of a callee that
+/// only reads both (`zcmp(b, b)`) keeps its shared references.
+#[test]
+fn r819_4_control_the_same_pointer_read_at_two_positions_keeps_its_references() {
+    let input = include_str!("testdata/r819_same_pointer_two_positions.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            let signature = flat
+                .split("fn zcmp(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no zcmp:\n{source}"));
+            assert!(
+                signature.contains("a: &Z") && signature.contains("b: &Z"),
+                "({signature})\n{source}"
+            );
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}

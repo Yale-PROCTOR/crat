@@ -961,57 +961,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     // fact about the callee's two FORMALS, so it travels with them when the
     // callee hands both on bare (`ReadDistance(s, br)` → `ReadDistanceInternal
     // (safe, s, br)`). Every position counts, converting or not.
-    let param_index: FxHashMap<NodeKey, usize> = subjects
-        .iter()
-        .filter_map(|subject| match subject.kind {
-            SubjectKind::Param { hir_index } => Some(((subject.fn_did, subject.hir_id), hir_index)),
-            SubjectKind::Local => None,
-        })
-        .collect();
-    let bare = |shape: ArgShape| match shape {
-        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => Some(binding),
-        _ => None,
-    };
-    // (callee, inner position, outer position): the inner formal lies inside
-    // the outer formal's referent at some call.
-    let mut proven_overlap = std::collections::BTreeSet::<(u32, usize, usize)>::new();
-    let mut proven_callees = FxHashMap::<u32, LocalDefId>::default();
-    loop {
-        let mut grew = false;
-        for (callee, sites) in &facts.call_args {
-            for site in sites {
-                for outer in &site.args {
-                    let Some(outer_root) = bare(outer.shape) else { continue };
-                    for inner in &site.args {
-                        if inner.index == outer.index {
-                            continue;
-                        }
-                        let carried = bare(inner.shape).is_some_and(|inner_root| {
-                            match (
-                                param_index.get(&(site.caller, inner_root)),
-                                param_index.get(&(site.caller, outer_root)),
-                            ) {
-                                (Some(&i), Some(&o)) => proven_overlap.contains(&(
-                                    site.caller.local_def_index.as_u32(),
-                                    i,
-                                    o,
-                                )),
-                                _ => false,
-                            }
-                        });
-                        if inner.inside_of.contains(&outer_root) || carried {
-                            let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
-                            proven_callees.insert(key.0, *callee);
-                            grew |= proven_overlap.insert(key);
-                        }
-                    }
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
+    let (proven_overlap, proven_callees) = proven_overlaps(facts, subjects);
     for &(callee, inner, outer) in &proven_overlap {
         let callee = proven_callees[&callee];
         let keys = [outer, inner].map(|index| param_key.get(&(callee, index)).copied());
@@ -1705,6 +1655,71 @@ fn escape_block_reason(
         EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
         EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
     }
+}
+
+/// R808-5 / R810-2 — the proven-overlap formal pairs: `(callee, inner, outer)`
+/// where, at some call, the inner argument provably lies inside the outer
+/// argument's referent, carried to a callee that receives both bare. With the
+/// callee of each key.
+pub(crate) fn proven_overlaps(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+) -> (
+    std::collections::BTreeSet<(u32, usize, usize)>,
+    FxHashMap<u32, LocalDefId>,
+) {
+    let param_index: FxHashMap<NodeKey, usize> = subjects
+        .iter()
+        .filter_map(|subject| match subject.kind {
+            SubjectKind::Param { hir_index } => Some(((subject.fn_did, subject.hir_id), hir_index)),
+            SubjectKind::Local => None,
+        })
+        .collect();
+    let bare = |shape: ArgShape| match shape {
+        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => Some(binding),
+        _ => None,
+    };
+    // (callee, inner position, outer position): the inner formal lies inside
+    // the outer formal's referent at some call.
+    let mut proven_overlap = std::collections::BTreeSet::<(u32, usize, usize)>::new();
+    let mut proven_callees = FxHashMap::<u32, LocalDefId>::default();
+    loop {
+        let mut grew = false;
+        for (callee, sites) in &facts.call_args {
+            for site in sites {
+                for outer in &site.args {
+                    let Some(outer_root) = bare(outer.shape) else { continue };
+                    for inner in &site.args {
+                        if inner.index == outer.index {
+                            continue;
+                        }
+                        let carried = bare(inner.shape).is_some_and(|inner_root| {
+                            match (
+                                param_index.get(&(site.caller, inner_root)),
+                                param_index.get(&(site.caller, outer_root)),
+                            ) {
+                                (Some(&i), Some(&o)) => proven_overlap.contains(&(
+                                    site.caller.local_def_index.as_u32(),
+                                    i,
+                                    o,
+                                )),
+                                _ => false,
+                            }
+                        });
+                        if inner.inside_of.contains(&outer_root) || carried {
+                            let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
+                            proven_callees.insert(key.0, *callee);
+                            grew |= proven_overlap.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    (proven_overlap, proven_callees)
 }
 
 #[cfg(test)]

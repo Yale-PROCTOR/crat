@@ -125,6 +125,8 @@ pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]
 mod pinned_local_tests;
+#[cfg(test)]
+mod proven_overlap_tests;
 pub(crate) mod raw_boundary;
 pub(crate) mod raw_boundary_contracts;
 pub(crate) mod raw_field_null;
