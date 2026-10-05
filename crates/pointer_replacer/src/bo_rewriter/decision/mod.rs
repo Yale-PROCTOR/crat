@@ -2002,6 +2002,97 @@ fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
 /// Corpus-unreachable by construction, which is precisely why it is witnessed
 /// through the `perturb` hook rather than by a sweep: a guard no test can break
 /// is not a guard.
+/// A safe form that is not optional.
+fn delivers_non_optional(decision: &Decision) -> bool {
+    match decision {
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::Cursor { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Box(_) => true,
+        Decision::Opt { .. } | Decision::Degraded(_) => false,
+    }
+}
+
+/// The subject's OWN nullability evidence (R824-2): a null literal at its
+/// construction, a null assignment to it, a null test of it, or a caller's
+/// null literal at its position.
+fn own_nullable_evidence(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let key = (subject.fn_did, subject.hir_id);
+    subject.null_init
+        || ctx
+            .constructions
+            .init_hirs
+            .get(&key)
+            .is_some_and(|hir| emitability::is_zero_literal(ctx.tcx.hir_node(*hir).expect_expr()))
+        || ctx
+            .opt_uses
+            .get(&key)
+            .is_some_and(|uses| uses.null_assigned)
+        || null_assigned_in_body(ctx.tcx, subject)
+        || null_tested(ctx, subject)
+        || option_ops::param_receives_null_literal(ctx.facts, subject)
+}
+
+fn null_tested(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    ctx.facts
+        .raw_only_uses
+        .get(&(subject.fn_did, subject.hir_id))
+        .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+}
+
+/// R517-10's local: null-initialized, with no other null evidence and never
+/// handed on bare to a call (the declaration planner renders it `&mut []` /
+/// `&[]` until its assignment).
+fn declaration_owns_null_init(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let key = (subject.fn_did, subject.hir_id);
+    matches!(subject.kind, SubjectKind::Local)
+        && subject.null_init
+        && !ctx.opt_uses.get(&key).is_some_and(|uses| uses.null_assigned)
+        && !null_assigned_in_body(ctx.tcx, subject)
+        && !null_tested(ctx, subject)
+        && !ctx.facts.call_args.values().flatten().any(|site| {
+            site.caller == subject.fn_did
+                && site
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg.shape, emitability::ArgShape::BareLocal(b) if b == subject.hir_id))
+        })
+}
+
+/// A null literal assigned to the subject's binding anywhere in its body.
+fn null_assigned_in_body(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct NullAssign<'tcx> {
+        binding: HirId,
+        found: bool,
+        _tcx: TyCtxt<'tcx>,
+    }
+    impl<'v> Visitor<'v> for NullAssign<'_> {
+        fn visit_expr(&mut self, expr: &'v rustc_hir::Expr<'v>) {
+            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+                && emitability::is_zero_literal(rhs)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(subject.fn_did) else {
+        return false;
+    };
+    let mut visitor = NullAssign {
+        binding: subject.hir_id,
+        found: false,
+        _tcx: tcx,
+    };
+    visitor.visit_body(body);
+    visitor.found
+}
+
 /// Test-only: subjects (by label) whose Option stage a witness withdraws, the
 /// way an exclusion re-derivation would (R824-2's witnesses).
 #[cfg(test)]
@@ -2010,14 +2101,32 @@ pub(crate) static FORCED_OPTION_WITHDRAWALS: std::sync::Mutex<Vec<String>> =
 
 /// Is the Option family stage enabled for this subject?
 fn option_stage_enabled(family_policy: &super::additive::FamilyPolicy, subject: &Subject) -> bool {
+    !forced_option_withdrawal(subject)
+        && family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
+}
+
+/// Is the Option stage WITHDRAWN for this subject: the run has reached the
+/// Option stage, and an exclusion re-derivation took it back (a stage not yet
+/// reached is not a withdrawal: earlier stages are candidates, not deliveries).
+fn option_stage_withdrawn(
+    family_policy: &super::additive::FamilyPolicy,
+    subject: &Subject,
+) -> bool {
+    forced_option_withdrawal(subject)
+        || (family_policy.stage >= FamilyStage::Option
+            && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option))
+}
+
+fn forced_option_withdrawal(subject: &Subject) -> bool {
     #[cfg(test)]
     if FORCED_OPTION_WITHDRAWALS
         .lock()
         .is_ok_and(|labels| labels.contains(&subject.label))
     {
-        return false;
+        return true;
     }
-    family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
+    let _ = subject;
+    false
 }
 
 fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
@@ -2033,6 +2142,24 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
             DegradeReason::RetainedAlias { detail },
+        );
+    }
+    // R824-2 (§29, R819-1): with the Option stage withdrawn, a subject whose
+    // OWN evidence is nullable is never delivered in a non-optional safe form
+    // (reference, slice, cursor or owner), whichever promotion produced it; it
+    // falls back to raw. Carried evidence on an indexed slot stays under
+    // R785-10. The exception is R517-10's null-initialized local, rendered
+    // `&mut []` / `&[]` until its assignment, when the initializer is its only
+    // null evidence and it is never handed on.
+    if option_stage_withdrawn(ctx.family_policy, subject)
+        && delivers_non_optional(&decision)
+        && own_nullable_evidence(ctx, subject)
+        && !declaration_owns_null_init(ctx, subject)
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::NullInit,
         );
     }
     if subject.ty_span.is_some() {
@@ -2840,7 +2967,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // R819-1 (§29): a subject with nullability evidence, its own or carried,
         // is never a non-optional reference. With its Option stage withdrawn it
         // falls back to raw, not to the plain form.
-        if (subject.null_init || (!option_enabled && nullable_evidence)) && depth2_npo.is_none() {
+        if (subject.null_init
+            || (option_stage_withdrawn(family_policy, subject) && nullable_evidence))
+            && depth2_npo.is_none()
+        {
             return degrade(subject, decl_site, DegradeReason::NullInit);
         }
         // **LAST, on the freed-slot placement rule.** Every subject reaching

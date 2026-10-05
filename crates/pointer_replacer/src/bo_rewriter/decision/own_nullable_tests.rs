@@ -25,10 +25,7 @@ fn form(input: &str, label: &str, withdrawn: bool) -> String {
             .entries
             .iter()
             .find(|(subject, _)| subject.label == label)
-            .map(|(_, decision)| {
-                eprintln!("W5D-FORM {label} withdrawn={withdrawn} {decision:?}");
-                super::seam::form_of(decision).key().to_owned()
-            })
+            .map(|(_, decision)| super::seam::form_of(decision).key().to_owned())
             .unwrap_or_else(|| panic!("no subject {label}"))
     })
     .expect("input type-checks");
@@ -115,3 +112,9 @@ fn r824_2_control_with_the_option_stage_enabled_the_forms_stay_safe() {
         assert_ne!(form(input, label, false), "raw", "{label}");
     }
 }
+
+// The exception (R517-10's null-initialized local, whose initializer is its
+// only null evidence and which is never handed on) has no witness: the local
+// shapes tried were decided raw for other reasons with the stage withdrawn
+// (slice-use-unsupported; kind-raw), so a control there would pass vacuously.
+// It stands on the code (`declaration_owns_null_init`).
