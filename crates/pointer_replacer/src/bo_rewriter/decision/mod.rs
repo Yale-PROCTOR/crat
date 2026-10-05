@@ -2505,8 +2505,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         uses.iter()
             .any(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&&**op))
     });
-    let nullable_value = option_enabled
-        && (constructions
+    // R819-1 (§29): the nullability evidence, read whether or not the Option
+    // stage is enabled; a withdrawn stage removes the optional form, never the
+    // evidence (see the null-init gate below).
+    let nullable_evidence = constructions
             .init_hirs
             .get(&(subject.fn_did, subject.hir_id))
             .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()))
@@ -2541,7 +2543,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                         })
                     },
                     subject,
-                ))));
+                )));
+    let nullable_value = option_enabled && nullable_evidence;
     let mut form = match raw_uses {
         Some(uses) => {
             let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
@@ -2808,7 +2811,10 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // a count rather than an estimate — the same construction that made the
     // freed gate's zero movement structural.
     if matches!(form, Form::Plain) {
-        if subject.null_init && depth2_npo.is_none() {
+        // R819-1 (§29): a subject with nullability evidence, its own or carried,
+        // is never a non-optional reference. With its Option stage withdrawn it
+        // falls back to raw, not to the plain form.
+        if (subject.null_init || (!option_enabled && nullable_evidence)) && depth2_npo.is_none() {
             return degrade(subject, decl_site, DegradeReason::NullInit);
         }
         // **LAST, on the freed-slot placement rule.** Every subject reaching
