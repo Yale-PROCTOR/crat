@@ -2438,27 +2438,53 @@ pub unsafe fn f(p: *mut H, g: *mut H) {
 "#;
 
 #[test]
-#[ignore = "RED: era-5c 145a, Codex round 2, AGG"]
 fn e5c_evident_red_cx_agg() {
     assert!(of_record(CX_AGG)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145a, Codex round 2, REC"]
 fn e5c_evident_red_cx_rec() {
     assert!(of_record(CX_REC)["rec::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145a, Codex round 2, TOP"]
 fn e5c_evident_red_cx_top() {
     assert!(of_record(CX_TOP)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145a, Codex round 2, SLOT"]
 fn e5c_evident_red_cx_slot() {
     assert!(of_record(CX_SLOT)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145a, Codex round 2, RAW"]
 fn e5c_evident_red_cx_raw() {
     assert!(of_record(CX_RAW)["f::p"].withdraws());
+}
+
+/// Codex round 2's fixes, their faults.
+#[test]
+fn e5c_evident_faults_round2() {
+    let faulted = |code: &str, subject: &str, rule: Rule| {
+        verdicts_opts(
+            code,
+            &[],
+            Options {
+                fault: Some(rule),
+                ..Options::of_record()
+            },
+        )[subject]
+            .withdraws()
+    };
+    assert!(!faulted(CX_TOP, "f::p", Rule::TopShape), "TOP");
+    assert!(!faulted(CX_SLOT, "f::p", Rule::SelfStores), "SLOT");
+    assert!(!faulted(CX_AGG, "f::p", Rule::WideStores), "AGG");
+    assert!(
+        !verdicts_opts(
+            CX_REC,
+            &[],
+            Options {
+                close_n1: false,
+                ..Options::of_record()
+            }
+        )["rec::p"]
+            .withdraws(),
+        "REC"
+    );
 }

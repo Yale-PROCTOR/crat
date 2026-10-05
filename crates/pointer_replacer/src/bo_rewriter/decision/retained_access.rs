@@ -203,6 +203,9 @@ pub(crate) enum Rule {
     /// era-5c 145 H4: a self store without a dereference on the left (`h.q = &h.x`), or
     /// with an address on the right, is a self-reference.
     SelfStores,
+    /// era-5c 145a (Codex round 2, TOP): a hold on a `Top` access takes the subject's own
+    /// evident shape.
+    TopShape,
     /// H3: a byte pointer reaching a member is a view wherever it was loaded from, and a
     /// re-cast view keeps its mark.
     ViewValues,
@@ -4051,6 +4054,48 @@ impl<'tcx> Relation<'tcx> {
         self.derived_stores_by(body, &derived)
     }
 
+    /// era-5c 145a AGG: everything a value of `seed` reaches inside the body through
+    /// copies, casts, aggregates and field reads (no dereference), to a fixpoint.
+    fn wide_family(&self, body: &Body<'tcx>, seed: &FxHashSet<Local>) -> FxHashSet<Local> {
+        let mut family = seed.clone();
+        if !self.on(Rule::WideStores) {
+            return family;
+        }
+        loop {
+            let before = family.len();
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else {
+                        continue;
+                    };
+                    if !dst.projection.is_empty() {
+                        continue;
+                    }
+                    let in_family = |op: &Operand<'tcx>| {
+                        op.place().is_some_and(|place| {
+                            family.contains(&place.local)
+                                && !place
+                                    .projection
+                                    .iter()
+                                    .any(|p| matches!(p, ProjectionElem::Deref))
+                        })
+                    };
+                    let reaches = match rvalue {
+                        Rvalue::Use(op) | Rvalue::Cast(_, op, _) => in_family(op),
+                        Rvalue::Aggregate(_, ops) => ops.iter().any(in_family),
+                        _ => false,
+                    };
+                    if reaches {
+                        family.insert(dst.local);
+                    }
+                }
+            }
+            if family.len() == before {
+                return family;
+            }
+        }
+    }
+
     /// H6 (a): aggregate locals that carry a value `derived` holds, to a fixpoint.
     fn carriers_of(&self, body: &Body<'tcx>, derived: &dyn Fn(Local) -> bool) -> FxHashSet<Local> {
         let mut carriers: FxHashSet<Local> = FxHashSet::default();
@@ -4525,9 +4570,75 @@ fn self_fields<'tcx>(
         set.insert(local);
         set
     };
+    // era-5c 145a SLOT: a local holding the address of a struct field of a local's own
+    // place (`slot = &raw mut h.q`), through copies and casts: `*slot = v` stores `h.q`.
+    let mut field_addr: FxHashMap<Local, (Local, DefId, usize)> = FxHashMap::default();
+    if wide {
+        for _ in 0..4 {
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else {
+                        continue;
+                    };
+                    if !dst.projection.is_empty() {
+                        continue;
+                    }
+                    let found = match rvalue {
+                        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                            if !place
+                                .projection
+                                .iter()
+                                .any(|p| matches!(p, ProjectionElem::Deref)) =>
+                        {
+                            match place.projection.last() {
+                                Some(ProjectionElem::Field(index, _)) => {
+                                    let parent = Place {
+                                        local: place.local,
+                                        projection: tcx.mk_place_elems(
+                                            &place.projection[..place.projection.len() - 1],
+                                        ),
+                                    };
+                                    match parent.ty(body, tcx).ty.kind() {
+                                        TyKind::Adt(adt, _) if adt.is_struct() => {
+                                            Some((place.local, adt.did(), index.index()))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        Rvalue::Use(op) | Rvalue::Cast(_, op, _) => {
+                            local_of(op).and_then(|l| field_addr.get(&l).copied())
+                        }
+                        _ => None,
+                    };
+                    if let Some(found) = found {
+                        field_addr.insert(dst.local, found);
+                    }
+                }
+            }
+        }
+    }
     for data in body.basic_blocks.iter() {
         for statement in &data.statements {
             let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else { continue };
+            // era-5c 145a SLOT: `*slot = v`, `slot` the address of `base.field`.
+            if let [ProjectionElem::Deref] = dst.projection.as_slice()
+                && let Some(&(base, did, index)) = field_addr.get(&dst.local)
+            {
+                let value = match rvalue {
+                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => local_of(op),
+                    Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => Some(place.local),
+                    _ => None,
+                };
+                if let Some(value) = value
+                    && !with(value).is_disjoint(&with(base))
+                {
+                    out.insert((did, index));
+                }
+                continue;
+            }
             // era-5c 145 H4: a stack struct's own field (`h.q = …`) as well as a
             // pointee's (`(*s).q = …`).
             if !wide && !matches!(dst.projection.first(), Some(ProjectionElem::Deref)) {
@@ -4851,6 +4962,21 @@ impl RetainedAccessCheck {
             Via::Field(did, index) => !on(Rule::RawGuard) || field_raw(did, index),
             Via::Cell(_) | Via::Opaque | Via::Unresolved | Via::Unknown => true,
         };
+        // era-5c 145a TOP: an access through `Top` has no shape of its own; it reaches the
+        // subject, so the subject's own evident shape is the hold's.
+        let top_shape = |mut hold: Hold, objs: &FxHashSet<Obj>, access: &Access| {
+            if access.obj == Obj::Top
+                && on(Rule::TopShape)
+                && !matches!(hold.shape, Shape::SelfRef | Shape::Cycle)
+                && let Some(shape) = objs
+                    .iter()
+                    .map(|&o| shapes.of(relation.root(o)))
+                    .find(|shape| matches!(shape, Shape::SelfRef | Shape::Cycle))
+            {
+                hold.shape = shape;
+            }
+            hold
+        };
         let hold_of =
             |access: &Access, line_of: &mut dyn FnMut(LocalDefId, Location) -> String| Hold {
                 kind: HoldKind::Access,
@@ -4917,6 +5043,9 @@ impl RetainedAccessCheck {
                     // era-5c 145 H5: an aggregate built from the formal carries it to a callee.
                     let carried = relation.carriers_of(&body, &|l: Local| derived.contains(&l));
                     derived.extend(carried);
+                    // era-5c 145a AGG: and field reads of them, to a fixpoint.
+                    let reached = relation.wide_family(&body, &derived);
+                    derived.extend(reached);
                     if !stored_formals.contains(&(f, i)) && relation.escapes(&body, &derived, &none)
                     {
                         stored_formals.insert((f, i));
@@ -4992,7 +5121,7 @@ impl RetainedAccessCheck {
                         unknowns = true;
                         // era-5c 145 H1: (E) keeps an evident shape all the same.
                         if relation.options.evident && on(Rule::EvidentUnknown) {
-                            holds.push(hold_of(a, &mut line_of));
+                            holds.push(top_shape(hold_of(a, &mut line_of), &objs, a));
                         }
                     } else {
                         holds.push(hold_of(a, &mut line_of));
@@ -5122,10 +5251,18 @@ impl RetainedAccessCheck {
             } else {
                 FxHashMap::default()
             };
+            let mut recursive_at: FxHashMap<BasicBlock, Vec<Access>> = FxHashMap::default();
             for block in body.basic_blocks.indices() {
                 for g in relation.call_targets(&body, block) {
-                    if g != f || relation.options.close_n1 {
+                    if g != f {
                         at.entry(block)
+                            .or_default()
+                            .extend(relation.acc.get(&g).into_iter().flatten().copied());
+                    } else if relation.options.close_n1 {
+                        // era-5c 145a REC: another activation's accesses, which the
+                        // subject's own family does not cover.
+                        recursive_at
+                            .entry(block)
                             .or_default()
                             .extend(relation.acc.get(&g).into_iter().flatten().copied());
                     }
@@ -5232,8 +5369,7 @@ impl RetainedAccessCheck {
                             }
                         }
                         // ... and a callee that stores what it is passed.
-                        let carriers =
-                            relation.carriers_of(&body, &|l: Local| derived.contains(&l));
+                        let carriers = relation.wide_family(&body, &derived);
                         for (block, data) in body.basic_blocks.iter_enumerated() {
                             let Some(call) = as_call(data.terminator(), tcx) else { continue };
                             let targets = relation.call_targets(&body, block);
@@ -5287,12 +5423,20 @@ impl RetainedAccessCheck {
                 let mut unknowns = false;
                 let mut p8 = false;
                 let mut seen: FxHashSet<Access> = FxHashSet::default();
-                for (block, accesses) in &at {
+                let blocks: FxHashSet<BasicBlock> =
+                    at.keys().chain(recursive_at.keys()).copied().collect();
+                for block in &blocks {
                     if !everywhere && live_at[block].is_disjoint(&derived) {
                         continue;
                     }
-                    for a in accesses {
-                        if (a.at.0 == f && family.contains(&a.by))
+                    let own = at.get(block).into_iter().flatten().map(|a| (a, true));
+                    let other = recursive_at
+                        .get(block)
+                        .into_iter()
+                        .flatten()
+                        .map(|a| (a, false));
+                    for (a, own) in own.chain(other) {
+                        if (own && a.at.0 == f && family.contains(&a.by))
                             || !raw_via(a.via)
                             || !(a.write || (mutable && on(Rule::MutRead)))
                             || !seen.insert(*a)
@@ -5309,7 +5453,7 @@ impl RetainedAccessCheck {
                             unknowns = true;
                             // era-5c 145 H1: (E) keeps an evident shape all the same.
                             if relation.options.evident && on(Rule::EvidentUnknown) {
-                                holds.push(hold_of(a, &mut line_of));
+                                holds.push(top_shape(hold_of(a, &mut line_of), &objs, a));
                             }
                         } else {
                             holds.push(hold_of(a, &mut line_of));
