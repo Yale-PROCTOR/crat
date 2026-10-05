@@ -305,6 +305,8 @@ mod cast_of_local_bridge_tests;
 #[cfg(test)]
 mod census_world_tests;
 #[cfg(test)]
+mod closure_coupling_tests;
+#[cfg(test)]
 mod contract_extent_integration_tests;
 #[cfg(test)]
 mod counted_void_tests;
