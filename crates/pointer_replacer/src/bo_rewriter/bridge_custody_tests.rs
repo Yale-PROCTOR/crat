@@ -1135,6 +1135,92 @@ mod matcher {
         assert_eq!(Correspondence::default(), Correspondence::ByType);
     }
 
+    /// **R833-4 (main 175a §5), RULED — an original annotated by a raw-pointer alias
+    /// pairs by binding identity.** brotli's `WriteMetaBlockInternal` declares
+    /// `let mut literal_context_lut: ContextLut = ..` (`pub type ContextLut = *const
+    /// uint8_t;`), and the tree delivers it as `&u8`. The local-type test compared the
+    /// alias as written, and resolving it gives `*const uint8_t`, whose pointee chain
+    /// ends in `libc::c_uchar` and never equals `u8` as text: batch 55's two pair rows
+    /// and their pending sibling read `initializer-original-binding-correspondence-
+    /// unresolved` after R819-3. A bare alias that R605-2 resolves to a raw pointer is
+    /// matched as an unannotated raw local is (R460-1(b)): the unique declaration in each
+    /// owner and the initializer relation, the emitted form a reference whose mutability
+    /// is not above the raw pointer's; the pointee is not compared. A non-pointer alias,
+    /// a name the module does not bind, and a `&mut` for a `*const` alias still refuse.
+    #[test]
+    fn r833_4_an_original_annotated_by_a_raw_alias_pairs_by_identity() {
+        use crate::bo_rewriter::bridge_custody_match::Correspondence;
+        let case = |original_decl: &str, emitted_decl: &str| {
+            let input = format!(
+                "mod m {{ pub type Lut = *const u8; pub type Count = usize; pub fn target(w: *mut i32, r: *const u8) {{}} pub fn caller(w: *mut i32, seed: *const u8) {{ {original_decl} target(w, p); }} }}"
+            );
+            let lo = input.find("target(w, p)").unwrap() as u32;
+            let output = format!(
+                "mod m {{ pub type Lut = *const u8; pub type Count = usize; pub fn target(w: *mut i32, r: *const u8) {{}} pub fn caller(w: *mut i32, seed: &u8) {{ {emitted_decl} {{ let __crat_pair_raw_{lo}_1: *const u8 = core::ptr::from_ref(p); target(w, __crat_pair_raw_{lo}_1); }} }} }}"
+            );
+            let mut expected = expectation(BridgeKind::PairT2RawView);
+            expected.caller = "m::caller".into();
+            expected.callee = "m::target".into();
+            expected.anchor = SiteAnchor::Call {
+                span: ByteSpan {
+                    lo,
+                    hi: lo + "target(w, p)".len() as u32,
+                },
+                argument_indices: vec![1],
+            };
+            let original = syntax::inventory_source("r833-original.rs", &input).unwrap();
+            let emitted = syntax::inventory_source("r833-emitted.rs", &output).unwrap();
+            compare(BridgeCustodyInput {
+                original: &original,
+                emitted: &emitted,
+                original_source: &input,
+                emitted_source: &output,
+                expectations: &[expected],
+                context: &BridgeCustodyContext::default(),
+            })
+        };
+
+        let report = case("let mut p: Lut = seed;", "let mut p: &u8 = seed;");
+        assert_eq!(
+            report.rows[0].status,
+            ReceiptStatus::MatchedRaw,
+            "an original annotated by a raw alias pairs by identity: {report:#?}"
+        );
+        assert!(report.data, "{report:#?}");
+        assert_eq!(report.rows[0].correspondence, Correspondence::ByIdentity);
+
+        // The controls: each refuses, and none claims the widening.
+        for (original_decl, emitted_decl, why) in [
+            (
+                "let mut p: Count = seed;",
+                "let mut p: &u8 = seed;",
+                "a non-pointer alias",
+            ),
+            (
+                "let mut p: Missing = seed;",
+                "let mut p: &u8 = seed;",
+                "a name the module does not bind",
+            ),
+            (
+                "let mut p: Lut = seed;",
+                "let mut p: &mut u8 = seed;",
+                "a &mut for a *const alias",
+            ),
+        ] {
+            let report = case(original_decl, emitted_decl);
+            assert_eq!(
+                report.rows[0].status,
+                ReceiptStatus::Unresolved,
+                "{why}: {report:#?}"
+            );
+            assert_eq!(
+                report.rows[0].correspondence,
+                Correspondence::ByType,
+                "{why}"
+            );
+        }
+    }
+
     #[test]
     fn bridge_custody_match_pending_local_raw_view_shares_the_ordinary_receipt() {
         let lo = LOCAL_PENDING_INPUT.find("target(w, r)").unwrap();
