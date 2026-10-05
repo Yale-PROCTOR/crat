@@ -192,3 +192,32 @@ fn r821_3_control_a_formal_whose_address_is_taken_is_not_certified() {
         (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
     );
 }
+
+/// The review's finding 1: a place reached through a pointer loaded from the
+/// formal (`&mut (*(*l).head).next`) is not a place inside `l`'s object.
+#[test]
+fn r821_review_control_a_place_through_a_loaded_pointer_is_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "link", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
+}
+
+/// The review's finding 5: a formal assigned inside a closure of the entry.
+#[test]
+fn r821_review_control_a_formal_assigned_in_a_closure_is_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "in_closure", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
+}
+
+/// The review's finding 5: an entry the program calls through an extern
+/// declaration of its own symbol.
+#[test]
+fn r821_review_control_an_entry_called_by_its_symbol_is_not_certified() {
+    assert_eq!(
+        read_at(ROOTS, "two", "by_symbol", 0, 1),
+        (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+    );
+}
