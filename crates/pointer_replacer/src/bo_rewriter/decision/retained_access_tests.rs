@@ -2757,3 +2757,148 @@ fn e5c_evident_faults_under_facts() {
     assert!(!with(CX_TOP, "f::p", &[exposed, Rule::TopShape]), "TOP");
     assert!(!with(R3_AGG, "f::p", &[Rule::WideStores]), "WideStores");
 }
+
+// ---- The review of (ii), round 4: Codex (2026-10-05, at 37df6867c). Six missed holds
+// ---- inside E1 / E2 on the rebuilt line, as RED witnesses under the mode of record.
+
+const R4_BYTES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+use core::ffi::c_void;
+extern "C" { fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void; }
+#[repr(C)] pub struct N { q: *mut N, v: i32 }
+pub unsafe fn entry(n: *mut N) {
+    (*n).q = n;
+    let p = n;
+    let mut bits = 0usize;
+    memcpy(&mut bits as *mut _ as *mut c_void, &p as *const _ as *const c_void, core::mem::size_of::<usize>());
+    let q = bits as *mut N;
+    (*q).v = 1;
+    (*p).v = 2;
+}
+"#;
+
+const R4_MEMBER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] pub struct N { q: *mut N, a: i32, b: i32 }
+pub unsafe fn entry(n: *mut N) {
+    (*n).q = n;
+    let p = &raw mut (*n).b;
+    let r = (*n).q;
+    let a = (&raw mut (*r).a) as usize;
+    let q = (a + 4) as *mut i32;
+    *q = 1;
+    *p = 2;
+}
+"#;
+
+const R4_REPEAT: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+static mut K: *mut i32 = 0 as *mut i32;
+pub unsafe fn entry() {
+    let mut x = 0i32;
+    let p = &mut x as *mut i32;
+    let a = [p; 2];
+    K = a[0];
+    *K = 1;
+    *p = 2;
+}
+"#;
+
+const R4_RETURN: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+static mut K: *mut i32 = 0 as *mut i32;
+#[repr(C)] struct W { v: *mut i32 }
+unsafe fn id(p: *mut i32) -> *mut i32 { let w = W { v: p }; w.v }
+pub unsafe fn entry() {
+    let mut x = 0i32;
+    let p = &mut x as *mut i32;
+    let q = id(p);
+    K = q;
+    *K = 1;
+    *p = 2;
+}
+"#;
+
+const R4_STATIC: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] pub struct N { q: *mut N, v: i32 }
+static mut X: N = N { q: &raw mut X, v: 0 };
+pub unsafe fn entry() {
+    let p = &raw mut X;
+    let q = (*p).q;
+    (*q).v = 1;
+    (*p).v = 2;
+}
+"#;
+
+const R4_TRANSMUTE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+#[repr(C)] pub struct N { q: *mut N, v: i32 }
+pub unsafe fn entry(n: *mut N) {
+    let b: *mut N = core::mem::transmute(n);
+    (*b).q = b;
+    let p = b;
+    let r = (*b).q;
+    (*r).v = 1;
+    (*p).v = 2;
+}
+"#;
+
+const R4_CALLBACK: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
+use core::ffi::c_void;
+#[repr(C)] pub struct N { q: *mut N, v: i32 }
+static mut ROOT: *mut N = 0 as _;
+static mut PAT: *const i8 = 0 as _;
+static mut OUT: *mut c_void = 0 as _;
+static mut D: i32 = 0;
+extern "C" {
+    fn glob(p: *const i8, f: i32, cb: unsafe extern "C" fn(*const i8, i32) -> i32, out: *mut c_void) -> i32;
+}
+unsafe extern "C" fn cb(_: *const i8, _: i32) -> i32 {
+    let p = ROOT;
+    if D == 0 { D = 1; glob(PAT, 0, cb, OUT); }
+    (*p).v = 1;
+    0
+}
+pub unsafe fn entry(n: *mut N, pat: *const i8, out: *mut c_void) {
+    (*n).q = n; ROOT = n; PAT = pat; OUT = out; D = 0;
+    cb(0 as _, 0);
+}
+"#;
+
+#[test]
+fn e5c_evident_red_r4_bytes() {
+    let v = of_record(R4_BYTES);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_member() {
+    let v = of_record(R4_MEMBER);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_repeat() {
+    let v = of_record(R4_REPEAT);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_return() {
+    let v = of_record(R4_RETURN);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_static() {
+    let v = of_record(R4_STATIC);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_transmute() {
+    let v = of_record(R4_TRANSMUTE);
+    assert!(v["entry::p"].withdraws(), "{v:#?}");
+}
+#[test]
+fn e5c_evident_red_r4_callback() {
+    let v = of_record(R4_CALLBACK);
+    assert!(v["cb::p"].withdraws(), "{v:#?}");
+}
