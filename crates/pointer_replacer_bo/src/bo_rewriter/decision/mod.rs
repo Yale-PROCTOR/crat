@@ -1495,6 +1495,145 @@ thread_local! {
     /// them (narrowing 2 (b), read on the settled table). Empty outside it.
     static ENTRY_RULE_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
         std::cell::RefCell::default();
+    /// The subjects [`lift_owner_releases`] released: wave-4's lifts claimed
+    /// them, but none delivered. Empty outside [`decide_with_raw_fallbacks`].
+    static LIFT_OWNER_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+}
+
+/// **Narrowing 1's evidence declines, read on the settled table (R819-3 item 5;
+/// main 174).** W-C7 declines a subject on refuting evidence — a companion
+/// that does not bound the indexes (R423-6), a measured count that does not
+/// fit (`caller-count`) — and R423-6 rules that such a caller "stays raw and
+/// adapts under the addendum-77 receipt". The rule stands aside for it; where
+/// it settled THIN while the array formal it is handed to settled a slice, the
+/// thin form renders the one-element view (lodepng `addPaddingBits::in_0` into
+/// `readBitFromReversedStream`). It is held raw there, as the restore hold
+/// holds, with its own op. Returns `(index, hold)` pairs.
+fn evidence_decline_holds(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> Vec<(usize, DegradeReason)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (subject, decision))| {
+            if !matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) {
+                return None;
+            }
+            let declined = matches!(
+                slice_input::prove(ctx.tcx, subject, ctx.facts, ctx.fat),
+                Err(slice_input::Hold::CompanionNotIndexBound)
+            ) || matches!(
+                thin_counted::prove(ctx.tcx, subject, ctx.facts),
+                Err(thin_counted::Hold::CallerCount)
+            );
+            if !declined {
+                return None;
+            }
+            let (callee, index) = slice_input::fat_hand_on(subject, ctx.facts, ctx.fat)?;
+            let formal = entries.iter().find(|(formal, decision)| {
+                formal.fn_did == callee
+                    && formal.local.as_usize() == index + 1
+                    && takes_slice(decision)
+            })?;
+            let parameter_index = match formal.0.kind {
+                SubjectKind::Param { hir_index } => hir_index,
+                _ => index,
+            };
+            Some((
+                at,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(local_callee_extent::LocalCalleeAccess {
+                        callee_id: callee,
+                        parameter_index,
+                        callee: ctx.tcx.def_path_str(callee.to_def_id()),
+                        parameter: formal
+                            .0
+                            .param_name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_owned()),
+                        access: if subject.mutable { "write" } else { "read" },
+                        reason: local_callee_extent::AccessReason::PointerArithmetic {
+                            op: EVIDENCE_DECLINE_HOLD_OP.to_owned(),
+                        },
+                        footprint_bytes: None,
+                    }),
+                    count: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The op of [`evidence_decline_holds`]' receipt.
+pub(crate) const EVIDENCE_DECLINE_HOLD_OP: &str = "evidence-declined-one-element-into-wider-formal";
+
+/// **Narrowing 1, read on the settled table (R819-3 item 5; main 174).** The rule
+/// stands aside for a subject in wave-4's local-callee or thin-extent set, whose
+/// licensed lift gives it an exact width. Where no lift delivered — the subject
+/// settled thin while the array formal it is handed to settled a slice — the
+/// thin form renders the one-element view (wave-6o's two-levels witness:
+/// `mid(core::slice::from_ref(indent))`), so the rule takes it after all. Read
+/// after the promotions, where the lifts deliver. W-C7's evidence declines
+/// (`CompanionNotIndexBound`, `caller-count`) are not released: R423-6 keeps
+/// such a caller raw.
+fn lift_owner_releases(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .filter(|(subject, decision)| {
+            let key = (subject.fn_did, subject.hir_id);
+            matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) && (ctx.local_callee_extent.contains_key(&key) || ctx.thin_extent.contains(&key))
+                && !matches!(
+                    slice_input::prove(ctx.tcx, subject, ctx.facts, ctx.fat),
+                    Err(slice_input::Hold::CompanionNotIndexBound)
+                )
+                && !matches!(
+                    thin_counted::prove(ctx.tcx, subject, ctx.facts),
+                    Err(thin_counted::Hold::CallerCount)
+                )
+                && slice_input::hands_on_to_fat(subject, ctx.facts, ctx.fat, ctx.family_policy)
+                && slice_input::fat_hand_on(subject, ctx.facts, ctx.fat).is_some_and(
+                    |(callee, index)| {
+                        entries.iter().any(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                    },
+                )
+        })
+        .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+        .collect()
 }
 
 /// **Narrowing 2 (b), read on the settled table (R815-7 item 3; main 173a).** A
@@ -1553,6 +1692,7 @@ impl RestoreHoldRelease {
     fn begin() -> Self {
         RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
         ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
+        LIFT_OWNER_RELEASED.with(|released| released.borrow_mut().clear());
         Self
     }
 }
@@ -1561,6 +1701,7 @@ impl Drop for RestoreHoldRelease {
     fn drop(&mut self) {
         RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
         ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
+        LIFT_OWNER_RELEASED.with(|released| released.borrow_mut().clear());
     }
 }
 
@@ -1631,6 +1772,29 @@ pub(crate) fn decide_with_raw_fallbacks(
     // never taken where the exact width, the mask companion or a root proved one.
     let mut licensed_lifts = licensed_lifts;
     licensed_lifts.extend(licensed_lift::promote_fallback(ctx, &mut entries));
+    // Narrowing 1 on the settled table (main 174): a lift-claimed subject no
+    // lift delivered is decided again with the rule free to take it.
+    let lift_released = lift_owner_releases(ctx, &entries);
+    if !lift_released.is_empty() {
+        LIFT_OWNER_RELEASED
+            .with(|released| released.borrow_mut().extend(lift_released.iter().copied()));
+        for (subject, decision) in entries.iter_mut() {
+            let key = (subject.fn_did, subject.hir_id);
+            if lift_released.contains(&key) && !fallbacks.contains_key(&key) {
+                *decision = decide_one(ctx, subject);
+            }
+        }
+    }
+    for (at, reason) in evidence_decline_holds(ctx, &entries) {
+        let (subject, decision) = &mut entries[at];
+        if !fallbacks.contains_key(&(subject.fn_did, subject.hir_id)) {
+            *decision = degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                reason,
+            );
+        }
+    }
     cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()
@@ -3260,7 +3424,12 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         && supplied.is_none()
         && matches!(form, Form::Plain | Form::Opt { slice: false })
         && slice_input::hands_on_to_fat(subject, facts, fat, family_policy)
-        && !owned_elsewhere()
+        && (!owned_elsewhere()
+            || LIFT_OWNER_RELEASED.with(|released| {
+                released
+                    .borrow()
+                    .contains(&(subject.fn_did, subject.hir_id))
+            }))
         && !rule_stands_aside()
     {
         form = match form {
