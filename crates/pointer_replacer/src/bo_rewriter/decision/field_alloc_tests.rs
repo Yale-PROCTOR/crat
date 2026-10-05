@@ -479,3 +479,131 @@ fn w6l_fa_s_the_review_use_findings_render_no_length() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// brotli's ring buffer before `InitBuffer` (R825-4a, review finding 2):
+/// `RingBufferInit` leaves `buffer_` null with `cur_size_` 0, and an empty
+/// stream finished at once reaches `EncodeData` with `data` null and `bytes`
+/// 0 — a defined C path, since nothing is read. `Sum` is not a masked reader,
+/// so `len-field-alloc` gives its slice formal `cur_size_ + 7`.
+const RB_NULL: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case, non_camel_case_types, non_upper_case_globals)]
+extern "C" {
+    fn malloc(n: u64) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct RingBuffer {
+    pub size_: u32,
+    pub mask_: u32,
+    pub cur_size_: u32,
+    pub data_: *mut u8,
+    pub buffer_: *mut u8,
+}
+#[repr(C)]
+pub struct State {
+    pub ringbuffer_: RingBuffer,
+    pub pos: u64,
+}
+unsafe fn RingBufferInit(mut rb: *mut RingBuffer) {
+    (*rb).cur_size_ = 0 as i32 as u32;
+    let ref mut fresh63 = (*rb).data_;
+    *fresh63 = 0 as *mut u8;
+    let ref mut fresh64 = (*rb).buffer_;
+    *fresh64 = 0 as *mut u8;
+}
+unsafe fn RingBufferInitBuffer(buflen: u32, mut rb: *mut RingBuffer) {
+    static mut kSlackForEightByteHashingEverywhere: u64 = 7 as i32 as u64;
+    let mut new_data = if ((2 as i32 as u32).wrapping_add(buflen) as u64)
+        .wrapping_add(kSlackForEightByteHashingEverywhere)
+        > 0 as i32 as u64
+    {
+        malloc(
+            ((2 as i32 as u32).wrapping_add(buflen) as u64)
+                .wrapping_add(kSlackForEightByteHashingEverywhere)
+                .wrapping_mul(::std::mem::size_of::<u8>() as u64),
+        ) as *mut u8
+    } else {
+        0 as *mut u8
+    };
+    if !((*rb).data_).is_null() {
+        free((*rb).data_ as *mut core::ffi::c_void);
+        let ref mut fresh65 = (*rb).data_;
+        *fresh65 = 0 as *mut u8;
+    }
+    let ref mut fresh66 = (*rb).data_;
+    *fresh66 = new_data;
+    (*rb).cur_size_ = buflen;
+    let ref mut fresh67 = (*rb).buffer_;
+    *fresh67 = ((*rb).data_).offset(2 as i32 as isize);
+}
+unsafe fn Reader(mut data: *const u8, mut mask: u64, mut ix: u64, mut len: u64) -> u32 {
+    let mut masked = ix & mask;
+    let mut k: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while k < len {
+        s = s.wrapping_add(*data.offset(masked.wrapping_add(k) as isize) as u32);
+        k = k.wrapping_add(1);
+    }
+    s
+}
+unsafe fn Sum(mut data: *const u8, mut pos: u64, mut len: u64) -> u32 {
+    let mut k: u64 = 0 as i32 as u64;
+    let mut s: u32 = 0 as i32 as u32;
+    while k < len {
+        s = s.wrapping_add(*data.offset(pos.wrapping_add(k) as isize) as u32);
+        k = k.wrapping_add(1);
+    }
+    s
+}
+pub unsafe fn Encode(mut s: *mut State, mut bytes: u64) -> u32 {
+    let mut data = 0 as *mut u8;
+    data = (*s).ringbuffer_.buffer_;
+    let mut mask = (*s).ringbuffer_.mask_ as u64;
+    let mut h = Reader(data.offset(bytes as isize), mask, (*s).pos, bytes);
+    h.wrapping_add(Sum(data, (*s).pos, bytes))
+}
+pub unsafe fn Setup(mut s: *mut State, mut n: u32) {
+    RingBufferInit(&mut (*s).ringbuffer_);
+    RingBufferInitBuffer(n, &mut (*s).ringbuffer_);
+}
+pub unsafe fn Finish(mut s: *mut State) -> u32 {
+    RingBufferInit(&mut (*s).ringbuffer_);
+    (*s).pos = 0 as i32 as u64;
+    Encode(s, 0 as i32 as u64)
+}
+"#;
+
+/// FA-e (R825-4c, the review's finding 5) — the arm end to end: `Sum::data`
+/// is delivered, and `Encode`'s call builds its slice with the licensed
+/// field length `cur_size_ + 7`, no fallback extent.
+#[test]
+fn w6l_fa_e_the_field_length_reaches_the_emitted_construction() {
+    let rows = reasons(RB_NULL);
+    assert_eq!(reason_of(&rows, "Sum", "data"), "<emitted>", "{rows:#?}");
+    let source = flat(&crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB_NULL).unwrap());
+    assert!(
+        source.contains("(*s).ringbuffer_.cur_size_ as usize + 7"),
+        "{source}"
+    );
+    assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
+}
+
+/// FA-n (R825-4a, R517-10) — the null base. `Finish` reaches `Sum` with
+/// `buffer_` null and `cur_size_` 0, so `from_raw_parts(data, cur_size_ + 7)`
+/// would build a seven-element slice on a null pointer: UB on a defined input,
+/// outside the §77 waiver. The construction binds the base once and renders a
+/// null base as the empty slice, as the declaration planner does.
+#[test]
+fn w6l_fa_n_a_null_field_base_is_the_empty_slice() {
+    let source = flat(&crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB_NULL).unwrap());
+    assert!(
+        source.contains(
+            "{ let __crat_field_base = data; if __crat_field_base.is_null() { &[] } else { core::slice::from_raw_parts(__crat_field_base, ((*s).ringbuffer_.cur_size_ as usize + 7) as usize) } }"
+        ),
+        "{source}"
+    );
+    assert!(
+        !source.contains("core::slice::from_raw_parts(data, ((*s).ringbuffer_.cur_size_"),
+        "{source}"
+    );
+}
