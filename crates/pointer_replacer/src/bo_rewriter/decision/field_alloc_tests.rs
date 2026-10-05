@@ -591,14 +591,15 @@ fn w6l_fa_e_the_field_length_reaches_the_emitted_construction() {
 /// FA-n (R825-4a, R517-10) — the null base. `Finish` reaches `Sum` with
 /// `buffer_` null and `cur_size_` 0, so `from_raw_parts(data, cur_size_ + 7)`
 /// would build a seven-element slice on a null pointer: UB on a defined input,
-/// outside the §77 waiver. The construction binds the base once and renders a
-/// null base as the empty slice, as the declaration planner does.
+/// outside the §77 waiver. The construction evaluates the base and the length
+/// once (in their order, before binding either: FA-h) and renders a null base
+/// as the empty slice, as the declaration planner does.
 #[test]
 fn w6l_fa_n_a_null_field_base_is_the_empty_slice() {
     let source = flat(&crate::bo_rewriter::emit_tests::ast_emitted_source_of(RB_NULL).unwrap());
     assert!(
         source.contains(
-            "{ let __crat_field_base = data; if __crat_field_base.is_null() { &[] } else { core::slice::from_raw_parts(__crat_field_base, ((*s).ringbuffer_.cur_size_ as usize + 7) as usize) } }"
+            "match (data, ((*s).ringbuffer_.cur_size_ as usize + 7) as usize) { (__crat_field_base, __crat_field_len) => if __crat_field_base.is_null() { &[] } else { core::slice::from_raw_parts(__crat_field_base, __crat_field_len) }, }"
         ),
         "{source}"
     );
@@ -622,7 +623,7 @@ fn w6l_fa_n_the_text_renderer_guards_the_null_base_too() {
         assert_eq!(
             flat(&spec.render_in_context("data", true).unwrap()),
             format!(
-                "{{ let __crat_field_base = data; if __crat_field_base.is_null() {{ {empty} }} else {{ core::slice::{ctor}(__crat_field_base, (n + 7) as usize) }} }}"
+                "match (data, (n + 7) as usize) {{ (__crat_field_base, __crat_field_len) => if __crat_field_base.is_null() {{ {empty} }} else {{ core::slice::{ctor}(__crat_field_base, __crat_field_len) }}, }}"
             )
         );
     }

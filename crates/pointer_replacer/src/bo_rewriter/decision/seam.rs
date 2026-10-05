@@ -354,9 +354,11 @@ pub(crate) enum SeamLen {
 /// which its `strlen + 1` length reads.
 pub(crate) const NUL_WALK_BASE: &str = "__crat_nul_walk_base";
 
-/// **wave-6l R825-4a.** The binding a null-guarded field-allocated
-/// construction gives its base.
+/// **wave-6l R825-4a.** The bindings a null-guarded field-allocated
+/// construction gives its base and its length (a `match` arm's, bound after
+/// both are evaluated).
 pub(crate) const FIELD_BASE: &str = "__crat_field_base";
+pub(crate) const FIELD_LEN: &str = "__crat_field_len";
 
 impl SeamLen {
     /// The length's source text. **The single place both emitters read it
@@ -1307,9 +1309,10 @@ pub(crate) struct GlueSpec {
     /// R422-5 owner-view glue lacked.
     pub(crate) option_view: Option<bool>,
     /// **wave-6l R825-4a (R517-10).** A `FromRawParts` whose base may still
-    /// hold its field's null initializer: the construction binds the base
-    /// once and a null base is the empty slice (the declaration planner's
-    /// rendering), never a slice of the length on a null pointer.
+    /// hold its field's null initializer: the construction evaluates the base
+    /// and the length once and a null base is the empty slice (the
+    /// declaration planner's rendering), never a slice of the length on a
+    /// null pointer.
     pub(crate) null_base_empty: bool,
 }
 
@@ -1844,7 +1847,7 @@ impl GlueSpec {
                     SeamLen::Licensed(len) if self.null_base_empty => {
                         let empty = if self.mutable { "&mut []" } else { "&[]" };
                         format!(
-                            "{{ let {FIELD_BASE} = {base}; if {FIELD_BASE}.is_null() {{ {empty} }} else {{ core::slice::{ctor}({FIELD_BASE}, ({len}) as usize) }} }}"
+                            "match ({base}, ({len}) as usize) {{ ({FIELD_BASE}, {FIELD_LEN}) => if {FIELD_BASE}.is_null() {{ {empty} }} else {{ core::slice::{ctor}({FIELD_BASE}, {FIELD_LEN}) }}, }}"
                         )
                     }
                     SeamLen::Licensed(len)

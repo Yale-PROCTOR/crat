@@ -2056,24 +2056,29 @@ fn checked_optional(
     (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
 }
 
-/// **wave-6l R825-4a.** `{ let __crat_field_base = ARGUMENT; if
-/// __crat_field_base.is_null() { &[] } else { PAYLOAD } }`: the argument node
-/// moves in once, and a null base is the empty slice.
+/// **wave-6l R825-4a.** `match (ARGUMENT, LENGTH) { (__crat_field_base,
+/// __crat_field_len) => if __crat_field_base.is_null() { &[] } else { PAYLOAD }
+/// }`: both nodes move in once and are evaluated, in their order, before
+/// anything is bound; a null base is the empty slice.
 fn field_base_guarded(
     argument: rustc_ast::Expr,
+    length: rustc_ast::Expr,
     payload: rustc_ast::Expr,
     mutable: bool,
 ) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_FIELD_BASE_ARG";
+    const LEN: &str = "__CRAT_FIELD_BASE_LEN";
     const PAYLOAD: &str = "__CRAT_FIELD_BASE_PAYLOAD";
     let text = format!(
-        "{{ let {base} = {ARG}; if {base}.is_null() {{ {empty} }} else {{ {PAYLOAD} }} }}",
+        "match ({ARG}, {LEN}) {{ ({base}, {len}) => if {base}.is_null() {{ {empty} }} else {{ {PAYLOAD} }}, }}",
         base = crate::bo_rewriter::decision::seam::FIELD_BASE,
+        len = crate::bo_rewriter::decision::seam::FIELD_LEN,
         empty = if mutable { "&mut []" } else { "&[]" },
     );
     let mut parsed = graft_expr(&text).ok()?;
     struct Replace {
         argument: rustc_ast::Expr,
+        length: rustc_ast::Expr,
         payload: rustc_ast::Expr,
         hits: usize,
     }
@@ -2088,6 +2093,11 @@ fn field_base_guarded(
                     self.hits += 1;
                     return;
                 }
+                if name == Symbol::intern(LEN) {
+                    *expr = self.length.clone();
+                    self.hits += 1;
+                    return;
+                }
                 if name == Symbol::intern(PAYLOAD) {
                     *expr = self.payload.clone();
                     self.hits += 1;
@@ -2099,11 +2109,12 @@ fn field_base_guarded(
     }
     let mut replace = Replace {
         argument,
+        length,
         payload,
         hits: 0,
     };
     replace.visit_expr(&mut parsed);
-    (replace.hits == 2).then_some(parsed.kind)
+    (replace.hits == 3).then_some(parsed.kind)
 }
 
 /// **wave-6l relay 077.** `{ let __crat_nul_walk_base = ARGUMENT; PAYLOAD }`:
@@ -2676,11 +2687,18 @@ impl<'a> SeamGraftVisitor<'a> {
         } else {
             core_arg
         };
-        // wave-6l R825-4a: a field-allocated construction binds its base once
-        // and renders a null base as the empty slice (the text renderer does
-        // the same).
-        let field_base =
-            (spec.null_base_empty && nul_walk_base.is_none()).then(|| core_arg.clone());
+        // wave-6l R825-4a: a field-allocated construction evaluates its base
+        // and its length once, before anything is bound (so the bindings
+        // capture no name either reads), and renders a null base as the empty
+        // slice (the text renderer does the same).
+        let (field_base, len) = match (spec.null_base_empty && nul_walk_base.is_none(), len) {
+            (true, Some(len)) => (
+                Some((core_arg.clone(), len)),
+                Some(P(graft_expr(crate::bo_rewriter::decision::seam::FIELD_LEN)
+                    .expect("fixed binding path parses"))),
+            ),
+            (_, len) => (None, len),
+        };
         let core_arg = if field_base.is_some() {
             P(graft_expr(crate::bo_rewriter::decision::seam::FIELD_BASE)
                 .expect("fixed binding path parses"))
@@ -2704,8 +2722,9 @@ impl<'a> SeamGraftVisitor<'a> {
             None => core,
         };
         let core = match field_base {
-            Some(base) => expr(field_base_guarded(
+            Some((base, len)) => expr(field_base_guarded(
                 (*base).clone(),
+                (*len).clone(),
                 (*core).clone(),
                 spec.mutable,
             )?),
