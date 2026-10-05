@@ -577,7 +577,7 @@ fn e5c_hold_corpus_rows() {
         // `CRAT_E5C_HOLD_FAULT` names one rule to drop, for the price of each;
         // `CRAT_E5C_HOLD_BYTES=off` drops R1's premise.
         // CRAT_E5C_HOLD_FAULT=Rule[,Rule...]: the first is the fault; all are removed.
-        let rules: [Rule; 45] = [
+        let rules: [Rule; 49] = [
             Rule::OutsideLoad,
             Rule::AllocatorHook,
             Rule::CopyCarry,
@@ -623,6 +623,10 @@ fn e5c_hold_corpus_rows() {
             Rule::Escape,
             Rule::IncomingStores,
             Rule::AggregateTransfer,
+            Rule::OneDerivation,
+            Rule::SccExtents,
+            Rule::FactSelfStores,
+            Rule::ExposedProvenance,
         ];
         let named: Vec<Rule> = std::env::var("CRAT_E5C_HOLD_FAULT")
             .unwrap_or_default()
@@ -649,6 +653,7 @@ fn e5c_hold_corpus_rows() {
             close_n1: std::env::var("CRAT_E5C_HOLD_CLOSE").is_ok_and(|v| v.contains("n1")),
             close_n2: std::env::var("CRAT_E5C_HOLD_CLOSE").is_ok_and(|v| v.contains("n2")),
             evident: std::env::var("CRAT_E5C_HOLD_MODE").as_deref() == Ok("evident"),
+            facts: std::env::var("CRAT_E5C_HOLD_FACTS").as_deref() == Ok("on"),
         };
         let check = RetainedAccessCheck::compute_options(&program, &raw, options);
         eprintln!(
@@ -676,7 +681,7 @@ fn e5c_hold_corpus_rows() {
                 })
                 .unwrap_or_else(|| format!("_{}", local.as_usize()));
             rows.push(format!(
-                "{}\t{}\t{name}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{name}\t{}\t{}\t{}\t{}\t{}",
                 tcx.def_path_str(f.to_def_id()),
                 local.as_usize(),
                 if local.as_usize() <= body.arg_count {
@@ -690,7 +695,12 @@ fn e5c_hold_corpus_rows() {
                     Verdict::Unknown => "unknown",
                 },
                 verdict.receipt().unwrap_or_default(),
-                check.premise(*f, *local).unwrap_or_default()
+                check.premise(*f, *local).unwrap_or_default(),
+                // era-5c 146: the evident rule of the first hold (the census receipt's).
+                verdict
+                    .evident_receipt()
+                    .and_then(|r| r.split(':').nth(1).map(str::to_owned))
+                    .unwrap_or_default()
             ));
         }
     })
@@ -2208,6 +2218,15 @@ fn of_record(code: &str) -> FxHashMap<String, Verdict> {
     verdicts_opts(code, &[], Options::of_record())
 }
 
+/// The mode of record with the recognisers read off the spelling (before (ii), era-5c
+/// 146): the configuration rounds 1 and 2's faults were built in.
+fn spelled() -> Options {
+    Options {
+        facts: false,
+        ..Options::of_record()
+    }
+}
+
 /// R833-2 (H3 is (b)): what the rule holds is a shape the program stores and uses within
 /// one call from outside, here through the program's own driver `run`.
 const W1_RUN: &str = r#"
@@ -2395,7 +2414,7 @@ fn e5c_evident_faults() {
             &[],
             Options {
                 fault: Some(rule),
-                ..Options::of_record()
+                ..spelled()
             },
         )[subject]
             .withdraws()
@@ -2419,7 +2438,7 @@ fn e5c_evident_faults() {
             &[],
             Options {
                 close_n1: false,
-                ..Options::of_record()
+                ..spelled()
             }
         )["walk::p"]
             .withdraws(),
@@ -2515,7 +2534,7 @@ fn e5c_evident_red_cx_raw() {
     assert!(of_record(CX_RAW)["f::p"].withdraws());
 }
 
-/// Codex round 2's fixes, their faults.
+/// Codex round 2's fixes, their faults (in the spelling configuration, as built).
 #[test]
 fn e5c_evident_faults_round2() {
     let faulted = |code: &str, subject: &str, rule: Rule| {
@@ -2524,7 +2543,7 @@ fn e5c_evident_faults_round2() {
             &[],
             Options {
                 fault: Some(rule),
-                ..Options::of_record()
+                ..spelled()
             },
         )[subject]
             .withdraws()
@@ -2538,7 +2557,7 @@ fn e5c_evident_faults_round2() {
             &[],
             Options {
                 close_n1: false,
-                ..Options::of_record()
+                ..spelled()
             }
         )["rec::p"]
             .withdraws(),
@@ -2547,8 +2566,8 @@ fn e5c_evident_faults_round2() {
 }
 
 // ---- The review of (E), round 3: Codex (2026-10-05, at 6ea2ad111). Four more variants of
-// ---- round 2's classes, as RED witnesses under the mode of record; open while the user
-// ---- chooses among (i) / (ii) / (iii) (era-5c 145a §4, relay 185).
+// ---- round 2's classes; RED at 5c2ec2d94, closed by (ii) (R835-1, era-5c 146): the
+// ---- recognisers read off the points-to facts.
 
 const R3_AGG: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, static_mut_refs)]
@@ -2626,24 +2645,115 @@ pub unsafe fn entry() {
 "#;
 
 #[test]
-#[ignore = "RED: Codex round 3, AGG' (era-5c 146): a derivation after the extraction; open under the user's (i)/(ii)/(iii)"]
 fn e5c_evident_red_r3_agg() {
     let v = of_record(R3_AGG);
     assert!(v["f::p"].withdraws(), "{v:#?}");
     assert!(v["entry::p"].withdraws(), "{v:#?}");
 }
 #[test]
-#[ignore = "RED: Codex round 3, REC' (era-5c 146): mutual recursion; open under the user's (i)/(ii)/(iii)"]
 fn e5c_evident_red_r3_rec() {
     assert!(of_record(R3_REC)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: Codex round 3, SLOT' (era-5c 146): a field address through a pointer; open under the user's (i)/(ii)/(iii)"]
 fn e5c_evident_red_r3_slot() {
     assert!(of_record(R3_SLOT)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: Codex round 3, TOP' (era-5c 146): both endpoints Top through integer casts; open under the user's (i)/(ii)/(iii)"]
 fn e5c_evident_red_r3_top() {
     assert!(of_record(R3_TOP)["f::p"].withdraws());
+}
+
+/// (ii)'s four rules, their faults: each round-3 witness goes back to Clear without its
+/// rule.
+#[test]
+fn e5c_evident_faults_facts() {
+    let faulted = |code: &str, subject: &str, rule: Rule| {
+        verdicts_opts(
+            code,
+            &[],
+            Options {
+                fault: Some(rule),
+                ..Options::of_record()
+            },
+        )[subject]
+            .withdraws()
+    };
+    assert!(!faulted(R3_AGG, "f::p", Rule::OneDerivation), "AGG'");
+    assert!(!faulted(R3_REC, "f::p", Rule::SccExtents), "REC'");
+    assert!(!faulted(R3_SLOT, "f::p", Rule::FactSelfStores), "SLOT'");
+    assert!(!faulted(R3_TOP, "f::p", Rule::ExposedProvenance), "TOP'");
+}
+
+/// What (ii) holds that the spelling did not: a node that points to another node of its
+/// own allocation site is, to flow-insensitive facts, a pointer into its own object. The
+/// spelling missed it when the stored value is a load (`(*x).next = (*l).head`), not a
+/// value of the holder's own base.
+const LIST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; }
+#[repr(C)] pub struct N { pub next: *mut N, pub v: i32 }
+#[repr(C)] pub struct L { pub head: *mut N }
+unsafe fn push(l: *mut L, x: *mut N) { (*x).next = (*l).head; (*l).head = x; }
+unsafe fn walk(a: *mut N) { let b = (*a).next; (*b).v = 1; (*a).v = 2; }
+pub unsafe fn run() {
+    let mut l = L { head: 0 as *mut N };
+    let mut i = 0;
+    while i < 3 { let x = malloc(16) as *mut N; (*x).v = 0; push(&mut l, x); i += 1; }
+    walk(l.head);
+}
+"#;
+
+#[test]
+fn e5c_evident_facts_hold_a_recursive_structure() {
+    let v = of_record(LIST);
+    let receipt = of(&v, "walk::a").evident_receipt();
+    assert!(
+        receipt
+            .as_deref()
+            .is_some_and(|r| r.starts_with("evident:self-reference:")),
+        "{v:#?}"
+    );
+    let spelled = verdicts_opts(
+        LIST,
+        &[],
+        Options {
+            fault: Some(Rule::FactSelfStores),
+            ..Options::of_record()
+        },
+    );
+    assert_eq!(of(&spelled, "walk::a"), &Verdict::Clear, "{spelled:#?}");
+}
+
+/// The rules of rounds 1 and 2 that stay in force under (ii), their faults in the mode of
+/// record: an evident hold under `Top` (H1) and a `Top` access taking the subject's shape
+/// (TOP) act where `Top` remains, here with the exposed-provenance premise taken away; a
+/// callee's store reaches its callers' formals through `WideStores`.
+#[test]
+fn e5c_evident_faults_under_facts() {
+    let with = |code: &str, subject: &str, rules: &[Rule]| {
+        let faults = rules
+            .iter()
+            .fold(Options::of_record().faults, |m, &r| m | (1u64 << r as u64));
+        verdicts_opts(
+            code,
+            &[],
+            Options {
+                faults,
+                ..Options::of_record()
+            },
+        )[subject]
+            .withdraws()
+    };
+    let exposed = Rule::ExposedProvenance;
+    assert!(
+        with(EH1_TOP_SUBJECT, "f::x", &[exposed]),
+        "H1 holds under Top"
+    );
+    assert!(
+        !with(EH1_TOP_SUBJECT, "f::x", &[exposed, Rule::EvidentUnknown]),
+        "H1"
+    );
+    assert!(with(CX_TOP, "f::p", &[exposed]), "TOP holds under Top");
+    assert!(!with(CX_TOP, "f::p", &[exposed, Rule::TopShape]), "TOP");
+    assert!(!with(R3_AGG, "f::p", &[Rule::WideStores]), "WideStores");
 }
