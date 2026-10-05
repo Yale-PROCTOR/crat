@@ -130,12 +130,12 @@ mod reader_chain_tests;
 pub(crate) mod receiver_input;
 pub(crate) mod ref_beside_raw;
 pub(crate) mod released_indirect;
-pub(crate) mod retained_alias_observed;
-#[cfg(test)]
-mod retained_alias_observed_tests;
 pub(crate) mod retained_access;
 #[cfg(test)]
 mod retained_access_tests;
+pub(crate) mod retained_alias_observed;
+#[cfg(test)]
+mod retained_alias_observed_tests;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
@@ -2272,6 +2272,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
+        retained_access: _,
         // R823-3: read again by the masked hold when the narrowing returns.
         field_alloc: _,
         io_domain,

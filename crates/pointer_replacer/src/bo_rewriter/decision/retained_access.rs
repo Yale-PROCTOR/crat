@@ -194,6 +194,15 @@ pub(crate) enum Rule {
     /// H6: stores of a formal's value inside an aggregate, by a library contract, by an
     /// unlisted foreign function, or by a callee that stores its own formal.
     WideStores,
+    /// era-5c 145 H1: under (E), an evident hold stands even where the subject may be
+    /// `Top` (an unknown hold is not a reason to drop an evident shape).
+    EvidentUnknown,
+    /// era-5c 145 H2: a local's derived stores are a formal's (aggregates, library
+    /// contracts, unlisted calls, callees that store it).
+    LocalWideStores,
+    /// era-5c 145 H4: a self store without a dereference on the left (`h.q = &h.x`), or
+    /// with an address on the right, is a self-reference.
+    SelfStores,
     /// H3: a byte pointer reaching a member is a view wherever it was loaded from, and a
     /// re-cast view keeps its mark.
     ViewValues,
@@ -253,6 +262,7 @@ impl Options {
         Options {
             closed: true,
             evident: true,
+            close_n1: true,
             faults: 1u64 << Rule::RoundTrip as u64,
             ..Options::default()
         }
@@ -4033,13 +4043,16 @@ impl<'tcx> Relation<'tcx> {
         body: &Body<'tcx>,
         formal: usize,
     ) -> Vec<(Location, Place<'tcx>)> {
-        let tcx = self.tcx;
         let derived = |l: Local| {
             self.from_param
                 .get(&(f, l))
                 .is_some_and(|params| params.contains(&formal))
         };
-        // H6 (a): aggregate locals that carry a derived value, to a fixpoint.
+        self.derived_stores_by(body, &derived)
+    }
+
+    /// H6 (a): aggregate locals that carry a value `derived` holds, to a fixpoint.
+    fn carriers_of(&self, body: &Body<'tcx>, derived: &dyn Fn(Local) -> bool) -> FxHashSet<Local> {
         let mut carriers: FxHashSet<Local> = FxHashSet::default();
         if self.on(Rule::WideStores) {
             loop {
@@ -4071,6 +4084,52 @@ impl<'tcx> Relation<'tcx> {
                 }
             }
         }
+        carriers
+    }
+
+    /// The stores of a value `derived` holds (a formal's family, or a local's: era-5c
+    /// 145 H2), and the stores of a pointer field of it (H5: `(*g).px = s.p`).
+    fn derived_stores_by(
+        &self,
+        body: &Body<'tcx>,
+        derived: &dyn Fn(Local) -> bool,
+    ) -> Vec<(Location, Place<'tcx>)> {
+        let tcx = self.tcx;
+        let carriers = self.carriers_of(body, derived);
+        // era-5c 145 H5: a value read out of a derived aggregate's field (`_3 = s.p`, no
+        // dereference) is derived, to a fixpoint.
+        let mut read: FxHashSet<Local> = FxHashSet::default();
+        if self.on(Rule::WideStores) {
+            loop {
+                let before = read.len();
+                for data in body.basic_blocks.iter() {
+                    for statement in &data.statements {
+                        let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else {
+                            continue;
+                        };
+                        if !dst.projection.is_empty() {
+                            continue;
+                        }
+                        if let Rvalue::Use(op) | Rvalue::Cast(_, op, _) = rvalue
+                            && let Some(place) = op.place()
+                            && !place
+                                .projection
+                                .iter()
+                                .any(|p| matches!(p, ProjectionElem::Deref))
+                            && (derived(place.local)
+                                || carriers.contains(&place.local)
+                                || read.contains(&place.local))
+                        {
+                            read.insert(dst.local);
+                        }
+                    }
+                }
+                if read.len() == before {
+                    break;
+                }
+            }
+        }
+        let derived = |l: Local| derived(l) || read.contains(&l);
         let mut out = vec![];
         for (block, data) in body.basic_blocks.iter_enumerated() {
             for (statement_index, statement) in data.statements.iter().enumerate() {
@@ -4082,10 +4141,26 @@ impl<'tcx> Relation<'tcx> {
                     block,
                     statement_index,
                 };
+                // H5: a pointer field of an aggregate value (`s.p`, no dereference).
+                let field_of = |op: &Operand<'tcx>| {
+                    op.place().filter(|place| {
+                        self.on(Rule::WideStores)
+                            && !place.projection.is_empty()
+                            && !place
+                                .projection
+                                .iter()
+                                .any(|p| matches!(p, ProjectionElem::Deref))
+                    })
+                };
                 let stored = match rvalue {
-                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => local_of(op).is_some_and(|l| {
-                        (is_ptr(dst.ty(body, tcx).ty) && derived(l)) || carriers.contains(&l)
-                    }),
+                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => {
+                        local_of(op).is_some_and(|l| {
+                            (is_ptr(dst.ty(body, tcx).ty) && derived(l)) || carriers.contains(&l)
+                        }) || field_of(op).is_some_and(|place| {
+                            is_ptr(dst.ty(body, tcx).ty)
+                                && (derived(place.local) || carriers.contains(&place.local))
+                        })
+                    }
                     Rvalue::Aggregate(_, ops) if self.on(Rule::WideStores) => {
                         ops.iter().any(|op| {
                             local_of(op).is_some_and(|l| derived(l) || carriers.contains(&l))
@@ -4398,16 +4473,64 @@ fn self_fields<'tcx>(
     body: &Body<'tcx>,
     bases: &FxHashMap<Local, FxHashSet<Local>>,
     out: &mut FxHashSet<(DefId, usize)>,
+    wide: bool,
 ) {
+    // era-5c 145 H4: an address of a local's own place (`&mut h.x`, no dereference)
+    // has that local as a base, through copies and casts, to a fixpoint.
+    let mut addr: FxHashMap<Local, FxHashSet<Local>> = FxHashMap::default();
+    if wide {
+        loop {
+            let mut grew = false;
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else {
+                        continue;
+                    };
+                    if !dst.projection.is_empty() {
+                        continue;
+                    }
+                    let from: FxHashSet<Local> = match rvalue {
+                        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                            if !place
+                                .projection
+                                .iter()
+                                .any(|p| matches!(p, ProjectionElem::Deref)) =>
+                        {
+                            FxHashSet::from_iter([place.local])
+                        }
+                        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                            addr.get(&place.local).cloned().unwrap_or_default()
+                        }
+                        Rvalue::Use(op) | Rvalue::Cast(_, op, _) => local_of(op)
+                            .and_then(|l| addr.get(&l).cloned())
+                            .unwrap_or_default(),
+                        _ => FxHashSet::default(),
+                    };
+                    if !from.is_empty() {
+                        let set = addr.entry(dst.local).or_default();
+                        let before = set.len();
+                        set.extend(from);
+                        grew |= set.len() != before;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
     let with = |local: Local| {
         let mut set = bases.get(&local).cloned().unwrap_or_default();
+        set.extend(addr.get(&local).into_iter().flatten().copied());
         set.insert(local);
         set
     };
     for data in body.basic_blocks.iter() {
         for statement in &data.statements {
             let StatementKind::Assign(box (dst, rvalue)) = &statement.kind else { continue };
-            if !matches!(dst.projection.first(), Some(ProjectionElem::Deref)) {
+            // era-5c 145 H4: a stack struct's own field (`h.q = …`) as well as a
+            // pointee's (`(*s).q = …`).
+            if !wide && !matches!(dst.projection.first(), Some(ProjectionElem::Deref)) {
                 continue;
             }
             let Some(ProjectionElem::Field(index, _)) = dst.projection.last() else { continue };
@@ -4418,6 +4541,8 @@ fn self_fields<'tcx>(
             let TyKind::Adt(adt, _) = parent.ty(body, tcx).ty.kind() else { continue };
             let value = match rvalue {
                 Rvalue::Use(op) | Rvalue::Cast(_, op, _) => local_of(op),
+                // era-5c 145 H4: an address of a place of the same base (`&raw mut h.x`).
+                Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) if wide => Some(place.local),
                 _ => None,
             };
             if let Some(value) = value
@@ -4624,7 +4749,11 @@ impl RetainedAccessCheck {
         slots: &CrateSlots,
         model: &FxHashMap<SlotRef, SlotKind>,
     ) -> Self {
-        Self::compute_options(program, &Self::model_fields(slots, model), Options::of_record())
+        Self::compute_options(
+            program,
+            &Self::model_fields(slots, model),
+            Options::of_record(),
+        )
     }
 
     /// The model's field kinds as the raw guard reads them: a retaining field the
@@ -4687,7 +4816,7 @@ impl RetainedAccessCheck {
         for &f in &program.functions {
             let body = relation.body(f);
             let bases = relation.bases_of(&body);
-            self_fields(tcx, &body, &bases, &mut fields);
+            self_fields(tcx, &body, &bases, &mut fields, on(Rule::SelfStores));
         }
         let shapes = Shapes::new(&relation, &fields);
         let mut spans: FxHashMap<(LocalDefId, Location), String> = FxHashMap::default();
@@ -4785,6 +4914,9 @@ impl RetainedAccessCheck {
                         .map(|(&l, _)| l)
                         .collect();
                     derived.insert(formal);
+                    // era-5c 145 H5: an aggregate built from the formal carries it to a callee.
+                    let carried = relation.carriers_of(&body, &|l: Local| derived.contains(&l));
+                    derived.extend(carried);
                     if !stored_formals.contains(&(f, i)) && relation.escapes(&body, &derived, &none)
                     {
                         stored_formals.insert((f, i));
@@ -4858,6 +4990,10 @@ impl RetainedAccessCheck {
                     }
                     if unknown_hold(&objs, a) {
                         unknowns = true;
+                        // era-5c 145 H1: (E) keeps an evident shape all the same.
+                        if relation.options.evident && on(Rule::EvidentUnknown) {
+                            holds.push(hold_of(a, &mut line_of));
+                        }
                     } else {
                         holds.push(hold_of(a, &mut line_of));
                     }
@@ -5085,7 +5221,38 @@ impl RetainedAccessCheck {
                 // A local's derived value stored into memory outlives its loan as a raw
                 // child of it (era-5c 140 §5: brotli's `h#488`, `h->symbol_lists = &h->…`).
                 if on(Rule::DerivedStore) {
-                    for (location, dst) in relation.stores_of(&body, &derived) {
+                    let mut stores = relation.stores_of(&body, &derived);
+                    if on(Rule::LocalWideStores) {
+                        // era-5c 145 H2: a local's derived stores are a formal's.
+                        let wide =
+                            relation.derived_stores_by(&body, &|l: Local| derived.contains(&l));
+                        for store in wide {
+                            if !stores.contains(&store) {
+                                stores.push(store);
+                            }
+                        }
+                        // ... and a callee that stores what it is passed.
+                        let carriers =
+                            relation.carriers_of(&body, &|l: Local| derived.contains(&l));
+                        for (block, data) in body.basic_blocks.iter_enumerated() {
+                            let Some(call) = as_call(data.terminator(), tcx) else { continue };
+                            let targets = relation.call_targets(&body, block);
+                            for (j, arg) in call.args.iter().enumerate() {
+                                let passed = local_of(&arg.node)
+                                    .filter(|l| derived.contains(l) || carriers.contains(l));
+                                if let Some(l) = passed
+                                    && targets.iter().any(|&g| memory_stored.contains(&(g, j + 1)))
+                                {
+                                    let location = Location {
+                                        block,
+                                        statement_index: data.statements.len(),
+                                    };
+                                    stores.push((location, Place::from(l)));
+                                }
+                            }
+                        }
+                    }
+                    for (location, dst) in stores {
                         let place = match dst.projection.last() {
                             Some(ProjectionElem::Field(field, _)) => {
                                 let parent = Place {
@@ -5140,6 +5307,10 @@ impl RetainedAccessCheck {
                         }
                         if unknown_hold(&objs, a) {
                             unknowns = true;
+                            // era-5c 145 H1: (E) keeps an evident shape all the same.
+                            if relation.options.evident && on(Rule::EvidentUnknown) {
+                                holds.push(hold_of(a, &mut line_of));
+                            }
                         } else {
                             holds.push(hold_of(a, &mut line_of));
                         }

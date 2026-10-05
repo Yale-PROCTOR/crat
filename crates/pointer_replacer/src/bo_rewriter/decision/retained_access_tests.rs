@@ -2209,18 +2209,27 @@ fn of_record(code: &str) -> FxHashMap<String, Verdict> {
 }
 
 #[test]
+#[ignore = "era-5c 145 H3: both W1 entries are uncalled, so in the closed world the client's object is two fresh objects; the user's answer to H3 decides"]
 fn e5c_evident_record_holds_the_cycle() {
     let v = of_record(W1_STREAM);
     let receipt = of(&v, "handle_compress::strm").evident_receipt();
-    assert!(receipt.as_deref().is_some_and(|r| r.starts_with("evident:cycle:")), "{receipt:?}");
+    assert!(
+        receipt
+            .as_deref()
+            .is_some_and(|r| r.starts_with("evident:cycle:")),
+        "{receipt:?}"
+    );
 }
 
 #[test]
+#[ignore = "era-5c 145 H3: as above, for W2's init and append"]
 fn e5c_evident_record_holds_the_self_reference() {
     let v = of_record(W2_SELF);
     let receipt = of(&v, "append::v").evident_receipt();
     assert!(
-        receipt.as_deref().is_some_and(|r| r.starts_with("evident:self-reference:small_vec.p")),
+        receipt
+            .as_deref()
+            .is_some_and(|r| r.starts_with("evident:self-reference:small_vec.p")),
         "{receipt:?}"
     );
 }
@@ -2229,7 +2238,12 @@ fn e5c_evident_record_holds_the_self_reference() {
 fn e5c_evident_record_holds_the_derived_store() {
     let v = of_record(DERIVED);
     let receipt = of(&v, "keep::x").evident_receipt();
-    assert!(receipt.as_deref().is_some_and(|r| r.starts_with("evident:derived-store:")), "{receipt:?}");
+    assert!(
+        receipt
+            .as_deref()
+            .is_some_and(|r| r.starts_with("evident:derived-store:")),
+        "{receipt:?}"
+    );
 }
 
 /// What is not an evident shape is not held: P9 stands for it.
@@ -2295,27 +2309,63 @@ pub unsafe fn keep(g: *mut G, x: *mut i32) { put(g, S { p: x }); }
 "#;
 
 #[test]
-#[ignore = "RED: era-5c 145, H1"]
 fn e5c_evident_red_h1_top_subject() {
     assert!(of_record(EH1_TOP_SUBJECT)["f::x"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145, H2"]
 fn e5c_evident_red_h2_local_callee_store() {
     assert!(of_record(EH2_LOCAL_CALLEE_STORE)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145, H4"]
 fn e5c_evident_red_h4_stack_self() {
     assert!(of_record(EH4_STACK_SELF)["f::p"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145, H5 (F2)"]
 fn e5c_evident_red_h5_aggregate_to_callee() {
     assert!(of_record(EH5_AGGREGATE_TO_CALLEE)["keep::x"].withdraws());
 }
 #[test]
-#[ignore = "RED: era-5c 145, N1 under (E)"]
 fn e5c_evident_red_n1_self_recursion() {
     assert!(of_record(N1_SELF_RECURSION)["walk::p"].withdraws());
+}
+
+/// Each fix's fault (era-5c 145): the witness clears without it.
+#[test]
+fn e5c_evident_faults() {
+    let faulted = |code: &str, subject: &str, rule: Rule| {
+        verdicts_opts(
+            code,
+            &[],
+            Options {
+                fault: Some(rule),
+                ..Options::of_record()
+            },
+        )[subject]
+            .withdraws()
+    };
+    assert!(
+        !faulted(EH1_TOP_SUBJECT, "f::x", Rule::EvidentUnknown),
+        "H1"
+    );
+    assert!(
+        !faulted(EH2_LOCAL_CALLEE_STORE, "f::p", Rule::LocalWideStores),
+        "H2"
+    );
+    assert!(!faulted(EH4_STACK_SELF, "f::p", Rule::SelfStores), "H4");
+    assert!(
+        !faulted(EH5_AGGREGATE_TO_CALLEE, "keep::x", Rule::WideStores),
+        "H5"
+    );
+    assert!(
+        !verdicts_opts(
+            N1_SELF_RECURSION,
+            &[],
+            Options {
+                close_n1: false,
+                ..Options::of_record()
+            }
+        )["walk::p"]
+            .withdraws(),
+        "N1"
+    );
 }
