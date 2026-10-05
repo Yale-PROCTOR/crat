@@ -1150,13 +1150,13 @@ mod matcher {
     #[test]
     fn r833_4_an_original_annotated_by_a_raw_alias_pairs_by_identity() {
         use crate::bo_rewriter::bridge_custody_match::Correspondence;
-        let case = |original_decl: &str, emitted_decl: &str| {
+        let case_with = |original_decl: &str, seed: &str, emitted_decl: &str, view: &str| {
             let input = format!(
                 "mod m {{ pub type Lut = *const u8; pub type Count = usize; pub fn target(w: *mut i32, r: *const u8) {{}} pub fn caller(w: *mut i32, seed: *const u8) {{ {original_decl} target(w, p); }} }}"
             );
             let lo = input.find("target(w, p)").unwrap() as u32;
             let output = format!(
-                "mod m {{ pub type Lut = *const u8; pub type Count = usize; pub fn target(w: *mut i32, r: *const u8) {{}} pub fn caller(w: *mut i32, seed: &u8) {{ {emitted_decl} {{ let __crat_pair_raw_{lo}_1: *const u8 = core::ptr::from_ref(p); target(w, __crat_pair_raw_{lo}_1); }} }} }}"
+                "mod m {{ pub type Lut = *const u8; pub type Count = usize; pub fn target(w: *mut i32, r: *const u8) {{}} pub fn caller(w: *mut i32, seed: {seed}) {{ {emitted_decl} {{ let __crat_pair_raw_{lo}_1: *const u8 = {view}; target(w, __crat_pair_raw_{lo}_1); }} }} }}"
             );
             let mut expected = expectation(BridgeKind::PairT2RawView);
             expected.caller = "m::caller".into();
@@ -1178,6 +1178,9 @@ mod matcher {
                 expectations: &[expected],
                 context: &BridgeCustodyContext::default(),
             })
+        };
+        let case = |original_decl: &str, emitted_decl: &str| {
+            case_with(original_decl, "&u8", emitted_decl, "core::ptr::from_ref(p)")
         };
 
         let report = case("let mut p: Lut = seed;", "let mut p: &u8 = seed;");
@@ -1219,6 +1222,30 @@ mod matcher {
                 "{why}"
             );
         }
+
+        // The Codex review of R833-4: the widening never takes away a match the type
+        // test already makes. An undelivered local keeps the alias on both sides and
+        // pairs by type, as before.
+        let unchanged = case_with(
+            "let mut p: Lut = seed;",
+            "*const u8",
+            "let mut p: Lut = seed;",
+            "p",
+        );
+        assert_eq!(
+            unchanged.rows[0].status,
+            ReceiptStatus::MatchedRaw,
+            "an unchanged alias still pairs: {unchanged:#?}"
+        );
+        assert_eq!(unchanged.rows[0].correspondence, Correspondence::ByType);
+        // And an alias-identity candidate whose initializer differs refuses, claiming nothing.
+        let other_init = case("let mut p: Lut = seed;", "let mut p: &u8 = &*seed;");
+        assert_eq!(
+            other_init.rows[0].status,
+            ReceiptStatus::Unresolved,
+            "{other_init:#?}"
+        );
+        assert_eq!(other_init.rows[0].correspondence, Correspondence::ByType);
     }
 
     #[test]
