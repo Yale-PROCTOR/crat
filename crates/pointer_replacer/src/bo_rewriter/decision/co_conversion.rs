@@ -147,6 +147,11 @@ pub(crate) enum BlockReason {
     /// side beside the other (`&mut` or a raw view) is undefined under Tree
     /// Borrows (wave-6o 112b). Both positions stay raw, as in the input.
     ProvenOverlap,
+    /// **R833-1 (USER).** At a call inside the program, a pair that is not
+    /// shown disjoint has one member as the raw view; its peer, the primary,
+    /// keeps its raw form too (no reference beside a raw view of what may be
+    /// the same object). The pair row names the site.
+    PairNotShownDisjoint,
     DuplicatePlaceRoot,
 }
 
@@ -168,6 +173,7 @@ impl BlockReason {
             BlockReason::EscapesViaFieldStore => "escapes-via-field-store",
             BlockReason::EscapesViaStaticStore => "escapes-via-static-store",
             BlockReason::ProvenOverlap => "pair-proven-overlap",
+            BlockReason::PairNotShownDisjoint => "pair-not-shown-disjoint",
             BlockReason::DuplicatePlaceRoot => "duplicate-place-root",
         }
     }
@@ -1472,6 +1478,11 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             pair_sites.push(extra.clone());
         }
     }
+    // R833-1 (USER): the callee's side of the pair rule, before the raw views
+    // are blocked, so the held peer carries its own reason.
+    for subject in peers_of_unproven_raw_views(&mut pair_sites) {
+        block(&mut node_block, subject, BlockReason::PairNotShownDisjoint);
+    }
     for row in &pair_sites {
         if matches!(row.role, PairRole::RawView | PairRole::Blocked) {
             block(
@@ -1664,8 +1675,24 @@ fn escape_block_reason(
 /// returned to be held raw (`pair-not-shown-disjoint`). Read-read pairs never
 /// form a pair here, and a certified pair's verdict is clear.
 pub(crate) fn peers_of_unproven_raw_views(rows: &mut [PairSiteDecision]) -> Vec<NodeKey> {
-    let _ = rows;
-    Vec::new()
+    let unproven_calls = rows
+        .iter()
+        .filter(|row| row.role == PairRole::RawView && row.verdict != A5SiteProofVerdict::Clear)
+        .map(|row| (row.caller, row.callee, row.call_span))
+        .collect::<Vec<_>>();
+    let mut held = Vec::new();
+    for row in rows.iter_mut() {
+        if row.role == PairRole::Primary
+            && row.verdict != A5SiteProofVerdict::Clear
+            && unproven_calls.contains(&(row.caller, row.callee, row.call_span))
+        {
+            row.role = PairRole::Blocked;
+            row.tier = PairTier::Blocked;
+            row.reason = "pair-not-shown-disjoint".to_owned();
+            held.push(row.subject);
+        }
+    }
+    held
 }
 
 /// R808-5 / R810-2 — the proven-overlap formal pairs: `(callee, inner, outer)`
