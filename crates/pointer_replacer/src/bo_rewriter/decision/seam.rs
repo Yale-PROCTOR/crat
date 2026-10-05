@@ -6507,13 +6507,20 @@ pub(crate) fn synthesize_with_raw_boundary(
                         } else {
                             (positions[j].blind, positions[i].blind)
                         };
-                        let proof = a5_site_proofs.lookup(
+                        let mut proof = a5_site_proofs.lookup(
                             site.caller.local_def_index.as_u32(),
                             callee.local_def_index.as_u32(),
                             positions[i].index,
                             positions[j].index,
                             positions[i].span,
                             positions[j].span,
+                        );
+                        super::outside_byte_view::read_under_p8(
+                            facts,
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
                         );
                         let conflict = PeerConflict {
                             left: positions[i].index.min(positions[j].index),
