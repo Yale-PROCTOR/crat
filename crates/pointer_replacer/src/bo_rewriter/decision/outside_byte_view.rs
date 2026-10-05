@@ -16,9 +16,9 @@
 //! Not covered: an entry the program calls or names, an unexported function,
 //! an argument that is not the entry's own formal (nor a place inside its own
 //! referent), a formal the body assigns or takes the address of, an entry
-//! with a closure or an extern declaration of its own symbol, a program whose
-//! R767 table is unknown,
-//! and (R767) a formal pair the program's provided test passes one object to.
+//! with a closure or an extern declaration of its own symbol. A client outside
+//! the program that passes one object to two formals of an entry is outside
+//! the scope (R836-1: R767's exception is withdrawn).
 //!
 //! It is read where the seam's site gate looks the pair's A5 proof up: that
 //! proof's raw-view fallback is what makes a formal a raw view (binn's
@@ -50,12 +50,10 @@ pub(crate) struct EntryFormal {
     pub pointee: String,
 }
 
-/// An outside-only entry's formals by binding, and the position pairs its
-/// provided test aliases (R767).
+/// An outside-only entry's formals by binding.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EntryFormals {
     pub by_binding: FxHashMap<HirId, EntryFormal>,
-    pub test_aliased: Vec<(usize, usize)>,
 }
 
 /// The receipt of the instance a certified pair is.
@@ -114,26 +112,16 @@ pub(crate) fn certifies(
         entry.by_binding.get(&root)
     };
     let (left, right) = (formal(left)?, formal(right)?);
-    let pair = (
-        left.position.min(right.position),
-        left.position.max(right.position),
-    );
     // The roots must be two different formals: one formal handed twice, or
     // two places inside one formal, is one outside object (wave-6o 123).
-    if left.position == right.position
-        || entry
-            .test_aliased
-            .iter()
-            .any(|&(a, b)| (a.min(b), a.max(b)) == pair)
-    {
+    if left.position == right.position {
         return None;
     }
     Some(instance(left, right))
 }
 
 /// The exported entries nothing in the program calls or names, each with its
-/// raw-pointer formals the body never assigns nor addresses, and the pairs its
-/// test aliases.
+/// raw-pointer formals the body never assigns nor addresses.
 /// `facts` must already hold every call and reference in the crate.
 pub(crate) fn entry_formals(
     tcx: TyCtxt<'_>,
@@ -157,19 +145,12 @@ pub(crate) fn entry_formals(
             .instantiate_identity()
             .skip_binder()
             .inputs();
-        // R767's table is the program's: an unknown program fails closed.
-        let Some(test_aliased) = super::aliased_by_test::aliased_pairs(tcx, owner) else {
-            continue;
-        };
         // A closure can assign a formal out of the visitor's sight, and an
         // extern declaration of the entry's own symbol is a call from inside.
         if has_closure(body) || declared_extern(tcx, owner) {
             continue;
         }
-        let mut formals = EntryFormals {
-            test_aliased,
-            ..Default::default()
-        };
+        let mut formals = EntryFormals::default();
         for (position, param) in body.params.iter().enumerate() {
             let PatKind::Binding(_, binding, _, None) = param.pat.kind else {
                 continue;

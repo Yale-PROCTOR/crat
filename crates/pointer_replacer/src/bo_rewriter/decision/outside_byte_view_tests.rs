@@ -99,18 +99,6 @@ fn r819_2_two_mutable_formals_of_one_pointee_are_w4s_instance() {
     certified(&input, "binn_object_blob", SAME_POINTEE_MUT);
 }
 
-/// R767: a formal pair the provided test passes one object to (the fixture
-/// table's `crat_w6o_zsub`, positions 0 and 2).
-#[test]
-fn r819_2_control_a_pair_the_provided_test_aliases_is_not_certified() {
-    let input = BLOB.replace(
-        "pub unsafe extern \"C\" fn binn_object_blob(\n    mut obj: *mut core::ffi::c_void,\n    mut key: *const i8,\n    mut psize: *mut i32,",
-        "pub unsafe extern \"C\" fn crat_w6o_zsub(\n    mut key: *const i8,\n    mut obj: *mut core::ffi::c_void,\n    mut psize: *mut i32,",
-    );
-    assert!(input.contains("fn crat_w6o_zsub("));
-    not_certified(&input, "crat_w6o_zsub");
-}
-
 /// An entry the program itself calls.
 #[test]
 fn r819_2_control_an_entry_the_program_calls_is_not_certified() {
