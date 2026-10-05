@@ -4,7 +4,7 @@
 //! In the closed program, each pointer argument of an exported entry that no
 //! function of the program calls designates a separate object. So two distinct
 //! formals of such an entry, handed on bare (or as places inside them) and
-//! never assigned, are disjoint. The receipt names the instance:
+//! never assigned nor addressed, are disjoint. The receipt names the instance:
 //! - `pair-disjoint:premise-outside-byte-view`: a byte or `void` formal beside a
 //!   typed one (P8 `OutsideByteViewDiscipline`, R814-2);
 //! - `exported-entry:same-pointee-mut-pair`: one pointee, both mutable (W4,
@@ -14,7 +14,7 @@
 //!   separate).
 //!
 //! Not covered: an entry the program calls or names, an unexported function,
-//! an argument that is not the entry's own formal, a formal the body assigns,
+//! an argument that is not the entry's own formal, a formal the body assigns or takes the address of,
 //! and (R767) a formal pair the program's provided test passes one object to.
 //!
 //! It is read where the seam's site gate looks the pair's A5 proof up: that
@@ -111,6 +111,8 @@ pub(crate) fn certifies(
         left.position.min(right.position),
         left.position.max(right.position),
     );
+    // The roots must be two different formals: one formal handed twice, or
+    // two places inside one formal, is one outside object (wave-6o 123).
     if left.position == right.position
         || entry
             .test_aliased
@@ -123,7 +125,8 @@ pub(crate) fn certifies(
 }
 
 /// The exported entries nothing in the program calls or names, each with its
-/// raw-pointer formals the body never assigns, and the pairs its test aliases.
+/// raw-pointer formals the body never assigns nor addresses, and the pairs its
+/// test aliases.
 /// `facts` must already hold every call and reference in the crate.
 pub(crate) fn entry_formals(
     tcx: TyCtxt<'_>,
@@ -160,7 +163,7 @@ pub(crate) fn entry_formals(
             else {
                 continue;
             };
-            if assigned(body, binding) {
+            if assigned_or_addressed(body, binding) {
                 continue;
             }
             formals.by_binding.insert(
@@ -187,15 +190,18 @@ fn is_byte<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> bool {
         TyKind::Int(rustc_middle::ty::IntTy::I8) | TyKind::Uint(rustc_middle::ty::UintTy::U8)
     ) || pointee.is_c_void(tcx)
 }
-fn assigned(body: &rustc_hir::Body<'_>, binding: HirId) -> bool {
+fn assigned_or_addressed(body: &rustc_hir::Body<'_>, binding: HirId) -> bool {
     struct Assign {
         binding: HirId,
         found: bool,
     }
     impl<'v> Visitor<'v> for Assign {
         fn visit_expr(&mut self, expr: &'v rustc_hir::Expr<'v>) {
-            if let rustc_hir::ExprKind::Assign(lhs, ..) | rustc_hir::ExprKind::AssignOp(_, lhs, _) =
-                expr.kind
+            // An assignment to the binding, or its address taken (a write
+            // through that address can reassign it: wave-6o 123 note 1).
+            if let rustc_hir::ExprKind::Assign(lhs, ..)
+            | rustc_hir::ExprKind::AssignOp(_, lhs, _)
+            | rustc_hir::ExprKind::AddrOf(_, _, lhs) = expr.kind
                 && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
                 && let rustc_hir::def::Res::Local(local) = path.res
                 && local == self.binding
