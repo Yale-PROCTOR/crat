@@ -108,6 +108,8 @@ pub(crate) mod outside_byte_view;
 #[cfg(test)]
 mod outside_byte_view_tests;
 pub(crate) mod overlapping_pairs;
+#[cfg(test)]
+mod own_nullable_tests;
 pub(crate) mod ownership_fields_cache_binding;
 pub(crate) mod ownership_fields_constructor;
 pub(crate) mod ownership_fields_deallocator;
@@ -2000,6 +2002,24 @@ fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
 /// Corpus-unreachable by construction, which is precisely why it is witnessed
 /// through the `perturb` hook rather than by a sweep: a guard no test can break
 /// is not a guard.
+/// Test-only: subjects (by label) whose Option stage a witness withdraws, the
+/// way an exclusion re-derivation would (R824-2's witnesses).
+#[cfg(test)]
+pub(crate) static FORCED_OPTION_WITHDRAWALS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Is the Option family stage enabled for this subject?
+fn option_stage_enabled(family_policy: &super::additive::FamilyPolicy, subject: &Subject) -> bool {
+    #[cfg(test)]
+    if FORCED_OPTION_WITHDRAWALS
+        .lock()
+        .is_ok_and(|labels| labels.contains(&subject.label))
+    {
+        return false;
+    }
+    family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
+}
+
 fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let decision = decide_one_ladder(ctx, subject);
     // Wave-6o relay 146 (R796-1): the retained-alias stop-gap. A listed formal
@@ -2307,8 +2327,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if io_domain.contains(&(subject.fn_did, subject.hir_id)) {
         return degrade(subject, decl_site, DegradeReason::IoDomainType);
     }
-    let option_enabled =
-        family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option);
+    let option_enabled = option_stage_enabled(family_policy, subject);
     let depth2_npo = matches!(subject.kind, SubjectKind::Local)
         .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
         .flatten();
