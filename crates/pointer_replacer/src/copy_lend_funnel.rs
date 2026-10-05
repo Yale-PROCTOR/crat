@@ -1596,10 +1596,17 @@ pub unsafe fn f() -> i32 {
         };
 
         ::utils::compilation::run_compiler_on_str(
+            // L01^14 (R804-1): the copy-lend guard refuses a caller's value the function only
+            // reads, so the carrier's formal is released here and its pair stays eligible.
             r#"
-pub unsafe fn f(p: *const i32) -> i32 {
+unsafe extern "C" {
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f(p: *mut i32) -> i32 {
     let q = p;
-    unsafe { *q }
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
 }
 "#,
             |tcx| {

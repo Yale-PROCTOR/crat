@@ -179,6 +179,10 @@ pub(crate) enum CopyLendEligibilityDrop {
     C3OrdinaryCall,
     C3ReallocSource,
     C3OutwardUnknownCall,
+    /// L01¹⁴ (R804-1): the source holds its caller's value and nothing in the
+    /// function releases it, so the lend reading would make an owner of a value the
+    /// function was only handed (R536-4).
+    GuardCallerDerivedSource,
 }
 
 impl CopyLendEligibilityDrop {
@@ -194,6 +198,7 @@ impl CopyLendEligibilityDrop {
             Self::C3OrdinaryCall => "c3-ordinary-call",
             Self::C3ReallocSource => "c3-realloc-source",
             Self::C3OutwardUnknownCall => "c3-outward-unknown-call",
+            Self::GuardCallerDerivedSource => "guard-caller-derived-source",
         }
     }
 }
@@ -2322,6 +2327,7 @@ pub(crate) fn analyze_copy_lend_candidates(
             .unwrap_or_else(|| panic!("missing origin flow for {fn_did:?}"));
         let value_flows = flows.body.depth0_value_flows();
         let live_before = live_before_by_location(program.tcx, &body);
+        let caller_derived = super::caller_derived_locals(&body, program.tcx);
 
         for (pair, mut sites) in by_pair {
             sites.sort_by_key(|site| site.sort_key());
@@ -2347,6 +2353,17 @@ pub(crate) fn analyze_copy_lend_candidates(
             } else {
                 live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
             };
+            // R804-1: lend only an owner the function makes or releases itself.
+            let rhs_local = sites[0].rhs_local;
+            let drop = drop.or_else(|| {
+                let released = destination_flows_to_deallocator(
+                    program.tcx,
+                    &body,
+                    &owner_closure([SlotOwner::Local(rhs_local)], &value_flows),
+                );
+                (copy_lend_guard() && caller_derived.contains(&rhs_local) && !released)
+                    .then_some(CopyLendEligibilityDrop::GuardCallerDerivedSource)
+            });
             answer.push(CopyLendPairCandidate { pair, sites, drop });
         }
     }
@@ -2357,6 +2374,11 @@ pub(crate) fn analyze_copy_lend_candidates(
         )
     });
     answer
+}
+
+/// The R804-1 guard; `CRAT_E5C_L14_FAULT=copy-lend-guard` removes it (the fault).
+fn copy_lend_guard() -> bool {
+    std::env::var("CRAT_E5C_L14_FAULT").as_deref() != Ok("copy-lend-guard")
 }
 
 fn collect_copy_sites(

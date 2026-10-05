@@ -673,6 +673,12 @@ impl RelaxedSelectors {
 }
 
 impl KindSolver {
+    /// era-5c 134: the whole system the solve sees (hard and soft), as SMT-LIB text.
+    #[cfg(test)]
+    pub(crate) fn system_text(&self) -> String {
+        self.solver.to_string()
+    }
+
     pub fn new(slots: &CrateSlots) -> Self {
         Self::build(slots, Some(CoreTracker::new_mandatory()), true)
     }

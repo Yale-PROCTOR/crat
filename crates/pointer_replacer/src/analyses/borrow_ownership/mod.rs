@@ -65,6 +65,8 @@ pub(crate) mod raw_cause;
 pub(crate) mod realloc;
 pub(crate) mod realloc_ssa;
 pub mod resolve;
+#[cfg(test)]
+mod copy_lend_guard_tests;
 pub(crate) mod retirement;
 pub(crate) mod safety_mono;
 pub(crate) mod slot_key;
