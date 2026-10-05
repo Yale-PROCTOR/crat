@@ -349,3 +349,40 @@ fn r819_4_control_the_same_pointer_read_at_two_positions_keeps_its_references() 
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+/// R833-1 (USER), the callee's side, end-to-end controls. (The rule's own
+/// witness is unit-level, `decision/pair_rule_tests.rs`: on this reduction the
+/// census world reads `add(G1, G2)` as proven disjoint even where `G2` may hold
+/// `G1`'s pointer, so no raw-view pair forms here — three attempts.)
+fn r833_signature(name: &str) -> String {
+    let input = include_str!("testdata/r833_pair_not_shown_disjoint.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.split(&format!("fn {name}("))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no {name}:\n{source}"))
+                .to_owned()
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
+
+/// Control: the same callee shape at a call the scope's certificate proves.
+#[test]
+fn r833_1_control_a_certified_pair_keeps_its_references() {
+    let signature = r833_signature("add2");
+    assert!(signature.contains("a: &mut i32"), "({signature})");
+    assert!(signature.contains("b: &"), "({signature})");
+}
+
+/// Control: a pair whose members are only read keeps shared references.
+#[test]
+fn r833_1_control_a_read_read_pair_keeps_shared_references() {
+    let signature = r833_signature("sum");
+    assert!(
+        signature.contains("a: &i32") && signature.contains("b: &i32"),
+        "({signature})"
+    );
+}

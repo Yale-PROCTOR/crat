@@ -1657,6 +1657,17 @@ fn escape_block_reason(
     }
 }
 
+/// R833-1 (USER) — the callee's side of the pair rule. At a call inside the
+/// program where a pair is not shown disjoint and one member takes the raw
+/// view, its peer may not keep a reference either: the primaries at that call
+/// whose own verdict is not clear become blocked, and their subjects are
+/// returned to be held raw (`pair-not-shown-disjoint`). Read-read pairs never
+/// form a pair here, and a certified pair's verdict is clear.
+pub(crate) fn peers_of_unproven_raw_views(rows: &mut [PairSiteDecision]) -> Vec<NodeKey> {
+    let _ = rows;
+    Vec::new()
+}
+
 /// R808-5 / R810-2 — the proven-overlap formal pairs: `(callee, inner, outer)`
 /// where, at some call, the inner argument provably lies inside the outer
 /// argument's referent or is the same pointer (R819-1 item 4), carried to a

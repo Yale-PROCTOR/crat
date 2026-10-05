@@ -120,6 +120,8 @@ pub(crate) mod ownership_fields_source;
 pub(crate) mod ownership_fields_store_close;
 pub(crate) mod pair_disjointness;
 pub(crate) mod pending_hold;
+#[cfg(test)]
+mod pair_rule_tests;
 pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]
