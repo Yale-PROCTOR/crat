@@ -1,20 +1,25 @@
-//! **R815-6 — premise P8 `OutsideByteViewDiscipline` (R814-2) at the pair proof.**
+//! **R815-6 / R819-1 item 2 — the scope's separate-object certificate (R816-1)
+//! at the pair proof.**
 //!
-//! P8: an outside caller does not hand the program a byte (or `void`) view of
-//! an object that it also hands the program typed. So at a call where both
-//! arguments are formals of an exported entry that nothing in the program
-//! calls, handed on bare (or as places inside them), one of byte or `void`
-//! pointee and the other of a non-character pointee, the two point into
-//! different outside objects: the pair is disjoint under P8, receipted
-//! `pair-disjoint:premise-outside-byte-view` on the pair row.
+//! In the closed program, each pointer argument of an exported entry that no
+//! function of the program calls designates a separate object. So two distinct
+//! formals of such an entry, handed on bare (or as places inside them) and
+//! never assigned, are disjoint. The receipt names the instance:
+//! - `pair-disjoint:premise-outside-byte-view`: a byte or `void` formal beside a
+//!   typed one (P8 `OutsideByteViewDiscipline`, R814-2);
+//! - `exported-entry:same-pointee-mut-pair`: one pointee, both mutable (W4,
+//!   R462);
+//! - `pair-disjoint:scope-closed-program`: the rest (two byte formals, a shared
+//!   and a mutable formal of one pointee, pointees the type route cannot
+//!   separate).
 //!
-//! Not covered: two byte formals, two typed formals (W4's same-pointee arm and
-//! the type route stay as they are), and an argument that is not the entry's
-//! own formal (a local, even one copied from a formal, is not read through).
+//! Not covered: an entry the program calls or names, an unexported function,
+//! an argument that is not the entry's own formal, a formal the body assigns,
+//! and (R767) a formal pair the program's provided test passes one object to.
 //!
 //! It is read where the seam's site gate looks the pair's A5 proof up: that
-//! proof's raw-view fallback is what makes the typed formal a raw view
-//! (binn's `binn_object_blob` → `binn_object_get::psize`).
+//! proof's raw-view fallback is what makes a formal a raw view (binn's
+//! `binn_object_blob` → `binn_object_get::psize`).
 
 use rustc_hash::FxHashMap;
 use rustc_hir::{
@@ -26,8 +31,40 @@ use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 
 use super::emitability::{ArgShape, CallSite, EmitabilityFacts};
 
-/// The receipt on a pair row this premise certifies.
+/// The receipt of the byte-beside-typed instance (P8).
 pub(crate) const RECEIPT: &str = "pair-disjoint:premise-outside-byte-view";
+/// The receipt of W4's instance: one pointee, both mutable.
+pub(crate) const SAME_POINTEE_MUT: &str = "exported-entry:same-pointee-mut-pair";
+/// The receipt of the scope's remaining instances.
+pub(crate) const SCOPE_CLOSED_PROGRAM: &str = "pair-disjoint:scope-closed-program";
+
+/// One formal of an outside-only entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EntryFormal {
+    pub position: usize,
+    pub byte: bool,
+    pub mutable: bool,
+    pub pointee: String,
+}
+
+/// An outside-only entry's formals by binding, and the position pairs its
+/// provided test aliases (R767).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EntryFormals {
+    pub by_binding: FxHashMap<HirId, EntryFormal>,
+    pub test_aliased: Vec<(usize, usize)>,
+}
+
+/// The receipt of the instance a certified pair is.
+pub(crate) fn instance(left: &EntryFormal, right: &EntryFormal) -> &'static str {
+    if left.byte != right.byte {
+        RECEIPT
+    } else if left.pointee == right.pointee && left.mutable && right.mutable {
+        SAME_POINTEE_MUT
+    } else {
+        SCOPE_CLOSED_PROGRAM
+    }
+}
 
 /// The pair proof at `site` for `left` / `right`, read under P8: a pair P8
 /// certifies is clear, with the premise as its reason.
@@ -39,24 +76,23 @@ pub(crate) fn read_under_p8(
     proof: &mut super::a5_site_proof::A5PeerProof,
 ) {
     if proof.verdict != super::a5_site_proof::A5SiteProofVerdict::Clear
-        && certifies(facts, site, left, right)
+        && let Some(receipt) = certifies(facts, site, left, right)
     {
         proof.verdict = super::a5_site_proof::A5SiteProofVerdict::Clear;
-        proof.reason = RECEIPT;
-        proof.family = "premise-outside-byte-view";
+        proof.reason = receipt;
+        proof.family = "scope-separate-objects";
     }
 }
 
-/// Does P8 certify the pair of argument positions `left` / `right` at `site`?
+/// The receipt of the instance when the scope certifies the pair of argument
+/// positions `left` / `right` at `site`, else `None`.
 pub(crate) fn certifies(
     facts: &EmitabilityFacts,
     site: &CallSite,
     left: usize,
     right: usize,
-) -> bool {
-    let Some(formals) = facts.outside_entry_formals.get(&site.caller) else {
-        return false;
-    };
+) -> Option<&'static str> {
+    let entry = facts.outside_entry_formals.get(&site.caller)?;
     let formal = |index: usize| {
         let argument = site.args.iter().find(|argument| argument.index == index)?;
         let root = match argument.shape {
@@ -68,19 +104,31 @@ pub(crate) fn certifies(
             } => base,
             _ => return None,
         };
-        formals.get(&root).copied()
+        entry.by_binding.get(&root)
     };
-    // Two formals of different classes are two different formals.
-    matches!((formal(left), formal(right)), (Some(left), Some(right)) if left != right)
+    let (left, right) = (formal(left)?, formal(right)?);
+    let pair = (
+        left.position.min(right.position),
+        left.position.max(right.position),
+    );
+    if left.position == right.position
+        || entry
+            .test_aliased
+            .iter()
+            .any(|&(a, b)| (a.min(b), a.max(b)) == pair)
+    {
+        return None;
+    }
+    Some(instance(left, right))
 }
 
 /// The exported entries nothing in the program calls or names, each with its
-/// raw-pointer formals the body never assigns: binding -> byte pointee.
+/// raw-pointer formals the body never assigns, and the pairs its test aliases.
 /// `facts` must already hold every call and reference in the crate.
 pub(crate) fn entry_formals(
     tcx: TyCtxt<'_>,
     facts: &EmitabilityFacts,
-) -> FxHashMap<LocalDefId, FxHashMap<HirId, bool>> {
+) -> FxHashMap<LocalDefId, EntryFormals> {
     let mut out = FxHashMap::default();
     for owner in tcx.hir_body_owners() {
         if tcx.def_kind(owner) != rustc_hir::def::DefKind::Fn
@@ -99,20 +147,33 @@ pub(crate) fn entry_formals(
             .instantiate_identity()
             .skip_binder()
             .inputs();
-        let mut formals = FxHashMap::default();
+        let mut formals = EntryFormals {
+            test_aliased: super::aliased_by_test::aliased_pairs(tcx, owner),
+            ..Default::default()
+        };
         for (position, param) in body.params.iter().enumerate() {
             let PatKind::Binding(_, binding, _, None) = param.pat.kind else {
                 continue;
             };
-            let Some(TyKind::RawPtr(pointee, _)) = inputs.get(position).map(|ty| ty.kind()) else {
+            let Some(TyKind::RawPtr(pointee, mutability)) =
+                inputs.get(position).map(|ty| ty.kind())
+            else {
                 continue;
             };
             if assigned(body, binding) {
                 continue;
             }
-            formals.insert(binding, is_byte(tcx, *pointee));
+            formals.by_binding.insert(
+                binding,
+                EntryFormal {
+                    position,
+                    byte: is_byte(tcx, *pointee),
+                    mutable: mutability.is_mut(),
+                    pointee: pointee.to_string(),
+                },
+            );
         }
-        if !formals.is_empty() {
+        if !formals.by_binding.is_empty() {
             out.insert(owner, formals);
         }
     }

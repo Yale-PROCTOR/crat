@@ -15,6 +15,7 @@
 //! The formal stays an ordinary raw formal of its class, so its in-crate
 //! callers are bridged at the call like any raw formal's.
 
+use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::TyCtxt;
 
 use super::{Subject, SubjectKind};
@@ -99,6 +100,27 @@ pub(crate) fn held(tcx: TyCtxt<'_>, subject: &Subject) -> Option<String> {
         })
         .collect();
     (!pairs.is_empty()).then(|| pairs.join(";"))
+}
+
+/// R819-1 item 2 (wave-5d): the formal position pairs of `entry` that the
+/// provided test passes one object to, whatever the members do. The scope's
+/// separate-object certificate does not hold for them.
+pub(crate) fn aliased_pairs(tcx: TyCtxt<'_>, entry: LocalDefId) -> Vec<(usize, usize)> {
+    let program = std::env::var("CRAT_ERA5_PROGRAM").ok();
+    let owned;
+    let text: &str = match std::env::var(OVERRIDE) {
+        Ok(path) => {
+            owned = std::fs::read_to_string(&path).unwrap_or_default();
+            &owned
+        }
+        Err(_) => table_for(program.is_some()),
+    };
+    let program = program.as_deref().unwrap_or("-");
+    let name = tcx.item_name(entry.to_def_id());
+    rows(text)
+        .filter(|r| r.program == program && r.entry == name.as_str())
+        .map(|r| (r.formals[0].1, r.formals[1].1))
+        .collect()
 }
 
 #[cfg(test)]

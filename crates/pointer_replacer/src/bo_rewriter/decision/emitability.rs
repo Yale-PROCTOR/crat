@@ -1102,10 +1102,10 @@ pub(crate) struct EmitabilityFacts {
     /// Item-E wave 2's exact, allowlisted body positions. An empty entry for a
     /// ninth function is the scope control; no downstream name filter exists.
     pub body_adapters: Vec<BodyAdapterSite>,
-    /// R815-6 (P8): for each exported entry nothing in the program calls, its
-    /// raw-pointer formals the body never assigns, by binding: is the pointee
-    /// a byte or `void`?
-    pub outside_entry_formals: FxHashMap<LocalDefId, FxHashMap<HirId, bool>>,
+    /// R815-6 / R819-1 (the scope's certificate): for each exported entry
+    /// nothing in the program calls, its raw-pointer formals the body never
+    /// assigns, and the formal pairs its provided test aliases (R767).
+    pub outside_entry_formals: FxHashMap<LocalDefId, super::outside_byte_view::EntryFormals>,
 }
 
 /// Gather A1 facts for the whole crate in one HIR pass per function body.
