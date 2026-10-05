@@ -3221,9 +3221,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     //     ownership-fields native bundle renders that view from its Box owner
     //     itself, and a slice view costs the owner its Box (class_split's clean
     //     twin; wave-5d2 026 measured the same trade for R453-4's arm). Where
-    //     the formal stays raw (a negative or unknown offset: heman's
-    //     `edt_with_payload::z`) the bundle cannot deliver, and the rule keeps
-    //     the view.
+    //     the formal's offsets may be negative (heman's `edt_with_payload::z`)
+    //     the same holds once the native refresh delivers the other owners:
+    //     a slice view into the raw formal has no carrier and withdraws every
+    //     owner of the function (wave-6a relay 151), so the rule stands aside
+    //     there too.
     let rule_stands_aside = || {
         // (b) is read on the settled table (`entry_rule_releases`, main 173a).
         let unseen_entry = ENTRY_RULE_RELEASED.with(|released| {
@@ -3232,14 +3234,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 .contains(&(subject.fn_did, subject.hir_id))
         });
         let bundle_view = matches!(subject.kind, SubjectKind::Local)
-            && slice_input::fat_hand_on(subject, facts, fat).is_some_and(|(callee, index)| {
-                let formal = Local::from_usize(index + 1);
-                !sign.may_be_negative(callee, formal)
-                    || compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
-                        tcx, callee, formal,
-                    )
-                    .is_ok()
-            })
+            && slice_input::fat_hand_on(subject, facts, fat).is_some()
             && slice_input::offset_view_root(tcx, subject.fn_did, subject.hir_id).is_some_and(
                 |root| {
                     subjects.iter().any(|owner| {
