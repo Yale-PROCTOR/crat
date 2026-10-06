@@ -30,7 +30,14 @@ fn read(caller: &str) -> (A5SiteProofVerdict, &'static str) {
             left_site: None,
             right_site: None,
         };
-        super::loaded_operand::read_loaded_operands(site, 0, 1, &mut proof);
+        // The retention the test supplies: only `keep` keeps its argument.
+        let keep = functions
+            .iter()
+            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == "keep")
+            .copied();
+        super::loaded_operand::read_loaded_operands(site, 0, 1, &mut proof, |callee, _| {
+            Some(callee) == keep
+        });
         (proof.verdict, proof.reason)
     })
     .expect("input type-checks")
@@ -75,4 +82,27 @@ fn r838_control_two_locals_addresses_keep_the_proof() {
 #[test]
 fn r838_control_an_entrys_two_formals_keep_the_proof() {
     assert_eq!(read("entry"), PROVEN);
+}
+
+/// The narrowing: a loaded pointer beside `&mut l`, `l` a scalar local whose
+/// address reaches no memory (its one borrow is this argument, and `add` keeps
+/// nothing), keeps the proof.
+#[test]
+fn r838_narrowed_a_loaded_pointer_beside_an_unescaped_local_keeps_the_proof() {
+    assert_eq!(read("unescaped"), PROVEN);
+}
+
+#[test]
+fn r838_narrowed_control_the_local_stored_through_a_pointer_is_not_shown_disjoint() {
+    assert_eq!(read("stored"), NOT_SHOWN);
+}
+
+#[test]
+fn r838_narrowed_control_the_local_handed_to_a_callee_that_keeps_it_is_not_shown_disjoint() {
+    assert_eq!(read("kept"), NOT_SHOWN);
+}
+
+#[test]
+fn r838_narrowed_control_the_local_bound_by_ref_is_not_shown_disjoint() {
+    assert_eq!(read("ref_bound"), NOT_SHOWN);
 }

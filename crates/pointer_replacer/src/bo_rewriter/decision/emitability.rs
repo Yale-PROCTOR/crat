@@ -301,6 +301,12 @@ pub(crate) struct Arg {
     /// a value's origin complete and private, which stores in other bodies make
     /// false. See [`loaded_from_memory`].
     pub loaded_from_memory: bool,
+    /// Report 137 §5: for `&mut l` over a scalar local `l`, every place the
+    /// body takes `l`'s address — `Some((callee, position))` for a direct
+    /// argument of a local callee, `None` for anything else. Absent when the
+    /// argument is not such an address or the body cannot be read that way.
+    /// See [`super::loaded_operand::address_uses`].
+    pub address_uses: Option<Vec<Option<(LocalDefId, usize)>>>,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -1718,6 +1724,15 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 self.tcx,
                                                 self.fn_did,
                                                 arg,
+                                            ),
+                                            address_uses: direct_mutable_storage(arg).and_then(
+                                                |(local, _)| {
+                                                    super::loaded_operand::address_uses(
+                                                        self.tcx,
+                                                        self.fn_did,
+                                                        local,
+                                                    )
+                                                },
                                             ),
                                         }
                                     })

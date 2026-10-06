@@ -47,3 +47,29 @@ pub unsafe fn locals() {
 pub unsafe extern "C" fn entry(mut x: *mut i32, mut y: *mut i32) {
     add(x, y);
 }
+// The narrowing (wave-5d report 137 §5): a loaded pointer beside the address of
+// a scalar local whose address never reaches memory keeps the proof; the same
+// local stored once, handed to a callee that keeps it, or bound by `ref` does not.
+unsafe fn keep(mut r: *mut i32) {
+    G1 = r;
+}
+pub unsafe fn unescaped(mut p: *mut *mut i32) {
+    let mut l: i32 = 0;
+    add(*p, &mut l);
+}
+pub unsafe fn stored(mut p: *mut *mut i32) {
+    let mut l: i32 = 0;
+    *p = &mut l;
+    add(*p, &mut l);
+}
+pub unsafe fn kept() {
+    let mut l: i32 = 0;
+    keep(&mut l);
+    add(G1, &mut l);
+}
+pub unsafe fn ref_bound(mut p: *mut *mut i32) {
+    let mut l: i32 = 0;
+    let ref mut r = l;
+    *r = 1;
+    add(*p, &mut l);
+}
