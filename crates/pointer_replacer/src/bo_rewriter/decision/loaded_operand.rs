@@ -31,17 +31,28 @@ pub(crate) fn read_loaded_operands(
     left: usize,
     right: usize,
     proof: &mut A5PeerProof,
-    _may_retain: impl Fn(LocalDefId, usize) -> bool,
+    may_retain: impl Fn(LocalDefId, usize) -> bool,
 ) {
     if proof.verdict != A5SiteProofVerdict::Clear || proof.reason != "a5-proven-disjoint" {
         return;
     }
-    let loaded = |index: usize| {
-        site.args
-            .iter()
-            .find(|argument| argument.index == index)
-            .is_some_and(|argument| argument.loaded_from_memory)
+    let argument = |index: usize| site.args.iter().find(|argument| argument.index == index);
+    let loaded = |index: usize| argument(index).is_some_and(|argument| argument.loaded_from_memory);
+    // A pointer loaded from memory cannot hold an address that never reached
+    // memory: the address of a scalar local every borrow of which is a direct
+    // argument of a local callee that keeps nothing.
+    let unescaped = |index: usize| {
+        argument(index)
+            .and_then(|argument| argument.address_uses.as_ref())
+            .is_some_and(|uses| {
+                uses.iter().all(|place| {
+                    place.is_some_and(|(callee, position)| !may_retain(callee, position))
+                })
+            })
     };
+    if (loaded(left) && unescaped(right)) || (loaded(right) && unescaped(left)) {
+        return;
+    }
     if loaded(left) || loaded(right) {
         proof.verdict = A5SiteProofVerdict::Overlapping;
         proof.reason = REASON;
