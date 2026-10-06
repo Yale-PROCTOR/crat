@@ -651,14 +651,16 @@ const BORROWED_INTO_HELD: &str = "#![allow(dead_code, unused_unsafe)]\n\
     }\n\
     pub unsafe fn entry() {\n\
         let mut value = 1;\n\
-        let mut other = 2;\n\
-        let holder = Holder { data: &mut value };\n\
-        outer(&holder, &mut other);\n\
+        let shared: *mut i32 = &mut value;\n\
+        let holder = Holder { data: shared };\n\
+        outer(&holder, shared);\n\
     }\n";
 
 #[test]
 fn r861_1_m4_a_binding_borrowed_into_a_held_formal_is_held() {
-    let out = outcome(BORROWED_INTO_HELD);
+    // The census's A5 world (the open world's proof-site assertion trips here,
+    // main 186 class C); `entry` hands one object to both sides.
+    let out = census_outcome(BORROWED_INTO_HELD);
     assert_eq!(
         reason_of(&out, "caller::src"),
         Some("held:pair-not-shown-disjoint"),
