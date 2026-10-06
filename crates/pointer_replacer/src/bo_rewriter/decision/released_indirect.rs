@@ -366,10 +366,19 @@ pub(crate) fn to_hold(
         .entries
         .iter()
         .map(|(subject, decision)| {
-            (
-                (subject.fn_did, subject.hir_id),
-                matches!(decision, super::Decision::Degraded(_)),
-            )
+            // Exhaustive by rule (`import_denylist`): a new disposition is
+            // classified here, never dropped by a bypass shape.
+            let raw = match decision {
+                super::Decision::Degraded(_) => true,
+                super::Decision::Ref { .. }
+                | super::Decision::InferredRef { .. }
+                | super::Decision::Slice { .. }
+                | super::Decision::NestedSlice { .. }
+                | super::Decision::Cursor { .. }
+                | super::Decision::Opt { .. }
+                | super::Decision::Box(_) => false,
+            };
+            ((subject.fn_did, subject.hir_id), raw)
         })
         .collect();
     held.iter()
