@@ -1757,56 +1757,94 @@ fn escape_block_reason(
 }
 
 /// R833-1 (USER) — the callee's side of the pair rule. At a call inside the
-/// program where a pair is not shown disjoint and one member stays raw (it
-/// takes the raw view, or it is blocked), its peers may not keep a reference
-/// either: the primaries at that call whose own verdict is not clear become
-/// blocked, and their subjects are returned to be held raw
-/// (`pair-not-shown-disjoint`). A peer the raw member's unproven proof names
-/// and that has no row at the call (a raw view A5's fallback learned for one
-/// position only) gets a blocked row from `peer_row`, so the class terminal
-/// sees it as it sees any other. Read-read pairs never form a pair here, and a
-/// certified pair's verdict is clear.
+/// program, a member that stays raw (it takes the raw view, or it is blocked)
+/// and is not shown disjoint holds every peer its proof does not clear, and so
+/// does each peer it holds, to a fixpoint (the independent review's MED 3):
+/// - the primaries at that call whose own verdict is not clear;
+/// - a position the member's proof names as unproven, whatever that
+///   position's own row says (its row is read, not merely found);
+/// - a named position with no row at the call: `peer_row` gives it a blocked
+///   row (only for a conversion node), so the class terminal holds it, and
+///   its own unproven partners (as the rows at the call record them) follow.
+///
+/// The held subjects are returned (`pair-not-shown-disjoint`). Read-read
+/// pairs never form a pair here, and a certified pair's verdict is clear.
 pub(crate) fn peers_of_unproven_raw_views(
     rows: &mut Vec<PairSiteDecision>,
     peer_row: impl Fn(&PairSiteDecision, usize) -> Option<PairSiteDecision>,
 ) -> Vec<NodeKey> {
-    let raw_members = rows
+    type Call = (LocalDefId, LocalDefId, Span);
+    let call_of = |row: &PairSiteDecision| -> Call { (row.caller, row.callee, row.call_span) };
+    // Every unproven pair the rows record, both ways, by call.
+    let mut partners = FxHashMap::<(Call, usize), Vec<usize>>::default();
+    for row in rows.iter() {
+        for &peer in &row.unproven_peers {
+            for (from, to) in [(row.argument_index, peer), (peer, row.argument_index)] {
+                let list = partners.entry((call_of(row), from)).or_default();
+                if !list.contains(&to) {
+                    list.push(to);
+                }
+            }
+        }
+    }
+    let mut held = Vec::new();
+    let hold = |row: &mut PairSiteDecision, held: &mut Vec<NodeKey>| {
+        row.role = PairRole::Blocked;
+        row.tier = PairTier::Blocked;
+        row.reason = "pair-not-shown-disjoint".to_owned();
+        if !held.contains(&row.subject) {
+            held.push(row.subject);
+        }
+    };
+    let mut work = rows
         .iter()
-        .filter(|row| {
+        .enumerate()
+        .filter(|(_, row)| {
             matches!(row.role, PairRole::RawView | PairRole::Blocked)
                 && row.verdict != A5SiteProofVerdict::Clear
         })
-        .cloned()
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let same_call = |row: &PairSiteDecision, member: &PairSiteDecision| {
-        (row.caller, row.callee, row.call_span) == (member.caller, member.callee, member.call_span)
-    };
-    let mut held = Vec::new();
-    for row in rows.iter_mut() {
-        if row.role == PairRole::Primary
-            && row.verdict != A5SiteProofVerdict::Clear
-            && raw_members.iter().any(|member| same_call(row, member))
-        {
-            row.role = PairRole::Blocked;
-            row.tier = PairTier::Blocked;
-            row.reason = "pair-not-shown-disjoint".to_owned();
-            held.push(row.subject);
+    let mut seen = work.iter().copied().collect::<FxHashSet<_>>();
+    while let Some(member) = work.pop() {
+        let call = call_of(&rows[member]);
+        let named = partners
+            .get(&(call, rows[member].argument_index))
+            .cloned()
+            .unwrap_or_default();
+        // The primaries at the call not shown disjoint, and every row the
+        // member's proof names.
+        for index in 0..rows.len() {
+            let row = &rows[index];
+            let at_call = call_of(row) == call && index != member;
+            let unproven_primary =
+                row.role == PairRole::Primary && row.verdict != A5SiteProofVerdict::Clear;
+            let named_here = named.contains(&row.argument_index)
+                && matches!(row.role, PairRole::Primary | PairRole::Clear);
+            if at_call && (unproven_primary || named_here) {
+                hold(&mut rows[index], &mut held);
+                if seen.insert(index) {
+                    work.push(index);
+                }
+            }
         }
-    }
-    for member in &raw_members {
-        for &peer in &member.unproven_peers {
+        // A named position with no row at the call.
+        for peer in named {
             if rows
                 .iter()
-                .any(|row| same_call(row, member) && row.argument_index == peer)
+                .any(|row| call_of(row) == call && row.argument_index == peer)
             {
                 continue;
             }
-            if let Some(row) = peer_row(member, peer) {
-                if !held.contains(&row.subject) {
-                    held.push(row.subject);
-                }
-                rows.push(row);
-            }
+            let Some(mut row) = peer_row(&rows[member], peer) else {
+                continue;
+            };
+            row.unproven_peers = partners.get(&(call, peer)).cloned().unwrap_or_default();
+            hold(&mut row, &mut held);
+            rows.push(row);
+            let index = rows.len() - 1;
+            seen.insert(index);
+            work.push(index);
         }
     }
     held
