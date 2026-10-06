@@ -592,6 +592,43 @@ pub(crate) fn enabled_proof(
         .then_some(proof)
 }
 
+/// **R758-1 (2) / R763-1 (a) — the thin-into-fat hand-on (main 147 §2).** A
+/// subject handed BARE into a callee parameter the fatness analysis calls an
+/// array is used as an array there: the hand-on is its array-use op-fact, and
+/// its own fatness is the licence (the S3.2′-2 authority split, with the
+/// callee's access standing in for the subject's uses). W-C7 above takes such a
+/// forwarder only when every caller supplies a buffer; without it the thin form
+/// reaches the callee as a one-element `from_ref` / `from_mut` (shape (i),
+/// R416-5's defect: the callee indexes past it and panics on a UB-free input)
+/// or, at a raw formal, as a one-element reference read past its end (g25,
+/// R763-1). The extent comes from where it comes for every slice: the callers
+/// that hold one hand it on; the others adapt under §77's receipted fallback
+/// (R481). One fat hand-on is enough — a slice also serves a thin formal
+/// (`&x[0]`), where a thin form never serves a fat one.
+pub(crate) fn hands_on_to_fat(
+    subject: &Subject,
+    facts: &EmitabilityFacts,
+    fat: &FatFacts,
+    policy: &crate::bo_rewriter::additive::FamilyPolicy,
+) -> bool {
+    subject.ptr_depth == 1
+        && fat.is_array(subject.fn_did, subject.local)
+        && policy.enabled(
+            subject.fn_did,
+            crate::bo_rewriter::additive::FamilyStage::SliceUse,
+        )
+        && facts.call_args.iter().any(|(&callee, calls)| {
+            calls
+                .iter()
+                .filter(|call| call.caller == subject.fn_did)
+                .flat_map(|call| &call.args)
+                .any(|arg| {
+                    matches!(arg.shape, ArgShape::BareLocal(argument) if argument == subject.hir_id)
+                        && fat.is_array(callee, Local::from_usize(arg.index + 1))
+                })
+        })
+}
+
 /// **Does the accessing callee index this parameter under its OWN adjacent
 /// companion, and nothing else?**
 ///
