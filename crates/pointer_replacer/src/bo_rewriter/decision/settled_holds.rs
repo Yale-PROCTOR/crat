@@ -39,16 +39,40 @@ pub(crate) fn is_settled_hold(decision: &Decision) -> bool {
 }
 
 /// The callers' bindings handed whole to a formal in `forced`.
+///
+/// Only formals the raw boundary's hypothesis (`hypothesis`) reads safe: there the
+/// boundary planned no bridge for their callers. A formal already raw in the
+/// hypothesis has its callers' bridges planned (wave-6o's `OptSliceToRaw` into
+/// glibc's local `stat`), and a hold on it is a relabel.
 pub(crate) fn into_held_formals(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     facts: &EmitabilityFacts,
     table: &DecisionTable,
+    hypothesis: &DecisionTable,
     forced: &FxHashMap<(LocalDefId, HirId), DegradeReason>,
 ) -> Vec<((LocalDefId, HirId), DegradeReason)> {
+    let raw_in_hypothesis: FxHashSet<(LocalDefId, HirId)> = hypothesis
+        .entries
+        .iter()
+        .filter(|(_, decision)| match decision {
+            Decision::Degraded(_) => true,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => false,
+        })
+        .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+        .collect();
     let held_formals: FxHashSet<(LocalDefId, usize)> = table
         .entries
         .iter()
-        .filter(|(subject, _)| forced.contains_key(&(subject.fn_did, subject.hir_id)))
+        .filter(|(subject, _)| {
+            let node = (subject.fn_did, subject.hir_id);
+            forced.contains_key(&node) && !raw_in_hypothesis.contains(&node)
+        })
         .filter_map(|(subject, _)| match subject.kind {
             SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
             _ => None,
@@ -71,15 +95,61 @@ pub(crate) fn into_held_formals(
         })
         .map(|(subject, _)| (subject.fn_did, subject.hir_id))
         .collect();
+    let held_bindings: Vec<(LocalDefId, HirId)> = {
+        let mut nodes: Vec<_> = table
+            .entries
+            .iter()
+            .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+            .filter(|node| forced.contains_key(node) && !raw_in_hypothesis.contains(node))
+            .collect();
+        nodes.sort_by_key(|(function, binding)| {
+            (function.local_def_index.as_u32(), binding.local_id.as_u32())
+        });
+        nodes.dedup();
+        nodes
+    };
     let mut out = Vec::new();
     let mut seen = FxHashSet::default();
+    // **Within the function (the stand-in review's M4; relay 297).** The model
+    // keeps `B = A` in one kind (kind-equate); a hold forces `B` raw after it, and
+    // a delivered `A` assigned or initialized into the held `B` then coerces
+    // silently (`&mut T` into `*mut T`), the ladder's hazard with no compiler
+    // backstop. `A` is decided raw too.
+    for (function, binding) in &held_bindings {
+        for source in flows_into_binding(tcx, *function, *binding) {
+            let node = (*function, source);
+            if !delivered.contains(&node) || forced.contains_key(&node) || !seen.insert(node) {
+                continue;
+            }
+            out.push((
+                node,
+                DegradeReason::IntoHeldFormal {
+                    detail: format!(
+                        "into-held-binding:{}::{}",
+                        tcx.def_path_str(function.to_def_id()),
+                        tcx.hir_name(*binding)
+                    ),
+                },
+            ));
+        }
+    }
     let mut held: Vec<_> = held_formals.into_iter().collect();
     held.sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
     for (callee, index) in held {
         for call in facts.call_args.get(&callee).into_iter().flatten() {
             for argument in call.args.iter().filter(|argument| argument.index == index) {
+                // The ladder's three rules (`co_conversion`): the binding whole
+                // (`flows-into-raw-param`), cast (`cast-of-converting-local`), or
+                // borrowed (`borrowed-into-raw-param`, `&mut *r` / `&mut (*r).f`:
+                // the raw pointer the callee may keep outlives the reborrow; the
+                // stand-in review's M4).
                 let binding = match argument.shape {
-                    ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => binding,
+                    ArgShape::BareLocal(binding)
+                    | ArgShape::CastOfLocal { binding, .. }
+                    | ArgShape::AddrOf {
+                        base: Some(binding),
+                        ..
+                    } => binding,
                     _ => continue,
                 };
                 let node = (call.caller, binding);
@@ -100,6 +170,64 @@ pub(crate) fn into_held_formals(
         }
     }
     out
+}
+
+/// The bindings of `function` assigned or initialized into `binding` whole,
+/// cast, or borrowed (`B = A`, `let B = A as *mut T`, `B = &mut *A`): the ladder's
+/// argument shapes, read on the right-hand side.
+fn flows_into_binding(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    function: LocalDefId,
+    binding: HirId,
+) -> Vec<HirId> {
+    use rustc_hir::{Expr, ExprKind, LetStmt, PatKind, QPath, def::Res, intravisit};
+    struct Find<'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        binding: HirId,
+        sources: Vec<HirId>,
+    }
+    impl<'tcx> Find<'tcx> {
+        fn take(&mut self, value: &'tcx Expr<'tcx>) {
+            match super::emitability::classify_arg(self.tcx, value) {
+                ArgShape::BareLocal(source)
+                | ArgShape::CastOfLocal {
+                    binding: source, ..
+                }
+                | ArgShape::AddrOf {
+                    base: Some(source), ..
+                } if source != self.binding => self.sources.push(source),
+                _ => {}
+            }
+        }
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
+                && path.res == Res::Local(self.binding)
+            {
+                self.take(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+
+        fn visit_local(&mut self, local: &'tcx LetStmt<'tcx>) {
+            if let PatKind::Binding(_, id, ..) = local.pat.kind
+                && id == self.binding
+                && let Some(init) = local.init
+            {
+                self.take(init);
+            }
+            intravisit::walk_local(self, local);
+        }
+    }
+    let mut find = Find {
+        tcx,
+        binding,
+        sources: Vec::new(),
+    };
+    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(function));
+    find.sources
 }
 
 /// One settled-table hold's receipt: the predicate (its reason's key), the

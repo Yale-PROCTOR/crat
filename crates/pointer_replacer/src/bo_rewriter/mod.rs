@@ -8884,9 +8884,13 @@ fn finish_decide<'tcx>(
                     }
                 }
             }
-            for (node, reason) in
-                decision::settled_holds::into_held_formals(tcx, &facts, &table, &forced)
-            {
+            for (node, reason) in decision::settled_holds::into_held_formals(
+                tcx,
+                &facts,
+                &table,
+                &boundary_hypothesis,
+                &forced,
+            ) {
                 receipts.push(decision::settled_holds::SettledHoldReceipt::of(
                     node, &reason,
                 ));
@@ -9585,6 +9589,30 @@ fn finish_decide<'tcx>(
             .as_ref()
             .map(|prior| prior.plan.held_classes())
             .unwrap_or_default();
+        // **Relay 297 (main 188; the stand-in review's H1).** The plan's pending
+        // receipts read the table's sibling inventory, which only the emission
+        // set; the planning-time feedback below read an empty list. With the
+        // hold on, the in-loop plan carries the inventory the emission will read
+        // (receipt and audit readers only: no edit reads it).
+        if decision::pending_hold::enabled()
+            && family_policy.stage >= additive::FamilyStage::Declaration
+        {
+            table.sibling_overlap_inventory = decision::sibling_overlap::collect_inventory_from(
+                tcx,
+                &decision::sibling_overlap::SiblingInputs {
+                    slots: &slots,
+                    model: &model,
+                    mut_facts: &mut_facts,
+                    facts: &facts,
+                    subjects: &subjects,
+                    a5_site_proofs: &a5_site_proofs,
+                    raw_boundary_sites: &raw_boundary_sites,
+                    retention: &retention,
+                    origins: analysis.origins.as_ref(),
+                },
+                &table.seams.outbound_expressions,
+            );
+        }
         let prepared = prepare_plan_files(
             tcx,
             &table,
@@ -9682,11 +9710,16 @@ fn finish_decide<'tcx>(
         if decision::pending_hold::enabled()
             && family_policy.stage >= additive::FamilyStage::Declaration
         {
+            // The terminal's state before any verify revert: the classes the plan
+            // itself withholds (binn's `binn_object_get_value` is class-held at
+            // planning), as the post-condition reads them.
+            let withheld = effective_withheld_classes(
+                &prepared.plan,
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
+            );
             let mut grew = false;
-            for site in prepared
-                .plan
-                .pending_sibling_receipts(&std::collections::BTreeSet::new())
-            {
+            for site in prepared.plan.pending_sibling_receipts(&withheld) {
                 let Some(source) = site.receipt.potential.source.declared() else {
                     continue;
                 };
