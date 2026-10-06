@@ -210,6 +210,26 @@ fn applied(
 /// Protection uses a conservative superset of delivery: prior terminally
 /// prepared safe declarations. Only the emitted-tree custody instrument counts
 /// delivery; this planner never substitutes a Ready bit for that measurement.
+/// Is this decision a settled-table hold (relay 297)? Exhaustive by rule
+/// (`import_denylist`).
+fn settled_hold(decision: &decision::Decision) -> bool {
+    match decision {
+        decision::Decision::Degraded(record) => match record.reason {
+            decision::DegradeReason::PairNotShownDisjoint { .. }
+            | decision::DegradeReason::ReleasedThroughIndirectCall { .. }
+            | decision::DegradeReason::IntoHeldFormal { .. } => true,
+            _ => false,
+        },
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => false,
+    }
+}
+
 fn losses<'a>(
     prior: &'a StageSnapshot,
     candidate: &StageSnapshot,
@@ -224,12 +244,18 @@ fn losses<'a>(
                 return None;
             }
             let key = (subject.fn_did, subject.hir_id);
-            let survives = candidate
+            let now = candidate
                 .table
                 .entries
                 .iter()
-                .find(|(s, _)| (s.fn_did, s.hir_id) == key)
-                .is_some_and(|(s, d)| applied(candidate, s, d));
+                .find(|(s, _)| (s.fn_did, s.hir_id) == key);
+            // **Relay 297 (main 187, D5 (a)).** A subject a settled-table hold
+            // decides raw is a ruled loss, never a family regression to restore:
+            // the pending hold reads the emitted program's forms only from the
+            // Declaration stage on, so its first holds there are not losses of
+            // the earlier stages' deliveries.
+            let held = now.is_some_and(|(_, d)| settled_hold(d));
+            let survives = held || now.is_some_and(|(s, d)| applied(candidate, s, d));
             let required_null = subject.null_init
                 && match old {
                     decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,

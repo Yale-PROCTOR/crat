@@ -8842,7 +8842,13 @@ fn finish_decide<'tcx>(
                     new.entry(node).or_insert(reason);
                 }
             }
-            if decision::pending_hold::enabled() {
+            // Relay 297 (main 187, D5 (a)): the pending predicate reads a callee
+            // formal's form, and before the Declaration stage a formal can be raw
+            // only because its family is not on yet; a hold taken there is not
+            // the emitted program's.
+            if decision::pending_hold::enabled()
+                && family_policy.stage >= additive::FamilyStage::Declaration
+            {
                 for (node, reason) in
                     std::mem::take(&mut carried)
                         .into_iter()
