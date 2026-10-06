@@ -1598,6 +1598,19 @@ pub(crate) fn finalize_signature_classes(
                 reason: super::decision::DegradeReason::AliasedStorageWithdrawn { .. },
                 ..
             }) => continue,
+            // Relay 297 (main 187, D5 (c)): the settled-table holds, as R584-5's
+            // withdrawal: decided raw on the settled table after co-conversion
+            // set the class's arm requirements, in the input's raw form, so a
+            // held subject neither requires an arm of its class nor blocks it
+            // (brotli's decoder: the pair hold on `s` / `available_out` /
+            // `total_out` held the whole class and dragged `next_out` raw).
+            Decision::Degraded(super::decision::Degradation {
+                reason:
+                    super::decision::DegradeReason::PairNotShownDisjoint { .. }
+                    | super::decision::DegradeReason::ReleasedThroughIndirectCall { .. }
+                    | super::decision::DegradeReason::IntoHeldFormal { .. },
+                ..
+            }) => continue,
             Decision::Degraded(record) => (false, Some(record.reason.key())),
         };
         if emits {
