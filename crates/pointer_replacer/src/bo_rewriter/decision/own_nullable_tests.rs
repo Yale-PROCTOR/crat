@@ -10,8 +10,16 @@ use super::FORCED_OPTION_WITHDRAWALS;
 const ALLOW: &str =
     "#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_snake_case)]\n";
 
+/// The hook is process-global: one decision at a time, so a withdrawal one
+/// test forces is never seen by another running beside it (the control, the
+/// same labels with the stage enabled).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The form decided for `label`, with its Option stage withdrawn or not.
 fn form(input: &str, label: &str, withdrawn: bool) -> String {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if withdrawn {
         FORCED_OPTION_WITHDRAWALS
             .lock()
