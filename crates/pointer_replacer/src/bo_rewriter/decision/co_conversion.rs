@@ -2299,6 +2299,7 @@ mod a5_cast_role_tests {
                         element_address: false,
                         deref_pointer: None,
                         inside_of: Vec::new(),
+                        loaded_from_memory: false,
                     }],
                 }],
             );

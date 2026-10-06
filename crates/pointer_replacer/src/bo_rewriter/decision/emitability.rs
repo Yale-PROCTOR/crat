@@ -294,6 +294,13 @@ pub(crate) struct Arg {
     /// and, through a root local whose own one definition lies inside `Y`,
     /// `Y` too (`h = &mut (*s).arena.header`). See [`inside_of`].
     pub inside_of: Vec<HirId>,
+    /// **R838 (era-5c 148)** — the argument's pointer value is LOADED FROM
+    /// MEMORY: a static's contents, a dereference, a field or element read
+    /// through a pointer or of a static, pointer arithmetic on such a value, or
+    /// a local one of whose definitions is one. A5's origin evidence calls such
+    /// a value's origin complete and private, which stores in other bodies make
+    /// false. See [`loaded_from_memory`].
+    pub loaded_from_memory: bool,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -343,6 +350,12 @@ pub(crate) fn deref_pointer(
 ///   initializer being such an address;
 /// * then, while the root `X` is itself such a local, the local its one
 ///   definition lies inside (`h = &mut (*s).arena.header`), bounded.
+/// R838 (era-5c 148): is the argument's pointer value loaded from memory?
+pub(crate) fn loaded_from_memory(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> bool {
+    let _ = (tcx, owner, expr);
+    false
+}
+
 pub(crate) fn inside_of(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Vec<HirId> {
     fn place_root(mut place: &Expr<'_>) -> Option<HirId> {
         loop {
@@ -1613,6 +1626,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                             element_address: element_address(arg),
                                             deref_pointer: deref_pointer(typeck, arg),
                                             inside_of: inside_of(self.tcx, self.fn_did, arg),
+                                            loaded_from_memory: loaded_from_memory(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
                                         }
                                     })
                                     .collect(),

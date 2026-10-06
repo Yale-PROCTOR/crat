@@ -86,6 +86,9 @@ pub(crate) mod licensed_lift;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
+pub(crate) mod loaded_operand;
+#[cfg(test)]
+mod loaded_operand_tests;
 pub(crate) mod local_callee_extent;
 pub(crate) mod masked_runtime;
 #[cfg(test)]
