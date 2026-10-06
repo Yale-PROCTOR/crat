@@ -7333,15 +7333,28 @@ pub(crate) fn synthesize_with_raw_boundary(
         call.atom_ids.dedup();
     }
     for site in raw_boundary.address_sites() {
-        // **A settled-table hold (relay 297; libzahl `zor`).** The address views
-        // are planned once, on the table before the holds: an operand a hold made
-        // raw keeps its raw text, as any raw operand of a comparison does, not the
-        // reference view its pre-hold form had (`from_ref(c).cast_mut()` over a
-        // `*mut`, `E0308`).
-        if decision_of
-            .get(&site.node)
-            .is_some_and(|decision| super::settled_holds::is_settled_hold(decision))
-        {
+        // **A subject the final table leaves raw (relay 297; libzahl `zor`, and
+        // the stand-in review's M3).** The address views are planned once, on
+        // the raw boundary's hypothesis, before the holds and the learned A5
+        // roles: an operand decided raw since keeps its raw text, as any raw
+        // operand of a comparison does. Its pre-hold reference view is either
+        // ill-typed (`from_ref(c).cast_mut()` over a `*mut`, `E0308`: libzahl
+        // `zor` under the hold, `zneg` / `zbset` at the frame under a learned
+        // `pair-raw-view`) or a silent reborrow of a raw pointer
+        // (`from_mut(&mut *c)`), a retag the input never made.
+        let raw_now = match decision_of.get(&site.node) {
+            None | Some(Decision::Degraded(_)) => true,
+            Some(
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_),
+            ) => false,
+        };
+        if raw_now {
             continue;
         }
         let Ok(argument) = sm.span_to_snippet(site.span) else {
