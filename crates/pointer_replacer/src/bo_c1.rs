@@ -13020,6 +13020,12 @@ mod run {
         let mut subject_outcomes = String::from(
             "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\temitted_form\n",
         );
+        // R849-1 (USER, 2026-10-06; main relay 289): the delivered assignment K, by
+        // subject identity, for wave-6o's BorrowCoverage certificate validator (the
+        // final replay re-run on what the tree carries, after reverts and departures).
+        let mut delivered_kinds = String::from(
+            "owner\tmir_local\tdepth\tmodel_kind\tdelivered_kind\tcause\tsubject_key\n",
+        );
         // **R622-1 (1) — `realized-by-owner-view`.** A degraded subject whose
         // emitted declaration another plan's surviving edit typed safe (heman's
         // `convex_hull#258`: the view `hull_buffer`'s Box class writes as
@@ -13111,12 +13117,29 @@ mod run {
                 delivery.revert_scope(),
                 emitted_form,
             ));
+            let model_kind = subject.get("model_kind").map_or("-", String::as_str);
+            let delivered_kind = super::delivered_slot_kind(realized, emitted_form);
+            delivered_kinds.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                owner_fn,
+                subject.get("mir_local").map_or("-", String::as_str),
+                subject.get("ptr_depth").map_or("-", String::as_str),
+                model_kind,
+                delivered_kind,
+                super::delivered_slot_cause(delivery, model_kind, delivered_kind),
+                subject_key,
+            ));
         }
         std::fs::write(
             directory.join(format!("{name}.raw-boundary-subject-outcomes.tsv")),
             stamp(&subject_outcomes),
         )
         .expect("write raw-boundary subject outcomes");
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-delivered-kinds.tsv")),
+            stamp(&delivered_kinds),
+        )
+        .expect("write raw-boundary delivered kinds");
         std::fs::write(
             directory.join(format!("{name}.raw-boundary-owner-view-attributions.tsv")),
             stamp(&owner_view_receipts),
@@ -25166,7 +25189,8 @@ fn raw_boundary_wave2_corpus_census() {
             ) + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
-                + &raw_boundary_leak_parity_lines(&ledger_dir),
+                + &raw_boundary_leak_parity_lines(&ledger_dir)
+                + &raw_boundary_cover_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25213,7 +25237,8 @@ fn raw_boundary_wave2_corpus_census() {
                 + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
-                + &raw_boundary_leak_parity_lines(&ledger_dir),
+                + &raw_boundary_leak_parity_lines(&ledger_dir)
+                + &raw_boundary_cover_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26470,7 +26495,8 @@ fn raw_boundary_wave2_corpus_census() {
             + &raw_boundary_allocator_lines(&ledger_dir)
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
-                + &raw_boundary_leak_parity_lines(&ledger_dir),
+                + &raw_boundary_leak_parity_lines(&ledger_dir)
+                + &raw_boundary_cover_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
@@ -26483,6 +26509,156 @@ fn raw_boundary_wave2_corpus_census() {
 /// made: heman's two at frame 13. `data=true` stands for it (the seat's ruling); the
 /// census receipt counts it: `overcount=<n>` and, where non-zero,
 /// `overcount_by_program=<p>:<n>,..`.
+/// **R849-1 (main relay 289) — the delivered assignment projected onto a slot kind**,
+/// as analysis-fanout 008 §2 states it: a delivered ref-family form is `ref`, a
+/// delivered `Box` form is `owning` (a candidate only: Box is outside Theorem A),
+/// and every subject the tree does not deliver (degraded, reverted, typed-excluded)
+/// is `raw`. Fields come from `field-transactions.tsv`; temporaries keep the model's
+/// kind; a function revert is the reverted subjects plus `final-reverts.tsv`.
+fn delivered_slot_kind(delivered: bool, emitted_form: &str) -> &'static str {
+    if !delivered {
+        "raw"
+    } else if emitted_form.contains("box") {
+        "owning"
+    } else {
+        "ref"
+    }
+}
+
+/// R849-1 (wave-6o 131's vocabulary): why a census subject's slot carries its delivered
+/// kind. A delivered subject whose kind is not its model's is a certificate departure
+/// (an owning model delivered as a reference, a reference delivered as a Box). Fields
+/// (`field-transaction`) and temporaries (`temporary-model-kind`) are the validator's
+/// own rows, from `field-transactions.tsv` and the model.
+fn delivered_slot_cause(
+    delivery: RawBoundarySubjectDelivery,
+    model_kind: &str,
+    delivered_kind: &str,
+) -> &'static str {
+    match delivery {
+        RawBoundarySubjectDelivery::Realized if model_kind == delivered_kind => "delivered",
+        RawBoundarySubjectDelivery::Realized => "certificate-departure",
+        RawBoundarySubjectDelivery::Degraded => "degraded",
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Function) => "fn-reverted",
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Program) => "reverted",
+        RawBoundarySubjectDelivery::TypedExcluded => "typed-excluded",
+    }
+}
+
+/// **R849-1 (main relay 289) — the BorrowCoverage validator's receipt in the census
+/// receipt.** wave-6o's validator writes `<program>.raw-boundary-borrow-coverage-certificate.tsv`
+/// (wave-6o 131; columns read by name: `status` (`ok` accepts), `edges`, `viol`, `repair`,
+/// `decline`); this sums them over the twenty, under relay 289's `cover_*` names and
+/// wave-6o's `borrow_coverage_cert_*`. `cover=absent` while no program carries one.
+fn raw_boundary_cover_lines(ledger_dir: &std::path::Path) -> String {
+    let (mut viol, mut repair, mut decline, mut edges, mut accepted) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut by_program = Vec::new();
+    for program in CORPUS {
+        let path = ledger_dir.join(format!(
+            "{}.raw-boundary-borrow-coverage-certificate.tsv",
+            program.name
+        ));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut lines = text.lines();
+        let Some(header) = lines.next() else { continue };
+        let columns = header.split('\t').collect::<Vec<_>>();
+        let index = |name: &str| columns.iter().position(|column| *column == name);
+        let (mut v, mut r, mut d) = (0usize, 0usize, 0usize);
+        let mut program_ok = true;
+        let mut rows = 0usize;
+        for row in lines.filter(|row| !row.is_empty()) {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            let read = |name: &str| {
+                index(name)
+                    .and_then(|at| fields.get(at))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            v += read("viol");
+            r += read("repair");
+            d += read("decline");
+            rows += 1;
+            edges += read("edges");
+            program_ok &= index("status")
+                .and_then(|at| fields.get(at))
+                .is_some_and(|status| *status == "ok");
+        }
+        accepted += usize::from(program_ok && rows > 0);
+        by_program.push(format!("{}:{v}/{r}/{d}", program.name));
+        viol += v;
+        repair += r;
+        decline += d;
+    }
+    if by_program.is_empty() {
+        return "cover=absent\n".to_owned();
+    }
+    format!(
+        "cover_viol={viol}\ncover_repair={repair}\ncover_decline={decline}\ncover_programs={}/{}\ncover_by_program={}\nborrow_coverage_cert_accept={accepted}/{}\nborrow_coverage_cert_edges={edges}\nborrow_coverage_cert_decline={decline}\n",
+        by_program.len(),
+        CORPUS.len(),
+        by_program.join(","),
+        by_program.len()
+    )
+}
+
+/// R849-1: the projection, and the receipt's sums (absent, then two programs).
+#[test]
+fn r849_1_delivered_kinds_and_the_cover_receipt() {
+    assert_eq!(delivered_slot_kind(false, "unchanged"), "raw");
+    assert_eq!(delivered_slot_kind(true, "ref"), "ref");
+    assert_eq!(delivered_slot_kind(true, "opt-slice"), "ref");
+    assert_eq!(delivered_slot_kind(true, "owner-view"), "ref");
+    assert_eq!(delivered_slot_kind(true, "box"), "owning");
+    assert_eq!(delivered_slot_kind(true, "opt-box-slice"), "owning");
+    let dir = std::env::temp_dir().join(format!("crat-r849-cover-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(raw_boundary_cover_lines(&dir), "cover=absent\n");
+    std::fs::write(
+        dir.join("bst.raw-boundary-borrow-coverage-certificate.tsv"),
+        "corpus\tprogram\tstatus\tviol\trepair\tdecline\nrs-crown\tbst\tok\t0\t0\t0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("brotli.raw-boundary-borrow-coverage-certificate.tsv"),
+        "program\tstatus\tdecline\tedges\tviol\trepair\nbrotli\treject\t1\t4\t2\t3\n",
+    )
+    .unwrap();
+    let lines = raw_boundary_cover_lines(&dir);
+    assert!(lines.contains("cover_viol=2\n"), "{lines}");
+    assert!(lines.contains("cover_repair=3\n"), "{lines}");
+    assert!(lines.contains("cover_decline=1\n"), "{lines}");
+    assert!(lines.contains("cover_programs=2/20\n"), "{lines}");
+    assert!(
+        lines.contains("brotli:2/3/1") && lines.contains("bst:0/0/0"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("borrow_coverage_cert_accept=1/2\n"),
+        "{lines}"
+    );
+    assert!(lines.contains("borrow_coverage_cert_edges=4\n"), "{lines}");
+    assert_eq!(
+        delivered_slot_cause(RawBoundarySubjectDelivery::Realized, "owning", "ref"),
+        "certificate-departure"
+    );
+    assert_eq!(
+        delivered_slot_cause(RawBoundarySubjectDelivery::Realized, "ref", "ref"),
+        "delivered"
+    );
+    assert_eq!(
+        delivered_slot_cause(
+            RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Function),
+            "ref",
+            "raw"
+        ),
+        "fn-reverted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn raw_boundary_overcount_lines(ledger_dir: &std::path::Path) -> String {
     let mut total = 0usize;
     let mut by_program = Vec::new();
