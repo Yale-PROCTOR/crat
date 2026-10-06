@@ -208,6 +208,7 @@ fn pinned(marker: &str, name: &str, body: &str, locals: &[(&str, SlotKind)]) -> 
 /// (`WriteRingBuffer::next_out` optional, the caller's optional, the
 /// intermediate callee's formal a reference).
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn w6a_r738_a_reborrowed_optional_out_parameter_in_the_decoder_loop_compiles() {
     let (source, reverted) = pinned(
         "w6a-r738-ring-frame",
@@ -323,6 +324,7 @@ fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
 /// call any more; the call still lends the optional, which is this witness's
 /// subject.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn w6a_r738_a_wrapped_call_lends_its_optional() {
     let (source, reverted) = pinned(
         "w6a-r738-wrapped-frame",

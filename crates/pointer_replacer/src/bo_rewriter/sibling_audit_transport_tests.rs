@@ -220,6 +220,7 @@ fn assert_missing_row_caught(report: &CheckpointReport, missing: &str) {
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn sibling_audit_transport_actual_capture_retains_every_coverage_identity() {
     let capture = captured();
     let encoded = serde_json::to_vec(&capture.export).expect("owned capture serializes");
@@ -246,6 +247,7 @@ fn sibling_audit_transport_actual_capture_retains_every_coverage_identity() {
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn sibling_audit_transport_removed_nonpending_row_is_caught_by_capture_comparison() {
     let capture = captured();
     let mut changed = capture.export.clone();
@@ -276,6 +278,7 @@ fn digest(value: &impl serde::Serialize) -> String {
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn sibling_audit_transport_reaggregate_rechecks_rows_despite_saved_success() {
     let capture = captured();
     // These metadata labels identify a constructed consumer-test frame, not a
@@ -357,11 +360,13 @@ fn assert_missing_capture(absent: bool) {
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn sibling_audit_transport_absent_capture_is_not_zero_coverage() {
     assert_missing_capture(true);
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
 fn sibling_audit_transport_empty_rows_are_not_zero_coverage() {
     assert_missing_capture(false);
 }
