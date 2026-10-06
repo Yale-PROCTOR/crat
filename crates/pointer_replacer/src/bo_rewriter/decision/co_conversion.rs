@@ -356,6 +356,9 @@ pub(crate) struct PairSiteDecision {
     pub(crate) verdict: A5SiteProofVerdict,
     pub(crate) reason: String,
     pub(crate) peer_receipts: String,
+    /// R833-1: the argument positions at this call whose proof against this
+    /// position is not clear (the peers the pair rule must hold).
+    pub(crate) unproven_peers: Vec<usize>,
     /// A5-owned whole-call carrier; ordinary PAIR rows leave this absent.
     pub(crate) a5_fallback: Option<A5ProofSiteKey>,
 }
@@ -1203,6 +1206,23 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                         .into_iter()
                         .collect::<Vec<_>>()
                         .join(";");
+                    let unproven_peers = incident
+                        .iter()
+                        .filter(|(_, _, proof)| proof.verdict != A5SiteProofVerdict::Clear)
+                        .map(|(left, right, _)| {
+                            let (left, right) = (
+                                node_positions[*left].argument_index,
+                                node_positions[*right].argument_index,
+                            );
+                            if left == position.argument_index {
+                                right
+                            } else {
+                                left
+                            }
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
                     let copy_candidate = incident.iter().any(|(left, right, _)| {
                         node_positions[*left].mutable != node_positions[*right].mutable
                     });
@@ -1307,6 +1327,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                         verdict,
                         reason,
                         peer_receipts,
+                        unproven_peers,
                         a5_fallback: None,
                     });
                 }
@@ -1498,7 +1519,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     }
     // R833-1 (USER): the callee's side of the pair rule, before the raw views
     // are blocked, so the held peer carries its own reason.
-    for subject in peers_of_unproven_raw_views(&mut pair_sites) {
+    for subject in peers_of_unproven_raw_views(&mut pair_sites, |callee, index| {
+        param_key.get(&(callee, index)).copied()
+    }) {
         block(&mut node_block, subject, BlockReason::PairNotShownDisjoint);
     }
     for row in &pair_sites {
@@ -1692,7 +1715,10 @@ fn escape_block_reason(
 /// whose own verdict is not clear become blocked, and their subjects are
 /// returned to be held raw (`pair-not-shown-disjoint`). Read-read pairs never
 /// form a pair here, and a certified pair's verdict is clear.
-pub(crate) fn peers_of_unproven_raw_views(rows: &mut [PairSiteDecision]) -> Vec<NodeKey> {
+pub(crate) fn peers_of_unproven_raw_views(
+    rows: &mut [PairSiteDecision],
+    _param_of: impl Fn(LocalDefId, usize) -> Option<NodeKey>,
+) -> Vec<NodeKey> {
     let unproven_calls = rows
         .iter()
         .filter(|row| row.role == PairRole::RawView && row.verdict != A5SiteProofVerdict::Clear)
@@ -2335,6 +2361,7 @@ mod a5_cast_role_tests {
                 verdict: A5SiteProofVerdict::Undeterminable,
                 reason: "a5-fallback-raw-view-role".into(),
                 peer_receipts: "fixture".into(),
+                unproven_peers: Vec::new(),
                 a5_fallback: Some(A5ProofSiteKey {
                     caller,
                     location: MirLocationKey::new(0, 0),

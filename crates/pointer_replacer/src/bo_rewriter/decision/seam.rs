@@ -686,6 +686,8 @@ pub(crate) struct A5PositionProof {
     pub reason: String,
     pub locations: String,
     pub peer_receipts: String,
+    /// R833-1: the argument positions whose proof against `index` is not clear.
+    pub unproven_peers: Vec<usize>,
     pub world: &'static str,
     pub guard: &'static str,
     pub fallback: A5ProofSiteFallback,
@@ -768,6 +770,19 @@ impl A5PositionProof {
             .into_iter()
             .collect::<Vec<_>>()
             .join(";");
+        let unproven_peers = conflicts
+            .iter()
+            .filter(|conflict| conflict.proof.verdict != A5SiteProofVerdict::Clear)
+            .map(|conflict| {
+                if conflict.left == index {
+                    conflict.right
+                } else {
+                    conflict.left
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut proof_site_key = None;
         let mut ambiguous_site_key = false;
         for key in conflicts
@@ -798,6 +813,7 @@ impl A5PositionProof {
             reason,
             locations,
             peer_receipts,
+            unproven_peers,
             world: proofs.world(),
             guard: proofs.guard(),
             fallback: if verdict == A5SiteProofVerdict::Clear {

@@ -10271,6 +10271,7 @@ fn learn_a5_fallback_roles(
                 verdict: proof.verdict,
                 reason: "a5-fallback-raw-view-role".into(),
                 peer_receipts: proof.peer_receipts.clone(),
+                unproven_peers: proof.unproven_peers.clone(),
                 a5_fallback: proof.proof_site_key,
             },
             proof.clone(),

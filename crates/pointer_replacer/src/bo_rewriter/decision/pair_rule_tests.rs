@@ -48,6 +48,7 @@ fn rows(
                 verdict: verdicts[i],
                 reason: "pair-proof-accepted".to_owned(),
                 peer_receipts: String::new(),
+                unproven_peers: Vec::new(),
                 a5_fallback: None,
             })
             .collect();
@@ -64,7 +65,7 @@ fn r833_1_the_primary_beside_an_unproven_raw_view_is_held() {
         [PairRole::Primary, PairRole::RawView, PairRole::Clear],
         [Overlapping, Overlapping, Clear],
     );
-    let held = peers_of_unproven_raw_views(&mut rows);
+    let held = peers_of_unproven_raw_views(&mut rows, |_, _| None);
     assert_eq!(held, vec![subjects[0]]);
     assert_eq!(rows[0].role, PairRole::Blocked);
     assert_eq!(rows[0].reason, "pair-not-shown-disjoint");
@@ -80,6 +81,47 @@ fn r833_1_control_a_clear_call_holds_nothing() {
         [PairRole::Primary, PairRole::Clear, PairRole::Clear],
         [Clear, Clear, Clear],
     );
-    assert!(peers_of_unproven_raw_views(&mut rows).is_empty());
+    assert!(peers_of_unproven_raw_views(&mut rows, |_, _| None).is_empty());
     assert_eq!(rows[0].role, PairRole::Primary);
+}
+
+/// R833-1, a peer with no row at the call (a raw view A5's fallback learned:
+/// lodepng's `readChunk_PLTE(color, data, …)`, where only `data` has a row):
+/// the formal the raw view's unproven proof names is held all the same.
+#[test]
+fn r833_1_the_peer_of_a_learned_raw_view_without_a_row_is_held() {
+    use A5SiteProofVerdict::{Clear, Overlapping};
+    let (rows, subjects) = rows(
+        [PairRole::Clear, PairRole::RawView, PairRole::Clear],
+        [Clear, Overlapping, Clear],
+    );
+    // Only the raw view's own row exists; it names position 0 as its peer.
+    let mut rows = vec![PairSiteDecision {
+        unproven_peers: vec![0],
+        reason: "a5-fallback-raw-view-role".to_owned(),
+        ..rows[1].clone()
+    }];
+    let callee = subjects[0].0;
+    let held = peers_of_unproven_raw_views(&mut rows, |function, index| {
+        (function == callee).then(|| subjects[index])
+    });
+    assert_eq!(held, vec![subjects[0]]);
+    assert_eq!(
+        rows[0].role,
+        PairRole::RawView,
+        "the raw view itself is not re-roled here"
+    );
+}
+
+/// Control: a learned raw view whose peers are all clear names none.
+#[test]
+fn r833_1_control_a_learned_raw_view_with_no_unproven_peer_holds_nothing() {
+    use A5SiteProofVerdict::{Clear, Overlapping};
+    let (rows, subjects) = rows(
+        [PairRole::Clear, PairRole::RawView, PairRole::Clear],
+        [Clear, Overlapping, Clear],
+    );
+    let mut rows = vec![rows[1].clone()];
+    let held = peers_of_unproven_raw_views(&mut rows, |_, index| Some(subjects[index]));
+    assert!(held.is_empty());
 }
