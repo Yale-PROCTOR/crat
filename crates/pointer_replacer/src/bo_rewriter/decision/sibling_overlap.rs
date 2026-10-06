@@ -626,6 +626,15 @@ pub(crate) fn collect_inventory_from(
                                 ..
                             }
                         )
+                })
+                // Beneath casts (relay 297; binn `&mut value as *mut i32 as
+                // *mut c_void`): the cast address is still the binding's.
+                || call_argument_is(tcx, caller, site.call_span, argument_index, |peeled| {
+                    matches!(
+                        peeled.kind,
+                        ExprKind::AddrOf(_, _, operand)
+                            if matches!(super::emitability::place_root(operand), (Some(_), false))
+                    )
                 });
             let literal = literal_argument(tcx, caller, site.call_span, argument_index);
             siblings.push(SiblingEvidence {
@@ -1124,13 +1133,35 @@ pub(crate) fn risky_sibling_of(potential: &SiblingPotential, sibling: &SiblingEv
 /// A literal is never written on a UB-free input, so it is not risky beside a
 /// source, as R608-1 treats a literal source.
 fn literal_argument(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span, index: usize) -> bool {
-    struct Find<'tcx> {
+    call_argument_is(tcx, caller, call_span, index, |peeled| {
+        matches!(
+            peeled.kind,
+            ExprKind::Lit(lit)
+                if matches!(
+                    lit.node,
+                    rustc_ast::LitKind::Str(..)
+                        | rustc_ast::LitKind::ByteStr(..)
+                        | rustc_ast::LitKind::CStr(..)
+                )
+        )
+    })
+}
+
+/// Does `test` hold of the call's argument at `index`, beneath its casts?
+fn call_argument_is(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    call_span: Span,
+    index: usize,
+    test: fn(&Expr<'_>) -> bool,
+) -> bool {
+    struct Find {
         call_span: Span,
         index: usize,
+        test: fn(&Expr<'_>) -> bool,
         found: bool,
-        _tcx: TyCtxt<'tcx>,
     }
-    impl<'tcx> intravisit::Visitor<'tcx> for Find<'tcx> {
+    impl<'tcx> intravisit::Visitor<'tcx> for Find {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
             if let ExprKind::Call(_, arguments) = expr.kind
                 && expr.span.source_callsite() == self.call_span.source_callsite()
@@ -1143,14 +1174,7 @@ fn literal_argument(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span, index:
                         _ => break,
                     };
                 }
-                if let ExprKind::Lit(lit) = peeled.kind
-                    && matches!(
-                        lit.node,
-                        rustc_ast::LitKind::Str(..)
-                            | rustc_ast::LitKind::ByteStr(..)
-                            | rustc_ast::LitKind::CStr(..)
-                    )
-                {
+                if (self.test)(peeled) {
                     self.found = true;
                 }
             }
@@ -1160,8 +1184,8 @@ fn literal_argument(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span, index:
     let mut find = Find {
         call_span,
         index,
+        test,
         found: false,
-        _tcx: tcx,
     };
     intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
     find.found
