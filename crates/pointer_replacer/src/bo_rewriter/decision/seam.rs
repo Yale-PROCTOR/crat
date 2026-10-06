@@ -4406,6 +4406,19 @@ pub(crate) fn replan_a5_raw_view(
         (rendered, template.key().to_owned())
     };
 
+    // The operand is rendered peeled of its casts (`a5_role_operand_span`), so
+    // a cast argument's raw view would carry the operand's pointee, not the
+    // formal's (binn `copy_be32(.., &mut int32 as *mut i32 as *mut u32)`:
+    // `from_mut(&mut int32)` against `*mut u32`). The program's own cast is
+    // put back, to the formal's raw type.
+    let raw_expression = if matches!(
+        view.argument_shape,
+        "addr-of-cast" | "addr-of-mut-cast" | "cast-of-local"
+    ) {
+        format!("({raw_expression} as {})", view.target.rendered)
+    } else {
+        raw_expression
+    };
     let mut template = raw_template;
     if terminal_found != Form::Raw && view.negative_write.is_some() {
         template.push_str(":negative-write=foster-immutable");
