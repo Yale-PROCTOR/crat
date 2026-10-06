@@ -128,6 +128,9 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // raw under the receipted T2 PAIR verdict, and the clean sibling still
     // converts. Making both positions safe still yields E0499; blocking both
     // now fails the ruled mechanical-fallback branch.
+    // R819-1 item 4 / R833-1 (USER) supersede the split: one pointer at both
+    // positions, one of them written, is a proven overlap, so both formals
+    // stay raw and the call is the program's own; the clean sibling converts.
     "g20_callsite_adapt_propagate",
     "g21_callsite_blocked_class",
     // **g22-g25 — THE SEAM BATCH, ratified 2026-08-11.** All four land GREEN:

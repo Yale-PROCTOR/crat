@@ -4668,12 +4668,11 @@ mod coconv_witnesses {
         );
     }
 
-    /// **R165-2 PAIR:** a duplicated argument keeps one safe primary and one
-    /// raw-view position, without affecting the clean class beside it.
-    ///
-    /// The two aliased formal positions must split deterministically; treating
-    /// both as safe recreates E0499, while blocking unconditionally loses the
-    /// ruled T2 fallback and also fails on `g21_ok`.
+    /// **R165-2 PAIR, as R819-1 item 4 / R833-1 (USER) rule it:** one pointer
+    /// at both positions, one of them written, is a proven overlap, so BOTH
+    /// formals stay raw (`pair-proven-overlap`), without affecting the clean
+    /// class beside it. (R165-2's split kept a safe primary beside the raw
+    /// view; the rulings take it back.)
     #[test]
     fn pair_w1_duplicated_argument_selects_primary_and_raw_view() {
         let rows = census(&format!(
@@ -4686,11 +4685,15 @@ mod coconv_witnesses {
         let a = row(&rows, "g21_aliased", 1);
         let b = row(&rows, "g21_aliased", 2);
         assert_eq!(
-            a["admissible"], "1",
-            "the canonical primary must stay safe: {a:?}"
+            (a["admissible"].as_str(), a["node_block"].as_str()),
+            ("0", "pair-proven-overlap"),
+            "the written position is held: {a:?}"
         );
-        assert_eq!(b["admissible"], "0", "the peer must be the raw view: {b:?}");
-        assert_eq!(b["node_block"], "duplicate-place-root", "{b:?}");
+        assert_eq!(
+            (b["admissible"].as_str(), b["node_block"].as_str()),
+            ("0", "pair-proven-overlap"),
+            "its peer is held: {b:?}"
+        );
         assert_eq!(
             ok["admissible"], "1",
             "a blocked class must not take the clean one with it — one blocked \
@@ -9456,9 +9459,10 @@ fn pair_w1_copy_read_uses_the_existing_c9_effect_carrier() {
     );
 }
 
-/// PAIR-W1/A-2 RED: this source has a Copy read side but no existing C9
-/// site/effect carrier. The Copy arm is `held-no-proof`; the site falls through
-/// to the separately receipted T2 raw view.
+/// PAIR-W1/A-2, as R819-1 item 4 / R833-1 (USER) rule it: one place at both
+/// positions, one written, is a proven overlap, so neither formal is safe and
+/// no raw view is spent (the T2 fallback this pinned kept `write` a live
+/// `&mut` beside a raw read of the same `x`).
 #[test]
 fn pair_w1_copy_shape_without_existing_carrier_is_held_then_t2() {
     let source = "#![allow(dead_code, unused_unsafe)]\n\
@@ -9468,33 +9472,21 @@ fn pair_w1_copy_shape_without_existing_carrier_is_held_then_t2() {
              update(&mut x, &mut x);\n\
          }\n";
     let outcome = pair_w1_outcome(source);
-    let super::RewriteOutcome::Emitted {
-        source,
-        raw_boundary_artifacts,
-        ..
-    } = outcome
-    else {
-        panic!("PAIR-W1 no-carrier fallback must emit: {outcome:#?}");
+    let super::RewriteOutcome::Emitted { source, .. } = outcome else {
+        panic!("PAIR-W1 held pair must emit: {outcome:#?}");
     };
-    assert!(!source.contains("__crat_c9_"), "{source}");
-    assert!(source.contains("let __crat_pair_raw_"), "{source}");
     assert!(
-        raw_boundary_artifacts
-            .pairs
-            .contains("held-no-proof:c9-effect-carrier-absent;pair-t2"),
-        "{}",
-        raw_boundary_artifacts.pairs
+        source.contains("update(write: *mut i32, read: *const i32)"),
+        "{source}"
     );
-    assert!(raw_boundary_artifacts.bridge_events.iter().any(|event| {
-        event.site.bridge_kind == "pair-t2-raw-view"
-            && event.retention == super::bridge_receipt::BridgeRetentionTier::T2
-            && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
-    }));
+    assert!(!source.contains("__crat_c9_"), "{source}");
+    assert!(!source.contains("let __crat_pair_raw_"), "{source}");
 }
 
-/// PAIR-W1 RED, T2 branch: without a licensed Copy snapshot, the selected raw
-/// view is materialized before the surviving mutable borrow and carries the
-/// exact unsafe-bridge waiver.
+/// PAIR-W1, T2 branch, as R833-1 (USER) rules it: the raw view of `x` is not
+/// shown disjoint from the other `&mut x`, so the primary is held beside it
+/// (`pair-not-shown-disjoint`) and both formals stay raw; no raw view is
+/// materialized before a surviving borrow, because none survives.
 #[test]
 fn pair_w1_t2_raw_view_is_materialized_before_the_safe_borrow() {
     let source = "#![allow(dead_code, unused_unsafe)]\n\
@@ -9506,29 +9498,27 @@ fn pair_w1_t2_raw_view_is_materialized_before_the_safe_borrow() {
     let outcome = pair_w1_outcome(source);
     let super::RewriteOutcome::Emitted {
         source,
-        raw_boundary_artifacts,
         degradations,
         ..
     } = outcome
     else {
         panic!("PAIR-W1 T2 branch must emit: {outcome:#?}");
     };
-    let temp = source
-        .find("let __crat_pair_raw_")
-        .unwrap_or_else(|| panic!("degradations={degradations:#?}\n{source}"));
-    let borrow = source.find("update(&mut").expect("safe borrow");
-    assert!(temp < borrow, "{source}");
-    assert!(source.contains("core::ptr::from_mut(&mut x)"), "{source}");
-    let raw = raw_boundary_artifacts
-        .bridge_events
-        .iter()
-        .filter(|event| event.site.bridge_kind == "pair-t2-raw-view")
-        .collect::<Vec<_>>();
-    assert_eq!(raw.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
-    assert!(raw.iter().all(|event| {
-        event.retention == super::bridge_receipt::BridgeRetentionTier::T2
-            && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
-    }));
+    assert!(
+        source.contains("update(a: *mut i32, b: *mut i32)"),
+        "{source}"
+    );
+    assert!(!source.contains("let __crat_pair_raw_"), "{source}");
+    assert!(
+        degradations.iter().any(|d| d.subject == "update::a"
+            && matches!(
+                d.reason,
+                super::decision::DegradeReason::SilentCoercion {
+                    via: super::decision::co_conversion::BlockReason::PairNotShownDisjoint
+                }
+            )),
+        "{degradations:#?}"
+    );
 }
 
 /// PAIR-W1/G18: when both same-object positions may retain the pointer there is

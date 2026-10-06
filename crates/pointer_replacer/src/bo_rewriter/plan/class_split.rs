@@ -726,22 +726,27 @@ pub unsafe fn info_copy(dest: *mut Info, source: *mut Info) -> u32 {
 }
 "#;
 
+    /// R833-1 (USER, 2026-10-05) takes the delivery back: the raw view
+    /// `(*source).iccp_name` is not shown disjoint from `dest` at the call, so
+    /// its primary `info` is held raw beside it (`pair-not-shown-disjoint`)
+    /// and nothing is hoisted.
     #[test]
     fn a_hoisted_field_read_view_with_a_raw_caller_delivers_the_primary() {
         let got = run(LODEPNG_ASSIGN_ICC_SHAPE);
         assert_eq!(
-            column(&got.subjects, "assign_icc::info#1", "exclusion"),
-            "-",
+            (
+                column(&got.subjects, "assign_icc::info#1", "reason"),
+                column(&got.subjects, "assign_icc::info#1", "placed")
+            ),
+            ("pair-not-shown-disjoint", "0"),
             "{}",
             got.subjects
         );
-        assert_eq!(column(&got.subjects, "assign_icc::info#1", "placed"), "1");
         let text = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(text.contains("info: &mut Info"), "{}", got.tree());
+        assert!(text.contains("info: *mut Info"), "{}", got.tree());
         assert!(
-            text.contains("= (*source).iccp_name;")
-                && (text.contains("__crat_a5_raw_") || text.contains("__crat_pair_raw_")),
-            "the raw field read is hoisted verbatim into the call snapshot:\n{}",
+            !text.contains("__crat_a5_raw_") && !text.contains("__crat_pair_raw_"),
+            "no raw view is hoisted beside a held primary:\n{}",
             got.tree()
         );
     }
@@ -1379,13 +1384,16 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
                 got.subjects
             );
         }
-        // The clean twin delivers all four — one edit, in the CALLEE, is the
-        // whole difference (ownership-fields' `the-one-edit.diff`).
+        // The clean twin delivered all four (one edit, in the CALLEE, was the
+        // whole difference). Under R833-1 (USER) it is held too: `cf` is a
+        // raw view at `transform_to_coordfield(sdf, cf)` not shown disjoint
+        // from `sdf`, so `sdf` is held (`pair-not-shown-disjoint`) and its
+        // class with it (wave-5d report 138).
         let clean = run(COORDFIELD_WITH_THE_CALLEE);
         assert_eq!(
-            column(&clean.subjects, "transform_to_coordfield::ff#8", "decision"),
-            "box",
-            "the clean twin still delivers:\n{}",
+            column(&clean.subjects, "transform_to_coordfield::sdf#1", "reason"),
+            "pair-not-shown-disjoint",
+            "the clean twin's peer is held:\n{}",
             clean.subjects
         );
     }
@@ -1683,8 +1691,18 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
     /// to say what it does to it.
     #[test]
     fn the_owner_renders_all_four_views_itself() {
+        // R833-1 (USER): `cf` is a raw view at `transform_to_coordfield(sdf,
+        // cf)` that A5 does not show disjoint from `sdf`, so `sdf` is held
+        // beside it (`pair-not-shown-disjoint`) and the class with it: the
+        // four owners no longer deliver (wave-5d report 138 prices it).
         let got = run(COORDFIELD_WITH_THE_CALLEE);
         eprintln!("COORDFIELD\n{}", got.subjects);
+        assert_eq!(
+            column(&got.subjects, "transform_to_coordfield::sdf#1", "reason"),
+            "pair-not-shown-disjoint",
+            "{}",
+            got.subjects
+        );
         for key in [
             "transform_to_coordfield::ff#8",
             "transform_to_coordfield::dd#14",
@@ -1692,25 +1710,12 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
             "transform_to_coordfield::ww#32",
         ] {
             assert_eq!(
-                column(&got.subjects, key, "decision"),
-                "box",
-                "the owner delivers:\n{}",
+                column(&got.subjects, key, "placed"),
+                "0",
+                "the held class takes its owners:\n{}",
                 got.subjects
             );
         }
-        let tree = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
-        for view in ["(*(ff))[", "(*(dd))[", "(*(zz))[", "(*(ww))["] {
-            assert!(
-                tree.contains(view),
-                "the owner's plan renders the view `{view}`:\n{}",
-                got.tree()
-            );
-        }
-        assert!(
-            !tree.contains("FALLBACK_SLICE_EXTENT"),
-            "and none of them fabricates an extent:\n{}",
-            got.tree()
-        );
     }
 
     #[test]
