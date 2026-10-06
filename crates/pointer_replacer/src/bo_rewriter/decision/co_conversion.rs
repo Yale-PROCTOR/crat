@@ -1519,9 +1519,41 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     }
     // R833-1 (USER): the callee's side of the pair rule, before the raw views
     // are blocked, so the held peer carries its own reason.
-    for subject in peers_of_unproven_raw_views(&mut pair_sites, |callee, index| {
-        param_key.get(&(callee, index)).copied()
-    }) {
+    let peer_row = |member: &PairSiteDecision, peer: usize| {
+        let subject = param_key.get(&(member.callee, peer)).copied()?;
+        let (site, argument) = facts
+            .call_args
+            .get(&member.callee)
+            .into_iter()
+            .flatten()
+            .filter(|site| site.caller == member.caller && site.span == member.call_span)
+            .flat_map(|site| {
+                site.args
+                    .iter()
+                    .filter(move |argument| argument.index == peer)
+                    .map(move |argument| (site, argument))
+            })
+            .next()?;
+        Some(PairSiteDecision {
+            caller: member.caller,
+            callee: member.callee,
+            argument_index: peer,
+            span: argument.span,
+            call_span: member.call_span,
+            subject,
+            source_node: argument.shape.place_root().map(|root| (site.caller, root)),
+            target: argument.target.clone(),
+            source_shape: argument.shape.key(),
+            role: PairRole::Blocked,
+            tier: PairTier::Blocked,
+            verdict: member.verdict,
+            reason: "pair-not-shown-disjoint".to_owned(),
+            peer_receipts: member.peer_receipts.clone(),
+            unproven_peers: vec![member.argument_index],
+            a5_fallback: None,
+        })
+    };
+    for subject in peers_of_unproven_raw_views(&mut pair_sites, peer_row) {
         block(&mut node_block, subject, BlockReason::PairNotShownDisjoint);
     }
     for row in &pair_sites {
@@ -1710,32 +1742,35 @@ fn escape_block_reason(
 }
 
 /// R833-1 (USER) — the callee's side of the pair rule. At a call inside the
-/// program where a pair is not shown disjoint and one member takes the raw
-/// view, its peer may not keep a reference either: the primaries at that call
-/// whose own verdict is not clear become blocked, and their subjects are
-/// returned to be held raw (`pair-not-shown-disjoint`). Read-read pairs never
-/// form a pair here, and a certified pair's verdict is clear.
+/// program where a pair is not shown disjoint and one member stays raw (it
+/// takes the raw view, or it is blocked), its peers may not keep a reference
+/// either: the primaries at that call whose own verdict is not clear become
+/// blocked, and their subjects are returned to be held raw
+/// (`pair-not-shown-disjoint`). A peer the raw member's unproven proof names
+/// and that has no row at the call (a raw view A5's fallback learned for one
+/// position only) gets a blocked row from `peer_row`, so the class terminal
+/// sees it as it sees any other. Read-read pairs never form a pair here, and a
+/// certified pair's verdict is clear.
 pub(crate) fn peers_of_unproven_raw_views(
-    rows: &mut [PairSiteDecision],
-    param_of: impl Fn(LocalDefId, usize) -> Option<NodeKey>,
+    rows: &mut Vec<PairSiteDecision>,
+    peer_row: impl Fn(&PairSiteDecision, usize) -> Option<PairSiteDecision>,
 ) -> Vec<NodeKey> {
-    let unproven_views = rows
+    let raw_members = rows
         .iter()
-        .filter(|row| row.role == PairRole::RawView && row.verdict != A5SiteProofVerdict::Clear)
-        .map(|row| {
-            (
-                (row.caller, row.callee, row.call_span),
-                row.unproven_peers.clone(),
-            )
+        .filter(|row| {
+            matches!(row.role, PairRole::RawView | PairRole::Blocked)
+                && row.verdict != A5SiteProofVerdict::Clear
         })
+        .cloned()
         .collect::<Vec<_>>();
+    let same_call = |row: &PairSiteDecision, member: &PairSiteDecision| {
+        (row.caller, row.callee, row.call_span) == (member.caller, member.callee, member.call_span)
+    };
     let mut held = Vec::new();
     for row in rows.iter_mut() {
         if row.role == PairRole::Primary
             && row.verdict != A5SiteProofVerdict::Clear
-            && unproven_views
-                .iter()
-                .any(|(call, _)| *call == (row.caller, row.callee, row.call_span))
+            && raw_members.iter().any(|member| same_call(row, member))
         {
             row.role = PairRole::Blocked;
             row.tier = PairTier::Blocked;
@@ -1743,22 +1778,19 @@ pub(crate) fn peers_of_unproven_raw_views(
             held.push(row.subject);
         }
     }
-    // A peer the raw view's unproven proof names and that has no row at the
-    // call (a raw view A5's fallback learned for one position only): its
-    // callee formal is held the same way.
-    for ((caller, callee, call_span), peers) in unproven_views {
-        for peer in peers {
-            let has_row = rows.iter().any(|row| {
-                (row.caller, row.callee, row.call_span) == (caller, callee, call_span)
-                    && row.argument_index == peer
-            });
-            if has_row {
+    for member in &raw_members {
+        for &peer in &member.unproven_peers {
+            if rows
+                .iter()
+                .any(|row| same_call(row, member) && row.argument_index == peer)
+            {
                 continue;
             }
-            if let Some(subject) = param_of(callee, peer)
-                && !held.contains(&subject)
-            {
-                held.push(subject);
+            if let Some(row) = peer_row(member, peer) {
+                if !held.contains(&row.subject) {
+                    held.push(row.subject);
+                }
+                rows.push(row);
             }
         }
     }

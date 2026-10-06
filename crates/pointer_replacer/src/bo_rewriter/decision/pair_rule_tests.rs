@@ -101,15 +101,23 @@ fn r833_1_the_peer_of_a_learned_raw_view_without_a_row_is_held() {
         reason: "a5-fallback-raw-view-role".to_owned(),
         ..rows[1].clone()
     }];
-    let callee = subjects[0].0;
-    let held = peers_of_unproven_raw_views(&mut rows, |function, index| {
-        (function == callee).then(|| subjects[index])
+    let held = peers_of_unproven_raw_views(&mut rows, |member, index| {
+        Some(PairSiteDecision {
+            argument_index: index,
+            subject: subjects[index],
+            role: PairRole::Blocked,
+            tier: PairTier::Blocked,
+            reason: "pair-not-shown-disjoint".to_owned(),
+            ..member.clone()
+        })
     });
     assert_eq!(held, vec![subjects[0]]);
+    // The raw view keeps its role; the peer gets a blocked row of its own.
+    assert_eq!(rows[0].role, PairRole::RawView);
+    assert_eq!(rows.len(), 2);
     assert_eq!(
-        rows[0].role,
-        PairRole::RawView,
-        "the raw view itself is not re-roled here"
+        (rows[1].subject, rows[1].role),
+        (subjects[0], PairRole::Blocked)
     );
 }
 
@@ -122,6 +130,28 @@ fn r833_1_control_a_learned_raw_view_with_no_unproven_peer_holds_nothing() {
         [Clear, Overlapping, Clear],
     );
     let mut rows = vec![rows[1].clone()];
-    let held = peers_of_unproven_raw_views(&mut rows, |_, index| Some(subjects[index]));
+    let held = peers_of_unproven_raw_views(&mut rows, |member, index| {
+        Some(PairSiteDecision {
+            argument_index: index,
+            subject: subjects[index],
+            ..member.clone()
+        })
+    });
     assert!(held.is_empty());
+    assert_eq!(rows.len(), 1);
+}
+
+/// R833-1: a blocked member not shown disjoint is raw like a raw view, so the
+/// primary beside it is held (binn `copy_be32(p, &mut id as ..)`, where the raw
+/// view's template is unavailable and `psource` is blocked instead).
+#[test]
+fn r833_1_the_primary_beside_an_unproven_blocked_member_is_held() {
+    use A5SiteProofVerdict::{Clear, Overlapping};
+    let (mut rows, subjects) = rows(
+        [PairRole::Primary, PairRole::Blocked, PairRole::Clear],
+        [Overlapping, Overlapping, Clear],
+    );
+    let held = peers_of_unproven_raw_views(&mut rows, |_, _| None);
+    assert_eq!(held, vec![subjects[0]]);
+    assert_eq!(rows[0].role, PairRole::Blocked);
 }
