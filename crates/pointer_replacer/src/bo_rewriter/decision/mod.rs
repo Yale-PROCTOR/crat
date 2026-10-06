@@ -2113,7 +2113,7 @@ fn option_stage_enabled(family_policy: &super::additive::FamilyPolicy, subject: 
 /// Is the Option stage WITHDRAWN for this subject: the run has reached the
 /// Option stage, and an exclusion re-derivation took it back (a stage not yet
 /// reached is not a withdrawal: earlier stages are candidates, not deliveries).
-fn option_stage_withdrawn(
+pub(crate) fn option_stage_withdrawn(
     family_policy: &super::additive::FamilyPolicy,
     subject: &Subject,
 ) -> bool {

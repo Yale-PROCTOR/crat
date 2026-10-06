@@ -9930,7 +9930,9 @@ fn finish_decide<'tcx>(
                 // consulted here for the same reason: the unresolved receipt IS
                 // the statement that a prior delivery was not preserved and
                 // that this rule had nothing it was allowed to retire for it.
-            } else if let Some(error) = additive::preservation_error(prior, &candidate, &[]) {
+            } else if let Some(error) =
+                additive::preservation_error(prior, &candidate, &[], &family_policy)
+            {
                 return Err(error);
             }
         }

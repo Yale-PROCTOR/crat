@@ -214,6 +214,7 @@ fn losses<'a>(
     prior: &'a StageSnapshot,
     candidate: &StageSnapshot,
     soundness: &[SoundnessWithdrawal],
+    policy: &FamilyPolicy,
 ) -> Vec<&'a decision::Subject> {
     prior
         .table
@@ -263,7 +264,11 @@ fn losses<'a>(
                 | decision::Decision::NestedSlice { .. }
                 | decision::Decision::Cursor { .. } => true,
             };
+            // ... and only where the candidate's stage did withdraw the
+            // subject's Option stage (the review's MED 5): the label alone is
+            // not the rule.
             let null_withdrawn = non_optional_prior
+                && decision::option_stage_withdrawn(policy, subject)
                 && candidate
                     .table
                     .entries
@@ -290,8 +295,9 @@ pub(crate) fn preservation_error(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
     soundness: &[SoundnessWithdrawal],
+    policy: &FamilyPolicy,
 ) -> Option<String> {
-    let lost = losses(prior, candidate, soundness);
+    let lost = losses(prior, candidate, soundness, policy);
     (!lost.is_empty()).then(|| {
         format!(
             "additive-family-preservation-invariant:unrestored:{:?}",
@@ -1228,7 +1234,7 @@ fn anchors(
     BTreeMap<SignatureClassId, (String, Anchor)>,
     BTreeSet<SignatureClassId>,
 ) {
-    let protected = losses(prior, candidate, soundness)
+    let protected = losses(prior, candidate, soundness, policy)
         .into_iter()
         .map(|s| SignatureClassId::of(s.fn_did))
         .collect::<BTreeSet<_>>();

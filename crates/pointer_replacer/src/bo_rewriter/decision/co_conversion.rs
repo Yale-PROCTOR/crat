@@ -1536,7 +1536,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             .get(&(member.callee, peer))
             .copied()
             .filter(|subject| converts.contains(subject))?;
-        let (site, argument) = facts
+        // The call's own argument fact; without it (the review's MED 3(c)) the
+        // peer is still held, its row placed at the call itself.
+        let fact = facts
             .call_args
             .get(&member.callee)
             .into_iter()
@@ -1548,17 +1550,19 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     .filter(move |argument| argument.index == peer)
                     .map(move |argument| (site, argument))
             })
-            .next()?;
+            .next();
         Some(PairSiteDecision {
             caller: member.caller,
             callee: member.callee,
             argument_index: peer,
-            span: argument.span,
+            span: fact.map_or(member.call_span, |(_, argument)| argument.span),
             call_span: member.call_span,
             subject,
-            source_node: argument.shape.place_root().map(|root| (site.caller, root)),
-            target: argument.target.clone(),
-            source_shape: argument.shape.key(),
+            source_node: fact.and_then(|(site, argument)| {
+                argument.shape.place_root().map(|root| (site.caller, root))
+            }),
+            target: fact.and_then(|(_, argument)| argument.target.clone()),
+            source_shape: fact.map_or("argument-fact-absent", |(_, argument)| argument.shape.key()),
             role: PairRole::Blocked,
             tier: PairTier::Blocked,
             verdict: member.verdict,

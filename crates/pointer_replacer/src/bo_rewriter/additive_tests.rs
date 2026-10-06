@@ -1209,3 +1209,37 @@ fn r645_4_a_waiting_owner_restores_when_the_round_retires_nothing_else() {
         "the waiting owner restores and the round retires something: {rows:#?}"
     );
 }
+
+/// The independent review's MED 5 (relay 182 item 4): a `null-init` loss of
+/// a non-optional prior is the soundness rule only where the candidate's
+/// stage did withdraw the subject's Option stage. With the Option stage
+/// still enabled, the same loss is a lost delivery.
+#[test]
+fn r824_2_a_null_init_loss_with_the_option_stage_enabled_is_still_a_loss() {
+    with_null_ref_history(false, |prior, candidate, _, _| {
+        assert!(
+            additive::preservation_error(
+                &prior,
+                &candidate,
+                &[],
+                &FamilyPolicy::at(FamilyStage::Option)
+            )
+            .is_some(),
+            "the label alone does not exempt the loss"
+        );
+    });
+}
+
+/// Control: the Option stage withdrawn for the owner, the same loss is the
+/// R824-2 fallback, not a lost delivery.
+#[test]
+fn r824_2_control_a_null_init_loss_with_the_option_stage_withdrawn_is_the_rule() {
+    with_null_ref_history(false, |prior, candidate, _, owner| {
+        let mut policy = FamilyPolicy::at(FamilyStage::Option);
+        policy.withdrawn.insert((FamilyStage::Option, owner));
+        assert_eq!(
+            additive::preservation_error(&prior, &candidate, &[], &policy),
+            None
+        );
+    });
+}
