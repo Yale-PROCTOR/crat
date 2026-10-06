@@ -5201,6 +5201,10 @@ pub(crate) struct RetainedAccessCheck {
     /// Subjects Clear only under P8 (`OutsideByteViewDiscipline`, relay 176): the
     /// receipt `premise=outside-byte-view`.
     premised: FxHashSet<(LocalDefId, Local)>,
+    /// R842-2 (USER): the declarations whose verdict P10 `ExposedProvenance` decides
+    /// (it changes with the premise taken away): `retained-access-withdrawn` (held only
+    /// with it) or `retained-access-cleared` (clear only with it).
+    exposed_premised: FxHashMap<(LocalDefId, Local), &'static str>,
 }
 
 impl RetainedAccessCheck {
@@ -5215,11 +5219,39 @@ impl RetainedAccessCheck {
         slots: &CrateSlots,
         model: &FxHashMap<SlotRef, SlotKind>,
     ) -> Self {
-        Self::compute_options(
-            program,
-            &Self::model_fields(slots, model),
-            Options::of_record(),
-        )
+        Self::compute_record(program, &Self::model_fields(slots, model))
+    }
+
+    /// The mode of record, with P10's receipts (R842-2): the check once more with the
+    /// premise taken away, and the verdicts that differ.
+    pub(crate) fn compute_record(
+        program: &RustProgram<'_>,
+        field_raw: &dyn Fn(DefId, usize) -> bool,
+    ) -> Self {
+        let options = Options::of_record();
+        let mut check = Self::compute_options(program, field_raw, options);
+        if options.facts {
+            let without = Self::compute_options(
+                program,
+                field_raw,
+                Options {
+                    faults: options.faults | (1u64 << Rule::ExposedProvenance as u64),
+                    ..options
+                },
+            );
+            for (key, verdict) in &check.verdicts {
+                let other = without.verdicts.get(key).is_some_and(|v| v.withdraws());
+                if verdict.withdraws() != other {
+                    let kind = if verdict.withdraws() {
+                        "retained-access-withdrawn"
+                    } else {
+                        "retained-access-cleared"
+                    };
+                    check.exposed_premised.insert(*key, kind);
+                }
+            }
+        }
+        check
     }
 
     /// The model's field kinds as the raw guard reads them: a retaining field the
@@ -5902,6 +5934,7 @@ impl RetainedAccessCheck {
             bodies,
             container_of,
             premised,
+            exposed_premised: FxHashMap::default(),
         }
     }
 
@@ -5962,7 +5995,38 @@ impl RetainedAccessCheck {
             .then_some("premise=outside-byte-view")
     }
 
+    /// R842-2: P10's receipt kind for a declaration whose verdict the premise decides.
+    pub(crate) fn exposed_premise(&self, f: LocalDefId, local: Local) -> Option<&'static str> {
+        self.exposed_premised.get(&(f, local)).copied()
+    }
+
     pub(crate) fn container_of_sites(&self) -> &[(LocalDefId, Local)] {
         &self.container_of
     }
+}
+
+/// R842-2 (USER): P10 `ExposedProvenance`'s census receipts, one per subject whose
+/// decision the premise decides (`premise=exposed-provenance`, counted per program).
+pub(crate) fn exposed_premise_receipts(
+    tcx: TyCtxt<'_>,
+    check: &RetainedAccessCheck,
+    subjects: &[super::Subject],
+) -> Vec<super::call_result_option::PremiseReceipt> {
+    subjects
+        .iter()
+        .filter_map(|subject| {
+            let site_kind = check.exposed_premise(subject.fn_did, subject.local)?;
+            Some(super::call_result_option::PremiseReceipt {
+                owner: tcx.def_path_str(subject.fn_did.to_def_id()),
+                subject: subject.label.clone(),
+                site: format!(
+                    "{}..{}",
+                    subject.binding_span.lo().0,
+                    subject.binding_span.hi().0
+                ),
+                premise: "exposed-provenance",
+                site_kind,
+            })
+        })
+        .collect()
 }

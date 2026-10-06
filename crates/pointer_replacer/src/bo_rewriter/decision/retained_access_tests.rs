@@ -2942,3 +2942,85 @@ fn e5c_evident_faults_round4() {
     );
     assert!(!faulted(R4_CALLBACK, "cb::p", Rule::SccExtents), "callback");
 }
+
+// ---- R842-2 (USER): P10 `ExposedProvenance`'s receipt.
+
+/// The receipt kinds the mode of record gives, by subject.
+fn premises_of_record(code: &str) -> FxHashMap<String, &'static str> {
+    let mut out = FxHashMap::default();
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = program_of(tcx);
+        let raw = |_: DefId, _: usize| true;
+        let check = RetainedAccessCheck::compute_record(&program, &raw);
+        for &f in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+            let fn_name = tcx.item_name(f.to_def_id());
+            for info in &body.var_debug_info {
+                let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value else {
+                    continue;
+                };
+                if place.projection.is_empty()
+                    && let Some(kind) = check.exposed_premise(f, place.local)
+                {
+                    out.insert(format!("{fn_name}::{}", info.name), kind);
+                }
+            }
+        }
+    })
+    .expect("compiles");
+    out
+}
+
+/// An integer made a pointer into an unrelated local beside a subject whose object
+/// refers to itself: the premise decides the subject's verdict.
+const P10_DECIDES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+#[repr(C)] pub struct N { q: *mut N, v: i32 }
+pub unsafe fn entry(n: *mut N) {
+    (*n).q = n;
+    let mut x = 0i32;
+    let a = (&mut x as *mut i32) as usize;
+    let r = a as *mut i32;
+    let p = n;
+    *r = 1;
+    (*p).v = 2;
+}
+"#;
+
+/// The receipt names exactly the declarations whose verdict differs with the premise
+/// taken away, with the direction; a subject held both ways has none.
+#[test]
+fn e5c_p10_receipt_names_the_declarations_it_decides() {
+    let with = of_record(P10_DECIDES);
+    let without = verdicts_opts(
+        P10_DECIDES,
+        &[],
+        Options {
+            fault: Some(Rule::ExposedProvenance),
+            ..Options::of_record()
+        },
+    );
+    eprintln!("P10 with: {with:#?}\nP10 without: {without:#?}");
+    let premises = premises_of_record(P10_DECIDES);
+    for (subject, verdict) in &with {
+        let differs = verdict.withdraws() != without[subject].withdraws();
+        let expected = differs.then_some(if verdict.withdraws() {
+            "retained-access-withdrawn"
+        } else {
+            "retained-access-cleared"
+        });
+        assert_eq!(premises.get(subject).copied(), expected, "{subject}");
+    }
+    assert_eq!(
+        premises.get("entry::p"),
+        Some(&"retained-access-cleared"),
+        "{premises:#?}"
+    );
+    // TOP': held only with the premise (without it both endpoints are `Top`).
+    assert_eq!(
+        premises_of_record(R3_TOP).get("f::p"),
+        Some(&"retained-access-withdrawn")
+    );
+    // Held both ways: no receipt.
+    assert_eq!(premises.get("entry::n"), None);
+}

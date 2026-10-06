@@ -10025,7 +10025,18 @@ fn finish_decide<'tcx>(
                 .declines_tsv(tcx, &subjects, &model, &slots, &fat),
             licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
             premise_receipts: decision::call_result_option::premise_receipts_tsv(
-                &table.seams.premise_receipts,
+                &table
+                    .seams
+                    .premise_receipts
+                    .iter()
+                    .cloned()
+                    // R842-2: P10's receipts.
+                    .chain(decision::retained_access::exposed_premise_receipts(
+                        tcx,
+                        &retained_access,
+                        &subjects,
+                    ))
+                    .collect::<Vec<_>>(),
             ),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
             sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
