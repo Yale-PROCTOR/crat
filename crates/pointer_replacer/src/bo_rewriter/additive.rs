@@ -216,6 +216,34 @@ fn losses<'a>(
     soundness: &[SoundnessWithdrawal],
     policy: &FamilyPolicy,
 ) -> Vec<&'a decision::Subject> {
+    // The candidate's degrade reason for a subject, if degraded.
+    fn reason_of(
+        candidate: &StageSnapshot,
+        key: (LocalDefId, HirId),
+    ) -> Option<decision::DegradeReason> {
+        candidate
+            .table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == key)
+            .and_then(|(_, d)| match d {
+                decision::Decision::Degraded(record) => Some(record.reason.clone()),
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Cursor { .. } => None,
+            })
+    }
+    // R819-1 / R824-2: the candidate's stage withdrew this subject's Option
+    // stage and it fell back to raw on its own null evidence.
+    let withdrawn_by_null = |subject: &decision::Subject| {
+        decision::option_stage_withdrawn(policy, subject)
+            && reason_of(candidate, (subject.fn_did, subject.hir_id))
+                == Some(decision::DegradeReason::NullInit)
+    };
     prior
         .table
         .entries
@@ -267,26 +295,41 @@ fn losses<'a>(
             // ... and only where the candidate's stage did withdraw the
             // subject's Option stage (the review's MED 5): the label alone is
             // not the rule.
-            let null_withdrawn = non_optional_prior
-                && decision::option_stage_withdrawn(policy, subject)
+            let null_withdrawn = non_optional_prior && withdrawn_by_null(subject);
+            // The knock-on, anchored (relay 182 item 4, the attach::r abort):
+            // a raw view at a call where a subject of the caller, or a formal
+            // of the callee, was null-withdrawn at this stage is R833-1's
+            // consequence of that withdrawal (its peer went raw), not a lost
+            // delivery.
+            let pair_knock_on = non_optional_prior
+                && reason_of(candidate, key) == Some(decision::DegradeReason::PairRawView)
                 && candidate
                     .table
-                    .entries
+                    .seams
+                    .pair_raw_calls
                     .iter()
-                    .find(|(s, _)| (s.fn_did, s.hir_id) == key)
-                    .is_some_and(|(_, d)| match d {
-                        decision::Decision::Degraded(record) => {
-                            record.reason == decision::DegradeReason::NullInit
-                        }
-                        decision::Decision::Ref { .. }
-                        | decision::Decision::InferredRef { .. }
-                        | decision::Decision::Slice { .. }
-                        | decision::Decision::Opt { .. }
-                        | decision::Decision::Box(_)
-                        | decision::Decision::NestedSlice { .. }
-                        | decision::Decision::Cursor { .. } => false,
+                    .map(|call| (call.caller, call.callee))
+                    .chain(
+                        candidate
+                            .table
+                            .seams
+                            .a5_raw_calls
+                            .iter()
+                            .map(|call| (call.caller, call.callee)),
+                    )
+                    .any(|(caller, callee)| {
+                        callee == subject.fn_did
+                            && candidate.table.entries.iter().any(|(other, _)| {
+                                (other.fn_did == caller
+                                    || (other.fn_did == callee
+                                        && matches!(
+                                            other.kind,
+                                            decision::SubjectKind::Param { .. }
+                                        )))
+                                    && withdrawn_by_null(other)
+                            })
                     });
-            (!survives && !witnessed && !null_withdrawn).then_some(subject)
+            (!survives && !witnessed && !null_withdrawn && !pair_knock_on).then_some(subject)
         })
         .collect()
 }
