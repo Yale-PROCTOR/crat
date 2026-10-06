@@ -588,3 +588,137 @@ fn r861_1_d1_open_world_a_frame_binding_sibling_beneath_casts_is_not_held() {
         out.reasons
     );
 }
+
+/// **The premise's own condition (the stand-in review's M1).** A formal
+/// reassigned before the call no longer holds a referent from before the frame:
+/// `name = other` may leave it addressing anything, so the frame-binding
+/// exemption does not apply and the formal is held as any formal beside a written
+/// sibling.
+const H3_REASSIGNED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat_t {
+    pub st_dev: u64,
+    pub st_mode: u32,
+}
+extern "C" {
+    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+}
+unsafe fn stat(mut path: *const i8, mut buf: *mut stat_t) -> i32 {
+    return __xstat(1 as i32, path, buf);
+}
+pub unsafe fn CopyStat(mut name: *const i8, mut other: *const i8) -> u32 {
+    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
+    if *other != 0 {
+        name = other;
+    }
+    if stat(name, &mut statbuf) != 0 {
+        return 0;
+    }
+    statbuf.st_mode
+}
+"#;
+
+#[test]
+fn r861_1_m1_a_reassigned_formal_is_not_under_the_frame_binding_premise() {
+    let out = outcome(H3_REASSIGNED);
+    assert_eq!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// The control: a formal only stepped from itself (`name = name.offset(1)`)
+/// still addresses its entry referent; the premise applies.
+#[test]
+fn r861_1_m1_a_formal_stepped_from_itself_keeps_the_premise() {
+    let input = H3_REASSIGNED.replace(
+        "    if *other != 0 {\n        name = other;\n    }\n",
+        "    if *other != 0 {\n        name = name.offset(1);\n    }\n",
+    );
+    assert!(input.contains("name.offset(1)"));
+    let out = outcome(&input);
+    assert_ne!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// **The ladder's borrowed rule into a held formal (the stand-in review's M4).**
+/// `caller::src` is held beside `(*holder).data` (H1); `outer` hands it
+/// `&mut *r`, a reborrow of its delivered `r`: the raw pointer `update` may keep
+/// would outlive the reborrow, so `r` is held too (`held:into-held-formal`), as
+/// the ladder blocks `borrowed-into-raw-param`.
+const BORROWED_INTO_HELD: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+        update((*holder).data, src);\n\
+    }\n\
+    pub unsafe fn outer(holder: *const Holder, r: *mut i32) {\n\
+        *r = 3;\n\
+        caller(holder, &mut *r);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let mut other = 2;\n\
+        let holder = Holder { data: &mut value };\n\
+        outer(&holder, &mut other);\n\
+    }\n";
+
+#[test]
+fn r861_1_m4_a_binding_borrowed_into_a_held_formal_is_held() {
+    let out = outcome(BORROWED_INTO_HELD);
+    assert_eq!(
+        reason_of(&out, "caller::src"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    assert_eq!(
+        reason_of(&out, "outer::r"),
+        Some("held:into-held-formal"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// **Within the function (the stand-in review's M4).** `caller::s2` is the held
+/// source; `src` initializes it whole. The model keeps the two in one kind; with
+/// `s2` held raw, a delivered `src` would coerce into it silently, so `src` is
+/// held too (`into-held-binding`).
+const FLOWS_INTO_HELD: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+        let s2: *const i32 = src;\n\
+        update((*holder).data, s2);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let holder = Holder { data: &mut value };\n\
+        caller(&holder, &value);\n\
+    }\n";
+
+#[test]
+fn r861_1_m4_a_binding_flowing_into_a_held_binding_is_held() {
+    let out = outcome(FLOWS_INTO_HELD);
+    let held = |subject: &str| {
+        matches!(
+            reason_of(&out, subject),
+            Some("held:pair-not-shown-disjoint" | "held:into-held-formal")
+        )
+    };
+    assert!(
+        held("caller::s2") && held("caller::src"),
+        "both held: {:?}",
+        out.reasons
+    );
+    let caller = signature(&out.source, "caller");
+    assert!(caller.contains("src: *const i32"), "raw: {caller}");
+}
