@@ -1717,23 +1717,49 @@ fn escape_block_reason(
 /// form a pair here, and a certified pair's verdict is clear.
 pub(crate) fn peers_of_unproven_raw_views(
     rows: &mut [PairSiteDecision],
-    _param_of: impl Fn(LocalDefId, usize) -> Option<NodeKey>,
+    param_of: impl Fn(LocalDefId, usize) -> Option<NodeKey>,
 ) -> Vec<NodeKey> {
-    let unproven_calls = rows
+    let unproven_views = rows
         .iter()
         .filter(|row| row.role == PairRole::RawView && row.verdict != A5SiteProofVerdict::Clear)
-        .map(|row| (row.caller, row.callee, row.call_span))
+        .map(|row| {
+            (
+                (row.caller, row.callee, row.call_span),
+                row.unproven_peers.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let mut held = Vec::new();
     for row in rows.iter_mut() {
         if row.role == PairRole::Primary
             && row.verdict != A5SiteProofVerdict::Clear
-            && unproven_calls.contains(&(row.caller, row.callee, row.call_span))
+            && unproven_views
+                .iter()
+                .any(|(call, _)| *call == (row.caller, row.callee, row.call_span))
         {
             row.role = PairRole::Blocked;
             row.tier = PairTier::Blocked;
             row.reason = "pair-not-shown-disjoint".to_owned();
             held.push(row.subject);
+        }
+    }
+    // A peer the raw view's unproven proof names and that has no row at the
+    // call (a raw view A5's fallback learned for one position only): its
+    // callee formal is held the same way.
+    for ((caller, callee, call_span), peers) in unproven_views {
+        for peer in peers {
+            let has_row = rows.iter().any(|row| {
+                (row.caller, row.callee, row.call_span) == (caller, callee, call_span)
+                    && row.argument_index == peer
+            });
+            if has_row {
+                continue;
+            }
+            if let Some(subject) = param_of(callee, peer)
+                && !held.contains(&subject)
+            {
+                held.push(subject);
+            }
         }
     }
     held
