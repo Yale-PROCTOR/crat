@@ -624,6 +624,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// census reader counts its rows as the view kind in place of its own view
     /// reading. Empty: the reader's own view reading stands.
     pub(crate) premise_view_sites: String,
+    /// Relay 297: the settled-table holds' receipts, one row per predicate that
+    /// named a subject (`<p>.raw-boundary-settled-holds.tsv`).
+    pub(crate) settled_hold_receipts: String,
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contract_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
@@ -8820,6 +8823,10 @@ fn finish_decide<'tcx>(
             Vec::new()
         };
         let mut forced = rustc_hash::FxHashMap::default();
+        // Every predicate that names a subject, in the pass it names it: a subject
+        // two predicates hold carries both receipts (relay 297), though its
+        // decision carries the first reason.
+        let mut receipts = Vec::new();
         loop {
             let mut new = rustc_hash::FxHashMap::default();
             for (node, reason) in decision::released_indirect::to_hold(
@@ -8828,6 +8835,9 @@ fn finish_decide<'tcx>(
                 &released_held.1,
             ) {
                 if !forced.contains_key(&node) {
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        node, &reason,
+                    ));
                     released_held.1.insert(node);
                     new.entry(node).or_insert(reason);
                 }
@@ -8842,7 +8852,13 @@ fn finish_decide<'tcx>(
                             &raw_boundary,
                         ))
                 {
-                    if !forced.contains_key(&node) && !new.contains_key(&node) {
+                    if forced.contains_key(&node) {
+                        continue;
+                    }
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        node, &reason,
+                    ));
+                    if !new.contains_key(&node) {
                         pending_held.1.insert(node, reason.clone());
                         new.insert(node, reason);
                     }
@@ -8851,6 +8867,9 @@ fn finish_decide<'tcx>(
             for (node, reason) in
                 decision::settled_holds::into_held_formals(tcx, &facts, &table, &forced)
             {
+                receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                    node, &reason,
+                ));
                 new.entry(node).or_insert(reason);
             }
             if new.is_empty() {
@@ -8886,6 +8905,7 @@ fn finish_decide<'tcx>(
                 ),
             };
         }
+        table.settled_hold_receipts = receipts;
         // R586-2: the sole-origin upgrades, on the table the ladder settled.
         decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);
         // **R666-1 / R697-2 — the loader.** The model's arm-(a) receipts
@@ -9824,6 +9844,7 @@ fn finish_decide<'tcx>(
             ),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
             premise_view_sites: String::new(),
+            settled_hold_receipts: decision::settled_holds::receipts_tsv(tcx, &table),
             a5_hold_views: String::new(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),

@@ -81,3 +81,38 @@ pub(crate) fn into_held_formals(
     }
     out
 }
+
+/// One settled-table hold's receipt: the predicate (its reason's key), the
+/// subject, the reason's detail. A subject two predicates name has two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SettledHoldReceipt {
+    pub(crate) predicate: &'static str,
+    pub(crate) node: (LocalDefId, HirId),
+    pub(crate) detail: String,
+}
+
+impl SettledHoldReceipt {
+    pub(crate) fn of(node: (LocalDefId, HirId), reason: &DegradeReason) -> Self {
+        Self {
+            predicate: reason.key(),
+            node,
+            detail: reason.detail(),
+        }
+    }
+}
+
+/// `<p>.raw-boundary-settled-holds.tsv`: `predicate`, `subject` (the census's
+/// subject key), `detail`.
+pub(crate) fn receipts_tsv(tcx: rustc_middle::ty::TyCtxt<'_>, table: &DecisionTable) -> String {
+    let mut out = String::from("predicate\tsubject\tdetail\n");
+    for receipt in &table.settled_hold_receipts {
+        let subject = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == receipt.node)
+            .map(|(subject, _)| subject.identity_key(&tcx.def_path_str(subject.fn_did.to_def_id())))
+            .unwrap_or_else(|| "-".to_owned());
+        out += &format!("{}\t{subject}\t{}\n", receipt.predicate, receipt.detail);
+    }
+    out
+}

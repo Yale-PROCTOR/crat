@@ -1103,6 +1103,9 @@ pub(crate) enum Decision {
 /// The finished, immutable table handed to [`super::plan`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
+    /// Relay 297: every settled-table hold's receipt, one per predicate that named
+    /// the subject (`settled_holds`).
+    pub(crate) settled_hold_receipts: Vec<settled_holds::SettledHoldReceipt>,
     pub(crate) counted_void: counted_void::Contracts,
     /// wave-6a W6A-T1: the admitted flexible-tail struct transactions.
     pub(crate) flexible_tails: flexible_tail::Transactions,
@@ -1523,6 +1526,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         .map(|subject| (subject.fn_did, subject.hir_id))
         .collect();
     DecisionTable {
+        settled_hold_receipts: Vec::new(),
         counted_void: ctx.counted_void.clone(),
         flexible_tails: ctx.flexible_tails.clone(),
         box_params: ctx.box_params.clone(),
@@ -3291,6 +3295,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            settled_hold_receipts: Vec::new(),
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),

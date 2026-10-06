@@ -12795,6 +12795,8 @@ mod run {
             // **R801-2 (main 165)** — the view families' P7 sites, read by P7's
             // census reader as its `declaration-view` kind.
             ("premise-view-sites", artifact.premise_view_sites.as_str()),
+            // Relay 297: the settled-table holds, one row per predicate.
+            ("settled-holds", artifact.settled_hold_receipts.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(
@@ -26686,6 +26688,26 @@ fn raw_boundary_pending_hold_lines(ledger_dir: &std::path::Path) -> String {
         }
         held += count;
     }
+    // Relay 297: the settled-table holds by predicate (a subject two predicates
+    // name counts under both), and the subjects named twice.
+    let mut by_predicate = std::collections::BTreeMap::<String, usize>::new();
+    let mut named_twice = 0usize;
+    for program in CORPUS {
+        let path = ledger_dir.join(format!("{}.raw-boundary-settled-holds.tsv", program.name));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut subjects = std::collections::BTreeMap::<String, usize>::new();
+        for row in text.lines().skip(1) {
+            let mut fields = row.split('\t');
+            let (Some(predicate), Some(subject)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            *by_predicate.entry(predicate.to_owned()).or_default() += 1;
+            *subjects.entry(subject.to_owned()).or_default() += 1;
+        }
+        named_twice += subjects.values().filter(|count| **count > 1).count();
+    }
     let mut out = format!(
         "pending_hold={}\npending_held={held}\n",
         if crate::bo_rewriter::decision::pending_hold::enabled() {
@@ -26697,6 +26719,18 @@ fn raw_boundary_pending_hold_lines(ledger_dir: &std::path::Path) -> String {
     if !by_program.is_empty() {
         out += &format!("pending_held_by_program={}\n", by_program.join(","));
     }
+    out += &format!(
+        "settled_holds_by_predicate={}\nsettled_holds_named_twice={named_twice}\n",
+        if by_predicate.is_empty() {
+            "-".to_owned()
+        } else {
+            by_predicate
+                .iter()
+                .map(|(predicate, count)| format!("{predicate}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    );
     out
 }
 

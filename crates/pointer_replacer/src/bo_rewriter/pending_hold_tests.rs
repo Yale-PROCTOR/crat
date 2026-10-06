@@ -376,3 +376,98 @@ fn r857_1_an_optional_formal_into_a_held_raw_formal_is_bridged() {
         .collect::<Vec<_>>();
     assert!(reverted.is_empty(), "verify reverts: {reverted:?}");
 }
+
+/// **Relay 297: one held map, one loop.** `Drop2::p` is both copied by `memcpy`
+/// beside the written `out` (the pending hold) and released through
+/// `free_func` (R857-2's backstop): it stays held, and the settled-hold table
+/// carries BOTH predicates' receipts for it.
+const TWO_HOLDS: &str = r#"
+// r861-two-holds
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn free(p: *mut core::ffi::c_void);
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+pub type free_func_t =
+    Option<unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ()>;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MemoryManager {
+    pub free_func: free_func_t,
+    pub opaque: *mut core::ffi::c_void,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Obj {
+    pub k: i32,
+}
+unsafe extern "C" fn DefaultFree(mut opaque: *mut core::ffi::c_void, mut address: *mut core::ffi::c_void) {
+    free(address);
+}
+pub unsafe fn Init(mut m: *mut MemoryManager) {
+    (*m).free_func = Some(DefaultFree as unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ());
+}
+pub unsafe fn Drop2(mut m: *mut MemoryManager, mut out: *mut Obj, mut p: *mut Obj) {
+    memcpy(out as *mut core::ffi::c_void, p as *const core::ffi::c_void, 4 as u64);
+    (*m).free_func.expect("non-null function pointer")((*m).opaque, p as *mut core::ffi::c_void);
+}
+"#;
+
+#[test]
+fn r861_a_subject_two_holds_name_stays_held_with_both_receipts() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set(
+        "r861-two-holds",
+        Vec::new(),
+        vec![("Drop2::p".to_owned(), SlotKind::Ref)],
+    );
+    let result = super::rewrite_m1_census_world(TWO_HOLDS);
+    super::test_model_override::clear();
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        raw_boundary_artifacts,
+        ..
+    } = result
+    else {
+        panic!("the fixture must emit: {result:?}");
+    };
+    println!(
+        "SOURCE\n{source}\nRECEIPTS\n{}",
+        raw_boundary_artifacts.settled_hold_receipts
+    );
+    let reason = degradations
+        .iter()
+        .find(|d| d.subject.starts_with("Drop2::p"))
+        .map(|d| d.reason.key());
+    assert!(
+        matches!(
+            reason,
+            Some("held:released-through-indirect-call" | "held:pair-not-shown-disjoint")
+        ),
+        "held: {reason:?}"
+    );
+    let predicates = raw_boundary_artifacts
+        .settled_hold_receipts
+        .lines()
+        .filter(|row| {
+            row.split('\t')
+                .nth(1)
+                .is_some_and(|s| s.contains("Drop2::p"))
+        })
+        .map(|row| row.split('\t').next().unwrap_or_default().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        predicates,
+        [
+            "held:pair-not-shown-disjoint",
+            "held:released-through-indirect-call"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "{}",
+        raw_boundary_artifacts.settled_hold_receipts
+    );
+}

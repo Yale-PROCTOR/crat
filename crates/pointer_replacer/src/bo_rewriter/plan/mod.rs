@@ -6316,6 +6316,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            settled_hold_receipts: Vec::new(),
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
@@ -6421,6 +6422,7 @@ mod tests {
             arm: "test",
         };
         let table = |declarations: Vec<ExplicitDeclarationSite>| DecisionTable {
+            settled_hold_receipts: Vec::new(),
             counted_void: Default::default(),
             nested_receipts: Vec::new(),
             cursor_receipts: Vec::new(),
@@ -6510,6 +6512,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            settled_hold_receipts: Vec::new(),
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),

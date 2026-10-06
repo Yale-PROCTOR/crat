@@ -210,6 +210,7 @@ mod tests {
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
         DecisionTable {
+            settled_hold_receipts: Vec::new(),
             counted_void: Default::default(),
             flexible_tails: Default::default(),
             box_params: Default::default(),
