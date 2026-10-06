@@ -709,3 +709,45 @@ fn r861_1_m4_a_binding_flowing_into_a_held_binding_is_held() {
     let caller = signature(&out.source, "caller");
     assert!(caller.contains("src: *const i32"), "raw: {caller}");
 }
+
+/// **The within-function rule through a temporary (the stand-in review round 2,
+/// N1).** `s2` is the held source; `src` reaches it through a C2Rust ternary
+/// (`if flag != 0 { src } else { … }`), a MIR temporary the HIR shapes do not
+/// see. The model keeps the two in one kind, so a delivered `src` would coerce
+/// into the raw `s2` silently: `src` is held too, `into-held-binding`.
+const FLOWS_THROUGH_TERNARY: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32, other: *const i32, flag: i32) {\n\
+        let s2: *const i32 = if flag != 0 { src } else { other };\n\
+        update((*holder).data, s2);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let holder = Holder { data: &mut value };\n\
+        caller(&holder, &value, &value, 1);\n\
+    }\n";
+
+#[test]
+fn r861_1_n1_a_binding_flowing_through_a_ternary_into_a_held_binding_is_held() {
+    let out = outcome(FLOWS_THROUGH_TERNARY);
+    assert_eq!(
+        reason_of(&out, "caller::s2"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    for formal in ["caller::src", "caller::other"] {
+        assert_eq!(
+            reason_of(&out, formal),
+            Some("held:into-held-formal"),
+            "{formal}: {:?}",
+            out.reasons
+        );
+    }
+    let caller = signature(&out.source, "caller");
+    assert!(
+        caller.contains("src: *const i32") && caller.contains("other: *const i32"),
+        "held raw: {caller}"
+    );
+}
