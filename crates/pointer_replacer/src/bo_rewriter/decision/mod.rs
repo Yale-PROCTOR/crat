@@ -2012,18 +2012,21 @@ fn delivers_non_optional(decision: &Decision) -> bool {
         | Decision::Slice { .. }
         | Decision::Cursor { .. }
         | Decision::NestedSlice { .. } => true,
-        // An owner is the Box family's: it decides `Box` / `Option<Box>` from
-        // the same evidence, and a null test before the box is its
-        // construction's guard (`null-guard-before-box`), not a null value of
-        // the owner (wave6a `w6a_ac`: `copied::dup`).
-        Decision::Box(_) | Decision::Opt { .. } | Decision::Degraded(_) => false,
+        Decision::Box(plan) => !plan.optional,
+        Decision::Opt { .. } | Decision::Degraded(_) => false,
     }
 }
 
 /// The subject's OWN nullability evidence (R824-2): a null literal at its
 /// construction, a null assignment to it, a null test of it, or a caller's
-/// null literal at its position.
-fn own_nullable_evidence(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+/// null literal at its position. For an owner (`Box`), a null test is not
+/// counted: before the box it is the allocation's guard
+/// (`null-guard-before-box`), and the Box family decides `Option<Box>` from
+/// the same evidence; a null VALUE (a literal, an assignment, a caller's
+/// literal) still is, whichever Box producer planned it (the review's
+/// LOW/MED 6: `ownership_fields_constructor`'s fallback plans `optional:
+/// false` without reading it).
+fn own_nullable_evidence(ctx: &Ctx<'_, '_>, subject: &Subject, owner: bool) -> bool {
     let key = (subject.fn_did, subject.hir_id);
     subject.null_init
         || ctx
@@ -2036,7 +2039,7 @@ fn own_nullable_evidence(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
             .get(&key)
             .is_some_and(|uses| uses.null_assigned)
         || null_assigned_in_body(ctx.tcx, subject)
-        || null_tested(ctx, subject)
+        || (!owner && null_tested(ctx, subject))
         || option_ops::param_receives_null_literal(ctx.facts, subject)
 }
 
@@ -2158,7 +2161,20 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // null evidence and it is never handed on.
     if option_stage_withdrawn(ctx.family_policy, subject)
         && delivers_non_optional(&decision)
-        && own_nullable_evidence(ctx, subject)
+        && own_nullable_evidence(
+            ctx,
+            subject,
+            match &decision {
+                Decision::Box(_) => true,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Cursor { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Degraded(_) => false,
+            },
+        )
         && !declaration_owns_null_init(ctx, subject)
     {
         return degrade(
