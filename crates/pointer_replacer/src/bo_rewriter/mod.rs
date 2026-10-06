@@ -8319,6 +8319,12 @@ fn finish_decide<'tcx>(
     // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
     // once: they read the program, not a decision.
     let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
+    // Relay 297 (main 187): the sources the plan named pending, held for the rest
+    // of the run (see below, before the stage snapshot).
+    let mut planned_held: rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        decision::DegradeReason,
+    > = Default::default();
     // The formals the backstop held at the current family stage (see below).
     let mut released_held: (
         Option<additive::FamilyStage>,
@@ -8846,6 +8852,14 @@ fn finish_decide<'tcx>(
             // formal's form, and before the Declaration stage a formal can be raw
             // only because its family is not on yet; a hold taken there is not
             // the emitted program's.
+            for (node, reason) in &planned_held {
+                if !forced.contains_key(node) && !new.contains_key(node) {
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        *node, reason,
+                    ));
+                    new.insert(*node, reason.clone());
+                }
+            }
             if decision::pending_hold::enabled()
                 && family_policy.stage >= additive::FamilyStage::Declaration
             {
@@ -9654,6 +9668,50 @@ fn finish_decide<'tcx>(
                 ));
             }
             if withdrawn || refreshed {
+                continue;
+            }
+        }
+        // **Relay 297 (main 187): the planning-time pending sites, fed back.** A
+        // callee formal the plan leaves raw (binn `binn_object_get_value::key`,
+        // `unplaceable:slice-use-evidence-held`) is invisible to the settled-table
+        // hold, and the post-condition then degraded the whole program. The pending
+        // predicate on the plan names its delivered sources here; they join the
+        // settled-table holds for the rest of the run and the stage is decided
+        // again (the map only grows). The post-condition stays the tripwire for a
+        // site only a verify revert creates.
+        if decision::pending_hold::enabled()
+            && family_policy.stage >= additive::FamilyStage::Declaration
+        {
+            let mut grew = false;
+            for site in prepared
+                .plan
+                .pending_sibling_receipts(&std::collections::BTreeSet::new())
+            {
+                let Some(source) = site.receipt.potential.source.declared() else {
+                    continue;
+                };
+                let node = (source.fn_did, source.hir_id);
+                if planned_held.contains_key(&node) {
+                    continue;
+                }
+                planned_held.insert(
+                    node,
+                    decision::DegradeReason::PairNotShownDisjoint {
+                        detail: format!(
+                            "pair-not-shown-disjoint:{};planned;risky-siblings={}",
+                            decision::raw_boundary::site_atom_id(&site.receipt.potential.site),
+                            site.receipt
+                                .risky_siblings
+                                .iter()
+                                .map(|sibling| format!("arg{}", sibling.argument_index))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    },
+                );
+                grew = true;
+            }
+            if grew {
                 continue;
             }
         }
