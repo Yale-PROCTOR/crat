@@ -592,12 +592,37 @@ pub(crate) fn collect_inventory_from(
                 [sibling] => Some(sibling.source_span),
                 _ => None,
             };
+            // At a foreign callee the call's argument fact; at a LOCAL callee the
+            // local call-argument fact's `&mut x` over a binding reached without a
+            // dereference (main 186, D1: brotli `CopyStat` behind C2Rust's local
+            // `stat` wrapper): the premise is about the caller's frame, not the
+            // callee's kind.
             let frame_binding = ctx.facts.foreign_call_args.iter().any(|fact| {
                 fact.caller == caller
                     && fact.call_span == site.call_span
                     && fact.argument_index == argument_index
                     && super::pending_sibling::addresses_a_frame_binding(fact)
-            });
+            }) || callee
+                .as_local()
+                .and_then(|callee| ctx.facts.call_args.get(&callee))
+                .into_iter()
+                .flatten()
+                .filter(|call| {
+                    call.caller == caller
+                        && call.span.source_callsite() == site.call_span.source_callsite()
+                })
+                .flat_map(|call| call.args.iter())
+                .any(|argument| {
+                    argument.index == argument_index
+                        && matches!(
+                            argument.shape,
+                            super::emitability::ArgShape::AddrOf {
+                                base: Some(_),
+                                through_deref: false,
+                                ..
+                            }
+                        )
+                });
             siblings.push(SiblingEvidence {
                 argument_index,
                 argument_shape,

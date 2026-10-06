@@ -224,3 +224,77 @@ fn r857_1_h3_control_a_sibling_through_a_dereference_is_held() {
     let function = signature(&out.source, "countHardLinks");
     assert!(function.contains("name: *mut i8"), "held raw: {function}");
 }
+
+/// **D1 (main 186): R857-1's premise at a LOCAL callee.** brotli `CopyStat`'s
+/// shape: C2Rust's local `stat` wrapper stands between the formal and `__xstat`,
+/// and the sibling addresses a binding of the caller's own frame. The premise is
+/// about the caller's frame, not the callee's kind: neither held nor pending.
+const H3_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat_t {
+    pub st_dev: u64,
+    pub st_mode: u32,
+}
+extern "C" {
+    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+}
+unsafe fn stat(mut path: *const i8, mut buf: *mut stat_t) -> i32 {
+    return __xstat(1 as i32, path, buf);
+}
+pub unsafe fn CopyStat(mut name: *const i8) -> u32 {
+    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
+    if stat(name, &mut statbuf) != 0 {
+        return 0;
+    }
+    statbuf.st_mode
+}
+"#;
+
+#[test]
+fn r857_1_d1_a_frame_binding_sibling_at_a_local_callee_is_neither_held_nor_pending() {
+    let out = match super::rewrite_m1_census_world(H3_LOCAL_CALLEE) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            println!("SOURCE\n{source}");
+            assert!(super::verify::type_checks_str(&source), "{source}");
+            Outcome {
+                source,
+                reasons: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
+            }
+        }
+        other => panic!("the fixture must emit: {other:?}"),
+    };
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_eq!(
+        reason_of(&out, "CopyStat::name"),
+        None,
+        "not held: {:?}",
+        out.reasons
+    );
+}
+
+/// D1 in the open world (`rewrite_m1`, no attestation: no A5 proof is final), as
+/// the suite's fixtures run: the premise alone keeps the site off the pending set
+/// and the formal is not this hold's (in this world `stat::path` takes its own
+/// `held:thin-extent`, and its class carries `CopyStat` with it).
+#[test]
+fn r857_1_d1_open_world_a_frame_binding_sibling_at_a_local_callee_is_not_held() {
+    let out = outcome(H3_LOCAL_CALLEE);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not this hold's: {:?}",
+        out.reasons
+    );
+}
