@@ -67,15 +67,18 @@ pub(crate) fn into_held_formals(
         })
         .map(|(subject, _)| (subject.fn_did, subject.hir_id))
         .collect();
-    let held_formals: FxHashSet<(LocalDefId, usize)> = table
+    // Each held formal, with whether the raw boundary's hypothesis already read
+    // it raw (the stand-in review round 3, F3: that plans a bridge only for a
+    // caller binding the hypothesis read safe, so the skip is per argument).
+    let held_formals: FxHashMap<(LocalDefId, usize), bool> = table
         .entries
         .iter()
-        .filter(|(subject, _)| {
-            let node = (subject.fn_did, subject.hir_id);
-            forced.contains_key(&node) && !raw_in_hypothesis.contains(&node)
-        })
+        .filter(|(subject, _)| forced.contains_key(&(subject.fn_did, subject.hir_id)))
         .filter_map(|(subject, _)| match subject.kind {
-            SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
+            SubjectKind::Param { hir_index } => Some((
+                (subject.fn_did, hir_index),
+                raw_in_hypothesis.contains(&(subject.fn_did, subject.hir_id)),
+            )),
             _ => None,
         })
         .collect();
@@ -145,8 +148,8 @@ pub(crate) fn into_held_formals(
         }
     }
     let mut held: Vec<_> = held_formals.into_iter().collect();
-    held.sort_by_key(|(callee, index)| (callee.local_def_index.as_u32(), *index));
-    for (callee, index) in held {
+    held.sort_by_key(|((callee, index), _)| (callee.local_def_index.as_u32(), *index));
+    for ((callee, index), formal_raw_in_hypothesis) in held {
         for call in facts.call_args.get(&callee).into_iter().flatten() {
             for argument in call.args.iter().filter(|argument| argument.index == index) {
                 // The ladder's three rules (`co_conversion`): the binding whole
@@ -164,6 +167,11 @@ pub(crate) fn into_held_formals(
                     _ => continue,
                 };
                 let node = (call.caller, binding);
+                // The bridge is planned when the hypothesis read the formal raw
+                // and this binding safe.
+                if formal_raw_in_hypothesis && !raw_in_hypothesis.contains(&node) {
+                    continue;
+                }
                 if !delivered.contains(&node) || forced.contains_key(&node) || !seen.insert(node) {
                     continue;
                 }
@@ -185,9 +193,10 @@ pub(crate) fn into_held_formals(
 
 /// The MIR locals of `function` whose pointer value reaches `target` (the stand-in
 /// review round 2, N1): copies and casts through any temporaries (a C2Rust
-/// ternary's arms, a block's tail), pointer steps (`offset` / `add` / `sub` and
-/// their wrapping and byte forms, `cast*`), and addresses of places reached
-/// through a dereference of the local (`&mut (*a).f`, `&mut *a`). A load through
+/// ternary's arms, a block's tail), calls returning a pointer from their pointer
+/// arguments (the pointer steps, `strchr`, a local helper), and addresses of
+/// places reached through a dereference of the local (`&mut (*a).f`,
+/// `&mut *a`). A load through
 /// a dereference (`b = (*s).p`) is the pointee's value, not the local's, and is
 /// no flow.
 fn locals_flowing_into(
@@ -233,33 +242,22 @@ fn locals_flowing_into(
                 sources.entry(place.local).or_default().push(from);
             }
         }
+        // A call whose result is a pointer may return one of its pointer
+        // arguments (the pointer steps, `strchr`, `memcpy`, a local
+        // `skip_ws(p)`; the stand-in review round 3, F2): read as a flow from
+        // each, which over-holds for yield only.
         if let Some(terminator) = &block.terminator
             && let TerminatorKind::Call {
-                func,
-                args,
-                destination,
-                ..
+                args, destination, ..
             } = &terminator.kind
             && destination.projection.is_empty()
-            && let Some((callee, _)) = func.const_fn_def()
-            && matches!(
-                tcx.item_name(callee).as_str(),
-                "offset"
-                    | "add"
-                    | "sub"
-                    | "wrapping_offset"
-                    | "wrapping_add"
-                    | "wrapping_sub"
-                    | "byte_offset"
-                    | "byte_add"
-                    | "byte_sub"
-                    | "cast"
-                    | "cast_mut"
-                    | "cast_const"
-            )
-            && let Some(from) = args.first().and_then(|argument| whole(&argument.node))
+            && body.local_decls[destination.local].ty.is_any_ptr()
         {
-            sources.entry(destination.local).or_default().push(from);
+            for from in args.iter().filter_map(|argument| whole(&argument.node)) {
+                if body.local_decls[from].ty.is_any_ptr() {
+                    sources.entry(destination.local).or_default().push(from);
+                }
+            }
         }
     }
     let mut seen = FxHashSet::default();
