@@ -18,6 +18,26 @@ use super::{
     emitability::{ArgShape, EmitabilityFacts},
 };
 
+/// Is this decision a settled-table hold (relay 297)? Exhaustive by rule
+/// (`import_denylist`).
+pub(crate) fn is_settled_hold(decision: &Decision) -> bool {
+    match decision {
+        Decision::Degraded(record) => match record.reason {
+            DegradeReason::PairNotShownDisjoint { .. }
+            | DegradeReason::ReleasedThroughIndirectCall { .. }
+            | DegradeReason::IntoHeldFormal { .. } => true,
+            _ => false,
+        },
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_) => false,
+    }
+}
+
 /// The callers' bindings handed whole to a formal in `forced`.
 pub(crate) fn into_held_formals(
     tcx: rustc_middle::ty::TyCtxt<'_>,

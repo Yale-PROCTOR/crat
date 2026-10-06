@@ -7333,6 +7333,17 @@ pub(crate) fn synthesize_with_raw_boundary(
         call.atom_ids.dedup();
     }
     for site in raw_boundary.address_sites() {
+        // **A settled-table hold (relay 297; libzahl `zor`).** The address views
+        // are planned once, on the table before the holds: an operand a hold made
+        // raw keeps its raw text, as any raw operand of a comparison does, not the
+        // reference view its pre-hold form had (`from_ref(c).cast_mut()` over a
+        // `*mut`, `E0308`).
+        if decision_of
+            .get(&site.node)
+            .is_some_and(|decision| super::settled_holds::is_settled_hold(decision))
+        {
+            continue;
+        }
         let Ok(argument) = sm.span_to_snippet(site.span) else {
             continue;
         };

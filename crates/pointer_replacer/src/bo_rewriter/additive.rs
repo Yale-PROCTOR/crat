@@ -210,26 +210,6 @@ fn applied(
 /// Protection uses a conservative superset of delivery: prior terminally
 /// prepared safe declarations. Only the emitted-tree custody instrument counts
 /// delivery; this planner never substitutes a Ready bit for that measurement.
-/// Is this decision a settled-table hold (relay 297)? Exhaustive by rule
-/// (`import_denylist`).
-fn settled_hold(decision: &decision::Decision) -> bool {
-    match decision {
-        decision::Decision::Degraded(record) => match record.reason {
-            decision::DegradeReason::PairNotShownDisjoint { .. }
-            | decision::DegradeReason::ReleasedThroughIndirectCall { .. }
-            | decision::DegradeReason::IntoHeldFormal { .. } => true,
-            _ => false,
-        },
-        decision::Decision::Ref { .. }
-        | decision::Decision::InferredRef { .. }
-        | decision::Decision::Slice { .. }
-        | decision::Decision::NestedSlice { .. }
-        | decision::Decision::Cursor { .. }
-        | decision::Decision::Opt { .. }
-        | decision::Decision::Box(_) => false,
-    }
-}
-
 fn losses<'a>(
     prior: &'a StageSnapshot,
     candidate: &StageSnapshot,
@@ -254,7 +234,7 @@ fn losses<'a>(
             // the pending hold reads the emitted program's forms only from the
             // Declaration stage on, so its first holds there are not losses of
             // the earlier stages' deliveries.
-            let held = now.is_some_and(|(_, d)| settled_hold(d));
+            let held = now.is_some_and(|(_, d)| decision::settled_holds::is_settled_hold(d));
             let survives = held || now.is_some_and(|(s, d)| applied(candidate, s, d));
             let required_null = subject.null_init
                 && match old {
