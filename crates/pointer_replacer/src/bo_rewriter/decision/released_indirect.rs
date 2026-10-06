@@ -15,8 +15,10 @@
 //! a cast, a reference through it) reaches a release on a path that crosses an
 //! indirect call, directly or through local callees: the lend's own waiver sites
 //! (`lend::Plan::waivers`) and their callers alike (the stand-in review's HIGH-1:
-//! brotli's `BrotliFree(m, p)` frees its caller's formal too). A direct `free` of
-//! a formal is the freed-slot gate's (R763).
+//! brotli's `BrotliFree(m, p)` frees its caller's formal too). A direct `free`
+//! is not this hold's: in the formal's own body the freed-slot gate (R763) owns
+//! it, one local call away the model's sink linking and the lend's
+//! consuming-callee refusal do.
 //!
 //! **The targets (reading (A), the closed world of R816):** the functions the
 //! program itself makes into a value of the call's function-pointer type — every
@@ -167,7 +169,8 @@ enum Path {
     /// Any release: libc `free` / `realloc`, directly or through calls.
     Any,
     /// A release on a path that crosses at least one indirect call (the backstop's
-    /// own scope: a direct `free` of a formal is the freed-slot gate's, R763).
+    /// own scope: a direct `free` is the freed-slot gate's (R763) or, through a
+    /// local callee, the model's sink linking and the lend's consuming-callee).
     ThroughIndirect,
 }
 

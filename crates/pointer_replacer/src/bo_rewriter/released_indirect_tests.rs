@@ -293,3 +293,112 @@ fn r857_2_a_formal_released_through_a_static_holding_libc_free_is_raw() {
     let function = signature(&out.source, "item_free");
     assert!(function.contains("item: *mut Item"), "raw: {function}");
 }
+
+/// The head every remaining fixture shares: libc `free`, a releasing
+/// `DefaultFree`, and the `free_func` type.
+const HEAD: &str = "#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case, non_camel_case_types, non_upper_case_globals)]\n\
+    extern \"C\" {\n\
+        fn free(p: *mut core::ffi::c_void);\n\
+    }\n\
+    pub type free_func_t =\n\
+        Option<unsafe extern \"C\" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ()>;\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)]\n\
+    pub struct MemoryManager {\n\
+        pub free_func: free_func_t,\n\
+        pub opaque: *mut core::ffi::c_void,\n\
+    }\n\
+    #[derive(Copy, Clone)]\n\
+    #[repr(C)]\n\
+    pub struct Obj {\n\
+        pub k: i32,\n\
+    }\n\
+    unsafe extern \"C\" fn DefaultFree(mut opaque: *mut core::ffi::c_void, mut address: *mut core::ffi::c_void) {\n\
+        free(address);\n\
+    }\n";
+
+/// **The cycle (the stand-in review, round 2).** `A` releases its formal on one
+/// path and calls `B` on the other, and `B` only calls `A`. Walking `A` first
+/// reads `B` while `A` is open, so `B`'s `false` on that visit is not final; the
+/// walk of 843dcfc58 cached it, and `B` was then never held.
+#[test]
+fn r857_2_a_cycle_through_a_caller_hides_no_release() {
+    let marker = "r857-2-cycle";
+    let text = format!(
+        "// {marker}\n{HEAD}\
+         pub unsafe fn Init(mut m: *mut MemoryManager) {{\n\
+             (*m).free_func = Some(DefaultFree as unsafe extern \"C\" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ());\n\
+         }}\n\
+         pub unsafe fn A(mut m: *mut MemoryManager, mut p: *mut Obj, mut c: i32) {{\n\
+             (*p).k = c;\n\
+             if c > 0 {{\n\
+                 B(m, p, c - 1);\n\
+             }} else {{\n\
+                 (*m).free_func.expect(\"non-null function pointer\")((*m).opaque, p as *mut core::ffi::c_void);\n\
+             }}\n\
+         }}\n\
+         pub unsafe fn B(mut m: *mut MemoryManager, mut p: *mut Obj, mut c: i32) {{\n\
+             (*p).k = c;\n\
+             A(m, p, c);\n\
+         }}\n"
+    );
+    let out = outcome_with(marker, &text, &["A::p", "B::p"]);
+    for formal in ["A::p", "B::p"] {
+        assert_eq!(
+            reason_of(&out, formal),
+            Some("held:released-through-indirect-call"),
+            "{formal}: {:?}",
+            out.reasons
+        );
+    }
+}
+
+/// **The path's boundary.** A formal freed by a DIRECT call one local call away
+/// (no indirect call on the path) is not this hold's: the model's sink linking
+/// and the lend's consuming-callee refusal own it.
+#[test]
+fn r857_2_control_a_direct_free_through_a_local_callee_is_not_this_hold() {
+    let marker = "r857-2-direct";
+    let text = format!(
+        "// {marker}\n{HEAD}\
+         unsafe fn kill(mut q: *mut Obj) {{\n\
+             free(q as *mut core::ffi::c_void);\n\
+         }}\n\
+         pub unsafe fn C(mut p: *mut Obj) {{\n\
+             (*p).k = 0;\n\
+             kill(p);\n\
+         }}\n"
+    );
+    let out = outcome_with(marker, &text, &["C::p"]);
+    assert_ne!(
+        reason_of(&out, "C::p"),
+        Some("held:released-through-indirect-call"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// **A static initializer's function.** The program's only assignment of the
+/// releasing function is a static's initializer (read from HIR): held.
+#[test]
+fn r857_2_a_release_assigned_by_a_static_initializer_is_raw() {
+    let marker = "r857-2-static-init";
+    let text = format!(
+        "// {marker}\n{HEAD}\
+         pub static mut FREE: free_func_t =\n\
+             Some(DefaultFree as unsafe extern \"C\" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ());\n\
+         pub unsafe fn D(mut p: *mut Obj) {{\n\
+             (*p).k = 0;\n\
+             FREE.expect(\"non-null function pointer\")(core::ptr::null_mut(), p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let out = outcome_with(marker, &text, &["D::p"]);
+    assert_eq!(
+        reason_of(&out, "D::p"),
+        Some("held:released-through-indirect-call"),
+        "{:?}",
+        out.reasons
+    );
+    let function = signature(&out.source, "D");
+    assert!(function.contains("p: *mut Obj"), "raw: {function}");
+}
