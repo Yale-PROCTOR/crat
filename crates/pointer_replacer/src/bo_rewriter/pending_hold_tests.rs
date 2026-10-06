@@ -120,7 +120,7 @@ fn r855_1_h1_a_pending_formal_is_decided_raw() {
     let out = outcome(PARAMETER_CASE);
     assert_eq!(out.pending, 0, "the pending table reads 0");
     assert_eq!(
-        reason_of(&out, "caller::src"),
+        reason_of(&out, "or::c"),
         Some("held:pair-not-shown-disjoint"),
         "{:?}",
         out.reasons
@@ -469,5 +469,44 @@ fn r861_a_subject_two_holds_name_stays_held_with_both_receipts() {
         .collect(),
         "{}",
         raw_boundary_artifacts.settled_hold_receipts
+    );
+}
+
+/// **The comparison view of a held formal** (relay 297; libzahl `zor` / `zxor` /
+/// `zadd_unsigned` at the 57 head): the address views of a pointer comparison
+/// are planned once, on the table before the holds, so a formal the hold later
+/// makes raw kept its reference view, `core::ptr::from_ref(c).cast_mut()` over a
+/// `*mut` (`E0308`). A held operand keeps its raw text, as any raw operand of a
+/// comparison does.
+const HELD_COMPARISON: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Num { used: i32, sign: i32 }\n\
+    pub static mut LAST: *mut Num = 0 as *mut Num;\n\
+    pub unsafe fn set(a: *mut Num, b: *mut Num) { LAST = b; (*a).sign = (*b).sign; (*a).used = (*b).used; }\n\
+    pub unsafe fn or(a: *mut Num, b: *mut Num, c: *mut Num) {\n\
+        if (*b).used == 0 { if a != c { set(a, c); } return; }\n\
+        (*a).used = (*b).used + (*c).used;\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut x = Num { used: 0, sign: 0 };\n\
+        let mut y = Num { used: 0, sign: 1 };\n\
+        let mut z = Num { used: 1, sign: 1 };\n\
+        or(&mut x, &mut y, &mut z);\n\
+    }\n";
+
+#[test]
+fn r861_1_a_held_operand_of_a_comparison_keeps_its_raw_text() {
+    let out = outcome(HELD_COMPARISON);
+    assert_eq!(
+        reason_of(&out, "or::c"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    let or = signature(&out.source, "or");
+    assert!(or.contains("c: *mut Num"), "held raw: {or}");
+    assert!(
+        !out.source.contains("from_ref(c)") && !out.source.contains("from_mut(&mut *c)"),
+        "no reference view of a held formal: {}",
+        out.source
     );
 }
