@@ -202,7 +202,7 @@ fn r857_1_h3_a_frame_binding_sibling_is_neither_held_nor_pending() {
     let out = outcome(H3_FRAME_BINDING);
     assert_eq!(out.pending, 0, "not a pending site");
     assert_eq!(
-        reason_of(&out, "copyRec::s"),
+        reason_of(&out, "countHardLinks::name"),
         None,
         "not held: {:?}",
         out.reasons
@@ -216,7 +216,7 @@ fn r857_1_h3_control_a_sibling_through_a_dereference_is_held() {
     let out = outcome(H3_THROUGH_DEREF);
     assert_eq!(out.pending, 0, "the pending table reads 0");
     assert_eq!(
-        reason_of(&out, "copyRec::s"),
+        reason_of(&out, "countHardLinks::name"),
         Some("held:pair-not-shown-disjoint"),
         "{:?}",
         out.reasons
