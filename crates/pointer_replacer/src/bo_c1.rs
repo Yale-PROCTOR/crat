@@ -25190,7 +25190,8 @@ fn raw_boundary_wave2_corpus_census() {
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
                 + &raw_boundary_leak_parity_lines(&ledger_dir)
-                + &raw_boundary_cover_lines(&ledger_dir),
+                + &raw_boundary_cover_lines(&ledger_dir)
+                + &raw_boundary_pending_hold_lines(&ledger_dir),
         )
         .expect("write typed-failure census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
@@ -25238,7 +25239,8 @@ fn raw_boundary_wave2_corpus_census() {
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
                 + &raw_boundary_leak_parity_lines(&ledger_dir)
-                + &raw_boundary_cover_lines(&ledger_dir),
+                + &raw_boundary_cover_lines(&ledger_dir)
+                + &raw_boundary_pending_hold_lines(&ledger_dir),
         )
         .expect("write frame-absent census receipt");
         raw_boundary_write_manifest(&artifact_dir).expect("write frame-absent artifact manifest");
@@ -26496,7 +26498,8 @@ fn raw_boundary_wave2_corpus_census() {
                 + &raw_boundary_overcount_lines(&ledger_dir)
                 + &raw_boundary_premise_lines(&ledger_dir)
                 + &raw_boundary_leak_parity_lines(&ledger_dir)
-                + &raw_boundary_cover_lines(&ledger_dir),
+                + &raw_boundary_cover_lines(&ledger_dir)
+                + &raw_boundary_pending_hold_lines(&ledger_dir),
     )
     .expect("write census receipt");
     raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
@@ -26657,6 +26660,44 @@ fn r849_1_delivered_kinds_and_the_cover_receipt() {
         "fn-reverted"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **R829-1 / R855-1 (main 184) — the pending hold on the census receipt.** The
+/// switch (a frame-identity input) and the subjects it held (`subjects.tsv` reason
+/// `held:pair-not-shown-disjoint`), per program.
+fn raw_boundary_pending_hold_lines(ledger_dir: &std::path::Path) -> String {
+    let mut held = 0usize;
+    let mut by_program = Vec::new();
+    for program in CORPUS {
+        let path = ledger_dir.join(format!("{}.raw-boundary-subjects.tsv", program.name));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut lines = text.lines();
+        let Some(header) = lines.next() else { continue };
+        let Some(at) = header.split('\t').position(|column| column == "reason") else {
+            continue;
+        };
+        let count = lines
+            .filter(|row| row.split('\t').nth(at) == Some("held:pair-not-shown-disjoint"))
+            .count();
+        if count > 0 {
+            by_program.push(format!("{}:{count}", program.name));
+        }
+        held += count;
+    }
+    let mut out = format!(
+        "pending_hold={}\npending_held={held}\n",
+        if crate::bo_rewriter::decision::pending_hold::enabled() {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    if !by_program.is_empty() {
+        out += &format!("pending_held_by_program={}\n", by_program.join(","));
+    }
+    out
 }
 
 fn raw_boundary_overcount_lines(ledger_dir: &std::path::Path) -> String {

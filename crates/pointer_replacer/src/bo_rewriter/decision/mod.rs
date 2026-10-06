@@ -114,6 +114,7 @@ mod ownership_fields_roles_tests;
 pub(crate) mod ownership_fields_source;
 pub(crate) mod ownership_fields_store_close;
 pub(crate) mod pair_disjointness;
+pub(crate) mod pending_hold;
 pub(crate) mod pending_sibling;
 pub(crate) mod pinned_local;
 #[cfg(test)]
@@ -932,6 +933,13 @@ pub(crate) enum DegradeReason {
     ReleasedThroughIndirectCall {
         detail: String,
     },
+    /// R829-1 / R855-1 (USER; main 184): the caller-side hold of a pending
+    /// sibling-overlap site, decided on the settled table (`pending_hold`): a
+    /// delivered source handed to a raw formal beside a risky raw sibling the pair
+    /// proof did not show disjoint keeps its raw form. `detail` names the site.
+    PairNotShownDisjoint {
+        detail: String,
+    },
 }
 
 impl DegradeReason {
@@ -980,6 +988,7 @@ impl DegradeReason {
             DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
             DegradeReason::RetainedAlias { .. } => "held:retained-alias",
             DegradeReason::ReleasedThroughIndirectCall { .. } => released_indirect::KEY,
+            DegradeReason::PairNotShownDisjoint { .. } => "held:pair-not-shown-disjoint",
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
             // Names the indirection: the class's key is payload, reported by
@@ -1003,6 +1012,7 @@ impl DegradeReason {
             DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
             DegradeReason::RetainedAlias { detail } => detail.clone(),
             DegradeReason::ReleasedThroughIndirectCall { detail } => detail.clone(),
+            DegradeReason::PairNotShownDisjoint { detail } => detail.clone(),
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
             }

@@ -409,7 +409,7 @@ pub(crate) fn audit(inputs: &[Input]) -> Vec<Row> {
                                 reason: reason.into(),
                             },
                         },
-                        risky: sibling_overlap::risky_sibling(sibling),
+                        risky: sibling_overlap::risky_sibling_of(potential, sibling),
                     }
                 })
                 .collect();

@@ -43,7 +43,7 @@ use super::{
 /// re-census: without this term the three bzip2 `lstat` / `stat` rows
 /// (`countHardLinks::name#1`, `notAStandardFile::name#1`,
 /// `saveInputFileMetaInfo::srcName#1`) lost the deliveries R407-14 gave them.
-fn addresses_a_frame_binding(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
+pub(crate) fn addresses_a_frame_binding(fact: &super::raw_boundary::ForeignCallArgFact) -> bool {
     matches!(fact.shape, "addr-of" | "addr-of-mut")
         && !fact.root_through_deref
         && fact.root.is_some()

@@ -143,6 +143,8 @@ mod pair_static_root_tests;
 mod pair_type_rule_yield_tests;
 #[cfg(test)]
 mod pair_view_of_formal_tests;
+#[cfg(test)]
+mod pending_hold_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) mod premise_census;
@@ -2840,6 +2842,14 @@ fn verify_and_revert(
                 &reverted,
                 &reverted_atoms,
             );
+            // R829-1 / R855-1, the post-condition (main 184): with the hold on, the
+            // pending table the census publishes reads 0, or the program does not emit.
+            let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
+            if pending_left > 0 && decision::pending_hold::enabled() {
+                return facts.degraded(format!(
+                    "pending-hold-incomplete: {pending_left} pending site(s) remain at the emitted revert state"
+                ));
+            }
             return facts.emitted(source, files);
         }
 
@@ -3324,6 +3334,12 @@ fn verify_and_revert(
                 &final_reverted,
                 &reverted_atoms,
             );
+            let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
+            if pending_left > 0 && decision::pending_hold::enabled() {
+                return facts.degraded(format!(
+                    "pending-hold-incomplete: {pending_left} pending site(s) remain after the bisect"
+                ));
+            }
             facts.emitted(source, final_files)
         }
         _ => {
@@ -8310,6 +8326,18 @@ fn finish_decide<'tcx>(
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
     let mut retired = additive::RetiredReceipts::default();
     let mut family_receipts = Vec::new();
+    // **R857-1 (main 184a §2).** The pending hold's set, carried across the
+    // re-runs of ONE family stage: a withdrawal the hold caused (a caller's slice
+    // with no bridge into the held formal) re-decides the same stage, and the
+    // held subject must keep the hold's reason there rather than the withdrawn
+    // family's. A new stage re-enables the families and asks the hold afresh.
+    let mut pending_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+    ) = (None, Default::default());
     let original_c9_plans = retained_c9_plans.clone();
     let mut a5_role_profile = None;
     // wave-6f: fields a finalization refused, with the cause; grows only, so
@@ -8728,33 +8756,102 @@ fn finish_decide<'tcx>(
             };
             table = decision::decide(&ctx, &subjects);
         }
-        // **R857-2 / R858-4 (USER via the seat; reading (A), era-5c 151; fan-out
-        // 074) — the backstop, on the settled table, before anything is planned.**
-        // A formal released on a path through an indirect call whose
-        // program-assigned target releases it is decided raw
-        // (`held:released-through-indirect-call`) where this table delivers it as
-        // a reference; re-decided until nothing new is held. A family withdrawal
-        // the hold leads to re-decides the same stage: there a formal held earlier
-        // keeps the hold's reason where the re-run decides it raw anyway (a
-        // relabel, never a forced form).
+        // **The settled-table holds, one fixpoint** (main 186 §6): R857-2's backstop
+        // (`held:released-through-indirect-call`; reading (A), era-5c 151; fan-out
+        // 074) and R829-1 / R855-1 / R857-1's pending hold
+        // (`held:pair-not-shown-disjoint`; main 184 / 184a), read on the settled
+        // table before anything is planned. Each pass adds what either names on the
+        // current table, and the table is decided again with EVERY hold forced raw,
+        // so neither drops the other's; a held formal is a raw target for the calls
+        // into it, so the loop asks again until nothing new is held (each pass only
+        // adds). The seams below then plan every call into a held formal with the
+        // ordinary bridge. Within one family stage, a subject held earlier keeps its
+        // hold's reason where a re-run after a withdrawal decides it raw anyway (a
+        // relabel, never a forced raw form, so the withdrawal still restores
+        // whatever the predecessor delivered).
         if released_held.0 != Some(family_policy.stage) {
             released_held = (Some(family_policy.stage), Default::default());
         }
-        let mut released = rustc_hash::FxHashMap::default();
+        if pending_held.0 != Some(family_policy.stage) {
+            pending_held = (Some(family_policy.stage), Default::default());
+        }
+        let pending_coverage = if decision::pending_hold::enabled() {
+            decision::sibling_overlap::collect_inventory_from(
+                tcx,
+                &decision::sibling_overlap::SiblingInputs {
+                    slots: &slots,
+                    model: &model,
+                    mut_facts: &mut_facts,
+                    facts: &facts,
+                    subjects: &subjects,
+                    a5_site_proofs: &a5_site_proofs,
+                    raw_boundary_sites: &raw_boundary_sites,
+                    retention: &retention,
+                    origins: analysis.origins.as_ref(),
+                },
+                &decision::outbound_expression::OutboundExpressionPlans::default(),
+            )
+            .coverage
+        } else {
+            Vec::new()
+        };
+        let mut carried = if decision::pending_hold::enabled() {
+            pending_held
+                .1
+                .iter()
+                .filter(|(node, _)| {
+                    table.entries.iter().any(|(subject, decision)| {
+                        (subject.fn_did, subject.hir_id) == **node
+                            && match decision {
+                                decision::Decision::Degraded(_) => true,
+                                decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Slice { .. }
+                                | decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_) => false,
+                            }
+                    })
+                })
+                .map(|(node, reason)| (*node, reason.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut forced = rustc_hash::FxHashMap::default();
         loop {
-            let new = decision::released_indirect::to_hold(
+            let mut new = rustc_hash::FxHashMap::default();
+            for (node, reason) in decision::released_indirect::to_hold(
                 &released_through_indirect,
                 &table,
                 &released_held.1,
-            )
-            .into_iter()
-            .filter(|(node, _)| !released.contains_key(node))
-            .collect::<Vec<_>>();
+            ) {
+                if !forced.contains_key(&node) {
+                    released_held.1.insert(node);
+                    new.entry(node).or_insert(reason);
+                }
+            }
+            if decision::pending_hold::enabled() {
+                for (node, reason) in
+                    std::mem::take(&mut carried)
+                        .into_iter()
+                        .chain(decision::pending_hold::holds(
+                            &table,
+                            &pending_coverage,
+                            &raw_boundary,
+                        ))
+                {
+                    if !forced.contains_key(&node) && !new.contains_key(&node) {
+                        pending_held.1.insert(node, reason.clone());
+                        new.insert(node, reason);
+                    }
+                }
+            }
             if new.is_empty() {
                 break;
             }
-            released_held.1.extend(new.iter().map(|(node, _)| *node));
-            released.extend(new);
+            forced.extend(new);
             table = match &relaxed {
                 Some(relaxed) => {
                     let ctx = decision::Ctx {
@@ -8768,7 +8865,7 @@ fn finish_decide<'tcx>(
                             Some(&return_receivers),
                         )
                     };
-                    decision::decide_with_raw_fallbacks(&ctx, &subjects, &released)
+                    decision::decide_with_raw_fallbacks(&ctx, &subjects, &forced)
                 }
                 None => decision::decide_with_raw_fallbacks(
                     &ctx_of!(
@@ -8780,7 +8877,7 @@ fn finish_decide<'tcx>(
                         Some(&return_receivers),
                     ),
                     &subjects,
-                    &released,
+                    &forced,
                 ),
             };
         }

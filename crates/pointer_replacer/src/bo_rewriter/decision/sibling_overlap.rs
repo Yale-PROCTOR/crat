@@ -67,6 +67,12 @@ pub(crate) struct SiblingEvidence {
     pub argument_span: Option<Span>,
     pub proof: A5PeerProof,
     pub access: SiblingAccess,
+    /// **R857-1 (main 184a (a)).** The argument is the address of a place rooted
+    /// in a binding of the caller's own frame (`&mut statBuf`), read from the
+    /// call's foreign argument fact by
+    /// [`addresses_a_frame_binding`](super::pending_sibling::addresses_a_frame_binding).
+    /// No fact is `false`: the premise is never guessed.
+    pub frame_binding: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,12 +592,19 @@ pub(crate) fn collect_inventory_from(
                 [sibling] => Some(sibling.source_span),
                 _ => None,
             };
+            let frame_binding = ctx.facts.foreign_call_args.iter().any(|fact| {
+                fact.caller == caller
+                    && fact.call_span == site.call_span
+                    && fact.argument_index == argument_index
+                    && super::pending_sibling::addresses_a_frame_binding(fact)
+            });
             siblings.push(SiblingEvidence {
                 argument_index,
                 argument_shape,
                 argument_span,
                 proof,
                 access,
+                frame_binding,
             });
         }
         if siblings.is_empty() && matches!(source, SiblingSource::Declared(_)) {
@@ -1009,7 +1022,7 @@ pub(crate) fn select_pending(
             let risky_siblings = potential
                 .siblings
                 .iter()
-                .filter(|sibling| risky_sibling(sibling))
+                .filter(|sibling| risky_sibling_of(potential, sibling))
                 .cloned()
                 .collect();
             Some(PendingSiblingReceipt {
@@ -1054,7 +1067,25 @@ fn pending_site_premise(potential: &SiblingPotential, state: TerminalSiteState) 
             potential.local_post_call,
             LocalPostCallEvidence::DeadUnprotected { .. }
         )
-        && potential.siblings.iter().any(risky_sibling)
+        && potential
+            .siblings
+            .iter()
+            .any(|sibling| risky_sibling_of(potential, sibling))
+}
+
+/// **R857-1 (main 184a option (a)) — the frame-binding premise, one predicate at
+/// decision time and at the terminal.** A formal's referent existed before its
+/// function's frame began, so it cannot lie in storage that frame created: a
+/// sibling that addresses a binding of the caller's own frame cannot alias a
+/// formal source under the UB-free-input scope (a scope fact, R407-14 —
+/// `pending_sibling.rs` reads it for the decision-time hold), whatever the A5
+/// verdict, which is not final when the decision is taken.
+pub(crate) fn risky_sibling_of(potential: &SiblingPotential, sibling: &SiblingEvidence) -> bool {
+    let formal_source = potential
+        .source
+        .declared()
+        .is_some_and(|source| matches!(source.kind, SubjectKind::Param { .. }));
+    risky_sibling(sibling) && !(formal_source && sibling.frame_binding)
 }
 
 pub(crate) fn risky_sibling(sibling: &SiblingEvidence) -> bool {
