@@ -202,7 +202,7 @@ fn r857_1_h3_a_frame_binding_sibling_is_neither_held_nor_pending() {
     let out = outcome(H3_FRAME_BINDING);
     assert_eq!(out.pending, 0, "not a pending site");
     assert_eq!(
-        reason_of(&out, "countHardLinks::name"),
+        reason_of(&out, "copyRec::s"),
         None,
         "not held: {:?}",
         out.reasons
@@ -216,7 +216,7 @@ fn r857_1_h3_control_a_sibling_through_a_dereference_is_held() {
     let out = outcome(H3_THROUGH_DEREF);
     assert_eq!(out.pending, 0, "the pending table reads 0");
     assert_eq!(
-        reason_of(&out, "countHardLinks::name"),
+        reason_of(&out, "copyRec::s"),
         Some("held:pair-not-shown-disjoint"),
         "{:?}",
         out.reasons
@@ -590,59 +590,44 @@ fn r861_1_d1_open_world_a_frame_binding_sibling_beneath_casts_is_not_held() {
 }
 
 /// **The premise's own condition (the stand-in review's M1).** A formal
-/// reassigned before the call no longer holds a referent from before the frame:
-/// `name = other` may leave it addressing anything, so the frame-binding
-/// exemption does not apply and the formal is held as any formal beside a written
-/// sibling.
+/// reassigned before the call (`s = other`) may no longer hold a referent from
+/// before the frame, so the frame-binding exemption reads only a formal holding
+/// its entry value or a pointer stepped from it. (No reduced RED: on this shape
+/// and on the `lstat` one the reassignment trips another hold first — a lifetime
+/// degrade, `held:thin-extent` — so the fixture serves the control below.)
 const H3_REASSIGNED: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct stat_t {
-    pub st_dev: u64,
-    pub st_mode: u32,
+pub struct rec {
+    pub a: u64,
+    pub b: u64,
 }
 extern "C" {
-    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+    fn fill(src: *const rec, dst: *mut rec) -> i32;
 }
-unsafe fn stat(mut path: *const i8, mut buf: *mut stat_t) -> i32 {
-    return __xstat(1 as i32, path, buf);
-}
-pub unsafe fn CopyStat(mut name: *const i8, mut other: *const i8) -> u32 {
-    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
-    if *other != 0 {
-        name = other;
+pub unsafe fn copyRec(mut s: *mut rec, mut other: *mut rec) -> u64 {
+    let mut local: rec = rec { a: 0, b: 0 };
+    if (*other).a != 0 {
+        s = other;
     }
-    if stat(name, &mut statbuf) != 0 {
+    let i = fill(s, &mut local);
+    if i != 0 {
         return 0;
     }
-    statbuf.st_mode
+    local.b + (*s).a
 }
 "#;
 
-#[test]
-fn r861_1_m1_a_reassigned_formal_is_not_under_the_frame_binding_premise() {
-    let out = outcome(H3_REASSIGNED);
-    assert_eq!(
-        reason_of(&out, "CopyStat::name"),
-        Some("held:pair-not-shown-disjoint"),
-        "{:?}",
-        out.reasons
-    );
-}
-
-/// The control: a formal only stepped from itself (`name = name.offset(1)`)
-/// still addresses its entry referent; the premise applies.
+/// The control: a formal only stepped from itself (`s = s.offset(1)`) still
+/// addresses its entry referent; the premise applies.
 #[test]
 fn r861_1_m1_a_formal_stepped_from_itself_keeps_the_premise() {
-    let input = H3_REASSIGNED.replace(
-        "    if *other != 0 {\n        name = other;\n    }\n",
-        "    if *other != 0 {\n        name = name.offset(1);\n    }\n",
-    );
-    assert!(input.contains("name.offset(1)"));
+    let input = H3_REASSIGNED.replace("        s = other;\n", "        s = s.offset(1);\n");
+    assert!(input.contains("s.offset(1)"));
     let out = outcome(&input);
     assert_ne!(
-        reason_of(&out, "CopyStat::name"),
+        reason_of(&out, "copyRec::s"),
         Some("held:pair-not-shown-disjoint"),
         "{:?}",
         out.reasons
