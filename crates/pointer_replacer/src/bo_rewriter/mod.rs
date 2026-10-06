@@ -8319,12 +8319,15 @@ fn finish_decide<'tcx>(
     // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
     // once: they read the program, not a decision.
     let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
-    // Relay 297 (main 187): the sources the plan named pending, held for the rest
-    // of the run (see below, before the stage snapshot).
-    let mut planned_held: rustc_hash::FxHashMap<
-        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
-        decision::DegradeReason,
-    > = Default::default();
+    // Relay 297 (main 187): the sources the stage's plan named pending, held for
+    // the rest of the stage (see below, before the stage snapshot).
+    let mut planned_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+    ) = (None, Default::default());
     // The formals the backstop held at the current family stage (see below).
     let mut released_held: (
         Option<additive::FamilyStage>,
@@ -8784,6 +8787,12 @@ fn finish_decide<'tcx>(
         if pending_held.0 != Some(family_policy.stage) {
             pending_held = (Some(family_policy.stage), Default::default());
         }
+        // The planned holds are the stage's own plan's (a later stage's family
+        // can deliver the target a Declaration-stage plan left raw), so they reset
+        // with the stage too, and persist only through its re-runs.
+        if planned_held.0 != Some(family_policy.stage) {
+            planned_held = (Some(family_policy.stage), Default::default());
+        }
         let pending_coverage = if decision::pending_hold::enabled() {
             decision::sibling_overlap::collect_inventory_from(
                 tcx,
@@ -8852,7 +8861,7 @@ fn finish_decide<'tcx>(
             // formal's form, and before the Declaration stage a formal can be raw
             // only because its family is not on yet; a hold taken there is not
             // the emitted program's.
-            for (node, reason) in &planned_held {
+            for (node, reason) in &planned_held.1 {
                 if !forced.contains_key(node) && !new.contains_key(node) {
                     receipts.push(decision::settled_holds::SettledHoldReceipt::of(
                         *node, reason,
@@ -9704,9 +9713,9 @@ fn finish_decide<'tcx>(
         // `unplaceable:slice-use-evidence-held`) is invisible to the settled-table
         // hold, and the post-condition then degraded the whole program. The pending
         // predicate on the plan names its delivered sources here; they join the
-        // settled-table holds for the rest of the run and the stage is decided
-        // again (the map only grows). The post-condition stays the tripwire for a
-        // site only a verify revert creates.
+        // settled-table holds for the rest of the stage and the stage is decided
+        // again (the map only grows within a stage). The post-condition stays the
+        // tripwire for a site only a verify revert creates.
         if decision::pending_hold::enabled()
             && family_policy.stage >= additive::FamilyStage::Declaration
         {
@@ -9724,10 +9733,10 @@ fn finish_decide<'tcx>(
                     continue;
                 };
                 let node = (source.fn_did, source.hir_id);
-                if planned_held.contains_key(&node) {
+                if planned_held.1.contains_key(&node) {
                     continue;
                 }
-                planned_held.insert(
+                planned_held.1.insert(
                     node,
                     decision::DegradeReason::PairNotShownDisjoint {
                         detail: format!(
