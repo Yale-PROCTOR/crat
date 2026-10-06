@@ -13,7 +13,12 @@
 //! - `declaration-view`: `let x = p.as_mut()` / `p.as_ref()`;
 //!
 //!   each where the input declares `x` a raw pointer (or `x` is the input's raw
-//!   formal, re-bound by the generator); and
+//!   formal, re-bound by the generator);
+//! - the same three at an ASSIGNMENT `x = ..` (`assignment-view`,
+//!   `assignment-construction`, `assignment-reborrow`, and the Option family's
+//!   nullable constructions as `assignment-option-construction`; R857-3), read
+//!   against the input's assignment of the same ordinal, and not read at all
+//!   where the generator kept a different number of assignments of `x`; and
 //! - `call-bridge`: a delivered thin `Ref` formal that its callers bridge from a
 //!   raw pointer (a placed `c-raw-reborrow-{mut,shared}` adapter, R758-1 (β)),
 //!   read at the callee's entry.
@@ -40,10 +45,14 @@ pub(crate) enum SiteKind {
     AssignmentView,
     AssignmentConstruction,
     AssignmentReborrow,
+    /// The Option family's nullable C-string / slice construction at an
+    /// assignment (`Some(from_raw_parts(..))`, `p.as_ref().map(|p| ..)`, the
+    /// is-null `if` / `else`): the one construction the lanes table also carries.
+    AssignmentOptionConstruction,
 }
 
 impl SiteKind {
-    pub(crate) const ALL: [SiteKind; 7] = [
+    pub(crate) const ALL: [SiteKind; 8] = [
         SiteKind::CallBridge,
         SiteKind::DeclarationView,
         SiteKind::DeclarationConstruction,
@@ -51,6 +60,7 @@ impl SiteKind {
         SiteKind::AssignmentView,
         SiteKind::AssignmentConstruction,
         SiteKind::AssignmentReborrow,
+        SiteKind::AssignmentOptionConstruction,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -62,6 +72,7 @@ impl SiteKind {
             SiteKind::AssignmentView => "assignment-view",
             SiteKind::AssignmentConstruction => "assignment-construction",
             SiteKind::AssignmentReborrow => "assignment-reborrow",
+            SiteKind::AssignmentOptionConstruction => "assignment-option-construction",
         }
     }
 
@@ -661,6 +672,39 @@ fn value_construction(expr: &Expr) -> Option<String> {
     }
 }
 
+/// **R857-3 (the stand-in review, round 2, MED-2′).** Is this construction the
+/// Option family's nullable shape: `Some(from_raw_parts(..))`,
+/// `p.as_ref().map(|p| from_raw_parts(..))` or `if p.is_null() { None } else {
+/// Some(..) }` (possibly the tail of a block)? A cursor's re-seed
+/// (`Some(SliceCursor::from_raw_parts(..))`) is not: no lane carries it.
+fn option_shaped(expr: &Expr) -> bool {
+    let tail = |block: &Block| match block.stmts.last() {
+        Some(Stmt::Expr(expr, None)) => option_shaped(expr),
+        _ => false,
+    };
+    match peel(expr) {
+        Expr::Call(call) => {
+            matches!(peel(&call.func), Expr::Path(path) if path.path.is_ident("Some"))
+                && !call
+                    .args
+                    .iter()
+                    .any(|argument| tokens(argument).contains("SliceCursor"))
+        }
+        Expr::MethodCall(call) => call.method == "map",
+        Expr::Path(path) => path.path.is_ident("None"),
+        Expr::Block(block) => tail(&block.block),
+        Expr::Unsafe(block) => tail(&block.block),
+        Expr::If(branch) => {
+            tail(&branch.then_branch)
+                || branch
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, otherwise)| option_shaped(otherwise))
+        }
+        _ => false,
+    }
+}
+
 fn is_raw_pointer(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_))
         || matches!(ty, Type::Paren(inner) if is_raw_pointer(&inner.elem))
@@ -833,12 +877,20 @@ pub(crate) fn read_program(
             let Some((kind, pointer)) = reference_from_raw(value) else {
                 continue;
             };
-            let kind = kind.at_assignment();
-            if wrapper && kind == SiteKind::AssignmentConstruction {
+            let kind = if kind == SiteKind::DeclarationConstruction && option_shaped(value) {
+                SiteKind::AssignmentOptionConstruction
+            } else {
+                kind.at_assignment()
+            };
+            let construction = matches!(
+                kind,
+                SiteKind::AssignmentConstruction | SiteKind::AssignmentOptionConstruction
+            );
+            if wrapper && construction {
                 reading.exempt_exposure += 1;
                 continue;
             }
-            if kind == SiteKind::AssignmentConstruction && pointer.starts_with("b\"") {
+            if construction && pointer.starts_with("b\"") {
                 reading.exempt_literal += 1;
                 continue;
             }
@@ -979,19 +1031,23 @@ pub(crate) fn merge_lane_views(reading: &mut Reading, lane_tsv: &str) -> bool {
         return false;
     }
     // The lanes' table (the Option family's view adapters, wave-6o) covers the
-    // views and the nullable C-string / slice constructions made at assignments
-    // too (R857-3): the reader's own rows of those kinds give way, so nothing
-    // counts twice. A construction at an assignment the lane does not make (a
-    // cursor's re-seed) is then the lane's to carry.
+    // views and the Option family's nullable constructions made at assignments
+    // too (R857-3): the reader's own rows of exactly those kinds give way, so
+    // nothing counts twice. Every other construction (the slice family's sized
+    // assignment, a cursor's re-seed) stays the reader's: no lane carries it.
     reading.rows.retain(|row| {
         !matches!(
             row.kind,
-            SiteKind::DeclarationView | SiteKind::AssignmentView | SiteKind::AssignmentConstruction
+            SiteKind::DeclarationView
+                | SiteKind::AssignmentView
+                | SiteKind::AssignmentOptionConstruction
         )
     });
     reading.held_b.remove(&SiteKind::DeclarationView);
     reading.held_b.remove(&SiteKind::AssignmentView);
-    reading.held_b.remove(&SiteKind::AssignmentConstruction);
+    reading
+        .held_b
+        .remove(&SiteKind::AssignmentOptionConstruction);
     reading.rows.extend(rows);
     reading.lane_views = true;
     true

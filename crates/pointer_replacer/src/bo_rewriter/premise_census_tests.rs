@@ -277,7 +277,7 @@ fn r801_2_census_lines_count_by_kind_and_program() {
         "{lines}"
     );
     assert!(lines.contains(
-        "premise_bridge_dereferenceable_kinds=call-bridge:0,declaration-view:1,declaration-construction:0,declaration-reborrow:0,assignment-view:0,assignment-construction:0,assignment-reborrow:0\n"
+        "premise_bridge_dereferenceable_kinds=call-bridge:0,declaration-view:1,declaration-construction:0,declaration-reborrow:0,assignment-view:0,assignment-construction:0,assignment-reborrow:0,assignment-option-construction:0\n"
     ));
     assert!(lines.contains("premise_bridge_dereferenceable_by_program=p:1\n"));
     assert!(lines.contains("premise_bridge_dereferenceable_unreadable=q:missing\n"));
@@ -558,34 +558,81 @@ fn r857_3_a_construction_assigned_to_a_raw_formal_has_a_row() {
     assert_eq!(reading.rows[0].site, "assign#1");
 }
 
-/// A non-empty lanes table carries the views and constructions at assignments:
-/// the reader's own rows of those kinds give way (nothing counts twice).
+/// A non-empty lanes table carries the views and the Option family's nullable
+/// constructions at assignments: the reader's rows of exactly those kinds give
+/// way; a bare construction (the slice family's sized assignment) stays.
 #[test]
-fn r857_3_a_lanes_table_replaces_the_readers_assignment_rows() {
+fn r857_3_a_lanes_table_replaces_only_the_option_familys_assignment_rows() {
     let mut reading = read(
-        "pub mod m { pub unsafe fn f(name: *const i8, mut s: *const u8) {
+        "pub mod m { pub unsafe fn f(name: *const i8, mut s: *const u8, mut t: *const u8) {
             let mut envbase: *mut i8 = 0 as *mut i8;
             envbase = getenv(name);
             log_it();
             s = g();
             log_it();
+            t = g();
+            log_it();
         } }",
-        "pub mod m { pub unsafe fn f(name: *const i8, mut s: &[u8]) {
+        "pub mod m { pub unsafe fn f(name: *const i8, mut s: &[u8], mut t: Option<&[u8]>) {
             let mut envbase: Option<&mut i8> = None;
             envbase = (getenv(name) as *mut i8).as_mut();
             log_it();
             s = core::slice::from_raw_parts(g(), 1024);
             log_it();
+            t = if g().is_null() { None } else { Some(core::slice::from_raw_parts(g(), 1024)) };
+            log_it();
         } }",
         &[],
     );
-    assert_eq!(reading.rows.len(), 2, "{reading:?}");
+    assert_eq!(
+        kinds(&reading),
+        vec![
+            (SiteKind::AssignmentView, "m::f", "envbase"),
+            (SiteKind::AssignmentConstruction, "m::f", "s"),
+            (SiteKind::AssignmentOptionConstruction, "m::f", "t"),
+        ]
+    );
     assert!(super::premise_census::merge_lane_views(
         &mut reading,
         "function\tbinding\tsite\trule_b\tquiet_prefix\nm::f\tenvbase\tlane-site\tthe next item: log_it ()\tfails\n",
     ));
     assert_eq!(
         kinds(&reading),
-        vec![(SiteKind::DeclarationView, "m::f", "envbase")]
+        vec![
+            (SiteKind::AssignmentConstruction, "m::f", "s"),
+            (SiteKind::DeclarationView, "m::f", "envbase"),
+        ]
     );
+}
+
+/// The pairing at a later ordinal: the binding's SECOND assignment is read
+/// against the input's second (lil `fnc_func::cmd` #2's shape), and an untyped
+/// raw `let` (`let mut x = 0 as *mut T;`, C2Rust's usual spelling) is raw.
+#[test]
+fn r857_3_the_second_assignment_of_an_untyped_raw_let_is_read_against_the_second() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(a: *mut i32, b: *mut i32) {
+            let mut x = 0 as *mut i32;
+            x = a;
+            *x = 0;
+            x = b;
+            log_it();
+            *x = 1;
+        } }",
+        "pub mod m { pub unsafe fn f(a: *mut i32, b: *mut i32) {
+            let mut x: Option<&mut i32> = None;
+            x = a.as_mut();
+            *x.unwrap() = 0;
+            x = b.as_mut();
+            log_it();
+            *x.unwrap() = 1;
+        } }",
+        &[],
+    );
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::AssignmentView, "m::f", "x")]
+    );
+    assert_eq!(reading.rows[0].site, "assign#2");
+    assert_eq!(reading.held_b.get(&SiteKind::AssignmentView), Some(&1));
 }
