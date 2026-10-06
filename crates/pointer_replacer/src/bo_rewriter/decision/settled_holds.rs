@@ -1,6 +1,7 @@
 //! **The settled-table holds' callers (relay 297; main 186 §5).** A hold on the
-//! settled table (the pending hold, R857-2's backstop, era-5c's retained-access
-//! check) can make a LOCAL formal raw after co-conversion has read the classes:
+//! settled table (the pending hold, R857-2's backstop; era-5c's retained-access
+//! check when its line composes) can make a LOCAL formal raw after co-conversion
+//! has read the classes:
 //! the callers that hand it one of their own bindings whole still carry the form
 //! the ladder gave that binding. A `&T` then coerces into the raw formal silently
 //! (the co-conversion hazard the ladder blocks as `flows-into-raw-param`), and an
