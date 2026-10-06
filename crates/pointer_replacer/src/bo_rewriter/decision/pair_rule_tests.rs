@@ -155,3 +155,65 @@ fn r833_1_the_primary_beside_an_unproven_blocked_member_is_held() {
     assert_eq!(held, vec![subjects[0]]);
     assert_eq!(rows[0].role, PairRole::Blocked);
 }
+
+/// The independent review's MED 3(a): one step only. `b` (a learned raw view)
+/// names `a` (no row); `c`'s own row records that its proof against `a` is
+/// not clear. Holding `a` makes it a raw member too, so `c` is held as well.
+#[test]
+fn r833_1_a_newly_held_peer_holds_its_own_unproven_partners() {
+    use A5SiteProofVerdict::{Clear, Overlapping};
+    let (rows, subjects) = rows(
+        [PairRole::Clear, PairRole::RawView, PairRole::Clear],
+        [Clear, Overlapping, Overlapping],
+    );
+    let mut rows = vec![
+        PairSiteDecision {
+            unproven_peers: vec![0],
+            ..rows[1].clone()
+        },
+        PairSiteDecision {
+            unproven_peers: vec![0],
+            ..rows[2].clone()
+        },
+    ];
+    let held = peers_of_unproven_raw_views(&mut rows, |member, index| {
+        Some(PairSiteDecision {
+            argument_index: index,
+            subject: subjects[index],
+            role: PairRole::Blocked,
+            tier: PairTier::Blocked,
+            reason: "pair-not-shown-disjoint".to_owned(),
+            ..member.clone()
+        })
+    });
+    assert!(
+        held.contains(&subjects[0]) && held.contains(&subjects[2]) && held.len() == 2,
+        "{held:?}"
+    );
+    assert_eq!(
+        rows[1].role,
+        PairRole::Blocked,
+        "c is held beside the held a"
+    );
+}
+
+/// MED 3(b): a row that exists is read by the raw member's proof, not skipped
+/// for existing: `a`'s own row says clear, `b`'s proof against `a` does not.
+#[test]
+fn r833_1_an_existing_row_the_raw_member_names_is_held_whatever_its_own_role() {
+    use A5SiteProofVerdict::{Clear, Overlapping};
+    let (rows, subjects) = rows(
+        [PairRole::Clear, PairRole::RawView, PairRole::Clear],
+        [Clear, Overlapping, Clear],
+    );
+    let mut rows = vec![
+        rows[0].clone(),
+        PairSiteDecision {
+            unproven_peers: vec![0],
+            ..rows[1].clone()
+        },
+    ];
+    let held = peers_of_unproven_raw_views(&mut rows, |_, _| None);
+    assert_eq!(held, vec![subjects[0]]);
+    assert_eq!(rows[0].role, PairRole::Blocked);
+}
