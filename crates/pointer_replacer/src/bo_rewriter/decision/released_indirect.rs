@@ -70,7 +70,7 @@ pub(crate) fn holds(
         .map(|&f| (tcx.def_path_str(f.to_def_id()), f))
         .collect();
     let reified = reified(program);
-    let mut memo = FxHashMap::default();
+    let mut walk = ReleaseWalk::new(program, &reified);
     for site in &plan.waivers {
         let Some(&caller) = functions.get(&site.caller) else {
             continue;
@@ -101,7 +101,7 @@ pub(crate) fn holds(
             .get(&pointer)
             .into_iter()
             .flatten()
-            .filter(|&&target| releases(program, &reified, target, site.argument, &mut memo))
+            .filter(|&&target| walk.releases(target, site.argument))
             .map(|&target| tcx.def_path_str(target))
             .collect::<Vec<_>>();
         releasing.sort();
@@ -192,95 +192,166 @@ fn reified<'tcx>(program: &RustProgram<'tcx>) -> Reified<'tcx> {
     out
 }
 
-/// Does `function` release its argument `argument`? A cycle answers no on its
-/// way round; the release, if any, is found on another path.
-fn releases<'tcx>(
-    program: &RustProgram<'tcx>,
-    reified: &Reified<'tcx>,
-    function: DefId,
-    argument: usize,
-    memo: &mut FxHashMap<(DefId, usize), bool>,
-) -> bool {
-    let tcx = program.tcx;
-    if tcx.is_foreign_item(function) {
-        let name = tcx.item_name(function);
-        return argument == 0 && matches!(name.as_str(), "free" | "realloc");
+/// The release walk: does a function release its argument? Answers are cached
+/// only when final: a `false` that read a frame still open below it (a cycle
+/// through a caller) is recomputed when asked again, so a release found later
+/// on that caller's other path is never hidden by a cached `false`.
+struct ReleaseWalk<'p, 'tcx> {
+    program: &'p RustProgram<'tcx>,
+    reified: &'p Reified<'tcx>,
+    memo: FxHashMap<(DefId, usize), bool>,
+    stack: Vec<(DefId, usize)>,
+}
+
+impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
+    fn new(program: &'p RustProgram<'tcx>, reified: &'p Reified<'tcx>) -> Self {
+        Self {
+            program,
+            reified,
+            memo: FxHashMap::default(),
+            stack: Vec::new(),
+        }
     }
-    let Some(local) = function
-        .as_local()
-        .filter(|local| program.functions.contains(local))
-    else {
-        return false;
-    };
-    if let Some(&known) = memo.get(&(function, argument)) {
-        return known;
+
+    /// Does `function` release its argument `argument`?
+    fn releases(&mut self, function: DefId, argument: usize) -> bool {
+        self.visit(function, argument).0
     }
-    memo.insert((function, argument), false);
-    let body = tcx.mir_drops_elaborated_and_const_checked(local).borrow();
-    if argument >= body.arg_count {
-        return false;
+
+    /// The answer, and the lowest open frame it read (`usize::MAX` for none).
+    fn visit(&mut self, function: DefId, argument: usize) -> (bool, usize) {
+        let tcx = self.program.tcx;
+        if tcx.is_foreign_item(function) {
+            let name = tcx.item_name(function);
+            return (
+                argument == 0 && matches!(name.as_str(), "free" | "realloc"),
+                usize::MAX,
+            );
+        }
+        let Some(local) = function
+            .as_local()
+            .filter(|local| self.program.functions.contains(local))
+        else {
+            return (false, usize::MAX);
+        };
+        let key = (function, argument);
+        if let Some(&known) = self.memo.get(&key) {
+            return (known, usize::MAX);
+        }
+        if let Some(open) = self.stack.iter().position(|frame| *frame == key) {
+            return (false, open);
+        }
+        let depth = self.stack.len();
+        self.stack.push(key);
+        let (found, lowest) = self.walk(local, argument);
+        self.stack.pop();
+        if found || lowest >= depth {
+            self.memo.insert(key, found);
+        }
+        (found, lowest)
     }
-    let mut closure = FxHashSet::from_iter([Local::from_usize(argument + 1)]);
-    let member = |operand: &Operand<'_>, closure: &FxHashSet<Local>| {
-        operand
-            .place()
-            .is_some_and(|place| place.projection.is_empty() && closure.contains(&place.local))
-    };
-    loop {
-        let size = closure.len();
-        for data in body.basic_blocks.iter() {
-            for statement in &data.statements {
-                if let StatementKind::Assign(assign) = &statement.kind
-                    && let (destination, Rvalue::Use(operand) | Rvalue::Cast(_, operand, _)) =
-                        &**assign
+
+    /// One body: the formal's closure (copies, casts, references through it and
+    /// pointer results of library calls on it) and every call it reaches.
+    fn walk(&mut self, local: LocalDefId, argument: usize) -> (bool, usize) {
+        let tcx = self.program.tcx;
+        let body = tcx.mir_drops_elaborated_and_const_checked(local).borrow();
+        if argument >= body.arg_count {
+            return (false, usize::MAX);
+        }
+        let mut closure = FxHashSet::from_iter([Local::from_usize(argument + 1)]);
+        let member = |operand: &Operand<'_>, closure: &FxHashSet<Local>| {
+            operand
+                .place()
+                .is_some_and(|place| place.projection.is_empty() && closure.contains(&place.local))
+        };
+        loop {
+            let size = closure.len();
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    let StatementKind::Assign(assign) = &statement.kind else {
+                        continue;
+                    };
+                    let (destination, rvalue) = &**assign;
+                    let derived = match rvalue {
+                        Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                            member(operand, &closure)
+                        }
+                        Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
+                            place.is_indirect_first_projection() && closure.contains(&place.local)
+                        }
+                        _ => false,
+                    };
+                    if derived && destination.projection.is_empty() {
+                        closure.insert(destination.local);
+                    }
+                }
+                if let TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } = &data.terminator().kind
                     && destination.projection.is_empty()
-                    && member(operand, &closure)
+                    && body.local_decls[destination.local].ty.is_raw_ptr()
+                    && args.iter().any(|operand| member(&operand.node, &closure))
+                    && func
+                        .constant()
+                        .and_then(|constant| match *constant.ty().kind() {
+                            TyKind::FnDef(def, _) => Some(def),
+                            _ => None,
+                        })
+                        .is_some_and(|def| !def.is_local())
                 {
                     closure.insert(destination.local);
                 }
             }
-        }
-        if closure.len() == size {
-            break;
-        }
-    }
-    let mut found = false;
-    'blocks: for data in body.basic_blocks.iter() {
-        let (func, args) = match &data.terminator().kind {
-            TerminatorKind::Call { func, args, .. }
-            | TerminatorKind::TailCall { func, args, .. } => (func, args),
-            _ => continue,
-        };
-        // A function item called in place, or a function pointer.
-        let direct = func
-            .constant()
-            .and_then(|constant| match *constant.ty().kind() {
-                TyKind::FnDef(def, _) => Some(def),
-                _ => None,
-            });
-        let pointer = tcx.erase_regions(func.ty(&*body, tcx));
-        for (index, operand) in args.iter().enumerate() {
-            if !member(&operand.node, &closure) {
-                continue;
+            if closure.len() == size {
+                break;
             }
-            // `releases` answers for a foreign item (`free` / `realloc`), a program
-            // function, and no for any other library function.
-            let releasing = match direct {
-                Some(callee) => releases(program, reified, callee, index, memo),
-                None => reified
-                    .get(&pointer)
-                    .into_iter()
-                    .flatten()
-                    .any(|&target| releases(program, reified, target, index, memo)),
+        }
+        let mut lowest = usize::MAX;
+        for data in body.basic_blocks.iter() {
+            let (func, args) = match &data.terminator().kind {
+                TerminatorKind::Call { func, args, .. }
+                | TerminatorKind::TailCall { func, args, .. } => (func, args),
+                _ => continue,
             };
-            if releasing {
-                found = true;
-                break 'blocks;
+            // A function item called in place, or a function pointer.
+            let direct = func
+                .constant()
+                .and_then(|constant| match *constant.ty().kind() {
+                    TyKind::FnDef(def, _) => Some(def),
+                    _ => None,
+                });
+            let pointer = tcx.erase_regions(func.ty(&*body, tcx));
+            for (index, operand) in args.iter().enumerate() {
+                if !member(&operand.node, &closure) {
+                    continue;
+                }
+                // `visit` answers for a foreign item (`free` / `realloc`), a
+                // program function, and no for any other library function.
+                let targets: Vec<DefId> = match direct {
+                    Some(callee) => vec![callee],
+                    None => self
+                        .reified
+                        .get(&pointer)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect(),
+                };
+                for target in targets {
+                    let (releasing, open) = self.visit(target, index);
+                    lowest = lowest.min(open);
+                    if releasing {
+                        return (true, lowest);
+                    }
+                }
             }
         }
+        (false, lowest)
     }
-    memo.insert((function, argument), found);
-    found
 }
 
 /// The formals [`holds`] names that the settled table delivers, and those this
