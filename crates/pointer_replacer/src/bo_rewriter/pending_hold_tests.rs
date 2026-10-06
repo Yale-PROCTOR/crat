@@ -510,3 +510,81 @@ fn r861_1_a_held_operand_of_a_comparison_keeps_its_raw_text() {
         out.source
     );
 }
+
+/// The census's A5 world (`rewrite_m1_census_world`), read as [`outcome`] reads
+/// the open world.
+fn census_outcome(text: &str) -> Outcome {
+    match super::rewrite_m1_census_world(text) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            println!("SOURCE\n{source}");
+            assert!(super::verify::type_checks_str(&source), "{source}");
+            Outcome {
+                source,
+                reasons: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
+            }
+        }
+        other => panic!("the fixture must emit: {other:?}"),
+    }
+}
+
+/// **D1 beneath casts** (relay 297; binn `binn_list_int32`'s
+/// `&mut value as *mut i32 as *mut c_void`): the address of the caller's own
+/// binding, cast, is still that binding's address, so the premise reads it as
+/// it reads `&mut statbuf`.
+const H3_LOCAL_CALLEE_CAST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat_t {
+    pub st_dev: u64,
+    pub st_mode: u32,
+}
+extern "C" {
+    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+}
+unsafe fn stat(mut path: *const i8, mut buf: *mut core::ffi::c_void) -> i32 {
+    return __xstat(1 as i32, path, buf as *mut stat_t);
+}
+pub unsafe fn CopyStat(mut name: *const i8) -> u32 {
+    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
+    if stat(name, &mut statbuf as *mut stat_t as *mut core::ffi::c_void) != 0 {
+        return 0;
+    }
+    statbuf.st_mode
+}
+"#;
+
+#[test]
+fn r861_1_d1_a_frame_binding_sibling_beneath_casts_is_neither_held_nor_pending() {
+    let out = census_outcome(H3_LOCAL_CALLEE_CAST);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_eq!(
+        reason_of(&out, "CopyStat::name"),
+        None,
+        "not held: {:?}",
+        out.reasons
+    );
+}
+
+/// The same in the open world, where no A5 proof is final: the premise alone
+/// keeps the site off the pending set.
+#[test]
+fn r861_1_d1_open_world_a_frame_binding_sibling_beneath_casts_is_not_held() {
+    let out = outcome(H3_LOCAL_CALLEE_CAST);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not this hold's: {:?}",
+        out.reasons
+    );
+}
