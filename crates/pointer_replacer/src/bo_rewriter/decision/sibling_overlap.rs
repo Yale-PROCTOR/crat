@@ -73,6 +73,10 @@ pub(crate) struct SiblingEvidence {
     /// [`addresses_a_frame_binding`](super::pending_sibling::addresses_a_frame_binding).
     /// No fact is `false`: the premise is never guessed.
     pub frame_binding: bool,
+    /// **R861-1 (main 186 D3).** The argument is a string or byte-string literal
+    /// (beneath its casts): never written on a UB-free input, so never the
+    /// written side of an overlap.
+    pub literal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -623,6 +627,7 @@ pub(crate) fn collect_inventory_from(
                             }
                         )
                 });
+            let literal = literal_argument(tcx, caller, site.call_span, argument_index);
             siblings.push(SiblingEvidence {
                 argument_index,
                 argument_shape,
@@ -630,6 +635,7 @@ pub(crate) fn collect_inventory_from(
                 proof,
                 access,
                 frame_binding,
+                literal,
             });
         }
         if siblings.is_empty() && matches!(source, SiblingSource::Declared(_)) {
@@ -1110,7 +1116,55 @@ pub(crate) fn risky_sibling_of(potential: &SiblingPotential, sibling: &SiblingEv
         .source
         .declared()
         .is_some_and(|source| matches!(source.kind, SubjectKind::Param { .. }));
-    risky_sibling(sibling) && !(formal_source && sibling.frame_binding)
+    risky_sibling(sibling) && !(formal_source && sibling.frame_binding) && !sibling.literal
+}
+
+/// **R861-1 (main 186 D3).** Is the call's argument at `index` a string or
+/// byte-string literal beneath its casts (`b"--\0" as *const u8 as *const i8`)?
+/// A literal is never written on a UB-free input, so it is not risky beside a
+/// source, as R608-1 treats a literal source.
+fn literal_argument(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span, index: usize) -> bool {
+    struct Find<'tcx> {
+        call_span: Span,
+        index: usize,
+        found: bool,
+        _tcx: TyCtxt<'tcx>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(_, arguments) = expr.kind
+                && expr.span.source_callsite() == self.call_span.source_callsite()
+                && let Some(argument) = arguments.get(self.index)
+            {
+                let mut peeled = argument;
+                loop {
+                    peeled = match peeled.kind {
+                        ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => inner,
+                        _ => break,
+                    };
+                }
+                if let ExprKind::Lit(lit) = peeled.kind
+                    && matches!(
+                        lit.node,
+                        rustc_ast::LitKind::Str(..)
+                            | rustc_ast::LitKind::ByteStr(..)
+                            | rustc_ast::LitKind::CStr(..)
+                    )
+                {
+                    self.found = true;
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        call_span,
+        index,
+        found: false,
+        _tcx: tcx,
+    };
+    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
+    find.found
 }
 
 pub(crate) fn risky_sibling(sibling: &SiblingEvidence) -> bool {
