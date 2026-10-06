@@ -665,12 +665,14 @@ pub(crate) fn pair_raw_view_expression(
     use super::Decision;
 
     let pointee = &target.pointee;
-    let raw_passthrough = || {
-        matches!(
-            source_shape,
-            "bare-local" | "cast-of-local" | "raw-expr" | "cast"
-        )
-        .then(|| argument.to_owned())
+    // A cast shape's span is its operand, so the raw temporary restates the
+    // argument's own cast to the formal's type (a raw source the decision layer
+    // held raw at a `p as *mut c_void` argument rendered `let t: *mut c_void =
+    // p;`, E0308, and the verify loop reverted the callee's class: main 186).
+    let raw_passthrough = || match source_shape {
+        "bare-local" | "raw-expr" => Some(argument.to_owned()),
+        "cast-of-local" | "cast" => Some(format!("{argument} as {}", target.rendered)),
+        _ => None,
     };
     match source {
         Some(Decision::Ref { mutable }) | Some(Decision::InferredRef { mutable, .. }) => {

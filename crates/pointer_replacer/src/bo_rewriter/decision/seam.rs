@@ -4263,10 +4263,18 @@ pub(crate) fn replan_a5_raw_view(
     }
 
     let (raw_expression, raw_template) = if terminal_found == Form::Raw {
-        (
-            view.argument_expression.clone(),
-            "raw-passthrough".to_owned(),
-        )
+        // A cast shape's argument expression is its operand: the raw temporary
+        // restates the argument's own cast to the formal's type (main 186: a
+        // source the decision layer held raw at `obj as *mut c_void` rendered
+        // `let t: *mut c_void = obj;`, E0308, and the verify loop reverted the
+        // callee's class).
+        let raw = match view.argument_shape {
+            "cast-of-local" | "cast" => {
+                format!("{} as {}", view.argument_expression, view.target.rendered)
+            }
+            _ => view.argument_expression.clone(),
+        };
+        (raw, "raw-passthrough".to_owned())
     } else {
         let source_decision =
             decision_for_safe_form(terminal_found).ok_or(SeamBlock::A5RawViewUnavailable)?;
