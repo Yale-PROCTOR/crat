@@ -2011,9 +2011,12 @@ fn delivers_non_optional(decision: &Decision) -> bool {
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }
         | Decision::Cursor { .. }
-        | Decision::NestedSlice { .. }
-        | Decision::Box(_) => true,
-        Decision::Opt { .. } | Decision::Degraded(_) => false,
+        | Decision::NestedSlice { .. } => true,
+        // An owner is the Box family's: it decides `Box` / `Option<Box>` from
+        // the same evidence, and a null test before the box is its
+        // construction's guard (`null-guard-before-box`), not a null value of
+        // the owner (wave6a `w6a_ac`: `copied::dup`).
+        Decision::Box(_) | Decision::Opt { .. } | Decision::Degraded(_) => false,
     }
 }
 
