@@ -120,7 +120,7 @@ fn r855_1_h1_a_pending_formal_is_decided_raw() {
     let out = outcome(PARAMETER_CASE);
     assert_eq!(out.pending, 0, "the pending table reads 0");
     assert_eq!(
-        reason_of(&out, "or::c"),
+        reason_of(&out, "caller::src"),
         Some("held:pair-not-shown-disjoint"),
         "{:?}",
         out.reasons
