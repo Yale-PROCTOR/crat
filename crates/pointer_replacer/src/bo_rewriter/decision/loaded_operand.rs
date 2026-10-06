@@ -25,11 +25,11 @@ pub(crate) const REASON: &str = "a5-proof-over-a-loaded-operand";
 /// The proof at `site` for `left` / `right`, read with the correction.
 pub(crate) fn read_loaded_operands(
     site: &CallSite,
-    _callee: LocalDefId,
+    callee: LocalDefId,
     left: usize,
     right: usize,
     proof: &mut A5PeerProof,
-    _no_retention: impl Fn(LocalDefId, usize) -> bool,
+    no_retention: impl Fn(LocalDefId, usize) -> bool,
 ) {
     if proof.verdict != A5SiteProofVerdict::Clear || proof.reason != "a5-proven-disjoint" {
         return;
@@ -38,10 +38,14 @@ pub(crate) fn read_loaded_operands(
     let loaded = |index: usize| argument(index).is_some_and(|argument| argument.loaded_from_memory);
     // A pointer loaded from memory cannot hold an address no pointer held
     // before the call: the address of a scalar local taken only by this
-    // argument, at a call no loop repeats (independent review, R820-2: the
-    // retention rows do not see every store, so they are not relied on).
-    let unescaped =
-        |index: usize| argument(index).is_some_and(|argument| argument.address_once_here);
+    // argument, at a call no loop repeats (the independent review, R820-2:
+    // the retention rows do not see every store, so the body alone decides
+    // that) - and, as relay 180 item 4 asks, handed to a callee that carries
+    // the no-retention certificate for it.
+    let unescaped = |index: usize| {
+        argument(index).is_some_and(|argument| argument.address_once_here)
+            && no_retention(callee, index)
+    };
     if (loaded(left) && unescaped(right)) || (loaded(right) && unescaped(left)) {
         return;
     }
