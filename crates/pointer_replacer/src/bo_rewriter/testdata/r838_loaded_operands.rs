@@ -106,3 +106,12 @@ pub unsafe fn if_let_ref(mut p: *mut *mut i32, mut pp: *mut *mut i32) {
     }
     add(*p, &mut l);
 }
+// Relay 180 item 4: a callee that may keep the address it receives.
+unsafe fn keepadd(mut a: *mut i32, mut b: *mut i32) {
+    G1 = b;
+    *a += *b;
+}
+pub unsafe fn kept_once(mut p: *mut *mut i32) {
+    let mut l: i32 = 0;
+    keepadd(*p, &mut l);
+}

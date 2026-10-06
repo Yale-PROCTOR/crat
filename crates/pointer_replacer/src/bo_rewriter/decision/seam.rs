@@ -6555,9 +6555,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                         // from memory is not taken (era-5c 148).
                         super::loaded_operand::read_loaded_operands(
                             site,
+                            *callee,
                             positions[i].index,
                             positions[j].index,
                             &mut proof,
+                            |callee, index| {
+                                matches!(
+                                    retention.get(callee, index),
+                                    Some(super::raw_boundary::RetentionVerdict::NoRetain { .. })
+                                )
+                            },
                         );
                         super::outside_byte_view::read_under_p8(
                             facts,

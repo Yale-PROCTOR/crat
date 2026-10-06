@@ -1119,9 +1119,16 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                             // from memory is not taken (era-5c 148).
                             super::loaded_operand::read_loaded_operands(
                                 site,
+                                *callee,
                                 a.argument_index,
                                 b.argument_index,
                                 &mut proof,
+                                |callee, index| {
+                                    matches!(
+                                        retention.get(callee, index),
+                                        Some(RetentionVerdict::NoRetain { .. })
+                                    )
+                                },
                             );
                             super::outside_byte_view::read_under_p8(
                                 facts,

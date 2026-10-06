@@ -25,9 +25,11 @@ pub(crate) const REASON: &str = "a5-proof-over-a-loaded-operand";
 /// The proof at `site` for `left` / `right`, read with the correction.
 pub(crate) fn read_loaded_operands(
     site: &CallSite,
+    _callee: LocalDefId,
     left: usize,
     right: usize,
     proof: &mut A5PeerProof,
+    _no_retention: impl Fn(LocalDefId, usize) -> bool,
 ) {
     if proof.verdict != A5SiteProofVerdict::Clear || proof.reason != "a5-proven-disjoint" {
         return;

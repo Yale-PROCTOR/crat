@@ -8,6 +8,13 @@ const INPUT: &str = include_str!("../testdata/r838_loaded_operands.rs");
 /// `caller`'s call into `add`, its arguments 0 and 1: a proven-disjoint proof
 /// read through the correction.
 fn read(caller: &str) -> (A5SiteProofVerdict, &'static str) {
+    read_call("add", caller)
+}
+
+/// The same, for a call into `callee`. The no-retention certificate the test
+/// supplies: every callee but `keepadd` certifies it.
+fn read_call(callee: &str, caller: &str) -> (A5SiteProofVerdict, &'static str) {
+    let callee_name = callee;
     ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let functions = tcx
             .hir_body_owners()
@@ -16,8 +23,8 @@ fn read(caller: &str) -> (A5SiteProofVerdict, &'static str) {
         let facts = super::emitability::collect(tcx, &functions);
         let callee = functions
             .iter()
-            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == "add")
-            .expect("add");
+            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == callee_name)
+            .expect("the callee");
         let site = facts.call_args[callee]
             .iter()
             .find(|site| tcx.item_name(site.caller.to_def_id()).as_str() == caller)
@@ -30,7 +37,9 @@ fn read(caller: &str) -> (A5SiteProofVerdict, &'static str) {
             left_site: None,
             right_site: None,
         };
-        super::loaded_operand::read_loaded_operands(site, 0, 1, &mut proof);
+        super::loaded_operand::read_loaded_operands(site, *callee, 0, 1, &mut proof, |c, _| {
+            tcx.item_name(c.to_def_id()).as_str() != "keepadd"
+        });
         (proof.verdict, proof.reason)
     })
     .expect("input type-checks")
@@ -127,4 +136,12 @@ fn r838_narrowed_control_a_call_a_loop_repeats_is_not_shown_disjoint() {
 #[test]
 fn r838_narrowed_control_an_if_let_ref_binding_is_not_shown_disjoint() {
     assert_eq!(read("if_let_ref"), NOT_SHOWN);
+}
+
+/// Relay 180 item 4: the callee that receives the address must also certify
+/// no retention: `keepadd` stores its second argument, so a loaded pointer
+/// beside `&mut l` taken once, outside a loop, is still not shown disjoint.
+#[test]
+fn r838_narrowed_control_a_callee_without_the_no_retention_certificate_is_not_shown_disjoint() {
+    assert_eq!(read_call("keepadd", "kept_once"), NOT_SHOWN);
 }
