@@ -371,7 +371,14 @@ fn scanf_tail_first(symbol: &str) -> Option<usize> {
 fn is_stdio_stream_position(symbol: &str, argument_index: usize) -> bool {
     matches!(
         (symbol, argument_index),
-        ("fgetc", 0) | ("fgets", 2) | ("fprintf", 0) | ("fputs", 1) | ("fscanf", 0) | ("ungetc", 1)
+        ("fgetc", 0)
+            | ("fgets", 2)
+            | ("fprintf", 0)
+            | ("fputs", 1)
+            | ("fread", 3)
+            | ("fscanf", 0)
+            | ("fwrite", 3)
+            | ("ungetc", 1)
     )
 }
 
