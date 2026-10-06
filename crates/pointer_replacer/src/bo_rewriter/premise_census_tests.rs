@@ -501,3 +501,91 @@ fn r857_3_an_assignment_to_a_non_pointer_binding_is_not_read() {
     assert!(reading.rows.is_empty(), "{reading:?}");
     assert!(reading.held_b.is_empty(), "{reading:?}");
 }
+
+/// **The stand-in review of R857-3, MED-1.** The generator removed one of the
+/// binding's assignments (a cursor's `p = p.offset(1)` became `p.seek(1)`), so
+/// the emitted second assignment is the input's THIRD: pairing by ordinal would
+/// read the wrong input site (a false `held`). A different count is not read.
+#[test]
+fn r857_3_an_assignment_the_generator_removed_makes_the_binding_unread() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(a: *mut i32, b: *mut i32) {
+            let mut p: *mut i32 = 0 as *mut i32;
+            p = a;
+            p = p.offset(1);
+            *p = 0;
+            p = b;
+            log_it();
+            *p = 1;
+        } }",
+        "pub mod m { pub unsafe fn f(a: *mut i32, b: *mut i32) {
+            let mut p: Option<&mut i32> = None;
+            p = a.as_mut();
+            *p.unwrap() = 0;
+            p = b.as_mut();
+            log_it();
+            *p.unwrap() = 1;
+        } }",
+        &[],
+    );
+    assert!(reading.rows.is_empty(), "{reading:?}");
+    assert!(reading.held_b.is_empty(), "{reading:?}");
+    assert_eq!(reading.unread, 2, "{reading:?}");
+}
+
+/// json.h `json_write_pretty::indent`'s shape: a raw FORMAL re-assigned with a
+/// slice construction, the next input item unrelated: a row of the
+/// assignment-construction kind.
+#[test]
+fn r857_3_a_construction_assigned_to_a_raw_formal_has_a_row() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(mut s: *const u8) -> u8 {
+            s = g();
+            log_it();
+            *s
+        } }",
+        "pub mod m { pub unsafe fn f(mut s: &[u8]) -> u8 {
+            s = core::slice::from_raw_parts(g(), 1024);
+            log_it();
+            s[0]
+        } }",
+        &[],
+    );
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::AssignmentConstruction, "m::f", "s")]
+    );
+    assert_eq!(reading.rows[0].site, "assign#1");
+}
+
+/// A non-empty lanes table carries the views and constructions at assignments:
+/// the reader's own rows of those kinds give way (nothing counts twice).
+#[test]
+fn r857_3_a_lanes_table_replaces_the_readers_assignment_rows() {
+    let mut reading = read(
+        "pub mod m { pub unsafe fn f(name: *const i8, mut s: *const u8) {
+            let mut envbase: *mut i8 = 0 as *mut i8;
+            envbase = getenv(name);
+            log_it();
+            s = g();
+            log_it();
+        } }",
+        "pub mod m { pub unsafe fn f(name: *const i8, mut s: &[u8]) {
+            let mut envbase: Option<&mut i8> = None;
+            envbase = (getenv(name) as *mut i8).as_mut();
+            log_it();
+            s = core::slice::from_raw_parts(g(), 1024);
+            log_it();
+        } }",
+        &[],
+    );
+    assert_eq!(reading.rows.len(), 2, "{reading:?}");
+    assert!(super::premise_census::merge_lane_views(
+        &mut reading,
+        "function\tbinding\tsite\trule_b\tquiet_prefix\nm::f\tenvbase\tlane-site\tthe next item: log_it ()\tfails\n",
+    ));
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::DeclarationView, "m::f", "envbase")]
+    );
+}

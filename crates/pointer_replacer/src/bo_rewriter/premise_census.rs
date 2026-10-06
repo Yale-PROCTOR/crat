@@ -818,8 +818,13 @@ pub(crate) fn read_program(
         // the binding must be raw in the input, and (b) is read on the items
         // after the input's assignment.
         let input_assigns = input_fn.map(assigns).unwrap_or_default();
+        let emitted_assigns = assigns(function);
+        let mut emitted_counts = BTreeMap::<String, usize>::new();
+        for (name, ..) in &emitted_assigns {
+            *emitted_counts.entry(name.clone()).or_default() += 1;
+        }
         let mut assign_ordinals = BTreeMap::<String, usize>::new();
-        for (name, value, _) in assigns(function) {
+        for (name, value, _) in emitted_assigns {
             let ordinal = {
                 let next = assign_ordinals.entry(name.clone()).or_default();
                 *next += 1;
@@ -850,6 +855,18 @@ pub(crate) fn read_program(
                     reading.unread += 1;
                     continue;
                 }
+            }
+            // The k-th pairing holds only when the generator kept every assignment
+            // of the binding (a cursor's `p.seek(d)` or a forward position removes
+            // one): a different count is not read, never paired with the wrong
+            // input assignment (stand-in review of R857-3, MED-1).
+            let input_count = input_assigns
+                .iter()
+                .filter(|(other, ..)| *other == name)
+                .count();
+            if input_count != emitted_counts.get(&name).copied().unwrap_or(0) {
+                reading.unread += 1;
+                continue;
             }
             let Some((_, _, after)) = input_assigns
                 .iter()
@@ -961,13 +978,20 @@ pub(crate) fn merge_lane_views(reading: &mut Reading, lane_tsv: &str) -> bool {
     if rows.is_empty() {
         return false;
     }
-    // The lanes' table covers the views at assignments too (R857-3): the
-    // reader's own view rows of both kinds give way, so nothing counts twice.
+    // The lanes' table (the Option family's view adapters, wave-6o) covers the
+    // views and the nullable C-string / slice constructions made at assignments
+    // too (R857-3): the reader's own rows of those kinds give way, so nothing
+    // counts twice. A construction at an assignment the lane does not make (a
+    // cursor's re-seed) is then the lane's to carry.
     reading.rows.retain(|row| {
-        row.kind != SiteKind::DeclarationView && row.kind != SiteKind::AssignmentView
+        !matches!(
+            row.kind,
+            SiteKind::DeclarationView | SiteKind::AssignmentView | SiteKind::AssignmentConstruction
+        )
     });
     reading.held_b.remove(&SiteKind::DeclarationView);
     reading.held_b.remove(&SiteKind::AssignmentView);
+    reading.held_b.remove(&SiteKind::AssignmentConstruction);
     reading.rows.extend(rows);
     reading.lane_views = true;
     true
