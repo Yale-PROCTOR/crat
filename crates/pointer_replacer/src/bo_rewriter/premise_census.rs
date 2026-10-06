@@ -64,6 +64,16 @@ impl SiteKind {
             SiteKind::AssignmentReborrow => "assignment-reborrow",
         }
     }
+
+    /// The same reference, made at an assignment instead of a declaration.
+    fn at_assignment(self) -> SiteKind {
+        match self {
+            SiteKind::DeclarationView => SiteKind::AssignmentView,
+            SiteKind::DeclarationConstruction => SiteKind::AssignmentConstruction,
+            SiteKind::DeclarationReborrow => SiteKind::AssignmentReborrow,
+            other => other,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +83,8 @@ pub(crate) struct Row {
     pub(crate) binding: String,
     pub(crate) ordinal: usize,
     pub(crate) pointer: String,
-    /// The call site of a `call-bridge` row (`caller@site`); `-` at a declaration.
+    /// The call site of a `call-bridge` row (`caller@site`); `-` at a declaration;
+    /// `assign#k` at the binding's k-th assignment (R857-3).
     pub(crate) site: String,
     /// Why (b) fails.
     pub(crate) rule_b: String,
@@ -173,6 +184,60 @@ fn lets(function: &ItemFn) -> Vec<(String, &Local, &[Stmt])> {
     let mut lets = Lets { found: Vec::new() };
     lets.visit_block(&function.block);
     lets.found
+}
+
+/// **R857-3 (075 §S7(b)).** Every assignment to a bare binding (`x = e;`), in
+/// source order, with the items of its block after it.
+struct Assigns<'a> {
+    found: Vec<(String, &'a Expr, &'a [Stmt])>,
+}
+
+impl<'a> Visit<'a> for Assigns<'a> {
+    fn visit_block(&mut self, block: &'a Block) {
+        for (position, stmt) in block.stmts.iter().enumerate() {
+            if let Stmt::Expr(expr, _) = stmt
+                && let Expr::Assign(assign) = peel(expr)
+                && let Expr::Path(path) = peel(&assign.left)
+                && let Some(ident) = path.path.get_ident()
+            {
+                self.found.push((
+                    ident.to_string(),
+                    &assign.right,
+                    &block.stmts[position + 1..],
+                ));
+            }
+            self.visit_stmt(stmt);
+        }
+    }
+}
+
+fn assigns(function: &ItemFn) -> Vec<(String, &Expr, &[Stmt])> {
+    let mut assigns = Assigns { found: Vec::new() };
+    assigns.visit_block(&function.block);
+    assigns.found
+}
+
+/// Does the input hold `name` as a raw pointer: a typed raw `let`, an untyped
+/// `let` whose initializer is not already a reference, or a raw formal?
+/// `None`: nothing to read it from.
+fn raw_binding(
+    function: &ItemFn,
+    input_lets: &[(String, &Local, &[Stmt])],
+    name: &str,
+) -> Option<bool> {
+    match input_lets.iter().find(|(other, ..)| other == name) {
+        Some((_, declared, _)) => match binding_of(&declared.pat).and_then(|(_, ty)| ty) {
+            Some(ty) => Some(is_raw_pointer(ty)),
+            None => match &declared.init {
+                Some(init) => Some(
+                    !matches!(peel(&init.expr), Expr::Reference(_))
+                        && reference_from_raw(&init.expr).is_none(),
+                ),
+                None => None,
+            },
+        },
+        None => raw_formal(function, name).then_some(true),
+    }
 }
 
 fn peel(mut expr: &Expr) -> &Expr {
@@ -748,6 +813,67 @@ pub(crate) fn read_program(
                 }),
             }
         }
+        // **R857-3 (075 §S7(b)): the same reading at an ASSIGNMENT.** The
+        // emitted k-th assignment of a binding is read against the input's k-th;
+        // the binding must be raw in the input, and (b) is read on the items
+        // after the input's assignment.
+        let input_assigns = input_fn.map(assigns).unwrap_or_default();
+        let mut assign_ordinals = BTreeMap::<String, usize>::new();
+        for (name, value, _) in assigns(function) {
+            let ordinal = {
+                let next = assign_ordinals.entry(name.clone()).or_default();
+                *next += 1;
+                *next
+            };
+            let Some((kind, pointer)) = reference_from_raw(value) else {
+                continue;
+            };
+            let kind = kind.at_assignment();
+            if wrapper && kind == SiteKind::AssignmentConstruction {
+                reading.exempt_exposure += 1;
+                continue;
+            }
+            if kind == SiteKind::AssignmentConstruction && pointer.starts_with("b\"") {
+                reading.exempt_literal += 1;
+                continue;
+            }
+            let Some(input_fn) = input_fn else {
+                reading.unread += 1;
+                continue;
+            };
+            match raw_binding(input_fn, &input_lets, &name) {
+                Some(true) => {}
+                // Not a raw pointer in the input: not a reference the generator
+                // made from one.
+                Some(false) => continue,
+                None => {
+                    reading.unread += 1;
+                    continue;
+                }
+            }
+            let Some((_, _, after)) = input_assigns
+                .iter()
+                .filter(|(other, ..)| *other == name)
+                .nth(ordinal - 1)
+            else {
+                reading.unread += 1;
+                continue;
+            };
+            let after = items(after);
+            match rule_b(&after, &name, &local_fns) {
+                Ok(_) => *reading.held_b.entry(kind).or_default() += 1,
+                Err(why) => reading.rows.push(Row {
+                    kind,
+                    function: input_path.clone(),
+                    binding: name.clone(),
+                    ordinal,
+                    pointer,
+                    site: format!("assign#{ordinal}"),
+                    rule_b: why,
+                    quiet_prefix: quiet_prefix(&after, &name, &local_fns),
+                }),
+            }
+        }
     }
     let emitted_fns = functions(emitted);
     let mut formals = BTreeSet::new();
@@ -835,10 +961,13 @@ pub(crate) fn merge_lane_views(reading: &mut Reading, lane_tsv: &str) -> bool {
     if rows.is_empty() {
         return false;
     }
-    reading
-        .rows
-        .retain(|row| row.kind != SiteKind::DeclarationView);
+    // The lanes' table covers the views at assignments too (R857-3): the
+    // reader's own view rows of both kinds give way, so nothing counts twice.
+    reading.rows.retain(|row| {
+        row.kind != SiteKind::DeclarationView && row.kind != SiteKind::AssignmentView
+    });
     reading.held_b.remove(&SiteKind::DeclarationView);
+    reading.held_b.remove(&SiteKind::AssignmentView);
     reading.rows.extend(rows);
     reading.lane_views = true;
     true

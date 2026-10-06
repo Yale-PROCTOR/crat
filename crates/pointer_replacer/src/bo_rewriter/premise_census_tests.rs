@@ -277,7 +277,7 @@ fn r801_2_census_lines_count_by_kind_and_program() {
         "{lines}"
     );
     assert!(lines.contains(
-        "premise_bridge_dereferenceable_kinds=call-bridge:0,declaration-view:1,declaration-construction:0,declaration-reborrow:0\n"
+        "premise_bridge_dereferenceable_kinds=call-bridge:0,declaration-view:1,declaration-construction:0,declaration-reborrow:0,assignment-view:0,assignment-construction:0,assignment-reborrow:0\n"
     ));
     assert!(lines.contains("premise_bridge_dereferenceable_by_program=p:1\n"));
     assert!(lines.contains("premise_bridge_dereferenceable_unreadable=q:missing\n"));
