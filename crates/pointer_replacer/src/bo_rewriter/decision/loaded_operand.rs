@@ -10,10 +10,7 @@
 //! disjoint (R833-1).
 
 use rustc_hir::{
-    Expr, ExprKind, HirId, Node, PatKind, QPath,
-    def::{DefKind, Res},
-    def_id::LocalDefId,
-    intravisit::Visitor,
+    Expr, ExprKind, HirId, Node, PatKind, QPath, def::Res, def_id::LocalDefId, intravisit::Visitor,
 };
 use rustc_middle::ty::TyCtxt;
 
@@ -31,25 +28,18 @@ pub(crate) fn read_loaded_operands(
     left: usize,
     right: usize,
     proof: &mut A5PeerProof,
-    may_retain: impl Fn(LocalDefId, usize) -> bool,
 ) {
     if proof.verdict != A5SiteProofVerdict::Clear || proof.reason != "a5-proven-disjoint" {
         return;
     }
     let argument = |index: usize| site.args.iter().find(|argument| argument.index == index);
     let loaded = |index: usize| argument(index).is_some_and(|argument| argument.loaded_from_memory);
-    // A pointer loaded from memory cannot hold an address that never reached
-    // memory: the address of a scalar local every borrow of which is a direct
-    // argument of a local callee that keeps nothing.
-    let unescaped = |index: usize| {
-        argument(index)
-            .and_then(|argument| argument.address_uses.as_ref())
-            .is_some_and(|uses| {
-                uses.iter().all(|place| {
-                    place.is_some_and(|(callee, position)| !may_retain(callee, position))
-                })
-            })
-    };
+    // A pointer loaded from memory cannot hold an address no pointer held
+    // before the call: the address of a scalar local taken only by this
+    // argument, at a call no loop repeats (independent review, R820-2: the
+    // retention rows do not see every store, so they are not relied on).
+    let unescaped =
+        |index: usize| argument(index).is_some_and(|argument| argument.address_once_here);
     if (loaded(left) && unescaped(right)) || (loaded(right) && unescaped(left)) {
         return;
     }
@@ -60,28 +50,27 @@ pub(crate) fn read_loaded_operands(
     }
 }
 
-/// Every place `owner`'s body takes the address of the scalar local `local`:
-/// `Some((callee, position))` where the address (under casts) is directly an
-/// argument of a call to a local function, `None` for any other borrow — an
-/// address stored, bound, compared or cast to an integer, a `ref` binding of
-/// the local, an auto-referenced method receiver. Absent (`None` overall)
-/// when the local is not a scalar or the body has a closure, which could
-/// capture it by reference. A scalar's address is taken by `&` / `&raw` or by
-/// a `ref` binding, and by nothing else.
-pub(crate) fn address_uses(
+/// Is `borrow` (an `&` / `&mut` / `&raw` of the scalar local `local`) the
+/// only place `owner`'s body takes `local`'s address, outside any loop?
+/// Then no pointer anywhere holds that address when the call `borrow` is an
+/// argument of evaluates its arguments. Any other way of taking a scalar's
+/// address counts: another borrow, a `ref` binding (`let`, `if let`, a match
+/// arm), an auto-referenced method receiver; a body with a closure, which can
+/// capture it by reference, is never read so.
+pub(crate) fn address_taken_once_here(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
     local: HirId,
-) -> Option<Vec<Option<(LocalDefId, usize)>>> {
+    borrow: HirId,
+) -> bool {
     let typeck = tcx.typeck(owner);
     if !typeck.node_type(local).is_scalar() {
-        return None;
+        return false;
     }
     struct Uses<'a, 'tcx> {
-        tcx: TyCtxt<'tcx>,
         typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
         local: HirId,
-        uses: Vec<Option<(LocalDefId, usize)>>,
+        borrows: Vec<Option<HirId>>,
         closure: bool,
     }
     fn is_local(expr: &Expr<'_>, local: HirId) -> bool {
@@ -98,38 +87,12 @@ pub(crate) fn address_uses(
         });
         by_ref
     }
-    impl<'tcx> Uses<'_, 'tcx> {
-        /// The call argument this borrow is, through casts.
-        fn argument_of(&self, borrow: &Expr<'_>) -> Option<(LocalDefId, usize)> {
-            let mut child = borrow.hir_id;
-            loop {
-                let Node::Expr(parent) = self.tcx.parent_hir_node(child) else {
-                    return None;
-                };
-                match parent.kind {
-                    ExprKind::Cast(..) | ExprKind::DropTemps(..) => child = parent.hir_id,
-                    ExprKind::Call(callee, arguments) => {
-                        let position = arguments.iter().position(|a| a.hir_id == child)?;
-                        let ExprKind::Path(QPath::Resolved(None, path)) = callee.kind else {
-                            return None;
-                        };
-                        let Res::Def(DefKind::Fn, function) = path.res else {
-                            return None;
-                        };
-                        return function.as_local().map(|function| (function, position));
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
     impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
             match expr.kind {
                 ExprKind::Closure(..) => self.closure = true,
                 ExprKind::AddrOf(_, _, operand) if is_local(operand, self.local) => {
-                    let argument = self.argument_of(expr);
-                    self.uses.push(argument);
+                    self.borrows.push(Some(expr.hir_id));
                 }
                 ExprKind::MethodCall(_, receiver, _, _)
                     if is_local(receiver, self.local)
@@ -144,13 +107,18 @@ pub(crate) fn address_uses(
                                 )
                             }) =>
                 {
-                    self.uses.push(None);
+                    self.borrows.push(None);
                 }
                 ExprKind::Match(scrutinee, arms, _)
                     if is_local(scrutinee, self.local)
                         && arms.iter().any(|arm| binds_by_ref(arm.pat)) =>
                 {
-                    self.uses.push(None);
+                    self.borrows.push(None);
+                }
+                ExprKind::Let(let_expr)
+                    if is_local(let_expr.init, self.local) && binds_by_ref(let_expr.pat) =>
+                {
+                    self.borrows.push(None);
                 }
                 _ => {}
             }
@@ -162,19 +130,35 @@ pub(crate) fn address_uses(
                 && is_local(init, self.local)
                 && binds_by_ref(let_stmt.pat)
             {
-                self.uses.push(None);
+                self.borrows.push(None);
             }
             rustc_hir::intravisit::walk_local(self, let_stmt);
         }
     }
     let body = tcx.hir_body_owned_by(owner);
     let mut uses = Uses {
-        tcx,
         typeck,
         local,
-        uses: Vec::new(),
+        borrows: Vec::new(),
         closure: false,
     };
     uses.visit_body(body);
-    (!uses.closure).then_some(uses.uses)
+    if uses.closure || uses.borrows != [Some(borrow)] {
+        return false;
+    }
+    // Not inside a loop: a later iteration's call would see what an earlier
+    // one may have stored.
+    let mut node = borrow;
+    loop {
+        node = tcx.parent_hir_id(node);
+        match tcx.hir_node(node) {
+            Node::Expr(parent) if matches!(parent.kind, ExprKind::Loop(..)) => return false,
+            Node::Item(_)
+            | Node::ImplItem(_)
+            | Node::TraitItem(_)
+            | Node::ForeignItem(_)
+            | Node::Crate(_) => return true,
+            _ => {}
+        }
+    }
 }

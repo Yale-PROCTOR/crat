@@ -1122,12 +1122,6 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                                 a.argument_index,
                                 b.argument_index,
                                 &mut proof,
-                                |callee, index| {
-                                    !matches!(
-                                        retention.get(callee, index),
-                                        Some(RetentionVerdict::NoRetain { .. })
-                                    )
-                                },
                             );
                             super::outside_byte_view::read_under_p8(
                                 facts,
@@ -2406,7 +2400,7 @@ mod a5_cast_role_tests {
                         deref_pointer: None,
                         inside_of: Vec::new(),
                         loaded_from_memory: false,
-                        address_uses: None,
+                        address_once_here: false,
                     }],
                 }],
             );

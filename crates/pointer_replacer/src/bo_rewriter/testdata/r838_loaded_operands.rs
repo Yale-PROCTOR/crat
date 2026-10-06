@@ -90,3 +90,19 @@ pub unsafe fn derefs_equal(mut p: *mut *mut i32, mut q: *mut *mut i32) {
 pub unsafe fn derefs_equal_caller(mut x: *mut *mut i32) {
     derefs_equal(x, x);
 }
+// The independent review (R820-2): a loop repeats the call, and an `if let ref`
+// takes the address too.
+pub unsafe fn in_loop(mut p: *mut *mut i32, mut n: i32) {
+    let mut l: i32 = 0;
+    while n > 0 {
+        add(*p, &mut l);
+        n -= 1;
+    }
+}
+pub unsafe fn if_let_ref(mut p: *mut *mut i32, mut pp: *mut *mut i32) {
+    let mut l: i32 = 0;
+    if let ref mut r = l {
+        *pp = r;
+    }
+    add(*p, &mut l);
+}

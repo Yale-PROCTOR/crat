@@ -30,14 +30,7 @@ fn read(caller: &str) -> (A5SiteProofVerdict, &'static str) {
             left_site: None,
             right_site: None,
         };
-        // The retention the test supplies: only `keep` keeps its argument.
-        let keep = functions
-            .iter()
-            .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == "keep")
-            .copied();
-        super::loaded_operand::read_loaded_operands(site, 0, 1, &mut proof, |callee, _| {
-            Some(callee) == keep
-        });
+        super::loaded_operand::read_loaded_operands(site, 0, 1, &mut proof);
         (proof.verdict, proof.reason)
     })
     .expect("input type-checks")
@@ -85,8 +78,8 @@ fn r838_control_an_entrys_two_formals_keep_the_proof() {
 }
 
 /// The narrowing: a loaded pointer beside `&mut l`, `l` a scalar local whose
-/// address reaches no memory (its one borrow is this argument, and `add` keeps
-/// nothing), keeps the proof.
+/// address the body takes only here, at a call no loop repeats, keeps the
+/// proof (no pointer held that address when the arguments were evaluated).
 #[test]
 fn r838_narrowed_a_loaded_pointer_beside_an_unescaped_local_keeps_the_proof() {
     assert_eq!(read("unescaped"), PROVEN);
@@ -98,7 +91,7 @@ fn r838_narrowed_control_the_local_stored_through_a_pointer_is_not_shown_disjoin
 }
 
 #[test]
-fn r838_narrowed_control_the_local_handed_to_a_callee_that_keeps_it_is_not_shown_disjoint() {
+fn r838_narrowed_control_the_local_handed_to_another_call_first_is_not_shown_disjoint() {
     assert_eq!(read("kept"), NOT_SHOWN);
 }
 
@@ -124,4 +117,14 @@ fn r838_era5c_148a_a_static_copied_into_another_is_not_shown_disjoint() {
 #[test]
 fn r838_era5c_148a_two_dereferences_a_caller_makes_equal_are_not_shown_disjoint() {
     assert_eq!(read("derefs_equal"), NOT_SHOWN);
+}
+
+#[test]
+fn r838_narrowed_control_a_call_a_loop_repeats_is_not_shown_disjoint() {
+    assert_eq!(read("in_loop"), NOT_SHOWN);
+}
+
+#[test]
+fn r838_narrowed_control_an_if_let_ref_binding_is_not_shown_disjoint() {
+    assert_eq!(read("if_let_ref"), NOT_SHOWN);
 }

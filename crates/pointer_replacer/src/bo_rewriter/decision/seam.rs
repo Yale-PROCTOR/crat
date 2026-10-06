@@ -4415,7 +4415,14 @@ pub(crate) fn replan_a5_raw_view(
         view.argument_shape,
         "addr-of-cast" | "addr-of-mut-cast" | "cast-of-local"
     ) {
-        format!("({raw_expression} as {})", view.target.rendered)
+        let pointer = match view.target.mutability {
+            super::raw_boundary::RawMutability::Mut => "*mut _",
+            super::raw_boundary::RawMutability::Const => "*const _",
+        };
+        format!(
+            "({raw_expression} as {pointer} as {})",
+            view.target.rendered
+        )
     } else {
         raw_expression
     };
@@ -6551,12 +6558,6 @@ pub(crate) fn synthesize_with_raw_boundary(
                             positions[i].index,
                             positions[j].index,
                             &mut proof,
-                            |callee, index| {
-                                !matches!(
-                                    retention.get(callee, index),
-                                    Some(super::raw_boundary::RetentionVerdict::NoRetain { .. })
-                                )
-                            },
                         );
                         super::outside_byte_view::read_under_p8(
                             facts,
