@@ -250,7 +250,26 @@ fn losses<'a>(
                 && soundness
                     .iter()
                     .any(|proof| proof.subject == key && !proof.null_construction.is_dummy());
-            (!survives && !witnessed).then_some(subject)
+            // R819-1 / R824-2 (§29): with its Option stage withdrawn, a subject
+            // with its own null evidence falls back to raw rather than keep a
+            // NON-OPTIONAL form; that withdrawal is the soundness rule, not a
+            // lost delivery. A valid optional prior stays protected (R220).
+            let null_withdrawn = !matches!(old, decision::Decision::Opt { .. })
+                && candidate
+                    .table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| (s.fn_did, s.hir_id) == key)
+                    .is_some_and(|(_, d)| {
+                        matches!(
+                            d,
+                            decision::Decision::Degraded(decision::Degradation {
+                                reason: decision::DegradeReason::NullInit,
+                                ..
+                            })
+                        )
+                    });
+            (!survives && !witnessed && !null_withdrawn).then_some(subject)
         })
         .collect()
 }
