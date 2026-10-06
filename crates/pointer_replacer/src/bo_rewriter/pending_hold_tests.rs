@@ -329,3 +329,50 @@ fn r861_1_d3_a_string_literal_sibling_is_not_risky() {
         out.reasons
     );
 }
+
+/// **The probe's json.h collateral (main 186 §5, relay 297).** The callee's
+/// formal is held (`memcpy` writes its sibling), and the caller hands it its own
+/// OPTIONAL formal (a null test makes it `Option<&T>`): the call is planned with
+/// the ordinary bridge into the held raw formal, so no verify round reverts it.
+const JSON_OPTION_INTO_HELD: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct json_value_s {
+    pub payload: i32,
+    pub type_0: i32,
+}
+unsafe extern "C" fn copy_value(mut state: *mut u8, mut value: *const json_value_s) {
+    memcpy(state as *mut core::ffi::c_void, value as *const core::ffi::c_void, 8 as u64);
+}
+pub unsafe extern "C" fn extract(mut value: *const json_value_s) -> i32 {
+    if value.is_null() {
+        return 0;
+    }
+    let mut buf: [u8; 8] = [0; 8];
+    copy_value(buf.as_mut_ptr(), value);
+    return (*value).type_0;
+}
+"#;
+
+#[test]
+fn r857_1_an_optional_formal_into_a_held_raw_formal_is_bridged() {
+    let (source, degradations) = match super::rewrite_m1_census_world(JSON_OPTION_INTO_HELD) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            ..
+        } => (source, degradations),
+        other => panic!("the fixture must emit: {other:?}"),
+    };
+    println!("SOURCE\n{source}");
+    let reverted = degradations
+        .iter()
+        .filter(|d| d.reason.key() == "reverted-after-verify-failure")
+        .map(|d| d.subject.clone())
+        .collect::<Vec<_>>();
+    assert!(reverted.is_empty(), "verify reverts: {reverted:?}");
+}
