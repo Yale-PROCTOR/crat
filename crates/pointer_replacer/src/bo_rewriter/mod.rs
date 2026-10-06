@@ -8848,6 +8848,11 @@ fn finish_decide<'tcx>(
                     }
                 }
             }
+            for (node, reason) in
+                decision::settled_holds::into_held_formals(tcx, &facts, &table, &forced)
+            {
+                new.entry(node).or_insert(reason);
+            }
             if new.is_empty() {
                 break;
             }

@@ -144,6 +144,7 @@ pub(crate) mod returned_child_descent;
 mod returned_child_tests;
 pub(crate) mod root_extent;
 pub(crate) mod seam;
+pub(crate) mod settled_holds;
 pub(crate) mod shared_read_pairs;
 pub(crate) mod shared_weakening;
 pub(crate) mod sibling_overlap;
@@ -933,6 +934,11 @@ pub(crate) enum DegradeReason {
     ReleasedThroughIndirectCall {
         detail: String,
     },
+    /// Relay 297 (main 186 §5): a caller's binding handed whole to a local formal a
+    /// settled-table hold made raw (`settled_holds`). `detail` names the formal.
+    IntoHeldFormal {
+        detail: String,
+    },
     /// R829-1 / R855-1 (USER; main 184): the caller-side hold of a pending
     /// sibling-overlap site, decided on the settled table (`pending_hold`): a
     /// delivered source handed to a raw formal beside a risky raw sibling the pair
@@ -988,6 +994,7 @@ impl DegradeReason {
             DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
             DegradeReason::RetainedAlias { .. } => "held:retained-alias",
             DegradeReason::ReleasedThroughIndirectCall { .. } => released_indirect::KEY,
+            DegradeReason::IntoHeldFormal { .. } => "held:into-held-formal",
             DegradeReason::PairNotShownDisjoint { .. } => "held:pair-not-shown-disjoint",
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
@@ -1012,6 +1019,7 @@ impl DegradeReason {
             DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
             DegradeReason::RetainedAlias { detail } => detail.clone(),
             DegradeReason::ReleasedThroughIndirectCall { detail } => detail.clone(),
+            DegradeReason::IntoHeldFormal { detail } => detail.clone(),
             DegradeReason::PairNotShownDisjoint { detail } => detail.clone(),
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
