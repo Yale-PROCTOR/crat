@@ -96,19 +96,26 @@ pub(crate) fn into_held_formals(
         })
         .map(|(subject, _)| (subject.fn_did, subject.hir_id))
         .collect();
-    let held_bindings: Vec<(LocalDefId, HirId)> = {
+    // Every held subject, whatever the hypothesis read (the stand-in review
+    // round 2, N2: a relaxation can deliver a binding the hypothesis left raw).
+    let held_bindings: Vec<(LocalDefId, HirId, rustc_middle::mir::Local)> = {
         let mut nodes: Vec<_> = table
             .entries
             .iter()
-            .map(|(subject, _)| (subject.fn_did, subject.hir_id))
-            .filter(|node| forced.contains_key(node) && !raw_in_hypothesis.contains(node))
+            .filter(|(subject, _)| forced.contains_key(&(subject.fn_did, subject.hir_id)))
+            .map(|(subject, _)| (subject.fn_did, subject.hir_id, subject.local))
             .collect();
-        nodes.sort_by_key(|(function, binding)| {
+        nodes.sort_by_key(|(function, binding, _)| {
             (function.local_def_index.as_u32(), binding.local_id.as_u32())
         });
         nodes.dedup();
         nodes
     };
+    let by_local: FxHashMap<(LocalDefId, rustc_middle::mir::Local), HirId> = table
+        .entries
+        .iter()
+        .map(|(subject, _)| ((subject.fn_did, subject.local), subject.hir_id))
+        .collect();
     let mut out = Vec::new();
     let mut seen = FxHashSet::default();
     // **Within the function (the stand-in review's M4; relay 297).** The model
@@ -116,8 +123,11 @@ pub(crate) fn into_held_formals(
     // a delivered `A` assigned or initialized into the held `B` then coerces
     // silently (`&mut T` into `*mut T`), the ladder's hazard with no compiler
     // backstop. `A` is decided raw too.
-    for (function, binding) in &held_bindings {
-        for source in flows_into_binding(tcx, *function, *binding) {
+    for (function, binding, local) in &held_bindings {
+        for source in locals_flowing_into(tcx, *function, *local) {
+            let Some(&source) = by_local.get(&(*function, source)) else {
+                continue;
+            };
             let node = (*function, source);
             if !delivered.contains(&node) || forced.contains_key(&node) || !seen.insert(node) {
                 continue;
@@ -173,62 +183,97 @@ pub(crate) fn into_held_formals(
     out
 }
 
-/// The bindings of `function` assigned or initialized into `binding` whole,
-/// cast, or borrowed (`B = A`, `let B = A as *mut T`, `B = &mut *A`): the ladder's
-/// argument shapes, read on the right-hand side.
-fn flows_into_binding(
+/// The MIR locals of `function` whose pointer value reaches `target` (the stand-in
+/// review round 2, N1): copies and casts through any temporaries (a C2Rust
+/// ternary's arms, a block's tail), pointer steps (`offset` / `add` / `sub` and
+/// their wrapping and byte forms, `cast*`), and addresses of places reached
+/// through a dereference of the local (`&mut (*a).f`, `&mut *a`). A load through
+/// a dereference (`b = (*s).p`) is the pointee's value, not the local's, and is
+/// no flow.
+fn locals_flowing_into(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     function: LocalDefId,
-    binding: HirId,
-) -> Vec<HirId> {
-    use rustc_hir::{Expr, ExprKind, LetStmt, PatKind, QPath, def::Res, intravisit};
-    struct Find<'tcx> {
-        tcx: rustc_middle::ty::TyCtxt<'tcx>,
-        binding: HirId,
-        sources: Vec<HirId>,
-    }
-    impl<'tcx> Find<'tcx> {
-        fn take(&mut self, value: &'tcx Expr<'tcx>) {
-            match super::emitability::classify_arg(self.tcx, value) {
-                ArgShape::BareLocal(source)
-                | ArgShape::CastOfLocal {
-                    binding: source, ..
-                }
-                | ArgShape::AddrOf {
-                    base: Some(source), ..
-                } if source != self.binding => self.sources.push(source),
-                _ => {}
-            }
-        }
-    }
-    impl<'tcx> intravisit::Visitor<'tcx> for Find<'tcx> {
-        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            if let ExprKind::Assign(lhs, rhs, _) = expr.kind
-                && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
-                && path.res == Res::Local(self.binding)
-            {
-                self.take(rhs);
-            }
-            intravisit::walk_expr(self, expr);
-        }
-
-        fn visit_local(&mut self, local: &'tcx LetStmt<'tcx>) {
-            if let PatKind::Binding(_, id, ..) = local.pat.kind
-                && id == self.binding
-                && let Some(init) = local.init
-            {
-                self.take(init);
-            }
-            intravisit::walk_local(self, local);
-        }
-    }
-    let mut find = Find {
-        tcx,
-        binding,
-        sources: Vec::new(),
+    target: rustc_middle::mir::Local,
+) -> Vec<rustc_middle::mir::Local> {
+    use rustc_middle::mir::{
+        BinOp, Local, Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     };
-    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(function));
-    find.sources
+    fn whole(operand: &Operand<'_>) -> Option<Local> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                Some(place.local)
+            }
+            _ => None,
+        }
+    }
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    let mut sources: FxHashMap<Local, Vec<Local>> = FxHashMap::default();
+    for block in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(assign) = &statement.kind else {
+                continue;
+            };
+            let (place, rvalue) = &**assign;
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let from = match rvalue {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => whole(operand),
+                Rvalue::BinaryOp(BinOp::Offset, operands) => whole(&operands.0),
+                Rvalue::Ref(_, _, borrowed) | Rvalue::RawPtr(_, borrowed)
+                    if borrowed.projection.first() == Some(&ProjectionElem::Deref) =>
+                {
+                    Some(borrowed.local)
+                }
+                _ => None,
+            };
+            if let Some(from) = from {
+                sources.entry(place.local).or_default().push(from);
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &terminator.kind
+            && destination.projection.is_empty()
+            && let Some((callee, _)) = func.const_fn_def()
+            && matches!(
+                tcx.item_name(callee).as_str(),
+                "offset"
+                    | "add"
+                    | "sub"
+                    | "wrapping_offset"
+                    | "wrapping_add"
+                    | "wrapping_sub"
+                    | "byte_offset"
+                    | "byte_add"
+                    | "byte_sub"
+                    | "cast"
+                    | "cast_mut"
+                    | "cast_const"
+            )
+            && let Some(from) = args.first().and_then(|argument| whole(&argument.node))
+        {
+            sources.entry(destination.local).or_default().push(from);
+        }
+    }
+    let mut seen = FxHashSet::default();
+    let mut work = vec![target];
+    while let Some(local) = work.pop() {
+        for &from in sources.get(&local).into_iter().flatten() {
+            if from != target && seen.insert(from) {
+                work.push(from);
+            }
+        }
+    }
+    let mut out: Vec<Local> = seen.into_iter().collect();
+    out.sort();
+    out
 }
 
 /// One settled-table hold's receipt: the predicate (its reason's key), the
