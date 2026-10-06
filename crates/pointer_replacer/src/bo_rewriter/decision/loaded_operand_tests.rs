@@ -106,3 +106,22 @@ fn r838_narrowed_control_the_local_handed_to_a_callee_that_keeps_it_is_not_shown
 fn r838_narrowed_control_the_local_bound_by_ref_is_not_shown_disjoint() {
     assert_eq!(read("ref_bound"), NOT_SHOWN);
 }
+
+/// era-5c 148a, executed in the census world (each emitted `add(a: &mut i32,
+/// b: &i32)` before the correction): `add(G1, G1)`.
+#[test]
+fn r838_era5c_148a_one_static_passed_twice_is_not_shown_disjoint() {
+    assert_eq!(read("same_static"), NOT_SHOWN);
+}
+
+/// era-5c 148a: `G2 = G1; add(G1, G2)`.
+#[test]
+fn r838_era5c_148a_a_static_copied_into_another_is_not_shown_disjoint() {
+    assert_eq!(read("copied_static"), NOT_SHOWN);
+}
+
+/// era-5c 148a: `add(*p, *q)` called with `p == q`.
+#[test]
+fn r838_era5c_148a_two_dereferences_a_caller_makes_equal_are_not_shown_disjoint() {
+    assert_eq!(read("derefs_equal"), NOT_SHOWN);
+}

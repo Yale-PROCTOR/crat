@@ -73,3 +73,20 @@ pub unsafe fn ref_bound(mut p: *mut *mut i32) {
     *r = 1;
     add(*p, &mut l);
 }
+// era-5c 148a's executed shapes: one static passed twice, a static copied into
+// another, two dereferences of pointers a caller makes equal.
+pub unsafe fn same_static(mut p: *mut i32) {
+    G1 = p;
+    add(G1, G1);
+}
+pub unsafe fn copied_static(mut p: *mut i32) {
+    G1 = p;
+    G2 = G1;
+    add(G1, G2);
+}
+pub unsafe fn derefs_equal(mut p: *mut *mut i32, mut q: *mut *mut i32) {
+    add(*p, *q);
+}
+pub unsafe fn derefs_equal_caller(mut x: *mut *mut i32) {
+    derefs_equal(x, x);
+}
