@@ -120,6 +120,26 @@ fn decisions(input: &str) -> Vec<(String, super::Decision)> {
     })
     .unwrap()
 }
+/// [`decisions`] in the census's A5 world (the precise replay against the
+/// frozen benchmark graph; relay 297, main 188 class C).
+fn census_world_decisions(input: &str) -> Vec<(String, super::Decision)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap()
+        .0
+        .entries
+        .iter()
+        .map(|(s, d)| (s.label.clone(), d.clone()))
+        .collect()
+    })
+    .unwrap()
+}
 fn decision<'a>(table: &'a [(String, super::Decision)], label: &str) -> &'a super::Decision {
     &table
         .iter()
@@ -131,28 +151,45 @@ fn flat(emitted: &str) -> String {
     emitted.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `h` mixes converting targets (`symbol`) with raw targets (`symbol_lists`):
-/// the raw sites are bridged, the converting sites are the seam's.
+/// `h` mixes converting targets (`symbol`) with raw targets (`symbol_lists`).
+/// Under R829-1 / R861-1 (relay 297, main 188) `h` is borrowed into
+/// `ProcessSingleCodeLength`'s raw `repeat` (arg2, `&mut (*h).repeat`) beside
+/// siblings the callee writes and the open world does not show disjoint
+/// (args 1, 3–7: the other field addresses, the loaded `(*h).symbol_lists`
+/// and the two array views), so it is decided raw on the settled table
+/// (`held:pair-not-shown-disjoint`): its declaration keeps the input's raw
+/// form and none of its raw sites is bridged.
 #[test]
 fn w5c_mixed_boundary_decoder_arena_view_delivers() {
     let input = fixture();
     let table = decisions(&input);
+    // R829-1 (relay 297, main 188): SafeReadSymbolCodeLengths::h is held beside
+    // the written args 1, 3-7 at ProcessSingleCodeLength (h's site: arg2); the
+    // decision moves from Ref { mutable: true } to the hold.
     assert!(
         matches!(
             decision(&table, "SafeReadSymbolCodeLengths::h"),
-            super::Decision::Ref { mutable: true }
+            super::Decision::Degraded(super::Degradation {
+                reason: super::DegradeReason::PairNotShownDisjoint { detail },
+                ..
+            }) if detail.contains(":ProcessSingleCodeLength:2:")
+                && detail.ends_with(";risky-siblings=arg1,arg3,arg4,arg5,arg6,arg7")
         ),
         "{:?}",
         decision(&table, "SafeReadSymbolCodeLengths::h")
     );
     let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let text = flat(&emitted);
+    // R829-1 (relay 297, main 188): SafeReadSymbolCodeLengths::h is held beside
+    // the written args 1, 3-7 at ProcessSingleCodeLength; its declaration stays
+    // `*mut` (was `&mut`) and `(*h).symbol_lists` is no longer bridged through
+    // a `__crat_raw` temporary.
     assert!(
-        text.contains("let h: &mut BrotliMetablockHeaderArena = &mut (*s).arena;"),
+        text.contains("let h: *mut BrotliMetablockHeaderArena = &mut (*s).arena;"),
         "{emitted}"
     );
     assert!(
-        text.contains("let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16;"),
+        !text.contains("let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16;"),
         "{emitted}"
     );
     assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
@@ -166,19 +203,32 @@ fn w5c_mixed_boundary_decoder_arena_view_delivers() {
 /// `s` is borrowed through (`&mut (*s).br`, `&mut *((*s).ringbuffer).offset(…)`)
 /// into targets that convert to other safe forms; those are their families'
 /// adapter questions, never a raw seam of `s`.
+///
+/// Restated (R829-1, relay 297, main 188): `s` is a source at
+/// `BrotliCopyBytes(…, &mut (*s).br, …)` beside the written `dest` (arg0) that
+/// no proof shows disjoint, in the census's A5 world as in the open one, so it
+/// is held raw; it reaches `BrotliEnsureRingBuffer` through the bridge.
 #[test]
 fn w5c_mixed_boundary_output_state_delivers() {
     let input = output_fixture();
-    let table = decisions(&input);
+    let table = census_world_decisions(&input);
+    // R829-1 (relay 297, main 188): CopyUncompressedBlockToOutput::s is held beside
+    // `dest` (arg0) at BrotliCopyBytes; `Ref { mutable: true }` → the hold.
     assert!(
         matches!(
             decision(&table, "CopyUncompressedBlockToOutput::s"),
-            super::Decision::Ref { mutable: true }
+            super::Decision::Degraded(super::Degradation {
+                reason: super::DegradeReason::PairNotShownDisjoint { detail },
+                ..
+            }) if detail.contains(":BrotliCopyBytes:1:") && detail.ends_with(";risky-siblings=arg0")
         ),
         "{:?}",
         decision(&table, "CopyUncompressedBlockToOutput::s")
     );
-    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let emitted = match crate::bo_rewriter::rewrite_m1_census_world(&input) {
+        crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("the census world emits: {other:#?}"),
+    };
     let text = flat(&emitted);
     // Where the owner's class is NOT applied (this reduction alone: its
     // `available_out` sibling flows into `WriteRingBuffer`'s raw parameter)

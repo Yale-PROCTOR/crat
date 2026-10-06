@@ -210,7 +210,11 @@ fn w6l_nulwalk_c_an_early_stop_walk_of_a_parameter_keeps_the_fallback() {
     );
 }
 
-/// A callee that copies a counted 16 bytes: not bounded by the NUL.
+/// A callee that copies a counted 16 bytes: not bounded by the NUL. Restated
+/// (R829-1, relay 297): `copy16::s` is the source beside `memcpy`'s written
+/// destination `d.as_mut_ptr()` (arg0, the callee's own array through a
+/// method call, not shown disjoint), so it is held raw; the caller hands
+/// `url` raw and no slice is constructed, so no fallback either.
 #[test]
 fn w6l_nulwalk_c_a_counted_callee_keeps_the_fallback() {
     let out = emitted(&b_literal().replace(
@@ -218,9 +222,15 @@ fn w6l_nulwalk_c_a_counted_callee_keeps_the_fallback() {
         "unsafe fn copy16(s: *const c_char) -> c_int {\n    let mut d = [0u8; 16];\n    memcpy(d.as_mut_ptr() as *mut c_void, s as *const c_void, 16);\n    d[0] as c_int + *s.offset(1) as c_int\n}\nunsafe fn parse_int(s: *const c_char) -> c_int {",
     ).replace("    parse_int(url)\n", "    copy16(url)\n"));
     assert!(!out.contains("nul-walk:"), "{out}");
+    // R829-1 (relay 297, main 188): copy16::s is held beside `d.as_mut_ptr()` (arg0) at memcpy; the fallback construction → the raw formal and a raw `copy16(url)`.
     assert!(
-        takes_fallback(&out),
-        "the control constructs the slice with the fallback: {out}"
+        out.contains("unsafe fn copy16(s: *const c_char) -> c_int {"),
+        "the held source keeps its raw formal: {out}"
+    );
+    assert!(out.contains("copy16(url)"), "{out}");
+    assert!(
+        !takes_fallback(&out),
+        "no slice is constructed for a raw formal: {out}"
     );
 }
 

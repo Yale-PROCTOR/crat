@@ -61,7 +61,16 @@ fn wave6o_thin_optional_into_a_local_raw_formal_is_held() {
 /// the fatness table already types as a C string, and is indexed once (op facts
 /// govern the slice form, fatness corroborates: S3.2′-2), so `input_path` is
 /// FAT (`Option<&[i8]>`) and carries its extent: the bridge into the raw formal
-/// is built (`OptSliceToRaw`, `.as_ptr()`).
+/// was built (`OptSliceToRaw`, `.as_ptr()`).
+///
+/// Under R829-1 / R861-1 (relay 297, main 188) no bridge is planned here:
+/// `stat::__path` is held raw beside the written `__statbuf` formal at `__xstat`
+/// (`held:pair-not-shown-disjoint`), and `CopyStat::input_path`, handed whole
+/// to that held formal, is decided raw too (`held:into-held-formal`). No bridge
+/// is planned into a formal that was safe in the raw boundary's hypothesis; the
+/// frame's `OptSliceToRaw` bridge came from the class revert's outbound input
+/// form. `input_path` keeps its raw `*const i8` and reaches `stat` and `chmod`
+/// bare. The name is kept.
 #[test]
 fn wave6o_fat_optional_into_a_local_raw_formal_is_bridged() {
     let input = FOREIGN
@@ -76,8 +85,22 @@ fn wave6o_fat_optional_into_a_local_raw_formal_is_bridged() {
     assert!(verify::type_checks_str(&input));
     let output = ast_emitted_source_of(&input).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
-    assert!(flat.contains("input_path:Option<&[i8]>"), "{output}");
-    assert!(flat.contains("as_ptr()"), "{output}");
+    // R829-1 (relay 297, main 188): stat::__path is held beside the written
+    // __statbuf at __xstat, and CopyStat::input_path is held into that formal
+    // (held:into-held-formal); `input_path: Option<&[i8]>` bridged by
+    // `.as_ptr()` -> the raw `input_path: *const i8` passed bare.
+    assert!(
+        flat.contains("fnCopyStat(mutinput_path:*consti8"),
+        "{output}"
+    );
+    assert!(flat.contains("fnstat(mut__path:*consti8"), "{output}");
+    assert!(flat.contains("stat(input_path,&mutstatbuf)"), "{output}");
+    assert!(
+        flat.contains("chmod(input_path,statbuf.st_mode)"),
+        "{output}"
+    );
+    assert!(!flat.contains("input_path:Option<&[i8]>"), "{output}");
+    assert!(!flat.contains("as_ptr()"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
 

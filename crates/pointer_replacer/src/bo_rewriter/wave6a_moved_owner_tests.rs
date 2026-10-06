@@ -271,6 +271,14 @@ fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
     );
 }
 
+/// Under R829-1 / R861-1 (relay 297, main 188) the sibling the A5 raw view was
+/// built for is held: `twice::available_out` / `twice::total_out` (and
+/// `sink`'s `s` / `available_out` / `total_out`) are borrowed into
+/// `WriteRingBuffer`'s raw formals beside siblings the callee writes (`s`,
+/// `available_out`, `total_out`) and are decided raw
+/// (`held:pair-not-shown-disjoint`). No `__crat_a5_raw_` view wraps the first
+/// call any more; the call still lends the optional, which is this witness's
+/// subject.
 #[test]
 fn w6a_r738_a_wrapped_call_lends_its_optional() {
     let (source, reverted) = pinned(
@@ -290,12 +298,24 @@ fn w6a_r738_a_wrapped_call_lends_its_optional() {
     );
     let text = compact(&source);
     assert_eq!(reverted, 0, "{source}");
+    // R829-1 (relay 297, main 188): twice::available_out / twice::total_out are
+    // held beside the written s / available_out / total_out at WriteRingBuffer;
+    // the pinned `result={let__crat_a5_raw_` view of total_out is gone, both
+    // stay `*mut usize` and the first call is bare.
     assert!(
-        text.contains("result={let__crat_a5_raw_"),
-        "the first call carries the sibling's raw view: {source}"
+        text.contains(
+            "fntwice(muts:*mutState,mutavailable_out:*mutusize,mutnext_out:Option<&mut*mutu8>,muttotal_out:*mutusize)"
+        ),
+        "{source}"
     );
     assert!(
-        text.contains("WriteRingBuffer(s,available_out,next_out.as_deref_mut(),"),
+        !text.contains("__crat_a5_raw_"),
+        "no sibling raw view wraps the first call: {source}"
+    );
+    assert!(
+        text.contains(
+            "result=WriteRingBuffer(s,available_out,next_out.as_deref_mut(),total_out,0asi32);"
+        ),
         "the first call lends: {source}"
     );
     // The final call keeps its transfer (wave-6r's rule, unchanged).

@@ -256,6 +256,63 @@ pub unsafe fn caller(mut buf: *mut u8, mut r: *mut Reg) -> i32 {
     );
 }
 
+/// **A retaining callee with no pointer sibling** — k19's static-store shape
+/// (`cast_of_local_bridge_tests::k19_retaining_callee_does_not_bridge`):
+/// `target::p` is handed to `keep`, which stores it in a static, and nothing
+/// stands beside it at the call, so no pending sibling site exists and the
+/// tier-2 retention waiver bridges it.
+const RETAINED_ALONE: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    static mut SINK: *const core::ffi::c_void = core::ptr::null();\n\
+    unsafe fn keep(q: *const core::ffi::c_void) { SINK = q; }\n\
+    pub unsafe fn target(p: *mut i32) -> i32 \
+    { *p.offset(1) += 1; keep(p as *const core::ffi::c_void); *p.offset(0) }\n";
+
+/// `input`'s emission plan in the open world: the bridge receipts that spend the
+/// tier-2 retention waiver, the bridge events' reconciliation, and `(reason key,
+/// detail)` of `source`'s decision when it is degraded.
+fn waived_bridge_receipts(
+    input: &str,
+    source: &str,
+) -> (usize, Result<(), String>, Option<(&'static str, String)>) {
+    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label == source)
+            .ok_or_else(|| format!("no subject {source}"))?;
+        let degraded = match decision {
+            super::decision::Decision::Degraded(record) => {
+                Some((record.reason.key(), record.reason.detail()))
+            }
+            _ => None,
+        };
+        let emission = super::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )?;
+        let events = emission
+            .plan
+            .bridge_events(&std::collections::BTreeSet::new());
+        let waived = events
+            .iter()
+            .filter(|event| {
+                event.waiver_id.as_deref()
+                    == Some(super::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID)
+            })
+            .count();
+        Ok::<_, String>((
+            waived,
+            super::bridge_receipt::reconcile_bridge_events(&events).map(|_| ()),
+            degraded,
+        ))
+    })
+    .expect("fixture compiler context")
+    .expect("emission")
+}
+
 /// **W6O-T2-6 (R523-1) — the BRIDGE receipts of a waived site reconcile.**
 ///
 /// One comparator over from the transport: `BridgeReceiptEvent::validate`
@@ -263,39 +320,51 @@ pub unsafe fn caller(mut buf: *mut u8, mut r: *mut Reg) -> i32 {
 /// read `reconciliation-drift:bridge /
 /// T2_bridge_receipt_lacks_the_exact_waiver_ID` and the census was
 /// `data=false` — nothing could land while the arm was in.
+///
+/// **R829-1 (relay 297, main 188).** The reduced `GetValue` shape hands
+/// `caller::buf` to the retaining raw `p` beside `value`, a formal `GetValue`
+/// writes through, so the source is held raw on the settled table before
+/// planning (`held:pair-not-shown-disjoint`, `risky-siblings=arg1`): that site
+/// has no bridge and spends no waiver. A waived bridge of a delivered source
+/// beside a risky sibling is a pending site, unreachable in an emitted program
+/// (the post-condition degrades a program that would keep one). The waiver's
+/// bridge receipts still exist where nothing stands beside the retained source,
+/// so the reconciliation is pinned on k19's static-store shape, and the
+/// `GetValue` shape pins the hold.
 #[test]
 fn wave6o_a_waived_sites_bridge_receipts_reconcile() {
-    let outcome = ::utils::compilation::run_compiler_on_input(
-        ::utils::compilation::str_to_input(RETAINED),
-        |tcx| {
-            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
-            let emission = super::emit_files(
-                tcx,
-                &table,
-                &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
-            )?;
-            let events = emission
-                .plan
-                .bridge_events(&std::collections::BTreeSet::new());
-            let waived = events
-                .iter()
-                .filter(|event| {
-                    event.waiver_id.as_deref()
-                        == Some(super::decision::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID)
-                })
-                .count();
-            Ok::<_, String>((
-                waived,
-                super::bridge_receipt::reconcile_bridge_events(&events).map(|_| ()),
-            ))
-        },
-    )
-    .expect("fixture compiler context")
-    .expect("emission");
+    // R829-1 (relay 297, main 188): caller::buf is held beside value at GetValue; its site
+    // spends no waiver (it carried the tier-2 waived bridge receipt) and the events reconcile.
+    let (waived, reconciled, degraded) = waived_bridge_receipts(RETAINED, "caller::buf");
+    let (key, detail) = degraded.expect("caller::buf is held raw");
+    assert_eq!(key, "held:pair-not-shown-disjoint", "{detail}");
     assert!(
-        outcome.0 > 0,
+        detail.contains(":GetValue:0:") && detail.ends_with(";risky-siblings=arg1"),
+        "the hold names GetValue's retaining p and the written value: {detail}"
+    );
+    assert_eq!(waived, 0, "a held source has no bridge to waive");
+    assert_eq!(reconciled, Ok(()), "and the bridge events reconcile");
+    let output = super::emit_tests::ast_emitted_source_of(RETAINED).expect("native emission");
+    let declarations = super::delivery_custody::inventory_source("retained-held.rs", &output)
+        .expect("independent held declarations");
+    let buf = declarations
+        .iter()
+        .find(|row| row.owner == "caller" && row.parameter_index == Some(1))
+        .expect("caller's buf formal");
+    assert!(
+        matches!(
+            &buf.type_shape,
+            super::delivery_custody::TypeShape::RawPointer { mutable: true, .. }
+        ),
+        "held raw: {output}"
+    );
+    // R829-1 (relay 297, main 188): the waived site moves to a retaining callee with no
+    // sibling (k19's static store); the waived receipt and its reconciliation are unchanged.
+    let (waived, reconciled, degraded) = waived_bridge_receipts(RETAINED_ALONE, "target::p");
+    assert_eq!(degraded, None, "the retained source is delivered");
+    assert!(
+        waived > 0,
         "the fixture carries a tier-2 waived bridge receipt"
     );
-    assert_eq!(outcome.1, Ok(()), "and the bridge events reconcile");
+    assert_eq!(reconciled, Ok(()), "and the bridge events reconcile");
 }

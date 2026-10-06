@@ -467,6 +467,8 @@ fn w6l_nul_c5_a_wrapped_receiver_keeps_the_argument_bridge() {
 }
 
 /// The held one of the family, pinned so a later carrier build sees it move.
+/// Restated (R829-1, relay 297): `strclone::s` is now held too, beside
+/// `strcpy`'s written destination `ns` (arg0, a fresh `malloc` result).
 #[test]
 fn w6l_nul_the_catcher_stays_held_at_its_local_callee_argument() {
     let decisions = super::emit_tests::decisions_of(PROBE_CATCHER);
@@ -475,7 +477,12 @@ fn w6l_nul_the_catcher_stays_held_at_its_local_callee_argument() {
         "return-not-adapted",
         "{decisions:#?}"
     );
-    assert_eq!(reason(&decisions, "s", true), "<emitted>", "{decisions:#?}");
+    // R829-1 (relay 297, main 188): strclone::s is held beside `ns` (arg0, a fresh malloc) at strcpy; `<emitted>` → held:pair-not-shown-disjoint.
+    assert_eq!(
+        reason(&decisions, "s", true),
+        "held:pair-not-shown-disjoint",
+        "{decisions:#?}"
+    );
 }
 
 /// W6 — both halves of the R419-3 hold exempt a literal-only source, and the
@@ -527,14 +534,19 @@ fn w6l_nul_w6_a_literal_source_is_not_a_pending_sibling_site() {
 }
 
 /// W7 — the count's value, not its spelling: one element, no thin-extent hold.
+/// Restated (R829-1, relay 297): `pIn` is held beside `memcpy`'s written
+/// destination `pOut` (arg0, a formal not shown disjoint), so the subject is
+/// no longer delivered; the one-element count fact itself still holds.
 #[test]
 fn w6l_nul_w7_a_constant_count_of_the_pointee_size_is_one_element() {
     let decisions = super::emit_tests::decisions_of(PROBE_KMVEC4);
+    // R829-1 (relay 297, main 188): kmVec4Assign::pIn is held beside `pOut` (arg0) at memcpy; `<emitted>` → held:pair-not-shown-disjoint (not a thin-extent hold).
     assert_eq!(
         reason(&decisions, "pIn", true),
-        "<emitted>",
+        "held:pair-not-shown-disjoint",
         "{decisions:#?}"
     );
+    assert!(memcpy_source_one_pointee(PROBE_KMVEC4));
 }
 
 const CONTROL_SIGN_CHANGING_COUNT: &str = r#"
@@ -635,7 +647,10 @@ unsafe fn copy_n(mut dst: *mut u8, mut src: *const u8, mut n: usize) {
 
 /// C2 — a counted companion beats the fallback: the null-tested source with an
 /// exact count takes its contract promotion (evidence `n`) in the ladder, so
-/// the waiver's lift never sees it.
+/// the waiver's lift never sees it. Restated (R829-1, relay 297): `src` is
+/// held raw beside `memcpy`'s written destination `dst` (arg0, a formal not
+/// shown disjoint), so no promotion forms; the waiver's lift still never sees
+/// it.
 #[test]
 fn w6l_nul_c2_a_counted_companion_beats_the_fallback() {
     let promotions = ::utils::compilation::run_compiler_on_input(
@@ -653,21 +668,17 @@ fn w6l_nul_c2_a_counted_companion_beats_the_fallback() {
     )
     .expect("fixture compiles")
     .expect("decision table");
-    let source = promotions
-        .0
-        .iter()
-        .find(|promotion| promotion.nullable)
-        .unwrap_or_else(|| panic!("the nullable source is promoted: {:#?}", promotions.0));
+    // R829-1 (relay 297, main 188): copy_n::src is held beside `dst` (arg0) at memcpy; the nullable `n`-evidence promotion → no promotion at all.
+    assert!(
+        promotions.0.is_empty(),
+        "the held source takes no promotion: {:#?}",
+        promotions.0
+    );
+    let decisions = super::emit_tests::decisions_of(CONTROL_COUNTED);
     assert_eq!(
-        source.length,
-        super::decision::contract_extent::LengthPlan::Evidence {
-            elements: "n".to_owned(),
-            source: super::decision::contract_extent::LengthSource::ExactContract {
-                site: source.sites[0].site.clone(),
-                argument_index: 2,
-            },
-        },
-        "{source:#?}"
+        reason(&decisions, "src", true),
+        "held:pair-not-shown-disjoint",
+        "{decisions:#?}"
     );
     assert!(
         !promotions.1.contains("copy_n::src"),
@@ -976,23 +987,30 @@ fn flat(source: &str) -> String {
 
 /// W9 (R615-7, STOP 2) — the count's value divided by the pointee's size is
 /// an exact element count, the two sites agree on it, and every caller
-/// constructs over it instead of the §77 fallback.
+/// constructs over it instead of the §77 fallback. Restated (R829-1, relay
+/// 297): at the first `memcpy` `dist_cache` is the source beside the written
+/// destination `orig_dist_cache.as_mut_ptr()` (arg0, the callee's own array
+/// through a method call, not shown disjoint), so it is held raw: no
+/// promotion, no construction at the caller, and still no fallback.
 #[test]
 fn w6l_nul_w9_a_constant_byte_count_is_an_element_count_at_every_caller() {
     let length = contract_length(PROBE_DIST_CACHE, "dist_cache");
-    assert!(length.starts_with("Evidence { elements: \"4\""), "{length}");
+    // R829-1 (relay 297, main 188): ZopfliRefs::dist_cache is held beside `orig_dist_cache.as_mut_ptr()` (arg0) at the first memcpy; `Evidence { elements: "4" .. }` → no-promotion.
+    assert_eq!(length, "no-promotion");
+    let decisions = super::emit_tests::decisions_of(PROBE_DIST_CACHE);
+    assert_eq!(
+        reason(&decisions, "dist_cache", true),
+        "held:pair-not-shown-disjoint",
+        "{decisions:#?}"
+    );
     let (source, _) = emitted_source(PROBE_DIST_CACHE);
     let source = flat(&source);
+    // R829-1 (relay 297, main 188): ZopfliRefs::dist_cache is held at the first memcpy; `&mut [i32]` → the raw formal, and the caller's `(4) as usize` construction → none.
     assert!(
-        source.contains("fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: &mut [i32])"),
+        source.contains("fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: *mut i32)"),
         "{source}"
     );
-    assert!(
-        source.contains(
-            "core::slice::from_raw_parts_mut(((*s).dist_cache_).as_mut_ptr(), (4) as usize)"
-        ),
-        "{source}"
-    );
+    assert!(!source.contains("(4) as usize"), "{source}");
     assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
 }
 
@@ -1062,10 +1080,16 @@ fn w6l_nul_c7_a_partial_element_constant_stays_fallback() {
     assert!(!flat(&source).contains("(1) as usize"), "{source}");
 }
 
+/// Restated (R829-1, relay 297): at the first `memcpy` `dist_cache` is the
+/// source beside the written destination `orig.as_mut_ptr()` (arg0, the
+/// callee's own array through a method call, not shown disjoint), so it is
+/// held raw and no promotion (hence no `MultipleRequirements` fallback plan)
+/// forms; neither constant becomes an extent.
 #[test]
 fn w6l_nul_c8_unequal_constant_sites_stay_fallback() {
     let length = contract_length(CONTROL_UNEQUAL_CONSTANTS, "dist_cache");
-    assert_eq!(length, "Fallback(MultipleRequirements)");
+    // R829-1 (relay 297, main 188): refs::dist_cache is held beside `orig.as_mut_ptr()` (arg0) at the first memcpy; `Fallback(MultipleRequirements)` → no-promotion.
+    assert_eq!(length, "no-promotion");
     let (source, _) = emitted_source(CONTROL_UNEQUAL_CONSTANTS);
     let source = flat(&source);
     assert!(!source.contains("(4) as usize"), "{source}");

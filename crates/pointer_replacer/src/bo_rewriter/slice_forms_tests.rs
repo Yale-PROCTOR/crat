@@ -1,26 +1,36 @@
 //! Forward parameter fixtures derived from rs-crown urlparser::strff.
 
+/// Under R829-1 / R861-1 (relay 297, main 188) the pass-on target is held:
+/// `strdup::input` is borrowed into `strcpy`'s raw source beside the written,
+/// unproven `dup` (arg0) and is decided raw (`held:pair-not-shown-disjoint`),
+/// and `strff::ptr`, handed whole to that held formal, is decided raw too
+/// (`held:into-held-formal`). Neither forward arm renders on this fixture any
+/// more; the name is kept.
 #[test]
 fn wave6s_strff_forward_parameter_pass_on() {
     let source = emit(STRFF);
     println!("EMITTED {source}");
     assert!(super::verify::type_checks_str(&source), "{source}");
+    // R829-1 (relay 297, main 188): strdup::input is held beside `dup` (arg0) at
+    // strcpy and strff::ptr is held into it; `ptr: &[i8]` -> `ptr: *mut i8`,
+    // `input: *const i8` stays.
     assert!(
-        source.contains("ptr: &[i8]"),
-        "forward parameter must deliver: {source}"
+        source.contains("pub unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8"),
+        "the forward parameter is held raw: {source}"
     );
-    // The rendering is the arm that fires: the indexed forward parameter when
-    // the pass-on target stays a raw position (`strdup::input` on its
-    // `strlen` / `strcpy` C arms), the S3.2′-2b reslice (`ptr = &ptr[1..]`)
-    // when it is a slice. wave-4's contract extent (batch-7 probe P2) makes
-    // `strdup::input` a slice through its `strlen` contract, so THIS fixture
-    // may render either way (R217-2(a): the expectation moves where wave-4
-    // intentionally delivers); the index form stays pinned by the revert,
-    // incoming-extent and raw-local-caller witnesses below.
     assert!(
-        source.contains("let mut __crat_wave6s_pos_") || source.contains("ptr = &ptr[1..];"),
-        "forward parameter renders by one of its two arms: {source}"
+        source.contains("unsafe extern \"C\" fn strdup(input: *const i8) -> *mut i8"),
+        "the pass-on target is held raw: {source}"
     );
+    // The rendering was the arm that fires: the indexed forward parameter when
+    // the pass-on target stays a raw position, the S3.2′-2b reslice
+    // (`ptr = &ptr[1..]`) when it is a slice. R829-1 (relay 297, main 188):
+    // with both ends held neither renders, and the pass-on is the input's.
+    assert!(
+        !source.contains("__crat_wave6s_pos_") && !source.contains("ptr = &ptr[1..];"),
+        "no forward arm renders on a held parameter: {source}"
+    );
+    assert!(source.contains("strdup(ptr)"), "{source}");
 }
 
 fn emit(input: &str) -> String {
@@ -229,35 +239,43 @@ fn wave6s_backward_parameter_keeps_its_separate_hold() {
 /// nothing at all and the fabrication, where it is still owed, moves to
 /// `drive`'s own callers. Both spellings are accepted; a length read off `n`
 /// is accepted in neither.
+///
+/// **R829-1 / R861-1 (relay 297, main 188).** `strdup::input` is now held
+/// beside `strcpy`'s written, unproven `dup` (`held:pair-not-shown-disjoint`)
+/// and `strff::ptr`, handed whole to it, is held too
+/// (`held:into-held-formal`), so the chain is raw end to end: `drive`'s raw
+/// `p` reaches a raw `ptr` and no slice is constructed anywhere, with or
+/// without a fallback. The claim holds trivially on this fixture and is still
+/// asserted.
 #[test]
 fn wave6s_strff_incoming_preserves_tail_extent() {
     let input =
         format!("{STRFF}\npub unsafe fn drive(p: *mut i8, n: i32) -> *mut i8 {{ strff(p, n) }}");
     let source = emit(&input);
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("ptr: &[i8]"), "{source}");
+    // R829-1 (relay 297, main 188): strdup::input is held beside `dup` (arg0) at
+    // strcpy and strff::ptr is held into it; `ptr: &[i8]` -> `ptr: *mut i8`.
+    assert!(
+        source.contains("pub unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8"),
+        "{source}"
+    );
     let compact = source.split_whitespace().collect::<String>();
     assert!(
         !compact.contains("from_raw_parts(p,(n)asusize)")
             && !compact.contains("from_raw_parts(p,nasusize)"),
         "the prefix count is never the tail's extent: {source}"
     );
-    let raw_incoming = source.contains("p: *mut i8");
-    if raw_incoming {
-        assert!(
-            source.contains("FALLBACK_SLICE_EXTENT"),
-            "a raw incoming source constructs with the named fallback: {source}"
-        );
-    } else {
-        assert!(
-            source.contains("p: &[i8]"),
-            "the incoming source is either raw or lifted, nothing else: {source}"
-        );
-        assert!(
-            !compact.contains("from_raw_parts("),
-            "a lifted chain constructs nothing here: {source}"
-        );
-    }
+    // R829-1 (relay 297, main 188): with `ptr` held raw the incoming source
+    // stays raw and nothing is constructed (was: the named fallback at a raw
+    // `p`, or a lifted `p: &[i8]`).
+    assert!(
+        source.contains("pub unsafe fn drive(p: *mut i8, n: i32) -> *mut i8 { strff(p, n) }"),
+        "{source}"
+    );
+    assert!(
+        !compact.contains("from_raw_parts(") && !source.contains("FALLBACK_SLICE_EXTENT"),
+        "a raw chain constructs nothing here: {source}"
+    );
 }
 
 /// urlparser `url_get_port` → `strff`, reduced with the real caller: the argument
@@ -383,16 +401,26 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
 /// class, so the caller holds (`blocked-subject:kind-raw`,
 /// `missing-required-arm:c`), its previously applied `url` is "lost", and the
 /// restoration walk withdraws `strff` through the interface graph.
+///
+/// **R829-1 / R861-1 (relay 297, main 188).** `strff::ptr` is now raw for a
+/// reason on its callee's side, not its caller's: `strdup::input` is held
+/// beside `strcpy`'s written, unproven `dup` (`held:pair-not-shown-disjoint`)
+/// and `ptr`, handed whole to it, is held too (`held:into-held-formal`). The
+/// caller still withdraws nothing: `url` delivers and no interface
+/// restoration receipt is written.
 #[test]
 fn wave6s_strff_survives_its_raw_local_caller() {
     let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
     println!("EMITTED {source}");
     println!("FAMILY RECEIPTS {receipts}");
     assert!(super::verify::type_checks_str(&source), "{source}");
+    // R829-1 (relay 297, main 188): strdup::input is held beside `dup` (arg0) at
+    // strcpy and strff::ptr is held into it; `ptr: &[i8]` -> `ptr: *mut i8`.
     assert!(
-        source.contains("ptr: &[i8]"),
-        "the forward parameter is withdrawn by its caller: {receipts}\n{source}"
+        source.contains("unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8"),
+        "the forward parameter is held raw by its callee's hold: {receipts}\n{source}"
     );
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
     assert!(source.contains("url: &i8"), "{source}");
     assert!(
         !receipts.contains("restore-family-interface-path"),
@@ -429,6 +457,14 @@ const STOREH2_WITH_STORE_RANGE: &str = r#"
 /// only through the other and requests nothing, and the pipeline fails with
 /// `additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]` —
 /// wave-5d's binn `binn_get_bool` MAX-3 shape.
+///
+/// **R829-1 / R861-1 (relay 297, main 188).** The caller's `data` is now held
+/// raw: it is handed to `StoreH2`'s raw `data` (the `pair-raw-view` role)
+/// beside `self_0` (arg0), which `StoreH2` writes and which is not shown
+/// disjoint (`held:pair-not-shown-disjoint`). So the caller is neither lifted
+/// nor adapted with the fallback; the call still crosses through the A5 raw
+/// local, now bound to the raw `data`. Both `self_0` deliveries — this
+/// witness's own subject — are unchanged.
 #[test]
 fn wave6s_storeh2_survives_its_thin_raw_caller() {
     let (source, receipts) = emit_with_family_receipts(STOREH2_WITH_STORE_RANGE);
@@ -453,20 +489,27 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     // T2 raw bridge (`let __crat_a5_raw_…: *const u8 = data.as_ptr();`).
     // Both spellings keep this witness's own subject — the two `self_0`
     // deliveries the preservation invariant is about — and both type-check.
-    let lifted_caller = compact.contains("StoreRangeH2(mutself_0:&mutH2,mutdata:&[u8]");
-    if lifted_caller {
-        assert!(
-            compact.contains("__crat_a5_raw_") && compact.contains("=data.as_ptr();"),
-            "the lifted caller crosses back through the A5 raw bridge: {source}"
-        );
-    } else {
-        assert!(
-            compact.contains(
-                "StoreH2(self_0,core::slice::from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT),"
-            ),
-            "{source}"
-        );
-    }
+    // R829-1 (relay 297, main 188): StoreRangeH2::data is held beside `self_0`
+    // (arg0) at StoreH2; neither spelling applies any more (was: the lifted
+    // `data: &[u8]` with `= data.as_ptr();`, or the fallback construction
+    // into the callee), the caller keeps `data: *const u8` and the A5 raw
+    // local binds it bare.
+    assert!(
+        compact.contains("fnStoreH2(mutself_0:&mutH2,mutdata:*constu8,"),
+        "{source}"
+    );
+    assert!(
+        compact.contains("fnStoreRangeH2(mutself_0:&mutH2,mutdata:*constu8,"),
+        "{source}"
+    );
+    assert!(
+        compact.contains(":*constu8=data;StoreH2(self_0,__crat_a5_raw_"),
+        "the held caller crosses through the A5 raw local unchanged: {source}"
+    );
+    assert!(
+        !compact.contains("from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT)"),
+        "{source}"
+    );
 }
 
 /// Negative controls: the arithmetic consumed by anything other than the

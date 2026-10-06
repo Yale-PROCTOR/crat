@@ -171,10 +171,14 @@ fn attested_rewrite(source: &str) -> super::RewriteOutcome {
 #[test]
 fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed() {
     // #1b: `memcpy` returns its destination, so the destination is admitted
-    // only where the caller discards the return (`memcpy(..);`); both
-    // array-decay arguments then take the exact count from the contract's own
-    // count argument (`n`, licensed because it spells no call), under the
-    // corpus's attested A5 mode which proves the two arrays disjoint.
+    // only where the caller discards the return (`memcpy(..);`); the
+    // array-decay destination then takes the exact count from the contract's
+    // own count argument (`n`, licensed because it spells no call), under the
+    // corpus's attested A5 mode which proves the two arrays disjoint at
+    // `copy`'s call. R829-1 (relay 297, main 188): the SOURCE no longer
+    // promotes: `copy::src` meets memcpy beside the written formal `dest`, which
+    // no proof shows disjoint at memcpy's own site, so it is decided raw
+    // (`held:pair-not-shown-disjoint`) and its caller hands it `src.as_ptr()`.
     let source = r#"
         #![allow(dead_code, unused_unsafe, unused_mut)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -189,7 +193,13 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
         }
     "#;
     let plans = attested_promotions(source);
-    assert_eq!(plans.len(), 2, "plans={plans:#?}");
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // only the destination promotes (plans 2 → 1).
+    assert_eq!(plans.len(), 1, "plans={plans:#?}");
+    assert!(
+        plans[0].subject.contains("binding=2"),
+        "the destination, not the source: {plans:#?}"
+    );
     assert!(
         plans.iter().all(|plan| matches!(
             &plan.length,
@@ -205,16 +215,24 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
     );
     let output = attested_emitted(source);
     assert!(output.contains("dest: &mut [u8]"), "{output}");
-    assert!(output.contains("src: &[u8]"), "{output}");
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // it keeps `*const u8` (was `&[u8]`) and reaches memcpy unbridged.
+    let copy_signature = output
+        .lines()
+        .find(|line| line.contains("fn copy("))
+        .unwrap_or_default();
+    assert!(copy_signature.contains("src: *const u8"), "{output}");
     assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
     assert!(
-        output.contains("memcpy(dest.as_mut_ptr(), src.as_ptr(), n)"),
+        output.contains("memcpy(dest.as_mut_ptr(), src, n)"),
         "{output}"
     );
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // only the destination's construction remains, and the source is not built.
     assert!(
         output.contains("core::slice::from_raw_parts_mut(dest.as_mut_ptr(), (n) as usize)")
-            && output.contains("core::slice::from_raw_parts(src.as_ptr(), (n) as usize)"),
-        "both constructions carry the exact count from the contract's own argument:\n{output}"
+            && !output.contains("core::slice::from_raw_parts(src.as_ptr()"),
+        "the destination's construction carries the exact count; the held source is passed raw:\n{output}"
     );
 
     // The companion is the callee's PARAMETER that spells the count, found by
@@ -242,7 +260,7 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
     assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
 
     // A USED return keeps the destination out (its returned alias needs the
-    // returned-child custody #1b does not carry); the source still promotes.
+    // returned-child custody #1b does not carry).
     let used_return = r#"
         #![allow(dead_code, unused_unsafe, unused_mut)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -257,10 +275,11 @@ fn ce_w02_memcpy_exact_count_keeps_both_initialized_byte_slices_evidence_backed(
         }
     "#;
     let plans = attested_promotions(used_return);
-    assert_eq!(plans.len(), 1, "{plans:#?}");
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // the source no longer promotes either (plans 1 → 0: was `binding=4`).
     assert!(
-        plans[0].subject.contains("binding=4"),
-        "the source, not the destination: {plans:#?}"
+        plans.is_empty(),
+        "neither the used-return destination nor the held source: {plans:#?}"
     );
 }
 
@@ -365,17 +384,20 @@ fn ce_w07_strncpy_source_count_is_an_upper_bound_and_never_exact_evidence() {
         }
     "#;
     let plans = promotions(source);
-    assert_eq!(
-        plans.len(),
-        1,
-        "only the readable source is eligible: {plans:#?}"
+    // R829-1 (relay 297, main 188): bounded::src is held beside
+    // `dest.as_mut_ptr()` at strncpy (the written destination is not an
+    // address-of a frame binding); the readable source no longer promotes
+    // (plans 1 → 0), so neither an upper bound nor exact evidence is issued.
+    assert!(
+        plans.is_empty(),
+        "the held source is not eligible: {plans:#?}"
     );
-    assert_eq!(
-        plans[0].length,
-        super::decision::contract_extent::LengthPlan::Fallback(
-            super::decision::contract_extent::FallbackReason::UpperBound
-        )
-    );
+    let decisions = super::emit_tests::decisions_of(source);
+    let src = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "src" && *is_param)
+        .expect("bounded::src subject");
+    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
 }
 
 #[test]
@@ -390,31 +412,21 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
         }
     "#;
     let plans = promotions(source);
-    assert_eq!(
-        plans.len(),
-        1,
-        "only the readable source promotes: {plans:#?}"
-    );
-    assert_eq!(
-        plans[0].length,
-        super::decision::contract_extent::LengthPlan::Fallback(
-            super::decision::contract_extent::FallbackReason::UpperBound
-        )
-    );
-    let count_expression = plans[0]
-        .sites
-        .iter()
-        .find_map(|site| match &site.requirement {
-            super::decision::contract_extent::Requirement::UpperBound(Some(count)) => {
-                count.elements.as_ref().ok()
-            }
-            _ => None,
-        })
-        .expect("upper-bound count operand");
+    // R829-1 (relay 297, main 188): copy_file_name::src is held beside
+    // `dest.as_mut_ptr()` at strncpy; the readable source no longer promotes
+    // (plans 1 → 0), so this fixture no longer carries the multi-line count
+    // into an upper-bound plan (the count-operand check is unreachable here),
+    // and the receipt-width checks below read whatever rows remain.
     assert!(
-        count_expression.contains('\n'),
-        "the compiler fact retains the original expression: {count_expression:?}"
+        plans.is_empty(),
+        "the held source does not promote: {plans:#?}"
     );
+    let decisions = super::emit_tests::decisions_of(source);
+    let src = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "src" && *is_param)
+        .expect("copy_file_name::src subject");
+    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
 
     let super::RewriteOutcome::Emitted {
         source: output,
@@ -426,6 +438,12 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
     };
     assert!(output.contains("strncpy("), "{output}");
     assert_eq!(output.matches("1034usize - 10usize").count(), 1, "{output}");
+    // R829-1 (relay 297, main 188): copy_file_name::src is held beside
+    // `dest.as_mut_ptr()` at strncpy; it keeps its raw form.
+    assert!(
+        output.contains("copy_file_name(src: *const i8)"),
+        "{output}"
+    );
 
     let rendered =
         super::mechanical_receipt::render_slice_use_rows(&raw_boundary_artifacts.slice_use_rows);
@@ -447,10 +465,12 @@ fn multiline_count_expression_is_single_line_only_in_the_receipt() {
 
 #[test]
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
-    // A count that spells a CALL is not licensed as the constructions' length
-    // (each construction would evaluate it again): both constructions take
-    // the arrays' own length (R625) and the count stays the single, original
-    // scalar argument inside its conditional.
+    // A count that spells a CALL is not licensed as the construction's length
+    // (a construction would evaluate it again): the destination's construction
+    // takes the array's own length (R625) and the count stays the single,
+    // original scalar argument inside its conditional. R829-1 (relay 297, main
+    // 188): the source is held raw beside the written `dest` at memcpy, so the
+    // single-evaluation claim is read on the destination's construction alone.
     let source = r#"
         #![allow(dead_code, unused_unsafe, static_mut_refs)]
         extern "C" { fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8; }
@@ -466,7 +486,13 @@ fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() 
         }
     "#;
     let plans = attested_promotions(source);
-    assert_eq!(plans.len(), 2, "plans={plans:#?}");
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // only the destination promotes (plans 2 → 1).
+    assert_eq!(plans.len(), 1, "plans={plans:#?}");
+    assert!(
+        plans[0].subject.contains("binding=2"),
+        "the destination, not the source: {plans:#?}"
+    );
     let output = attested_emitted(source);
     assert_eq!(
         output.matches("next_n()").count(),
@@ -476,10 +502,18 @@ fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() 
     let if_pos = output.find("if run").expect("conditional remains");
     let count_pos = output.rfind("next_n()").expect("count remains");
     assert!(count_pos > if_pos, "the count was hoisted: {output}");
+    // R829-1 (relay 297, main 188): copy::src is held beside `dest` at memcpy;
+    // it keeps `*const u8`, and one construction (the destination's) takes the
+    // array's length (was 2).
+    let copy_signature = output
+        .lines()
+        .find(|line| line.contains("fn copy("))
+        .unwrap_or_default();
+    assert!(copy_signature.contains("src: *const u8"), "{output}");
     assert_eq!(
         output.matches("(4) as usize").count(),
-        2,
-        "both constructions take the arrays' length rather than re-evaluating the count:\n{output}"
+        1,
+        "the destination's construction takes the array's length rather than re-evaluating the count:\n{output}"
     );
 }
 
@@ -491,11 +525,19 @@ fn ce_w09_non_length_and_identity_failures_remain_held() {
         pub unsafe fn copy(dest: *mut u8, src: *const u8, n: usize) { memcpy(dest, src, n); }
     "#;
     let plans = promotions(uninitialized);
-    assert_eq!(
-        plans.len(),
-        1,
-        "the write-only parameter must not promote: {plans:#?}"
+    // R829-1 (relay 297, main 188): copy::src is held beside the written formal
+    // `dest` at memcpy (`copy` is a plain `pub fn`, no exported entry); the
+    // readable source no longer promotes either (plans 1 → 0).
+    assert!(
+        plans.is_empty(),
+        "the write-only parameter must not promote, nor the held source: {plans:#?}"
     );
+    let decisions = super::emit_tests::decisions_of(uninitialized);
+    let src = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "src" && *is_param)
+        .expect("copy::src subject");
+    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
     // Re-premised by R481-1 / R482-3 (the waiver), wave-4 report 043: the hold
     // still decides — it is what sends the subject past every evidence arm — and
     // the waiver then lifts it with the fabricated extent. The claim is asserted
@@ -1229,6 +1271,12 @@ fn ce_l01_an_adjacent_value_is_not_licensed_as_the_length() {
 /// The licensed half: the callee's own pinned count position names the
 /// sibling (`strncpy(dst, src, n)` in the callee: `n` bounds the read of
 /// `src`), so `n` is evidence and the caller's construction takes it.
+///
+/// **R829-1 (relay 297, main 188):** on this fixture `src` meets `strncpy`
+/// beside the written `buf.as_mut_ptr()`, so it is held raw
+/// (`held:pair-not-shown-disjoint`) before the licence is read; the witness
+/// now pins that hold, and the licence needs a fixture without a written
+/// sibling.
 const CE_L02_COUNT_POSITION_LICENSES: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_assignments)]
 extern "C" {
@@ -1253,12 +1301,27 @@ fn ce_l02_a_count_position_of_the_callee_licenses_the_sibling() {
     else {
         panic!("CE-L02 must emit");
     };
-    assert!(source.contains("src: &[i8]"), "{source}");
+    // R829-1 (relay 297, main 188): read_n::src is held beside
+    // `buf.as_mut_ptr()` at strncpy (the H-C7 shape: the written destination is
+    // not an address-of a frame binding); it keeps `*const i8` (was `&[i8]`),
+    // so the count position licenses no construction at the caller on this
+    // fixture and `base.offset(1)` is handed over raw.
+    assert!(
+        source.contains("unsafe fn read_n(src: *const i8, n: usize)"),
+        "{source}"
+    );
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("core::slice::from_raw_parts(base.offset(1), (n) as usize)"),
-        "the callee's count position names `n`, so the sibling is licensed:\n{source}"
+        flat.contains("read_n(base.offset(1), n)")
+            && !flat.contains("from_raw_parts(base.offset(1)"),
+        "the held formal takes the caller's raw argument unbuilt:\n{source}"
     );
+    let decisions = super::emit_tests::decisions_of(CE_L02_COUNT_POSITION_LICENSES);
+    let src = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "src" && *is_param)
+        .expect("read_n::src subject");
+    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
@@ -1319,6 +1382,10 @@ fn ce_v01_a_void_cast_counted_position_holds_the_thin_form() {
 /// `memcpy`'s shape (position 0 `Write` `ByteCount` returns-alias, position 1
 /// `Read` `ByteCount`, the exact count at argument 2); `memset(s, c, n)` writes
 /// exactly `n` bytes at position 0 and returns it.
+///
+/// R829-1 (relay 297, main 188): the memmove SOURCE is now held raw beside the
+/// written destination formal, so only the destination promotes; the name is
+/// kept.
 #[test]
 fn ce_m01_memmove_promotes_both_byte_slices_with_the_exact_count() {
     let source = r#"
@@ -1335,12 +1402,36 @@ fn ce_m01_memmove_promotes_both_byte_slices_with_the_exact_count() {
         }
     "#;
     let plans = attested_promotions(source);
-    assert_eq!(plans.len(), 2, "plans={plans:#?}");
+    // R829-1 (relay 297, main 188): shift::src is held beside the written
+    // formal `dest` at memmove (the caller's arrays are proven disjoint at
+    // `shift`'s call, not at memmove's); only the destination promotes, with
+    // the exact count (plans 2 → 1).
+    assert_eq!(plans.len(), 1, "plans={plans:#?}");
+    assert!(
+        plans[0].subject.contains("binding=2")
+            && matches!(
+                &plans[0].length,
+                super::decision::contract_extent::LengthPlan::Evidence {
+                    elements,
+                    source: super::decision::contract_extent::LengthSource::ExactContract {
+                        argument_index: 2,
+                        ..
+                    },
+                } if elements.trim() == "n"
+            ),
+        "the destination, with the exact count: {plans:#?}"
+    );
     let output = attested_emitted(source);
     assert!(output.contains("dest: &mut [u8]"), "{output}");
-    assert!(output.contains("src: &[u8]"), "{output}");
+    // R829-1 (relay 297, main 188): shift::src is held beside `dest` at
+    // memmove; it keeps `*const u8` (was `&[u8]`) and reaches memmove unbridged.
+    let shift_signature = output
+        .lines()
+        .find(|line| line.contains("fn shift("))
+        .unwrap_or_default();
+    assert!(shift_signature.contains("src: *const u8"), "{output}");
     assert!(
-        output.contains("memmove(dest.as_mut_ptr(), src.as_ptr(), n)"),
+        output.contains("memmove(dest.as_mut_ptr(), src, n)"),
         "{output}"
     );
     assert!(!output.contains("FALLBACK_SLICE_EXTENT"), "{output}");
@@ -1741,21 +1832,19 @@ fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
         .iter()
         .find(|(name, is_param, _)| name == "format" && *is_param)
         .expect("CE-A03 format subject");
-    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
-    // report 043.** The claim this witness was built for is unchanged and is
-    // asserted first: the contract-extent EVIDENCE arm still refuses here. What
-    // changed is the terminal form — the waiver now lifts the refused subject
-    // with `FALLBACK_SLICE_EXTENT`, receipted `fallback(extent-lift@…)`, so the
-    // old "stays thin" assertion no longer states the rule it was testing.
-    // The promotion is still not taken — that is this witness's claim — and
-    // the subject reaches the waiver rather than the contract's fat form.
-    // The candidate is still computed; what this witness is about is that the
-    // pending-sibling site REFUSES it, so the subject may not take the
-    // contract's fat form. It now reaches the waiver instead, and the receipt
-    // says `fallback` — no contract extent was taken.
+    // **Re-premised by R829-1 / R855-1 (the USER; the pair waiver ended),
+    // relay 297, main 188.** The claim this witness was built for is unchanged:
+    // the pending-sibling site REFUSES the contract-alone promotion, so the
+    // subject may not take the contract's fat form. What changed is the
+    // terminal form: the site is no longer lifted under the waiver
+    // (`<emitted>` with a `fallback` receipt, R481-1 / R482-3); it is held on
+    // the settled table and the subject is decided raw.
+    // R829-1 (relay 297, main 188): get_part::format is held beside `tmp`
+    // (sscanf's written scanf-tail argument, a fresh `malloc`) at sscanf;
+    // `<emitted>` → `held:pair-not-shown-disjoint`.
     assert_eq!(
-        format.2, "<emitted>",
-        "the waiver lifts what the contract may not: {decisions:#?}"
+        format.2, "held:pair-not-shown-disjoint",
+        "the pending site holds what the contract may not promote: {decisions:#?}"
     );
     let fabricated = table_of(CE_A03_CONTRACT_ALONE_PENDING, |table| {
         table
@@ -1894,19 +1983,19 @@ fn ce_a05_a_sibling_borrowed_through_a_deref_keeps_the_pending_hold() {
         .iter()
         .find(|(n, is_param, _)| n == "name" && *is_param)
         .expect("CE-A05 name subject");
-    // **Re-premised by R481-1 / R482-3 (the USER's extent-lift waiver), wave-4
-    // report 043.** The claim this witness was built for is unchanged and is
-    // asserted first: the contract-extent EVIDENCE arm still refuses here. What
-    // changed is the terminal form — the waiver now lifts the refused subject
-    // with `FALLBACK_SLICE_EXTENT`, receipted `fallback(extent-lift@…)`, so the
-    // old "stays thin" assertion no longer states the rule it was testing.
-    // The candidate is still computed; what this witness is about is that the
-    // pending-sibling site REFUSES it, so the subject may not take the
-    // contract's fat form. It now reaches the waiver instead, and the receipt
-    // says `fallback` — no contract extent was taken.
+    // **Re-premised by R829-1 / R855-1 / R857-1 (the USER; the pair waiver
+    // ended), relay 297, main 188.** The claim this witness was built for is
+    // unchanged: a sibling borrowed through a dereference is not a frame
+    // binding, so the site stays a pending sibling-overlap site and the
+    // contract-alone promotion is refused. What changed is the terminal form:
+    // the site is no longer lifted under the waiver (`<emitted>` with a
+    // `fallback` receipt, R481-1 / R482-3); the pending hold is now a decision,
+    // and the subject is decided raw (main's `r857_1_h3_control`).
+    // R829-1 (relay 297, main 188): countHardLinks::name is held beside
+    // `&mut (*h).st` at lstat; `<emitted>` → `held:pair-not-shown-disjoint`.
     assert_eq!(
-        name.2, "<emitted>",
-        "the waiver lifts what the contract may not: {decisions:#?}"
+        name.2, "held:pair-not-shown-disjoint",
+        "the pending site holds what the contract may not promote: {decisions:#?}"
     );
     let evidence = table_of(CE_A05_ADDR_THROUGH_DEREF_SIBLING, |table| {
         table
@@ -2717,39 +2806,43 @@ pub unsafe extern "C" fn StoreWide(mut s: *mut TableState) {
 /// walk could always have read but never asked for, and the CALLEE's parameter
 /// lifts because every one of its call sites now hands it a root that states an
 /// extent.
+///
+/// **R829-1 (relay 297, main 188), a cascade.** `StoreInner::storage` meets
+/// `BrotliWriteBits` beside the written formal `pos` and is held raw
+/// (`held:pair-not-shown-disjoint`); `StoreFromField::storage` is then handed
+/// to that held formal beside `&mut pos` (a local source, so the frame-binding
+/// premise does not cover it) and is held in the same fixpoint. A settled-table
+/// hold is not a local-callee-access-extent hold, so neither subject is a
+/// root-extent row on this fixture any more; the sibling-size claim needs a
+/// fixture without the written `pos`. The name is kept.
 #[test]
 fn w4b105_a_field_root_takes_its_sibling_size() {
     let rows = b1_rows(W4_B1_SIBLING_SIZE);
-    let local = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreFromField::storage"))
-        .unwrap_or_else(|| panic!("no StoreFromField::storage row: {rows:?}"));
-    assert_eq!(local.1, "lifted", "{rows:?}");
+    // R829-1 (relay 297, main 188): StoreInner::storage is held beside `pos` at
+    // BrotliWriteBits and StoreFromField::storage beside `&mut pos` at
+    // StoreInner; both root-extent rows (`lifted` / `sibling-size:…`, and the
+    // parameter's `every-caller-states-an-extent`) are gone.
+    assert!(rows.is_empty(), "no root-extent row: {rows:?}");
+    let decisions = super::emit_tests::decisions_of(W4_B1_SIBLING_SIZE);
+    let reason_of = |is_param: bool| {
+        decisions
+            .iter()
+            .find(|(name, param, _)| name == "storage" && *param == is_param)
+            .map(|(_, _, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("no storage subject (param={is_param}): {decisions:#?}"))
+    };
     assert_eq!(
-        local.2, "sibling-size:storage_:storage_size_",
-        "the extent is the sibling's, and the receipt names both fields: {rows:?}"
+        reason_of(true),
+        "held:pair-not-shown-disjoint",
+        "StoreInner::storage: {decisions:#?}"
     );
-    // **The parameter half, and the wall it actually meets — measured, not
-    // assumed.** With the sibling extent in place the call site DOES state one,
-    // so the parameter clears the root test it used to fail
-    // (`caller-root-states-no-extent` becomes `every-caller-states-an-extent`).
-    // It is then held one step later, by its OWN use: `BrotliWriteBits(pos,
-    // storage)` is an argument to a local callee that is still raw, and
-    // `slice_uses` is a pre-decision fact, so nothing this pass does can make
-    // that use renderable. The chain therefore lifts bottom-up or not at all —
-    // which is a different wall from the one the build was aimed at, and is
-    // recorded here as the next question rather than asserted away.
-    let parameter = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreInner::storage"))
-        .unwrap_or_else(|| panic!("no StoreInner::storage row: {rows:?}"));
-    assert_eq!(
-        parameter.2, "every-caller-states-an-extent",
-        "the root test now passes at the parameter: {rows:?}"
-    );
-    assert_eq!(
-        parameter.3, "slice-use-unsupported",
-        "and the remaining blocker is the use side: {rows:?}"
+    let local = reason_of(false);
+    assert!(
+        matches!(
+            local.as_str(),
+            "held:pair-not-shown-disjoint" | "held:into-held-formal"
+        ),
+        "StoreFromField::storage is held in the cascade: {local} {decisions:#?}"
     );
 }
 
@@ -2845,62 +2938,61 @@ fn w4b108_the_accessor_states_the_extent_of_what_it_returns() {
 /// before it is a null dereference — a bug in the INPUT program, on which crat
 /// owes no soundness. The rule needs no dominance proof; it needs the
 /// assignment to be the only one.
+///
+/// **R829-1 (relay 297, main 188), a cascade (as W4B1-5).**
+/// `StoreInnerDeclared::storage` meets `BrotliWriteBits` beside the written
+/// formal `pos` and is held raw (`held:pair-not-shown-disjoint`);
+/// `StoreDeclaredThenField::storage` is then handed to that held formal beside
+/// `&mut pos` (a local source) and is held in the same fixpoint. Neither is a
+/// root-extent row any more and the local keeps its raw declaration, so the
+/// sole-assignment walk and the `&mut []` emission need a fixture without the
+/// written `pos`; what still holds is that no slice is built on the null base.
+/// The name is kept.
 #[test]
 fn w4b109_a_null_declared_local_takes_its_sole_assignment() {
     let rows = b1_rows(W4_B1_DECLARED_NULL_FIELD);
-    let storage = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreDeclaredThenField::storage"))
-        .unwrap_or_else(|| panic!("no StoreDeclaredThenField::storage row: {rows:?}"));
-    // **Column one — the root.** The walk followed the assignment, the element
-    // type came from rustc because the declaration spells none, and the sibling
-    // arm answered: this root STATES an extent where it used to state nothing.
+    // R829-1 (relay 297, main 188): StoreInnerDeclared::storage is held beside
+    // `pos` at BrotliWriteBits and StoreDeclaredThenField::storage beside
+    // `&mut pos` at StoreInnerDeclared; both root-extent rows (`lifted` /
+    // `sibling-size:…`, and the parameter's `every-caller-states-an-extent`)
+    // are gone.
+    assert!(rows.is_empty(), "no root-extent row: {rows:?}");
+    let decisions = super::emit_tests::decisions_of(W4_B1_DECLARED_NULL_FIELD);
+    let reason_of = |is_param: bool| {
+        decisions
+            .iter()
+            .find(|(name, param, _)| name == "storage" && *param == is_param)
+            .map(|(_, _, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("no storage subject (param={is_param}): {decisions:#?}"))
+    };
     assert_eq!(
-        storage.2, "sibling-size:storage_:storage_size_",
-        "the walk followed the assignment and the sibling arm answered it: {rows:?}"
+        reason_of(true),
+        "held:pair-not-shown-disjoint",
+        "StoreInnerDeclared::storage: {decisions:#?}"
     );
-    // **Column two — and the row is still held, by the USE side.** The
-    // assignment `storage = (*s).storage_;` is itself a use of the binding with
-    // no slice image, and `slice_uses` is a pre-decision fact. So this shape
-    // carries report 049's C4 wall inside it: the extent is now known and the
-    // row cannot yet take the form. Recorded, not asserted away — the residue
-    // moves from "no extent" to "an extent this build cannot carry", which is
-    // precisely the distinction B1's two columns exist to keep.
-    assert_eq!(
-        storage.1, "lifted",
-        "main 071c (a): the assignment is the construction, so the root's own \
-         initializer no longer holds it: {rows:?}"
+    let local = reason_of(false);
+    assert!(
+        matches!(
+            local.as_str(),
+            "held:pair-not-shown-disjoint" | "held:into-held-formal"
+        ),
+        "StoreDeclaredThenField::storage is held in the cascade: {local} {decisions:#?}"
     );
-    // **And it must EMIT, not merely decide.** The first wiring of the
-    // admission produced two defects at once and both are pinned here: a
-    // declaration rendered `from_raw_parts_mut(0 as *mut T, 1024)` — a slice on
-    // a NULL base, instant UB of a kind §77 does not waive — and an assignment
-    // left as a raw pointer on the right of a `&mut [T]` binding, an ill-typed
-    // crate. The empty slice is what the binding holds until the assignment,
-    // and the assignment carries the construction.
+    // **And it must EMIT.** The first wiring of the admission rendered
+    // `from_raw_parts_mut(0 as *mut T, 1024)` — a slice on a NULL base, instant
+    // UB of a kind §77 does not waive. R829-1 (relay 297, main 188):
+    // StoreDeclaredThenField::storage is held beside `&mut pos` at
+    // StoreInnerDeclared; it keeps its raw declaration (was
+    // `let mut storage: &mut [u8] = &mut [];` with the construction on the
+    // assignment), and still no slice is built on the null base.
     let source = emitted(W4_B1_DECLARED_NULL_FIELD);
     assert!(
-        source.contains("let mut storage: &mut [u8] = &mut [];"),
-        "no slice may be built on a null base: {source}"
-    );
-    assert!(
-        source.contains("storage = core::slice::from_raw_parts_mut((*s).storage_,"),
-        "the assignment carries the construction: {source}"
+        source.contains("let mut storage = 0 as *mut uint8_t;"),
+        "the held local keeps its raw declaration: {source}"
     );
     assert!(
         !source.contains("from_raw_parts_mut(0 as *mut uint8_t"),
         "the null-base construction must be gone: {source}"
-    );
-    // The parameter one hop along still waits on ITS use: the argument's image
-    // at a callee that is still raw is wave-6s2's pass-on question, not this
-    // rule's, and main's answer does not reach it.
-    let parameter = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreInnerDeclared::storage"))
-        .unwrap_or_else(|| panic!("no StoreInnerDeclared::storage row: {rows:?}"));
-    assert_eq!(
-        parameter.2, "every-caller-states-an-extent",
-        "and the parameter one hop along clears the root test: {rows:?}"
     );
 }
 
@@ -3418,9 +3510,42 @@ pub unsafe extern "C" fn StoreExported(mut pos: *mut size_t, mut storage: *mut u
 "#;
 
 /// **W4B1-4 (R489-3(b)) — unmeasured is not evidence-absent.**
+///
+/// The census's A5 world (relay 297, main 188 class C): `StoreExported` is an
+/// uncalled `#[no_mangle]` entry, so its two formals are disjoint (R819) and
+/// `storage` beside the written `pos` at `BrotliWriteBits` is no pending site
+/// there; the open world, where no proof is final, holds it.
 #[test]
 fn w4b104_a_parameter_with_no_call_site_is_unmeasured_not_held() {
-    let rows = b1_rows(W4_B1_NO_CALL_SITE);
+    let rows = match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(W4_B1_NO_CALL_SITE),
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::A5Mode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>(
+                table
+                    .root_extents
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.subject.clone(),
+                            row.outcome.to_string(),
+                            row.extent.clone(),
+                            row.evidence.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    ) {
+        Ok(Ok(rows)) => rows,
+        other => panic!("the fixture yields a table: {other:?}"),
+    };
     let storage = rows
         .iter()
         .find(|(subject, ..)| subject.starts_with("StoreExported::storage"))

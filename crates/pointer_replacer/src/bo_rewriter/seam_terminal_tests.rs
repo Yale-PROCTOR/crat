@@ -429,14 +429,42 @@ fn seam_terminal_pair_raw_parameter_void_read_import_uses_its_placed_form() {
     );
 }
 
+/// **R829-1 (relay 297, main 188).** This pinned the A5 raw view of the
+/// delivered shared `caller::src` rendered from its input twin once the caller
+/// class reverted. `caller::src` is handed to `update`'s raw `src` beside
+/// `(*holder).data`, which `update` writes, and `entry` passes one object to
+/// both, so the source is held raw on the settled table before planning
+/// (`held:pair-not-shown-disjoint`): a reference view of it, reverted or not,
+/// and the pending receipt it carried are unreachable in an emitted program for
+/// this shape (the post-condition degrades a program that would keep one). It
+/// now pins the hold at the reverted state.
 #[test]
 fn seam_terminal_pair_raw_view_uses_the_reverted_source_form() {
-    r231_raw_role_case(true);
+    let fixture = r231_raw_role_case(true);
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
+    // reverted caller carries no pending receipt (the source is raw before any reversion).
+    assert!(fixture.pending.is_empty(), "{:?}", fixture.pending);
 }
 
+/// **R829-1 (relay 297, main 188).** This pinned the materialized reference view
+/// (`core::ptr::from_ref(src)`) of the delivered shared `caller::src` at
+/// `update`'s raw `src`. The source is held raw beside `(*holder).data`, which
+/// `update` writes (`held:pair-not-shown-disjoint`), so that view and the
+/// pending waiver it carried are unreachable in an emitted program for this
+/// shape (the post-condition degrades a program that would keep one). The raw
+/// callee role stays (the fixture asserts `update::src`'s `PairRawView`); the
+/// test now pins the hold.
 #[test]
 fn r231_fallback_has_a_raw_callee_role_and_materialized_view() {
-    r231_raw_role_case(false);
+    let fixture = r231_raw_role_case(false);
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
+    // reference view is materialized and no pending receipt exists.
+    assert!(
+        !fixture.output.contains("from_ref(src)"),
+        "{}",
+        fixture.output
+    );
+    assert!(fixture.pending.is_empty(), "{:?}", fixture.pending);
 }
 
 fn r231_raw_role_case(revert_caller: bool) -> R231CustodyFixture {
@@ -455,6 +483,19 @@ fn r231_raw_role_fixture_with_atom(
     // The scalar update body matches the established PAIR Copy-without-C9
     // fixture; the entry seeds one allocation into both the field-loaded
     // primary and the direct peer at the exact caller site under test.
+    //
+    // **R829-1 (relay 297, main 188).** This is `pending_hold_tests`' H1 shape:
+    // `caller::src` is handed to `update`'s raw `src` beside `(*holder).data`,
+    // which `update` writes, and `entry` passes one object to both, so the pair
+    // is not shown disjoint and the source is decided raw on the settled table
+    // before planning (`held:pair-not-shown-disjoint`). The shared-Ref source
+    // whose A5 T2 raw view, pending waiver and coverage gap this fixture pinned
+    // is unreachable in an emitted program for this shape (the post-condition
+    // degrades a program that would keep a pending site). The fixture now pins
+    // the hold: the held reason on the table, `update::src`'s raw PAIR role, the
+    // plan's pending receipts and coverage gaps at the requested revert state,
+    // and the emitted program (the round driver in the census's A5 world) with
+    // both `src` formals raw and no pending receipt.
     let input = "#![allow(dead_code, unused_unsafe)]\n\
         pub struct Holder { data: *mut i32 }\n\
         pub unsafe fn update(dst: *mut i32, src: *const i32) {\n\
@@ -472,8 +513,7 @@ fn r231_raw_role_fixture_with_atom(
         verify::type_checks_str(input),
         "PAIR source-reversion input type-checks"
     );
-    let (output, expectations, context, pending, gaps) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        let capture = super::ast_transform::capture_ast(tcx).expect("PAIR source-reversion AST");
+    let (pending, gaps) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (mut table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
             crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
             Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
@@ -499,119 +539,79 @@ fn r231_raw_role_fixture_with_atom(
             .and_then(|slot| ctx.model.get(&super::SlotRef::Local(source.fn_did, slot)))
             .copied();
         assert_eq!(kind, Some(super::SlotKind::Ref), "the PAIR source must be frozen model-Ref");
-        assert!(matches!(source_decision, Decision::Ref { mutable: false }),
-            "the original production PAIR source must be a decided shared Ref: {source_decision:?}");
-        let (raw_parameter, raw_decision) = table.entries.iter()
+        // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update;
+        // it was a decided shared Ref, it is now decided raw under the hold's own reason.
+        let Decision::Degraded(record) = source_decision else {
+            panic!("the PAIR source is held raw before planning: {source_decision:?}");
+        };
+        assert_eq!(record.reason.key(), "held:pair-not-shown-disjoint", "{source_decision:?}");
+        let detail = record.reason.detail();
+        assert!(detail.starts_with("pair-not-shown-disjoint:raw-boundary-site:caller:")
+            && detail.contains(":update:1:")
+            && detail.ends_with(";risky-siblings=arg0"),
+            "the hold names update's raw src and the written (*holder).data: {detail}");
+        let (_, raw_decision) = table.entries.iter()
             .find(|(subject, _)| subject.label == "update::src").expect("exact PAIR raw parameter");
         assert!(matches!(raw_decision, Decision::Degraded(record) if record.reason == DegradeReason::PairRawView),
             "the callee must have the actual PAIR raw-view role: {raw_decision:?}");
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans).expect("PAIR source-reversion terminal plan");
-        let caller_class = SignatureClassId::of(source.fn_did);
-        let update_class = SignatureClassId::of(raw_parameter.fn_did);
-        for id in [caller_class, update_class] {
-            assert!(emission.plan.class_finalization.classes.get(&id)
-                .is_some_and(super::plan::SignatureClassPlan::is_ready),
-                "both actual classes must be ready before the source revert: {:?}",
-                emission.plan.class_finalization);
-        }
-        let calls = emission.plan.terminal_call_plans.a5_raw_calls.iter()
-            .filter(|call| call.caller == source.fn_did && call.callee == raw_parameter.fn_did)
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1, "one canonical A5 T2 call must survive terminal planning");
-        assert!(calls[0].views.iter().any(|view| view.argument_index == 1
-            && view.raw_expression.contains("core::ptr::from_ref(src)")
-            && view.source_node == Some((source.fn_did, source.hir_id))
-            && view.expected_form == Form::Raw
-            && view.adapted_expression == super::c9::A5_RAW_VALUE_PLACEHOLDER),
-            "the baseline carrier must actually require the shared safe source: {:?}", calls[0]);
-        assert!(emission.plan.bridge_events(&std::collections::BTreeSet::new()).iter().any(|event| {
-            event.site.owner_class == update_class && event.site.bridge_kind == "a5-site-proof-t2-fallback"
-                && event.retention == super::bridge_receipt::BridgeRetentionTier::T2
-                && event.waiver_id.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
-        }), "the raw-view selection must carry its actual T2 receipt");
-        assert!(emission.plan.class_finalization.classes[&update_class].sites.iter()
-            .filter(|site| site.key.bridge_kind == "a5-site-proof-t2-fallback")
-            .all(|site| matches!(site.state, super::plan::ClassSiteState::EditReady)),
-            "no A5 T2 obligation is a zero-syntax receipt");
+            &ctx.retained_c9_plans).expect("PAIR held-source terminal plan");
         let mut withheld = emission.plan.held_classes();
-        if revert_caller { withheld.insert(caller_class); }
+        if revert_caller { withheld.insert(SignatureClassId::of(source.fn_did)); }
         let atoms = if revert_atom {
             table.seams.raw_boundary_atom_groups.get(&(source.fn_did, source.hir_id))
                 .into_iter().flatten().map(|atom| atom.id.clone()).collect::<std::collections::BTreeSet<_>>()
         } else { std::collections::BTreeSet::new() };
-        if revert_atom { assert!(!atoms.is_empty(), "the exact source must have an actual atom group"); }
-        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
-            &withheld, &atoms, &table).expect("actual caller/class/atom reversion");
-        assert_eq!(reverts.keeps(caller_class), !revert_caller);
-        assert!(reverts.keeps(update_class), "the target class must remain live for this RFF witness");
-        let (files, _, _, _) = super::ast_transform::ast_emitted_files_from(tcx, &capture, &reverts,
-            emission.plan.root_file.as_ref(), &table, Some(&emission.plan.terminal_call_plans))
-            .expect("PAIR source-reversion emission");
-        use super::bridge_custody_match::{BridgeExpectation, BridgeKind, SiteAnchor, BridgeCustodyContext};
-        let source_file = tcx.sess.source_map().lookup_source_file(calls[0].call_span.lo());
-        let start = source_file.start_pos.0;
-        let call_span = super::delivery_custody::ByteSpan {
-            lo: calls[0].call_span.lo().0 - start, hi: calls[0].call_span.hi().0 - start,
-        };
-        let expectations = emission.plan.bridge_events_with_atoms(&withheld, &atoms).into_iter()
-            .filter(|event| event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
-                && event.state == super::bridge_receipt::BridgeReceiptState::Applied
-                && event.site.owner_class == update_class
-                && event.site.bridge_kind == "a5-site-proof-t2-fallback")
-            .map(|event| {
-                let span = super::delivery_custody::ByteSpan { lo: event.site.lo, hi: event.site.hi };
-                let anchor = if span == call_span {
-                    SiteAnchor::Call { span, argument_indices: calls[0].views.iter().map(|view| view.argument_index).collect() }
-                } else {
-                    let proof = table.seams.overlap_proofs.iter().find(|proof|
-                        proof.caller == source.fn_did && proof.callee == raw_parameter.fn_did
-                            && proof.span.lo().0 - start == span.lo && proof.span.hi().0 - start == span.hi)
-                        .expect("Applied logical argument has its exact typed proof");
-                    SiteAnchor::Argument { span, argument_index: proof.index }
-                };
-                BridgeExpectation { pending_source: None, identity: format!("{:?}", event.site),
-                    kind: BridgeKind::A5SiteProofT2Fallback,
-                    caller: tcx.def_path_str(source.fn_did.to_def_id()),
-                    callee: tcx.def_path_str(raw_parameter.fn_did.to_def_id()),
-                    anchor, c9_stamp: None, tier: "T2".into(), waiver_id: event.waiver_id }
-            }).collect::<Vec<_>>();
-        assert_eq!(expectations.len(), 2, "one physical call and one logical position are Applied");
-        (files.into_values().next().expect("PAIR source-reversion output"), expectations,
-            BridgeCustodyContext { source_global_start: start, ..Default::default() },
-            emission.plan.pending_sibling_receipts_with_atoms(&withheld, &atoms), emission.plan.sibling_coverage_gaps_with_atoms(&withheld, &atoms))
+        (emission.plan.pending_sibling_receipts_with_atoms(&withheld, &atoms),
+            emission.plan.sibling_coverage_gaps_with_atoms(&withheld, &atoms))
     }).expect("PAIR source-reversion compiler context");
-    let declarations = inventory_source("reverted-pair-source.rs", &output)
-        .expect("independent PAIR source-reversion declarations");
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
+    // emitted program (the round driver, the census's A5 world) carries the hold, keeps
+    // both `src` formals raw, and has no pending receipt (it was the caller's `&i32`).
+    let (output, reasons, emitted_pending) = match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => (
+            source,
+            degradations
+                .iter()
+                .map(|d| (d.subject.clone(), d.reason.key()))
+                .collect::<Vec<_>>(),
+            raw_boundary_artifacts.pending_sibling_receipts.len(),
+        ),
+        other => panic!("the held PAIR shape must emit: {other:?}"),
+    };
+    println!("R231 emitted (caller_reverted={revert_caller}):\n{output}");
+    assert!(
+        verify::type_checks_str(&output),
+        "the held PAIR output must type/borrow-check: {output}"
+    );
+    let source_reason = reasons
+        .iter()
+        .find(|(subject, _)| subject.starts_with("caller::src"))
+        .map(|(_, key)| *key);
+    assert_eq!(
+        source_reason,
+        Some("held:pair-not-shown-disjoint"),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        emitted_pending, 0,
+        "the emitted program's pending table reads 0"
+    );
+    let declarations = inventory_source("held-pair-source.rs", &output)
+        .expect("independent held PAIR declarations");
     let caller = declarations
         .iter()
         .find(|row| row.owner == "caller" && row.parameter_index == Some(2))
         .expect("original caller parameter survives");
-    if revert_caller || revert_atom {
-        assert!(
-            matches!(
-                &caller.type_shape,
-                TypeShape::RawPointer { mutable: false, .. }
-            ),
-            "{output}"
-        );
-    } else {
-        assert!(
-            matches!(
-                &caller.type_shape,
-                TypeShape::Reference { mutable: false, .. }
-            ),
-            "{output}"
-        );
-    }
-    let callee = declarations
-        .iter()
-        .find(|row| row.owner == "update" && row.parameter_index == Some(1))
-        .expect("surviving update parameter");
     assert!(
         matches!(
-            &callee.type_shape,
-            TypeShape::Reference { mutable: true, .. }
+            &caller.type_shape,
+            TypeShape::RawPointer { mutable: false, .. }
         ),
         "{output}"
     );
@@ -626,30 +626,8 @@ fn r231_raw_role_fixture_with_atom(
         ),
         "{output}"
     );
-    if revert_caller || revert_atom {
-        assert!(
-            output
-                .lines()
-                .any(|line| line.contains("let __crat_a5_raw_") && line.contains(" = src;")),
-            "the actual raw-view temporary uses its input-form twin: {output}"
-        );
-        assert!(!output.contains("core::ptr::from_ref(src)"), "{output}");
-    } else {
-        assert!(
-            output.contains("let __crat_a5_raw_") && output.contains("core::ptr::from_ref(src)"),
-            "{output}"
-        );
-    }
-    println!("R231 emitted (caller_reverted={revert_caller}):\n{output}");
-    assert!(
-        verify::type_checks_str(&output),
-        "PAIR input-form output must type/borrow-check: {output}"
-    );
     R231CustodyFixture {
-        input: input.into(),
         output,
-        expectations,
-        context,
         pending,
         gaps,
     }
@@ -688,111 +666,60 @@ fn r231_restored_cast_operand_keeps_the_inner_reference() {
     .expect("instrument-only compiler facts, no model solve");
 }
 
+/// The R231 shape under R829-1 (relay 297, main 188): the emitted program (the
+/// round driver in the census's A5 world), and the plan's pending receipts and
+/// coverage gaps at the fixture's revert state. The bridge expectations and
+/// custody context it carried were the A5 T2 raw view of the delivered shared
+/// source, which the hold makes unreachable for this shape.
 struct R231CustodyFixture {
-    input: String,
     output: String,
-    expectations: Vec<super::bridge_custody_match::BridgeExpectation>,
-    context: super::bridge_custody_match::BridgeCustodyContext,
     pending: Vec<super::plan::sibling_overlap::PendingSite>,
     gaps: Vec<super::decision::sibling_overlap::CoverageGapReceipt>,
 }
 
+/// **R829-1 (relay 297, main 188).** This removed the rendered raw-view
+/// temporary of the delivered shared `caller::src` (`core::ptr::from_ref(src)`)
+/// while keeping its Applied A5 T2 receipts, and showed bridge custody fails
+/// closed. `caller::src` is now held raw beside `(*holder).data`, which `update`
+/// writes (`held:pair-not-shown-disjoint`): that reference view, its receipts
+/// and the pending waiver beside it are unreachable in an emitted program for
+/// this shape (the post-condition degrades a program that would keep a pending
+/// site), so there is no rendered view to fault. The test now pins the hold.
 #[test]
 fn r231_deliberate_fault_receipt_without_render_is_caught_by_bridge_custody() {
-    use super::{bridge_custody_match as custody, bridge_custody_syntax as syntax};
     let fixture = r231_raw_role_case(false);
-    let original = syntax::inventory_source("r231-input.rs", &fixture.input).unwrap();
-    let emitted = syntax::inventory_source("r231-output.rs", &fixture.output).unwrap();
-    let check = |output: &str, inventory: &syntax::Inventory| {
-        custody::compare(custody::BridgeCustodyInput {
-            original: &original,
-            emitted: inventory,
-            original_source: &fixture.input,
-            emitted_source: output,
-            expectations: &fixture.expectations,
-            context: &fixture.context,
-        })
-    };
-    let green = check(&fixture.output, &emitted);
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
+    // reference view of it is rendered, and neither a pending receipt nor a coverage gap exists.
     assert!(
-        green.data && green.rows.len() == 2,
-        "baseline actual emission: {green:#?}"
-    );
-    let binding = emitted
-        .bindings
-        .iter()
-        .find(|binding| {
-            binding.owner == "caller"
-                && binding.generated == Some(syntax::GeneratedKind::RawTemporary)
-        })
-        .expect("one actual raw-view binding");
-    let call = emitted
-        .calls
-        .iter()
-        .find(|call| {
-            call.owner == "caller"
-                && call.arguments.iter().any(|argument| {
-                    argument
-                        .binding
-                        .as_ref()
-                        .is_some_and(|bound| bound.id == binding.id)
-                })
-        })
-        .expect("raw-view actual call use");
-    let argument = call
-        .arguments
-        .iter()
-        .find(|argument| {
-            argument
-                .binding
-                .as_ref()
-                .is_some_and(|bound| bound.id == binding.id)
-        })
-        .unwrap();
-    let mut edits = vec![(binding.declaration_span, ""), (argument.span, "src")];
-    edits.sort_by_key(|(span, _)| std::cmp::Reverse(span.lo));
-    let mut fault = fixture.output.clone();
-    for (span, replacement) in edits {
-        fault.replace_range(span.lo as usize..span.hi as usize, replacement);
-    }
-    assert!(
-        verify::type_checks_str(&fault),
-        "the deliberate fault must evade type checking: {fault}"
-    );
-    let fault_inventory = syntax::inventory_source("r231-fault.rs", &fault).unwrap();
-    let caught = check(&fault, &fault_inventory);
-    println!(
-        "R231 deliberate-fault check: receipt-without-render caught by bridge custody: {caught:#?}"
+        !fixture.output.contains("from_ref(src)"),
+        "{}",
+        fixture.output
     );
     assert!(
-        !caught.data
-            && caught
-                .rows
-                .iter()
-                .all(|row| row.status == custody::ReceiptStatus::Missing),
-        "Applied receipts without rendered views must fail closed: {caught:#?}"
-    );
-    assert!(
-        check(&fixture.output, &emitted).data,
-        "fault injection leaves the authoritative output and receipts unchanged"
+        fixture.pending.is_empty() && fixture.gaps.is_empty(),
+        "{:?} {:?}",
+        fixture.pending,
+        fixture.gaps
     );
 }
 
+/// **R829-1 (relay 297, main 188).** This pinned the `T2-pending` stamp of the
+/// delivered `caller::src` handed to `update`'s raw `src`. Under R829-1 the
+/// source is held raw beside `(*holder).data`, which `update` writes
+/// (`held:pair-not-shown-disjoint`), so a pending stamp is unreachable in an
+/// emitted program for this shape (the post-condition degrades a program that
+/// would keep one). The test now pins the hold: no pending receipt, live or
+/// reverted.
 #[test]
 fn r233_pending_stamp_tracks_the_actual_source_and_callee_interfaces() {
     let live = r231_raw_role_case(false);
-    assert_eq!(
-        live.pending.len(),
-        1,
-        "the delivered source parameter into the raw callee carries one pending waiver"
-    );
-    let receipt = &live.pending[0];
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
+    // live plan carries no T2-pending stamp (it carried one for the delivered source).
     assert!(
-        receipt.site.is_ok(),
-        "exact compiler site mapping: {receipt:#?}"
+        live.pending.is_empty(),
+        "the held source carries no pending waiver: {:?}",
+        live.pending
     );
-    assert_eq!(receipt.receipt.potential.source.label(), "caller::src");
-    assert_eq!(receipt.receipt.tier, "T2-pending");
     let reverted = r231_raw_role_case(true);
     assert!(
         reverted.pending.is_empty(),
@@ -800,6 +727,14 @@ fn r233_pending_stamp_tracks_the_actual_source_and_callee_interfaces() {
     );
 }
 
+/// **R829-1 (relay 297, main 188).** This pinned the terminal coverage gap of
+/// the delivered `caller::src` whose source correspondence was made unknown.
+/// Under R829-1 the source is held raw beside `(*holder).data`, which `update`
+/// writes (`held:pair-not-shown-disjoint`), on the settled table before the
+/// injection lands, so it is not a delivered pending site and the gap (like the
+/// pending receipt it stands for) is unreachable in an emitted program for this
+/// shape (the post-condition degrades a program that would keep one). The test
+/// now pins the hold: no pending receipt and no gap, live or reverted.
 #[test]
 fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
     let live = r231_raw_role_fixture(false, true);
@@ -807,15 +742,12 @@ fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
         live.pending.is_empty(),
         "unknown source correspondence does not invent a waiver"
     );
-    assert_eq!(
-        live.gaps.len(),
-        1,
-        "planning must preserve the exact unresolved delivered site"
-    );
-    assert_eq!(live.gaps[0].potential.source.label(), "caller::src");
-    assert_eq!(
-        live.gaps[0].reason,
-        "sibling-source-bridge-custody-unresolved"
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
+    // live plan has no unresolved delivered site (it had one gap for the delivered source).
+    assert!(
+        live.gaps.is_empty(),
+        "a held source has no reference bridge custody to leave unresolved: {:?}",
+        live.gaps
     );
     let reverted = r231_raw_role_fixture(true, true);
     assert!(
@@ -824,76 +756,48 @@ fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
     );
 }
 
+/// **R829-1 (relay 297, main 188).** This matched the pending waiver of the
+/// delivered `caller::src` (a `WaivedPending` custody row) beside its two
+/// materialized raw views. Under R829-1 the source is held raw beside
+/// `(*holder).data`, which `update` writes (`held:pair-not-shown-disjoint`), so
+/// the pending waiver and its custody row are unreachable in an emitted program
+/// for this shape (the post-condition degrades a program that would keep one).
+/// The test now pins the hold: the plan has no pending receipt to add to custody
+/// (the fixture asserts the emitted program's pending table reads 0).
 #[test]
 fn r233_actual_pending_bridge_custody_tracks_the_materialized_view() {
-    use super::{bridge_custody_match as custody, bridge_custody_syntax as syntax};
     let fixture = r231_raw_role_case(false);
-    assert_eq!(fixture.pending.len(), 1);
-    let mut expectations = fixture.expectations.clone();
-    for pending in &fixture.pending {
-        let site = pending.site.as_ref().expect("exact compiler pending site");
-        expectations.push(custody::BridgeExpectation {
-            pending_source: None,
-            identity: site.receipt_key(),
-            kind: custody::BridgeKind::SiblingOverlapPending,
-            caller: pending.receipt.potential.site.caller.clone(),
-            callee: pending.receipt.potential.site.callee.path.clone(),
-            anchor: custody::SiteAnchor::Argument {
-                span: super::delivery_custody::ByteSpan {
-                    lo: site.lo,
-                    hi: site.hi,
-                },
-                argument_index: pending.receipt.potential.site.argument_index,
-            },
-            c9_stamp: None,
-            tier: pending.receipt.tier.into(),
-            waiver_id: Some(pending.receipt.waiver.into()),
-        });
-    }
-    let original = syntax::inventory_source("r233-original.rs", &fixture.input).unwrap();
-    let emitted = syntax::inventory_source("r233-emitted.rs", &fixture.output).unwrap();
-    let result = custody::compare(custody::BridgeCustodyInput {
-        original: &original,
-        emitted: &emitted,
-        original_source: &fixture.input,
-        emitted_source: &fixture.output,
-        expectations: &expectations,
-        context: &fixture.context,
-    });
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
+    // pending receipt exists (it had one, matched as WaivedPending).
     assert!(
-        result.data,
-        "actual S raw views and pending waiver must agree with the tree: {result:#?}"
+        fixture.pending.is_empty(),
+        "the held source has no pending waiver: {:?}",
+        fixture.pending
     );
-    assert_eq!(
-        result
-            .rows
-            .iter()
-            .filter(|row| row.status == custody::ReceiptStatus::MatchedRaw)
-            .count(),
-        2
-    );
-    assert_eq!(
-        result
-            .rows
-            .iter()
-            .filter(|row| row.status == custody::ReceiptStatus::WaivedPending)
-            .count(),
-        1
+    assert!(
+        !fixture.output.contains("from_ref(src)"),
+        "{}",
+        fixture.output
     );
 }
 
+/// **R829-1 (relay 297, main 188).** This pinned that reverting the delivered
+/// `caller::src`'s atom removed only its pending receipt and kept the raw-view
+/// carrier Applied. Under R829-1 the source is held raw beside
+/// `(*holder).data`, which `update` writes (`held:pair-not-shown-disjoint`),
+/// before any atom is reverted, so there is no pending receipt to remove: that
+/// receipt is unreachable in an emitted program for this shape (the
+/// post-condition degrades a program that would keep one). The test now pins
+/// the hold at the atom-reverted state: no pending receipt and no gap.
 #[test]
 fn r233_source_atom_reversion_removes_only_its_pending_receipt() {
     let atom = r231_raw_role_fixture_with_atom(false, false, true);
+    // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
+    // raw-view carrier count is no longer pinned (it was 2 Applied rows of the delivered source).
     assert!(
         atom.pending.is_empty(),
         "the source returned to raw while its class stays ready: {:?}",
         atom.pending
-    );
-    assert_eq!(
-        atom.expectations.len(),
-        2,
-        "the actual raw-view carrier remains Applied using its input twin"
     );
     let gap = r231_raw_role_fixture_with_atom(false, true, true);
     assert!(

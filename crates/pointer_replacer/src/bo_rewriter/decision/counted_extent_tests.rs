@@ -114,6 +114,12 @@ mod tests {
         assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
     }
 
+    /// Restated (R829-1, relay 297): `strncpy`'s destination
+    /// `dst.as_mut_ptr()` (arg0, the caller's own array through a method call,
+    /// not an address-of, so the frame-binding premise does not exempt it) is
+    /// written and not shown disjoint from `p`, so `p` is held raw on the
+    /// settled table: no `slice-shared` T1 receipt forms and the formal keeps
+    /// its raw type.
     #[test]
     fn w5c_wc2_existing_t1_counted_foreign_control() {
         let input = r#"
@@ -142,17 +148,24 @@ mod tests {
             .iter()
             .filter(|p| p.source_form == "slice-shared")
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1, "{:#?}", table.slice_use_receipts);
-        assert_eq!(
-            rows[0].retention,
-            crate::bo_rewriter::mechanical_receipt::MechanicalRetention::T1
+        // R829-1 (relay 297, main 188): caller::p is held beside `dst.as_mut_ptr()` (arg0) at strncpy; one T1 `slice-shared` receipt → none, and p is held:pair-not-shown-disjoint.
+        assert!(rows.is_empty(), "{:#?}", table.slice_use_receipts);
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == "caller::p")
+            .unwrap();
+        assert!(
+            matches!(decision, super::super::Decision::Degraded(d) if matches!(&d.reason, super::super::DegradeReason::PairNotShownDisjoint { detail } if detail.contains("risky-siblings=arg0"))),
+            "{subject:?} {decision:?}"
         );
         let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(input).unwrap();
+        // R829-1 (relay 297, main 188): caller::p is held beside `dst.as_mut_ptr()` at strncpy; `p: &[i8]` → `p: *const i8`.
         assert!(
             emitted
                 .split_whitespace()
                 .collect::<String>()
-                .contains("fncaller(p:&[i8]"),
+                .contains("fncaller(p:*consti8"),
             "{emitted}"
         );
         assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));

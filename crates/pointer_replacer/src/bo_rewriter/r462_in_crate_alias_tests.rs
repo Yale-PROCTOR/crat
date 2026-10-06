@@ -22,6 +22,30 @@ fn decisions(input: &str, function: &str) -> Vec<(String, Decision)> {
     .expect("fixture compiler context")
 }
 
+/// [`decisions`] in the census's A5 world (the precise replay against the
+/// frozen benchmark graph; relay 297, main 188 class C).
+fn census_world_decisions(input: &str, function: &str) -> Vec<(String, Decision)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        let mut out: Vec<(String, Decision)> = table
+            .entries
+            .iter()
+            .filter(|(subject, _)| tcx.item_name(subject.fn_did.to_def_id()).as_str() == function)
+            .filter_map(|(subject, decision)| Some((subject.param_name.clone()?, decision.clone())))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    })
+    .expect("fixture compiler context")
+}
+
 const INPUT: &str = r#"
 #![allow(dead_code, unused_mut, non_snake_case, non_camel_case_types)]
 #[repr(C)] pub struct Z { pub sign: i32, pub used: usize }
@@ -72,11 +96,17 @@ fn wave6o_in_crate_aliased_call_refuses_the_exported_pair() {
 
 /// The control: with distinct arguments only, the pair is certified under the
 /// waiver (external callers) plus the in-crate evidence, and stays `&mut`.
+///
+/// Runs in the census's A5 world (relay 297, main 188 class C): the open
+/// world holds `a` and `b` at `zcmpmag(a, b)`, each beside the other (written
+/// there), as pending-plan holds (`held:pair-not-shown-disjoint`, `;planned`),
+/// a world the census never runs in.
 #[test]
 fn wave6o_in_crate_distinct_calls_keep_the_exported_pair() {
     let input = INPUT.replace("    r += zcmp(&mut x, &mut x);\n", "");
     assert!(verify::type_checks_str(&input));
-    let ds = decisions(&input, "zcmp");
+    // The census's A5 world (relay 297, main 188 class C): the open world holds this site pending.
+    let ds = census_world_decisions(&input, "zcmp");
     assert!(
         both_mut_refs(&ds),
         "distinct in-crate arguments keep the pair: {ds:?}"

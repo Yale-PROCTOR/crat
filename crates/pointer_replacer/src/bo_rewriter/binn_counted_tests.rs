@@ -330,22 +330,37 @@ pub unsafe fn dup_bytes(mut p: *mut core::ffi::c_void, mut n: i32) -> *mut core:
 }
 "#;
 
+/// Restated (R829-1, relay 297): `memcpy`'s destination `dest` (arg0, a fresh
+/// `malloc` result) is written and not shown disjoint from `src`, so the source
+/// is held raw on the settled table and the counted read view no longer forms.
+/// The emitted program keeps its raw formal and still runs as the input does.
 #[test]
 fn w6v2_foreign_copy_source_counted_by_a_sibling_delivers() {
     let rows = super::emit_tests::decisions_of(MEMDUP);
+    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` (arg0, a fresh malloc) at memcpy; delivered `<emitted>` → held:pair-not-shown-disjoint.
     assert!(
-        delivers(&rows, "src"),
-        "the counted copy source delivers: {rows:?}"
+        !delivers(&rows, "src"),
+        "the copy source beside a written destination is held: {rows:?}"
+    );
+    assert_eq!(
+        reason(&rows, "src"),
+        "held:pair-not-shown-disjoint",
+        "{rows:?}"
     );
     let source = super::emit_tests::ast_emitted_source_of(MEMDUP).unwrap();
     let c = compact(&source);
+    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` at memcpy; `Option<&[u8]>` → the raw formal, and no count snapshot at the raw caller.
     assert!(
-        c.contains("fnbinn_memdup(mutsrc:Option<&[u8]>,mutsize:i32)"),
-        "null-tested counted read view: {source}"
+        c.contains("fnbinn_memdup(mutsrc:*mutcore::ffi::c_void,mutsize:i32)"),
+        "the held source keeps its raw formal: {source}"
     );
     assert!(
-        c.contains("(__crat_cv_1)asusize"),
-        "the raw caller's count is the snapshot of the sibling: {source}"
+        !c.contains("Option<&[u8]>"),
+        "no counted read view: {source}"
+    );
+    assert!(
+        !c.contains("__crat_cv_1"),
+        "no counted view, so the raw caller snapshots no count: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
     let main = r#"fn main() { unsafe {
@@ -385,16 +400,23 @@ fn w6v2_foreign_copy_destination_position_stays_held() {
     );
 }
 
-/// The emitted copy site: the shared byte view reaches `memcpy`'s source
-/// position through the row's bridge, and nothing is fabricated.
+/// The emitted copy site, and nothing is fabricated. Restated (R829-1, relay
+/// 297): the source is held raw beside `memcpy`'s written destination, so no
+/// shared byte view reaches the source position and the row has nothing to
+/// bridge; the call passes the raw formal as written.
 #[test]
 fn w6v2_foreign_copy_site_is_bridged_by_the_row() {
     let source = super::emit_tests::ast_emitted_source_of(MEMDUP).unwrap();
     assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
     let c = compact(&source);
+    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` (arg0, a fresh malloc) at memcpy; the row's `as_deref` bridge → the raw source passed unbridged.
     assert!(
-        c.contains("memcpy(dest,src.as_deref().map_or(core::ptr::null::<core::ffi::c_void>(),|slice|slice.as_ptr().cast::<core::ffi::c_void>()),sizeasu64)"),
-        "the row bridges the source position: {source}"
+        c.contains("memcpy(dest,src,sizeasu64)"),
+        "the held source reaches the source position raw: {source}"
+    );
+    assert!(
+        !c.contains("src.as_deref()"),
+        "no row bridge on a raw source: {source}"
     );
 }
 

@@ -102,6 +102,39 @@ pub(super) fn proofs(input: &str) -> Vec<(String, Result<usize, super::slice_inp
     })
     .unwrap()
 }
+/// [`proofs`] over the census's A5 world's table (the precise replay against
+/// the frozen benchmark graph; relay 297, main 188 class C).
+fn census_world_proofs(input: &str) -> Vec<(String, Result<usize, super::slice_input::Hold>)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let functions = tcx
+            .hir_body_owners()
+            .filter(|d| matches!(tcx.def_kind(*d), rustc_hir::def::DefKind::Fn))
+            .collect::<Vec<_>>();
+        let facts = super::emitability::collect(tcx, &functions);
+        let program = crate::bo_rewriter::collect_program(tcx);
+        let fat = crate::bo_rewriter::fat_facts::FatFacts::from_program(&program);
+        table
+            .entries
+            .iter()
+            .filter(|(s, _)| matches!(s.kind, super::SubjectKind::Param { .. }) && s.ptr_depth == 1)
+            .map(|(s, _)| {
+                (
+                    s.label.clone(),
+                    super::slice_input::prove(tcx, s, &facts, &fat).map(|p| p.members.len()),
+                )
+            })
+            .collect()
+    })
+    .unwrap()
+}
 pub(super) fn input_extents(
     input: &str,
 ) -> Vec<(String, Result<Extent, super::slice_input::Hold>)> {
@@ -215,7 +248,11 @@ fn w5c_slice_input_unsupplied_caller_adapts_with_the_companion() {
             "StitchToPreviousBlockH2(self_0, n, n, p, 4095);",
             "StitchToPreviousBlockH2(self_0, n, n, p, p, p, 4095);",
         );
-    let proofs = proofs(&no_companion);
+    // The census's A5 world (relay 297, main 188 class C): the open world holds this site pending.
+    // (On `no_companion` the open world's `decide_table` fails
+    // `additive-family-preservation-invariant:unrestored:[(8, 1), (8, 4), (8, 6)]`;
+    // the proofs read only the table's subject list.)
+    let proofs = census_world_proofs(&no_companion);
     assert_eq!(
         proof_of(&proofs, "StitchToPreviousBlockH2::ringbuffer"),
         &Err(Hold::CallerNotSupplied)
