@@ -70,7 +70,17 @@ fn reason_of<'a>(
 /// their reference forms.
 #[test]
 fn slicecursor_a_measured_only_end_sentinel_is_held_raw() {
-    let (source, degradations) = emitted(REDUCTION);
+    // The census's A5 world (main 186, class C): with R829-1's hold on the
+    // settled table, the open world's proof-site assertion trips on the A5 peers
+    // the held table plans; the census never runs there.
+    let (source, degradations) = match super::rewrite_m1_census_world(REDUCTION) {
+        RewriteOutcome::Emitted {
+            source,
+            degradations,
+            ..
+        } => (source, degradations),
+        _ => panic!("the reduction must emit"),
+    };
     assert_eq!(
         reason_of(&degradations, "EmitUncompressedMetaBlock::end"),
         Some(&DegradeReason::AddressObservationOnly),

@@ -3037,10 +3037,13 @@ fn w4b114_a_parameter_row_names_its_callers_roots() {
 /// ended in so "does it fire, and do those rows deliver?" is a table read.
 #[test]
 fn w4b115_the_admission_is_a_census_row() {
+    // The census's A5 world (main 186, class C): with R829-1's hold on the
+    // settled table, the open world's proof-site assertion trips on the A5 peers
+    // the held table plans; the census never runs there.
     let super::RewriteOutcome::Emitted {
         raw_boundary_artifacts,
         ..
-    } = super::rewrite_m1(W4_B1_DECLARED_NULL_FIELD)
+    } = super::rewrite_m1_census_world(W4_B1_DECLARED_NULL_FIELD)
     else {
         panic!("W4B1-15 must emit");
     };
