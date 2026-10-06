@@ -8297,6 +8297,14 @@ fn finish_decide<'tcx>(
     // copies).
     let certificate_ctors = ctors.clone();
     let certificate_subjects = subjects.clone();
+    // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
+    // once: they read the program, not a decision.
+    let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
+    // The formals the backstop held at the current family stage (see below).
+    let mut released_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashSet<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)>,
+    ) = (None, Default::default());
     let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
     let mut predecessor: Option<additive::StageSnapshot> = None;
     let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
@@ -8696,7 +8704,7 @@ fn finish_decide<'tcx>(
                 | decision::Decision::Degraded(_) => {}
             }
         }
-        if let Some(relaxed) = decision::local_callee_extent::relaxed_by_decisions(
+        let relaxed = decision::local_callee_extent::relaxed_by_decisions(
             tcx,
             &subjects,
             &facts,
@@ -8705,9 +8713,10 @@ fn finish_decide<'tcx>(
             &fat,
             &decided,
             &local_callee_extent_subjects,
-        ) {
+        );
+        if let Some(relaxed) = &relaxed {
             let ctx = decision::Ctx {
-                local_callee_extent: &relaxed,
+                local_callee_extent: relaxed,
                 ..ctx_of!(
                     decision::RefGate::LiftAdaptable,
                     Some(&coconv),
@@ -8718,6 +8727,53 @@ fn finish_decide<'tcx>(
                 )
             };
             table = decision::decide(&ctx, &subjects);
+        }
+        // **R857-2 / R858-4 (USER via the seat; reading (A), era-5c 151; fan-out
+        // 074) — the backstop, on the settled table, before anything is planned.**
+        // A lent formal handed to an indirect call whose program-assigned target
+        // releases it is decided raw (`held:released-through-indirect-call`) where
+        // this table delivers it; one re-decide, since holding a formal raw
+        // delivers no other. A family withdrawal the hold leads to re-decides the
+        // same stage: there a formal held earlier keeps the hold's reason where the
+        // re-run decides it raw anyway (a relabel, never a forced form).
+        if released_held.0 != Some(family_policy.stage) {
+            released_held = (Some(family_policy.stage), Default::default());
+        }
+        let released = decision::released_indirect::to_hold(
+            &released_through_indirect,
+            &table,
+            &released_held.1,
+        );
+        released_held.1.extend(released.keys().copied());
+        if !released.is_empty() {
+            table = match &relaxed {
+                Some(relaxed) => {
+                    let ctx = decision::Ctx {
+                        local_callee_extent: relaxed,
+                        ..ctx_of!(
+                            decision::RefGate::LiftAdaptable,
+                            Some(&coconv),
+                            Some(&lifetime_eligibility),
+                            Some(&raw_boundary),
+                            Some(&candidate_exposure),
+                            Some(&return_receivers),
+                        )
+                    };
+                    decision::decide_with_raw_fallbacks(&ctx, &subjects, &released)
+                }
+                None => decision::decide_with_raw_fallbacks(
+                    &ctx_of!(
+                        decision::RefGate::LiftAdaptable,
+                        Some(&coconv),
+                        Some(&lifetime_eligibility),
+                        Some(&raw_boundary),
+                        Some(&candidate_exposure),
+                        Some(&return_receivers),
+                    ),
+                    &subjects,
+                    &released,
+                ),
+            };
         }
         // R586-2: the sole-origin upgrades, on the table the ladder settled.
         decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);

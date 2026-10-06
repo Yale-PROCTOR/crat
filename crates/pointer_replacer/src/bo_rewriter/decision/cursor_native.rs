@@ -296,6 +296,7 @@ pub(crate) fn hold_is_final(decision: &Decision) -> bool {
         | DegradeReason::LocalCalleeAccessExtent { .. }
         | DegradeReason::MaskedIndexRuntimeLength { .. }
         | DegradeReason::RetainedAlias { .. }
+        | DegradeReason::ReleasedThroughIndirectCall { .. }
         | DegradeReason::FreedSlot => true,
         DegradeReason::RevertedAfterVerifyFailure
         | DegradeReason::SignatureClassHeld { .. }

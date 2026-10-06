@@ -127,6 +127,7 @@ pub(crate) mod raw_receiver;
 #[cfg(test)]
 mod reader_chain_tests;
 pub(crate) mod receiver_input;
+pub(crate) mod released_indirect;
 pub(crate) mod retained_alias_observed;
 #[cfg(test)]
 mod retained_alias_observed_tests;
@@ -925,6 +926,12 @@ pub(crate) enum DegradeReason {
     RetainedAlias {
         detail: String,
     },
+    /// R857-2 / R858-4 (reading (A); fan-out 074): a lent formal handed to an
+    /// indirect call whose program-assigned target releases it
+    /// (`released_indirect`). `detail` names the site and the targets.
+    ReleasedThroughIndirectCall {
+        detail: String,
+    },
 }
 
 impl DegradeReason {
@@ -972,6 +979,7 @@ impl DegradeReason {
             DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
             DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
             DegradeReason::RetainedAlias { .. } => "held:retained-alias",
+            DegradeReason::ReleasedThroughIndirectCall { .. } => released_indirect::KEY,
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
             // Names the indirection: the class's key is payload, reported by
@@ -994,6 +1002,7 @@ impl DegradeReason {
             DegradeReason::SignatureClassHeld { reason } => reason.clone(),
             DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
             DegradeReason::RetainedAlias { detail } => detail.clone(),
+            DegradeReason::ReleasedThroughIndirectCall { detail } => detail.clone(),
             DegradeReason::LocalCalleeAccessExtent { access, count } => {
                 thin_counted::hold_detail(access, *count)
             }
