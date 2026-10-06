@@ -13,11 +13,7 @@
 //! formal at the frame) with `test_model_override`, so the witness reads the
 //! generator's decision, not the solver's.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::analyses::borrow_ownership::SlotKind;
-
-static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Outcome {
     source: String,
@@ -25,23 +21,24 @@ struct Outcome {
 }
 
 fn outcome(marker: &str, text: &str) -> Outcome {
+    outcome_with(marker, text, &["DestroyInstance::state"])
+}
+
+/// The frame's verdict pinned for each named formal (`Ref`).
+fn outcome_with(marker: &str, text: &str, formals: &[&str]) -> Outcome {
     let _frame = super::test_model_override::frame_lock();
     super::test_model_override::set(
         marker,
         Vec::new(),
-        vec![("DestroyInstance::state".to_owned(), SlotKind::Ref)],
+        formals
+            .iter()
+            .map(|formal| ((*formal).to_owned(), SlotKind::Ref))
+            .collect(),
     );
-    let dir = std::env::temp_dir().join(format!(
-        "crat-r857-released-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("fixture dir");
-    let root = dir.join("lib.rs");
-    std::fs::write(&root, text).expect("fixture root");
-    let result = super::rewrite_m1_path(&root);
+    // The census's A5 world (an A5 pair at a local helper's call trips the open
+    // world's proof-site assertion, R805-7).
+    let result = super::rewrite_m1_census_world(text);
     super::test_model_override::clear();
-    let _ = std::fs::remove_dir_all(&dir);
     match result {
         super::RewriteOutcome::Emitted {
             source,
@@ -200,4 +197,99 @@ fn r857_2_control_a_client_supplied_target_is_outside_the_claim() {
         !destroy.contains("state: *mut State"),
         "delivered: {destroy}"
     );
+}
+
+/// **The review's HIGH-1 (stand-in, R820-2).** The caller's own formal reaches the
+/// release through a LOCAL helper that frees it through the function pointer
+/// (brotli's `BrotliFree(m, p)` shape): the lend gives the caller no waiver site
+/// of its own, yet its reference is freed while its protector is live. Held.
+#[test]
+fn r857_2_a_formal_released_through_a_local_helper_is_raw() {
+    let marker = "r857-2-helper";
+    let text = format!(
+        "// {marker}\n\
+         #![allow(dead_code, unused_unsafe, unused_mut, non_snake_case, non_camel_case_types)]\n\
+         extern \"C\" {{\n\
+             fn free(p: *mut core::ffi::c_void);\n\
+         }}\n\
+         pub type brotli_free_func =\n\
+             Option<unsafe extern \"C\" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ()>;\n\
+         #[derive(Copy, Clone)]\n\
+         #[repr(C)]\n\
+         pub struct MemoryManager {{\n\
+             pub free_func: brotli_free_func,\n\
+             pub opaque: *mut core::ffi::c_void,\n\
+         }}\n\
+         #[derive(Copy, Clone)]\n\
+         #[repr(C)]\n\
+         pub struct Obj {{\n\
+             pub k: i32,\n\
+         }}\n\
+         unsafe extern \"C\" fn DefaultFree(mut opaque: *mut core::ffi::c_void, mut address: *mut core::ffi::c_void) {{\n\
+             free(address);\n\
+         }}\n\
+         pub unsafe fn InitMemoryManager(mut m: *mut MemoryManager, mut free_f: brotli_free_func,\n\
+             mut opaque: *mut core::ffi::c_void) {{\n\
+             {DEFAULT_ASSIGNED}\n\
+             (*m).opaque = opaque;\n\
+         }}\n\
+         unsafe fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut core::ffi::c_void) {{\n\
+             (*m).free_func.expect(\"non-null function pointer\")((*m).opaque, p);\n\
+         }}\n\
+         pub unsafe fn Release(mut m: *mut MemoryManager, mut obj: *mut Obj) {{\n\
+             (*obj).k = 0;\n\
+             BrotliFree(m, obj as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let out = outcome_with(marker, &text, &["Release::obj"]);
+    assert_eq!(
+        reason_of(&out, "Release::obj"),
+        Some("held:released-through-indirect-call"),
+        "{:?}",
+        out.reasons
+    );
+    let release = signature(&out.source, "Release");
+    assert!(release.contains("obj: *mut Obj"), "raw: {release}");
+}
+
+/// binn's shape: the program stores libc `free` itself into a static function
+/// pointer and calls it on the formal. Raw: the freed-slot gate (R763) already
+/// decides it (binn `binn_free#1` at the frame), the backstop otherwise.
+#[test]
+fn r857_2_a_formal_released_through_a_static_holding_libc_free_is_raw() {
+    let marker = "r857-2-static-free";
+    let text = format!(
+        "// {marker}\n\
+         #![allow(dead_code, unused_unsafe, unused_mut, non_snake_case, non_camel_case_types, non_upper_case_globals)]\n\
+         extern \"C\" {{\n\
+             fn free(p: *mut core::ffi::c_void);\n\
+         }}\n\
+         #[derive(Copy, Clone)]\n\
+         #[repr(C)]\n\
+         pub struct Item {{\n\
+             pub k: i32,\n\
+         }}\n\
+         pub static mut free_fn: Option<unsafe extern \"C\" fn(*mut core::ffi::c_void) -> ()> = None;\n\
+         unsafe fn check_alloc_functions() {{\n\
+             if free_fn.is_none() {{\n\
+                 free_fn = Some(free as unsafe extern \"C\" fn(*mut core::ffi::c_void) -> ());\n\
+             }}\n\
+         }}\n\
+         pub unsafe fn item_free(mut item: *mut Item) {{\n\
+             check_alloc_functions();\n\
+             (*item).k = 0;\n\
+             free_fn.expect(\"non-null function pointer\")(item as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let out = outcome_with(marker, &text, &["item_free::item"]);
+    assert!(
+        matches!(
+            reason_of(&out, "item_free::item"),
+            Some("freed-slot" | "held:released-through-indirect-call")
+        ),
+        "{:?}",
+        out.reasons
+    );
+    let function = signature(&out.source, "item_free");
+    assert!(function.contains("item: *mut Item"), "raw: {function}");
 }
