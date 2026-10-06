@@ -6515,6 +6515,14 @@ pub(crate) fn synthesize_with_raw_boundary(
                             positions[i].span,
                             positions[j].span,
                         );
+                        // R838: the classifier's proof over an operand loaded
+                        // from memory is not taken (era-5c 148).
+                        super::loaded_operand::read_loaded_operands(
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
+                        );
                         super::outside_byte_view::read_under_p8(
                             facts,
                             site,

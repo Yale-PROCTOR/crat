@@ -352,8 +352,96 @@ pub(crate) fn deref_pointer(
 ///   definition lies inside (`h = &mut (*s).arena.header`), bounded.
 /// R838 (era-5c 148): is the argument's pointer value loaded from memory?
 pub(crate) fn loaded_from_memory(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> bool {
-    let _ = (tcx, owner, expr);
-    false
+    fn read_from_memory(tcx: TyCtxt<'_>, place: &Expr<'_>) -> bool {
+        // A place in memory others write: under a dereference, or a static.
+        let mut place = place;
+        loop {
+            place = match place.kind {
+                ExprKind::Unary(rustc_hir::UnOp::Deref, _) => return true,
+                ExprKind::Field(base, _)
+                | ExprKind::Index(base, _, _)
+                | ExprKind::DropTemps(base) => base,
+                ExprKind::Path(QPath::Resolved(None, path)) => {
+                    return matches!(
+                        path.res,
+                        Res::Def(rustc_hir::def::DefKind::Static { .. }, _)
+                    );
+                }
+                _ => {
+                    let _ = tcx;
+                    return false;
+                }
+            };
+        }
+    }
+    fn loaded(tcx: TyCtxt<'_>, body: &rustc_hir::Body<'_>, expr: &Expr<'_>, depth: usize) -> bool {
+        let expr = peel_casts(expr);
+        match expr.kind {
+            ExprKind::DropTemps(inner) => loaded(tcx, body, inner, depth),
+            // An address is computed, not loaded.
+            ExprKind::AddrOf(..) => false,
+            ExprKind::MethodCall(segment, receiver, _, _) => {
+                match segment.ident.name.as_str() {
+                    "as_mut_ptr" | "as_ptr" => false,
+                    // Pointer arithmetic keeps the base's origin.
+                    "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add"
+                    | "wrapping_sub" | "cast" | "cast_mut" | "cast_const" => {
+                        loaded(tcx, body, receiver, depth)
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => match path.res {
+                Res::Def(rustc_hir::def::DefKind::Static { .. }, _) => true,
+                // A local: loaded if any of its definitions is.
+                Res::Local(binding) if depth < 8 => definitions(body, binding)
+                    .into_iter()
+                    .any(|value| loaded(tcx, body, value, depth + 1)),
+                _ => false,
+            },
+            ExprKind::Unary(rustc_hir::UnOp::Deref, _)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => read_from_memory(tcx, expr),
+            _ => false,
+        }
+    }
+    fn definitions<'b>(body: &'b rustc_hir::Body<'b>, binding: HirId) -> Vec<&'b Expr<'b>> {
+        struct Defs<'b> {
+            binding: HirId,
+            found: Vec<&'b Expr<'b>>,
+        }
+        impl<'b> rustc_hir::intravisit::Visitor<'b> for Defs<'b> {
+            fn visit_local(&mut self, local: &'b rustc_hir::LetStmt<'b>) {
+                if let rustc_hir::PatKind::Binding(_, id, _, None) = local.pat.kind
+                    && id == self.binding
+                    && let Some(init) = local.init
+                {
+                    self.found.push(init);
+                }
+                rustc_hir::intravisit::walk_local(self, local);
+            }
+
+            fn visit_expr(&mut self, expr: &'b Expr<'b>) {
+                if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
+                    && path.res == Res::Local(self.binding)
+                {
+                    self.found.push(rhs);
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut defs = Defs {
+            binding,
+            found: Vec::new(),
+        };
+        rustc_hir::intravisit::Visitor::visit_body(&mut defs, body);
+        defs.found
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(owner) else {
+        return false;
+    };
+    loaded(tcx, body, expr, 0)
 }
 
 pub(crate) fn inside_of(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Vec<HirId> {

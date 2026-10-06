@@ -24,5 +24,18 @@ pub(crate) fn read_loaded_operands(
     right: usize,
     proof: &mut A5PeerProof,
 ) {
-    let _ = (site, left, right, proof);
+    if proof.verdict != A5SiteProofVerdict::Clear || proof.reason != "a5-proven-disjoint" {
+        return;
+    }
+    let loaded = |index: usize| {
+        site.args
+            .iter()
+            .find(|argument| argument.index == index)
+            .is_some_and(|argument| argument.loaded_from_memory)
+    };
+    if loaded(left) || loaded(right) {
+        proof.verdict = A5SiteProofVerdict::Overlapping;
+        proof.reason = REASON;
+        proof.family = "not-shown-disjoint";
+    }
 }

@@ -28,6 +28,11 @@ pub unsafe fn derefs(mut p: *mut *mut i32, mut q: *mut *mut i32) {
     let mut x = *p;
     add(x, *q);
 }
+pub unsafe fn locals_loaded(mut p: *mut *mut i32, mut q: *mut *mut i32) {
+    let mut x = *p;
+    let mut y = *q;
+    add(x, y);
+}
 // Controls: two static arrays' addresses; two locals' addresses; an entry's
 // two formals.
 pub unsafe fn arrays() {

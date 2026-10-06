@@ -1112,6 +1112,14 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                             // R833-1 / R819-1 (b): an entry's own formals are
                             // disjoint by scope here too, so the pair rule never
                             // holds a pair the seam's certificate proves.
+                            // R838: the classifier's proof over an operand loaded
+                            // from memory is not taken (era-5c 148).
+                            super::loaded_operand::read_loaded_operands(
+                                site,
+                                a.argument_index,
+                                b.argument_index,
+                                &mut proof,
+                            );
                             super::outside_byte_view::read_under_p8(
                                 facts,
                                 site,

@@ -58,6 +58,11 @@ fn r838_two_dereferences_one_through_a_local_are_not_shown_disjoint() {
 }
 
 #[test]
+fn r838_two_locals_each_defined_by_a_load_are_not_shown_disjoint() {
+    assert_eq!(read("locals_loaded"), NOT_SHOWN);
+}
+
+#[test]
 fn r838_control_two_static_arrays_addresses_keep_the_proof() {
     assert_eq!(read("arrays"), PROVEN);
 }

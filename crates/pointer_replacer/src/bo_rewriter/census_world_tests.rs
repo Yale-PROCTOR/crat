@@ -386,3 +386,39 @@ fn r833_1_control_a_read_read_pair_keeps_shared_references() {
         "({signature})"
     );
 }
+
+/// R838 (relay 178 item 2): `add(G1, G2)` with `G2` able to hold `G1`'s
+/// pointer is not shown disjoint, so `add`'s formals both stay raw; the
+/// entry's certified pair (`add2(x, y)`) keeps its references.
+fn r838_signature(name: &str) -> String {
+    let input = include_str!("testdata/r838_statics_pair.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.split(&format!("fn {name}("))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no {name}:\n{source}"))
+                .to_owned()
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
+
+#[test]
+fn r838_add_of_two_statics_contents_keeps_both_formals_raw() {
+    let signature = r838_signature("add");
+    assert!(
+        signature.contains("mut a: *mut i32") && signature.contains("mut b: *mut i32"),
+        "({signature})"
+    );
+}
+
+#[test]
+fn r838_control_the_entrys_certified_pair_keeps_its_references() {
+    let signature = r838_signature("add2");
+    assert!(
+        signature.contains("a: &mut i32") && signature.contains("b: &"),
+        "({signature})"
+    );
+}
