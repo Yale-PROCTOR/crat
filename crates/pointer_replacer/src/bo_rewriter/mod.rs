@@ -8730,22 +8730,31 @@ fn finish_decide<'tcx>(
         }
         // **R857-2 / R858-4 (USER via the seat; reading (A), era-5c 151; fan-out
         // 074) — the backstop, on the settled table, before anything is planned.**
-        // A lent formal handed to an indirect call whose program-assigned target
-        // releases it is decided raw (`held:released-through-indirect-call`) where
-        // this table delivers it; one re-decide, since holding a formal raw
-        // delivers no other. A family withdrawal the hold leads to re-decides the
-        // same stage: there a formal held earlier keeps the hold's reason where the
-        // re-run decides it raw anyway (a relabel, never a forced form).
+        // A formal released on a path through an indirect call whose
+        // program-assigned target releases it is decided raw
+        // (`held:released-through-indirect-call`) where this table delivers it as
+        // a reference; re-decided until nothing new is held. A family withdrawal
+        // the hold leads to re-decides the same stage: there a formal held earlier
+        // keeps the hold's reason where the re-run decides it raw anyway (a
+        // relabel, never a forced form).
         if released_held.0 != Some(family_policy.stage) {
             released_held = (Some(family_policy.stage), Default::default());
         }
-        let released = decision::released_indirect::to_hold(
-            &released_through_indirect,
-            &table,
-            &released_held.1,
-        );
-        released_held.1.extend(released.keys().copied());
-        if !released.is_empty() {
+        let mut released = rustc_hash::FxHashMap::default();
+        loop {
+            let new = decision::released_indirect::to_hold(
+                &released_through_indirect,
+                &table,
+                &released_held.1,
+            )
+            .into_iter()
+            .filter(|(node, _)| !released.contains_key(node))
+            .collect::<Vec<_>>();
+            if new.is_empty() {
+                break;
+            }
+            released_held.1.extend(new.iter().map(|(node, _)| *node));
+            released.extend(new);
             table = match &relaxed {
                 Some(relaxed) => {
                     let ctx = decision::Ctx {

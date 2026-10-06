@@ -11,8 +11,12 @@
 //! Miri `repro/`). Until the certificate refuses such a formal, the generator
 //! holds it here.
 //!
-//! **The sites** are the certificate's own: [`lend::Plan::waivers`], one per
-//! indirect call a lendable formal's closure reaches.
+//! **The formals:** every formal of a program function whose value (or a copy,
+//! a cast, a reference through it) reaches a release on a path that crosses an
+//! indirect call, directly or through local callees: the lend's own waiver sites
+//! (`lend::Plan::waivers`) and their callers alike (the stand-in review's HIGH-1:
+//! brotli's `BrotliFree(m, p)` frees its caller's formal too). A direct `free` of
+//! a formal is the freed-slot gate's (R763).
 //!
 //! **The targets (reading (A), the closed world of R816):** the functions the
 //! program itself makes into a value of the call's function-pointer type — every
@@ -28,8 +32,9 @@
 //! makes, directly, through a local callee or through an indirect call whose
 //! targets release.
 //!
-//! **What is held:** the waiver site's formal, only where the settled table
-//! delivers it; a formal the table already decides raw keeps its own reason.
+//! **What is held:** the formal, only where the settled table delivers it as a
+//! reference; a formal the table already decides raw keeps its own reason, and
+//! a Box formal (an owner its callee may drop) is never held.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -39,12 +44,12 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::{
-    mir::{BasicBlock, CastKind, Local, Operand, Rvalue, StatementKind, TerminatorKind},
+    mir::{CastKind, Local, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{Ty, TyCtxt, TyKind, TypeckResults, adjustment::PointerCoercion},
 };
 
 use super::{DegradeReason, Subject, SubjectKind};
-use crate::{analyses::borrow_ownership::licensing::lend, utils::rustc::RustProgram};
+use crate::utils::rustc::RustProgram;
 
 /// The reason's key in every table and receipt.
 pub(crate) const KEY: &str = "held:released-through-indirect-call";
@@ -53,71 +58,35 @@ pub(crate) const KEY: &str = "held:released-through-indirect-call";
 type Reified<'tcx> = FxHashMap<Ty<'tcx>, FxHashSet<DefId>>;
 
 /// The formals to hold, with their reason; the caller applies them where the
-/// settled table delivers the formal.
+/// settled table delivers the formal as a reference.
 pub(crate) fn holds(
     program: &RustProgram<'_>,
     subjects: &[Subject],
 ) -> FxHashMap<(LocalDefId, HirId), DegradeReason> {
     let tcx = program.tcx;
-    let plan = lend::collect(program);
-    let mut out = FxHashMap::default();
-    if plan.waivers.is_empty() {
-        return out;
-    }
-    let functions: FxHashMap<String, LocalDefId> = program
-        .functions
-        .iter()
-        .map(|&f| (tcx.def_path_str(f.to_def_id()), f))
-        .collect();
     let reified = reified(program);
     let mut walk = ReleaseWalk::new(program, &reified);
-    for site in &plan.waivers {
-        let Some(&caller) = functions.get(&site.caller) else {
+    let mut out = FxHashMap::default();
+    for subject in subjects {
+        let SubjectKind::Param { hir_index } = subject.kind else {
             continue;
         };
-        let Some(formal) = (site.formal as usize).checked_sub(1) else {
-            continue;
-        };
-        let Some(subject) = subjects.iter().find(|subject| {
-            subject.fn_did == caller
-                && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == formal)
-        }) else {
-            continue;
-        };
-        let node = (subject.fn_did, subject.hir_id);
-        if out.contains_key(&node) {
+        let function = subject.fn_did.to_def_id();
+        if !walk.releases(function, hir_index, Path::ThroughIndirect) {
             continue;
         }
-        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
-        let Some(data) = body.basic_blocks.get(BasicBlock::from_u32(site.block)) else {
-            continue;
-        };
-        let func = match &data.terminator().kind {
-            TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
-            _ => continue,
-        };
-        let pointer = tcx.erase_regions(func.ty(&*body, tcx));
-        let mut releasing = reified
-            .get(&pointer)
-            .into_iter()
-            .flatten()
-            .filter(|&&target| walk.releases(target, site.argument))
-            .map(|&target| tcx.def_path_str(target))
-            .collect::<Vec<_>>();
-        releasing.sort();
-        if releasing.is_empty() {
-            continue;
-        }
+        let via = walk
+            .witness
+            .get(&(function, hir_index, Path::ThroughIndirect))
+            .cloned()
+            .unwrap_or_default();
         out.insert(
-            node,
+            (subject.fn_did, subject.hir_id),
             DegradeReason::ReleasedThroughIndirectCall {
                 detail: format!(
-                    "released-through-indirect-call:{}:bb{}[{}]:arg{};targets={}",
-                    site.caller,
-                    site.block,
-                    site.statement,
-                    site.argument,
-                    releasing.join(",")
+                    "released-through-indirect-call:{}#{};via={via}",
+                    tcx.def_path_str(function),
+                    hir_index + 1
                 ),
             },
         );
@@ -192,15 +161,27 @@ fn reified<'tcx>(program: &RustProgram<'tcx>) -> Reified<'tcx> {
     out
 }
 
-/// The release walk: does a function release its argument? Answers are cached
+/// Which release paths count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Path {
+    /// Any release: libc `free` / `realloc`, directly or through calls.
+    Any,
+    /// A release on a path that crosses at least one indirect call (the backstop's
+    /// own scope: a direct `free` of a formal is the freed-slot gate's, R763).
+    ThroughIndirect,
+}
+
+/// The release walk: may a function release its argument? Answers are cached
 /// only when final: a `false` that read a frame still open below it (a cycle
 /// through a caller) is recomputed when asked again, so a release found later
 /// on that caller's other path is never hidden by a cached `false`.
 struct ReleaseWalk<'p, 'tcx> {
     program: &'p RustProgram<'tcx>,
     reified: &'p Reified<'tcx>,
-    memo: FxHashMap<(DefId, usize), bool>,
-    stack: Vec<(DefId, usize)>,
+    memo: FxHashMap<(DefId, usize, Path), bool>,
+    stack: Vec<(DefId, usize, Path)>,
+    /// For each `true`, the first call that leads to the release.
+    witness: FxHashMap<(DefId, usize, Path), String>,
 }
 
 impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
@@ -210,21 +191,22 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
             reified,
             memo: FxHashMap::default(),
             stack: Vec::new(),
+            witness: FxHashMap::default(),
         }
     }
 
-    /// Does `function` release its argument `argument`?
-    fn releases(&mut self, function: DefId, argument: usize) -> bool {
-        self.visit(function, argument).0
+    /// May `function` release its argument `argument` on a path of this kind?
+    fn releases(&mut self, function: DefId, argument: usize, path: Path) -> bool {
+        self.visit(function, argument, path).0
     }
 
     /// The answer, and the lowest open frame it read (`usize::MAX` for none).
-    fn visit(&mut self, function: DefId, argument: usize) -> (bool, usize) {
+    fn visit(&mut self, function: DefId, argument: usize, path: Path) -> (bool, usize) {
         let tcx = self.program.tcx;
         if tcx.is_foreign_item(function) {
             let name = tcx.item_name(function);
             return (
-                argument == 0 && matches!(name.as_str(), "free" | "realloc"),
+                path == Path::Any && argument == 0 && matches!(name.as_str(), "free" | "realloc"),
                 usize::MAX,
             );
         }
@@ -234,7 +216,7 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
         else {
             return (false, usize::MAX);
         };
-        let key = (function, argument);
+        let key = (function, argument, path);
         if let Some(&known) = self.memo.get(&key) {
             return (known, usize::MAX);
         }
@@ -243,7 +225,7 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
         }
         let depth = self.stack.len();
         self.stack.push(key);
-        let (found, lowest) = self.walk(local, argument);
+        let (found, lowest) = self.walk(local, argument, path);
         self.stack.pop();
         if found || lowest >= depth {
             self.memo.insert(key, found);
@@ -253,7 +235,7 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
 
     /// One body: the formal's closure (copies, casts, references through it and
     /// pointer results of library calls on it) and every call it reaches.
-    fn walk(&mut self, local: LocalDefId, argument: usize) -> (bool, usize) {
+    fn walk(&mut self, local: LocalDefId, argument: usize, path: Path) -> (bool, usize) {
         let tcx = self.program.tcx;
         let body = tcx.mir_drops_elaborated_and_const_checked(local).borrow();
         if argument >= body.arg_count {
@@ -311,7 +293,7 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
             }
         }
         let mut lowest = usize::MAX;
-        for data in body.basic_blocks.iter() {
+        for (block, data) in body.basic_blocks.iter_enumerated() {
             let (func, args) = match &data.terminator().kind {
                 TerminatorKind::Call { func, args, .. }
                 | TerminatorKind::TailCall { func, args, .. } => (func, args),
@@ -329,22 +311,46 @@ impl<'p, 'tcx> ReleaseWalk<'p, 'tcx> {
                 if !member(&operand.node, &closure) {
                     continue;
                 }
-                // `visit` answers for a foreign item (`free` / `realloc`), a
-                // program function, and no for any other library function.
-                let targets: Vec<DefId> = match direct {
-                    Some(callee) => vec![callee],
-                    None => self
-                        .reified
-                        .get(&pointer)
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .collect(),
+                // A direct call keeps the path's kind; past an indirect call any
+                // release counts. `visit` answers for a foreign item (`free` /
+                // `realloc`), a program function, and no for any other library
+                // function.
+                let (targets, next): (Vec<DefId>, Path) = match direct {
+                    Some(callee) => (vec![callee], path),
+                    None => (
+                        self.reified
+                            .get(&pointer)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .collect(),
+                        Path::Any,
+                    ),
                 };
                 for target in targets {
-                    let (releasing, open) = self.visit(target, index);
+                    let (releasing, open) = self.visit(target, index, next);
                     lowest = lowest.min(open);
                     if releasing {
+                        let step = match direct {
+                            Some(_) => format!(
+                                "{}#{}{}",
+                                tcx.def_path_str(target),
+                                index + 1,
+                                self.witness
+                                    .get(&(target, index, next))
+                                    .map(|rest| format!(">{rest}"))
+                                    .unwrap_or_default()
+                            ),
+                            None => format!(
+                                "{}:bb{}:arg{}->{}",
+                                tcx.def_path_str(local.to_def_id()),
+                                block.as_u32(),
+                                index,
+                                tcx.def_path_str(target)
+                            ),
+                        };
+                        self.witness
+                            .insert((local.to_def_id(), argument, path), step);
                         return (true, lowest);
                     }
                 }
@@ -365,7 +371,7 @@ pub(crate) fn to_hold(
     let decided: FxHashMap<(LocalDefId, HirId), bool> = table
         .entries
         .iter()
-        .map(|(subject, decision)| {
+        .filter_map(|(subject, decision)| {
             // Exhaustive by rule (`import_denylist`): a new disposition is
             // classified here, never dropped by a bypass shape.
             let raw = match decision {
@@ -375,10 +381,13 @@ pub(crate) fn to_hold(
                 | super::Decision::Slice { .. }
                 | super::Decision::NestedSlice { .. }
                 | super::Decision::Cursor { .. }
-                | super::Decision::Opt { .. }
-                | super::Decision::Box(_) => false,
+                | super::Decision::Opt { .. } => false,
+                // A Box formal owns its allocation: releasing it during the call
+                // is the consuming owner's own drop (wave-6a C1), not a reference
+                // freed behind its protector. Never held.
+                super::Decision::Box(_) => return None,
             };
-            ((subject.fn_did, subject.hir_id), raw)
+            Some(((subject.fn_did, subject.hir_id), raw))
         })
         .collect();
     held.iter()
