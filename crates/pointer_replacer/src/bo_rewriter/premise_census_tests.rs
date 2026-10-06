@@ -429,3 +429,75 @@ fn r801_2_the_view_families_table_is_the_view_kind() {
     ));
     assert_eq!(untouched, reading());
 }
+
+/// **R857-3 (075 §S7(b)).** bzip2 `addFlagsFromEnvVar::envbase`'s shape: a view
+/// written at an ASSIGNMENT (the binding is declared `None`), whose next input
+/// item is an unrelated call. (b) fails: a row of the assignment kind, with its
+/// own site identity.
+#[test]
+fn r857_3_an_assignment_view_not_dereferenced_next_has_a_row() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(name: *const i8) {
+            let mut envbase: *mut i8 = 0 as *mut i8;
+            envbase = getenv(name);
+            log_it();
+            if !envbase.is_null() { *envbase = 0; }
+        } }",
+        "pub mod m { pub unsafe fn f(name: *const i8) {
+            let mut envbase: Option<&mut i8> = None;
+            envbase = (getenv(name) as *mut i8).as_mut();
+            log_it();
+            if let Some(e) = envbase { *e = 0; }
+        } }",
+        &[],
+    );
+    assert_eq!(
+        kinds(&reading),
+        vec![(SiteKind::AssignmentView, "m::f", "envbase")]
+    );
+    assert_eq!(SiteKind::AssignmentView.key(), "assignment-view");
+    assert_eq!(reading.rows[0].site, "assign#1");
+    assert!(!reading.rows[0].quiet_prefix);
+}
+
+/// An assignment view the input dereferences in the very next item: (b) holds,
+/// no row, counted as held of the assignment kind.
+#[test]
+fn r857_3_an_assignment_view_dereferenced_next_has_no_row() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(p: *mut i32) {
+            let mut x: *mut i32 = 0 as *mut i32;
+            x = p;
+            *x = 1;
+        } }",
+        "pub mod m { pub unsafe fn f(p: *mut i32) {
+            let mut x: Option<&mut i32> = None;
+            x = p.as_mut();
+            *x.unwrap() = 1;
+        } }",
+        &[],
+    );
+    assert!(reading.rows.is_empty(), "{reading:?}");
+    assert_eq!(reading.held_b.get(&SiteKind::AssignmentView), Some(&1));
+}
+
+/// An assignment to a binding the input declares as a non-pointer is not a
+/// reference the generator made from a raw pointer: no row, nothing held.
+#[test]
+fn r857_3_an_assignment_to_a_non_pointer_binding_is_not_read() {
+    let reading = read(
+        "pub mod m { pub unsafe fn f(p: &mut i32) {
+            let mut x: Option<&mut i32> = None;
+            x = Some(p);
+            log_it();
+        } }",
+        "pub mod m { pub unsafe fn f(p: &mut i32) {
+            let mut x: Option<&mut i32> = None;
+            x = (p as *mut i32).as_mut();
+            log_it();
+        } }",
+        &[],
+    );
+    assert!(reading.rows.is_empty(), "{reading:?}");
+    assert!(reading.held_b.is_empty(), "{reading:?}");
+}

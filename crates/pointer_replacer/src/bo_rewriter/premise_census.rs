@@ -35,14 +35,22 @@ pub(crate) enum SiteKind {
     DeclarationView,
     DeclarationConstruction,
     DeclarationReborrow,
+    /// R857-3 (075 §S7(b)): the same three, made at an ASSIGNMENT to a binding
+    /// the input holds as a raw pointer.
+    AssignmentView,
+    AssignmentConstruction,
+    AssignmentReborrow,
 }
 
 impl SiteKind {
-    pub(crate) const ALL: [SiteKind; 4] = [
+    pub(crate) const ALL: [SiteKind; 7] = [
         SiteKind::CallBridge,
         SiteKind::DeclarationView,
         SiteKind::DeclarationConstruction,
         SiteKind::DeclarationReborrow,
+        SiteKind::AssignmentView,
+        SiteKind::AssignmentConstruction,
+        SiteKind::AssignmentReborrow,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -51,6 +59,9 @@ impl SiteKind {
             SiteKind::DeclarationView => "declaration-view",
             SiteKind::DeclarationConstruction => "declaration-construction",
             SiteKind::DeclarationReborrow => "declaration-reborrow",
+            SiteKind::AssignmentView => "assignment-view",
+            SiteKind::AssignmentConstruction => "assignment-construction",
+            SiteKind::AssignmentReborrow => "assignment-reborrow",
         }
     }
 }
