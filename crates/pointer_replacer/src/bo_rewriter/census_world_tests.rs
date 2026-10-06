@@ -423,13 +423,14 @@ fn r838_control_the_entrys_certified_pair_keeps_its_references() {
     );
 }
 
-/// R833-1 (wave-5d report 137): the peer of a raw view A5's fallback learned,
-/// with no pair row of its own, is held: `copy_be32`'s two formals stay raw.
-/// And the raw view of `&mut int32 as *mut i32 as *mut u32` keeps the cast to
-/// the formal's pointee (binn's E0308, `&mut u32` expected, `&mut i32` found),
-/// so the emission verifies without a revert.
+/// The raw view of a cast argument A5's fallback learned keeps the program's
+/// cast to the formal's raw type: `&mut int32 as *mut i32 as *mut u32` beside a
+/// loaded `p` (binn `copy_be32`, E0308 `&mut u32` expected, `&mut i32` found),
+/// so the emission verifies without a revert and `psource` stays raw.
+/// (`pdest` is a byte view here, not a conversion node: the pair rule does not
+/// reach it — wave-5d report 138's named residual.)
 #[test]
-fn r833_1_the_peer_of_a_learned_raw_view_stays_raw() {
+fn r833_1_the_raw_view_of_a_cast_address_keeps_its_cast() {
     let input = include_str!("testdata/r833_peer_of_a_learned_raw_view.rs");
     match super::rewrite_m1_census_world(input) {
         super::RewriteOutcome::Emitted {
@@ -451,10 +452,9 @@ fn r833_1_the_peer_of_a_learned_raw_view_stays_raw() {
                 (0, 0),
                 "the emission verifies without a revert: {first_diags:#?}\n{source}"
             );
-            let copy = signature("copy_be32");
             assert!(
-                copy.contains("pdest: *mut u32") && copy.contains("psource: *mut u32"),
-                "({copy})\n{source}"
+                signature("copy_be32").contains("psource: *mut u32"),
+                "{source}"
             );
             assert!(signature("save").contains("item: &mut Item"), "{source}");
         }

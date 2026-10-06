@@ -1525,8 +1525,16 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     }
     // R833-1 (USER): the callee's side of the pair rule, before the raw views
     // are blocked, so the held peer carries its own reason.
+    // Only a conversion node: a peer the ladder does not convert here (an
+    // optional formal at the Option stage, a byte view) is held, if at all,
+    // by its own stage, and a pair row for it reaches only the class terminal,
+    // after the seams are planned (the r815_6 control: binn_object_get's
+    // `key` held there left its inner call unbridged, E0308).
     let peer_row = |member: &PairSiteDecision, peer: usize| {
-        let subject = param_key.get(&(member.callee, peer)).copied()?;
+        let subject = param_key
+            .get(&(member.callee, peer))
+            .copied()
+            .filter(|subject| converts.contains(subject))?;
         let (site, argument) = facts
             .call_args
             .get(&member.callee)
