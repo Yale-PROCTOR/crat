@@ -298,3 +298,34 @@ fn r857_1_d1_open_world_a_frame_binding_sibling_at_a_local_callee_is_not_held() 
         out.reasons
     );
 }
+
+/// **R861-1 (D3): a string-literal sibling is not risky.** On a UB-free input a
+/// literal is never written, so a literal beside a formal cannot be the written
+/// side of an overlap (as R608-1 treats a literal SOURCE). `strncmp` has no
+/// contract row, so its literal argument reads `Unknown`; the formal is neither
+/// held nor pending.
+const D3_LITERAL_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn strncmp(a: *const i8, b: *const i8, n: u64) -> i32;
+}
+pub unsafe fn is_flag(mut name: *const i8) -> i32 {
+    let mut first: i8 = *name;
+    if first == 0 {
+        return 0;
+    }
+    return (strncmp(name, b"--\0" as *const u8 as *const i8, 2 as u64) == 0) as i32;
+}
+"#;
+
+#[test]
+fn r861_1_d3_a_string_literal_sibling_is_not_risky() {
+    let out = outcome(D3_LITERAL_SIBLING);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "is_flag::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not held: {:?}",
+        out.reasons
+    );
+}
