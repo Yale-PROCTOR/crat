@@ -12,6 +12,8 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Outcome {
     source: String,
     reasons: Vec<(String, String)>,
+    /// Each degradation's reason, debug-printed (its detail included).
+    details: Vec<(String, String)>,
     pending: usize,
 }
 
@@ -43,6 +45,10 @@ fn outcome(text: &str) -> Outcome {
                 reasons: degradations
                     .iter()
                     .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
                     .collect(),
                 pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
             }
@@ -268,6 +274,10 @@ fn r857_1_d1_a_frame_binding_sibling_at_a_local_callee_is_neither_held_nor_pendi
                 reasons: degradations
                     .iter()
                     .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
                     .collect(),
                 pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
             }
@@ -529,6 +539,10 @@ fn census_outcome(text: &str) -> Outcome {
                     .iter()
                     .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
                     .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
+                    .collect(),
                 pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
             }
         }
@@ -745,9 +759,65 @@ fn r861_1_n1_a_binding_flowing_through_a_ternary_into_a_held_binding_is_held() {
             out.reasons
         );
     }
+    assert!(
+        detail_of(&out, "caller::src").is_some_and(|d| d.contains("into-held-binding:caller::s2")),
+        "{:?}",
+        out.details
+    );
     let caller = signature(&out.source, "caller");
     assert!(
         caller.contains("src: *const i32") && caller.contains("other: *const i32"),
         "held raw: {caller}"
     );
+}
+
+fn detail_of<'a>(outcome: &'a Outcome, subject: &str) -> Option<&'a str> {
+    outcome
+        .details
+        .iter()
+        .find(|(s, _)| s.starts_with(subject))
+        .map(|(_, d)| d.as_str())
+}
+
+/// **The MIR arms, one witness each (the stand-in review round 3, C3).** The
+/// held source `s2` receives `src` through a cast, a pointer step, a reborrow
+/// through a dereference, and a call that returns its argument (F2); each holds
+/// `src` with the `into-held-binding:caller::s2` detail.
+#[test]
+fn r861_1_n1_each_mir_arm_holds_the_flowing_binding() {
+    for (arm, initializer, extra) in [
+        ("cast", "src as *mut i32 as *const i32", ""),
+        ("step", "src.offset(0)", ""),
+        ("reborrow", "&*src as *const i32", ""),
+        (
+            "call",
+            "same(src)",
+            "pub unsafe fn same(p: *const i32) -> *const i32 { p }\n",
+        ),
+    ] {
+        let input = FLOWS_INTO_HELD
+            .replace(
+                "let s2: *const i32 = src;",
+                &format!("let s2: *const i32 = {initializer};"),
+            )
+            .replace(
+                "pub unsafe fn entry() {",
+                &format!("{extra}pub unsafe fn entry() {{"),
+            );
+        assert!(input.contains(initializer), "{arm}: {input}");
+        assert!(extra.is_empty() || input.contains(extra), "{arm}: {input}");
+        let out = outcome(&input);
+        assert_eq!(
+            reason_of(&out, "caller::s2"),
+            Some("held:pair-not-shown-disjoint"),
+            "{arm}: {:?}",
+            out.reasons
+        );
+        assert!(
+            detail_of(&out, "caller::src")
+                .is_some_and(|d| d.contains("into-held-binding:caller::s2")),
+            "{arm}: {:?}",
+            out.details
+        );
+    }
 }
