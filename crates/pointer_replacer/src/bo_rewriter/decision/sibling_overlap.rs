@@ -601,11 +601,14 @@ pub(crate) fn collect_inventory_from(
             // dereference (main 186, D1: brotli `CopyStat` behind C2Rust's local
             // `stat` wrapper): the premise is about the caller's frame, not the
             // callee's kind.
-            let frame_binding = ctx.facts.foreign_call_args.iter().any(|fact| {
+            let addresses_a_frame_binding = ctx.facts.foreign_call_args.iter().any(|fact| {
                 fact.caller == caller
                     && fact.call_span == site.call_span
                     && fact.argument_index == argument_index
                     && super::pending_sibling::addresses_a_frame_binding(fact)
+                    && fact
+                        .root
+                        .is_some_and(|root| binding_holds_its_object(tcx, caller, root))
             }) || callee
                 .as_local()
                 .and_then(|callee| ctx.facts.call_args.get(&callee))
@@ -621,21 +624,27 @@ pub(crate) fn collect_inventory_from(
                         && matches!(
                             argument.shape,
                             super::emitability::ArgShape::AddrOf {
-                                base: Some(_),
+                                base: Some(base),
                                 through_deref: false,
                                 ..
-                            }
+                            } if binding_holds_its_object(tcx, caller, base)
                         )
                 })
                 // Beneath casts (relay 297; binn `&mut value as *mut i32 as
                 // *mut c_void`): the cast address is still the binding's.
-                || call_argument_is(tcx, caller, site.call_span, argument_index, |peeled| {
-                    matches!(
-                        peeled.kind,
-                        ExprKind::AddrOf(_, _, operand)
-                            if matches!(super::emitability::place_root(operand), (Some(_), false))
-                    )
-                });
+                || cast_address_root(tcx, caller, site.call_span, argument_index)
+                    .is_some_and(|root| binding_holds_its_object(tcx, caller, root));
+            // The premise's own condition (the stand-in review's M1): the formal
+            // still holds its entry value, or a pointer stepped from it.
+            let frame_binding = addresses_a_frame_binding
+                && match &source {
+                    SiblingSource::Declared(subject)
+                        if matches!(subject.kind, SubjectKind::Param { .. }) =>
+                    {
+                        formal_keeps_its_entry_value(tcx, subject.fn_did, subject.hir_id)
+                    }
+                    _ => true,
+                };
             let literal = literal_argument(tcx, caller, site.call_span, argument_index);
             siblings.push(SiblingEvidence {
                 argument_index,
@@ -1189,6 +1198,120 @@ fn call_argument_is(
     };
     intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
     find.found
+}
+
+/// The binding an ordinary borrow beneath the call argument's casts roots at,
+/// reached without a dereference (`&mut value as *mut i32 as *mut c_void`).
+fn cast_address_root(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    call_span: Span,
+    index: usize,
+) -> Option<HirId> {
+    struct Find {
+        call_span: Span,
+        index: usize,
+        root: Option<HirId>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Find {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(_, arguments) = expr.kind
+                && expr.span.source_callsite() == self.call_span.source_callsite()
+                && let Some(argument) = arguments.get(self.index)
+            {
+                let mut peeled = argument;
+                loop {
+                    peeled = match peeled.kind {
+                        ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => inner,
+                        _ => break,
+                    };
+                }
+                if let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, operand) = peeled.kind
+                    && let (Some(base), false) = super::emitability::place_root(operand)
+                {
+                    self.root = Some(base);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        call_span,
+        index,
+        root: None,
+    };
+    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
+    find.root
+}
+
+/// Does the binding hold its object itself (the stand-in review's M2)? A place
+/// rooted at a reference or `Box` binding may be reached through an implicit
+/// dereference (`&mut r.f`, `&mut b[i]`), which `place_root` does not record: its
+/// referent is not the frame's. A raw pointer never dereferences implicitly, so
+/// `&mut value` over a `*mut i8` local is that local's own storage.
+fn binding_holds_its_object(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirId) -> bool {
+    let ty = tcx.typeck(function).node_type(binding);
+    !(matches!(ty.kind(), TyKind::Ref(..)) || ty.is_box())
+}
+
+/// **The frame-binding premise's own condition (relay 297; the stand-in
+/// review's M1).** A formal's referent predates its function's frame only while
+/// the formal holds its entry value or a pointer stepped from it
+/// (`p = p.offset(1)`): any other assignment (`p = &mut local as *mut T`), or a
+/// mutable borrow of the binding itself, can leave it addressing the frame.
+fn formal_keeps_its_entry_value(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirId) -> bool {
+    fn names(expr: &Expr<'_>, binding: HirId) -> bool {
+        matches!(
+            expr.kind,
+            ExprKind::Path(QPath::Resolved(None, path)) if path.res == Res::Local(binding)
+        )
+    }
+    fn peel<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
+        loop {
+            expr = match expr.kind {
+                ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => inner,
+                _ => return expr,
+            };
+        }
+    }
+    struct Find {
+        binding: HirId,
+        broken: bool,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Find {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            match expr.kind {
+                ExprKind::Assign(lhs, rhs, _) if names(lhs, self.binding) => {
+                    let stepped = matches!(
+                        peel(rhs).kind,
+                        ExprKind::MethodCall(segment, receiver, ..)
+                            if matches!(
+                                segment.ident.as_str(),
+                                "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add"
+                                    | "wrapping_sub"
+                            ) && names(peel(receiver), self.binding)
+                    );
+                    if !stepped {
+                        self.broken = true;
+                    }
+                }
+                ExprKind::AssignOp(_, lhs, _) if names(lhs, self.binding) => self.broken = true,
+                ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, operand)
+                    if names(operand, self.binding) =>
+                {
+                    self.broken = true
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        binding,
+        broken: false,
+    };
+    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(function));
+    !find.broken
 }
 
 pub(crate) fn risky_sibling(sibling: &SiblingEvidence) -> bool {
