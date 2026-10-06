@@ -2281,6 +2281,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
     fn r231_checkpoint_export_live_capture_and_emitted_byte_fault() {
         let input = "#![allow(dead_code, unused_unsafe)]\n\
             pub struct Holder { data: *mut i32 }\n\

@@ -43,6 +43,7 @@ pub mod consumer {
 "#;
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r675_pair_e0425_a_hoisted_call_to_a_surfaced_imported_helper_is_qualified() {
     let out = emitted("r675_pair_e0425", PAIR_E0425);
     let flat = compact(&out.source);

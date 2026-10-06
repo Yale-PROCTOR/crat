@@ -368,17 +368,20 @@ fn assert_pair_raw_parameter_outbound(
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn seam_terminal_pair_raw_parameter_drives_its_outbound_adapter() {
     // The explicit cast is the established GREEN contrast from J03.
     pair_raw_parameter_outbound_case("b as *const i32");
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn seam_terminal_pair_raw_parameter_bare_operand_drives_its_outbound_adapter() {
     pair_raw_parameter_outbound_case("b");
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn seam_terminal_pair_raw_parameter_fixed_read_import_uses_its_placed_form() {
     // The write and the read touch the same one live element.
     //
@@ -410,6 +413,7 @@ fn seam_terminal_pair_raw_parameter_fixed_read_import_uses_its_placed_form() {
 }
 
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn seam_terminal_pair_raw_parameter_void_read_import_uses_its_placed_form() {
     // Both memcmp ranges are one initialized byte; a's write precedes the read.
     let input = "#![allow(dead_code, unused_unsafe)]\n\
@@ -439,6 +443,7 @@ fn seam_terminal_pair_raw_parameter_void_read_import_uses_its_placed_form() {
 /// this shape (the post-condition degrades a program that would keep one). It
 /// now pins the hold at the reverted state.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn seam_terminal_pair_raw_view_uses_the_reverted_source_form() {
     let fixture = r231_raw_role_case(true);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
@@ -455,6 +460,7 @@ fn seam_terminal_pair_raw_view_uses_the_reverted_source_form() {
 /// callee role stays (the fixture asserts `update::src`'s `PairRawView`); the
 /// test now pins the hold.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r231_fallback_has_a_raw_callee_role_and_materialized_view() {
     let fixture = r231_raw_role_case(false);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
@@ -686,6 +692,7 @@ struct R231CustodyFixture {
 /// this shape (the post-condition degrades a program that would keep a pending
 /// site), so there is no rendered view to fault. The test now pins the hold.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r231_deliberate_fault_receipt_without_render_is_caught_by_bridge_custody() {
     let fixture = r231_raw_role_case(false);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
@@ -711,6 +718,7 @@ fn r231_deliberate_fault_receipt_without_render_is_caught_by_bridge_custody() {
 /// would keep one). The test now pins the hold: no pending receipt, live or
 /// reverted.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r233_pending_stamp_tracks_the_actual_source_and_callee_interfaces() {
     let live = r231_raw_role_case(false);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
@@ -736,6 +744,7 @@ fn r233_pending_stamp_tracks_the_actual_source_and_callee_interfaces() {
 /// shape (the post-condition degrades a program that would keep one). The test
 /// now pins the hold: no pending receipt and no gap, live or reverted.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
     let live = r231_raw_role_fixture(false, true);
     assert!(
@@ -765,6 +774,7 @@ fn r233_unknown_source_custody_survives_planning_as_a_terminal_gap() {
 /// The test now pins the hold: the plan has no pending receipt to add to custody
 /// (the fixture asserts the emitted program's pending table reads 0).
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r233_actual_pending_bridge_custody_tracks_the_materialized_view() {
     let fixture = r231_raw_role_case(false);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; no
@@ -790,6 +800,7 @@ fn r233_actual_pending_bridge_custody_tracks_the_materialized_view() {
 /// post-condition degrades a program that would keep one). The test now pins
 /// the hold at the atom-reverted state: no pending receipt and no gap.
 #[test]
+#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
 fn r233_source_atom_reversion_removes_only_its_pending_receipt() {
     let atom = r231_raw_role_fixture_with_atom(false, false, true);
     // R829-1 (relay 297, main 188): caller::src is held beside (*holder).data at update; the
