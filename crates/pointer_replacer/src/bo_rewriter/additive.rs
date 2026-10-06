@@ -254,20 +254,32 @@ fn losses<'a>(
             // with its own null evidence falls back to raw rather than keep a
             // NON-OPTIONAL form; that withdrawal is the soundness rule, not a
             // lost delivery. A valid optional prior stays protected (R220).
-            let null_withdrawn = !matches!(old, decision::Decision::Opt { .. })
+            let non_optional_prior = match old {
+                decision::Decision::Opt { .. } | decision::Decision::Degraded(_) => false,
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Cursor { .. } => true,
+            };
+            let null_withdrawn = non_optional_prior
                 && candidate
                     .table
                     .entries
                     .iter()
                     .find(|(s, _)| (s.fn_did, s.hir_id) == key)
-                    .is_some_and(|(_, d)| {
-                        matches!(
-                            d,
-                            decision::Decision::Degraded(decision::Degradation {
-                                reason: decision::DegradeReason::NullInit,
-                                ..
-                            })
-                        )
+                    .is_some_and(|(_, d)| match d {
+                        decision::Decision::Degraded(record) => {
+                            record.reason == decision::DegradeReason::NullInit
+                        }
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Slice { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Box(_)
+                        | decision::Decision::NestedSlice { .. }
+                        | decision::Decision::Cursor { .. } => false,
                     });
             (!survives && !witnessed && !null_withdrawn).then_some(subject)
         })
