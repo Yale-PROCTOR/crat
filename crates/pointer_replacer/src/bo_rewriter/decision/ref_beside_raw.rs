@@ -276,7 +276,7 @@ pub(crate) fn overlap(left: &Designation, right: &Designation) -> Overlap {
         (true, false) | (false, true) => Overlap::LoadedOne,
         (false, false) => match (left.steps.get(common), right.steps.get(common)) {
             (Some(Step::Field(_)), Some(Step::Field(_)))
-                if !left.steps[..common].contains(&Step::Opaque) =>
+                if !left.steps.contains(&Step::Opaque) && !right.steps.contains(&Step::Opaque) =>
             {
                 Overlap::Disjoint
             }
@@ -705,13 +705,64 @@ pub(crate) fn holds(
                 ) => a == b,
                 _ => false,
             };
+            // The seam's pass-2 A5 gate (`seam.rs`'s site gates) reads a pair of
+            // converted positions it names (a borrowing shape), one mutable as its
+            // `is_mut` reads it (a mutable cursor or nested slice is not), on one root
+            // or with one side blind; elsewhere it builds no edge (the round-4 review's
+            // R4-3).
+            let gate_takes = |left: &Arg, right: &Arg, l: &Decision, r: &Decision| {
+                let borrows = |arg: &Arg| match arg.shape {
+                    ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => false,
+                    ArgShape::BareLocal(_)
+                    | ArgShape::AddrOf { .. }
+                    | ArgShape::AddrOfCast { .. }
+                    | ArgShape::CastOfLocal { .. }
+                    | ArgShape::RawExpr { .. } => true,
+                };
+                let gate_mut = |decision: &Decision| {
+                    matches!(
+                        form_of(decision),
+                        Form::Ref { mutable: true }
+                            | Form::Slice { mutable: true }
+                            | Form::Opt { mutable: true, .. }
+                    )
+                };
+                let blind = |arg: &Arg| match arg.shape {
+                    ArgShape::AddrOf { base: None, .. } | ArgShape::AddrOfCast { .. } => true,
+                    ArgShape::AddrOf {
+                        base: Some(base),
+                        through_deref: true,
+                        ..
+                    } => !decision_of
+                        .get(&(call.caller, base))
+                        .is_some_and(|decision| !is_raw(decision)),
+                    ArgShape::RawExpr { .. } => arg.array_start_blind.unwrap_or(true),
+                    ArgShape::AddrOf { .. }
+                    | ArgShape::BareLocal(_)
+                    | ArgShape::CastOfLocal { .. }
+                    | ArgShape::NullLit
+                    | ArgShape::Cast { .. }
+                    | ArgShape::Other => false,
+                };
+                let same_root = !matches!(
+                    (left.shape.place_root(), right.shape.place_root()),
+                    (Some(x), Some(y)) if x != y
+                );
+                borrows(left)
+                    && borrows(right)
+                    && (gate_mut(l) || gate_mut(r))
+                    && (same_root || blind(left) || blind(right))
+            };
             // The PAIR's nodes: co-conversion builds the same-root edges of two of
             // them (R3-1).
-            let pair_node = |decision: &Decision| {
-                matches!(
-                    decision,
-                    Decision::Ref { .. } | Decision::InferredRef { .. }
-                )
+            let pair_node = |decision: &Decision| match decision {
+                Decision::Ref { .. } | Decision::InferredRef { .. } => true,
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Cursor { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
             };
             // A5's C-9 mark on this pair at this call: the shared side is a
             // snapshot carried by the mark's effect proof (PAIR-W1's copy branch).
@@ -802,8 +853,12 @@ pub(crate) fn holds(
                     if matches!(edge, Edge::Ordered) {
                         continue;
                     }
+                    // A C-9 mark between two of the PAIR's nodes: the final filter drops a
+                    // mark whose formals are not both `Ref` (the round-4 review's R4-1).
                     if counted_answers(kind, held[0].1, left.index, right.index)
-                        || c9_marked(left.index, right.index)
+                        || (c9_marked(left.index, right.index)
+                            && pair_node(fl.decision)
+                            && pair_node(fr.decision))
                     {
                         continue;
                     }
@@ -924,9 +979,7 @@ pub(crate) fn holds(
                         // or the PAIR's two nodes give it an edge.
                         Relation::Same
                             if !seam_pair_owned()
-                                && (twin_fires()
-                                    || checked_borrows(left, right)
-                                    || (pair_node(fl.decision) && pair_node(fr.decision))) =>
+                                && (twin_fires() || checked_borrows(left, right)) =>
                         {
                             continue;
                         }
@@ -934,7 +987,11 @@ pub(crate) fn holds(
                         // (pass 2): a raw view unless A5 clears the pair, and only the
                         // classifier's clear is not taken (the round-3 review's R3-1
                         // (b)).
-                        Relation::Same if !seam_pair_owned() && kind == "ref-beside-ref" => {
+                        Relation::Same
+                            if !seam_pair_owned()
+                                && kind == "ref-beside-ref"
+                                && gate_takes(left, right, fl.decision, fr.decision) =>
+                        {
                             if !classifier_clear(&proof()) {
                                 continue;
                             }
@@ -946,11 +1003,17 @@ pub(crate) fn holds(
                         // Two of the PAIR's nodes are its (an unresolved root is
                         // its same root); a slice, an option or a cursor is no node
                         // (R3-1 (b)).
+                        // Two of the PAIR's nodes on a certificate's or a structural
+                        // edge (its `Ordered` edge was taken above); its classifier's
+                        // clear is not (R4-2).
                         Relation::Unresolved
-                            if pair_node(fl.decision) && pair_node(fr.decision) =>
+                            if pair_node(fl.decision) && pair_node(fr.decision) && certified =>
                         {
                             continue;
                         }
+                        // The twin takes a call with a raw sibling of a converted root
+                        // (R4-4: two loads under one root).
+                        Relation::Unresolved if !seam_pair_owned() && twin_fires() => continue,
                         Relation::Unresolved
                             if matches!(
                                 (expression(left.index), expression(right.index)),
@@ -967,9 +1030,14 @@ pub(crate) fn holds(
                                     format!("unresolved;proof=clear:{}", proof.reason)
                                 }
                                 A5SiteProofVerdict::Clear => continue,
-                                // Two converted positions: the A5 gate's raw view
-                                // (an unresolved root is its same root).
-                                _ if kind == "ref-beside-ref" => continue,
+                                // Two converted positions the A5 gate reads: its raw
+                                // view (an unresolved root is its same root).
+                                _ if kind == "ref-beside-ref"
+                                    && !seam_pair_owned()
+                                    && gate_takes(left, right, fl.decision, fr.decision) =>
+                                {
+                                    continue;
+                                }
                                 _ => format!("unresolved;proof={}", proof.verdict.key()),
                             }
                         }
