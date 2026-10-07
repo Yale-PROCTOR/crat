@@ -598,7 +598,7 @@ fn e5c_hold_corpus_rows() {
         // `CRAT_E5C_HOLD_FAULT` names one rule to drop, for the price of each;
         // `CRAT_E5C_HOLD_BYTES=off` drops R1's premise.
         // CRAT_E5C_HOLD_FAULT=Rule[,Rule...]: the first is the fault; all are removed.
-        let rules: [Rule; 51] = [
+        let rules: [Rule; 52] = [
             Rule::OutsideLoad,
             Rule::AllocatorHook,
             Rule::CopyCarry,
@@ -650,6 +650,7 @@ fn e5c_hold_corpus_rows() {
             Rule::ExposedProvenance,
             Rule::IntegerBytes,
             Rule::ExposedRoots,
+            Rule::FormalCalleeSites,
         ];
         let named: Vec<Rule> = std::env::var("CRAT_E5C_HOLD_FAULT")
             .unwrap_or_default()
@@ -2552,6 +2553,54 @@ fn e5c_r878_outside_evident_mode_the_filter_never_clears() {
     });
 }
 
+/// Relay 199 (main 198, R864-3 round 4, R4-1): the check sited a formal's callee store
+/// (H6 (c)) only when the formal stored nothing itself. Here `f`'s own store is the foreign
+/// `stash` (the tier waives it at its own bridged site) and the in-program `keep` takes `s`
+/// inside a `Pair` and keeps it in `H.f`: the check must name the `keep` call as a sited
+/// callee store, as it does for locals, so the host's tier filter at `stash`'s site cannot
+/// release `f::s`.
+const OWN_STORE_HIDES_CALLEE_STORE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
+#[repr(C)] pub struct S { pub x: i32 }
+#[repr(C)] #[derive(Copy, Clone)] pub struct Pair { pub a: *mut S, pub n: i32 }
+#[repr(C)] pub struct H { pub f: *mut S }
+extern "C" { fn stash(p: *mut S); }
+unsafe fn keep(p: Pair, h: *mut H) { (*h).f = p.a; }
+pub unsafe fn f(s: *mut S, h: *mut H) { stash(s); keep(Pair { a: s, n: 0 }, h); }
+pub unsafe fn run(o: *mut S, h: *mut H) { f(o, h); (*o).x = 2; let _y = (*(*h).f).x; }
+"#;
+
+#[test]
+fn e5c_r199_an_own_store_does_not_hide_a_sited_callee_store() {
+    let v = of_record(OWN_STORE_HIDES_CALLEE_STORE);
+    let s = of(&v, "f::s");
+    let Verdict::Held(holds) = s else { panic!("{s:#?}") };
+    assert!(
+        holds.iter().any(|hold| hold.kind == HoldKind::DerivedStore
+            && hold.dest == StoreDest::Callee
+            && hold.site.is_some()),
+        "no sited callee store for keep's call: {holds:#?}"
+    );
+}
+
+#[test]
+fn e5c_r199_fault_formal_callee_sites() {
+    let v = verdicts_opts(
+        OWN_STORE_HIDES_CALLEE_STORE,
+        &[],
+        Options {
+            faults: Options::of_record().faults | (1u64 << Rule::FormalCalleeSites as u64),
+            ..Options::of_record()
+        },
+    );
+    let s = of(&v, "f::s");
+    assert!(
+        !matches!(s, Verdict::Held(holds) if holds.iter().any(|hold| hold.dest == StoreDest::Callee
+            && hold.site.is_some())),
+        "the fault is caught: {s:#?}"
+    );
+}
+
 /// R833-2, (b) stated: each call from outside is taken on its own. A shape that one entry
 /// stores and another entry uses, both called only from outside, is not held (P9 covers it).
 #[test]
@@ -3026,7 +3075,11 @@ fn e5c_evident_faults_under_facts() {
     );
     assert!(with(CX_TOP, "f::p", &[exposed]), "TOP holds under Top");
     assert!(!with(CX_TOP, "f::p", &[exposed, Rule::TopShape]), "TOP");
-    assert!(!with(R3_AGG, "f::p", &[Rule::WideStores]), "WideStores");
+    // era-5c 160: the formal's per-call callee store is a second route to R3_AGG's hold.
+    assert!(
+        !with(R3_AGG, "f::p", &[Rule::WideStores, Rule::FormalCalleeSites]),
+        "WideStores"
+    );
 }
 
 // ---- The review of (ii), round 4: Codex (2026-10-05, at 37df6867c). Six missed holds

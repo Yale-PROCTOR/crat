@@ -248,6 +248,10 @@ pub(crate) enum Rule {
     /// era-5c 146 (ii), Codex round 4: exposing a member's address exposes its whole
     /// object (an integer may be moved to a sibling member on a UB-free input).
     ExposedRoots,
+    /// era-5c 160 (relay 199; main 198 R4-1): a formal's callee store sited per call, as a
+    /// local's: a callee that keeps what it is passed holds the formal at that call, whatever
+    /// the formal stores itself.
+    FormalCalleeSites,
 }
 
 /// The options of one computation: the witnesses' faults and the R1 measurement.
@@ -5623,8 +5627,36 @@ impl RetainedAccessCheck {
                     }
                 }
                 if on(Rule::DerivedStore) {
-                    let stores = relation.derived_stores(f, &body, i);
-                    // H6 (c): a callee keeps it in memory.
+                    let mut stores = relation.derived_stores(f, &body, i);
+                    if facts(Rule::OneDerivation) && facts(Rule::FormalCalleeSites) {
+                        // era-5c 160 (relay 199; main 198 R4-1): a callee that keeps what it is
+                        // passed, sited per call as for locals; an own store no longer hides it
+                        // (the host's tier filter reads each site on its own).
+                        let derived = |l: Local| {
+                            relation
+                                .from_param
+                                .get(&(f, l))
+                                .is_some_and(|params| params.contains(&i))
+                        };
+                        let family = relation.formal_family(&body, &derived, i);
+                        for (block, data) in body.basic_blocks.iter_enumerated() {
+                            let Some(call) = as_call(data.terminator(), tcx) else { continue };
+                            let targets = relation.call_targets(&body, block);
+                            for (j, arg) in call.args.iter().enumerate() {
+                                if Relation::reads_family(&family, &arg.node)
+                                    && let Some(l) = arg.node.place().map(|p| p.local)
+                                    && targets.iter().any(|&g| memory_stored.contains(&(g, j + 1)))
+                                {
+                                    let location = Location {
+                                        block,
+                                        statement_index: data.statements.len(),
+                                    };
+                                    stores.push((location, Place::from(l)));
+                                }
+                            }
+                        }
+                    }
+                    // H6 (c): a callee keeps it in memory (unsited, where nothing is sited).
                     if stores.is_empty() && memory_stored.contains(&(f, i)) {
                         holds.push(Hold {
                             kind: HoldKind::DerivedStore,
