@@ -241,6 +241,33 @@ fn w6a_r738_a_reborrowed_optional_out_parameter_in_the_decoder_loop_compiles() {
 
 #[test]
 fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
+    // R866-1 / R870-1 (relay 302, main 194): with `fresh` beside it, `fresh`'s
+    // `next_out = &mut (*s).ring` is handed to `WriteRingBuffer` beside the whole
+    // `s` (contained), so `WriteRingBuffer::next_out` is held raw for every
+    // caller; the loop's lend is witnessed on `pump` alone.
+    let pump_only = &LOOP[..LOOP
+        .find("pub unsafe extern \"C\" fn fresh(")
+        .expect("fresh")];
+    let (source, reverted) = pinned(
+        "w6a-r738-loop-frame",
+        "r738-loop",
+        pump_only,
+        &[
+            ("pump::s", SlotKind::Raw),
+            ("pump::available_out", SlotKind::Raw),
+            ("pump::next_out", SlotKind::Ref),
+            ("pump::total_out", SlotKind::Raw),
+        ],
+    );
+    let text = compact(&source);
+    assert_eq!(reverted, 0, "{source}");
+    assert!(
+        text.contains("WriteRingBuffer(s,available_out,next_out.as_deref_mut(),total_out,0asi32)"),
+        "pump lends at its loop's only call: {source}"
+    );
+    // With the control: a binding declared inside the loop is a new binding each
+    // pass, and it lies inside `s` — the containment pair holds the callee's
+    // `next_out`, so both calls stay raw.
     let (source, reverted) = pinned(
         "w6a-r738-loop-frame",
         "r738-loop",
@@ -258,12 +285,13 @@ fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
     );
     let text = compact(&source);
     assert_eq!(reverted, 0, "{source}");
+    // R866-1 / R870-1 (relay 302, main 194): WriteRingBuffer::next_out is held
+    // (contained, at fresh); pump's lend → the raw call.
     let pump = &text[text.find("fnpump(").expect("pump")..text.find("fnfresh(").expect("fresh")];
     assert!(
-        pump.contains("WriteRingBuffer(s,available_out,next_out.as_deref_mut(),total_out,0asi32)"),
-        "pump lends at its loop's only call: {source}"
+        pump.contains("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)"),
+        "pump's call stays raw beside the held formal: {source}"
     );
-    // Control: a binding declared inside the loop is a new binding each pass.
     let fresh = &text[text.find("fnfresh(").expect("fresh")..];
     assert!(
         fresh.contains("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)"),
