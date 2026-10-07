@@ -1023,3 +1023,87 @@ fn r864_1_one_subject_at_a_pair_owned_call_is_held_raw() {
         out.details
     );
 }
+
+/// **The round-2 review's NEW-1, containment through an outer field:** `&mut
+/// (*s).br` beside `br` with `let br = &mut (*s).br` is one object (both
+/// formals delivered, `&mut Br` and `&Br`); the whole-outer requirement left it
+/// unanswered. The control passes a distinct field (`&mut (*s).other`): distinct
+/// fields of one object are disjoint.
+const CONTAINED_FIELD: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[repr(C)]\n\
+    pub struct Br { pos: u32, val: u32 }\n\
+    #[repr(C)]\n\
+    pub struct S { state: i32, br: Br, other: Br }\n\
+    pub unsafe fn read_bits(mut a: *mut Br, b: *mut Br) -> u32 {\n\
+        let _k = a as *mut u8;\n\
+        (*a).pos += 1;\n\
+        (*b).val\n\
+    }\n\
+    pub unsafe fn process(s: *mut S) -> u32 {\n\
+        let mut br: *mut Br = &mut (*s).br;\n\
+        read_bits(&mut (*s).br, br)\n\
+    }\n\
+    pub unsafe fn entry() -> u32 {\n\
+        let mut x = S { state: 0, br: Br { pos: 0, val: 0 }, other: Br { pos: 0, val: 0 } };\n\
+        process(&mut x)\n\
+    }\n";
+
+#[test]
+fn r864_1_round2_containment_through_an_outer_field_is_held() {
+    let out = outcome(CONTAINED_FIELD);
+    assert!(
+        detail_of(&out, "read_bits::b").is_some_and(|d| d.contains("ref-beside-")
+            && d.contains("read_bits#2:peer#1")
+            && d.contains(";contained")),
+        "{:?}",
+        out.details
+    );
+    let callee = signature(&out.source, "read_bits");
+    assert!(callee.contains("b: *mut Br"), "held raw: {callee}");
+    let distinct = CONTAINED_FIELD.replace(
+        "read_bits(&mut (*s).br, br)",
+        "read_bits(&mut (*s).other, br)",
+    );
+    assert!(distinct.contains("read_bits(&mut (*s).other, br)"));
+    let out = outcome(&distinct);
+    assert_eq!(reason_of(&out, "read_bits::b"), None, "{:?}", out.reasons);
+}
+
+/// **The round-2 review's NEW-2 — a pointer static's value is not the static's
+/// storage.** `G` and `H` are two pointer statics that both hold
+/// `TMP.as_mut_ptr()`: `zsqr(G, H)` hands one object at both positions. Two
+/// distinct statics read as two objects only when the arguments address the
+/// statics' own storage.
+const POINTER_STATICS: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[derive(Clone, Copy)]\n\
+    #[repr(C)]\n\
+    pub struct Z { sign: i32, used: usize }\n\
+    pub unsafe fn zsqr(mut a: *mut Z, b: *mut Z) {\n\
+        let _k = a.offset(0);\n\
+        let s = (*b).used;\n\
+        (*a).used = s + 1;\n\
+        (*a).sign = 1;\n\
+    }\n\
+    pub static mut TMP: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
+    pub static mut G: *mut Z = 0 as *mut Z;\n\
+    pub static mut H: *mut Z = 0 as *mut Z;\n\
+    pub unsafe fn entry() -> usize {\n\
+        G = TMP.as_mut_ptr();\n\
+        H = TMP.as_mut_ptr();\n\
+        zsqr(G, H);\n\
+        TMP[0].used\n\
+    }\n";
+
+#[test]
+fn r864_1_round2_two_pointer_statics_are_not_two_objects() {
+    let out = outcome(POINTER_STATICS);
+    assert!(
+        detail_of(&out, "zsqr::b").is_some_and(|d| d.contains("ref-beside-raw:")
+            && d.contains("zsqr#2:peer#1")
+            && d.contains(";unresolved")),
+        "{:?}",
+        out.details
+    );
+    let zsqr = signature(&out.source, "zsqr");
+    assert!(zsqr.contains("b: *mut Z"), "held raw: {zsqr}");
+}
