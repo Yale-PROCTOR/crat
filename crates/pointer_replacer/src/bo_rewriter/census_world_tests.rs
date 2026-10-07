@@ -579,3 +579,28 @@ fn r864_1_b_offset_and_copied_decays_of_one_array_are_not_delivered() {
         "add5:\n{source}"
     );
 }
+
+/// **wave-5d 145c — two raw locals holding one pointer** (the second review's
+/// HIGH-1, and wider: no array is needed). A bare raw local is rendered
+/// `&mut *p`, a reborrow borrowck does not see, so the overlap gate must ask
+/// the proof. Each callee writes `a` and reads `b` at one `i32`.
+#[test]
+fn r145c_raw_local_copies_of_one_pointer_are_not_delivered() {
+    let input = include_str!("testdata/r145c_raw_local_copies.rs");
+    let source = match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("the census world emits: {other:#?}"),
+    };
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for callee in ["add1", "add2", "add3", "add4"] {
+        assert!(
+            flat.contains(&format!("fn {callee}(mut a: *mut i32, mut b: *mut i32)")),
+            "{callee}:\n{source}"
+        );
+    }
+    // Control: copies of two distinct local arrays keep the proof.
+    assert!(
+        flat.contains("fn add5(mut a: &mut i32, mut b: &i32)"),
+        "add5:\n{source}"
+    );
+}
