@@ -125,3 +125,10 @@ fn r864_1_b_a_copy_with_another_definition_is_not_the_array() {
 fn r864_1_b_integer_arithmetic_on_a_decay_is_not_the_array() {
     assert_eq!(read("integer_arithmetic_on_a_decay", CLASSIFIER), NOT_TAKEN);
 }
+
+/// The third review's M-2: a local read twice through one copy (`p = q; …
+/// p = q;`) is still that copy's array, on both sides.
+#[test]
+fn r864_1_b_diamond_copies_of_one_array_are_not_disjoint() {
+    assert_eq!(read("diamond_copies_of_one_local", CLASSIFIER), SAME);
+}

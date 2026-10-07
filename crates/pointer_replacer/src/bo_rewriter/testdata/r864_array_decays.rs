@@ -63,3 +63,13 @@ pub unsafe fn integer_arithmetic_on_a_decay(mut d: usize) {
     let mut y: [i32; 4] = [0; 4];
     add((x.as_mut_ptr() as usize).wrapping_add(d) as *mut i32, y.as_mut_ptr());
 }
+pub unsafe fn diamond_copies_of_one_local() {
+    let mut x: [i32; 4] = [0; 4];
+    let q = x.as_mut_ptr();
+    let mut p = q;
+    p = q;
+    let r = x.as_mut_ptr();
+    let mut s = r;
+    s = r;
+    add(p, s);
+}
