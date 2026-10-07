@@ -433,6 +433,8 @@ mod returned_child_tests;
 #[cfg(test)]
 mod revert_input_tests;
 #[cfg(test)]
+mod review107_tests;
+#[cfg(test)]
 mod scalar_bytes_tests;
 #[cfg(test)]
 mod sealed_source_edge_frame_tests;
