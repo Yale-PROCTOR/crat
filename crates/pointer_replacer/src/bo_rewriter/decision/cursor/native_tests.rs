@@ -578,3 +578,60 @@ pub unsafe fn caller(mut strm: *mut bz_stream) -> i32 {
         "the held formal must stay held, never a cursor: reason {held:?}; {decisions:?}"
     );
 }
+
+/// **R828-7 (relay 114), S2 first half.** The paper's cursor figure, verbatim
+/// as the pinned c2rust emits it (analysis-fanout 060 §4): a position walked
+/// down from one past the end, compared with its own base. Both positions are
+/// over one window starting at `a`, so `p != a` is `p.pos() != 0`; no
+/// reference to one past the end is formed.
+const R828_FIGURE: &str = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn last_nonzero(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut p = a.offset(n as isize);
+    while p != a { p = p.offset(-1); if *p != 0 { return *p; } }
+    return 0 as ::core::ffi::c_int;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut a: [::core::ffi::c_int; 5] = [4, 0, 7, 0, 0];
+    last_nonzero(a.as_mut_ptr(), 5)
+}
+"###;
+
+#[test]
+fn slicecursor_r828_a_position_compared_with_its_own_base_is_an_index() {
+    let out = emitted(R828_FIGURE);
+    let compact: String = out.split_whitespace().collect();
+    // `a` is the parameter's own cursor and never moves: its position is 0, so
+    // this is `p.pos() != 0`.
+    assert!(
+        compact.contains("whilep.pos()!=a.pos()") && !compact.contains("whilep!=a"),
+        "the figure's loop compares two positions over one window: {out}"
+    );
+    assert!(
+        compact.contains("p.seek(") && compact.contains("p[0isize]"),
+        "the walk steps the cursor back and reads through it: {out}"
+    );
+    assert!(
+        !compact.contains("a:*const"),
+        "the base is no longer a raw pointer: {out}"
+    );
+}
+
+/// **R828-7 control.** The same walk compared with ANOTHER parameter `b`: two
+/// roots, so no index comparison exists, and the backward step is not guarded
+/// by a test against its own root. The function stays raw.
+#[test]
+fn slicecursor_r828_control_a_position_compared_across_two_roots_stays_raw() {
+    let src = R828_FIGURE.replace(
+        "last_nonzero(mut a: *const ::core::ffi::c_int, mut n: size_t)",
+        "last_nonzero(mut a: *const ::core::ffi::c_int, mut b: *const ::core::ffi::c_int, mut n: size_t)",
+    )
+    .replace("while p != a", "while p != b")
+    .replace("last_nonzero(a.as_mut_ptr(), 5)", "last_nonzero(a.as_mut_ptr(), a.as_mut_ptr(), 5)");
+    let out = emitted(&src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        compact.contains("whilep!=b") && !compact.contains(".pos()"),
+        "a comparison across two roots is not an index comparison: {out}"
+    );
+}
