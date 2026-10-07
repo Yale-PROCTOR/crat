@@ -14994,6 +14994,43 @@ fn r674_9_a_parameter_used_otherwise_proves_no_extent() {
     .expect("fixture compiles");
 }
 
+/// **R884-3 (wave-4 088) — no extent past a call that may not return.** The
+/// record's `len-callee-access` read `f(p, stop) { gate(stop); *p.offset(0) +
+/// *p.offset(1) }` as "reads elements 0..2 on every call", but `gate` exits on
+/// `stop != 0` before either read. Any call before the last access (one not a
+/// known non-diverging primitive) leaves no evidence-backed extent; a call
+/// after the last access does not matter, and a call in the value an element
+/// is assigned runs before the write.
+#[test]
+fn r884_3_no_extent_past_a_call_that_may_not_return() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn gate(stop: i32) { if stop != 0 { std::process::exit(0); } }\n\
+         pub unsafe fn f(p: *const u8, stop: i32) -> u8 { gate(stop); *p.offset(0) + *p.offset(1) }\n\
+         pub unsafe fn after(p: *const u8, stop: i32) -> u8 { let x = *p.offset(0) + *p.offset(1); gate(stop); x }\n\
+         pub unsafe fn value(p: *mut u8, stop: i32) { *p.offset(1) = { gate(stop); 7 }; }\n\
+         pub unsafe fn arith(p: *const u8) -> u8 { (*p.offset(0)).wrapping_add(*p.offset(2)) }\n";
+    ::utils::compilation::run_compiler_on_str(SRC, |tcx| {
+        let function = |name: &str| {
+            tcx.hir_body_owners()
+                .find(|owner| tcx.item_name(owner.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let extent = |name: &str| {
+            super::decision::element_extent::constant_access_extent(tcx, function(name), 0)
+        };
+        assert_eq!(
+            (
+                extent("f"),
+                extent("after"),
+                extent("value"),
+                extent("arith")
+            ),
+            (None, Some(2), None, Some(3))
+        );
+    })
+    .expect("fixture compiles");
+}
+
 /// **R677-6 (relay 141) — a bare raw argument takes the callee's proven
 /// extent too.** lodepng's `lodepng_read32bitInt(chunk)`: a raw pointer into a
 /// slice formal where no companion, contract, region, C string or array names a
