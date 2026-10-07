@@ -511,9 +511,10 @@ fn r866_signature(name: &str) -> String {
 
 /// R866-1 (fan-out 083): `safe_read(&mut *s, &mut *br)` with `br = &mut
 /// (*s).br`: both formals stay raw. In this small crate the model itself
-/// demotes `br` (the containment is a borrow conflict here) and the raw-side
-/// rule (R864-1 (a)) holds `s` beside it; the record delivered both, and the
-/// containment fact F2 holds them by is witnessed in `proven_overlap_tests`.
+/// demotes `br` (the containment is a borrow conflict here) and F2 holds `s`
+/// beside it (`&mut *s` reads as `s`, `&mut *br` lies inside it); the record
+/// delivered both, and the containment fact is witnessed in
+/// `proven_overlap_tests`.
 #[test]
 fn r866_1_a_field_of_the_other_arguments_object_holds_both_formals() {
     let signature = r866_signature("safe_read");

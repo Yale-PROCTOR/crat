@@ -1087,7 +1087,20 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     if !a.mutable && !b.mutable {
                         continue;
                     }
-                    let same_root = !matches!((a.root, b.root), (Some(x), Some(y)) if x != y);
+                    // R864-1 (b) (wave-5d 145a): two locals copied from one
+                    // array are distinct roots of one object.
+                    let decay = |index: usize| {
+                        site.args
+                            .iter()
+                            .find(|argument| argument.index == index)
+                            .and_then(|argument| argument.array_decay)
+                    };
+                    let same_array = matches!(
+                        (decay(a.argument_index), decay(b.argument_index)),
+                        (Some(x), Some(y)) if x == y && x != super::array_decay::DecayRoot::Other
+                    );
+                    let same_root =
+                        same_array || !matches!((a.root, b.root), (Some(x), Some(y)) if x != y);
                     let conflicts = match overlap {
                         OverlapRule::BlindOnly => same_root || a.blind || b.blind,
                         OverlapRule::AllPairs => true,
