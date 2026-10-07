@@ -391,8 +391,7 @@ pub(crate) fn collect_inventory_from(
     let mut exit_liveness = FxHashMap::default();
     let mut expressions = FxHashMap::default();
     // R864-1 (b): each call's argument roots, read once per call.
-    let mut argument_roots: FxHashMap<(LocalDefId, Span), Vec<Option<(HirId, bool)>>> =
-        FxHashMap::default();
+    let mut argument_roots: FxHashMap<(LocalDefId, Span), Vec<ArgumentRoot>> = FxHashMap::default();
     for site in &ctx.raw_boundary_sites.sites {
         let (caller, mut source, source_evidence) =
             if let Some(expression) = outbound_expressions.plans.get(&site.key) {
@@ -558,15 +557,24 @@ pub(crate) fn collect_inventory_from(
             let roots = argument_roots
                 .entry((caller, site.call_span))
                 .or_insert_with(|| call_argument_roots(tcx, caller, site.call_span));
-            let source_root = roots.get(site.key.argument_index).copied().flatten();
-            let sibling_root = roots.get(argument_index).copied().flatten();
-            // Two field places under one root may be disjoint fields (the PAIR's
-            // rule (c)): the rule reads one binding with at least one side whole.
-            let proof = if source_root.is_some()
-                && sibling_root.map(|(root, _)| root) == source_root.map(|(root, _)| root)
-                && !(source_root.is_some_and(|(_, field)| field)
-                    && sibling_root.is_some_and(|(_, field)| field))
-            {
+            // One binding's objects are one subject unless their designations
+            // part at distinct fields or one is reached through a loaded pointer
+            // (the round-2 review's NEW-1: a field twice, nested fields).
+            let same_subject = match (
+                roots.get(site.key.argument_index),
+                roots.get(argument_index),
+            ) {
+                (Some((Some(a), da)), Some((Some(b), db))) if a == b => match (da, db) {
+                    (Some(da), Some(db)) => {
+                        da.root == db.root
+                            && super::ref_beside_raw::overlap(da, db)
+                                == super::ref_beside_raw::Overlap::Yes
+                    }
+                    _ => true,
+                },
+                _ => false,
+            };
+            let proof = if same_subject {
                 unknown_proof("same-subject")
             } else {
                 proof
@@ -1227,56 +1235,31 @@ fn call_argument_is(
 /// The binding each argument of the call at `call_span` roots at (`place_root`:
 /// through casts, borrows, dereferences, fields, indices and method receivers),
 /// and whether its place crosses a field projection on the way.
-fn call_argument_roots(
-    tcx: TyCtxt<'_>,
-    caller: LocalDefId,
-    call_span: Span,
-) -> Vec<Option<(HirId, bool)>> {
-    fn crosses_field(expr: &Expr<'_>) -> bool {
-        let mut cur = expr;
-        loop {
-            cur = match &cur.kind {
-                ExprKind::Field(..) => return true,
-                ExprKind::Unary(rustc_hir::UnOp::Deref, base)
-                | ExprKind::Index(base, _, _)
-                | ExprKind::AddrOf(_, _, base)
-                | ExprKind::Cast(base, _)
-                | ExprKind::DropTemps(base) => base,
-                ExprKind::MethodCall(_, receiver, _, _) => receiver,
-                _ => return false,
-            };
-        }
-    }
-    struct Find {
-        call_span: Span,
-        roots: Option<Vec<Option<(HirId, bool)>>>,
-    }
-    impl<'tcx> intravisit::Visitor<'tcx> for Find {
-        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            if self.roots.is_none()
-                && let ExprKind::Call(_, arguments) = expr.kind
-                && expr.span.source_callsite() == self.call_span.source_callsite()
-            {
-                self.roots = Some(
-                    arguments
-                        .iter()
-                        .map(|argument| {
-                            super::emitability::place_root(argument)
-                                .0
-                                .map(|root| (root, crosses_field(argument)))
-                        })
-                        .collect(),
-                );
-            }
-            intravisit::walk_expr(self, expr);
-        }
-    }
-    let mut find = Find {
-        call_span,
-        roots: None,
-    };
-    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
-    find.roots.unwrap_or_default()
+/// An argument's root binding and the object it designates (normalized
+/// through single-definition locals), as `ref_beside_raw` reads them.
+type ArgumentRoot = (Option<HirId>, Option<super::ref_beside_raw::Designation>);
+
+fn call_argument_roots(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span) -> Vec<ArgumentRoot> {
+    let typeck = tcx.typeck(caller);
+    super::ref_beside_raw::call_arguments(tcx, caller)
+        .get(&call_span.source_callsite())
+        .map(|arguments| {
+            arguments
+                .iter()
+                .map(|argument| {
+                    (
+                        super::emitability::place_root(argument).0,
+                        super::ref_beside_raw::pointer_designation(typeck, argument).map(
+                            |designation| {
+                                super::ref_beside_raw::normalized(tcx, caller, typeck, designation)
+                                    .0
+                            },
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The binding an ordinary borrow beneath the call argument's casts roots at,

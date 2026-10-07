@@ -1336,7 +1336,7 @@ fn literal_like(e: &Expr<'_>) -> bool {
 
 /// The one definition of a local never assigned, never borrowed mutably:
 /// its `let` initializer.
-fn single_definition<'tcx>(
+pub(crate) fn single_definition<'tcx>(
     tcx: TyCtxt<'tcx>,
     function: LocalDefId,
     local: HirId,

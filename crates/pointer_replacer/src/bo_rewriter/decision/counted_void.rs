@@ -1663,7 +1663,7 @@ pub(crate) fn field_load_exemptions(
 ///
 /// The argument must be exactly `(*root).f` or `root.f`: one field load, no
 /// cast, no address — the shape whose value is the stored pointer itself.
-fn field_load_exemption(
+pub(crate) fn field_load_exemption(
     tcx: TyCtxt<'_>,
     site: &super::emitability::CallSite,
     root: HirId,
