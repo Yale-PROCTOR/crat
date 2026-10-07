@@ -79,6 +79,8 @@ pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
 #[cfg(test)]
+mod class2_pair_trace_tests;
+#[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
 mod construction_values_tests;
@@ -8492,7 +8494,6 @@ fn finish_decide<'tcx>(
              $exposure:expr, $return_receivers:expr $(,)?) => {
                 decision::Ctx {
                     tcx,
-                    retained_access: &retained_access,
                     field_alloc: &field_alloc_licences,
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,

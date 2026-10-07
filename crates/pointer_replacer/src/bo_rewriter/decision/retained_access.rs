@@ -5120,6 +5120,29 @@ pub(crate) struct Hold {
     pub(crate) retaining_place: String,
     /// `fn | retaining place | file:line`.
     pub(crate) witness: String,
+    /// era-5c 157 (relay 196, R864-3): where a derived store lands and the store's site, for
+    /// the hold's host (main's joint fixpoint) to read against the rewriter's deliveries.
+    pub(crate) dest: StoreDest,
+    /// The store's site: (the storing function's def index, block, statement).
+    pub(crate) site: Option<(u32, u32, usize)>,
+}
+
+/// era-5c 157 (relay 196): where a derived store lands. Struct and function identities are
+/// def indices of the local crate (`LocalDefId::local_def_index`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum StoreDest {
+    /// Not a store (an access hold).
+    None,
+    /// A field of a crate struct: (struct, field index).
+    Field(u32, usize),
+    /// An element of an array field of a crate struct: (struct, field index).
+    ArrayInField(u32, usize),
+    /// An element of the storing function's own array local (the local's index).
+    ArrayLocal(u32),
+    /// A callee that keeps what it is passed in memory.
+    Callee,
+    /// Anything else: through a pointer, a field of a foreign struct.
+    Other,
 }
 
 /// The check's verdict for one subject.
@@ -5130,6 +5153,58 @@ pub(crate) enum Verdict {
     /// The relation cannot see the subject's access set (an unmodelled kind, or a mixed
     /// object's cell loaded in its extent). Held, fail-closed.
     Unknown,
+}
+
+/// era-5c 157 (relay 196): a derived store's retaining place as the receipt names it, and where
+/// it lands.
+fn store_dest<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    dst: Place<'tcx>,
+    place_name: &dyn Fn(Via) -> String,
+) -> (String, StoreDest) {
+    let parent_adt = |end: usize| {
+        let parent = Place {
+            local: dst.local,
+            projection: tcx.mk_place_elems(&dst.projection[..end]),
+        };
+        match parent.ty(body, tcx).ty.kind() {
+            TyKind::Adt(adt, _) => Some(adt.did()),
+            _ => None,
+        }
+    };
+    let n = dst.projection.len();
+    match dst.projection.last() {
+        Some(ProjectionElem::Field(field, _)) => match parent_adt(n - 1) {
+            Some(did) => (
+                place_name(Via::Field(did, field.index())),
+                did.as_local().map_or(StoreDest::Other, |s| {
+                    StoreDest::Field(s.local_def_index.as_u32(), field.index())
+                }),
+            ),
+            None => ("elem".to_owned(), StoreDest::Other),
+        },
+        last => {
+            let element = matches!(
+                last,
+                Some(ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+            );
+            let dest = match (element, n.checked_sub(2).map(|k| dst.projection[k])) {
+                (false, _) if n == 0 => StoreDest::Callee,
+                (true, None) => StoreDest::ArrayLocal(dst.local.as_u32()),
+                (true, Some(ProjectionElem::Field(field, _))) => {
+                    match parent_adt(n - 2).and_then(|did| did.as_local()) {
+                        Some(s) => {
+                            StoreDest::ArrayInField(s.local_def_index.as_u32(), field.index())
+                        }
+                        None => StoreDest::Other,
+                    }
+                }
+                _ => StoreDest::Other,
+            };
+            (format!("elem:{}", dst.ty(body, tcx).ty), dest)
+        }
+    }
 }
 
 impl Verdict {
@@ -5385,6 +5460,8 @@ impl RetainedAccessCheck {
                     place_name(access.via),
                     line_of(access.at.0, access.at.1)
                 ),
+                dest: StoreDest::None,
+                site: None,
             };
         // A hold that rests on `Top` (either side) is an unknown one.
         let unknown_hold = |objs: &FxHashSet<Obj>, access: &Access| {
@@ -5551,26 +5628,12 @@ impl RetainedAccessCheck {
                                 tcx.def_path_str(f.to_def_id()),
                                 line_of(f, Location::START)
                             ),
+                            dest: StoreDest::Callee,
+                            site: None,
                         });
                     }
                     for (location, dst) in stores {
-                        let place = match dst.projection.last() {
-                            Some(ProjectionElem::Field(field, _)) => {
-                                let parent = Place {
-                                    local: dst.local,
-                                    projection: tcx.mk_place_elems(
-                                        &dst.projection[..dst.projection.len() - 1],
-                                    ),
-                                };
-                                match parent.ty(&*body, tcx).ty.kind() {
-                                    TyKind::Adt(adt, _) => {
-                                        place_name(Via::Field(adt.did(), field.index()))
-                                    }
-                                    _ => "elem".to_owned(),
-                                }
-                            }
-                            _ => format!("elem:{}", dst.ty(&*body, tcx).ty),
-                        };
+                        let (place, dest) = store_dest(tcx, &body, dst, &place_name);
                         holds.push(Hold {
                             kind: HoldKind::DerivedStore,
                             access: AccessKind::Write,
@@ -5582,6 +5645,12 @@ impl RetainedAccessCheck {
                                 place,
                                 line_of(f, location)
                             ),
+                            dest,
+                            site: Some((
+                                f.local_def_index.as_u32(),
+                                location.block.as_u32(),
+                                location.statement_index,
+                            )),
                         });
                     }
                 }
@@ -5847,23 +5916,7 @@ impl RetainedAccessCheck {
                         }
                     }
                     for (location, dst) in stores {
-                        let place = match dst.projection.last() {
-                            Some(ProjectionElem::Field(field, _)) => {
-                                let parent = Place {
-                                    local: dst.local,
-                                    projection: tcx.mk_place_elems(
-                                        &dst.projection[..dst.projection.len() - 1],
-                                    ),
-                                };
-                                match parent.ty(&*body, tcx).ty.kind() {
-                                    TyKind::Adt(adt, _) => {
-                                        place_name(Via::Field(adt.did(), field.index()))
-                                    }
-                                    _ => "elem".to_owned(),
-                                }
-                            }
-                            _ => format!("elem:{}", dst.ty(&*body, tcx).ty),
-                        };
+                        let (place, dest) = store_dest(tcx, &body, dst, &place_name);
                         holds.push(Hold {
                             kind: HoldKind::DerivedStore,
                             access: AccessKind::Write,
@@ -5875,6 +5928,12 @@ impl RetainedAccessCheck {
                                 place,
                                 line_of(f, location)
                             ),
+                            dest,
+                            site: Some((
+                                f.local_def_index.as_u32(),
+                                location.block.as_u32(),
+                                location.statement_index,
+                            )),
                         });
                     }
                 }

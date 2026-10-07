@@ -1346,9 +1346,6 @@ impl DecisionTable {
 /// next phase a finished value, so a context that could not be mutated is the
 /// honest shape for it.
 pub(crate) struct Ctx<'a, 'tcx> {
-    /// era-5c relay 182 (R826-1): the retained-access check of record, (E) in the
-    /// closed world.
-    pub(crate) retained_access: &'a retained_access::RetainedAccessCheck,
     /// wave-6l relay 071: the field-carried allocation lengths.
     // R823-3: unread while relay 071's narrowing is reverted (the masked hold
     // reads it again in 56).
@@ -2009,23 +2006,6 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             DegradeReason::RetainedAlias { detail },
         );
     }
-    // era-5c relay 182 (R826-1, USER): the retained-access check of record, the
-    // evident shapes by rule (a derived store, a self-reference, a cycle) in the closed
-    // world; P9 `RetainedAccessFreedom` stands for the rest. Receipt
-    // `held:retained-alias`, detail `evident:<rule>:<retaining place> | <witness>`.
-    let verdict = match subject.kind {
-        SubjectKind::Param { .. } => ctx
-            .retained_access
-            .formal(subject.fn_did, subject.local.as_usize()),
-        SubjectKind::Local => ctx.retained_access.local(subject.fn_did, subject.local),
-    };
-    if let Some(detail) = verdict.and_then(retained_access::Verdict::evident_receipt) {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
-            DegradeReason::RetainedAlias { detail },
-        );
-    }
     if subject.ty_span.is_some() {
         return decision;
     }
@@ -2272,7 +2252,6 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
 fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
-        retained_access: _,
         // R823-3: read again by the masked hold when the narrowing returns.
         field_alloc: _,
         io_domain,

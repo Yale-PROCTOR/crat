@@ -6,7 +6,8 @@ use rustc_hir::{ItemKind, OwnerNode};
 use rustc_span::def_id::DefId;
 
 use super::retained_access::{
-    AccessKind, HoldKind, Options, RetainedAccessCheck, Rule, Shape, Verdict, body_identity,
+    AccessKind, HoldKind, Options, RetainedAccessCheck, Rule, Shape, StoreDest, Verdict,
+    body_identity,
 };
 use crate::utils::rustc::RustProgram;
 
@@ -566,6 +567,8 @@ fn e5c_hold_corpus_rows() {
         .map(|(k, v)| (k.trim_end_matches("@d0").to_owned(), v.to_owned()))
         .collect();
     let mut rows = Vec::new();
+    // era-5c 157 (relay 196, R864-3): the verdict rows for the hold's host, beside the rows.
+    let mut vrows = Vec::new();
     ::utils::compilation::run_compiler_on_path(std::path::Path::new(&path), |tcx| {
         let program = program_of(tcx);
         let raw = |did: DefId, index: usize| {
@@ -704,11 +707,96 @@ fn e5c_hold_corpus_rows() {
                     .and_then(|r| r.split(':').nth(1).map(str::to_owned))
                     .unwrap_or_default()
             ));
+            // One row per hold of a held subject: the rule, the receipt detail, where a derived
+            // store lands (with the field's model kind), the store's site, and the subject's call
+            // sites (the keys the retention tier's dispositions sit on).
+            if let Verdict::Held(holds) = verdict {
+                let at = |span: rustc_span::Span| {
+                    let lo = tcx.sess.source_map().lookup_char_pos(span.lo());
+                    format!("{}:{}", lo.line, lo.col.0 + 1)
+                };
+                let mut sites = Vec::new();
+                for (block, data) in body.basic_blocks.iter_enumerated() {
+                    let rustc_middle::mir::TerminatorKind::Call { func, args, .. } =
+                        &data.terminator().kind
+                    else {
+                        continue;
+                    };
+                    let callee = func
+                        .const_fn_def()
+                        .map_or_else(|| "indirect".to_owned(), |(did, _)| tcx.def_path_str(did));
+                    for (j, arg) in args.iter().enumerate() {
+                        if arg.node.place().is_some_and(|p| p.local == *local) {
+                            sites.push(format!(
+                                "bb{}#{j}->{callee}@{}",
+                                block.as_u32(),
+                                at(data.terminator().source_info.span)
+                            ));
+                        }
+                    }
+                }
+                let path_of = |index: u32| {
+                    tcx.def_path_str(
+                        rustc_span::def_id::LocalDefId {
+                            local_def_index: rustc_span::def_id::DefIndex::from_u32(index),
+                        }
+                        .to_def_id(),
+                    )
+                };
+                let slot = |s: u32, i: usize| {
+                    let key = format!("{}::field{i}", path_of(s));
+                    let kind = kinds.get(&key).cloned().unwrap_or_else(|| "-".to_owned());
+                    (key, kind)
+                };
+                for (k, hold) in holds.iter().enumerate() {
+                    let receipt = Verdict::Held(vec![hold.clone()])
+                        .evident_receipt()
+                        .unwrap_or_default();
+                    let rule = receipt.split(':').nth(1).unwrap_or_default().to_owned();
+                    let none = || "-".to_owned();
+                    let (dest, slot_key, slot_kind) = match hold.dest {
+                        StoreDest::None => (none(), none(), none()),
+                        StoreDest::Field(s, i) => {
+                            let (key, kind) = slot(s, i);
+                            ("field".to_owned(), key, kind)
+                        }
+                        StoreDest::ArrayInField(s, i) => {
+                            let (key, kind) = slot(s, i);
+                            ("array-in-field".to_owned(), key, kind)
+                        }
+                        StoreDest::ArrayLocal(l) => (format!("array-local:_{l}"), none(), none()),
+                        StoreDest::Callee => ("callee-store".to_owned(), none(), none()),
+                        StoreDest::Other => ("other".to_owned(), none(), none()),
+                    };
+                    let site = hold
+                        .site
+                        .map_or_else(none, |(g, b, st)| format!("{}@bb{b}[{st}]", path_of(g)));
+                    vrows.push(format!(
+                        "{}\t{}::{name}\t{}\t{}\t{}\theld\t{k}\t{rule}\t{receipt}\t{dest}\t{slot_key}\t{slot_kind}\t{site}\t{}",
+                        tcx.def_path_str(f.to_def_id()),
+                        tcx.item_name(f.to_def_id()),
+                        local.as_usize(),
+                        if local.as_usize() <= body.arg_count { "f" } else { "l" },
+                        at(body.local_decls[*local].source_info.span),
+                        if sites.is_empty() { "-".to_owned() } else { sites.join(";") },
+                    ));
+                }
+            }
         }
     })
     .expect("compiles");
     rows.sort();
     std::fs::write(&out, rows.join("\n") + "\n").expect("write rows");
+    vrows.sort();
+    let header = "fn\tlabel\tlocal\tf_or_l\tdecl\tverdict\thold\trule\treceipt\tdest\tslot\tslot_kind\tstore_site\tcall_sites";
+    std::fs::write(
+        out.replace("/hold.", "/verdict."),
+        format!(
+            "{header}\n{}",
+            vrows.iter().map(|r| format!("{r}\n")).collect::<String>()
+        ),
+    )
+    .expect("write verdict rows");
 }
 
 // ---- The Codex review's findings (era-5c 139 §4): each a RED witness of a missed
