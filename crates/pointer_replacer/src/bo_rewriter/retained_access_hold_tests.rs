@@ -39,11 +39,18 @@ fn held(decisions: &FxHashMap<String, String>, subject: &str) -> bool {
 
 /// The positive control: libtree's shape, a self-reference stored by `init` and used
 /// by `append` within one call from outside, is held on the settled table (155 §4:
-/// the hook-free line left `append::v` `Ref { mutable: true }`).
+/// the hook-free line left `append::v` `Ref { mutable: true }`). The check reads the
+/// model's field kinds (a retaining field the model decides `Ref` / `Owning` is no raw
+/// retaining place), so the field carries raw evidence here (a byte write through it),
+/// as libtree's does.
 const SELF_REFERENCE: &str = r#"
 #[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
 pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
-pub unsafe fn append(v: *mut small_vec, x: u64) { *(*v).p.offset((*v).n as isize) = x; (*v).n += 1; }
+pub unsafe fn append(v: *mut small_vec, x: u64) {
+    *(*v).p.offset((*v).n as isize) = x;
+    *((*v).p as *mut u8) = 0;
+    (*v).n += 1;
+}
 pub unsafe fn run(v: *mut small_vec) { init(v); append(v, 1); }
 "#;
 

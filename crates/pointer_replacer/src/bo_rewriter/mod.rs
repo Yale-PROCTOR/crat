@@ -8326,6 +8326,19 @@ fn finish_decide<'tcx>(
     // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
     // once: they read the program, not a decision.
     let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
+    // **R864-3 (relay 299; era-5c 154 / 154a / 157c) — the retained-access check's
+    // holds, the joint fixpoint's fourth predicate**, named on the settled table
+    // after the field transactions (filter 3 reads them) and held for the rest of
+    // the stage like the planned holds; with them, the places the stage delivers
+    // before any retained hold (154a §2.1).
+    let mut retained_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+        Option<decision::retained_access_hold::Delivered>,
+    ) = (None, Default::default(), None);
     // Relay 297 (main 187): the sources the stage's plan named pending, held for
     // the rest of the stage (see below, before the stage snapshot).
     let mut planned_held: (
@@ -8800,6 +8813,9 @@ fn finish_decide<'tcx>(
         if planned_held.0 != Some(family_policy.stage) {
             planned_held = (Some(family_policy.stage), Default::default());
         }
+        if retained_held.0 != Some(family_policy.stage) {
+            retained_held = (Some(family_policy.stage), Default::default(), None);
+        }
         let pending_coverage = if decision::pending_hold::enabled() {
             decision::sibling_overlap::collect_inventory_from(
                 tcx,
@@ -8868,7 +8884,7 @@ fn finish_decide<'tcx>(
             // formal's form, and before the Declaration stage a formal can be raw
             // only because its family is not on yet; a hold taken there is not
             // the emitted program's.
-            for (node, reason) in &planned_held.1 {
+            for (node, reason) in planned_held.1.iter().chain(&retained_held.1) {
                 if !forced.contains_key(node) && !new.contains_key(node) {
                     receipts.push(decision::settled_holds::SettledHoldReceipt::of(
                         *node, reason,
@@ -9134,6 +9150,33 @@ fn finish_decide<'tcx>(
             continue;
         }
         table.field_transactions = field_transactions;
+        // R864-3: the retained-access check's holds on the settled table, under the
+        // three filters; a new hold decides the stage again with it raw (the map
+        // only grows within a stage). Filter 3 reads the places the stage
+        // delivered before its first retained hold.
+        let delivered = retained_held
+            .2
+            .get_or_insert_with(|| decision::retained_access_hold::Delivered::of(tcx, &table))
+            .clone();
+        let mut retained_grew = false;
+        for (node, reason) in decision::retained_access_hold::holds(
+            tcx,
+            &facts,
+            &table,
+            &raw_boundary,
+            &retained_access,
+            &slots,
+            &model,
+            &delivered,
+        ) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = retained_held.1.entry(node) {
+                entry.insert(reason);
+                retained_grew = true;
+            }
+        }
+        if retained_grew {
+            continue;
+        }
         // R425-3: the reader chain's own companion, for the seam's count
         // evidence (`count_companions`). Read from the settled table so the
         // index the seam licenses is the one the chain proved.
