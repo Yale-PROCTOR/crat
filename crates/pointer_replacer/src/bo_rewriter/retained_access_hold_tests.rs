@@ -288,7 +288,8 @@ fn r864_3_round4_an_own_store_does_not_hide_a_callee_store() {
 /// store (`KEPT = p`, a known retention the tier waives at `probe`'s site: the tier-2
 /// retention waiver, R481-2) and a caller that writes through its parent after `probe`
 /// returns, then reads through the kept pointer. The retention waiver's text excludes a
-/// use while the reference is live, not this one.
+/// use while the reference is live, not this one: R889-1 (relay 307) rules closure (i),
+/// filter 2 reads a T2 only where its waiver is the c-aliasing one.
 const KEPT_AFTER_THE_REFERENCE: &str = r#"
 #[repr(C)]
 pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
@@ -308,7 +309,6 @@ pub unsafe fn run(b: *mut u8) -> u8 { probe(b); *b = 5; *KEPT }
 "#;
 
 #[test]
-#[ignore = "R4-2 (main 198): the tier-2 retention waiver's exclusion is the seat's to rule; RED at 79e2d54cb"]
 fn r864_3_round4_a_retention_waiver_does_not_cover_a_later_use() {
     let d = decisions(&format!("{ALLOW}{KEPT_AFTER_THE_REFERENCE}"));
     assert!(
