@@ -129,3 +129,86 @@ fn r107_cb8_a_calling_argument_is_not_duplicated_into_the_length() {
     assert!(!row.contains("len-callee-bound"), "{row}");
     println!("CB8 ROW {row}");
 }
+
+// ---- the callee bound's full-file round (Codex, 10-07) ---------------------
+
+/// F1: `(n as u8)` with `n: i8 = -1` is index 255; `n + 1` would be 0.
+#[test]
+fn r107_cbf1_a_sign_changing_index_cast_is_refused() {
+    let src = "pub unsafe fn f(p: *const u8, n: i8) -> u8 { *p.offset((n as u8) as isize) }\n";
+    let got = bound(src, "f", 0);
+    assert!(got.as_deref().is_none_or(|g| !g.contains('n')), "{got:?}");
+}
+
+/// F2: `n.wrapping_add(1)` with `n = usize::MAX` is index 0; `n + 2` would
+/// wrap at the render and under-bound the other access.
+#[test]
+fn r107_cbf2_a_64_bit_wrapping_index_is_refused() {
+    let src = "pub unsafe fn f(p: *const i32, n: usize) -> i32 { *p.offset(n.wrapping_add(1) as isize) + *p.offset(2) }\n";
+    let got = bound(src, "f", 0);
+    assert!(got.as_deref().is_none_or(|g| !g.contains('n')), "{got:?}");
+}
+
+/// F3: `max(2n, 5)` must render with the product parenthesized (the bound's
+/// own rendering, read directly: the emission of a signed index is not this
+/// test's subject).
+#[test]
+fn r107_cbf3_a_product_term_renders_parenthesized() {
+    let src =
+        "pub unsafe fn f(p: *const i32, n: isize) -> i32 { *p.offset(n + n - 1) + *p.offset(4) }\n";
+    let mut out = None;
+    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
+        let def = tcx
+            .hir_body_owners()
+            .find(|d| tcx.item_name(d.to_def_id()).as_str() == "f")
+            .expect("f");
+        out = super::decision::callee_bound::of_parameter(tcx, def, 0)
+            .map(|b| b.render_count(&|_| "n".to_owned()));
+    })
+    .expect("fixture compiles");
+    let text = out.expect("a bound");
+    assert!(!text.starts_with("2 * ((n) as i128).max("), "{text}");
+}
+
+/// F4a: two increments per iteration skip the last index.
+#[test]
+fn r107_cbf4a_two_increments_per_iteration_give_no_bound() {
+    let src = "pub unsafe fn f(p: *const i32, n: usize) -> i32 {\n\
+        let mut s = 0; let mut i: usize = 0;\n\
+        while i < n { s += *p.offset(i as isize); i += 1; i += 1; }\n\
+        s }\n";
+    let got = bound(src, "f", 0);
+    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+}
+
+/// F4b: a read guarded inside the loop need not run at the last index.
+#[test]
+fn r107_cbf4b_a_guarded_read_in_a_loop_gives_no_loop_bound() {
+    let src = "pub unsafe fn f(p: *const i32, n: usize) -> i32 {\n\
+        let mut s = 0; let mut i: usize = 0;\n\
+        while i < n { if i == 0 { s += *p.offset(i as isize); } i += 1; }\n\
+        s }\n";
+    let got = bound(src, "f", 0);
+    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+}
+
+/// F5: a user function NAMED `wrapping_add` is a call with effects.
+#[test]
+fn r107_cbf5_a_function_named_like_a_primitive_is_a_call() {
+    let src = "static mut COUNTER: usize = 0;\n\
+        pub unsafe fn wrapping_add() -> usize { COUNTER += 1; COUNTER }\n\
+        pub unsafe fn read_at(p: *const i32, n: usize) -> i32 { *p.offset(n as isize) }\n\
+        pub unsafe fn caller(base: *const i32, k: isize) -> i32 { read_at(base.offset(k), wrapping_add()) }\n";
+    let out = flat(&emitted(&format!("{PRE}{src}")));
+    let call = out.split("fn caller").nth(1).unwrap_or("");
+    assert!(call.matches("wrapping_add()").count() <= 1, "{out}");
+}
+
+/// F6: `!0` for a `u8` parameter is 255; the copied text must keep that type.
+#[test]
+fn r107_cbf6_an_instantiated_argument_keeps_its_parameter_type() {
+    let src = "pub unsafe fn read_at(p: *const u8, n: u8) -> u8 { *p.offset(n as isize) }\n\
+        pub unsafe fn caller(base: *const u8, k: isize) -> u8 { read_at(base.offset(k), !0) }\n";
+    let out = flat(&emitted(&format!("{PRE}{src}")));
+    assert!(!out.contains("((!0) as i128)"), "{out}");
+}
