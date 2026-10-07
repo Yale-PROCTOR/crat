@@ -176,16 +176,16 @@ impl<'tcx> Scan<'_, 'tcx> {
     /// Round 2 (review 1): a pointer to a WHOLE object of the struct — the
     /// object itself (`t`, `&*t`, `&s`), never a field's address.
     fn whole_object(&self, arg: &'tcx Expr<'tcx>) -> bool {
+        // Round 3: the IMMEDIATE pointee (or referent) is the struct itself;
+        // `struct_of` would strip a pointer to pointers to it as well.
+        let is_adt = |t: Ty<'tcx>| matches!(t.kind(), TyKind::Adt(d, _) if d.did() == self.adt);
         let e = peel(arg);
         if let ExprKind::AddrOf(_, _, inner) = e.kind {
             return !matches!(peel(inner).kind, ExprKind::Field(..))
-                && struct_of(self.cx.tcx.typeck(self.cx.owner).expr_ty(inner))
-                    .is_some_and(|d| d.did() == self.adt);
+                && is_adt(self.cx.tcx.typeck(self.cx.owner).expr_ty(inner));
         }
         match self.cx.tcx.typeck(self.cx.owner).expr_ty(e).kind() {
-            TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => {
-                struct_of(*t).is_some_and(|d| d.did() == self.adt)
-            }
+            TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => is_adt(*t),
             _ => false,
         }
     }
