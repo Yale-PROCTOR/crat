@@ -9,8 +9,12 @@
 //! 1. only a subject the settled table decides in a reference family: a `Box` is a move,
 //!    not an alias, and a raw or degraded subject is raw already;
 //! 2. where the raw-boundary retention tier wrote a retention disposition (the tier-2
-//!    waiver, positive retention, an unconfirmed waiver) at a site passing the subject's
-//!    own value, the tier's disposition stands and the check adds nothing;
+//!    waiver where a bridge renders, positive retention, an unconfirmed waiver) at a site
+//!    passing the subject's own value, the tier's disposition stands for the retention
+//!    that site reads, and only for it: a store the check derives at that foreign call,
+//!    and a callee's store where every in-program callee the subject is handed to reads
+//!    so. Never a self-reference, a cycle or the subject's own store into memory (R878-1;
+//!    the stand-in review's round 2, R2-1);
 //! 3. an E1 derived store into a place the rewriter delivers is not a retained raw
 //!    pointer: a field or an array a field transaction applies on the current table,
 //!    also through a reborrow of the field (wave-6f's `&mut` store idiom); an output slot
@@ -34,11 +38,15 @@ use rustc_middle::{
     },
     ty::TyCtxt,
 };
+use rustc_span::Span;
 
 use super::{
     Decision, DecisionTable, DegradeReason, SubjectKind,
     lifetime::LifetimeEligibility,
-    raw_boundary::{RawBoundaryBlockReason, RawBoundaryDisposition, RawBoundaryDispositionIndex},
+    raw_boundary::{
+        RawBoundaryBlockReason, RawBoundaryDisposition, RawBoundaryDispositionIndex,
+        RawBoundaryRenderSite,
+    },
     retained_access::{Hold, HoldKind, RetainedAccessCheck, StoreDest, Verdict},
 };
 
@@ -222,10 +230,47 @@ fn store_into_output_slot(
     })
 }
 
+/// A raw pointer's own arithmetic and queries (`core::ptr`'s inherent methods that
+/// neither store their arguments nor write through them): no program formal receives
+/// the value there and nothing keeps it; the result is carried (the stand-in review's
+/// round 2, R2-4).
+fn pointer_arithmetic(tcx: TyCtxt<'_>, callee: rustc_hir::def_id::DefId) -> bool {
+    let path = tcx.def_path_str(callee);
+    (path.starts_with("core::ptr::const_ptr::") || path.starts_with("core::ptr::mut_ptr::"))
+        && matches!(
+            tcx.item_name(callee).as_str(),
+            "is_null"
+                | "offset"
+                | "wrapping_offset"
+                | "add"
+                | "sub"
+                | "wrapping_add"
+                | "wrapping_sub"
+                | "byte_offset"
+                | "byte_add"
+                | "byte_sub"
+                | "offset_from"
+                | "cast"
+                | "cast_mut"
+                | "cast_const"
+                | "addr"
+                | "is_aligned"
+        )
+}
+
+/// A local that may hold the subject's value: a pointer, or anything but a scalar (a
+/// comparison's `bool`, a length's integer are other values, R2-4; an address made an
+/// integer is carried by its cast).
+fn may_carry(ty: rustc_middle::ty::Ty<'_>) -> bool {
+    ty.is_any_ptr() || !ty.is_scalar()
+}
+
 /// The in-program formals a subject's value reaches at calls of its own function, read
 /// from MIR (the stand-in review's MED-1: copies, casts, borrows, aggregates and call
-/// results carry it): `None` where a carrier reaches a call no program formal receives
-/// (a foreign callee, an aggregate argument, a position that is no subject).
+/// results carry it; a value loaded through a carrier is another value, R2-4): `None`
+/// where a carrier reaches a call no program formal receives (a foreign callee, an
+/// aggregate argument, a position that is no subject), but a raw pointer's own
+/// arithmetic.
 fn receiving_formals(
     tcx: TyCtxt<'_>,
     function: LocalDefId,
@@ -238,9 +283,13 @@ fn receiving_formals(
     let mut carriers: FxHashSet<Local> = FxHashSet::default();
     carriers.insert(local);
     let reads = |operand: &Operand<'_>, carriers: &FxHashSet<Local>| {
-        operand
-            .place()
-            .is_some_and(|place| carriers.contains(&place.local))
+        operand.place().is_some_and(|place| {
+            carriers.contains(&place.local)
+                && !place
+                    .projection
+                    .iter()
+                    .any(|elem| matches!(elem, ProjectionElem::Deref))
+        })
     };
     loop {
         let before = carriers.len();
@@ -253,9 +302,11 @@ fn receiving_formals(
                     Rvalue::Use(operand)
                     | Rvalue::Cast(_, operand, _)
                     | Rvalue::Repeat(operand, _) => reads(operand, &carriers),
-                    Rvalue::Ref(_, _, place)
-                    | Rvalue::RawPtr(_, place)
-                    | Rvalue::CopyForDeref(place) => carriers.contains(&place.local),
+                    // A borrow into a carrier's referent points into the subject's object.
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                        carriers.contains(&place.local)
+                    }
+                    Rvalue::CopyForDeref(place) => reads(&Operand::Copy(*place), &carriers),
                     Rvalue::Aggregate(_, operands) => {
                         operands.iter().any(|operand| reads(operand, &carriers))
                     }
@@ -264,7 +315,11 @@ fn receiving_formals(
                     }
                     _ => false,
                 };
-                if carries {
+                let exposed = matches!(
+                    assign.1,
+                    Rvalue::Cast(rustc_middle::mir::CastKind::PointerExposeProvenance, ..)
+                );
+                if carries && (exposed || may_carry(body.local_decls[assign.0.local].ty)) {
                     carriers.insert(assign.0.local);
                 }
             }
@@ -273,6 +328,7 @@ fn receiving_formals(
                     args, destination, ..
                 } = &terminator.kind
                 && args.iter().any(|argument| reads(&argument.node, &carriers))
+                && may_carry(body.local_decls[destination.local].ty)
             {
                 carriers.insert(destination.local);
             }
@@ -293,10 +349,12 @@ fn receiving_formals(
             if !reads(&argument.node, &carriers) {
                 continue;
             }
-            let callee = func
-                .const_fn_def()
-                .and_then(|(callee, _)| callee.as_local())?;
-            found.push(*formal_of.get(&(callee, index))?);
+            let (callee, _) = func.const_fn_def()?;
+            match callee.as_local() {
+                Some(callee) => found.push(*formal_of.get(&(callee, index))?),
+                None if pointer_arithmetic(tcx, callee) => {}
+                None => return None,
+            }
         }
     }
     (!found.is_empty()).then_some(found)
@@ -316,18 +374,15 @@ fn reference_family(decision: &Decision) -> bool {
     }
 }
 
-/// Filter 2: the retention tier wrote a retention disposition (the tier-2 waiver,
-/// positive retention, an unconfirmed waiver) at a site passing the subject's own value
-/// (`bare-local`, `cast-of-local`; a pointer loaded through the subject is another value:
-/// the stand-in review's HIGH-3). A bridge's feasibility block is no retention reading.
-fn tier_decides(raw_boundary: &RawBoundaryDispositionIndex, node: (LocalDefId, HirId)) -> bool {
-    raw_boundary
-        .inventoried_sites()
-        .filter(|(_, _, site)| {
-            site.node == Some(node) && matches!(site.source_shape, "bare-local" | "cast-of-local")
-        })
-        .any(|(_, disposition, _)| match disposition {
-            RawBoundaryDisposition::T2 { .. } => true,
+/// Filter 2's reading of one site: a retention disposition (the tier-2 waiver where a
+/// bridge renders, the stand-in review's R2-2; positive retention; an unconfirmed waiver)
+/// at a site passing the subject's own value (`bare-local`, `cast-of-local`; a pointer
+/// loaded through the subject is another value: HIGH-3). A bridge's feasibility block is
+/// no retention reading.
+fn reads_retention(disposition: &RawBoundaryDisposition, site: &RawBoundaryRenderSite) -> bool {
+    matches!(site.source_shape, "bare-local" | "cast-of-local")
+        && match disposition {
+            RawBoundaryDisposition::T2 { .. } => site.target_stays_raw,
             RawBoundaryDisposition::Blocked { reason, .. } => match reason {
                 RawBoundaryBlockReason::PositiveRetention
                 | RawBoundaryBlockReason::WaiverUnconfirmed => true,
@@ -345,7 +400,72 @@ fn tier_decides(raw_boundary: &RawBoundaryDispositionIndex, node: (LocalDefId, H
             RawBoundaryDisposition::T1 { .. } | RawBoundaryDisposition::OwnedByOtherArm { .. } => {
                 false
             }
-        })
+        }
+}
+
+/// Filter 2: what the tier read of the subject's retention at its own sites.
+struct TierReading {
+    /// The calls at which the tier read it (their spans).
+    calls: FxHashSet<Span>,
+    /// Every site handing the subject to an in-program callee is such a reading (and
+    /// there is one).
+    local_callees: bool,
+}
+
+fn tier_reading(
+    raw_boundary: &RawBoundaryDispositionIndex,
+    node: (LocalDefId, HirId),
+) -> TierReading {
+    let own: Vec<_> = raw_boundary
+        .inventoried_sites()
+        .filter(|(_, _, site)| site.node == Some(node))
+        .map(|(_, disposition, site)| (reads_retention(disposition, site), site))
+        .collect();
+    let mut local = own
+        .iter()
+        .filter(|(_, site)| site.callee_local.is_some())
+        .peekable();
+    TierReading {
+        calls: own
+            .iter()
+            .filter(|(reads, _)| *reads)
+            .map(|(_, site)| site.call_span)
+            .collect(),
+        local_callees: local.peek().is_some() && local.all(|(reads, _)| *reads),
+    }
+}
+
+/// The span of the call a hold is sited at (the check derives a foreign call's keeping
+/// as a store at the call).
+fn call_at(tcx: TyCtxt<'_>, (function, block, statement): (u32, u32, usize)) -> Option<Span> {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(local_def(function))
+        .borrow();
+    let data = body.basic_blocks.get(BasicBlock::from_u32(block))?;
+    if statement < data.statements.len() {
+        return None;
+    }
+    let terminator = data.terminator.as_ref()?;
+    matches!(terminator.kind, TerminatorKind::Call { .. }).then_some(terminator.source_info.span)
+}
+
+/// Filter 2, per hold (the stand-in review's round 2, R2-1): the tier's reading stands for
+/// the retention its site reads — a store the check derives at that call, a callee's
+/// store where every in-program callee site reads retention. Never a self-reference or a
+/// cycle (an access hold), never the subject's own store into memory.
+fn tier_stands(tcx: TyCtxt<'_>, tier: &TierReading, hold: &Hold) -> bool {
+    hold.kind == HoldKind::DerivedStore
+        && match hold.dest {
+            StoreDest::Callee => tier.local_callees,
+            StoreDest::None
+            | StoreDest::Field(..)
+            | StoreDest::ArrayInField(..)
+            | StoreDest::ArrayLocal(_)
+            | StoreDest::Other => hold
+                .site
+                .and_then(|site| call_at(tcx, site))
+                .is_some_and(|span| tier.calls.contains(&span)),
+        }
 }
 
 /// The subjects to hold on this table, each with its receipt.
@@ -364,9 +484,6 @@ pub(crate) fn holds(
             continue;
         }
         let node = (subject.fn_did, subject.hir_id);
-        if tier_decides(raw_boundary, node) {
-            continue;
-        }
         let verdict = match subject.kind {
             SubjectKind::Param { .. } => check.formal(subject.fn_did, subject.local.as_usize()),
             SubjectKind::Local => check.local(subject.fn_did, subject.local),
@@ -378,8 +495,10 @@ pub(crate) fn holds(
             Some(Verdict::Held(holds)) => holds,
             Some(Verdict::Clear | Verdict::Unknown) | None => continue,
         };
+        let tier = tier_reading(raw_boundary, node);
         let kept: Vec<_> = holds
             .iter()
+            .filter(|hold| !tier_stands(tcx, &tier, hold))
             .filter(|hold| {
                 !(hold.kind == HoldKind::DerivedStore
                     && match hold.dest {
@@ -412,7 +531,9 @@ pub(crate) fn holds(
     // the subject's value reaches is delivered and not held itself — its own stores are
     // then into delivered places. Read to a fixpoint from all held, so an exemption rests
     // only on formals shown not held; a value reaching a call no program formal receives
-    // stays held.
+    // stays held. A formal whose only holds the tier reads at its own bridging site is not
+    // held for its callers: the pointer a callee keeps is derived from that formal's own
+    // reference, whatever its callers are, and that site's receipt names it.
     let decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = table
         .entries
         .iter()
