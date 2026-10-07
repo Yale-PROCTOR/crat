@@ -148,7 +148,10 @@ fn w4cb_3_seam_loop_bound_is_instantiated_with_the_call_s_argument() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        out.contains("from_raw_parts(base.offset(k), (((count) as i128).max(0)) as usize)"),
+        // F6 (relay 107): the argument is re-typed as the callee's parameter.
+        out.contains(
+            "from_raw_parts(base.offset(k), (((((count) as usize)) as i128).max(0)) as usize)"
+        ),
         "{out}"
     );
 }
@@ -436,7 +439,11 @@ fn w4cb_f8_a_negative_bound_renders_an_empty_slice() {
          pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ total(-5, 1, base.offset(k)) }}\n"
     );
     let out = flat(&emitted(&src));
-    assert!(out.contains("(((-5) as i128).max(0)) as usize"), "{out}");
+    // F6 (relay 107): re-typed as the callee's `i32`; still clamped to empty.
+    assert!(
+        out.contains("(((((-5) as i32)) as i128).max(0)) as usize"),
+        "{out}"
+    );
     // The rendered arithmetic itself, evaluated.
     assert_eq!(((-5i128).max(0)) as usize, 0);
 }

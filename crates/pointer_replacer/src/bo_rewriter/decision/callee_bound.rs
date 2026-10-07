@@ -108,7 +108,9 @@ impl Lin {
         if self.k != 0 {
             parts.push(format!("{}i128", self.k));
         }
-        if parts.len() == 1 && !parts[0].starts_with('-') {
+        // F3 (relay 107): only `((p) as i128)` is a receiver as it stands; a
+        // product `c * ((p) as i128)` is parenthesized before `.max(…)`.
+        if parts.len() == 1 && parts[0].starts_with("((") {
             return parts.remove(0);
         }
         format!("({})", parts.join(" + ").replace("+ -", "- "))
@@ -236,6 +238,18 @@ pub(crate) fn of_local(tcx: TyCtxt<'_>, f: LocalDefId, local: HirId) -> Option<B
 
 /// A call-site argument is admitted as an instantiation only when it is free
 /// of calls, assignments and blocks — it is duplicated into the length.
+/// The character before the identifier that ends at `i` (whitespace skipped):
+/// `.` for a method call (relay 107, F5).
+fn before_name(chars: &[char], i: usize) -> Option<char> {
+    chars[..i]
+        .iter()
+        .rev()
+        .skip_while(|c| c.is_whitespace())
+        .skip_while(|c| c.is_alphanumeric() || **c == '_')
+        .find(|c| !c.is_whitespace())
+        .copied()
+}
+
 pub(crate) fn pure_argument_text(text: &str) -> bool {
     // No block, index, address-of or assignment.
     if text.contains('{') || text.contains('[') || text.contains('&') {
@@ -269,10 +283,13 @@ pub(crate) fn pure_argument_text(text: &str) -> bool {
                     .chars()
                     .rev()
                     .collect::<String>();
+                // F5 (relay 107): only as a METHOD (`x.wrapping_add(..)`); a
+                // free function of that name is an arbitrary call.
                 if !matches!(
                     name.as_str(),
                     "wrapping_add" | "wrapping_sub" | "wrapping_mul"
-                ) {
+                ) || before_name(&chars, i) != Some('.')
+                {
                     return false;
                 }
             }
@@ -319,6 +336,9 @@ fn effect_free_text(text: &str) -> bool {
                     .chars()
                     .rev()
                     .collect::<String>();
+                if !name.is_empty() && before_name(&chars, i) != Some('.') {
+                    return false;
+                }
                 if !name.is_empty()
                     && !matches!(
                         name.as_str(),
@@ -388,7 +408,29 @@ pub(crate) fn at_call_site(
     {
         return None;
     }
-    let text = bound.render_count(&|i| texts[&i].clone());
+    // F6 (relay 107): the copied text is re-typed as the callee's parameter
+    // (`!0` passed to a `u8` is 255, not the `i32` -1 it reads as alone).
+    let inputs = tcx
+        .fn_sig(callee)
+        .skip_binder()
+        .skip_binder()
+        .inputs()
+        .to_vec();
+    let typed = |i: usize| {
+        let ty = inputs.get(i).map(|t| t.to_string()).unwrap_or_default();
+        if ty.is_empty() {
+            texts[&i].clone()
+        } else {
+            format!("(({}) as {ty})", texts[&i])
+        }
+    };
+    if needed
+        .iter()
+        .any(|i| inputs.get(*i).is_none_or(|t| !t.is_integral()))
+    {
+        return None;
+    }
+    let text = bound.render_count(&typed);
     Some((text, intern(bound.receipt(&parameter_names(tcx, callee)))))
 }
 
@@ -678,15 +720,8 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                     _ => None,
                 }
             }
-            // Relay 107 (review 2b): a wrapping sum equals the sum only where
-            // it cannot wrap; below 64 bits it can, for sizes a program uses.
-            ExprKind::MethodCall(segment, receiver, [arg], _)
-                if segment.ident.name.as_str() == "wrapping_add"
-                    && int_info(self.a.tcx, self.typeck().expr_ty(e))
-                        .is_some_and(|t| t.0 >= 64) =>
-            {
-                Some(self.value(receiver)?.plus(&self.value(arg)?, 1))
-            }
+            // F2 (relay 107): no `wrapping_*` value or index: it may wrap, and
+            // nothing here proves it does not.
             _ => None,
         }
     }
@@ -704,8 +739,12 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                 // The index the access uses is the cast value; it equals the
                 // inner value whenever that is in range of the target, which a
                 // pointer offset of a real allocation always is.
-                (from.0 <= to.0 || from.1 == Sign::Unsigned && from.0 <= to.0 + 1)
-                    .then(|| self.index_bound(inner, at))?
+                // F1 (relay 107): a signed value cast to unsigned (or any
+                // narrowing) changes it; an unsigned one cast to a signed type
+                // of equal width is exact for every real offset (≤ isize::MAX).
+                let exact = from.0 <= to.0
+                    && (from.1 == to.1 || (from.1 == Sign::Unsigned && to.1 == Sign::Signed));
+                exact.then(|| self.index_bound(inner, at))?
             }
             ExprKind::Path(..) => {
                 let id = local_of(idx)?;
@@ -730,13 +769,8 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                     _ => None,
                 }
             }
-            ExprKind::MethodCall(segment, receiver, [arg], _)
-                if segment.ident.name.as_str() == "wrapping_add"
-                    && int_info(self.a.tcx, self.typeck().expr_ty(idx))
-                        .is_some_and(|t| t.0 >= 64) =>
-            {
-                Some(self.index_bound(receiver, at)?.plus(&self.value(arg)?, 1))
-            }
+            // F2 (relay 107): no `wrapping_*` value or index: it may wrap, and
+            // nothing here proves it does not.
             _ => None,
         }
     }
@@ -787,6 +821,38 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                 tcx.hir_parent_id_iter(id).any(|p| p == stmt.hir_id)
             };
             let at_position = frame.body.stmts.iter().position(|s| contains(s, at));
+            // F4b (relay 107): the access runs on every iteration only as a
+            // top-level statement, not under a branch, loop or short-circuit.
+            let Some(at_stmt) = at_position else { return None };
+            let stmt_id = frame.body.stmts[at_stmt].hir_id;
+            for (id, node) in tcx.hir_parent_iter(at) {
+                if id == stmt_id {
+                    break;
+                }
+                if let Node::Expr(p) = node
+                    && (matches!(
+                        p.kind,
+                        ExprKind::If(..)
+                            | ExprKind::Match(..)
+                            | ExprKind::Loop(..)
+                            | ExprKind::Closure(..)
+                    ) || matches!(p.kind, ExprKind::Binary(op, ..) if matches!(op.node, BinOpKind::And | BinOpKind::Or)))
+                {
+                    return None;
+                }
+            }
+            // F4a: exactly one write of the counter inside the loop.
+            let writes_inside = self
+                .writes
+                .assignments
+                .iter()
+                .filter(|(var, a)| {
+                    *var == i && tcx.hir_parent_id_iter(*a).any(|p| p == frame.body.hir_id)
+                })
+                .count();
+            if writes_inside != 1 {
+                return None;
+            }
             for (var, assignment) in &self.writes.assignments {
                 if *var != i {
                     continue;
