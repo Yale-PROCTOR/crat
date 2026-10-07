@@ -635,3 +635,58 @@ fn slicecursor_r828_control_a_position_compared_across_two_roots_stays_raw() {
         "a comparison across two roots is not an index comparison: {out}"
     );
 }
+
+/// **R828-7 control (review finding 1).** An ORDERING of two positions over one
+/// root keeps the address view: a position one below the window's start wraps
+/// to `usize::MAX`, so `p.pos() >= a.pos()` would hold where `p >= a` does not
+/// (the caller passes `buf + 1`; the loop ends at `buf + 0`, below `a`).
+#[test]
+fn slicecursor_r828_control_an_ordering_of_two_positions_is_never_a_pos_ordering() {
+    let src = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn sum_back(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut q = a.offset(1 as isize);
+    let mut p = a.offset(n as isize).offset(-(1 as ::core::ffi::c_int) as isize);
+    let mut s: ::core::ffi::c_int = *q;
+    while p >= a { s += *p; p = p.offset(-1); }
+    return s;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut buf: [::core::ffi::c_int; 4] = [1, 2, 3, 4];
+    sum_back(buf.as_mut_ptr().offset(1), 1)
+}
+"###;
+    let out = emitted(src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        !compact.contains(".pos()>=") && !compact.contains(".pos()<="),
+        "an ordering never compares pos(): {out}"
+    );
+}
+
+/// **R828-7 control (review finding 2).** The guard `p != a` bounds the step
+/// only while `a` holds its entry value: here `a` is re-assigned past `p` first,
+/// so the walk goes below entry (the caller passes `b + 1`). The parameter's
+/// window stays refused and the function raw.
+#[test]
+fn slicecursor_r828_control_a_reassigned_root_does_not_guard_the_step() {
+    let src = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn f(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut p = a;
+    a = a.offset(n as isize);
+    while p != a { p = p.offset(-1); if *p != 0 { return *p; } }
+    return 0 as ::core::ffi::c_int;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut b: [::core::ffi::c_int; 2] = [5, 0];
+    f(b.as_mut_ptr().offset(1), 1)
+}
+"###;
+    let out = emitted(src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        compact.contains("whilep!=a") && !compact.contains("SliceCursor"),
+        "a re-assigned root guards nothing; the function stays raw: {out}"
+    );
+}
