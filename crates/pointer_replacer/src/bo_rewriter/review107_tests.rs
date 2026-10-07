@@ -285,3 +285,50 @@ fn r107_fc8_a_calling_base_is_not_duplicated_into_the_length() {
         "{out}"
     );
 }
+
+// ---- round 2 (Codex, 10-07): three bypasses of the field-count fixes --------
+
+const PAIR: &str = "#[repr(C)] pub struct S { pub p: *mut u8, pub n: usize }\n\
+pub unsafe fn make(n: usize) -> *mut S {\n\
+    let s = malloc(core::mem::size_of::<S>()) as *mut S;\n\
+    (*s).n = n;\n\
+    let ref mut f0 = (*s).p;\n\
+    *f0 = calloc((*s).n, core::mem::size_of::<u8>()) as *mut u8;\n\
+    s }\n";
+
+/// Round 2, finding 1: a field address is not a whole object; a whole-size
+/// copy from a field's address overwrites `n` without `p`.
+#[test]
+fn r107_r2a_a_copy_from_a_field_address_is_not_a_whole_copy() {
+    let src = format!(
+        "{PAIR}pub unsafe fn smash(dst: *mut S, src: *mut S) {{\n\
+        memcpy(&(*dst).n as *const usize as *mut usize as *mut core::ffi::c_void, &(*src).n as *const usize as *const core::ffi::c_void, core::mem::size_of::<S>()); }}\n"
+    );
+    assert_eq!(proven(&src, "S", "p"), None);
+}
+
+/// Round 2, finding 2: zero is a literal, not a text prefix.
+#[test]
+fn r107_r2b_a_nonzero_memset_value_is_not_a_zeroing() {
+    let src = format!(
+        "{PAIR}extern \"C\" {{ fn memset(d: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }}\n\
+        pub unsafe fn fill(s: *mut S) {{ memset(s as *mut core::ffi::c_void, 0 as i32 + 1, core::mem::size_of::<S>()); }}\n"
+    );
+    assert_eq!(proven(&src, "S", "p"), None);
+}
+
+/// Round 2, finding 3: a witness in the right operand of `&&` runs only when
+/// the left one holds.
+#[test]
+fn r107_r2c_a_short_circuit_witness_is_conditional() {
+    let src = format!(
+        "{ANN}pub unsafe fn init(n: u32, p: *mut f64, flag: bool) -> *mut Ann {{\n\
+        let ret = malloc(core::mem::size_of::<Ann>()) as *mut Ann;\n\
+        (*ret).total = n;\n\
+        let ref mut f0 = (*ret).weight;\n\
+        *f0 = p;\n\
+        let _ = flag && {{ let ref mut f1 = (*ret).output; *f1 = ((*ret).weight).offset((*ret).total as isize); true }};\n\
+        ret }}\n"
+    );
+    assert_eq!(proven(&src, "Ann", "weight"), None);
+}
