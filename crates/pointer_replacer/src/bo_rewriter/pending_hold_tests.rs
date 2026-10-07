@@ -984,3 +984,42 @@ fn r866_1_a_containment_pair_holds_both_formals() {
         "held raw: {callee}"
     );
 }
+
+/// **The stand-in review's HIGH-1 (R864-1, libzahl `zmodmul(a, &mut *a, …)`).**
+/// The caller hands its raw `a` at `zmodmul`'s raw position and `&mut *a` at a
+/// delivered one; the call's other pair (`c`, `d`) gives it a PAIR row, so the
+/// seam never consults its aliased-storage twin there, and the PAIR has no edge
+/// for `(a, b)` (`a` does not convert). One subject at two positions of such a
+/// call is held.
+const ZMODMUL_SELF: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[derive(Clone, Copy)]\n\
+    #[repr(C)]\n\
+    pub struct Z { sign: i32, used: usize }\n\
+    pub unsafe fn zmodmul(a: *mut Z, b: *mut Z, c: *mut Z, d: *mut Z) {\n\
+        let _k = a.offset(0);\n\
+        let u = (*b).used * (*c).used % ((*d).used + 1);\n\
+        (*a).used = u;\n\
+        (*a).sign = (*b).sign;\n\
+    }\n\
+    pub unsafe fn zmodpow(mut a: *mut Z, t: *mut Z, m: *mut Z) {\n\
+        let _k = a.offset(0);\n\
+        zmodmul(a, &mut *a, t, m);\n\
+    }\n\
+    pub unsafe fn entry() -> usize {\n\
+        let mut x: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
+        let mut t: [Z; 1] = [Z { sign: 0, used: 5 }; 1];\n\
+        let mut m: [Z; 1] = [Z { sign: 0, used: 7 }; 1];\n\
+        zmodpow(x.as_mut_ptr(), t.as_mut_ptr(), m.as_mut_ptr());\n\
+        x[0].used\n\
+    }\n";
+
+#[test]
+fn r864_1_one_subject_at_a_pair_owned_call_is_held_raw() {
+    let out = census_outcome(ZMODMUL_SELF);
+    let zmodmul = signature(&out.source, "zmodmul");
+    assert!(
+        zmodmul.contains("b: *mut Z"),
+        "zmodmul::b is raw beside the raw a it aliases: {zmodmul}\n{:?}",
+        out.details
+    );
+}
