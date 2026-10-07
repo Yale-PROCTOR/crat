@@ -461,3 +461,94 @@ fn r833_1_the_raw_view_of_a_cast_address_keeps_its_cast() {
         other => panic!("the census world emits: {other:#?}"),
     }
 }
+
+fn r864_signature(name: &str) -> String {
+    let input = include_str!("testdata/r864_raw_side.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.split(&format!("fn {name}("))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no {name}:\n{source}"))
+                .to_owned()
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
+
+/// R864-1 (a) (fan-out 081): `zsqr(x, &mut *x)` with `zsqr::a` raw: `b` is
+/// held raw beside it (no pair row, no A5 proof, not shown disjoint).
+#[test]
+fn r864_1_a_a_reference_formal_beside_a_raw_formal_not_shown_disjoint_is_held() {
+    let signature = r864_signature("zsqr");
+    assert!(signature.contains("mut b: *mut Z"), "({signature})");
+}
+
+/// Control: the reference side is `&mut local` (a scalar), its address taken
+/// only there.
+#[test]
+fn r864_1_a_control_a_local_taken_only_here_keeps_its_reference() {
+    let signature = r864_signature("zsqr2");
+    assert!(!signature.contains("mut b: *mut i32"), "({signature})");
+}
+
+fn r866_signature(name: &str) -> String {
+    let input = include_str!("testdata/r866_containment.rs");
+    match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => {
+            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.split(&format!("fn {name}("))
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("no {name}:\n{source}"))
+                .to_owned()
+        }
+        other => panic!("the census world emits: {other:#?}"),
+    }
+}
+
+/// R866-1 (fan-out 083): `safe_read(&mut *s, &mut *br)` with `br = &mut
+/// (*s).br`: both formals stay raw. In this small crate the model itself
+/// demotes `br` (the containment is a borrow conflict here) and the raw-side
+/// rule (R864-1 (a)) holds `s` beside it; the record delivered both, and the
+/// containment fact F2 holds them by is witnessed in `proven_overlap_tests`.
+#[test]
+fn r866_1_a_field_of_the_other_arguments_object_holds_both_formals() {
+    let signature = r866_signature("safe_read");
+    assert!(
+        signature.contains("mut s: *mut State") && signature.contains("mut br: *mut BitReader"),
+        "({signature})"
+    );
+}
+
+/// The direct spelling, `safe_read2(&mut *s, &mut (*s).br)`.
+#[test]
+fn r866_1_the_fields_address_beside_the_objects_reborrow_holds_both_formals() {
+    let signature = r866_signature("safe_read2");
+    assert!(
+        signature.contains("mut s: *mut State") && signature.contains("mut br: *mut BitReader"),
+        "({signature})"
+    );
+}
+
+/// Control: two distinct locals' addresses stay delivered.
+#[test]
+fn r866_1_control_two_distinct_locals_stay_delivered() {
+    let signature = r866_signature("safe_read3");
+    assert!(
+        !signature.contains("*mut State") && !signature.contains("*mut BitReader"),
+        "({signature})"
+    );
+}
+
+/// The substrate's spelling, `safe_read4(s, br)`: F2's proven overlap (`br`'s
+/// one definition lies inside `s`) holds both formals already.
+#[test]
+fn r866_1_the_substrate_spelling_is_f2s_proven_overlap() {
+    let signature = r866_signature("safe_read4");
+    assert!(
+        signature.contains("mut s: *mut State") && signature.contains("mut br: *mut BitReader"),
+        "({signature})"
+    );
+}

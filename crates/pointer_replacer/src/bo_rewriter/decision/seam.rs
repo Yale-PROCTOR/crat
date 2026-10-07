@@ -6566,6 +6566,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 )
                             },
                         );
+                        super::array_decay::read_array_decays(
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
+                        );
                         super::outside_byte_view::read_under_p8(
                             facts,
                             site,

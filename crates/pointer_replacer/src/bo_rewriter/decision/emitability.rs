@@ -306,6 +306,13 @@ pub(crate) struct Arg {
     /// nowhere else, at a call no loop repeats. See
     /// [`super::loaded_operand::address_taken_once_here`].
     pub address_once_here: bool,
+    /// R864-1 (b): the array this argument decays (`X.as_mut_ptr()` /
+    /// `X.as_ptr()`), and whether that is a local or a static by value. See
+    /// [`super::array_decay::decay_root`].
+    pub array_decay: Option<super::array_decay::DecayRoot>,
+    /// R866-1 (fan-out 083): the argument is a reborrow `&mut *x` / `&*x` of
+    /// the local `x` (under casts): the same pointer as `x` itself.
+    pub reborrow_of: Option<HirId>,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -685,7 +692,7 @@ fn body_side_effecting(expr: &Expr<'_>) -> bool {
 /// C2Rust writes null as `0 as *mut T` but also as `0 as libc::c_int as *mut T`,
 /// so a single-level test would classify the second as an ordinary cast and let
 /// a null through the gate that exists to stop it.
-fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
+pub(crate) fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
     while let ExprKind::Cast(inner, _) = &expr.kind {
         expr = inner;
     }
@@ -996,6 +1003,17 @@ pub(crate) fn type_size<'tcx>(
         .ok()
         .filter(|layout| layout.is_sized())
         .map(|layout| layout.size.bytes())
+}
+
+/// R866-1: `&mut *x` / `&*x` over a local `x`, under casts: the local.
+fn reborrow_of(expr: &Expr<'_>) -> Option<HirId> {
+    let ExprKind::AddrOf(_, _, inner) = peel_casts(expr).kind else {
+        return None;
+    };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = inner.kind else {
+        return None;
+    };
+    BodyFacts::resolved_local(peel_casts(pointer))
 }
 
 fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
@@ -1733,6 +1751,12 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                         peel_casts(arg).hir_id,
                                                     )
                                                 }),
+                                            array_decay: super::array_decay::decay_root(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
+                                            reborrow_of: reborrow_of(arg),
                                         }
                                     })
                                     .collect(),

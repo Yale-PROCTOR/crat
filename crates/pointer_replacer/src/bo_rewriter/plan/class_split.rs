@@ -366,9 +366,11 @@ pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_c
 }
 "#;
 
-    /// The pair-charged raw partner no longer vetoes its class: `code` places
-    /// as `&mut u16`, `extra_bits` keeps `*mut u32`, and the call site carries
-    /// the A5 raw view that was already planned for it.
+    /// The pair-charged raw partner, as R864-1 (a) (USER; fan-out 081) rules
+    /// it: `code` (a reference formal) beside the model-Raw `extra_bits` at a
+    /// call where the pair is not shown disjoint is held raw with it
+    /// (`pair-not-shown-disjoint`). Before, the class split placed `code` as
+    /// `&mut u32` beside the A5 raw view of a possibly aliased field.
     #[test]
     fn pair_charged_raw_partner_does_not_hold_its_class() {
         let got = run(UNCERTIFIED_PAIR_SHAPE);
@@ -379,34 +381,18 @@ pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_c
             got.subjects
         );
         assert_eq!(
-            column(
-                &got.arm_outcomes,
-                "prefix_encode::extra_bits#3",
-                "required_arms"
+            (
+                column(&got.subjects, "prefix_encode::code#2", "reason"),
+                column(&got.subjects, "prefix_encode::code#2", "placed")
             ),
-            "pair",
-            "the partner's only required arm is the A5 pair arm:\n{}",
-            got.arm_outcomes
-        );
-        assert_eq!(
-            column(&got.subjects, "prefix_encode::code#2", "exclusion"),
-            "-",
-            "the safe sibling is no longer withdrawn:\n{}",
+            ("pair-not-shown-disjoint", "0"),
+            "the reference beside the raw partner is held:\n{}",
             got.subjects
-        );
-        assert_eq!(
-            column(&got.subjects, "prefix_encode::code#2", "placed"),
-            "1"
         );
         let signature = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            signature.contains("code: &mut u32, extra_bits: *mut u32"),
-            "the sibling places and the partner stays raw:\n{}",
-            got.tree()
-        );
-        assert!(
-            got.tree().contains("__crat_a5_raw_"),
-            "the call site carries the planned A5 raw view:\n{}",
+            signature.contains("code: *mut u32, extra_bits: *mut u32"),
+            "both formals stay raw:\n{}",
             got.tree()
         );
     }

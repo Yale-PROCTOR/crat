@@ -1,0 +1,34 @@
+#![allow(dead_code, unused_mut, non_snake_case, unused_variables, unused_assignments, static_mut_refs)]
+// R864-1 (b) (fan-out 081): libzahl zmul's zadd(b_low.as_mut_ptr(), b_low.as_mut_ptr(), …)
+// read "proven disjoint". Two decays of one array are one object.
+pub static mut SA: [i32; 4] = [0; 4];
+pub static mut SB: [i32; 4] = [0; 4];
+unsafe fn add(mut a: *mut i32, mut b: *mut i32) {
+    *a += *b;
+}
+pub unsafe fn same_local() {
+    let mut x: [i32; 4] = [0; 4];
+    add(x.as_mut_ptr(), x.as_mut_ptr());
+}
+pub unsafe fn same_static() {
+    add(SA.as_mut_ptr(), SA.as_mut_ptr());
+}
+pub unsafe fn same_local_reborrowed() {
+    let mut x: [i32; 4] = [0; 4];
+    add(&mut *x.as_mut_ptr(), x.as_mut_ptr());
+}
+pub unsafe fn distinct_locals() {
+    let mut x: [i32; 4] = [0; 4];
+    let mut y: [i32; 4] = [0; 4];
+    add(x.as_mut_ptr(), y.as_mut_ptr());
+}
+pub unsafe fn distinct_statics() {
+    add(SA.as_mut_ptr(), SB.as_mut_ptr());
+}
+pub unsafe fn decay_beside_a_pointer(mut p: *mut i32) {
+    let mut x: [i32; 4] = [0; 4];
+    add(x.as_mut_ptr(), p);
+}
+pub unsafe fn decays_through_references(mut r: &mut [i32; 4], mut s: &mut [i32; 4]) {
+    add(r.as_mut_ptr(), s.as_mut_ptr());
+}

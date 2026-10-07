@@ -56,3 +56,47 @@ fn r819_4_the_same_pointer_read_twice_is_proven_and_left_to_the_written_conditio
     let proven = pairs(SAME_POINTER);
     assert!(proven.contains(&("zcmp".to_owned(), 1, 0)), "{proven:?}");
 }
+
+const CONTAINMENT: &str = include_str!("../testdata/r866_containment.rs");
+
+/// R866-1 (fan-out 083): `safe_read(&mut *s, &mut *br)` with `br = &mut
+/// (*s).br`: the reborrow `&mut *s` is `s` itself, and `br` lies inside `s`'s
+/// referent, so `br` (position 1) is a proven overlap of `s` (position 0).
+#[test]
+fn r866_1_a_field_inside_the_other_reborrowed_argument_is_a_proven_overlap() {
+    let proven = pairs(CONTAINMENT);
+    assert!(
+        proven.contains(&("safe_read".to_owned(), 1, 0)),
+        "{proven:?}"
+    );
+}
+
+/// The direct spelling `safe_read2(&mut *s, &mut (*s).br)`.
+#[test]
+fn r866_1_the_fields_address_beside_the_objects_reborrow_is_a_proven_overlap() {
+    let proven = pairs(CONTAINMENT);
+    assert!(
+        proven.contains(&("safe_read2".to_owned(), 1, 0)),
+        "{proven:?}"
+    );
+}
+
+/// The substrate's spelling `safe_read4(s, br)` was F2's already.
+#[test]
+fn r866_1_the_substrate_spelling_is_a_proven_overlap() {
+    let proven = pairs(CONTAINMENT);
+    assert!(
+        proven.contains(&("safe_read4".to_owned(), 1, 0)),
+        "{proven:?}"
+    );
+}
+
+/// Control: two distinct locals' addresses prove nothing.
+#[test]
+fn r866_1_control_two_distinct_locals_prove_nothing() {
+    let proven = pairs(CONTAINMENT);
+    assert!(
+        !proven.iter().any(|(callee, _, _)| callee == "safe_read3"),
+        "{proven:?}"
+    );
+}
