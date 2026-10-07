@@ -2982,21 +2982,47 @@ fn pending_target_accepts(
     match variadic_from {
         Some(first) if index >= first => {
             let argument = expression(argument_text)?;
-            let raw = match &unparen(&argument).kind {
-                ast::ExprKind::MethodCall(call) => {
-                    call.args.is_empty()
-                        && matches!(call.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
-                }
-                ast::ExprKind::Cast(_, ty) => matches!(ty.kind, ast::TyKind::Ptr(_)),
-                _ => false,
-            };
-            if raw {
+            if raw_by_construction(&argument) {
                 Ok(())
             } else {
                 Err("pending-variadic-argument-not-raw".into())
             }
         }
         _ => pending_target_raw(scopes, target, index),
+    }
+}
+
+/// Is this argument expression a raw pointer by its own spelling? `x.as_ptr()` /
+/// `x.as_mut_ptr()`, a cast to a raw pointer, and (relay 303) the bridges that end in
+/// a raw-pointer method or a raw-pointer constructor: `cast` / `cast_mut` /
+/// `cast_const` exist only on raw pointers, `core::ptr::from_ref` / `from_mut` /
+/// `null` / `null_mut` return one, and an Option's `map_or(null…(), ..)` has its
+/// default's type.
+fn raw_by_construction(argument: &ast::Expr) -> bool {
+    let raw_constructor = |expr: &ast::Expr| match &unparen(expr).kind {
+        ast::ExprKind::Call(callee, _) => match &unparen(callee).kind {
+            ast::ExprKind::Path(_, path) => path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.name.as_str(),
+                    "from_ref" | "from_mut" | "null" | "null_mut"
+                )
+            }),
+            _ => false,
+        },
+        _ => false,
+    };
+    match &unparen(argument).kind {
+        ast::ExprKind::MethodCall(call) => match call.seg.ident.name.as_str() {
+            "as_ptr" | "as_mut_ptr" | "cast_mut" | "cast_const" => call.args.is_empty(),
+            "cast" => true,
+            "map_or" | "map_or_else" => call
+                .args
+                .first()
+                .is_some_and(|default| raw_constructor(default)),
+            _ => false,
+        },
+        ast::ExprKind::Cast(_, ty) => matches!(ty.kind, ast::TyKind::Ptr(_)),
+        _ => raw_constructor(argument),
     }
 }
 
