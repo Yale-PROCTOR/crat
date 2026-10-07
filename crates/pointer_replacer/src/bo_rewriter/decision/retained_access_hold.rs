@@ -47,7 +47,7 @@ use super::{
         RawBoundaryBlockReason, RawBoundaryDisposition, RawBoundaryDispositionIndex,
         RawBoundaryRenderSite,
     },
-    retained_access::{Hold, HoldKind, RetainedAccessCheck, StoreDest, Verdict},
+    retained_access::{AccessKind, Hold, HoldKind, RetainedAccessCheck, Shape, StoreDest, Verdict},
 };
 
 /// The places the current table delivers (filter 3).
@@ -559,6 +559,34 @@ pub(crate) fn holds(
                 .borrow();
             carried_calls(tcx, &body, &carriers(&body, subject.local))
         };
+        // The stand-in review's round 4, R4-1: the check emits a formal's callee store (its
+        // H6 (c)) only where the formal stores nothing itself. Where it does, and its value
+        // reaches a call that may enter a program function, the callee store is read here
+        // as the check would emit it, unsited; the coverage below and the release judge it.
+        let mut holds = holds;
+        if matches!(subject.kind, SubjectKind::Param { .. })
+            && holds
+                .iter()
+                .any(|hold| hold.kind == HoldKind::DerivedStore && hold.dest != StoreDest::Callee)
+            && !holds
+                .iter()
+                .any(|hold| hold.dest == StoreDest::Callee && hold.site.is_none())
+            && calls.iter().any(|call| call.in_program)
+        {
+            holds.push(Hold {
+                kind: HoldKind::DerivedStore,
+                access: AccessKind::Write,
+                shape: Shape::Other,
+                retaining_place: "callee-store".to_owned(),
+                witness: format!(
+                    "{} | callee-store | beside its own store",
+                    tcx.def_path_str(subject.fn_did.to_def_id())
+                ),
+                dest: StoreDest::Callee,
+                site: None,
+                via: None,
+            });
+        }
         if holds
             .iter()
             .any(|hold| tier_stands(tcx, &reading, &calls, hold))
