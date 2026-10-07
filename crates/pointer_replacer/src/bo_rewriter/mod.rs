@@ -165,6 +165,8 @@ mod raw_place_values_tests;
 #[cfg(test)]
 mod released_indirect_tests;
 #[cfg(test)]
+mod retained_access_hold_tests;
+#[cfg(test)]
 mod retention_waiver_tests;
 pub(crate) mod revert_closure;
 #[cfg(test)]
