@@ -88,7 +88,8 @@ pub(crate) fn decay_root(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) ->
 /// A local whose initializer and every assignment are decays of one array (or
 /// arithmetic on the local itself), and whose address is never taken.
 /// A copy of another such local (`q = p`) is read through it (wave-5d 145c); a
-/// cycle reads as nothing.
+/// cycle reads as nothing. The guard is the current path only, so a copy read
+/// twice (`p = q; …; p = q;`) is still read (the third review's M-2).
 fn copied_decay(
     tcx: TyCtxt<'_>,
     owner: LocalDefId,
@@ -99,6 +100,17 @@ fn copied_decay(
         return None;
     }
     seen.push(binding);
+    let root = definitions_root(tcx, owner, binding, seen);
+    seen.pop();
+    root
+}
+
+fn definitions_root(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    binding: HirId,
+    seen: &mut Vec<HirId>,
+) -> Option<DecayRoot> {
     use rustc_hir::intravisit::{self, Visitor};
     struct Definitions<'tcx> {
         binding: HirId,
