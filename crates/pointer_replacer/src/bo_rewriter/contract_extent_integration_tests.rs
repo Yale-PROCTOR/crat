@@ -610,10 +610,15 @@ fn ce_d01_local_callee_boundary_declines_the_candidate_up_front() {
             .map(|(_, _, reason)| reason.as_str())
             .unwrap_or_else(|| panic!("no parameter {name}: {decisions:#?}"))
     };
+    // Restated (relay 305; R864-3's stand-in review, round 3, R3-1 / R3-2; main 197 / 198):
+    // `keep` stores `from` into a static, and the tier's row at that call is a block at a
+    // converting target (no bridge renders, so it reads no retention), so the
+    // retained-access check of record holds `from` first. A label: `from` stays raw, as
+    // the thin-extent backstop held it.
     assert_eq!(
         reason("from"),
-        "held:thin-extent",
-        "a declined candidate resumes the ladder at the thin-extent backstop: {decisions:#?}"
+        "held:retained-alias",
+        "the retained-access check holds the kept candidate: {decisions:#?}"
     );
     assert_eq!(reason("to"), "<emitted>", "{decisions:#?}");
     let super::RewriteOutcome::Emitted {

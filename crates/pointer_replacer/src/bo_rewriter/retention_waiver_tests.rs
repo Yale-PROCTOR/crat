@@ -336,11 +336,15 @@ fn wave6o_a_waived_sites_bridge_receipts_reconcile() {
     // R829-1 (relay 297, main 188): caller::buf is held beside value at GetValue; its site
     // spends no waiver (it carried the tier-2 waived bridge receipt) and the events reconcile.
     let (waived, reconciled, degraded) = waived_bridge_receipts(RETAINED, "caller::buf");
+    // Restated (relay 305; R864-3's stand-in review, round 3, R3-2; main 197 / 198): the
+    // retained-access check of record holds `caller::buf` first (`GetValue` keeps it, and
+    // the tier's row at that call is a block at a converting target, no bridge). A label:
+    // the source stays raw, as the pair hold held it.
     let (key, detail) = degraded.expect("caller::buf is held raw");
-    assert_eq!(key, "held:pair-not-shown-disjoint", "{detail}");
+    assert_eq!(key, "held:retained-alias", "{detail}");
     assert!(
-        detail.contains(":GetValue:0:") && detail.ends_with(";risky-siblings=arg1"),
-        "the hold names GetValue's retaining p and the written value: {detail}"
+        detail.starts_with("evident:derived-store:callee-store | caller"),
+        "the hold names the callee's store: {detail}"
     );
     assert_eq!(waived, 0, "a held source has no bridge to waive");
     assert_eq!(reconciled, Ok(()), "and the bridge events reconcile");

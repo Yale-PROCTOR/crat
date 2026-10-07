@@ -585,19 +585,21 @@ pub unsafe fn binn_list_int32(mut list: *mut core::ffi::c_void, mut pos: i32) ->
 
 #[test]
 fn w6v2_forwarders_over_a_returned_alias_chain_deliver() {
+    // Restated (relay 305; R864-3's stand-in review, round 3, R3-2; main 197 / 198):
+    // `binn_list_int32::list` is a formal, protected for its call, whose value
+    // `binn_list_get` hands on to a callee that keeps it; `binn_list_get::ptr`'s own
+    // retention is the tier-2 waiver at its site, which does not release a formal caller.
+    // `list` is held (a delivery lost), and `binn_list_get::ptr` then takes its family's
+    // void-pointee hold (a delivery lost). The leaf reader still delivers.
     let rows = by_function(CHAIN);
-    for (function, parameter) in [
-        ("binn_list_int32", "list"),
-        ("binn_list_get", "ptr"),
-        ("binn_get_ptr_type", "ptr"),
+    for (function, parameter, reason) in [
+        ("binn_list_int32", "list", "held:retained-alias"),
+        ("binn_list_get", "ptr", "held:void-pointee"),
+        ("binn_get_ptr_type", "ptr", "<emitted>"),
     ] {
         assert!(
-            rows.contains(&(
-                function.to_owned(),
-                parameter.to_owned(),
-                "<emitted>".to_owned()
-            )),
-            "{function}::{parameter} delivers: {rows:?}"
+            rows.contains(&(function.to_owned(), parameter.to_owned(), reason.to_owned())),
+            "{function}::{parameter}: {rows:?}"
         );
     }
     for (function, parameter) in [("binn_list_get_value", "ptr"), ("binn_ptr", "ptr")] {
@@ -613,28 +615,17 @@ fn w6v2_forwarders_over_a_returned_alias_chain_deliver() {
     let source = super::emit_tests::ast_emitted_source_of(CHAIN).unwrap();
     let c = compact(&source);
     assert!(
-        c.contains("fnbinn_list_int32(mutlist:&[u8],mutpos:i32)->i32{letmutvalue:i32=0;binn_list_get(list,pos,0x61asi32,&mutvalue);"),
-        "the accessor forwards its view safe-to-safe: {source}"
-    );
-    assert!(
-        c.contains("fnbinn_list_get(mutptr:&[u8],")
-            && c.contains(
-                "binn_list_get_value(ptr.as_ptr().cast::<core::ffi::c_void>().cast_mut(),pos,"
-            ),
-        "the middle forwarder crosses the raw seam by the byte-view bridge: {source}"
+        c.contains("fnbinn_list_int32(mutlist:*mutcore::ffi::c_void,mutpos:i32)->i32"),
+        "the accessor stays raw: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
     let main = r#"fn main() { unsafe {
         let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
         println!("{} {}", binn_list_int32(buffer.as_mut_ptr().cast(), 2), binn_list_int32(buffer.as_mut_ptr().cast(), 1));
     }}"#;
-    let emitted_main = r#"fn main() { unsafe {
-        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
-        println!("{} {}", binn_list_int32(&buffer[..], 2), binn_list_int32(&buffer[..], 1));
-    }}"#;
     let original = run_binary(&format!("{CHAIN}\n{main}"));
     assert_eq!(original, b"9 3\n".to_vec());
-    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
 }
 
 /// The full binn shape of the typed accessors (lib.rs:1389 `GetValue` storing

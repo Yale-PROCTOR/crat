@@ -120,24 +120,28 @@ fn reason_of(degradations: &[super::decision::Degradation], subject: &str) -> Op
 fn wave6k_adapted_callers_of_a_raw_callee_deliver() {
     let (source, degradations, final_reverts, reverted_count, _) = outcome(CLOSURE);
     assert_eq!(reverted_count, 0, "no verify-loop revert: {final_reverts}");
-    assert_eq!(
-        final_reverts.lines().count().saturating_sub(1),
-        0,
-        "nothing withheld: {final_reverts}"
-    );
+    // The two held callers are withheld by their hold (R3-2), not by a revert.
     assert!(
-        reason_of(&degradations, "caller::p#1").is_none(),
-        "{degradations:?}"
+        final_reverts
+            .lines()
+            .skip(1)
+            .all(|line| line.contains("held:blocked-subject:held:retained-alias")),
+        "nothing withheld but the held callers: {final_reverts}"
     );
-    assert!(
-        reason_of(&degradations, "grand::s#1").is_none(),
-        "{degradations:?}"
-    );
-    assert!(
-        source.contains("fn caller(mut p: Option<&mut S>)"),
-        "{source}"
-    );
-    assert!(source.contains("fn grand(s: &mut S)"), "{source}");
+    // Restated (relay 305; R864-3's stand-in review, round 3, R3-2; main 197 / 198):
+    // `callee` hands `p` to the foreign `pick` (retention unknown, the tier-2 waiver at
+    // that site); that receipt does not release a formal caller, which is protected for its
+    // call. `caller::p` and `grand::s` are held by the retained-access check (deliveries
+    // lost); `callee` still delivers, and nothing reverts.
+    for subject in ["caller::p", "grand::s"] {
+        assert!(
+            reason_of(&degradations, subject)
+                .is_some_and(|reason| reason.contains("RetainedAlias")),
+            "{subject}: {degradations:?}"
+        );
+    }
+    assert!(source.contains("fn caller(mut p: *mut S)"), "{source}");
+    assert!(source.contains("fn grand(s: *mut S)"), "{source}");
 }
 
 /// Control of the classification: on the closure fixture the caller→callee
@@ -167,9 +171,14 @@ fn wave6k_structural_pairs_are_never_narrowed() {
             )
         };
         let (caller, callee, grand) = (class_of("caller"), class_of("callee"), class_of("grand"));
+        // Restated (relay 305; R3-2; main 197 / 198): `grand::s` is held (its formal
+        // caller is not released on `callee`'s waiver), so grand→caller is no bare
+        // adapter edge any more; the classification is witnessed on callee→leaf.
+        let leaf = class_of("leaf");
         let bare = super::revert_closure::call_adapter_only_edges(&table, []);
         assert!(bare.contains(&(caller, callee)), "{bare:?}");
-        assert!(bare.contains(&(grand, caller)), "{bare:?}");
+        assert!(bare.contains(&(callee, leaf)), "{bare:?}");
+        assert!(!bare.contains(&(grand, caller)), "{bare:?}");
         let with_structural =
             super::revert_closure::call_adapter_only_edges(&table, [(caller, callee)]);
         assert!(
@@ -177,7 +186,7 @@ fn wave6k_structural_pairs_are_never_narrowed() {
             "{with_structural:?}"
         );
         assert!(
-            with_structural.contains(&(grand, caller)),
+            with_structural.contains(&(callee, leaf)),
             "{with_structural:?}"
         );
     })

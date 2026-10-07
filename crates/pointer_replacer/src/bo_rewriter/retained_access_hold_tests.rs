@@ -116,8 +116,11 @@ fn r864_3_filter3_a_store_into_a_delivered_field_is_not_held() {
     assert!(!held(&d, "ht_iterator::table"), "{d:#?}");
 }
 
-/// Filter 2: a subject the retention tier waives at its retaining site (binn's
-/// `GetValue` shape).
+/// Filter 2 at a block with no bridge (binn's `GetValue` shape). Restated (relay 305;
+/// the stand-in review's round 3, R3-2; main 197 / 198): `caller`'s site into `GetValue`
+/// is `Blocked{PositiveRetention}` at a target that converts, so nothing renders there and
+/// it reads no retention; `GetValue` keeps `buf` in `Blob.ptr`, raw, and `caller::buf` is
+/// held. The positive witness is the waived foreign site below.
 const RETAINED: &str = r#"
 #[repr(C)]
 pub struct Blob { pub ptr: *mut u8, pub len: i32 }
@@ -135,9 +138,31 @@ pub unsafe fn caller(mut buf: *mut u8, mut value: *mut Blob) -> i32 {
 "#;
 
 #[test]
-fn r864_3_filter2_the_tiers_disposition_stands() {
+fn r864_3_filter2_a_block_with_no_bridge_reads_no_retention() {
     let d = decisions(&format!("{ALLOW}{RETAINED}"));
+    assert!(held(&d, "caller::buf"), "{d:#?}");
+}
+
+/// Filter 2's positive witness: a foreign call the check reads as keeping its argument,
+/// at the subject's own site, where the tier spends the tier-2 waiver on a bridge: the
+/// tier's reading stands for that store, receipted at that site.
+const STASHED: &str = r#"
+extern "C" { fn stash(p: *mut u8); }
+pub unsafe fn caller(mut buf: *mut u8) -> u8 {
+    *buf = 1;
+    stash(buf);
+    *buf
+}
+"#;
+
+#[test]
+fn r864_3_filter2_a_waived_bridge_reads_its_own_call() {
+    let d = decisions(&format!("{ALLOW}{STASHED}"));
     assert!(!held(&d, "caller::buf"), "{d:#?}");
+    assert!(
+        d["caller::buf"].starts_with("Ref") || d["caller::buf"].starts_with("Slice"),
+        "{d:#?}"
+    );
 }
 
 /// The stand-in review's round 2, R2-1 (relay 304, R878-1: E2 / E3 are never exempt):
