@@ -213,8 +213,9 @@ fn e5c_hold_w2_a_pointer_into_the_struct_itself() {
     assert!(append.receipt().unwrap().starts_with("write:"));
 }
 
-/// The guard (132 §2): a write counts only through a raw retaining place. With the
-/// model deciding `small_vec.p` a reference, W2's write is not a retained access.
+/// The guard (132 §2) as `compute_options` takes it: a write counts only through a raw
+/// retaining place, as the caller's predicate reads fields. (R878-1: production no longer
+/// passes the model's kinds here; every field is raw, and the field transactions decide.)
 #[test]
 fn e5c_hold_the_guard_reads_the_model() {
     let v = verdicts_with(W2_SELF, &["small_vec.p"]);
@@ -590,11 +591,9 @@ fn e5c_hold_corpus_rows() {
     let mut vrows = Vec::new();
     ::utils::compilation::run_compiler_on_path(std::path::Path::new(&path), |tcx| {
         let program = program_of(tcx);
-        let raw = |did: DefId, index: usize| {
-            kinds
-                .get(&format!("{}::field{index}", tcx.def_path_str(did)))
-                .is_none_or(|kind| kind == "raw")
-        };
+        // R878-1 (era-5c 158): every field raw, as production computes the check; the field's
+        // model kind is a column (`via_kind`), and the host's transactions decide.
+        let raw = |_: DefId, _: usize| true;
         let started = std::time::Instant::now();
         // `CRAT_E5C_HOLD_FAULT` names one rule to drop, for the price of each;
         // `CRAT_E5C_HOLD_BYTES=off` drops R1's premise.
@@ -834,6 +833,10 @@ fn e5c_hold_corpus_rows() {
                         StoreDest::Callee => ("callee-store".to_owned(), none(), none()),
                         StoreDest::Other => ("other".to_owned(), none(), none()),
                     };
+                    let (via, via_kind) = match hold.via {
+                        Some((s, i)) => slot(s, i),
+                        None => (none(), none()),
+                    };
                     let site = hold
                         .site
                         .map_or_else(none, |(g, b, st)| format!("{}@bb{b}[{st}]", path_of(g)));
@@ -845,7 +848,7 @@ fn e5c_hold_corpus_rows() {
                         if local.as_usize() <= body.arg_count { "f" } else { "l" },
                         at(body.local_decls[*local].source_info.span),
                         if sites.is_empty() { "-".to_owned() } else { sites.join(";") },
-                    ));
+                    ) + &format!("\t{via}\t{via_kind}"));
                 }
             }
         }
@@ -854,7 +857,7 @@ fn e5c_hold_corpus_rows() {
     rows.sort();
     std::fs::write(&out, rows.join("\n") + "\n").expect("write rows");
     vrows.sort();
-    let header = "fn\tlabel\tlocal\tf_or_l\tdecl\tverdict\thold\trule\treceipt\tdest\tslot\tslot_kind\tstore_site\tcall_sites";
+    let header = "fn\tlabel\tlocal\tf_or_l\tdecl\tverdict\thold\trule\treceipt\tdest\tslot\tslot_kind\tstore_site\tcall_sites\tvia\tvia_kind";
     std::fs::write(
         &verdict_out,
         format!(
@@ -2434,6 +2437,90 @@ fn e5c_evident_record_holds_the_self_reference() {
             .as_deref()
             .is_some_and(|r| r.starts_with("evident:self-reference:small_vec.p")),
         "{receipt:?}"
+    );
+}
+
+/// R878-1 (main 194a §3; corrects era-5c 155 §4): the production check took the model's field
+/// kinds as its guard (132 §2: a model-`Ref` / `Owning` retaining field is no raw retaining
+/// place). The rewriter of record keeps `small_vec.p` raw (`field-mutable-held`), so the
+/// emitted `append(v: &mut small_vec, ..)` writes through a raw pointer into `*v` while the
+/// check said `Clear`. Computed as production computes it, with the model deciding the field
+/// `Ref`, `append::v` is still held: the guard is applied on the field transactions instead.
+#[test]
+fn e5c_r878_the_production_check_holds_append_whatever_the_model_decides_the_field() {
+    use crate::analyses::borrow_ownership::{
+        SlotKind, crate_slots::CrateSlots, slots::StructFieldSlot, solver::SlotRef,
+    };
+    ::utils::compilation::run_compiler_on_str(W2_RUN, |tcx| {
+        let program = program_of(tcx);
+        let slots = CrateSlots::build(&program);
+        let small_vec = *program.structs.first().expect("small_vec");
+        let p = slots
+            .field_slots
+            .slot_for_field_depth(
+                StructFieldSlot {
+                    struct_did: small_vec,
+                    field_index: 0,
+                },
+                0,
+            )
+            .map(SlotRef::Field)
+            .expect("small_vec.p's slot");
+        let model = FxHashMap::from_iter([(p, SlotKind::Ref)]);
+        let check = RetainedAccessCheck::compute(&program, &slots, &model);
+        let append = *program
+            .functions
+            .iter()
+            .find(|did| tcx.item_name(did.to_def_id()).as_str() == "append")
+            .expect("append");
+        let receipt = check.formal(append, 1).and_then(Verdict::evident_receipt);
+        assert!(
+            receipt
+                .as_deref()
+                .is_some_and(|r| r.starts_with("evident:self-reference:small_vec.p")),
+            "{receipt:?}"
+        );
+    })
+    .expect("compiles");
+}
+
+/// R878-1: the guard of 132 §2 on the applied field transactions. `append::v` holds through
+/// `small_vec.p`; a host whose transactions do not deliver the field keeps every hold, and one
+/// that delivers it drops the holds through it (the fault: the guard applied to every field).
+#[test]
+fn e5c_r878_the_guard_reads_the_applied_field_transactions() {
+    let v = of_record(W2_RUN);
+    let append = of(&v, "append::v");
+    let Verdict::Held(holds) = append else { panic!("{append:#?}") };
+    assert_eq!(
+        append.after_deliveries(&|_, _| false),
+        *append,
+        "nothing delivered"
+    );
+    let p = holds
+        .iter()
+        .find_map(|hold| hold.via)
+        .unwrap_or_else(|| panic!("a hold through a field: {holds:#?}"));
+    assert_eq!(p.1, 0, "small_vec.p");
+    match append.after_deliveries(&|s, f| (s, f) == p) {
+        Verdict::Clear => {}
+        Verdict::Held(kept) => assert!(kept.iter().all(|hold| hold.via != Some(p)), "{kept:#?}"),
+        Verdict::Unknown => panic!("unknown"),
+    }
+    let unfielded: Vec<_> = holds
+        .iter()
+        .filter(|hold| hold.via.is_none())
+        .cloned()
+        .collect();
+    let expected = if unfielded.is_empty() {
+        Verdict::Clear
+    } else {
+        Verdict::Held(unfielded)
+    };
+    assert_eq!(
+        append.after_deliveries(&|_, _| true),
+        expected,
+        "every field delivered"
     );
 }
 

@@ -5125,6 +5125,10 @@ pub(crate) struct Hold {
     pub(crate) dest: StoreDest,
     /// The store's site: (the storing function's def index, block, statement).
     pub(crate) site: Option<(u32, u32, usize)>,
+    /// era-5c 158 (R878-1): an access hold's retaining field `(struct, field)` when it is a
+    /// field of a crate struct: the guard of 132 §2 reads it against the applied field
+    /// transactions (`Verdict::after_deliveries`), not against the model.
+    pub(crate) via: Option<(u32, usize)>,
 }
 
 /// era-5c 157 (relay 196): where a derived store lands. Struct and function identities are
@@ -5228,6 +5232,25 @@ impl Verdict {
         })
     }
 
+    /// **R878-1 (era-5c 158): the guard of 132 §2 on the applied field transactions.** An
+    /// access through a crate struct's field the rewriter delivers (an applied field transaction:
+    /// a borrow-checked reference or an owning move) is not a retained raw access, so its hold
+    /// goes; every other hold stays. `delivered(struct, field)` is the host's reading of its
+    /// settled table (main's joint fixpoint). Nothing left is `Clear`.
+    pub(crate) fn after_deliveries(&self, delivered: &dyn Fn(u32, usize) -> bool) -> Verdict {
+        let Verdict::Held(holds) = self else { return self.clone() };
+        let kept: Vec<Hold> = holds
+            .iter()
+            .filter(|hold| !hold.via.is_some_and(|(s, f)| delivered(s, f)))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            Verdict::Clear
+        } else {
+            Verdict::Held(kept)
+        }
+    }
+
     /// The receipt detail: `<kind>:<witness>` of the first hold, or `unknown`.
     pub(crate) fn receipt(&self) -> Option<String> {
         match self {
@@ -5283,18 +5306,20 @@ pub(crate) struct RetainedAccessCheck {
 }
 
 impl RetainedAccessCheck {
-    /// The check under the model's field kinds: a retaining field the model decides
-    /// `Ref` or `Owning` is not a raw retaining place (132 §2's guard).
     /// The check of record (R826-1, USER: "(E)로 가자"): the evident shapes, held by
     /// rule, in the closed world (R816-1). Everything else stands under P9
     /// `RetainedAccessFreedom`. M1's round trip is off: it feeds only holds outside the
-    /// evident shapes, which P9 covers by statement (era-5c 143 §6).
+    /// evident shapes, which P9 covers by statement (era-5c 143 §6). **R878-1 (era-5c
+    /// 158):** every field is a raw retaining place here; the model's field kinds are not read
+    /// (the rewriter of record may keep a model-`Ref` field raw). The guard of 132 §2 is applied
+    /// where the field transactions are known: `Verdict::after_deliveries`. `slots` and
+    /// `model` stay in the signature for the callers (main's joint fixpoint) and are unread.
     pub(crate) fn compute(
         program: &RustProgram<'_>,
-        slots: &CrateSlots,
-        model: &FxHashMap<SlotRef, SlotKind>,
+        _slots: &CrateSlots,
+        _model: &FxHashMap<SlotRef, SlotKind>,
     ) -> Self {
-        Self::compute_record(program, &Self::model_fields(slots, model))
+        Self::compute_record(program, &|_, _| true)
     }
 
     /// The mode of record, with P10's receipts (R842-2): the check once more with the
@@ -5327,29 +5352,6 @@ impl RetainedAccessCheck {
             }
         }
         check
-    }
-
-    /// The model's field kinds as the raw guard reads them: a retaining field the
-    /// model decides `Ref` or `Owning` is not a raw retaining place (132 §2).
-    fn model_fields<'m>(
-        slots: &'m CrateSlots,
-        model: &'m FxHashMap<SlotRef, SlotKind>,
-    ) -> impl Fn(DefId, usize) -> bool + 'm {
-        move |did: DefId, index: usize| {
-            let Some(struct_did) = did.as_local() else { return true };
-            let kind = slots
-                .field_slots
-                .slot_for_field_depth(
-                    crate::analyses::borrow_ownership::slots::StructFieldSlot {
-                        struct_did,
-                        field_index: index,
-                    },
-                    0,
-                )
-                .map(SlotRef::Field)
-                .and_then(|slot| model.get(&slot).copied());
-            !matches!(kind, Some(SlotKind::Ref | SlotKind::Owning))
-        }
     }
 
     /// The check with the raw-field predicate given.
@@ -5462,6 +5464,12 @@ impl RetainedAccessCheck {
                 ),
                 dest: StoreDest::None,
                 site: None,
+                via: match access.via {
+                    Via::Field(did, index) => {
+                        did.as_local().map(|s| (s.local_def_index.as_u32(), index))
+                    }
+                    _ => None,
+                },
             };
         // A hold that rests on `Top` (either side) is an unknown one.
         let unknown_hold = |objs: &FxHashSet<Obj>, access: &Access| {
@@ -5630,6 +5638,7 @@ impl RetainedAccessCheck {
                             ),
                             dest: StoreDest::Callee,
                             site: None,
+                            via: None,
                         });
                     }
                     for (location, dst) in stores {
@@ -5651,6 +5660,7 @@ impl RetainedAccessCheck {
                                 location.block.as_u32(),
                                 location.statement_index,
                             )),
+                            via: None,
                         });
                     }
                 }
@@ -5934,6 +5944,7 @@ impl RetainedAccessCheck {
                                 location.block.as_u32(),
                                 location.statement_index,
                             )),
+                            via: None,
                         });
                     }
                 }
