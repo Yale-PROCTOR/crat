@@ -260,3 +260,59 @@ fn r864_3_round3_a_formal_is_not_released_on_its_callees_receipt() {
         "{d:#?}"
     );
 }
+
+/// The stand-in review's round 4, R4-1: the check emits a formal's callee store only when
+/// the formal stores nothing itself; here its own store is a foreign `stash` the tier
+/// waives at its own bridged site, and the in-program `keep` takes the subject inside an
+/// aggregate (no tier site) and keeps it in `H.f`.
+const OWN_STORE_HIDES_CALLEE_STORE: &str = r#"
+#[repr(C)] pub struct S { pub x: i32 }
+#[repr(C)] #[derive(Copy, Clone)] pub struct Pair { pub a: *mut S, pub n: i32 }
+#[repr(C)] pub struct H { pub f: *mut S }
+extern "C" { fn stash(p: *mut S); }
+unsafe fn keep(p: Pair, h: *mut H) { (*h).f = p.a; }
+pub unsafe fn f(s: *mut S, h: *mut H) { stash(s); keep(Pair { a: s, n: 0 }, h); }
+pub unsafe fn run(o: *mut S, h: *mut H) { f(o, h); (*o).x = 2; let _y = (*(*h).f).x; }
+"#;
+
+#[test]
+fn r864_3_round4_an_own_store_does_not_hide_a_callee_store() {
+    let d = decisions(&format!("{ALLOW}{OWN_STORE_HIDES_CALLEE_STORE}"));
+    assert!(
+        !d["f::s"].starts_with("Ref") && !d["f::s"].starts_with("InferredRef"),
+        "{d:#?}"
+    );
+}
+
+/// The review's round 4, R4-2 (ruling-level): binn's KEEP shape with its derived-global
+/// store (`KEPT = p`, a known retention the tier waives at `probe`'s site: the tier-2
+/// retention waiver, R481-2) and a caller that writes through its parent after `probe`
+/// returns, then reads through the kept pointer. The retention waiver's text excludes a
+/// use while the reference is live, not this one.
+const KEPT_AFTER_THE_REFERENCE: &str = r#"
+#[repr(C)]
+pub struct binn { pub header: i32, pub type_0: i32, pub size: i32, pub ptr: *mut core::ffi::c_void }
+static mut KEPT: *mut u8 = 0 as *mut u8;
+unsafe fn keep(mut p: *mut u8, mut out: *mut binn) -> i32 {
+    (*out).type_0 = *p as i32;
+    (*out).ptr = p as *mut core::ffi::c_void;
+    KEPT = p.cast::<i8>() as *mut u8;
+    return 1 as i32;
+}
+pub unsafe fn probe(mut s: *mut u8) -> i32 {
+    let mut out = binn { header: 0, type_0: 0, size: 0, ptr: 0 as *mut core::ffi::c_void };
+    if keep(s, &mut out) == 0 as i32 { return 0 as i32; }
+    return out.type_0;
+}
+pub unsafe fn run(b: *mut u8) -> u8 { probe(b); *b = 5; *KEPT }
+"#;
+
+#[test]
+#[ignore = "R4-2 (main 198): the tier-2 retention waiver's exclusion is the seat's to rule; RED at 79e2d54cb"]
+fn r864_3_round4_a_retention_waiver_does_not_cover_a_later_use() {
+    let d = decisions(&format!("{ALLOW}{KEPT_AFTER_THE_REFERENCE}"));
+    assert!(
+        !d["probe::s"].starts_with("Ref") && !d["probe::s"].starts_with("Slice"),
+        "{d:#?}"
+    );
+}
