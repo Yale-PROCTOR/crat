@@ -1173,9 +1173,47 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     if converts.contains(&raw_key) || raw.target.is_none() {
                         continue;
                     }
+                    // The raw side is a formal decided raw (fan-out 081's
+                    // model-Raw formal), not a safe form that merely does not
+                    // convert here.
+                    let raw_formal = match decision_of.get(&raw_key) {
+                        Some(Decision::Degraded(_)) | None => true,
+                        Some(
+                            Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::NestedSlice { .. }
+                            | Decision::Cursor { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_),
+                        ) => false,
+                    };
+                    if !raw_formal {
+                        continue;
+                    }
                     let raw_written = param_written.get(&raw_key).copied().unwrap_or(true);
                     for position in &node_positions {
                         if !position.mutable && !raw_written {
+                            continue;
+                        }
+                        // A reference decision only: a slice or other form held
+                        // here reaches only the class terminal, after the seams
+                        // are planned, and leaves its callers' arguments
+                        // unbridged (the r815_6 lesson); those stay the named
+                        // residual.
+                        let reference = match decision_of.get(&position.key) {
+                            Some(Decision::Ref { .. } | Decision::InferredRef { .. }) => true,
+                            Some(
+                                Decision::Slice { .. }
+                                | Decision::NestedSlice { .. }
+                                | Decision::Cursor { .. }
+                                | Decision::Opt { .. }
+                                | Decision::Box(_)
+                                | Decision::Degraded(_),
+                            )
+                            | None => false,
+                        };
+                        if !reference {
                             continue;
                         }
                         let (left, right, left_span, right_span) =
