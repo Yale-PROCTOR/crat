@@ -10,7 +10,10 @@
 //! [`constant_access_extent`] is one such proof, read from the callee's body:
 //! the parameter is only ever dereferenced at element `c` for literal `c`
 //! (`*p`, `*p.offset(c)`, `*p.add(c)`), and the body has no branch, loop or
-//! early return, so every access runs on every call. On a UB-free input (§28)
+//! early return, so every access runs on every call - and (R884-3, wave-4 088)
+//! no call runs before the last access, other than a known non-diverging
+//! primitive (pointer arithmetic, a wrapping integer operation): any other
+//! call may exit, unwind or diverge before the accesses. On a UB-free input (§28)
 //! the caller's pointer then covers elements `0..=max c`, and a slice of
 //! `max c + 1` elements is exactly what the callee reads. Any other use of the
 //! parameter (passed on, stored, cast, offset by a non-literal, reassigned)
@@ -39,6 +42,7 @@ pub(crate) fn constant_access_extent(
         parameter,
         max: None,
         refused: false,
+        call_seen: false,
     };
     // A `return` is admitted only as the body's last statement or its tail:
     // anything after an earlier one would not run on every call.
@@ -75,6 +79,31 @@ struct Accesses {
     parameter: HirId,
     max: Option<u64>,
     refused: bool,
+    /// A call that may not return has run (R884-3): an access after it does
+    /// not run on every call.
+    call_seen: bool,
+}
+
+/// Method calls known to return normally: pointer arithmetic and conversion,
+/// and wrapping integer operations.
+fn non_diverging_method(name: &str) -> bool {
+    matches!(
+        name,
+        "offset"
+            | "add"
+            | "sub"
+            | "wrapping_offset"
+            | "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_mul"
+            | "wrapping_neg"
+            | "is_null"
+            | "cast"
+            | "cast_mut"
+            | "cast_const"
+            | "as_ptr"
+            | "as_mut_ptr"
+    )
 }
 
 impl Accesses {
@@ -123,8 +152,32 @@ impl<'tcx> Visitor<'tcx> for Accesses {
                 self.refused = true;
                 return;
             }
+            // R884-3: a call runs after its callee and arguments, and may
+            // not return.
+            ExprKind::Call(..) => {
+                intravisit::walk_expr(self, e);
+                self.call_seen = true;
+                return;
+            }
+            ExprKind::MethodCall(segment, ..)
+                if !non_diverging_method(segment.ident.name.as_str()) =>
+            {
+                intravisit::walk_expr(self, e);
+                self.call_seen = true;
+                return;
+            }
+            // The value is evaluated before the place it is stored to.
+            ExprKind::Assign(place, value, _) | ExprKind::AssignOp(_, place, value) => {
+                self.visit_expr(value);
+                self.visit_expr(place);
+                return;
+            }
             ExprKind::Unary(UnOp::Deref, place) => {
                 if self.is_parameter(place) {
+                    if self.call_seen {
+                        self.refused = true;
+                        return;
+                    }
                     self.max = self.max.max(Some(0));
                     return;
                 }
@@ -136,6 +189,7 @@ impl<'tcx> Visitor<'tcx> for Accesses {
                     && self.is_parameter(receiver)
                 {
                     match literal(offset) {
+                        Some(_) if self.call_seen => self.refused = true,
                         Some(at) => self.max = self.max.max(Some(at)),
                         None => self.refused = true,
                     }
