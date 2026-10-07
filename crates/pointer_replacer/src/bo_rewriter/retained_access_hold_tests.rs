@@ -39,10 +39,9 @@ fn held(decisions: &FxHashMap<String, String>, subject: &str) -> bool {
 
 /// The positive control: libtree's shape, a self-reference stored by `init` and used
 /// by `append` within one call from outside, is held on the settled table (155 §4:
-/// the hook-free line left `append::v` `Ref { mutable: true }`). The check reads the
-/// model's field kinds (a retaining field the model decides `Ref` / `Owning` is no raw
-/// retaining place), so the field carries raw evidence here (a byte write through it),
-/// as libtree's does.
+/// the hook-free line left `append::v` `Ref { mutable: true }`). The field carries raw
+/// evidence here (a byte write through it), as libtree's does; the shape without it is
+/// pinned below.
 const SELF_REFERENCE: &str = r#"
 #[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
 pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
@@ -57,6 +56,28 @@ pub unsafe fn run(v: *mut small_vec) { init(v); append(v, 1); }
 #[test]
 fn r864_3_a_self_reference_is_held_on_the_settled_table() {
     let d = decisions(&format!("{ALLOW}{SELF_REFERENCE}"));
+    assert!(held(&d, "append::v"), "{d:#?}");
+    assert!(d["append::v"].contains("evident:self-reference"), "{d:#?}");
+}
+
+/// era-5c's own `W2_RUN` (main 194a §3; R878-1; era-5c 158 / 158a): with no raw evidence
+/// on `small_vec.p` the model decides it `Ref`, and the check of record used to clear
+/// `append::v` on that reading while the rewriter keeps the field raw. The check's guard
+/// now reads the applied field transactions (`after_deliveries`, relay 305), and no
+/// transaction delivers `small_vec.p`: held.
+const SELF_REFERENCE_UNMARKED: &str = r#"
+#[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
+pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
+pub unsafe fn append(v: *mut small_vec, x: u64) {
+    *(*v).p.offset((*v).n as isize) = x;
+    (*v).n += 1;
+}
+pub unsafe fn run(v: *mut small_vec) { init(v); append(v, 1); }
+"#;
+
+#[test]
+fn r864_3_libtrees_self_reference_is_held_whatever_the_model_decides_the_field() {
+    let d = decisions(&format!("{ALLOW}{SELF_REFERENCE_UNMARKED}"));
     assert!(held(&d, "append::v"), "{d:#?}");
     assert!(d["append::v"].contains("evident:self-reference"), "{d:#?}");
 }

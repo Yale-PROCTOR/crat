@@ -694,33 +694,34 @@ pub unsafe fn binn_list_str(mut list: *mut core::ffi::c_void, mut pos: i32) -> *
 
 #[test]
 fn w6v2_typed_accessor_discharges_through_three_output_levels() {
+    // Restated under R878-1 (A) / (B) (relay 304; main 196): `GetValue` stores `p` into
+    // `binn.ptr`, a field no transaction delivers, so the retained-access check of record
+    // holds `GetValue::p` (the tier's waiver row is at the site into its formal), and the
+    // container pointer's callers follow it, each handing it to a callee that keeps it:
+    // `binn_list_get::ptr` and `binn_list_str::list` (labels: they were
+    // `held:void-pointee`) and `binn_list_int32::list` (a delivery lost: it was `&[u8]`,
+    // bridged at the held middle). Every accessor stays raw and runs as the input does.
     let rows = by_function(ACCESSORS);
-    assert!(
-        rows.contains(&(
-            "binn_list_int32".to_owned(),
-            "list".to_owned(),
-            "<emitted>".to_owned()
-        )),
-        "the int accessor's container view delivers: {rows:?}"
-    );
-    for (function, parameter) in [("binn_list_str", "list"), ("binn_list_get", "ptr")] {
+    for (function, parameter) in [
+        ("GetValue", "p"),
+        ("binn_list_get", "ptr"),
+        ("binn_list_int32", "list"),
+        ("binn_list_str", "list"),
+    ] {
         assert!(
             rows.contains(&(
                 function.to_owned(),
                 parameter.to_owned(),
-                "held:void-pointee".to_owned()
+                "held:retained-alias".to_owned()
             )),
-            "{function}::{parameter} stays held: {rows:?}"
+            "{function}::{parameter}: {rows:?}"
         );
     }
     let source = super::emit_tests::ast_emitted_source_of(ACCESSORS).unwrap();
     let c = compact(&source);
     assert!(
-        c.contains("fnbinn_list_int32(mutlist:&[u8],mutpos:i32)->i32")
-            && c.contains(
-                "binn_list_get(list.as_ptr().cast::<core::ffi::c_void>().cast_mut(),pos,96asi32,"
-            ),
-        "the accessor bridges its view at the held middle: {source}"
+        c.contains("fnbinn_list_int32(mutlist:*mutcore::ffi::c_void,mutpos:i32)->i32"),
+        "the int accessor stays raw: {source}"
     );
     assert!(
         c.contains("fnbinn_list_str(mutlist:*mutcore::ffi::c_void,mutpos:i32)->*muti8"),
@@ -731,13 +732,9 @@ fn w6v2_typed_accessor_discharges_through_three_output_levels() {
         let mut buffer = [7u8, 0, 0, 0, 0, 0, 0, 0];
         println!("{} {}", binn_list_int32(buffer.as_mut_ptr().cast(), 0), *binn_list_str(buffer.as_mut_ptr().cast(), 0));
     }}"#;
-    let emitted_main = r#"fn main() { unsafe {
-        let mut buffer = [7u8, 0, 0, 0, 0, 0, 0, 0];
-        println!("{} {}", binn_list_int32(&buffer[..], 0), *binn_list_str(buffer.as_mut_ptr().cast(), 0));
-    }}"#;
     let original = run_binary(&format!("{ACCESSORS}\n{main}"));
     assert_eq!(original, b"7 7\n".to_vec());
-    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
 }
 
 /// R406-6 finding B, the direct shape: `get_value` stores the pointer it is
@@ -765,34 +762,37 @@ pub unsafe fn get_type(mut ptr: *mut u8, mut pos: i32) -> i32 {
 
 #[test]
 fn w6v2_stack_confined_out_param_retention_is_t1() {
+    // Restated under R878-1 (A) / (B) (relay 304; main 196): `get_value` stores `ptr`
+    // into `binn.ptr`, a field no transaction delivers, so the retained-access check of
+    // record holds `get_value::ptr`, and `get_type::ptr` follows it (the callee it is
+    // handed to keeps it; the tier's stack-storage T1 at that call, R476's frame-bounded
+    // reading, is no retention disposition). A delivery lost: both stay raw and run as
+    // the input does.
     let rows = by_function(CONFINED);
-    assert!(
-        rows.contains(&(
-            "get_type".to_owned(),
-            "ptr".to_owned(),
-            "<emitted>".to_owned()
-        )),
-        "the retained-into-confined-storage subject delivers: {rows:?}"
-    );
+    for (function, parameter) in [("get_value", "ptr"), ("get_type", "ptr")] {
+        assert!(
+            rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "held:retained-alias".to_owned()
+            )),
+            "{function}::{parameter}: {rows:?}"
+        );
+    }
     let source = super::emit_tests::ast_emitted_source_of(CONFINED).unwrap();
     let c = compact(&source);
     assert!(
-        c.contains("fnget_type(mutptr:&u8,mutpos:i32)->i32")
-            || c.contains("fnget_type(mutptr:&mutu8,mutpos:i32)->i32"),
-        "the subject takes its reference form: {source}"
+        c.contains("fnget_type(mutptr:*mutu8,mutpos:i32)->i32"),
+        "the held subject keeps its raw form: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
     let main = r#"fn main() { unsafe {
         let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
         println!("{} {}", get_type(buffer.as_mut_ptr(), 0), get_type(buffer.as_mut_ptr(), 1));
     }}"#;
-    let emitted_main = r#"fn main() { unsafe {
-        let mut buffer = [0xe0u8, 3, 9, 0, 0, 0, 0, 0];
-        println!("{} {}", get_type(&mut buffer[0], 0), get_type(&mut buffer[0], 1));
-    }}"#;
     let original = run_binary(&format!("{CONFINED}\n{main}"));
     assert_eq!(original, b"224 225\n".to_vec());
-    assert_eq!(original, run_binary(&format!("{source}\n{emitted_main}")));
+    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
 }
 
 /// The certificate's own line: a caller local whose pointer-carrying field is
@@ -996,12 +996,25 @@ fn w6v2_descendant_discharge_needs_the_callee_body() {
         let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
         assert!(super::verify::type_checks_str(&source));
     }
+    // Restated under R878-1 (A) / (B) (relay 304; main 196): `keep` stores `p` into
+    // `binn.ptr`, a field no transaction delivers, so the retained-access check of record
+    // holds `keep::p` (the tier's row is at the site into `keep`'s formal), and `probe::s`
+    // follows it: the callee it is handed to keeps it, and the tier's reading at that
+    // call is the frame-bounded T1 (R476), no retention disposition. A delivery lost;
+    // with the escaping store above, `probe`'s call spends the tier-2 waiver (R481-2)
+    // and `probe::s` still delivers.
     let clean = KEEP.replace("//ESCAPE//", "");
     let rows = by_function(&clean);
-    assert!(
-        rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
-        "with a clean body the confined out-param discharges: {rows:?}"
-    );
+    for (function, parameter) in [("keep", "p"), ("probe", "s")] {
+        assert!(
+            rows.contains(&(
+                function.to_owned(),
+                parameter.to_owned(),
+                "held:retained-alias".to_owned()
+            )),
+            "{function}::{parameter}: {rows:?}"
+        );
+    }
 }
 
 /// R410-2(d): a width reader (`return *(p as *const u32)`) is wave-6b's

@@ -1438,16 +1438,29 @@ pub unsafe fn emit(input: &[u8], n: usize) -> u64 {
             .map(|(_, d)| d.as_str())
             .unwrap_or("<no receipt>")
     };
+    // Restated under R878-1 (B) (relay 304; main 196): the retained-access check of
+    // record reads the foreign `sink` as keeping the cursor's value, and the tier's row at
+    // that call is `TemplateUnavailable` on a raw expression (retention unknown,
+    // unlicensed for a cursor), a bridge's block and no retention reading. `emit::ip` is
+    // held before the cursor family plans it: a delivery lost (the cursor and its view
+    // inside the cast were built at 3759c6ffc, with no retention receipt at `sink`).
     assert_eq!(
         of("emit::ip"),
-        "Ok(())",
-        "the cast operand's view is not delivered: {dispositions:?}"
+        "<no receipt>",
+        "the held cursor plans no view: {dispositions:?}"
+    );
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "ip" && !*p && r == "held:retained-alias"),
+        "{rows:?}"
     );
     let source = emitted(input);
     save_fixture("cursor-cast-to-void-formal", input, &source);
+    let c: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        source.contains(".as_ptr() as *const c_void)"),
-        "the cursor's raw view inside the cast is absent: {source}"
+        c.contains("sink(ip.offset(-1)as*constc_void)"),
+        "the raw cursor reaches sink as written: {source}"
     );
 }
 

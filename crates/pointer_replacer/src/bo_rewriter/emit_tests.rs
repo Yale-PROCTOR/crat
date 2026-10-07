@@ -13789,17 +13789,23 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
         super::decide_table(tcx).expect("local-retention table")
     })
     .expect("local-retention fixture compiles");
-    assert!(
-        table.entries.iter().any(|(subject, decision)| {
-            subject.param_name.as_deref() == Some("p")
-                && matches!(subject.kind, super::decision::SubjectKind::Local)
-                && matches!(decision, super::decision::Decision::Degraded(record)
-                    if record.reason == super::decision::DegradeReason::SliceUseUnsupported)
-        }),
-        "R220 must restore the predecessor raw local: {:?}",
-        table.entries
-    );
-    for name in ["src", "out"] {
+    // Restated under R878-1 (A) (relay 304; main 194a / 196): `(*out).saved = q` stores
+    // a copy of `src` into `Holder.saved`, a field no transaction delivers, so the
+    // retained-access check of record holds `src` and its local copy `p` (a delivery
+    // lost: `src` was `Ref`, beside R220's restored raw `p`). `out` stays delivered, and
+    // no slice-use plan is made for a held source.
+    for name in ["src", "p"] {
+        assert!(
+            table.entries.iter().any(|(subject, decision)| {
+                subject.param_name.as_deref() == Some(name)
+                    && matches!(decision, super::decision::Decision::Degraded(record)
+                        if matches!(record.reason, super::decision::DegradeReason::RetainedAlias { .. }))
+            }),
+            "{name} is held by the retained-access check: {:?}",
+            table.entries
+        );
+    }
+    for name in ["out"] {
         assert!(
             table.entries.iter().any(|(subject, decision)| {
                 subject.param_name.as_deref() == Some(name)
@@ -13809,28 +13815,13 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
             table.entries
         );
     }
-    let copy = table
-        .slice_use_receipts
-        .iter()
-        .find(|plan| plan.obligation.planned.source_shape == "body-copy")
-        .expect("nonvacuous local-copy receipt");
-    slu_r220_assert_retired_use_cause(
-        copy,
-        super::mechanical_receipt::MechanicalTerminalReason::PositiveRetention,
+    assert!(
+        !table
+            .slice_use_receipts
+            .iter()
+            .any(|plan| plan.obligation.planned.source_shape == "body-copy"),
+        "no local-copy plan for a held source"
     );
-    assert_eq!(
-        copy.retention,
-        super::mechanical_receipt::MechanicalRetention::PositiveRetention
-    );
-    assert_ne!(copy.adapter, "body-slice-raw-view");
-    let (events, rows) = copy.materialize(false, false);
-    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
-        .expect("local-retention hold join");
-    assert_eq!(
-        copy.obligation.planned.evidence.retention,
-        super::mechanical_receipt::MechanicalRetention::PositiveRetention
-    );
-    assert_eq!(copy.boundary_evidence, "copied-local-destination-retains");
     let emitted = ast_emitted_source_of(input).expect("local retained-copy fallback emission");
     assert!(
         verify::type_checks_str(&emitted),
@@ -14689,17 +14680,23 @@ fn opt_w1_thin_optional_copy_to_retained_raw_local_is_held() {
             .option_receipts
     })
     .expect("OPT retained raw local input compiles");
-    // R216/R217/R218: preserve the typed refusal through site-local raw fallback.
+    // Restated under R878-1 (A) (relay 304; main 194a / 196): `(*out).saved = q` stores
+    // `p`'s copy into `Holder.saved`, a field no transaction delivers, so the
+    // retained-access check of record holds `p` before the Option family plans it (a
+    // label: the family's site-local raw fallback, R216/R217/R218, held it raw too). No
+    // option plan applies to it.
     assert!(
-        plans
+        !plans
             .iter()
-            .any(|plan| plan.source_form == "raw"
-                && plan.obligation.intended_terminal_state == super::mechanical_receipt::MechanicalState::Reclassified
-                && plan.obligation.intended_terminal_reason
-                == Some(super::mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
-                        "additive-family-fallback:opt-use-unsupported;site-cause=positive-retention".to_owned()
-                    ))),
-        "retained thin raw view was not attributed: {plans:?}"
+            .any(|plan| plan.obligation.intended_terminal_state
+                == super::mechanical_receipt::MechanicalState::Applied),
+        "retained thin raw view was planned: {plans:?}"
+    );
+    let rows = decisions_of(input);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "p" && *p && r == "held:retained-alias"),
+        "{rows:?}"
     );
     let emitted = ast_emitted_source_of(input).expect("raw fallback emission");
     assert!(

@@ -487,15 +487,24 @@ pub unsafe extern "C" fn ht_set(mut table: *mut ht, mut key: *const i8, mut valu
 /// fallback extent leaves (the runtime harness's panic at 131,072).
 #[test]
 fn w6l_extent_ht_call_sites_take_the_capacity() {
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): `ht_set_entry::entries` is
+    // held by the retained-access check of record (an access through `ht_entry.key`); the
+    // tier's `SubjectNotSafe` rows at the sites into it say only that a bridge cannot be
+    // built. Neither call site builds a slice (a delivery lost), and none takes the
+    // fallback extent.
+    let rows = crate::bo_rewriter::emit_tests::decisions_of(HT_CALLERS);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "entries" && *p && r == "held:retained-alias"),
+        "{rows:?}"
+    );
     let edits = seam_edits(HT_CALLERS);
-    for (base, length) in [
-        ("new_entries", "(new_capacity) as usize"),
-        ("(*table).entries", "((*table).capacity) as usize"),
-    ] {
+    for base in ["new_entries", "(*table).entries"] {
         assert!(
-            edits.iter().any(|(replacement, extent)| replacement
-                .contains(&format!("from_raw_parts_mut({base}, {length})"))
-                && extent.contains("extent-proof:mask-of-length")),
+            !edits
+                .iter()
+                .any(|(replacement, _)| replacement
+                    .contains(&format!("from_raw_parts_mut({base}, "))),
             "{base}: {edits:#?}"
         );
     }

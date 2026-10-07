@@ -1598,7 +1598,11 @@ fn ce_m05_a_size_of_another_type_keeps_the_multi_element_extent() {
         .iter()
         .find(|(name, is_param, _)| name == "p" && *is_param)
         .expect("CE-M05 `p` subject");
-    assert_eq!(p.2, "held:local-callee-access-extent", "{decisions:#?}");
+    // Restated (relay 304, R878-1; the stand-in review's round 2, R2-1; main 196):
+    // `SAVED = p` is `p`'s own store into a static, which the retained-access check of
+    // record holds whatever the tier reads at `clear(p)`; `p` stays raw either way (a
+    // label: it was `held:local-callee-access-extent`).
+    assert_eq!(p.2, "held:retained-alias", "{decisions:#?}");
     assert_eq!(st.2, "<emitted>", "{decisions:#?}");
     let output = emitted(source);
     assert!(output.contains("st: &mut [Stat]"), "{output}");
@@ -1890,13 +1894,29 @@ pub mod src {
 
 #[test]
 fn ce_m06_a_nested_pointee_still_reads_as_one_element() {
+    // Restated under R878-1 (A) (relay 304; main 194a / 196): `(*v).p =
+    // ((*v).buf).as_mut_ptr()` stores into `small_vec_u64_t.p`, a field no transaction
+    // delivers, so the retained-access check of record holds `v` (libtree's
+    // self-reference). The one-element reading is witnessed on the struct without that
+    // store.
     let decisions = super::emit_tests::decisions_of(CE_M06_NESTED_POINTEE);
     let v = decisions
         .iter()
         .find(|(name, is_param, _)| name == "v" && *is_param)
         .expect("CE-M06 v subject");
-    assert_eq!(v.2, "<emitted>", "{decisions:#?}");
+    assert_eq!(v.2, "held:retained-alias", "{decisions:#?}");
     let source = emitted(CE_M06_NESTED_POINTEE);
+    assert!(!source.contains("[small_vec_u64_t]"), "{source}");
+    let unstored =
+        CE_M06_NESTED_POINTEE.replace("            (*v).p = ((*v).buf).as_mut_ptr();\n", "");
+    assert_ne!(unstored, CE_M06_NESTED_POINTEE);
+    let decisions = super::emit_tests::decisions_of(&unstored);
+    let v = decisions
+        .iter()
+        .find(|(name, is_param, _)| name == "v" && *is_param)
+        .expect("CE-M06 v subject");
+    assert_eq!(v.2, "<emitted>", "{decisions:#?}");
+    let source = emitted(&unstored);
     assert!(source.contains("v: &mut small_vec_u64_t"), "{source}");
     assert!(!source.contains("[small_vec_u64_t]"), "{source}");
 }

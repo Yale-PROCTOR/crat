@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use super::{
     bridge_receipt::{BridgeRetentionTier, SignatureClassId},
-    decision::{raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID, seam::SeamInputRendering},
+    decision::seam::SeamInputRendering,
 };
 
 struct Run {
@@ -140,16 +140,18 @@ const QUALITY10: &str = "#![allow(dead_code, unused_unsafe, unused_mut, non_came
 /// converted beside the held callee instead of closing.
 #[test]
 fn w6a_r575_a_value_local_address_at_a_held_callee_takes_the_retention_waiver() {
+    // Restated under R878-1 (B) (relay 304; main 196): the retained-access check of
+    // record holds `hasher_setup::hasher` (`initialize_h2` keeps `&mut (*hasher).common`
+    // in `(*hasher).h2`, a self-reference through a callee; the tier's positive-retention
+    // row is at that address, a pointer into the subject, not its own value), and
+    // `init_or_stitch::hasher` follows it raw (`held:into-held-formal`). The callee's
+    // formal is then raw by decision, not a converted formal of a held class: no input
+    // is admitted and no waiver is spent, and `&mut hasher` is the input's own coercion.
+    // The receipt moves; the emitted text below is unchanged.
     let run = run(QUALITY10, "quality10", "init_or_stitch");
     assert_eq!(
         run.inputs,
-        vec![(
-            "zero-syntax".to_owned(),
-            Some((
-                BridgeRetentionTier::T2,
-                Some(RAW_BOUNDARY_RETENTION_WAIVER_ID.to_owned())
-            ))
-        )],
+        Vec::new(),
         "{}\n{}",
         rows(&run.dispositions, "init_or_stitch").join("\n"),
         run.held_source

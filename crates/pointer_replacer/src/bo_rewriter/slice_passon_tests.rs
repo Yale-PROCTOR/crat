@@ -329,12 +329,18 @@ const PASS_ON_TO_RETAINING: &str = r#"
 
 #[test]
 fn wave6s2_pin_pass_on_into_a_positively_retaining_callee_stays_held() {
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): `KEEP = p` is `sink`'s own
+    // store into a static, which the retained-access check of record holds (`sink::p`
+    // `held:retained-alias`; `caller::buf` follows it, `held:into-held-formal`). The
+    // tier's positive-retention row is at the site into `sink`'s formal, which says
+    // nothing of what `sink` does with its value. A label: both stay raw, as the tier's
+    // row held them.
     let (source, receipts) = emit_with_receipts(PASS_ON_TO_RETAINING);
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("mut buf: *const u8"), "{source}");
     assert!(!source.contains("as_ptr()"), "{source}");
     assert!(
-        receipts.contains("positive-retention") || receipts.contains("PositiveRetention"),
+        receipts.contains("sink::p degraded:held:retained-alias"),
         "{receipts}"
     );
 }
@@ -356,20 +362,25 @@ const CALLEE_WRITER: &str = r#"
 
 #[test]
 fn wave6s2_pin_pass_on_into_a_callee_withdrawn_in_the_same_transaction_bridges() {
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): `sink` hands `p` to the
+    // foreign `consume`, which the retained-access check of record reads as keeping it.
+    // The tier's row at that call is a bridge's block (a shared pointer at a `*mut`
+    // position without negative-write evidence), not a retention reading, and its T2
+    // waiver is at the site into `sink`'s formal. `sink::p` is held, and so is
+    // `caller::buf` (the callee it is handed to keeps it, and that formal is held): a
+    // delivery lost, the pass-on stays raw.
     let (source, receipts) = emit_with_receipts(CALLEE_WRITER);
     assert!(super::verify::type_checks_str(&source), "{source}");
-    assert!(source.contains("mut buf: &[u8]"), "{source}");
+    assert!(source.contains("mut buf: *const u8"), "{source}");
     assert!(
         source.contains("mut p: *const u8"),
         "the callee keeps its raw parameter: {source}"
     );
+    assert!(joined(&source).contains("sink(buf, n)"), "{source}");
     assert!(
-        joined(&source).contains("sink(buf.as_ptr(), n)"),
-        "{source}"
-    );
-    assert!(
-        receipts.contains("negative-write-absent"),
-        "the callee's own withdrawal is receipted: {receipts}"
+        receipts.contains("sink::p degraded:held:retained-alias")
+            && receipts.contains("caller::buf degraded:held:retained-alias"),
+        "{receipts}"
     );
 }
 

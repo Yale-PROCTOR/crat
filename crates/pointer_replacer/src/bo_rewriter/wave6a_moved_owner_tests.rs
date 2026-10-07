@@ -227,15 +227,23 @@ fn w6a_r738_a_reborrowed_optional_out_parameter_in_the_decoder_loop_compiles() {
             ("Decompress::total_out", SlotKind::Ref),
         ],
     );
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): the retained-access check
+    // of record holds `WriteRingBuffer::next_out` (an access hold through the `*mut u8`
+    // slot it writes, never exempt); the tier's `Depth2StorageShape` rows at the sites
+    // into it say only that a bridge cannot be built. Every caller's `next_out` follows
+    // it raw and each call passes it bare: the lend this witness pinned is lost on
+    // brotli's shape (the emission still compiles, nothing reverts).
     let text = compact(&source);
     assert_eq!(reverted, 0, "{source}");
     assert!(
-        text.contains("mutnext_out:Option<&mut*mutu8>,"),
-        "the caller's optional is delivered: {source}"
+        !text.contains("Option<&mut*mutu8>") && !text.contains("as_deref_mut()"),
+        "{source}"
     );
-    assert!(
-        text.contains("WriteRingBuffer(s,available_out,next_out.as_deref_mut(),"),
-        "the loop's wrapped call lends: {source}"
+    assert_eq!(
+        text.matches("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)")
+            .count(),
+        2,
+        "both calls pass the raw slot bare: {source}"
     );
 }
 
@@ -259,11 +267,18 @@ fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
             ("pump::total_out", SlotKind::Raw),
         ],
     );
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): the retained-access check
+    // of record holds `WriteRingBuffer::next_out` (an access hold through the `*mut u8`
+    // slot it writes, never exempt); the tier's `Depth2StorageShape` rows at the sites
+    // into it say only that a bridge cannot be built. Every caller's `next_out` follows
+    // it raw and each call passes it bare: the lend this witness pinned is lost on
+    // brotli's shape (the emission still compiles, nothing reverts).
     let text = compact(&source);
     assert_eq!(reverted, 0, "{source}");
     assert!(
-        text.contains("WriteRingBuffer(s,available_out,next_out.as_deref_mut(),total_out,0asi32)"),
-        "pump lends at its loop's only call: {source}"
+        text.contains("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)")
+            && !text.contains("as_deref_mut()"),
+        "pump's loop call passes the raw slot bare: {source}"
     );
     // With the control: a binding declared inside the loop is a new binding each
     // pass, and it lies inside `s` — the containment pair holds the callee's
@@ -330,9 +345,15 @@ fn w6a_r738_a_wrapped_call_lends_its_optional() {
     // held beside the written s / available_out / total_out at WriteRingBuffer;
     // the pinned `result={let__crat_a5_raw_` view of total_out is gone, both
     // stay `*mut usize` and the first call is bare.
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): the retained-access check
+    // of record holds `WriteRingBuffer::next_out` (an access hold through the `*mut u8`
+    // slot it writes, never exempt); the tier's `Depth2StorageShape` rows at the sites
+    // into it say only that a bridge cannot be built. Every caller's `next_out` follows
+    // it raw and each call passes it bare: the lend this witness pinned is lost on
+    // brotli's shape (the emission still compiles, nothing reverts).
     assert!(
         text.contains(
-            "fntwice(muts:*mutState,mutavailable_out:*mutusize,mutnext_out:Option<&mut*mutu8>,muttotal_out:*mutusize)"
+            "fntwice(muts:*mutState,mutavailable_out:*mutusize,mutnext_out:*mut*mutu8,muttotal_out:*mutusize,)"
         ),
         "{source}"
     );
@@ -341,16 +362,9 @@ fn w6a_r738_a_wrapped_call_lends_its_optional() {
         "no sibling raw view wraps the first call: {source}"
     );
     assert!(
-        text.contains(
-            "result=WriteRingBuffer(s,available_out,next_out.as_deref_mut(),total_out,0asi32);"
-        ),
-        "the first call lends: {source}"
-    );
-    // The final call keeps its transfer (wave-6r's rule, unchanged).
-    assert_eq!(
-        text.matches("next_out.as_deref_mut()").count(),
-        1,
-        "{source}"
+        text.contains("result=WriteRingBuffer(s,available_out,next_out,total_out,0asi32);")
+            && !text.contains("as_deref_mut()"),
+        "the first call passes the raw slot bare: {source}"
     );
 }
 

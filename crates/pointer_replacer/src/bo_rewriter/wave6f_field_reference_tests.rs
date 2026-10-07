@@ -238,9 +238,13 @@ fn w6f_ht_store_and_load_deliver_through_the_field() {
 
     let (source, emitted_count, reverted_count) = emitted_source(ht_emitted());
     assert_eq!(reverted_count, 0);
+    // Restated (relay 305; era-5c 158 / 158a, main 196): the retained-access check of
+    // record reads every field as a raw retaining place unless a transaction delivers it,
+    // and holds `ht_next::it` by an access through `ht.entries` (never exempt): a
+    // delivery lost. The field's own transaction (`hti._table`) stands.
     assert_eq!(
-        emitted_count, 4,
-        "ht_length, ht_iterator::table, ht_next::it, ht_next::table"
+        emitted_count, 3,
+        "ht_length, ht_iterator::table, ht_next::table"
     );
     for needle in [
         "pub struct hti<'a> {",
@@ -251,7 +255,7 @@ fn w6f_ht_store_and_load_deliver_through_the_field() {
         "pub unsafe extern \"C\" fn ht_iterator<'a>(mut table: &'a ht) -> hti<'a> {",
         "_table: None,",
         "it._table = Some(table);",
-        "pub unsafe extern \"C\" fn ht_next(mut it: &mut hti) -> bool {",
+        "pub unsafe extern \"C\" fn ht_next(mut it: *mut hti) -> bool {",
         "let mut table: &crate::ht = (*it)._table.unwrap();",
     ] {
         assert!(source.contains(needle), "missing {needle:?} in\n{source}");

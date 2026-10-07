@@ -173,16 +173,19 @@ unsafe fn peek(value: *const Binn) -> i32 {{
             "a shared optional must not be bridged to a writable void view: {:?}",
             table.option_receipts
         );
-        // The hold is the void cell's own negative-write guard, not a later
-        // gate: its typed reason names the absent evidence.
+        // Restated under R878-1 (B) (relay 304; main 196): the retained-access check of
+        // record reads the foreign `scribble` as keeping `value`, and the tier's row at
+        // that call is `SharedToMut` (a bridge's block, no retention reading), so the
+        // check holds `peek::value` before the Option family plans: a label (it was
+        // raw at 3759c6ffc too, `OptUseUnsupported`), with no `&T -> &mut T` cast either
+        // way.
         assert!(
-            table.option_receipts.iter().any(|receipt| {
-                receipt.operation == "call-raw"
-                    && format!("{:?}", receipt.obligation.intended_terminal_reason)
-                        .contains("raw-boundary-shared-to-mut:negative-write-absent")
+            table.entries.iter().any(|(subject, decision)| {
+                subject.label == "peek::value"
+                    && matches!(decision, super::decision::Decision::Degraded(record)
+                        if matches!(record.reason, super::decision::DegradeReason::RetainedAlias { .. }))
             }),
-            "the void cell must hold on absent negative-write evidence: {:?}",
-            table.option_receipts
+            "the retained-access check holds the shared optional at the void cell"
         );
     })
     .expect("refusal compiler context");

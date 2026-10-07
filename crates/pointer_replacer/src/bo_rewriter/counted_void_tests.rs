@@ -1913,24 +1913,20 @@ unsafe fn json_parse_ex(mut src: *const core::ffi::c_void, mut src_size: size_t,
 
 #[test]
 fn w6v_counted_store_picks_the_following_sibling_by_position() {
+    // Restated under R878-1 (A) (relay 304; main 194a / 196): `state.src = src as *const
+    // i8` stores the parameter into `parse_state.src`, a field no transaction delivers,
+    // so the retained-access check of record holds `src` before the counted family reads
+    // its sibling (a delivery lost: it was `Option<&[u8]>` with the following sibling as
+    // its count). The pick itself is the family's other witnesses' (the delivering store
+    // above, the non-integer control below).
     let rows = super::emit_tests::decisions_of(JSON_REAL);
     assert!(
         rows.iter()
-            .any(|(n, p, r)| n == "src" && *p && r == "<emitted>"),
-        "the positional clause gives the ambiguous shape its count: {rows:?}"
+            .any(|(n, p, r)| n == "src" && *p && r == "held:retained-alias"),
+        "the retained-access check holds the stored parameter: {rows:?}"
     );
     let source = super::emit_tests::ast_emitted_source_of(JSON_REAL).unwrap();
     let c = compact(&source);
-    assert!(
-        c.contains("fnjson_parse_ex(mutsrc:Option<&[u8]>,mutsrc_size:size_t,"),
-        "the view takes the sibling that follows the pointer: {source}"
-    );
-    assert!(
-        c.contains(
-            "state.src=src.map_or(0as*consti8,|__crat_cv_src|__crat_cv_src.as_ptr()as*consti8);"
-        ),
-        "the store keeps its raw form: {source}"
-    );
     assert!(
         c.contains("state.flags_bitset=flags_bitset;"),
         "the other stored parameter is untouched: {source}"

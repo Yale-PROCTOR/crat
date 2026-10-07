@@ -214,13 +214,17 @@ fn w5c_mixed_boundary_output_state_delivers() {
     let table = census_world_decisions(&input);
     // R829-1 (relay 297, main 188): CopyUncompressedBlockToOutput::s is held beside
     // `dest` (arg0) at BrotliCopyBytes; `Ref { mutable: true }` → the hold.
+    // Restated (relay 305; era-5c 158 / 158a, main 196): the retained-access check of
+    // record now reads every field as a raw retaining place unless a transaction
+    // delivers it, and names `s`'s self-reference through `ringbuffer` (E2, never
+    // exempt); its hold runs first. A label: `s` stays raw either way.
     assert!(
         matches!(
             decision(&table, "CopyUncompressedBlockToOutput::s"),
             super::Decision::Degraded(super::Degradation {
-                reason: super::DegradeReason::PairNotShownDisjoint { detail },
+                reason: super::DegradeReason::RetainedAlias { detail },
                 ..
-            }) if detail.contains(":BrotliCopyBytes:1:") && detail.ends_with(";risky-siblings=arg0")
+            }) if detail.starts_with("evident:self-reference:BrotliDecoderStateInternal.ringbuffer")
         ),
         "{:?}",
         decision(&table, "CopyUncompressedBlockToOutput::s")
