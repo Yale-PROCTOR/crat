@@ -188,3 +188,50 @@ fn r864_3_round2_a_waived_site_does_not_exempt_an_own_store() {
         "{d:#?}"
     );
 }
+
+/// The stand-in review's round 3, R3-1: the tier's reading at one of the subject's
+/// calls (`note`, T2 with a bridge) is no reading of a callee store at another call that
+/// has no tier site (`keep` takes the subject inside an aggregate). `H.f` keeps the
+/// pointer and `run` writes through `o` before reading through it.
+const CALLEE_STORE_UNSITED: &str = r#"
+#[repr(C)] pub struct S { pub x: i32 }
+#[repr(C)] #[derive(Copy, Clone)] pub struct Pair { pub a: *mut S, pub n: i32 }
+#[repr(C)] pub struct H { pub f: *mut S }
+static mut LAST: *mut S = 0 as *mut S;
+unsafe fn note(p: *mut S) { LAST = p; }
+unsafe fn keep(p: Pair, h: *mut H) { (*h).f = p.a; }
+pub unsafe fn f(s: *mut S, h: *mut H) { note(s); keep(Pair { a: s, n: 0 }, h); }
+pub unsafe fn run(o: *mut S, h: *mut H) { f(o, h); (*o).x = 2; let _y = (*(*h).f).x; }
+"#;
+
+#[test]
+fn r864_3_round3_a_reading_at_one_call_is_none_at_an_unsited_one() {
+    let d = decisions(&format!("{ALLOW}{CALLEE_STORE_UNSITED}"));
+    assert!(
+        !d["f::s"].starts_with("Ref") && !d["f::s"].starts_with("InferredRef"),
+        "{d:#?}"
+    );
+}
+
+/// The review's round 3, R3-2: a protected formal released on its callee's receipt. `g`
+/// hands `p` to `keep` (stored into a static, the tier-2 waiver at `g`'s site), and `f`
+/// then frees what the static holds while its own `s` would be a protected `&mut S`.
+const RELEASED_THEN_FREED: &str = r#"
+extern "C" { fn free(p: *mut core::ffi::c_void); }
+#[repr(C)] pub struct S { pub x: i32 }
+static mut LIST: [*mut S; 8] = [0 as *mut S; 8];
+static mut N: usize = 0;
+unsafe fn keep(q: *mut S) { LIST[N] = q; N += 1; }
+unsafe fn g(p: *mut S) { (*p).x += 1; keep(p); }
+unsafe fn free_all() { while N > 0 { N -= 1; free(LIST[N] as *mut core::ffi::c_void); } }
+pub unsafe fn f(s: *mut S) { g(s); free_all(); }
+"#;
+
+#[test]
+fn r864_3_round3_a_formal_is_not_released_on_its_callees_receipt() {
+    let d = decisions(&format!("{ALLOW}{RELEASED_THEN_FREED}"));
+    assert!(
+        !d["f::s"].starts_with("Ref") && !d["f::s"].starts_with("InferredRef"),
+        "{d:#?}"
+    );
+}
