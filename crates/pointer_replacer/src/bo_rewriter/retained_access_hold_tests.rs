@@ -316,3 +316,28 @@ fn r864_3_round4_a_retention_waiver_does_not_cover_a_later_use() {
         "{d:#?}"
     );
 }
+
+/// The stand-in review's round 5, R5-1 (filter 2's scope: the seat's, main 198a): the
+/// check's family carries a program call's integer result whose return derives from the
+/// argument (`addr`), so `x as *mut S` reaches `keep2`'s argument 1, which keeps it in
+/// `H.f`; the host's carriers stop at the integer call result, so the per-(call, argument)
+/// coverage reads only `keep2`'s argument 0 (a c-aliasing T2) and exempts the unsited
+/// callee store. Constructed by the review; on this fixture `f::s` is held at bdb28f335
+/// (pinned, not red), so the shape stays the seat's question (MAX-3 on filter 2's scope).
+const INTEGER_ROUND_TRIP_KEPT: &str = r#"
+#[repr(C)] pub struct S { pub x: i32 }
+#[repr(C)] pub struct H { pub f: *mut S }
+unsafe fn addr(p: *mut S) -> usize { p as usize }
+unsafe fn keep2(p: *mut S, q: *mut S, h: *mut H) { let _a = p as usize; (*h).f = q; }
+pub unsafe fn f(s: *mut S, h: *mut H) { let x = addr(s); keep2(s, x as *mut S, h); }
+pub unsafe fn run(o: *mut S, h: *mut H) { f(o, h); (*o).x = 2; let _y = (*(*h).f).x; }
+"#;
+
+#[test]
+fn r864_3_round5_an_integer_round_trip_to_a_keeper_is_not_covered() {
+    let d = decisions(&format!("{ALLOW}{INTEGER_ROUND_TRIP_KEPT}"));
+    assert!(
+        !d["f::s"].starts_with("Ref") && !d["f::s"].starts_with("InferredRef"),
+        "{d:#?}"
+    );
+}
