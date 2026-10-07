@@ -26,7 +26,9 @@ pub(crate) fn is_settled_hold(decision: &Decision) -> bool {
         Decision::Degraded(record) => match record.reason {
             DegradeReason::PairNotShownDisjoint { .. }
             | DegradeReason::ReleasedThroughIndirectCall { .. }
-            | DegradeReason::IntoHeldFormal { .. } => true,
+            | DegradeReason::IntoHeldFormal { .. }
+            // R864-3: the retained-access hold (the stand-in review's MED-3).
+            | DegradeReason::RetainedAlias { .. } => true,
             _ => false,
         },
         Decision::Ref { .. }
