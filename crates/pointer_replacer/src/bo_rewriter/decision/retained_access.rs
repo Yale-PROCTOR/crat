@@ -5232,12 +5232,10 @@ impl Verdict {
         })
     }
 
-    /// **R878-1 (era-5c 158): the guard of 132 §2 on the applied field transactions.** An
-    /// access through a crate struct's field the rewriter delivers (an applied field transaction:
-    /// a borrow-checked reference or an owning move) is not a retained raw access, so its hold
-    /// goes; every other hold stays. `delivered(struct, field)` is the host's reading of its
-    /// settled table (main's joint fixpoint). Nothing left is `Clear`.
-    pub(crate) fn after_deliveries(&self, delivered: &dyn Fn(u32, usize) -> bool) -> Verdict {
+    /// R878-1: the holds through a field `delivered` names removed (an access through a
+    /// delivered field is not a retained raw access); nothing left is `Clear`. The host calls
+    /// `RetainedAccessCheck::after_deliveries`, which knows the mode the verdict was made in.
+    fn without_delivered(&self, delivered: &dyn Fn(u32, usize) -> bool) -> Verdict {
         let Verdict::Held(holds) = self else { return self.clone() };
         let kept: Vec<Hold> = holds
             .iter()
@@ -5303,6 +5301,8 @@ pub(crate) struct RetainedAccessCheck {
     /// (it changes with the premise taken away): `retained-access-withdrawn` (held only
     /// with it) or `retained-access-cleared` (clear only with it).
     exposed_premised: FxHashMap<(LocalDefId, Local), &'static str>,
+    /// The mode the verdicts were computed in (`Options::evident`): `after_deliveries` reads it.
+    evident: bool,
 }
 
 impl RetainedAccessCheck {
@@ -6005,6 +6005,26 @@ impl RetainedAccessCheck {
             container_of,
             premised,
             exposed_premised: FxHashMap::default(),
+            evident: options.evident,
+        }
+    }
+
+    /// **R878-1 (era-5c 158): the guard of 132 §2 on the applied field transactions, for the
+    /// host** (main's joint fixpoint, with `delivered(struct, field)` = an applied field
+    /// transaction on that field). The holds through a delivered field go; every other hold
+    /// stays. In evident mode (the mode of record) unknowns never hold, so a verdict left with
+    /// no hold is `Clear`. Outside it, `finish` keeps no record of an unknown access beside a
+    /// hold, so such a verdict stays fail-closed: `Unknown` (the review of 158a).
+    pub(crate) fn after_deliveries(
+        &self,
+        verdict: &Verdict,
+        delivered: &dyn Fn(u32, usize) -> bool,
+    ) -> Verdict {
+        match verdict.without_delivered(delivered) {
+            Verdict::Clear if !self.evident && matches!(verdict, Verdict::Held(_)) => {
+                Verdict::Unknown
+            }
+            filtered => filtered,
         }
     }
 

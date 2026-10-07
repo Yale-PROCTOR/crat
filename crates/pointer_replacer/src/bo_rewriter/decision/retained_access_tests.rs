@@ -2484,44 +2484,72 @@ fn e5c_r878_the_production_check_holds_append_whatever_the_model_decides_the_fie
     .expect("compiles");
 }
 
+/// `W2_RUN`'s check in `options`, and `append::v`'s verdict.
+fn w2_append(options: Options, body: impl FnOnce(&RetainedAccessCheck, &Verdict) + Send) {
+    ::utils::compilation::run_compiler_on_str(W2_RUN, |tcx| {
+        let program = program_of(tcx);
+        let check = RetainedAccessCheck::compute_options(&program, &|_, _| true, options);
+        let append = *program
+            .functions
+            .iter()
+            .find(|did| tcx.item_name(did.to_def_id()).as_str() == "append")
+            .expect("append");
+        body(&check, check.formal(append, 1).expect("append::v"));
+    })
+    .expect("compiles");
+}
+
 /// R878-1: the guard of 132 §2 on the applied field transactions. `append::v` holds through
 /// `small_vec.p`; a host whose transactions do not deliver the field keeps every hold, and one
 /// that delivers it drops the holds through it (the fault: the guard applied to every field).
 #[test]
 fn e5c_r878_the_guard_reads_the_applied_field_transactions() {
-    let v = of_record(W2_RUN);
-    let append = of(&v, "append::v");
-    let Verdict::Held(holds) = append else { panic!("{append:#?}") };
-    assert_eq!(
-        append.after_deliveries(&|_, _| false),
-        *append,
-        "nothing delivered"
-    );
-    let p = holds
-        .iter()
-        .find_map(|hold| hold.via)
-        .unwrap_or_else(|| panic!("a hold through a field: {holds:#?}"));
-    assert_eq!(p.1, 0, "small_vec.p");
-    match append.after_deliveries(&|s, f| (s, f) == p) {
-        Verdict::Clear => {}
-        Verdict::Held(kept) => assert!(kept.iter().all(|hold| hold.via != Some(p)), "{kept:#?}"),
-        Verdict::Unknown => panic!("unknown"),
-    }
-    let unfielded: Vec<_> = holds
-        .iter()
-        .filter(|hold| hold.via.is_none())
-        .cloned()
-        .collect();
-    let expected = if unfielded.is_empty() {
-        Verdict::Clear
-    } else {
-        Verdict::Held(unfielded)
-    };
-    assert_eq!(
-        append.after_deliveries(&|_, _| true),
-        expected,
-        "every field delivered"
-    );
+    w2_append(Options::of_record(), |check, append| {
+        let Verdict::Held(holds) = append else { panic!("{append:#?}") };
+        assert_eq!(
+            check.after_deliveries(append, &|_, _| false),
+            *append,
+            "nothing delivered"
+        );
+        let p = holds
+            .iter()
+            .find_map(|hold| hold.via)
+            .unwrap_or_else(|| panic!("a hold through a field: {holds:#?}"));
+        assert_eq!(p.1, 0, "small_vec.p");
+        match check.after_deliveries(append, &|s, f| (s, f) == p) {
+            Verdict::Clear => {}
+            Verdict::Held(kept) => {
+                assert!(kept.iter().all(|hold| hold.via != Some(p)), "{kept:#?}")
+            }
+            Verdict::Unknown => panic!("unknown in evident mode"),
+        }
+        let unfielded: Vec<_> = holds
+            .iter()
+            .filter(|hold| hold.via.is_none())
+            .cloned()
+            .collect();
+        let expected = if unfielded.is_empty() {
+            Verdict::Clear
+        } else {
+            Verdict::Held(unfielded)
+        };
+        assert_eq!(
+            check.after_deliveries(append, &|_, _| true),
+            expected,
+            "every field delivered"
+        );
+    });
+}
+
+/// R878-1, the review (era-5c 158a, Codex): outside evident mode `finish` keeps no record of
+/// an unknown access beside a hold, so removing the delivered holds must not answer `Clear`
+/// there: the verdict stays fail-closed (`Unknown`).
+#[test]
+fn e5c_r878_outside_evident_mode_the_filter_never_clears() {
+    w2_append(Options::default(), |check, append| {
+        assert!(matches!(append, Verdict::Held(_)), "{append:#?}");
+        assert_ne!(check.after_deliveries(append, &|_, _| true), Verdict::Clear);
+    });
 }
 
 /// R833-2, (b) stated: each call from outside is taken on its own. A shape that one entry
