@@ -5376,12 +5376,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // the two cast shapes read the OPERAND's snippet while every
                 // other shape reads the argument's own.
                 let (found, text, blind, borrows, literal_null) = match arg.shape {
+                    // wave-5d 145c: a local that stays raw is reborrowed
+                    // through a raw base (`&mut *p`), which borrowck does not
+                    // see, so it is blind exactly as a through-a-raw-deref
+                    // borrow is (§5a): `q = p; f(p, q)` must ask the proof.
                     ArgShape::BareLocal(hir) => (
                         decision_of
                             .get(&(site.caller, hir))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(arg.span).ok(),
-                        false,
+                        !decision_of
+                            .get(&(site.caller, hir))
+                            .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
                         true,
                         false,
                     ),
@@ -5430,7 +5436,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                             .get(&(site.caller, binding))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(inner).ok(),
-                        false,
+                        !decision_of
+                            .get(&(site.caller, binding))
+                            .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
                         true,
                         false,
                     ),

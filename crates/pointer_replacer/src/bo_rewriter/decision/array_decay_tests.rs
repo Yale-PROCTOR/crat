@@ -117,3 +117,11 @@ fn r864_1_b_a_copy_with_another_definition_is_not_the_array() {
         NOT_TAKEN
     );
 }
+
+/// The second review's MED-1: integer arithmetic on a decay's address can
+/// name any object, so it is not read as `x`; the decay beside it still
+/// refuses the classifier's proof.
+#[test]
+fn r864_1_b_integer_arithmetic_on_a_decay_is_not_the_array() {
+    assert_eq!(read("integer_arithmetic_on_a_decay", CLASSIFIER), NOT_TAKEN);
+}

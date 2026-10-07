@@ -1060,6 +1060,11 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                             through_deref: true,
                             ..
                         } => !converts.contains(&(b.owner.def_id, b)),
+                        // wave-5d 145c: a local that stays raw is reborrowed
+                        // through a raw base (`&mut *p`), outside borrowck.
+                        ArgShape::BareLocal(b) | ArgShape::CastOfLocal { binding: b, .. } => {
+                            !converts.contains(&(b.owner.def_id, b))
+                        }
                         _ => false,
                     };
                     Some(PairPosition {

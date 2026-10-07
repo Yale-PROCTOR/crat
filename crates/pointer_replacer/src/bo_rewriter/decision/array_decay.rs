@@ -14,8 +14,9 @@
 //!
 //! A decay is read through pointer arithmetic on it (`x.as_mut_ptr().offset(1)`
 //! stays inside `x`) and through a local whose every definition is a decay of
-//! one array or arithmetic on the local itself (wave-5d 145a: C's
-//! `add(&x[1], &x[1])` and `p = x; q = x; add(p, q)`).
+//! one array, a copy of such a local, or arithmetic on the local itself
+//! (wave-5d 145a / 145c: C's `add(&x[1], &x[1])`, `p = x; q = x; add(p, q)`
+//! and `p = x; q = p; …`).
 
 use rustc_hir::{
     Expr, ExprKind, HirId, QPath,
@@ -55,8 +56,10 @@ fn is_arithmetic(name: &str) -> bool {
     )
 }
 
-/// `expr` under casts, one `&*` / `&mut *`, and pointer arithmetic.
-fn strip<'a>(expr: &'a Expr<'a>) -> &'a Expr<'a> {
+/// `expr` under casts, one `&*` / `&mut *`, and pointer arithmetic (on a raw
+/// pointer receiver only: `(p as usize).wrapping_add(d) as *mut T` can name
+/// any object).
+fn strip<'a>(typeck: &rustc_middle::ty::TypeckResults<'_>, expr: &'a Expr<'a>) -> &'a Expr<'a> {
     let mut expr = peel_casts(expr);
     if let ExprKind::AddrOf(_, _, inner) = expr.kind
         && let ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = inner.kind
@@ -65,6 +68,7 @@ fn strip<'a>(expr: &'a Expr<'a>) -> &'a Expr<'a> {
     }
     while let ExprKind::MethodCall(segment, receiver, _, _) = expr.kind
         && is_arithmetic(segment.ident.name.as_str())
+        && typeck.expr_ty(receiver).is_raw_ptr()
     {
         expr = peel_casts(receiver);
     }
@@ -72,18 +76,29 @@ fn strip<'a>(expr: &'a Expr<'a>) -> &'a Expr<'a> {
 }
 
 pub(crate) fn decay_root(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<DecayRoot> {
-    let expr = strip(expr);
+    let expr = strip(tcx.typeck(owner), expr);
     if let ExprKind::Path(QPath::Resolved(None, path)) = expr.kind
         && let Res::Local(binding) = path.res
     {
-        return copied_decay(tcx, owner, binding);
+        return copied_decay(tcx, owner, binding, &mut Vec::new());
     }
     direct_decay(tcx, owner, expr)
 }
 
 /// A local whose initializer and every assignment are decays of one array (or
 /// arithmetic on the local itself), and whose address is never taken.
-fn copied_decay(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> Option<DecayRoot> {
+/// A copy of another such local (`q = p`) is read through it (wave-5d 145c); a
+/// cycle reads as nothing.
+fn copied_decay(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    binding: HirId,
+    seen: &mut Vec<HirId>,
+) -> Option<DecayRoot> {
+    if seen.contains(&binding) {
+        return None;
+    }
+    seen.push(binding);
     use rustc_hir::intravisit::{self, Visitor};
     struct Definitions<'tcx> {
         binding: HirId,
@@ -132,11 +147,17 @@ fn copied_decay(tcx: TyCtxt<'_>, owner: LocalDefId, binding: HirId) -> Option<De
     }
     let mut root = None;
     for value in definitions.values {
-        let value = strip(value);
+        let value = strip(tcx.typeck(owner), value);
         if is_binding(value, binding) {
             continue;
         }
-        let this = direct_decay(tcx, owner, value)?;
+        let this = match value.kind {
+            ExprKind::Path(QPath::Resolved(None, path)) => match path.res {
+                Res::Local(other) => copied_decay(tcx, owner, other, seen)?,
+                _ => return None,
+            },
+            _ => direct_decay(tcx, owner, value)?,
+        };
         match root {
             None => root = Some(this),
             Some(seen) if seen == this && seen != DecayRoot::Other => {}
