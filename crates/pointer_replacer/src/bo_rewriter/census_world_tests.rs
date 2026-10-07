@@ -553,3 +553,28 @@ fn r866_1_the_substrate_spelling_is_f2s_proven_overlap() {
         "({signature})"
     );
 }
+
+/// R864-1 (b) beyond the top of an argument (wave-5d 145a, the review's HIGH
+/// 2): an offset of a decay, a local copied from one, and a reborrow of an
+/// offset decay are views of the same array. Each callee writes `a` and reads
+/// `b` at one element, so neither may be a reference.
+#[test]
+fn r864_1_b_offset_and_copied_decays_of_one_array_are_not_delivered() {
+    let input = include_str!("testdata/r864_offset_decays.rs");
+    let source = match super::rewrite_m1_census_world(input) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("the census world emits: {other:#?}"),
+    };
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for callee in ["add1", "add2", "add4"] {
+        assert!(
+            flat.contains(&format!("fn {callee}(mut a: *mut i32, mut b: *mut i32)")),
+            "{callee}:\n{source}"
+        );
+    }
+    // Control: offsets of two distinct local arrays keep the classifier's proof.
+    assert!(
+        flat.contains("fn add5(mut a: &mut i32, mut b: &i32)"),
+        "add5:\n{source}"
+    );
+}

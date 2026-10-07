@@ -85,3 +85,35 @@ fn r864_1_b_control_decays_of_two_distinct_local_arrays_keep_the_proof() {
 fn r864_1_b_control_decays_of_two_distinct_static_arrays_keep_the_proof() {
     assert_eq!(read("distinct_statics", CLASSIFIER), PROVEN);
 }
+
+/// wave-5d 145a (the review's HIGH 2): C `add(&x[1], &x[1])`.
+#[test]
+fn r864_1_b_offsets_of_one_array_are_not_disjoint() {
+    assert_eq!(read("offsets_of_one_local", CLASSIFIER), SAME);
+}
+
+/// A local whose every definition is a decay of `x`, or arithmetic on itself.
+#[test]
+fn r864_1_b_locals_copied_from_one_array_are_not_disjoint() {
+    assert_eq!(read("copies_of_one_local", CLASSIFIER), SAME);
+}
+
+#[test]
+fn r864_1_b_reborrowed_offsets_of_one_array_are_not_disjoint() {
+    assert_eq!(read("reborrowed_offsets_of_one_local", CLASSIFIER), SAME);
+}
+
+#[test]
+fn r864_1_b_control_offsets_of_two_distinct_arrays_keep_the_proof() {
+    assert_eq!(read("offsets_of_two_locals", CLASSIFIER), PROVEN);
+}
+
+/// A copy with another definition is not read as the array; the decay beside
+/// it still refuses the classifier's proof.
+#[test]
+fn r864_1_b_a_copy_with_another_definition_is_not_the_array() {
+    assert_eq!(
+        read("a_copy_also_assigned_elsewhere", CLASSIFIER),
+        NOT_TAKEN
+    );
+}

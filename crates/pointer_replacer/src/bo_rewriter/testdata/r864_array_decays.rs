@@ -32,3 +32,29 @@ pub unsafe fn decay_beside_a_pointer(mut p: *mut i32) {
 pub unsafe fn decays_through_references(mut r: &mut [i32; 4], mut s: &mut [i32; 4]) {
     add(r.as_mut_ptr(), s.as_mut_ptr());
 }
+pub unsafe fn offsets_of_one_local() {
+    let mut x: [i32; 4] = [0; 4];
+    add(x.as_mut_ptr().offset(1), x.as_mut_ptr().offset(1));
+}
+pub unsafe fn copies_of_one_local() {
+    let mut x: [i32; 4] = [0; 4];
+    let mut p = x.as_mut_ptr();
+    let mut q = x.as_mut_ptr().offset(2);
+    p = p.offset(1);
+    add(p, q);
+}
+pub unsafe fn reborrowed_offsets_of_one_local() {
+    let mut x: [i32; 4] = [0; 4];
+    add(&mut *x.as_mut_ptr().offset(1), &mut *x.as_mut_ptr().offset(1));
+}
+pub unsafe fn offsets_of_two_locals() {
+    let mut x: [i32; 4] = [0; 4];
+    let mut y: [i32; 4] = [0; 4];
+    add(x.as_mut_ptr().offset(1), y.as_mut_ptr().offset(1));
+}
+pub unsafe fn a_copy_also_assigned_elsewhere(mut r: *mut i32) {
+    let mut x: [i32; 4] = [0; 4];
+    let mut p = x.as_mut_ptr();
+    p = r;
+    add(p, x.as_mut_ptr());
+}
