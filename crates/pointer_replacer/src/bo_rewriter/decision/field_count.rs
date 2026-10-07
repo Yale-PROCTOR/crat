@@ -173,6 +173,23 @@ impl<'tcx> Scan<'_, 'tcx> {
         }
     }
 
+    /// Round 2 (review 1): a pointer to a WHOLE object of the struct — the
+    /// object itself (`t`, `&*t`, `&s`), never a field's address.
+    fn whole_object(&self, arg: &'tcx Expr<'tcx>) -> bool {
+        let e = peel(arg);
+        if let ExprKind::AddrOf(_, _, inner) = e.kind {
+            return !matches!(peel(inner).kind, ExprKind::Field(..))
+                && struct_of(self.cx.tcx.typeck(self.cx.owner).expr_ty(inner))
+                    .is_some_and(|d| d.did() == self.adt);
+        }
+        match self.cx.tcx.typeck(self.cx.owner).expr_ty(e).kind() {
+            TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => {
+                struct_of(*t).is_some_and(|d| d.did() == self.adt)
+            }
+            _ => false,
+        }
+    }
+
     /// Relay 107 (review 4b): a callee with no local body may write through a
     /// pointer to the object. Only an exact whole-struct `memcpy` / `memmove`
     /// between two such objects, or a `memset` of the whole struct to zero,
@@ -205,10 +222,14 @@ impl<'tcx> Scan<'_, 'tcx> {
                     .is_some_and(|d| d.did() == self.adt)
         };
         let copy = matches!(name.as_str(), "memcpy" | "memmove")
-            && matches!(args, [d, s, n] if self.points_into(d) && self.points_into(s) && whole(n));
+            && matches!(args, [d, s, n] if self.whole_object(d) && self.whole_object(s) && whole(n));
+        // Round 2 (review 2): zero is a literal (through casts), not a text prefix.
+        let literal_zero = |v: &Expr<'_>| {
+            matches!(peel(v).kind, ExprKind::Lit(lit)
+                if matches!(lit.node, rustc_ast::LitKind::Int(value, _) if value.get() == 0))
+        };
         let zero = name == "memset"
-            && matches!(args, [d, v, n] if self.points_into(d) && whole(n)
-                && self.cx.text(v).is_some_and(|t| t == "0" || t.starts_with("0 as ")));
+            && matches!(args, [d, v, n] if self.whole_object(d) && whole(n) && literal_zero(v));
         if !copy && !zero {
             self.out.all_poisoned = true;
         }
@@ -414,6 +435,13 @@ fn offset_witness<'tcx>(
                 ExprKind::If(..) | ExprKind::Match(..) | ExprKind::Loop(..) | ExprKind::Closure(..)
             ) {
                 return;
+            }
+            // Round 2 (review 3): the right operand of `&&` / `||` runs only
+            // on one outcome of the left.
+            if let ExprKind::Binary(op, l, _) = e.kind
+                && matches!(op.node, BinOpKind::And | BinOpKind::Or)
+            {
+                return self.visit_expr(l);
             }
             if let ExprKind::MethodCall(seg, recv, [arg], _) = e.kind
                 && matches!(seg.ident.name.as_str(), "offset" | "add")
