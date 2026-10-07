@@ -332,3 +332,16 @@ fn r107_r2c_a_short_circuit_witness_is_conditional() {
     );
     assert_eq!(proven(&src, "Ann", "weight"), None);
 }
+
+/// Round 3 (Codex, 10-07): a pointer to POINTERS to the struct is not a whole
+/// object; a struct-sized copy out of an array of struct pointers installs any
+/// `p` and `n`.
+#[test]
+fn r107_r3a_a_pointer_array_is_not_a_whole_object() {
+    let src = format!(
+        "{PAIR}pub unsafe fn smash(dst: *mut S, one: *mut S) {{\n\
+        let slots = [one, 8usize as *mut S];\n\
+        memcpy(dst as *mut core::ffi::c_void, slots.as_ptr() as *const core::ffi::c_void, core::mem::size_of::<S>()); }}\n"
+    );
+    assert_eq!(proven(&src, "S", "p"), None);
+}
