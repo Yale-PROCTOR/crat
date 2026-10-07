@@ -1050,7 +1050,7 @@ const CONTAINED_FIELD: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n
 
 #[test]
 fn r864_1_round2_containment_through_an_outer_field_is_held() {
-    let out = outcome(CONTAINED_FIELD);
+    let out = census_outcome(CONTAINED_FIELD);
     assert!(
         detail_of(&out, "read_bits::b").is_some_and(|d| d.contains("ref-beside-")
             && d.contains("read_bits#2:peer#1")
@@ -1065,7 +1065,7 @@ fn r864_1_round2_containment_through_an_outer_field_is_held() {
         "read_bits(&mut (*s).other, br)",
     );
     assert!(distinct.contains("read_bits(&mut (*s).other, br)"));
-    let out = outcome(&distinct);
+    let out = census_outcome(&distinct);
     assert_eq!(reason_of(&out, "read_bits::b"), None, "{:?}", out.reasons);
 }
 
