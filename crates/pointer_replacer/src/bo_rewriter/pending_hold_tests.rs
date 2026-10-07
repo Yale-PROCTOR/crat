@@ -821,3 +821,108 @@ fn r861_1_n1_each_mir_arm_holds_the_flowing_binding() {
         );
     }
 }
+
+/// **R864-1 (a) (relay 299; fan-out 081 class 1) — a delivered reference
+/// formal beside a raw formal at an in-program call.** libzahl's
+/// `zsqr(x.as_mut_ptr(), x.as_mut_ptr())`: `zsqr::a` is model-Raw (here an
+/// integer round trip, libzahl's `libzahl_realloc`), `zsqr::b` is read only, and
+/// the frame delivered `b: &Z` beside the raw `a`, then wrote through `a` while
+/// the protected `b` was live. The pair pass drops the pair (one formal does not
+/// convert), so nothing held it: `b` is held, `ref-beside-raw`, same subject.
+const ZSQR_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[derive(Clone, Copy)]\n\
+    #[repr(C)]\n\
+    pub struct Z { sign: i32, used: usize }\n\
+    pub unsafe fn zsqr(mut a: *mut Z, b: *mut Z) {\n\
+        a = a as usize as *mut Z;\n\
+        let s = (*b).used;\n\
+        (*a).used = s + 1;\n\
+        (*a).sign = 1;\n\
+    }\n\
+    pub unsafe fn entry() -> usize {\n\
+        let mut x: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
+        zsqr(x.as_mut_ptr(), x.as_mut_ptr());\n\
+        x[0].used\n\
+    }\n";
+
+#[test]
+fn r864_1_a_a_reference_formal_beside_a_raw_formal_on_one_object_is_held() {
+    let out = outcome(ZSQR_ALIASED);
+    assert_eq!(
+        reason_of(&out, "zsqr::b"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        detail_of(&out, "zsqr::b")
+            .is_some_and(|d| d.contains("ref-beside-raw") && d.contains("same-subject")),
+        "{:?}",
+        out.details
+    );
+    let zsqr = signature(&out.source, "zsqr");
+    assert!(zsqr.contains("b: *mut Z"), "held raw: {zsqr}");
+}
+
+/// R864-1 (b) (class 2): the reference formal first and the raw one second,
+/// both `x.as_mut_ptr()` (libzahl `zmul`'s `zadd(&mut *b_low.as_mut_ptr(),
+/// b_low.as_mut_ptr(), …)`): one subject, never disjoint.
+const ZADD_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[derive(Clone, Copy)]\n\
+    #[repr(C)]\n\
+    pub struct Z { sign: i32, used: usize }\n\
+    pub unsafe fn zadd(a: *mut Z, mut b: *mut Z, c: *mut Z) {\n\
+        b = b as usize as *mut Z;\n\
+        (*a).used = (*c).used;\n\
+        let t = (*b).sign;\n\
+        (*a).sign = t;\n\
+    }\n\
+    pub unsafe fn entry() -> usize {\n\
+        let mut x: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
+        let mut y: [Z; 1] = [Z { sign: 1, used: 7 }; 1];\n\
+        zadd(x.as_mut_ptr(), x.as_mut_ptr(), y.as_mut_ptr());\n\
+        x[0].used\n\
+    }\n";
+
+#[test]
+fn r864_1_b_one_subject_at_two_positions_is_never_disjoint() {
+    let out = outcome(ZADD_ALIASED);
+    assert_eq!(
+        reason_of(&out, "zadd::a"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        detail_of(&out, "zadd::a").is_some_and(|d| d.contains("same-subject")),
+        "{:?}",
+        out.details
+    );
+}
+
+/// The controls: two distinct arrays of the caller's frame are disjoint, and a
+/// formal holding its entry value cannot address the caller's own array
+/// (premise (a)); `zadd::a` stays delivered.
+#[test]
+fn r864_1_distinct_frame_objects_and_an_entry_formal_are_disjoint() {
+    let distinct = ZADD_ALIASED.replace(
+        "zadd(x.as_mut_ptr(), x.as_mut_ptr(), y.as_mut_ptr());",
+        "zadd(x.as_mut_ptr(), y.as_mut_ptr(), y.as_mut_ptr());",
+    );
+    assert!(distinct.contains("zadd(x.as_mut_ptr(), y.as_mut_ptr()"));
+    let out = outcome(&distinct);
+    assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
+    let entry = ZADD_ALIASED.replace(
+        "pub unsafe fn entry() -> usize {\n",
+        "pub unsafe fn through(p: *mut Z) -> usize {\nlet mut q: [Z; 1] = [Z { sign: 2, used: 9 }; 1];\nlet mut r: [Z; 1] = [Z { sign: 4, used: 5 }; 1];\nzadd(q.as_mut_ptr(), p, r.as_mut_ptr());\nq[0].used\n}\npub unsafe fn entry() -> usize {\n",
+    ).replace(
+        "zadd(x.as_mut_ptr(), x.as_mut_ptr(), y.as_mut_ptr());",
+        "through(x.as_mut_ptr());",
+    );
+    assert!(
+        entry.contains("zadd(q.as_mut_ptr(), p, r.as_mut_ptr())"),
+        "{entry}"
+    );
+    let out = outcome(&entry);
+    assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
+}
