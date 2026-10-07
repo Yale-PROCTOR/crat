@@ -253,16 +253,16 @@ fn k19_retaining_callee_does_not_bridge() {
          pub unsafe fn target(p: *mut i32) -> i32 \
          {{ *p.offset(1) += 1; keep(p as *const core::ffi::c_void); *p.offset(0) }}\n"
     );
+    // Restated (relay 307, R889-1 on main 198's R4-2): `keep` stores `q` into a static,
+    // a known retention; the tier-2 retention waiver at `target`'s site excludes a use
+    // while the reference is live only, so filter 2 reads no retention there and the
+    // retained-access check of record holds `p` (a delivery lost). The name agrees with
+    // the assertion again: the retaining callee is not bridged (the tier's disposition row
+    // at the site still names the waiver; the held subject renders no bridge).
     let got = reasons(&input);
     assert_eq!(
         got.get("p").map(String::as_str),
-        Some("<emitted>"),
-        "a retained pointer bridges under the tier-2 waiver: {got:#?}"
-    );
-    let receipt = super::retention_waiver_tests::waived_receipt(&input, "target")
-        .unwrap_or_else(|| panic!("the admitted site carries no waiver receipt: {got:#?}"));
-    assert!(
-        receipt.contains("retention-waiver(tier-2, kind=known, subject=target::p, callee="),
-        "the receipt names the subject and the callee: {receipt}"
+        Some("held:retained-alias"),
+        "a retained pointer is held: {got:#?}"
     );
 }

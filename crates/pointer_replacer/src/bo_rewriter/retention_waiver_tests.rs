@@ -115,13 +115,6 @@ fn waived(rows: &[Row]) -> Option<&Row> {
         .find(|row| row.waiver_id.contains("retention-waiver:tier-2"))
 }
 
-/// The tier-2 receipt at `function`'s waived site, for the controls in other
-/// modules that the waiver re-premises (R481-2, R495-2).
-pub(super) fn waived_receipt(input: &str, function: &str) -> Option<String> {
-    let rows = dispositions(input, function);
-    waived(&rows).map(|row| row.evidence.clone())
-}
-
 /// **W6O-T2-1 — the delivering witness.** The retaining site is bridged under
 /// the retention waiver, with the per-site receipt naming the subject and the
 /// callee, the site carries an atom, and the emitted program type-checks.
@@ -362,13 +355,16 @@ fn wave6o_a_waived_sites_bridge_receipts_reconcile() {
         ),
         "held raw: {output}"
     );
-    // R829-1 (relay 297, main 188): the waived site moves to a retaining callee with no
-    // sibling (k19's static store); the waived receipt and its reconciliation are unchanged.
+    // Restated (relay 307, R889-1 on main 198's R4-2): k19's static store is a known
+    // retention, whose tier-2 retention waiver reads no retention for the retained-access
+    // check; `target::p` is held (a delivery lost), so no retention waiver is spent and the
+    // (empty) bridge events reconcile.
     let (waived, reconciled, degraded) = waived_bridge_receipts(RETAINED_ALONE, "target::p");
-    assert_eq!(degraded, None, "the retained source is delivered");
-    assert!(
-        waived > 0,
-        "the fixture carries a tier-2 waived bridge receipt"
+    assert_eq!(
+        degraded.as_ref().map(|(key, _)| key.to_string()).as_deref(),
+        Some("held:retained-alias"),
+        "the retained source is held"
     );
+    assert_eq!(waived, 0, "a held source has no bridge to waive");
     assert_eq!(reconciled, Ok(()), "and the bridge events reconcile");
 }

@@ -64,12 +64,17 @@ fn overlap_proof<'a>(tsv: &'a str, callee: &str, param: usize) -> &'a str {
 /// holds them; in brotli they are pair-owned and never reach it.)
 #[test]
 fn r573_4_the_star_receipt_names_the_forced_cover() {
+    // Restated (relay 307, R889-1 on main 198's R4-2; main 198a): `Setup` keeps `hasher` in
+    // `(*params).back`, a known retention whose tier-2 retention waiver at `Stitch`'s sites
+    // reads no retention under R889-1, so `Stitch::hasher` / `Stitch::params` stay raw (a
+    // delivery lost). The star then has one primary, `m`, and `data` is its raw view: no
+    // forced cover is needed and none is receipted. The rule stays witnessed at the plan
+    // (`pair_plan_tests::r573_4_*`).
     let tsv = seam_receipts(STAR);
     assert!(!tsv.contains("a5-primary-ambiguous"), "{tsv}");
     let data = overlap_proof(&tsv, "Setup", 3);
     assert!(data.contains("\ta5-site-proof-t2-fallback\t"), "{data}");
-    assert!(data.contains("pair-forced-cover"), "{data}");
     let m = overlap_proof(&tsv, "Setup", 0);
     assert!(m.contains("\ta5-site-proof-pair-primary\t"), "{m}");
-    assert!(m.contains("pair-forced-cover"), "{m}");
+    assert!(!tsv.contains("pair-forced-cover"), "{tsv}");
 }

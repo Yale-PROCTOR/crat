@@ -977,12 +977,20 @@ pub unsafe fn probe(mut s: *mut u8) -> i32 {
 
 #[test]
 fn w6v2_descendant_discharge_needs_the_callee_body() {
+    // Restated (relay 307, R889-1 on main 198's R4-2): the derived-global store's known
+    // retention spends the tier-2 retention waiver at `probe`'s site, whose exclusion is a
+    // use while the reference is live; filter 2 reads no retention there, so the
+    // retained-access check of record holds `probe::s` (a delivery lost).
     for (name, escape) in [("derived-global-store", "KEPT = p.cast::<i8>() as *mut u8;")] {
         let input = KEEP.replace("//ESCAPE//", escape);
         let rows = by_function(&input);
         assert!(
-            rows.contains(&("probe".to_owned(), "s".to_owned(), "<emitted>".to_owned())),
-            "{name}: the derived-global store is waived (R481-2), so it delivers: {rows:?}"
+            rows.contains(&(
+                "probe".to_owned(),
+                "s".to_owned(),
+                "held:retained-alias".to_owned()
+            )),
+            "{name}: {rows:?}"
         );
         let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
         assert!(super::verify::type_checks_str(&source));

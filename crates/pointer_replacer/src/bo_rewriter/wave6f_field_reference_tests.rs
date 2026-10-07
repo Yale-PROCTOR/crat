@@ -1356,24 +1356,34 @@ const TULIP_ARRAYS: &str = include_str!("wave6f_fixture_tulip_arrays.rs");
 /// its hold.
 #[test]
 fn w6f_tulip_array_delivers_through_its_whole_array_view() {
+    // Restated (relay 305 / 307; R864-3's stand-in review, round 4, R4-1's stop-gap; main
+    // 198a): `stress::data_in` stores into `inputs` (its own store, which the transaction
+    // would deliver) and its value reaches the call that takes the whole array; the
+    // stop-gap reads the check's suppressed callee store there, no program formal releases
+    // it, and `data_in` is held — so the array's store source is degraded and the
+    // transaction withdraws (deliveries lost: the array and its local reads). The callee's
+    // own slice formal still delivers; per-call siting in the check (era-5c, relay 199)
+    // would decide this call precisely.
     let observed = observe(TULIP_ARRAYS);
     let row = field_row(&observed, "stress", "inputs");
     assert_eq!(
-        (row.2.as_str(), row.3.as_str()),
-        ("applied", "array-opt-ref-shared"),
+        (row.2.as_str(), row.4.as_str()),
+        (
+            "held",
+            "store-source-degraded:stress::data_in:held:retained-alias"
+        ),
         "{row:?}"
     );
     let outcome = emitted("tulip_arrays", TULIP_ARRAYS);
     let (source, emitted_count, reverted) = emitted_source(&outcome);
     assert_eq!(reverted, 0, "{source}");
-    assert!(emitted_count >= 8, "{emitted_count}\n{source}");
+    assert!(emitted_count >= 5, "{emitted_count}\n{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
-        "let mut inputs: [Option<&f64>; 4] = [None; 4];",
-        "inputs[0 as usize] = Some(data_in);",
-        "let mut probe: &f64 = inputs[2 as usize].unwrap();",
-        // the view, cast at the seam
-        "inputs.as_ptr() as *const *const f64",
+        "fn ti_sma(mut size: i32, mut inputs: &[*const f64],",
+        "let mut inputs: [*const f64; 4] =",
+        "inputs[0 as usize] = data_in;",
+        "core::slice::from_raw_parts(inputs.as_ptr(), (4) as usize)",
     ] {
         let reborrowless = flat.replace("&*", "");
         assert!(
@@ -1399,10 +1409,16 @@ fn w6f_tulip_array_delivers_through_its_whole_array_view() {
 #[test]
 fn w6f_tulip_element_list_initializers_split_by_their_elements() {
     let observed = observe(TULIP_ARRAYS);
+    // Restated (relay 305 / 307; R4-1's stop-gap; main 198a): the null list's store
+    // source `stress::data_in` is held (witness 21's comment), so the list holds on its
+    // degraded source rather than delivering; the value lists below are unchanged.
     let null_list = field_row(&observed, "stress", "inputs");
     assert_eq!(
-        (null_list.2.as_str(), null_list.3.as_str()),
-        ("applied", "array-opt-ref-shared"),
+        (null_list.2.as_str(), null_list.4.as_str()),
+        (
+            "held",
+            "store-source-degraded:stress::data_in:held:retained-alias"
+        ),
         "{null_list:?}"
     );
     let value_list = field_row(&observed, "main_0", "all_inputs");
