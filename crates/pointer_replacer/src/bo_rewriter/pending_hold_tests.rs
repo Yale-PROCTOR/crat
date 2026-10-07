@@ -824,17 +824,19 @@ fn r861_1_n1_each_mir_arm_holds_the_flowing_binding() {
 
 /// **R864-1 (a) (relay 299; fan-out 081 class 1) — a delivered reference
 /// formal beside a raw formal at an in-program call.** libzahl's
-/// `zsqr(x.as_mut_ptr(), x.as_mut_ptr())`: `zsqr::a` is model-Raw (here an
-/// integer round trip, libzahl's `libzahl_realloc`), `zsqr::b` is read only, and
+/// `zsqr(x.as_mut_ptr(), x.as_mut_ptr())`: `zsqr::a` is model-Raw, `zsqr::b` is
+/// read only, and
 /// the frame delivered `b: &Z` beside the raw `a`, then wrote through `a` while
 /// the protected `b` was live. The pair pass drops the pair (one formal does not
 /// convert), so nothing held it: `b` is held, `ref-beside-raw`, same subject.
+/// (`a` is kept raw by a raw use, as heman's `kmQuaternionScale::pIn` is in
+/// `counted_void_tests`.)
 const ZSQR_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
     #[derive(Clone, Copy)]\n\
     #[repr(C)]\n\
     pub struct Z { sign: i32, used: usize }\n\
     pub unsafe fn zsqr(mut a: *mut Z, b: *mut Z) {\n\
-        a = a as usize as *mut Z;\n\
+        let _k = a.offset(0);\n\
         let s = (*b).used;\n\
         (*a).used = s + 1;\n\
         (*a).sign = 1;\n\
@@ -872,7 +874,7 @@ const ZADD_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
     #[repr(C)]\n\
     pub struct Z { sign: i32, used: usize }\n\
     pub unsafe fn zadd(a: *mut Z, mut b: *mut Z, c: *mut Z) {\n\
-        b = b as usize as *mut Z;\n\
+        let _k = b.offset(0);\n\
         (*a).used = (*c).used;\n\
         let t = (*b).sign;\n\
         (*a).sign = t;\n\
@@ -944,7 +946,7 @@ const CONTAINED_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
         (*s).state\n\
     }\n\
     pub unsafe fn process(mut s: *mut S) -> i32 {\n\
-        s = s as usize as *mut S;\n\
+        let _k = s.offset(0);\n\
         let mut br: *mut Br = &mut (*s).br;\n\
         read_distance(s, br)\n\
     }\n\
