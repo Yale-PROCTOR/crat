@@ -8872,14 +8872,24 @@ fn finish_decide<'tcx>(
             if decision::pending_hold::enabled()
                 && family_policy.stage >= additive::FamilyStage::Declaration
             {
-                for (node, reason) in
-                    std::mem::take(&mut carried)
-                        .into_iter()
-                        .chain(decision::pending_hold::holds(
-                            &table,
-                            &pending_coverage,
-                            &raw_boundary,
-                        ))
+                // R864-1 (relay 299): the pairs the pair pass drops, a delivered
+                // reference formal beside a raw one at an in-program call, held by
+                // the same rule (R833-1) and carried as the pending holds are.
+                for (node, reason) in std::mem::take(&mut carried)
+                    .into_iter()
+                    .chain(decision::pending_hold::holds(
+                        &table,
+                        &pending_coverage,
+                        &raw_boundary,
+                    ))
+                    .chain(decision::ref_beside_raw::holds(
+                        tcx,
+                        &facts,
+                        &table,
+                        &a5_site_proofs,
+                        &mut_facts,
+                        coconv.pair_sites(),
+                    ))
                 {
                     if forced.contains_key(&node) {
                         continue;

@@ -390,6 +390,9 @@ pub(crate) fn collect_inventory_from(
     let mut coverage = Vec::new();
     let mut exit_liveness = FxHashMap::default();
     let mut expressions = FxHashMap::default();
+    // R864-1 (b): each call's argument roots, read once per call.
+    let mut argument_roots: FxHashMap<(LocalDefId, Span), Vec<Option<HirId>>> =
+        FxHashMap::default();
     for site in &ctx.raw_boundary_sites.sites {
         let (caller, mut source, source_evidence) =
             if let Some(expression) = outbound_expressions.plans.get(&site.key) {
@@ -546,6 +549,22 @@ pub(crate) fn collect_inventory_from(
                 }
             } else {
                 unknown_proof("sibling-a5-operand-inventory-unresolved")
+            };
+            // **R864-1 (b) (relay 299; fan-out 081 class 2) — the same-subject
+            // rule, before any proof.** Two arguments rooted at one binding are
+            // never disjoint, whatever a proof says (libzahl `zmul`'s
+            // `zadd(&mut *b_low.as_mut_ptr(), b_low.as_mut_ptr(), …)` read
+            // `clear:a5-proven-disjoint`).
+            let roots = argument_roots
+                .entry((caller, site.call_span))
+                .or_insert_with(|| call_argument_roots(tcx, caller, site.call_span));
+            let source_root = roots.get(site.key.argument_index).copied().flatten();
+            let proof = if source_root.is_some()
+                && roots.get(argument_index).copied().flatten() == source_root
+            {
+                unknown_proof("same-subject")
+            } else {
+                proof
             };
             let access = if let Some(local_callee) = site.callee_local {
                 let callee_body = tcx
@@ -1200,6 +1219,37 @@ fn call_argument_is(
     find.found
 }
 
+/// The binding each argument of the call at `call_span` roots at (`place_root`:
+/// through casts, borrows, dereferences, fields, indices and method receivers).
+fn call_argument_roots(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span) -> Vec<Option<HirId>> {
+    struct Find {
+        call_span: Span,
+        roots: Option<Vec<Option<HirId>>>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for Find {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.roots.is_none()
+                && let ExprKind::Call(_, arguments) = expr.kind
+                && expr.span.source_callsite() == self.call_span.source_callsite()
+            {
+                self.roots = Some(
+                    arguments
+                        .iter()
+                        .map(|argument| super::emitability::place_root(argument).0)
+                        .collect(),
+                );
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        call_span,
+        roots: None,
+    };
+    intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
+    find.roots.unwrap_or_default()
+}
+
 /// The binding an ordinary borrow beneath the call argument's casts roots at,
 /// reached without a dereference (`&mut value as *mut i32 as *mut c_void`).
 fn cast_address_root(
@@ -1259,7 +1309,11 @@ fn binding_holds_its_object(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirI
 /// the formal holds its entry value or a pointer stepped from it
 /// (`p = p.offset(1)`): any other assignment (`p = &mut local as *mut T`), or a
 /// mutable borrow of the binding itself, can leave it addressing the frame.
-fn formal_keeps_its_entry_value(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirId) -> bool {
+pub(crate) fn formal_keeps_its_entry_value(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    binding: HirId,
+) -> bool {
     fn names(expr: &Expr<'_>, binding: HirId) -> bool {
         matches!(
             expr.kind,

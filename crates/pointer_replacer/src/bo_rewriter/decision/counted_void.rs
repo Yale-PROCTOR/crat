@@ -1251,7 +1251,7 @@ fn certified_disjoint(
     })
 }
 
-fn disjoint_roots<'tcx>(
+pub(crate) fn disjoint_roots<'tcx>(
     tcx: TyCtxt<'tcx>,
     caller: LocalDefId,
     left: &'tcx Expr<'tcx>,
@@ -2295,7 +2295,7 @@ pub(crate) fn record_hoist(
     });
 }
 
-fn contract_at(
+pub(crate) fn contract_at(
     table: &super::DecisionTable,
     callee: LocalDefId,
     index: usize,

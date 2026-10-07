@@ -199,7 +199,7 @@ pub(crate) fn into_held_formals(
 /// `&mut *a`). A load through
 /// a dereference (`b = (*s).p`) is the pointee's value, not the local's, and is
 /// no flow.
-fn locals_flowing_into(
+pub(crate) fn locals_flowing_into(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     function: LocalDefId,
     target: rustc_middle::mir::Local,

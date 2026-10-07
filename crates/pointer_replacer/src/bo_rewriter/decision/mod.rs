@@ -128,6 +128,7 @@ pub(crate) mod raw_receiver;
 #[cfg(test)]
 mod reader_chain_tests;
 pub(crate) mod receiver_input;
+pub(crate) mod ref_beside_raw;
 pub(crate) mod released_indirect;
 pub(crate) mod retained_alias_observed;
 #[cfg(test)]
