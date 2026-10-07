@@ -567,7 +567,26 @@ fn e5c_hold_corpus_rows() {
         .map(|(k, v)| (k.trim_end_matches("@d0").to_owned(), v.to_owned()))
         .collect();
     let mut rows = Vec::new();
-    // era-5c 157 (relay 196, R864-3): the verdict rows for the hold's host, beside the rows.
+    // era-5c 157 (relay 196, R864-3): the verdict rows for the hold's host, beside the rows:
+    // `CRAT_E5C_VERDICT_ROWS`, or the `hold.<program>` file's sibling `verdict.<program>`
+    // (never the hold rows' own path).
+    let verdict_out = std::env::var("CRAT_E5C_VERDICT_ROWS").unwrap_or_else(|_| {
+        let rows = std::path::Path::new(&out);
+        let name = rows
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a rows file name");
+        let program = name
+            .strip_prefix("hold.")
+            .expect("CRAT_E5C_SIDE_ROWS names a hold.<program> file, or set CRAT_E5C_VERDICT_ROWS");
+        rows.with_file_name(format!("verdict.{program}"))
+            .to_string_lossy()
+            .into_owned()
+    });
+    assert_ne!(
+        verdict_out, out,
+        "the verdict rows must not overwrite the hold rows"
+    );
     let mut vrows = Vec::new();
     ::utils::compilation::run_compiler_on_path(std::path::Path::new(&path), |tcx| {
         let program = program_of(tcx);
@@ -715,6 +734,48 @@ fn e5c_hold_corpus_rows() {
                     let lo = tcx.sess.source_map().lookup_char_pos(span.lo());
                     format!("{}:{}", lo.line, lo.col.0 + 1)
                 };
+                // The locals that carry the subject's value in its own function: the subject, and
+                // any local assigned a copy, a cast, or a reborrow (`&*`, `&raw *`) of a carrier.
+                let mut carried = rustc_hash::FxHashSet::from_iter([*local]);
+                loop {
+                    let before = carried.len();
+                    for data in body.basic_blocks.iter() {
+                        for statement in &data.statements {
+                            let rustc_middle::mir::StatementKind::Assign(box (dst, rvalue)) =
+                                &statement.kind
+                            else {
+                                continue;
+                            };
+                            if !dst.projection.is_empty() {
+                                continue;
+                            }
+                            let source = match rvalue {
+                                rustc_middle::mir::Rvalue::Use(op)
+                                | rustc_middle::mir::Rvalue::Cast(_, op, _) => {
+                                    op.place().filter(|p| p.projection.is_empty())
+                                }
+                                rustc_middle::mir::Rvalue::Ref(_, _, place)
+                                | rustc_middle::mir::Rvalue::RawPtr(_, place)
+                                | rustc_middle::mir::Rvalue::CopyForDeref(place) => {
+                                    matches!(
+                                        place.projection.as_slice(),
+                                        [rustc_middle::mir::ProjectionElem::Deref]
+                                    )
+                                    .then_some(*place)
+                                }
+                                _ => None,
+                            };
+                            if source.is_some_and(|p| carried.contains(&p.local)) {
+                                carried.insert(dst.local);
+                            }
+                        }
+                    }
+                    if carried.len() == before {
+                        break;
+                    }
+                }
+                // A call that passes a carrier itself (not a place projected from it): the
+                // diagnostic occurrence of the subject's sites, `bb<b>[<s>]#<arg>-><callee>@<at>`.
                 let mut sites = Vec::new();
                 for (block, data) in body.basic_blocks.iter_enumerated() {
                     let rustc_middle::mir::TerminatorKind::Call { func, args, .. } =
@@ -726,10 +787,15 @@ fn e5c_hold_corpus_rows() {
                         .const_fn_def()
                         .map_or_else(|| "indirect".to_owned(), |(did, _)| tcx.def_path_str(did));
                     for (j, arg) in args.iter().enumerate() {
-                        if arg.node.place().is_some_and(|p| p.local == *local) {
+                        if arg
+                            .node
+                            .place()
+                            .is_some_and(|p| p.projection.is_empty() && carried.contains(&p.local))
+                        {
                             sites.push(format!(
-                                "bb{}#{j}->{callee}@{}",
+                                "bb{}[{}]#{j}->{callee}@{}",
                                 block.as_u32(),
+                                data.statements.len(),
                                 at(data.terminator().source_info.span)
                             ));
                         }
@@ -790,7 +856,7 @@ fn e5c_hold_corpus_rows() {
     vrows.sort();
     let header = "fn\tlabel\tlocal\tf_or_l\tdecl\tverdict\thold\trule\treceipt\tdest\tslot\tslot_kind\tstore_site\tcall_sites";
     std::fs::write(
-        out.replace("/hold.", "/verdict."),
+        &verdict_out,
         format!(
             "{header}\n{}",
             vrows.iter().map(|r| format!("{r}\n")).collect::<String>()
