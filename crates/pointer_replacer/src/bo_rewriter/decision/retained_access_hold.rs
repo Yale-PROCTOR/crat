@@ -44,8 +44,8 @@ use super::{
     Decision, DecisionTable, DegradeReason, SubjectKind,
     lifetime::LifetimeEligibility,
     raw_boundary::{
-        RawBoundaryBlockReason, RawBoundaryDisposition, RawBoundaryDispositionIndex,
-        RawBoundaryRenderSite,
+        RAW_BOUNDARY_WAIVER_ID, RawBoundaryBlockReason, RawBoundaryDisposition,
+        RawBoundaryDispositionIndex, RawBoundaryRenderSite,
     },
     retained_access::{AccessKind, Hold, HoldKind, RetainedAccessCheck, Shape, StoreDest, Verdict},
 };
@@ -423,7 +423,11 @@ fn reads_retention(disposition: &RawBoundaryDisposition, site: &RawBoundaryRende
     site.target_stays_raw
         && matches!(site.source_shape, "bare-local" | "cast-of-local")
         && match disposition {
-            RawBoundaryDisposition::T2 { .. } => true,
+            // R889-1 (relay 307; the review's round 4, R4-2): only the c-aliasing waiver
+            // excludes an execution that "retains and later uses" the alias; the tier-2
+            // retention waiver (R481-2) excludes a use while the reference is live only,
+            // and reads no retention here.
+            RawBoundaryDisposition::T2 { waiver_id, .. } => *waiver_id == RAW_BOUNDARY_WAIVER_ID,
             RawBoundaryDisposition::Blocked { reason, .. } => match reason {
                 RawBoundaryBlockReason::PositiveRetention
                 | RawBoundaryBlockReason::WaiverUnconfirmed => true,
