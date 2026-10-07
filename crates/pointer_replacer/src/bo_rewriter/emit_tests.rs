@@ -15031,6 +15031,30 @@ fn r884_3_no_extent_past_a_call_that_may_not_return() {
     .expect("fixture compiles");
 }
 
+/// **R884-3 item 3 (wave-4 084 / 085 / 087, fixture `r107_cb8`) — a calling
+/// argument is not duplicated into the length.** `g(base.offset(k),
+/// (next)())` with `g`'s count following its pointer: the companion length was
+/// spelled from the argument's text, so `(next)()` ran twice. An argument that
+/// contains a call is not effect-free: the companion arm refuses it, and the
+/// site takes the fallback with its receipt.
+#[test]
+fn r884_3_a_calling_argument_is_not_duplicated_into_the_length() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, static_mut_refs)]\n\
+        static mut CALLS: usize = 0;\n\
+        pub unsafe fn next() -> usize { CALLS += 1; CALLS }\n\
+        pub unsafe fn g(p: *const i32, n: usize) -> i32 {\n\
+        let mut s = 0; let mut i: usize = 0;\n\
+        while i < n { s += *p.offset(i as isize); i += 1; }\n\
+        s }\n\
+        pub unsafe fn caller(base: *const i32, k: isize) -> i32 { g(base.offset(k), (next)()) }\n";
+    let out = match super::rewrite_m1(src) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("{other:#?}"),
+    };
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.matches("(next)()").count() <= 1, "{out}");
+}
+
 /// **R677-6 (relay 141) — a bare raw argument takes the callee's proven
 /// extent too.** lodepng's `lodepng_read32bitInt(chunk)`: a raw pointer into a
 /// slice formal where no companion, contract, region, C string or array names a
