@@ -925,8 +925,6 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
     let mut edge_candidates = Vec::<EdgeCandidate>::new();
     let mut pair_sites = Vec::<PairSiteDecision>::new();
-    // R864-1 (a): reference formals held beside a raw position (below).
-    let mut raw_side_holds = Vec::<PairSiteDecision>::new();
     /// First reason wins, so the census is deterministic under a node that
     /// contributes two.
     fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
@@ -1153,137 +1151,6 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                             block(&mut node_block, a.key, BlockReason::DuplicatePlaceRoot);
                             block(&mut node_block, b.key, BlockReason::DuplicatePlaceRoot);
                         }
-                    }
-                }
-            }
-            // R864-1 (a) (USER; fan-out 081): a converting formal beside a
-            // RAW position at the same call. The pair pass forms pairs among
-            // converting formals only, and A5 audits only Ref/Ref baseline
-            // pairs, so `zsqr(x.as_mut_ptr(), x.as_mut_ptr())` with `zsqr(a:
-            // *mut Z, b: &mut Z)` formed no pair at all. R833-1 on it: the
-            // reference formal is held unless the pair is shown disjoint (an
-            // audited proof, a certificate, or the body's own text: the
-            // reference side is `&mut l` with `l`'s address taken nowhere
-            // else). Read-read pairs are not pairs.
-            if let Some(proofs) = a5_site_proofs {
-                for raw in &site.args {
-                    let Some(raw_key) = param_key.get(&(*callee, raw.index)).copied() else {
-                        continue;
-                    };
-                    if converts.contains(&raw_key) || raw.target.is_none() {
-                        continue;
-                    }
-                    // The raw side is a formal decided raw (fan-out 081's
-                    // model-Raw formal), not a safe form that merely does not
-                    // convert here.
-                    let raw_formal = match decision_of.get(&raw_key) {
-                        Some(Decision::Degraded(_)) | None => true,
-                        Some(
-                            Decision::Ref { .. }
-                            | Decision::InferredRef { .. }
-                            | Decision::Slice { .. }
-                            | Decision::NestedSlice { .. }
-                            | Decision::Cursor { .. }
-                            | Decision::Opt { .. }
-                            | Decision::Box(_),
-                        ) => false,
-                    };
-                    if !raw_formal {
-                        continue;
-                    }
-                    let raw_written = param_written.get(&raw_key).copied().unwrap_or(true);
-                    for position in &node_positions {
-                        if !position.mutable && !raw_written {
-                            continue;
-                        }
-                        // A reference decision only: a slice or other form held
-                        // here reaches only the class terminal, after the seams
-                        // are planned, and leaves its callers' arguments
-                        // unbridged (the r815_6 lesson); those stay the named
-                        // residual.
-                        let reference = match decision_of.get(&position.key) {
-                            Some(Decision::Ref { .. } | Decision::InferredRef { .. }) => true,
-                            Some(
-                                Decision::Slice { .. }
-                                | Decision::NestedSlice { .. }
-                                | Decision::Cursor { .. }
-                                | Decision::Opt { .. }
-                                | Decision::Box(_)
-                                | Decision::Degraded(_),
-                            )
-                            | None => false,
-                        };
-                        if !reference {
-                            continue;
-                        }
-                        let (left, right, left_span, right_span) =
-                            if position.argument_index < raw.index {
-                                (position.argument_index, raw.index, position.span, raw.span)
-                            } else {
-                                (raw.index, position.argument_index, raw.span, position.span)
-                            };
-                        let mut proof = proofs.lookup(
-                            site.caller.local_def_index.as_u32(),
-                            callee.local_def_index.as_u32(),
-                            left,
-                            right,
-                            left_span,
-                            right_span,
-                        );
-                        if position.place_identity.is_some()
-                            && position.place_identity == raw.place_identity
-                        {
-                            proof.verdict = A5SiteProofVerdict::Overlapping;
-                            proof.reason = "same-place-root";
-                            proof.family = "same-object-identity";
-                        }
-                        super::loaded_operand::read_loaded_operands(
-                            site,
-                            *callee,
-                            left,
-                            right,
-                            &mut proof,
-                            |callee, index| {
-                                matches!(
-                                    retention.get(callee, index),
-                                    Some(RetentionVerdict::NoRetain { .. })
-                                )
-                            },
-                        );
-                        super::array_decay::read_array_decays(site, left, right, &mut proof);
-                        super::outside_byte_view::read_under_p8(
-                            facts, site, left, right, &mut proof,
-                        );
-                        let reference_unescaped = site
-                            .args
-                            .iter()
-                            .find(|argument| argument.index == position.argument_index)
-                            .is_some_and(|argument| argument.address_once_here)
-                            && matches!(
-                                retention.get(*callee, position.argument_index),
-                                Some(RetentionVerdict::NoRetain { .. })
-                            );
-                        if proof.verdict == A5SiteProofVerdict::Clear || reference_unescaped {
-                            continue;
-                        }
-                        raw_side_holds.push(PairSiteDecision {
-                            caller: site.caller,
-                            callee: *callee,
-                            argument_index: position.argument_index,
-                            span: position.span,
-                            call_span: site.span,
-                            subject: position.key,
-                            source_node: position.source_node,
-                            target: position.target.clone(),
-                            source_shape: position.source_shape,
-                            role: PairRole::Blocked,
-                            tier: PairTier::Blocked,
-                            verdict: proof.verdict,
-                            reason: "pair-not-shown-disjoint:raw-side".to_owned(),
-                            peer_receipts: proof.receipt(left, right),
-                            unproven_peers: vec![raw.index],
-                            a5_fallback: None,
-                        });
                     }
                 }
             }
@@ -1714,41 +1581,6 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
             a5_fallback: None,
         })
     };
-    // R864-1 (a): the reference formals held beside a raw position. A row
-    // the pass already has at that call is blocked in place.
-    for hold in raw_side_holds {
-        block(
-            &mut node_block,
-            hold.subject,
-            BlockReason::PairNotShownDisjoint,
-        );
-        let existing = pair_sites.iter().position(|row| {
-            (row.caller, row.callee, row.call_span, row.argument_index)
-                == (
-                    hold.caller,
-                    hold.callee,
-                    hold.call_span,
-                    hold.argument_index,
-                )
-        });
-        match existing {
-            Some(index) => {
-                let row = &mut pair_sites[index];
-                row.role = PairRole::Blocked;
-                row.tier = PairTier::Blocked;
-                row.reason = hold.reason;
-                if row.verdict == A5SiteProofVerdict::Clear {
-                    row.verdict = hold.verdict;
-                }
-                for peer in hold.unproven_peers {
-                    if !row.unproven_peers.contains(&peer) {
-                        row.unproven_peers.push(peer);
-                    }
-                }
-            }
-            None => pair_sites.push(hold),
-        }
-    }
     for subject in peers_of_unproven_raw_views(&mut pair_sites, peer_row) {
         block(&mut node_block, subject, BlockReason::PairNotShownDisjoint);
     }

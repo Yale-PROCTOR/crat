@@ -480,6 +480,7 @@ fn r864_signature(name: &str) -> String {
 /// R864-1 (a) (fan-out 081): `zsqr(x, &mut *x)` with `zsqr::a` raw: `b` is
 /// held raw beside it (no pair row, no A5 proof, not shown disjoint).
 #[test]
+#[ignore = "R864-1 (a) withdrawn from the 57 line after MAX-3 (wave-5d 145): the raw-side arm is not on this line"]
 fn r864_1_a_a_reference_formal_beside_a_raw_formal_not_shown_disjoint_is_held() {
     let signature = r864_signature("zsqr");
     assert!(signature.contains("mut b: *mut Z"), "({signature})");
