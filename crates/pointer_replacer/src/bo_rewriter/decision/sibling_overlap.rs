@@ -391,7 +391,7 @@ pub(crate) fn collect_inventory_from(
     let mut exit_liveness = FxHashMap::default();
     let mut expressions = FxHashMap::default();
     // R864-1 (b): each call's argument roots, read once per call.
-    let mut argument_roots: FxHashMap<(LocalDefId, Span), Vec<Option<HirId>>> =
+    let mut argument_roots: FxHashMap<(LocalDefId, Span), Vec<Option<(HirId, bool)>>> =
         FxHashMap::default();
     for site in &ctx.raw_boundary_sites.sites {
         let (caller, mut source, source_evidence) =
@@ -559,8 +559,13 @@ pub(crate) fn collect_inventory_from(
                 .entry((caller, site.call_span))
                 .or_insert_with(|| call_argument_roots(tcx, caller, site.call_span));
             let source_root = roots.get(site.key.argument_index).copied().flatten();
+            let sibling_root = roots.get(argument_index).copied().flatten();
+            // Two field places under one root may be disjoint fields (the PAIR's
+            // rule (c)): the rule reads one binding with at least one side whole.
             let proof = if source_root.is_some()
-                && roots.get(argument_index).copied().flatten() == source_root
+                && sibling_root.map(|(root, _)| root) == source_root.map(|(root, _)| root)
+                && !(source_root.is_some_and(|(_, field)| field)
+                    && sibling_root.is_some_and(|(_, field)| field))
             {
                 unknown_proof("same-subject")
             } else {
@@ -1220,11 +1225,31 @@ fn call_argument_is(
 }
 
 /// The binding each argument of the call at `call_span` roots at (`place_root`:
-/// through casts, borrows, dereferences, fields, indices and method receivers).
-fn call_argument_roots(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span) -> Vec<Option<HirId>> {
+/// through casts, borrows, dereferences, fields, indices and method receivers),
+/// and whether its place crosses a field projection on the way.
+fn call_argument_roots(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    call_span: Span,
+) -> Vec<Option<(HirId, bool)>> {
+    fn crosses_field(expr: &Expr<'_>) -> bool {
+        let mut cur = expr;
+        loop {
+            cur = match &cur.kind {
+                ExprKind::Field(..) => return true,
+                ExprKind::Unary(rustc_hir::UnOp::Deref, base)
+                | ExprKind::Index(base, _, _)
+                | ExprKind::AddrOf(_, _, base)
+                | ExprKind::Cast(base, _)
+                | ExprKind::DropTemps(base) => base,
+                ExprKind::MethodCall(_, receiver, _, _) => receiver,
+                _ => return false,
+            };
+        }
+    }
     struct Find {
         call_span: Span,
-        roots: Option<Vec<Option<HirId>>>,
+        roots: Option<Vec<Option<(HirId, bool)>>>,
     }
     impl<'tcx> intravisit::Visitor<'tcx> for Find {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1235,7 +1260,11 @@ fn call_argument_roots(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span) -> 
                 self.roots = Some(
                     arguments
                         .iter()
-                        .map(|argument| super::emitability::place_root(argument).0)
+                        .map(|argument| {
+                            super::emitability::place_root(argument)
+                                .0
+                                .map(|root| (root, crosses_field(argument)))
+                        })
                         .collect(),
                 );
             }
