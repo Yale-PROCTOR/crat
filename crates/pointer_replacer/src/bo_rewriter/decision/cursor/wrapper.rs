@@ -993,6 +993,40 @@ impl Uses<'_, '_> {
         Err(CursorHold::UseUnbuilt)
     }
 
+    /// **R828-7 (relay 114).** `other` is a position over this cursor's own
+    /// window: this cursor's base binding (`p` against `a` for `p = a + n`), or a
+    /// non-optional cursor candidate initialised from an offset chain rooted at
+    /// this subject. Each side moves only by advancing itself, so both index the
+    /// same base slice and `p != a` is `p.pos() != a.pos()`. A position of
+    /// another root never qualifies; its comparison keeps the address view.
+    fn same_root(&self, other: hir::HirId) -> bool {
+        let Some((other_subject, other_decision)) = self
+            .entries
+            .iter()
+            .find(|(s, _)| s.fn_did == self.subject.fn_did && s.hir_id == other)
+        else {
+            return false;
+        };
+        if !candidate_shape_in(self.ctx, other_subject, other_decision, self.entries) {
+            return false;
+        }
+        let self_advancing = |s: &Subject| self_assignments(self.ctx.tcx, s).1 == 0;
+        let rooted_here = |walker: &Subject, root: hir::HirId| {
+            self.ctx
+                .constructions
+                .init_hirs
+                .get(&(walker.fn_did, walker.hir_id))
+                .is_some_and(|&init| {
+                    let init = self.ctx.tcx.hir_node(init).expect_expr();
+                    matches!(init.kind, hir::ExprKind::MethodCall(..))
+                        && source_binding(self.ctx.tcx, walker.fn_did, init) == Some(root)
+                })
+        };
+        self_advancing(self.subject)
+            && self_advancing(other_subject)
+            && (rooted_here(self.subject, other) || rooted_here(other_subject, self.subject.hir_id))
+    }
+
     fn index(&self, e: &hir::Expr<'_>) -> Result<String, CursorHold> {
         if local(e) == Some(self.subject.hir_id) {
             return Ok("0isize".into());
@@ -1013,17 +1047,38 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
         // Only comparison/difference observations are scalar operations:
         // the resulting pointer is consumed by the comparison/difference, never
         // retained. Each operand owns its own edit and typed cursor receipt.
-        if let Some(operand) = self
+        if let Some((observation, operand)) = self
             .ctx
             .facts
             .address_observations
             .iter()
             .filter(|observation| scalar_address_operation(observation.op))
-            .flat_map(|observation| &observation.operands)
-            .find(|operand| {
-                operand.node == (self.subject.fn_did, self.subject.hir_id) && operand.span == e.span
+            .find_map(|observation| {
+                observation
+                    .operands
+                    .iter()
+                    .find(|operand| {
+                        operand.node == (self.subject.fn_did, self.subject.hir_id)
+                            && operand.span == e.span
+                    })
+                    .map(|operand| (observation, operand))
             })
         {
+            // R828-7 (relay 114): an ordering or equality with the other
+            // position of this window's own root compares the two indices. The
+            // operand is still address-only (never dereferenced), so it keeps the
+            // `cursor-address` receipt.
+            if !self.optional
+                && observation.op != "difference"
+                && observation.operands.iter().any(|other| {
+                    other.node.0 == self.subject.fn_did
+                        && other.node.1 != self.subject.hir_id
+                        && self.same_root(other.node.1)
+                })
+            {
+                self.push(e, format!("{}.pos()", self.name), "cursor-address");
+                return;
+            }
             let value = if self.optional {
                 format!(
                     "{}.as_ref().map_or(core::ptr::null(), |cursor| cursor.addr())",

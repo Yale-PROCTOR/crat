@@ -470,6 +470,11 @@ fn derive_parameter<'tcx>(
     // subject that walks below entry and never above it.
     let mut backward: Option<Location> = None;
     let mut forward = false;
+    // R828-7 (relay 114): the backward steps taken only after the moving
+    // position was tested against the root's entry value; see
+    // [`guarded_backward_step`]. `!=` needs every other move non-negative.
+    let mut guarded: Vec<(Location, bool)> = Vec::new();
+    let mut unsigned_moves = true;
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
             continue;
@@ -484,6 +489,12 @@ fn derive_parameter<'tcx>(
             continue;
         }
         let Some(delta) = args.get(1).and_then(|arg| constant(&arg.node)) else {
+            if !args
+                .get(1)
+                .is_some_and(|arg| unsigned_delta(tcx, body, block, &arg.node))
+            {
+                unsigned_moves = false;
+            }
             continue;
         };
         let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
@@ -494,13 +505,29 @@ fn derive_parameter<'tcx>(
         } else {
             delta < 0
         };
-        if moves_back {
-            backward.get_or_insert(Location {
-                block,
-                statement_index: data.statements.len(),
-            });
+        let site = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        if moves_back && delta.abs() == 1 {
+            match guarded_backward_step(body, root, block, receiver.local) {
+                Some(strict) => guarded.push((site, strict)),
+                None => {
+                    backward.get_or_insert(site);
+                }
+            }
+        } else if moves_back {
+            backward.get_or_insert(site);
         } else {
             forward = true;
+        }
+    }
+    // A step guarded by `pos > root` stays at or above entry on its own; one
+    // guarded by `pos != root` does only while the position never starts below
+    // entry, so every other move must be non-negative.
+    for (site, strict) in guarded {
+        if !strict && !unsigned_moves {
+            backward.get_or_insert(site);
         }
     }
     if let Some(site) = backward.filter(|_| !forward) {
@@ -510,6 +537,120 @@ fn derive_parameter<'tcx>(
             site,
         );
     }
+}
+
+/// **R828-7 (relay 114) — a backward step under a test against the root.**
+/// The one-step move `p.offset(-1)` in the block a `switchInt` enters when
+/// `p != root` (or `p > root`, `root < p`) holds, with nothing re-assigning the
+/// moved position in that block before the step: `while p != a { p--; .. }`.
+/// `Some(true)` for an ordering guard (the step stays at or above entry on its
+/// own), `Some(false)` for `!=` (it does while the position never starts
+/// below entry), `None` when the step is not so guarded.
+fn guarded_backward_step(
+    body: &Body<'_>,
+    root: Local,
+    block: mir::BasicBlock,
+    receiver: Local,
+) -> Option<bool> {
+    let step = &body.basic_blocks[block];
+    let moved = copied_from(step, receiver);
+    if step.statements.iter().any(|statement| {
+        matches!(&statement.kind, StatementKind::Assign(assign)
+            if assign.0.local == moved && assign.0.projection.is_empty())
+    }) {
+        return None;
+    }
+    let predecessors = &body.basic_blocks.predecessors()[block];
+    let [test] = predecessors.as_slice() else {
+        return None;
+    };
+    let data = &body.basic_blocks[*test];
+    let TerminatorKind::SwitchInt { discr, targets } = &data.terminator().kind else {
+        return None;
+    };
+    let flag = discr
+        .place()
+        .filter(|place| place.projection.is_empty())?
+        .local;
+    let mut values = targets.iter();
+    if !matches!(values.next(), Some((0, _)))
+        || values.next().is_some()
+        || targets.otherwise() != block
+    {
+        return None;
+    }
+    let (op, lhs, rhs) =
+        data.statements
+            .iter()
+            .rev()
+            .find_map(|statement| match &statement.kind {
+                StatementKind::Assign(assign)
+                    if assign.0.local == flag && assign.0.projection.is_empty() =>
+                {
+                    match &assign.1 {
+                        Rvalue::BinaryOp(op, operands) => Some((*op, &operands.0, &operands.1)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })?;
+    let side = |operand: &Operand<'_>| {
+        operand
+            .place()
+            .filter(|place| place.projection.is_empty())
+            .map(|place| copied_from(data, place.local))
+    };
+    let (lhs, rhs) = (side(lhs)?, side(rhs)?);
+    match op {
+        mir::BinOp::Ne if (lhs, rhs) == (moved, root) || (lhs, rhs) == (root, moved) => Some(false),
+        mir::BinOp::Gt if (lhs, rhs) == (moved, root) => Some(true),
+        mir::BinOp::Lt if (lhs, rhs) == (root, moved) => Some(true),
+        _ => None,
+    }
+}
+
+/// The local a block's temporary was copied (or moved) from, if the block
+/// assigns it so; the local itself otherwise.
+fn copied_from(data: &mir::BasicBlockData<'_>, local: Local) -> Local {
+    data.statements
+        .iter()
+        .rev()
+        .find_map(|statement| match &statement.kind {
+            StatementKind::Assign(assign)
+                if assign.0.local == local && assign.0.projection.is_empty() =>
+            {
+                match &assign.1 {
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                        if place.projection.is_empty() =>
+                    {
+                        Some(place.local)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(local)
+}
+
+/// A variable delta that cannot be negative: the block casts it from an
+/// unsigned integer (`n as isize`, `IntToInt`).
+fn unsigned_delta<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    block: mir::BasicBlock,
+    operand: &Operand<'tcx>,
+) -> bool {
+    let Some(place) = operand.place().filter(|place| place.projection.is_empty()) else {
+        return false;
+    };
+    body.basic_blocks[block].statements.iter().any(|statement| {
+        matches!(&statement.kind, StatementKind::Assign(assign)
+            if assign.0.local == place.local
+                && assign.0.projection.is_empty()
+                && matches!(&assign.1, Rvalue::Cast(mir::CastKind::IntToInt, source, _)
+                    if matches!(source.ty(&body.local_decls, tcx).kind(), ty::Uint(_))))
+    })
 }
 
 fn derive_array<'tcx>(
