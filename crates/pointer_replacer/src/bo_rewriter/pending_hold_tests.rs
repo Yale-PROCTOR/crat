@@ -926,3 +926,53 @@ fn r864_1_distinct_frame_objects_and_an_entry_formal_are_disjoint() {
     let out = outcome(&entry);
     assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
 }
+
+/// **R866-1 (relay 300; fan-out 083) — the containment pair.** brotli's
+/// `ProcessCommandsInternal` (its `s` raw) hands `SafeReadDistance(&mut *s,
+/// &mut *br)` with `br = &mut (*s).br`: both formals delivered as `&mut`, the
+/// second inside the first's object, no pair row at that call; the callee writes
+/// through `br` while the protected `s` covers it. Both formals are held
+/// (`ref-beside-ref`, `contained`).
+const CONTAINED_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[repr(C)]\n\
+    pub struct Br { pos: u32, val: u32 }\n\
+    #[repr(C)]\n\
+    pub struct S { state: i32, br: Br }\n\
+    pub unsafe fn read_distance(s: *mut S, br: *mut Br) -> i32 {\n\
+        (*br).pos += 1;\n\
+        (*s).state += 1;\n\
+        (*s).state\n\
+    }\n\
+    pub unsafe fn process(mut s: *mut S) -> i32 {\n\
+        s = s as usize as *mut S;\n\
+        let mut br: *mut Br = &mut (*s).br;\n\
+        read_distance(s, br)\n\
+    }\n\
+    pub unsafe fn entry() -> i32 {\n\
+        let mut x = S { state: 0, br: Br { pos: 0, val: 0 } };\n\
+        process(&mut x)\n\
+    }\n";
+
+#[test]
+fn r866_1_a_containment_pair_holds_both_formals() {
+    let out = outcome(CONTAINED_PAIR);
+    for formal in ["read_distance::s", "read_distance::br"] {
+        assert_eq!(
+            reason_of(&out, formal),
+            Some("held:pair-not-shown-disjoint"),
+            "{formal}: {:?}",
+            out.reasons
+        );
+        assert!(
+            detail_of(&out, formal)
+                .is_some_and(|d| d.contains("ref-beside-ref") && d.contains("contained")),
+            "{formal}: {:?}",
+            out.details
+        );
+    }
+    let callee = signature(&out.source, "read_distance");
+    assert!(
+        callee.contains("s: *mut S") && callee.contains("br: *mut Br"),
+        "held raw: {callee}"
+    );
+}
