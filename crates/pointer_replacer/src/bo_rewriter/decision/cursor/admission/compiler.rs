@@ -406,7 +406,15 @@ pub(super) fn inspect<'tcx>(
     {
         report.findings[0].outcome = Outcome::Missing(Need::RefAdmission);
     } else if shape == Shape::RawParameter {
-        derive_parameter(tcx, body, candidate.local, &component, &mut report);
+        let entry = node
+            .roots
+            .iter()
+            .find_map(|root| match root {
+                Root::Parameter(local) => Some(*local),
+                _ => None,
+            })
+            .unwrap_or(candidate.local);
+        derive_parameter(tcx, body, candidate.local, entry, &component, &mut report);
     } else if shape == Shape::LocalArray {
         let Root::Array(root) = *node.roots.first().unwrap() else { unreachable!() };
         derive_array(
@@ -448,6 +456,7 @@ fn derive_parameter<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     root: Local,
+    entry_root: Local,
     component: &[Local],
     report: &mut Admission,
 ) {
@@ -475,6 +484,7 @@ fn derive_parameter<'tcx>(
     // [`guarded_backward_step`]. `!=` needs every other move non-negative.
     let mut guarded: Vec<(Location, bool)> = Vec::new();
     let mut unsigned_moves = true;
+    let entry_fixed = holds_entry_value(body, entry_root);
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
             continue;
@@ -488,16 +498,18 @@ fn derive_parameter<'tcx>(
         if !component.contains(&receiver.local) {
             continue;
         }
+        let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
+            continue;
+        };
         let Some(delta) = args.get(1).and_then(|arg| constant(&arg.node)) else {
-            if !args
-                .get(1)
-                .is_some_and(|arg| unsigned_delta(tcx, body, block, &arg.node))
+            let forward_method = matches!(tcx.item_name(did).as_str(), "offset" | "add");
+            if !(forward_method
+                && args
+                    .get(1)
+                    .is_some_and(|arg| unsigned_delta(tcx, body, block, &arg.node)))
             {
                 unsigned_moves = false;
             }
-            continue;
-        };
-        let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
             continue;
         };
         let moves_back = if tcx.item_name(did).as_str() == "sub" {
@@ -509,8 +521,8 @@ fn derive_parameter<'tcx>(
             block,
             statement_index: data.statements.len(),
         };
-        if moves_back && delta.abs() == 1 {
-            match guarded_backward_step(body, root, block, receiver.local) {
+        if moves_back && delta.abs() == 1 && entry_fixed {
+            match guarded_backward_step(body, entry_root, block, receiver.local) {
                 Some(strict) => guarded.push((site, strict)),
                 None => {
                     backward.get_or_insert(site);
@@ -579,21 +591,10 @@ fn guarded_backward_step(
     {
         return None;
     }
-    let (op, lhs, rhs) =
-        data.statements
-            .iter()
-            .rev()
-            .find_map(|statement| match &statement.kind {
-                StatementKind::Assign(assign)
-                    if assign.0.local == flag && assign.0.projection.is_empty() =>
-                {
-                    match &assign.1 {
-                        Rvalue::BinaryOp(op, operands) => Some((*op, &operands.0, &operands.1)),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            })?;
+    let (op, lhs, rhs) = match &last_assignment(data, flag)?.1 {
+        Rvalue::BinaryOp(op, operands) => (*op, &operands.0, &operands.1),
+        _ => return None,
+    };
     let side = |operand: &Operand<'_>| {
         operand
             .place()
@@ -612,25 +613,49 @@ fn guarded_backward_step(
 /// The local a block's temporary was copied (or moved) from, if the block
 /// assigns it so; the local itself otherwise.
 fn copied_from(data: &mir::BasicBlockData<'_>, local: Local) -> Local {
+    match last_assignment(data, local).map(|assign| &assign.1) {
+        Some(Rvalue::Use(Operand::Copy(place) | Operand::Move(place)))
+            if place.projection.is_empty() =>
+        {
+            place.local
+        }
+        _ => local,
+    }
+}
+
+/// The block's last assignment to the whole of `local`, if any.
+fn last_assignment<'a, 'tcx>(
+    data: &'a mir::BasicBlockData<'tcx>,
+    local: Local,
+) -> Option<&'a (Place<'tcx>, Rvalue<'tcx>)> {
     data.statements
         .iter()
         .rev()
         .find_map(|statement| match &statement.kind {
-            StatementKind::Assign(assign)
-                if assign.0.local == local && assign.0.projection.is_empty() =>
-            {
-                match &assign.1 {
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
-                        if place.projection.is_empty() =>
-                    {
-                        Some(place.local)
-                    }
-                    _ => None,
-                }
+            StatementKind::Assign(assign) if assign.0.local == local => {
+                assign.0.projection.is_empty().then_some(&**assign)
             }
             _ => None,
         })
-        .unwrap_or(local)
+}
+
+/// The parameter still holds its entry value everywhere: the body never
+/// assigns it and never borrows it (`a = q`, `&mut a`).
+fn holds_entry_value(body: &Body<'_>, entry: Local) -> bool {
+    body.basic_blocks.iter().all(|data| {
+        data.statements
+            .iter()
+            .all(|statement| match &statement.kind {
+                StatementKind::Assign(assign) => {
+                    assign.0.local != entry
+                        && !matches!(&assign.1, Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                        if place.local == entry)
+                }
+                _ => true,
+            })
+            && !matches!(&data.terminator().kind,
+            TerminatorKind::Call { destination, .. } if destination.local == entry)
+    })
 }
 
 /// A variable delta that cannot be negative: the block casts it from an
@@ -644,13 +669,9 @@ fn unsigned_delta<'tcx>(
     let Some(place) = operand.place().filter(|place| place.projection.is_empty()) else {
         return false;
     };
-    body.basic_blocks[block].statements.iter().any(|statement| {
-        matches!(&statement.kind, StatementKind::Assign(assign)
-            if assign.0.local == place.local
-                && assign.0.projection.is_empty()
-                && matches!(&assign.1, Rvalue::Cast(mir::CastKind::IntToInt, source, _)
-                    if matches!(source.ty(&body.local_decls, tcx).kind(), ty::Uint(_))))
-    })
+    matches!(last_assignment(&body.basic_blocks[block], place.local).map(|assign| &assign.1),
+        Some(Rvalue::Cast(mir::CastKind::IntToInt, source, _))
+            if matches!(source.ty(&body.local_decls, tcx).kind(), ty::Uint(_)))
 }
 
 fn derive_array<'tcx>(

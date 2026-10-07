@@ -993,6 +993,32 @@ impl Uses<'_, '_> {
         Err(CursorHold::UseUnbuilt)
     }
 
+    /// **R828-7.** `e` (a bare use of this subject) is one side of `==` / `!=`
+    /// whose other side is a bare local of a non-optional subject over this
+    /// cursor's own root (see [`Self::same_root`]).
+    fn bare_equality_with_same_root(&self, e: &hir::Expr<'_>) -> bool {
+        if local(e) != Some(self.subject.hir_id) {
+            return false;
+        }
+        let hir::Node::Expr(parent) = self.ctx.tcx.parent_hir_node(e.hir_id) else {
+            return false;
+        };
+        let hir::ExprKind::Binary(op, lhs, rhs) = parent.kind else {
+            return false;
+        };
+        if !matches!(op.node, hir::BinOpKind::Eq | hir::BinOpKind::Ne) {
+            return false;
+        }
+        let other = if lhs.hir_id == e.hir_id { rhs } else { lhs };
+        local(other).is_some_and(|other| {
+            other != self.subject.hir_id
+                && self.entries.iter().any(|(s, _)| {
+                    s.fn_did == self.subject.fn_did && s.hir_id == other && !s.null_init
+                })
+                && self.same_root(other)
+        })
+    }
+
     /// **R828-7 (relay 114).** `other` is a position over this cursor's own
     /// window: this cursor's base binding (`p` against `a` for `p = a + n`), or a
     /// non-optional cursor candidate initialised from an offset chain rooted at
@@ -1064,17 +1090,17 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     .map(|operand| (observation, operand))
             })
         {
-            // R828-7 (relay 114): an ordering or equality with the other
-            // position of this window's own root compares the two indices. The
+            // R828-7 (relay 114): an equality with the other position of this
+            // window's own root compares the two indices. Equality only: an
+            // ordering of positions that wrapped below the window's start is not
+            // the ordering of their addresses (the `addr()` view keeps it). Both
+            // sides must be bare locals directly under `==` / `!=`, so a side left
+            // in the address view is a type error, never a silent cast. The
             // operand is still address-only (never dereferenced), so it keeps the
             // `cursor-address` receipt.
             if !self.optional
-                && observation.op != "difference"
-                && observation.operands.iter().any(|other| {
-                    other.node.0 == self.subject.fn_did
-                        && other.node.1 != self.subject.hir_id
-                        && self.same_root(other.node.1)
-                })
+                && matches!(observation.op, "eq" | "ne")
+                && self.bare_equality_with_same_root(e)
             {
                 self.push(e, format!("{}.pos()", self.name), "cursor-address");
                 return;
