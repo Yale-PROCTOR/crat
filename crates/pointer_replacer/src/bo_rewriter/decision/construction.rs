@@ -1014,7 +1014,7 @@ pub(crate) fn root_extent(
         && let Some((expression, receipt)) = super::field_count::length_at(
             tcx,
             subject.fn_did,
-            Collector::peel(tcx.hir_node(init_hir).expect_expr()),
+            tcx.hir_node(init_hir).expect_expr(),
             false,
         )
     {

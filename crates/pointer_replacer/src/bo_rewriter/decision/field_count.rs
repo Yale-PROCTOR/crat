@@ -122,6 +122,10 @@ struct Writes<'tcx> {
     writes: Vec<(HirId, usize, Place, Option<&'tcx Expr<'tcx>>)>,
     /// fields of `adt` written in a form the two shapes cannot cover
     poisoned: Vec<Symbol>,
+    /// Relay 107 (review 4b): the object handed to a function without a local
+    /// body (other than a whole-struct copy or zeroing): any field may be
+    /// written.
+    all_poisoned: bool,
 }
 
 struct Scan<'a, 'tcx> {
@@ -148,6 +152,66 @@ impl<'tcx> Scan<'_, 'tcx> {
                 .map(|(_, p)| p.clone());
         }
         None
+    }
+}
+
+impl<'tcx> Scan<'_, 'tcx> {
+    /// A pointer to the object (or to a field of it) under casts.
+    fn points_into(&self, arg: &'tcx Expr<'tcx>) -> bool {
+        let e = peel(arg);
+        if let ExprKind::AddrOf(_, _, inner) = e.kind
+            && self.cx.place(inner).is_some_and(|p| p.adt == self.adt)
+        {
+            return true;
+        }
+        let ty = self.cx.tcx.typeck(self.cx.owner).expr_ty(e);
+        match ty.kind() {
+            TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) => {
+                struct_of(*t).is_some_and(|d| d.did() == self.adt)
+            }
+            _ => false,
+        }
+    }
+
+    /// Relay 107 (review 4b): a callee with no local body may write through a
+    /// pointer to the object. Only an exact whole-struct `memcpy` / `memmove`
+    /// between two such objects, or a `memset` of the whole struct to zero,
+    /// keeps the pair; anything else poisons every field.
+    fn foreign_call(&mut self, callee: &'tcx Expr<'tcx>, args: &'tcx [Expr<'tcx>]) {
+        if !args.iter().any(|a| self.points_into(a)) {
+            return;
+        }
+        let tcx = self.cx.tcx;
+        let local_body = match self.cx.tcx.typeck(self.cx.owner).expr_ty(callee).kind() {
+            TyKind::FnDef(def, _) => def
+                .as_local()
+                .is_some_and(|l| tcx.hir_node_by_def_id(l).body_id().is_some()),
+            _ => false,
+        };
+        if local_body {
+            return; // its body is scanned on its own
+        }
+        let name = self.cx.text(callee).unwrap_or_default();
+        let name = name.rsplit("::").next().unwrap_or("").to_owned();
+        let whole = |size: &Expr<'tcx>| {
+            let ExprKind::Call(f, []) = peel(size).kind else { return false };
+            self.cx.text(f).is_some_and(|t| t.contains("size_of::<"))
+                && tcx
+                    .typeck(self.cx.owner)
+                    .node_args(f.hir_id)
+                    .types()
+                    .next()
+                    .and_then(struct_of)
+                    .is_some_and(|d| d.did() == self.adt)
+        };
+        let copy = matches!(name.as_str(), "memcpy" | "memmove")
+            && matches!(args, [d, s, n] if self.points_into(d) && self.points_into(s) && whole(n));
+        let zero = name == "memset"
+            && matches!(args, [d, v, n] if self.points_into(d) && whole(n)
+                && self.cx.text(v).is_some_and(|t| t == "0" || t.starts_with("0 as ")));
+        if !copy && !zero {
+            self.out.all_poisoned = true;
+        }
     }
 }
 
@@ -178,6 +242,18 @@ impl<'tcx> Visitor<'tcx> for Scan<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        // Relay 107 (review 4a): a `ref mut` alias of a field is a write only as
+        // `*alias = …`; any other use (handed on, reborrowed, cast) escapes it.
+        if let Some(id) = local_of(e)
+            && let Some((_, place)) = self.fresh.iter().find(|(b, _)| *b == id)
+            && !matches!(self.cx.tcx.parent_hir_node(e.hir_id),
+                rustc_hir::Node::Expr(p) if matches!(p.kind, ExprKind::Unary(UnOp::Deref, _)))
+        {
+            self.out.poisoned.push(place.field);
+        }
+        if let ExprKind::Call(callee, args) = e.kind {
+            self.foreign_call(callee, args);
+        }
         match e.kind {
             ExprKind::Assign(lhs, rhs, _) => {
                 if let Some(place) = self.target(lhs) {
@@ -259,17 +335,8 @@ fn allocation_count<'tcx>(
                         None
                     }
                 }
-                ExprKind::MethodCall(seg, recv, [arg], _)
-                    if seg.ident.name.as_str() == "wrapping_mul" =>
-                {
-                    if sized(recv) {
-                        Some(arg)
-                    } else if sized(arg) {
-                        Some(recv)
-                    } else {
-                        None
-                    }
-                }
+                // Relay 107: a `wrapping_mul` product may wrap to a smaller
+                // allocation than `n` elements; only the checked `*` is exact.
                 _ => None,
             }
         }
@@ -332,7 +399,7 @@ fn offset_witness<'tcx>(
     block: &'tcx Block<'tcx>,
     from: usize,
     f: &Place,
-) -> Option<Symbol> {
+) -> Option<(Symbol, usize)> {
     struct Find<'a, 'tcx> {
         cx: &'a Ctx<'tcx>,
         f: &'a Place,
@@ -340,6 +407,14 @@ fn offset_witness<'tcx>(
     }
     impl<'tcx> Visitor<'tcx> for Find<'_, 'tcx> {
         fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            // Relay 107 (review 5): a witness that runs only under a condition
+            // (or in a loop, or a closure) proves nothing about every path.
+            if matches!(
+                e.kind,
+                ExprKind::If(..) | ExprKind::Match(..) | ExprKind::Loop(..) | ExprKind::Closure(..)
+            ) {
+                return;
+            }
             if let ExprKind::MethodCall(seg, recv, [arg], _) = e.kind
                 && matches!(seg.ident.name.as_str(), "offset" | "add")
                 && self.cx.place(recv).as_ref() == Some(self.f)
@@ -353,16 +428,27 @@ fn offset_witness<'tcx>(
         }
     }
     let mut find = Find { cx, f, found: None };
-    for s in block.stmts.iter().skip(from + 1) {
+    for (i, s) in block.stmts.iter().enumerate().skip(from + 1) {
         find.visit_stmt(s);
-        if find.found.is_some() {
-            return find.found;
+        if let Some(c) = find.found {
+            return Some((c, i));
         }
     }
     if let Some(e) = block.expr {
         find.visit_expr(e);
     }
-    find.found
+    find.found.map(|c| (c, block.stmts.len()))
+}
+
+/// Relay 107 (review 3): which writes of the count an establishing block admits.
+#[derive(Clone, Copy)]
+enum Admits {
+    /// (E1, `n` reads the object's count) only before the pointer's write
+    Before(usize),
+    /// (E1, `n` a once-defined local) only stores of that same local
+    Local(HirId),
+    /// (E2) only before the offset witness
+    BeforeWitness(usize),
 }
 
 fn block_of<'tcx>(tcx: TyCtxt<'tcx>, id: HirId) -> Option<&'tcx Block<'tcx>> {
@@ -396,8 +482,9 @@ pub(crate) fn proven_count(
 
     let mut paired: Option<FieldCount> = None;
     // (block, count field) pairs whose count writes are covered
-    let mut covered: Vec<(LocalDefId, HirId, Symbol)> = Vec::new();
-    let mut count_writes: Vec<(LocalDefId, HirId, usize, Symbol)> = Vec::new();
+    let mut covered: Vec<(LocalDefId, HirId, String, Symbol, Admits)> = Vec::new();
+    let mut count_writes: Vec<(LocalDefId, HirId, usize, String, Symbol, Option<HirId>)> =
+        Vec::new();
 
     for owner in tcx.hir_body_owners() {
         if !matches!(
@@ -416,7 +503,7 @@ pub(crate) fn proven_count(
             block: None,
         };
         scan.visit_expr(body.value);
-        if scan.out.poisoned.contains(&field) {
+        if scan.out.poisoned.contains(&field) || scan.out.all_poisoned {
             return None;
         }
         for (block, i, place, rhs) in &scan.out.writes {
@@ -435,10 +522,13 @@ pub(crate) fn proven_count(
                         .filter(|c| c.adt == adt && c.base == place.base && is_count(c.field))
                     {
                         // n reads the same object's count
-                        Some(FieldCount {
-                            count: count.field,
-                            form: "alloc",
-                        })
+                        Some((
+                            FieldCount {
+                                count: count.field,
+                                form: "alloc",
+                            },
+                            Admits::Before(*i),
+                        ))
                     } else if let Some(v) = local_of(n) {
                         // n is a local written to the count in the same block
                         scan.out
@@ -451,9 +541,14 @@ pub(crate) fn proven_count(
                                     && r.and_then(local_of) == Some(v)
                             })
                             .filter(|_| single_definition(&cx, body, v).is_some())
-                            .map(|(_, _, p, _)| FieldCount {
-                                count: p.field,
-                                form: "alloc",
+                            .map(|(_, _, p, _)| {
+                                (
+                                    FieldCount {
+                                        count: p.field,
+                                        form: "alloc",
+                                    },
+                                    Admits::Local(v),
+                                )
                             })
                     } else {
                         None
@@ -461,40 +556,61 @@ pub(crate) fn proven_count(
                 } else {
                     // (E2) the offset witness
                     offset_witness(&cx, block_ref, *i, place)
-                        .filter(|c| is_count(*c))
-                        .map(|c| FieldCount {
-                            count: c,
-                            form: "offset",
+                        .filter(|(c, _)| is_count(*c))
+                        .map(|(c, w)| {
+                            (
+                                FieldCount {
+                                    count: c,
+                                    form: "offset",
+                                },
+                                Admits::BeforeWitness(w),
+                            )
                         })
                 };
-                let established = established?;
+                let (established, admits) = established?;
                 match &paired {
                     Some(p) if p.count != established.count => return None,
                     _ => {}
                 }
-                covered.push((owner, *block, established.count));
+                covered.push((owner, *block, place.base.clone(), established.count, admits));
                 if paired.as_ref().map(|p| p.form) != Some("alloc") {
                     paired = Some(established);
                 }
             } else {
-                count_writes.push((owner, *block, *i, place.field));
+                count_writes.push((
+                    owner,
+                    *block,
+                    *i,
+                    place.base.clone(),
+                    place.field,
+                    rhs.and_then(local_of),
+                ));
             }
         }
         if let Some(p) = &paired
-            && scan.out.poisoned.contains(&p.count)
+            && (scan.out.poisoned.contains(&p.count) || scan.out.all_poisoned)
         {
             return None;
         }
     }
     let paired = paired?;
-    // Every write of the count field sits in a block that establishes F.
+    // Every write of the count field sits in a block that establishes F for
+    // the same object, at a place that block admits (relay 107, review 3).
     if count_writes
         .iter()
-        .filter(|(_, _, _, c)| *c == paired.count)
-        .any(|(o, b, _, c)| {
-            !covered
-                .iter()
-                .any(|(o2, b2, c2)| o2 == o && b2 == b && c2 == c)
+        .filter(|(_, _, _, _, c, _)| *c == paired.count)
+        .any(|(o, b, i, base, c, rhs)| {
+            !covered.iter().any(|(o2, b2, base2, c2, admits)| {
+                o2 == o
+                    && b2 == b
+                    && base2 == base
+                    && c2 == c
+                    && match admits {
+                        Admits::Before(f) => i < f,
+                        Admits::Local(v) => *rhs == Some(*v),
+                        Admits::BeforeWitness(w) => i < w,
+                    }
+            })
         })
     {
         return None;
@@ -526,6 +642,7 @@ pub(crate) fn writes_either(
         .iter()
         .any(|(_, _, p, _)| p.field == field || p.field == count)
         || scan.out.poisoned.iter().any(|f| *f == field || *f == count)
+        || scan.out.all_poisoned
 }
 
 /// **The construction side.** For a base expression `B.F` in `owner`: the
@@ -533,11 +650,26 @@ pub(crate) fn writes_either(
 pub(crate) fn length_at<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
-    base: &'tcx Expr<'tcx>,
+    use_expr: &'tcx Expr<'tcx>,
     count_only: bool,
 ) -> Option<(String, String)> {
     let cx = Ctx { tcx, owner };
-    let place = cx.place(base)?;
+    let place = cx.place(peel(use_expr))?;
+    let def = tcx.adt_def(place.adt);
+    let field_ty = |name: Symbol| {
+        def.non_enum_variant()
+            .fields
+            .iter()
+            .find(|x| x.name == name)
+            .map(|x| tcx.type_of(x.did).instantiate_identity())
+    };
+    // Relay 107 (review 7): the count is in the FIELD's elements; a use
+    // through a cast to another pointee takes none.
+    let TyKind::RawPtr(field_pointee, _) = field_ty(place.field)?.kind() else { return None };
+    match tcx.typeck(owner).expr_ty(use_expr).kind() {
+        TyKind::RawPtr(use_pointee, _) if use_pointee == field_pointee => {}
+        _ => return None,
+    }
     // The base object is read twice; it must be free of effects.
     if place.base.contains('(') && !place.base.starts_with("(*") || place.base.contains('{') {
         return None;
@@ -547,6 +679,13 @@ pub(crate) fn length_at<'tcx>(
         return None;
     }
     let count = format!("{}.{}", place.base, proven.count);
+    // Relay 107 (review 6): a negative signed count is a valid backward
+    // witness and proves no forward extent; it renders as zero, never wrapped.
+    let count = if field_ty(proven.count)?.is_signed() {
+        format!("(({count}) as i128).max(0)")
+    } else {
+        count
+    };
     Some((
         if count_only {
             count
@@ -580,5 +719,5 @@ pub(crate) fn length_at_span(
     let body = tcx.hir_maybe_body_owned_by(owner)?;
     let mut at = At { span, found: None };
     at.visit_expr(body.value);
-    length_at(tcx, owner, peel(at.found?), true)
+    length_at(tcx, owner, at.found?, true)
 }

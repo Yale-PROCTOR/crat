@@ -16,6 +16,14 @@ fn emitted(src: &str) -> String {
     }
 }
 
+/// The seam ledger (the production producer's own rows).
+fn seams(src: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        super::seam_tsv(tcx).expect("seam receipt")
+    })
+    .expect("fixture compiles")
+}
+
 fn flat(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -77,7 +85,8 @@ pub unsafe fn set(table: *mut Ht, h: usize, k: isize) {\n\
 fn w4fc_1_an_offset_witness_sizes_a_field_by_its_sibling() {
     let out = flat(&emitted(&format!("{PRE}{GENANN}")));
     assert!(
-        out.contains("from_raw_parts((*ann).weight, ((*ann).total) as usize)"),
+        // Relay 107 (review 6): `total` is signed, so a negative count renders 0.
+        out.contains("from_raw_parts((*ann).weight, ((((*ann).total) as i128).max(0)) as usize)"),
         "{out}"
     );
 }
@@ -91,6 +100,26 @@ fn w4fc_2_an_allocation_sizes_a_field_passed_beside_its_count() {
     assert!(
         out.contains("from_raw_parts_mut((*table).entries, ((*table).capacity) as usize)"),
         "{out}"
+    );
+    // Relay 107: on the record the companion licence (the extent prover's
+    // `len-following`) answers this call first, with the same length; the
+    // field count's own seam witness is W4FC-2b.
+}
+
+/// **W4FC-2b — the field count at a seam with no count beside the field.** The
+/// callee reads `e[1]` only behind a branch, so neither a companion nor R677-6
+/// answers; the field count does (it is first in the R625 slot).
+#[test]
+fn w4fc_2b_a_field_without_a_companion_takes_its_count() {
+    let src = format!(
+        "{PRE}{HT}unsafe fn probe(e: *mut Entry, k: usize) -> i32 {{ if k > 0 {{ (*e.offset(1)).key.is_null() as i32 }} else {{ 0 }} }}\n\
+         pub unsafe fn peek(table: *mut Ht, k: usize) -> i32 {{ probe((*table).entries, k) }}\n"
+    );
+    let rows = seams(&src);
+    assert!(
+        rows.lines().any(|l| l.starts_with("placed\tprobe\t")
+            && l.contains("len-field-count:must:entries=capacity:alloc")),
+        "{rows}"
     );
 }
 
@@ -168,11 +197,10 @@ fn w4fc_3_both_forms_prove_the_pair() {
 fn w4fc_c1_a_lone_count_write_refuses() {
     let src = format!("{HT}pub unsafe fn shrink(t: *mut Ht) {{ (*t).capacity = 4; }}\n");
     assert_eq!(proven(&src, "Ht", "entries"), None);
-    let out = flat(&emitted(&format!("{PRE}{src}")));
-    assert!(
-        out.contains("from_raw_parts_mut((*table).entries, crate::FALLBACK_SLICE_EXTENT)"),
-        "{out}"
-    );
+    // Relay 107: on the record another arm (the companion licence) may size
+    // the argument; the control is that the FIELD COUNT does not answer.
+    let rows = seams(&format!("{PRE}{src}"));
+    assert!(!rows.contains("len-field-count"), "{rows}");
 }
 
 /// **W4FC-C2 — the field written with an unproven pointer refuses.**
