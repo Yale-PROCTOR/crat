@@ -319,8 +319,6 @@ mod escape_seam_tests;
 #[cfg(test)]
 mod expression_sibling_tests;
 #[cfg(test)]
-mod field_count_tests;
-#[cfg(test)]
 mod forced_cover_tests;
 #[cfg(test)]
 mod frame_bounded_tests;

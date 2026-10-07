@@ -204,12 +204,6 @@ pub(crate) enum SliceLengthSource {
     CalleeBound {
         receipt: String,
     },
-    /// **R763-2 (wave-4 build 2)** — a field whose element count is a sibling
-    /// field, proven from every write of the pair (`field_count`):
-    /// `len-field-count:must:<field>=<count>:<alloc|offset>`.
-    FieldCount {
-        receipt: String,
-    },
     Fallback,
 }
 
@@ -243,7 +237,7 @@ impl SliceLengthSource {
                     .join(";")
             ),
             Self::SiblingSize { field, sibling } => format!("sibling-size:{field}:{sibling}"),
-            Self::CalleeBound { receipt } | Self::FieldCount { receipt } => receipt.clone(),
+            Self::CalleeBound { receipt } => receipt.clone(),
             Self::Fallback => fallback_extent_receipt(),
         }
     }
@@ -1008,22 +1002,6 @@ pub(crate) fn root_extent(
     {
         return Some(length);
     }
-    // R763-2: no name pairs the field with its count, but every write of the
-    // pair establishes it (`field_count`).
-    if matches!(walked, Some(Construction::PlaceRead))
-        && let Some((expression, receipt)) = super::field_count::length_at(
-            tcx,
-            subject.fn_did,
-            tcx.hir_node(init_hir).expect_expr(),
-            false,
-        )
-    {
-        return Some(SliceLengthPlan {
-            expression,
-            source: SliceLengthSource::FieldCount { receipt },
-            provenance: Vec::new(),
-        });
-    }
     // R506-6 link (2)(i): the root is an ensure-capacity accessor's result, so
     // the extent is the sibling it maintains, read at this caller's argument.
     if matches!(walked, Some(Construction::CallResult))
@@ -1182,7 +1160,6 @@ fn bind_allocation_arguments(
         // The bound names the function's parameters, not an allocation
         // argument.
         | SliceLengthSource::CalleeBound { .. }
-        | SliceLengthSource::FieldCount { .. }
         | SliceLengthSource::Fallback => {
             return Ok((
                 Vec::new(),

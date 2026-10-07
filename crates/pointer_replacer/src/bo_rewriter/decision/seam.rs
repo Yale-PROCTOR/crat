@@ -245,9 +245,6 @@ pub(crate) enum LenEvidence {
     /// arguments. `key` is the full receipt,
     /// `len-callee-bound:<must|may>:<expr>`.
     CalleeBound { key: &'static str },
-    /// **R763-2 (wave-4 build 2)** — the argument is a field whose element
-    /// count is a proven sibling field (`field_count`), read at the same base.
-    FieldCount { key: &'static str },
 }
 
 impl LenEvidence {
@@ -262,7 +259,7 @@ impl LenEvidence {
             LenEvidence::CalleeAccess => "len-callee-access",
             LenEvidence::FieldAlloc => "len-field-alloc",
             LenEvidence::NulWalk => "len-nul-walk",
-            LenEvidence::CalleeBound { key } | LenEvidence::FieldCount { key } => key,
+            LenEvidence::CalleeBound { key } => key,
         }
     }
 }
@@ -5883,8 +5880,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         | LenEvidence::CalleeAccess
                         | LenEvidence::FieldAlloc
                         | LenEvidence::NulWalk
-                        | LenEvidence::CalleeBound { .. }
-                        | LenEvidence::FieldCount { .. } => None,
+                        | LenEvidence::CalleeBound { .. } => None,
                     }
                     .filter(|index| {
                         arm == LenEvidence::Contract
@@ -6116,60 +6112,36 @@ pub(crate) fn synthesize_with_raw_boundary(
                             Some(elements) => {
                                 (Some(elements.to_string()), Some(LenEvidence::ArrayType))
                             }
-                            // **R763-2** (first, R780-2 / R788-5) — a struct field
-                            // whose element count is a sibling field, proven from
-                            // every write of the pair (`field_count`).
-                            None => match site
-                                .args
-                                .iter()
-                                .find(|argument| argument.index == pos.index)
-                                .and_then(|argument| {
-                                    super::field_count::length_at_span(
-                                        tcx,
-                                        site.caller,
-                                        argument.span,
-                                    )
-                                }) {
-                                Some((text, key)) => (
-                                    Some(text),
-                                    Some(LenEvidence::FieldCount {
-                                        key: super::callee_bound::intern(key),
-                                    }),
-                                ),
-                                // **R677-6** — nor an array: the callee's own
-                                // straight-line accesses, where they prove one
-                                // (`element_extent`), rather than the fabricated extent.
-                                None => match super::element_extent::constant_access_extent(
-                                    tcx, *callee, pos.index,
-                                ) {
-                                    Some(elements) => (
-                                        Some(elements.to_string()),
-                                        Some(LenEvidence::CalleeAccess),
-                                    ),
-                                    // wave-6l relay 071 (R697-7): nor a constant
-                                    // access extent: a licensed field's allocation
-                                    // length, read from the same object.
-                                    None => match site
-                                        .args
-                                        .iter()
-                                        .find(|argument| argument.index == pos.index)
-                                        .and_then(|argument| {
-                                            table
-                                                .field_alloc_lengths
-                                                .get(&(site.caller, argument.span))
-                                        }) {
-                                        Some(length) => {
-                                            (Some(length.clone()), Some(LenEvidence::FieldAlloc))
+                            // **R677-6** — nor an array: the callee's own
+                            // straight-line accesses, where they prove one
+                            // (`element_extent`), rather than the fabricated extent.
+                            None => match super::element_extent::constant_access_extent(
+                                tcx, *callee, pos.index,
+                            ) {
+                                Some(elements) => {
+                                    (Some(elements.to_string()), Some(LenEvidence::CalleeAccess))
+                                }
+                                // wave-6l relay 071 (R697-7): nor a constant
+                                // access extent: a licensed field's allocation
+                                // length, read from the same object.
+                                None => match site
+                                    .args
+                                    .iter()
+                                    .find(|argument| argument.index == pos.index)
+                                    .and_then(|argument| {
+                                        table.field_alloc_lengths.get(&(site.caller, argument.span))
+                                    }) {
+                                    Some(length) => {
+                                        (Some(length.clone()), Some(LenEvidence::FieldAlloc))
+                                    }
+                                    // wave-6l relay 077 (R776-4): nor a field's
+                                    // allocation: a C string's `strlen + 1`.
+                                    None => match &nul_walk_len {
+                                        Some(len) => {
+                                            nul_walk_used.set(true);
+                                            (Some(len.clone()), Some(LenEvidence::NulWalk))
                                         }
-                                        // wave-6l relay 077 (R776-4): nor a field's
-                                        // allocation: a C string's `strlen + 1`.
-                                        None => match &nul_walk_len {
-                                            Some(len) => {
-                                                nul_walk_used.set(true);
-                                                (Some(len.clone()), Some(LenEvidence::NulWalk))
-                                            }
-                                            None => (None, len_evidence),
-                                        },
+                                        None => (None, len_evidence),
                                     },
                                 },
                             },
