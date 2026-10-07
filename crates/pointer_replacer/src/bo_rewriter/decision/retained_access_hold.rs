@@ -260,39 +260,31 @@ fn pointer_arithmetic(tcx: TyCtxt<'_>, callee: rustc_hir::def_id::DefId) -> bool
     )
 }
 
-/// A local that may hold the subject's value: a pointer, or anything but a scalar (a
-/// comparison's `bool`, a length's integer are other values, R2-4; an address made an
-/// integer is carried by its cast).
-fn may_carry(ty: rustc_middle::ty::Ty<'_>) -> bool {
-    ty.is_any_ptr() || !ty.is_scalar()
+/// A local that may hold the subject's value: a pointer, an integer (an address made an
+/// integer, and what arithmetic makes of it: the check's family carries it, the stand-in
+/// review's round 3, R3-4), or anything but a scalar; not a comparison's `bool`. A call's
+/// result carries it only as a pointer or an aggregate (R2-4).
+fn may_carry(ty: rustc_middle::ty::Ty<'_>, at_call: bool) -> bool {
+    ty.is_any_ptr() || !ty.is_scalar() || (!at_call && ty.is_integral())
 }
 
-/// The in-program formals a subject's value reaches at calls of its own function, read
-/// from MIR (the stand-in review's MED-1: copies, casts, borrows, aggregates and call
-/// results carry it; a value loaded through a carrier is another value, R2-4): `None`
-/// where a carrier reaches a call no program formal receives (a foreign callee, an
-/// aggregate argument, a position that is no subject), but a raw pointer's own
-/// arithmetic.
-fn receiving_formals(
-    tcx: TyCtxt<'_>,
-    function: LocalDefId,
-    local: Local,
-    formal_of: &FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)>,
-) -> Option<Vec<(LocalDefId, HirId)>> {
-    let body = tcx
-        .mir_drops_elaborated_and_const_checked(function)
-        .borrow();
+/// Whether an operand reads a carrier's own value (a value loaded through a carrier is
+/// another value, R2-4).
+fn reads(operand: &Operand<'_>, carriers: &FxHashSet<Local>) -> bool {
+    operand.place().is_some_and(|place| {
+        carriers.contains(&place.local)
+            && !place
+                .projection
+                .iter()
+                .any(|elem| matches!(elem, ProjectionElem::Deref))
+    })
+}
+
+/// The locals of `body` that carry the value of `local`, read from MIR (the stand-in
+/// review's MED-1: copies, casts, borrows, aggregates and call results).
+fn carriers(body: &Body<'_>, local: Local) -> FxHashSet<Local> {
     let mut carriers: FxHashSet<Local> = FxHashSet::default();
     carriers.insert(local);
-    let reads = |operand: &Operand<'_>, carriers: &FxHashSet<Local>| {
-        operand.place().is_some_and(|place| {
-            carriers.contains(&place.local)
-                && !place
-                    .projection
-                    .iter()
-                    .any(|elem| matches!(elem, ProjectionElem::Deref))
-        })
-    };
     loop {
         let before = carriers.len();
         for data in body.basic_blocks.iter() {
@@ -303,7 +295,8 @@ fn receiving_formals(
                 let carries = match &assign.1 {
                     Rvalue::Use(operand)
                     | Rvalue::Cast(_, operand, _)
-                    | Rvalue::Repeat(operand, _) => reads(operand, &carriers),
+                    | Rvalue::Repeat(operand, _)
+                    | Rvalue::UnaryOp(_, operand) => reads(operand, &carriers),
                     // A borrow into a carrier's referent points into the subject's object.
                     Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
                         carriers.contains(&place.local)
@@ -317,11 +310,7 @@ fn receiving_formals(
                     }
                     _ => false,
                 };
-                let exposed = matches!(
-                    assign.1,
-                    Rvalue::Cast(rustc_middle::mir::CastKind::PointerExposeProvenance, ..)
-                );
-                if carries && (exposed || may_carry(body.local_decls[assign.0.local].ty)) {
+                if carries && may_carry(body.local_decls[assign.0.local].ty, false) {
                     carriers.insert(assign.0.local);
                 }
             }
@@ -330,7 +319,7 @@ fn receiving_formals(
                     args, destination, ..
                 } = &terminator.kind
                 && args.iter().any(|argument| reads(&argument.node, &carriers))
-                && may_carry(body.local_decls[destination.local].ty)
+                && may_carry(body.local_decls[destination.local].ty, true)
             {
                 carriers.insert(destination.local);
             }
@@ -339,7 +328,26 @@ fn receiving_formals(
             break;
         }
     }
-    let mut found = Vec::new();
+    carriers
+}
+
+/// One call a carrier reaches: its span, its callee (`None` through a pointer), whether
+/// it may enter a program function (a direct call to one, or any call through a
+/// pointer), and the argument positions carrying the value; a raw pointer's own
+/// arithmetic is no such call.
+struct CarriedCall {
+    span: Span,
+    callee: Option<rustc_hir::def_id::DefId>,
+    in_program: bool,
+    arguments: Vec<usize>,
+}
+
+fn carried_calls(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+    carriers: &FxHashSet<Local>,
+) -> Vec<CarriedCall> {
+    let mut calls = Vec::new();
     for data in body.basic_blocks.iter() {
         let Some(terminator) = &data.terminator else {
             continue;
@@ -347,16 +355,45 @@ fn receiving_formals(
         let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
             continue;
         };
-        for (index, argument) in args.iter().enumerate() {
-            if !reads(&argument.node, &carriers) {
-                continue;
-            }
-            let (callee, _) = func.const_fn_def()?;
-            match callee.as_local() {
-                Some(callee) => found.push(*formal_of.get(&(callee, index))?),
-                None if pointer_arithmetic(tcx, callee) => {}
-                None => return None,
-            }
+        let callee = func.const_fn_def().map(|(callee, _)| callee);
+        if callee
+            .is_some_and(|callee| callee.as_local().is_none() && pointer_arithmetic(tcx, callee))
+        {
+            continue;
+        }
+        let arguments: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| reads(&argument.node, carriers))
+            .map(|(index, _)| index)
+            .collect();
+        if !arguments.is_empty() {
+            calls.push(CarriedCall {
+                span: terminator.source_info.span,
+                callee,
+                in_program: callee.is_none_or(|callee| {
+                    callee.as_local().is_some() && !tcx.is_foreign_item(callee)
+                }),
+                arguments,
+            });
+        }
+    }
+    calls
+}
+
+/// The in-program formals a subject's value reaches at calls of its own function:
+/// `None` where a carrier reaches a call no program formal receives (a foreign callee, an
+/// aggregate argument, a position that is no subject), but a raw pointer's own
+/// arithmetic.
+fn receiving_formals(
+    calls: &[CarriedCall],
+    formal_of: &FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)>,
+) -> Option<Vec<(LocalDefId, HirId)>> {
+    let mut found = Vec::new();
+    for call in calls {
+        let callee = call.callee?.as_local()?;
+        for index in &call.arguments {
+            found.push(*formal_of.get(&(callee, *index))?);
         }
     }
     (!found.is_empty()).then_some(found)
@@ -376,15 +413,17 @@ fn reference_family(decision: &Decision) -> bool {
     }
 }
 
-/// Filter 2's reading of one site: a retention disposition (the tier-2 waiver where a
-/// bridge renders, the stand-in review's R2-2; positive retention; an unconfirmed waiver)
-/// at a site passing the subject's own value (`bare-local`, `cast-of-local`; a pointer
-/// loaded through the subject is another value: HIGH-3). A bridge's feasibility block is
-/// no retention reading.
+/// Filter 2's reading of one site: a retention disposition (the tier-2 waiver, positive
+/// retention, an unconfirmed waiver) where a bridge renders (R878-1 (B): "at sites passing
+/// the subject's bridge"; the stand-in review's R2-2, R3-2: a block at a converting target
+/// renders nothing and degrades nothing), at a site passing the subject's own value
+/// (`bare-local`, `cast-of-local`; a pointer loaded through the subject is another value:
+/// HIGH-3). A bridge's feasibility block is no retention reading.
 fn reads_retention(disposition: &RawBoundaryDisposition, site: &RawBoundaryRenderSite) -> bool {
-    matches!(site.source_shape, "bare-local" | "cast-of-local")
+    site.target_stays_raw
+        && matches!(site.source_shape, "bare-local" | "cast-of-local")
         && match disposition {
-            RawBoundaryDisposition::T2 { .. } => site.target_stays_raw,
+            RawBoundaryDisposition::T2 { .. } => true,
             RawBoundaryDisposition::Blocked { reason, .. } => match reason {
                 RawBoundaryBlockReason::PositiveRetention
                 | RawBoundaryBlockReason::WaiverUnconfirmed => true,
@@ -405,36 +444,19 @@ fn reads_retention(disposition: &RawBoundaryDisposition, site: &RawBoundaryRende
         }
 }
 
-/// Filter 2: what the tier read of the subject's retention at its own sites.
-struct TierReading {
-    /// The calls at which the tier read it (their spans).
-    calls: FxHashSet<Span>,
-    /// Every site handing the subject to an in-program callee is such a reading (and
-    /// there is one).
-    local_callees: bool,
-}
-
+/// Filter 2: the (call, argument) positions at which the tier read the subject's
+/// retention at its own sites.
 fn tier_reading(
     raw_boundary: &RawBoundaryDispositionIndex,
     node: (LocalDefId, HirId),
-) -> TierReading {
-    let own: Vec<_> = raw_boundary
+) -> FxHashSet<(Span, usize)> {
+    raw_boundary
         .inventoried_sites()
-        .filter(|(_, _, site)| site.node == Some(node))
-        .map(|(_, disposition, site)| (reads_retention(disposition, site), site))
-        .collect();
-    let mut local = own
-        .iter()
-        .filter(|(_, site)| site.callee_local.is_some())
-        .peekable();
-    TierReading {
-        calls: own
-            .iter()
-            .filter(|(reads, _)| *reads)
-            .map(|(_, site)| site.call_span)
-            .collect(),
-        local_callees: local.peek().is_some() && local.all(|(reads, _)| *reads),
-    }
+        .filter(|(_, disposition, site)| {
+            site.node == Some(node) && reads_retention(disposition, site)
+        })
+        .map(|(key, _, site)| (site.call_span, key.argument_index))
+        .collect()
 }
 
 /// The span of the call a hold is sited at (the check derives a foreign call's keeping
@@ -451,22 +473,44 @@ fn call_at(tcx: TyCtxt<'_>, (function, block, statement): (u32, u32, usize)) -> 
     matches!(terminator.kind, TerminatorKind::Call { .. }).then_some(terminator.source_info.span)
 }
 
-/// Filter 2, per hold (the stand-in review's round 2, R2-1): the tier's reading stands for
-/// the retention its site reads — a store the check derives at that call, a callee's
-/// store where every in-program callee site reads retention. Never a self-reference or a
-/// cycle (an access hold), never the subject's own store into memory.
-fn tier_stands(tcx: TyCtxt<'_>, tier: &TierReading, hold: &Hold) -> bool {
+/// Filter 2, per hold (the stand-in review's round 2, R2-1; round 3, R3-1): the tier's
+/// reading stands for the retention it reads, at the call and the argument it reads it —
+/// a store the check derives at a call, where every argument carrying the subject there is
+/// such a reading; a callee's store, at its call when the check sites it, else at every
+/// call the subject's value reaches that may enter a program function (the check's
+/// callee store reads program formals only; a foreign callee's keeping is its own hold at
+/// that call). Never a self-reference or a cycle (an access hold), never the subject's own
+/// store into memory.
+fn tier_stands(
+    tcx: TyCtxt<'_>,
+    reading: &FxHashSet<(Span, usize)>,
+    calls: &[CarriedCall],
+    hold: &Hold,
+) -> bool {
+    let covered = |span: Span| {
+        let mut at = calls.iter().filter(|call| call.span == span).peekable();
+        at.peek().is_some()
+            && at.all(|call| {
+                call.arguments
+                    .iter()
+                    .all(|index| reading.contains(&(span, *index)))
+            })
+    };
     hold.kind == HoldKind::DerivedStore
-        && match hold.dest {
-            StoreDest::Callee => tier.local_callees,
-            StoreDest::None
-            | StoreDest::Field(..)
-            | StoreDest::ArrayInField(..)
-            | StoreDest::ArrayLocal(_)
-            | StoreDest::Other => hold
-                .site
-                .and_then(|site| call_at(tcx, site))
-                .is_some_and(|span| tier.calls.contains(&span)),
+        && match (hold.dest, hold.site) {
+            (StoreDest::Callee, None) => {
+                let mut program = calls.iter().filter(|call| call.in_program).peekable();
+                program.peek().is_some() && program.all(|call| covered(call.span))
+            }
+            (_, Some(site)) => call_at(tcx, site).is_some_and(covered),
+            (
+                StoreDest::None
+                | StoreDest::Field(..)
+                | StoreDest::ArrayInField(..)
+                | StoreDest::ArrayLocal(_)
+                | StoreDest::Other,
+                None,
+            ) => false,
         }
 }
 
@@ -479,8 +523,12 @@ pub(crate) fn holds(
     lifetime: &LifetimeEligibility,
 ) -> Vec<((LocalDefId, HirId), DegradeReason)> {
     let delivered = Delivered::of(tcx, table);
-    // Each candidate's holds left after filter 3's place readings.
-    let mut candidates: Vec<((LocalDefId, HirId), Local, Vec<Hold>)> = Vec::new();
+    // Each candidate's holds left after filter 3's place readings, whether it is a
+    // formal, and the calls its value reaches.
+    let mut candidates: Vec<((LocalDefId, HirId), bool, Vec<CarriedCall>, Vec<Hold>)> = Vec::new();
+    // The subjects a hold of which the tier's reading stands for (at their own bridged
+    // sites).
+    let mut waived: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
     for (subject, decision) in &table.entries {
         if !reference_family(decision) {
             continue;
@@ -504,10 +552,22 @@ pub(crate) fn holds(
             Verdict::Held(holds) => holds,
             Verdict::Clear | Verdict::Unknown => continue,
         };
-        let tier = tier_reading(raw_boundary, node);
+        let reading = tier_reading(raw_boundary, node);
+        let calls = {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(subject.fn_did)
+                .borrow();
+            carried_calls(tcx, &body, &carriers(&body, subject.local))
+        };
+        if holds
+            .iter()
+            .any(|hold| tier_stands(tcx, &reading, &calls, hold))
+        {
+            waived.insert(node);
+        }
         let kept: Vec<_> = holds
             .iter()
-            .filter(|hold| !tier_stands(tcx, &tier, hold))
+            .filter(|hold| !tier_stands(tcx, &reading, &calls, hold))
             .filter(|hold| {
                 !(hold.kind == HoldKind::DerivedStore
                     && match hold.dest {
@@ -532,7 +592,8 @@ pub(crate) fn holds(
             .cloned()
             .collect();
         if !kept.is_empty() {
-            candidates.push((node, subject.local, kept));
+            let formal = matches!(subject.kind, SubjectKind::Param { .. });
+            candidates.push((node, formal, calls, kept));
         }
     }
     // **A callee that keeps what it is passed** (154a §2.1: the callee formal's own
@@ -540,9 +601,11 @@ pub(crate) fn holds(
     // the subject's value reaches is delivered and not held itself — its own stores are
     // then into delivered places. Read to a fixpoint from all held, so an exemption rests
     // only on formals shown not held; a value reaching a call no program formal receives
-    // stays held. A formal whose only holds the tier reads at its own bridging site is not
-    // held for its callers: the pointer a callee keeps is derived from that formal's own
-    // reference, whatever its callers are, and that site's receipt names it.
+    // stays held. A receiver whose holds the tier reads at its own bridged site is not held
+    // for a local's release (the kept pointer is derived from the receiver's own
+    // reference, and that site's receipt names it), but it is for a formal's: a formal is
+    // protected for its call, and what the receiver's callee keeps may be freed before the
+    // formal's call returns (the stand-in review's round 3, R3-2).
     let decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = table
         .entries
         .iter()
@@ -559,24 +622,29 @@ pub(crate) fn holds(
             SubjectKind::Local => None,
         })
         .collect();
-    let receivers: FxHashMap<(LocalDefId, HirId), Option<Vec<(LocalDefId, HirId)>>> = candidates
-        .iter()
-        .filter(|(_, _, kept)| {
-            kept.iter()
-                .all(|hold| hold.kind == HoldKind::DerivedStore && hold.dest == StoreDest::Callee)
-        })
-        .map(|(node, local, _)| (*node, receiving_formals(tcx, node.0, *local, &formal_of)))
-        .collect();
+    let receivers: FxHashMap<(LocalDefId, HirId), (bool, Option<Vec<(LocalDefId, HirId)>>)> =
+        candidates
+            .iter()
+            .filter(|(_, _, _, kept)| {
+                kept.iter().all(|hold| {
+                    hold.kind == HoldKind::DerivedStore && hold.dest == StoreDest::Callee
+                })
+            })
+            .map(|(node, formal, calls, _)| {
+                (*node, (*formal, receiving_formals(calls, &formal_of)))
+            })
+            .collect();
     let mut held: FxHashSet<(LocalDefId, HirId)> =
-        candidates.iter().map(|(node, _, _)| *node).collect();
+        candidates.iter().map(|(node, _, _, _)| *node).collect();
     loop {
         let released: Vec<_> = receivers
             .iter()
-            .filter(|(node, formals)| {
+            .filter(|(node, (is_formal, formals))| {
                 held.contains(*node)
                     && formals.as_ref().is_some_and(|formals| {
                         formals.iter().all(|formal| {
                             !held.contains(formal)
+                                && !(*is_formal && waived.contains(formal))
                                 && decision_of.get(formal).is_some_and(|d| reference_family(d))
                         })
                     })
@@ -591,7 +659,7 @@ pub(crate) fn holds(
         }
     }
     let mut out = Vec::new();
-    for (node, _, kept) in candidates {
+    for (node, _, _, kept) in candidates {
         if !held.contains(&node) {
             continue;
         }
