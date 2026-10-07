@@ -5859,17 +5859,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 .count_companions(*callee, pos.index)
                                 .contains(index)
                     });
-                    // A CALL in the spelling (`f(`, `size_of::<T>(`) is the
-                    // hazard; grouping parentheses are not.
-                    let licensed_spelling =
-                        |text: &str| {
-                            arm != LenEvidence::Contract
-                                || !text.match_indices('(').any(|(at, _)| {
-                                    text[..at].trim_end().chars().next_back().is_some_and(|c| {
-                                        c.is_alphanumeric() || c == '_' || c == '>'
-                                    })
-                                })
-                        };
+                    // A CALL in the spelling (`f(`, `(next)(`, `size_of::<T>(`)
+                    // is the hazard on every companion arm: the length repeats
+                    // the argument's text, so a call in it would run twice
+                    // (R884-3 item 3, wave-4's `r107_cb8`). Grouping
+                    // parentheses are not a call.
+                    let licensed_spelling = |text: &str| {
+                        !text.match_indices('(').any(|(at, _)| {
+                            text[..at].trim_end().chars().next_back().is_some_and(|c| {
+                                c.is_alphanumeric() || c == '_' || c == '>' || c == ')'
+                            })
+                        })
+                    };
                     // **R477-6 — the masked companion licenses `+ 1`.** Where
                     // the chain proved the companion MASKS the accessing
                     // callee's indexes (`data.offset((ix & mask))`), every
