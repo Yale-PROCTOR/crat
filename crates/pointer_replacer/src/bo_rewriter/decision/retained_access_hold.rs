@@ -235,27 +235,29 @@ fn store_into_output_slot(
 /// the value there and nothing keeps it; the result is carried (the stand-in review's
 /// round 2, R2-4).
 fn pointer_arithmetic(tcx: TyCtxt<'_>, callee: rustc_hir::def_id::DefId) -> bool {
-    let path = tcx.def_path_str(callee);
-    (path.starts_with("core::ptr::const_ptr::") || path.starts_with("core::ptr::mut_ptr::"))
-        && matches!(
-            tcx.item_name(callee).as_str(),
-            "is_null"
-                | "offset"
-                | "wrapping_offset"
-                | "add"
-                | "sub"
-                | "wrapping_add"
-                | "wrapping_sub"
-                | "byte_offset"
-                | "byte_add"
-                | "byte_sub"
-                | "offset_from"
-                | "cast"
-                | "cast_mut"
-                | "cast_const"
-                | "addr"
-                | "is_aligned"
-        )
+    // An inherent method of a raw pointer (only `core` defines those, by coherence).
+    tcx.impl_of_method(callee).is_some_and(|parent| {
+        tcx.trait_id_of_impl(parent).is_none()
+            && tcx.type_of(parent).instantiate_identity().is_raw_ptr()
+    }) && matches!(
+        tcx.item_name(callee).as_str(),
+        "is_null"
+            | "offset"
+            | "wrapping_offset"
+            | "add"
+            | "sub"
+            | "wrapping_add"
+            | "wrapping_sub"
+            | "byte_offset"
+            | "byte_add"
+            | "byte_sub"
+            | "offset_from"
+            | "cast"
+            | "cast_mut"
+            | "cast_const"
+            | "addr"
+            | "is_aligned"
+    )
 }
 
 /// A local that may hold the subject's value: a pointer, or anything but a scalar (a
@@ -488,12 +490,19 @@ pub(crate) fn holds(
             SubjectKind::Param { .. } => check.formal(subject.fn_did, subject.local.as_usize()),
             SubjectKind::Local => check.local(subject.fn_did, subject.local),
         };
+        // era-5c 158a (relay 305): the check's own guard on the applied field transactions
+        // first — a hold through a field this table delivers goes — then the three filters.
         // The mode of record holds by the evident shapes; an `Unknown` verdict (an
         // unmodelled kind) has no evident receipt and stands under P9, as the hook of
         // record read it.
-        let holds = match verdict {
-            Some(Verdict::Held(holds)) => holds,
-            Some(Verdict::Clear | Verdict::Unknown) | None => continue,
+        let Some(verdict) = verdict else {
+            continue;
+        };
+        let holds = match check.after_deliveries(verdict, &|struct_index, field_index| {
+            delivered.fields.contains(&(struct_index, field_index))
+        }) {
+            Verdict::Held(holds) => holds,
+            Verdict::Clear | Verdict::Unknown => continue,
         };
         let tier = tier_reading(raw_boundary, node);
         let kept: Vec<_> = holds
