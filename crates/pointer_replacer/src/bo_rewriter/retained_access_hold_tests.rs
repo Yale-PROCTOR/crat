@@ -118,3 +118,52 @@ fn r864_3_filter2_the_tiers_disposition_stands() {
     let d = decisions(&format!("{ALLOW}{RETAINED}"));
     assert!(!held(&d, "caller::buf"), "{d:#?}");
 }
+
+/// The stand-in review's round 2, R2-1 (relay 304, R878-1: E2 / E3 are never exempt):
+/// filter 2 is a reading of one site's retention, not of the subject. A foreign call at
+/// the subject's own site that the tier waives (`trace`: retention unknown, the tier-2
+/// waiver) must not exempt the self-reference the check names (the positive control
+/// plus that one call).
+const SELF_REFERENCE_TRACED: &str = r#"
+extern "C" { fn trace(p: *mut core::ffi::c_void); }
+#[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
+pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
+pub unsafe fn append(v: *mut small_vec, x: u64) {
+    trace(v as *mut core::ffi::c_void);
+    *(*v).p.offset((*v).n as isize) = x;
+    *((*v).p as *mut u8) = 0;
+    (*v).n += 1;
+}
+pub unsafe fn run(v: *mut small_vec) { init(v); append(v, 1); }
+"#;
+
+#[test]
+fn r864_3_round2_a_waived_site_does_not_exempt_a_self_reference() {
+    let d = decisions(&format!("{ALLOW}{SELF_REFERENCE_TRACED}"));
+    assert!(held(&d, "append::v"), "{d:#?}");
+    assert!(d["append::v"].contains("evident:self-reference"), "{d:#?}");
+}
+
+/// R2-1's second shape: the subject's own derived store into a field the rewriter keeps
+/// raw (a place expression's address: wave-6f's `store-source-raw-expression`) is a
+/// retained raw pointer whatever the tier read at another of the subject's calls.
+const OWN_STORE_TRACED: &str = r#"
+extern "C" { fn trace(p: *mut core::ffi::c_void); }
+#[repr(C)] pub struct S { pub x: i32, pub y: i32 }
+#[repr(C)] pub struct H { pub f: *mut i32 }
+pub unsafe fn bind(h: *mut H, s: *mut S) {
+    trace(s as *mut core::ffi::c_void);
+    (*h).f = &mut (*s).x;
+}
+pub unsafe fn bump(h: *mut H) { *(*h).f += 1; }
+pub unsafe fn run(h: *mut H, s: *mut S) { bind(h, s); (*s).x = 0; bump(h); }
+"#;
+
+#[test]
+fn r864_3_round2_a_waived_site_does_not_exempt_an_own_store() {
+    let d = decisions(&format!("{ALLOW}{OWN_STORE_TRACED}"));
+    assert!(
+        !d["bind::s"].starts_with("Ref") && !d["bind::s"].starts_with("InferredRef"),
+        "{d:#?}"
+    );
+}
