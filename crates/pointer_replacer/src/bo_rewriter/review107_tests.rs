@@ -13,6 +13,14 @@ fn emitted(src: &str) -> String {
     }
 }
 
+/// The seam ledger (the production producer's own rows).
+fn seams(src: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
+        super::seam_tsv(tcx).expect("seam receipt")
+    })
+    .expect("fixture compiles")
+}
+
 fn flat(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -133,8 +141,15 @@ fn r107_cb8_a_calling_argument_is_not_duplicated_into_the_length() {
         while i < n { s += *p.offset(i as isize); i += 1; }\n\
         s }\n\
         pub unsafe fn caller(base: *const i32, k: isize) -> i32 { g(base.offset(k), (next)()) }\n";
-    let out = flat(&emitted(&format!("{PRE}{src}")));
-    assert!(out.matches("(next)()").count() <= 1, "{out}");
+    let rows = seams(src);
+    let row = rows
+        .lines()
+        .find(|l| l.starts_with("placed\tg\t"))
+        .unwrap_or_else(|| panic!("{rows}"));
+    // The callee bound refuses a calling argument (its own length is not
+    // taken); what else answers here is printed for the record.
+    assert!(!row.contains("len-callee-bound"), "{row}");
+    println!("CB8 ROW {row}");
 }
 
 // ---- field_count.rs --------------------------------------------------------

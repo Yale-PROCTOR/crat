@@ -259,7 +259,7 @@ pub(crate) fn pure_argument_text(text: &str) -> bool {
             }
             // A call — except the integer `wrapping_*` methods, which read
             // nothing but their operands.
-            '(' if word(prev) || prev == Some('>') => {
+            '(' if word(prev) || matches!(prev, Some('>' | ')' | ']')) => {
                 let name = chars[..i]
                     .iter()
                     .rev()
@@ -302,6 +302,14 @@ fn effect_free_text(text: &str) -> bool {
                 }
             }
             '(' => {
+                // Relay 107 (review 8b): `(f)()` / `t[k]()` call through a
+                // parenthesized or indexed callee.
+                if matches!(
+                    chars[..i].iter().rev().find(|c| !c.is_whitespace()),
+                    Some(')' | ']')
+                ) {
+                    return false;
+                }
                 let name = chars[..i]
                     .iter()
                     .rev()
@@ -552,6 +560,27 @@ impl<'tcx> Visitor<'tcx> for Writes {
 struct LoopFrame<'tcx> {
     body: &'tcx rustc_hir::Block<'tcx>,
     conjuncts: Vec<&'tcx Expr<'tcx>>,
+    /// Relay 107 (review 1a): the body can leave the loop before its
+    /// condition fails (`break`, `return`), so the counter need not reach the
+    /// limit and the limit proves no extent.
+    exits: bool,
+}
+
+/// Does `body` contain a `break` or a `return` anywhere (nested loops
+/// included: a labelled `break` may leave this one)?
+fn leaves_early(body: &rustc_hir::Block<'_>) -> bool {
+    struct V(bool);
+    impl<'v> Visitor<'v> for V {
+        fn visit_expr(&mut self, e: &'v Expr<'v>) {
+            if matches!(e.kind, ExprKind::Break(..) | ExprKind::Ret(..)) {
+                self.0 = true;
+            }
+            intravisit::walk_expr(self, e)
+        }
+    }
+    let mut v = V(false);
+    v.visit_block(body);
+    v.0
 }
 
 struct Walk<'a, 'b, 'tcx> {
@@ -649,25 +678,17 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                     _ => None,
                 }
             }
+            // Relay 107 (review 2b): a wrapping sum equals the sum only where
+            // it cannot wrap; below 64 bits it can, for sizes a program uses.
             ExprKind::MethodCall(segment, receiver, [arg], _)
-                if segment.ident.name.as_str() == "wrapping_add" =>
+                if segment.ident.name.as_str() == "wrapping_add"
+                    && int_info(self.a.tcx, self.typeck().expr_ty(e))
+                        .is_some_and(|t| t.0 >= 64) =>
             {
                 Some(self.value(receiver)?.plus(&self.value(arg)?, 1))
             }
             _ => None,
         }
-    }
-
-    /// An upper bound on a LOOP-BOUND expression `X`: over-approximation is
-    /// sound here, so casts that can only shrink the value are admitted.
-    fn upper(&self, e: &'tcx Expr<'tcx>) -> Option<Lin> {
-        let e = peel_parens(e);
-        if let ExprKind::Cast(inner, _) = e.kind {
-            let from = int_info(self.a.tcx, self.typeck().expr_ty(inner))?;
-            let to = int_info(self.a.tcx, self.typeck().expr_ty(e))?;
-            return never_increases(from, to).then(|| self.upper(inner))?;
-        }
-        self.value(e)
     }
 
     /// `ub(idx)`: a linear expression `L` with `idx < L` at the access.
@@ -710,7 +731,9 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                 }
             }
             ExprKind::MethodCall(segment, receiver, [arg], _)
-                if segment.ident.name.as_str() == "wrapping_add" =>
+                if segment.ident.name.as_str() == "wrapping_add"
+                    && int_info(self.a.tcx, self.typeck().expr_ty(idx))
+                        .is_some_and(|t| t.0 >= 64) =>
             {
                 Some(self.index_bound(receiver, at)?.plus(&self.value(arg)?, 1))
             }
@@ -729,6 +752,9 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
         }
         for frame in self.loops.iter().rev() {
             let mut found = None;
+            // Relay 107 (review 1b): a second conjunct can end the loop before
+            // the counter reaches the limit; only `while i < X` alone is exact.
+            let sole = frame.conjuncts.len() == 1;
             for c in &frame.conjuncts {
                 let ExprKind::Binary(op, l, r) = peel_parens(c).kind else { continue };
                 let (var, x, inclusive) = match op.node {
@@ -741,7 +767,10 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                 if !self.is_counter(var, i) {
                     continue;
                 }
-                let Some(x) = self.upper(x) else { continue };
+                // Relay 107 (review 2a): the limit is taken EXACTLY (`value`):
+                // a cast that can shrink it would make the bound larger than
+                // the loop's own extent.
+                let Some(x) = self.value(x) else { continue };
                 found = Some(if inclusive {
                     x.plus(&Lin::constant(1), 1)
                 } else {
@@ -750,6 +779,9 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                 break;
             }
             let Some(bound) = found else { continue };
+            if !sole || frame.exits {
+                return None;
+            }
             // Position of the top-level statement containing `at`.
             let contains = |stmt: &rustc_hir::Stmt<'_>, id: HirId| {
                 tcx.hir_parent_id_iter(id).any(|p| p == stmt.hir_id)
@@ -780,10 +812,48 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                     (None, Some(_)) if is_tail => {}
                     _ => return None,
                 }
+                // Relay 107: the counter steps by exactly one, so it reaches
+                // the limit's last index (a larger step can skip it).
+                if !Self::steps_by_one(tcx.hir_node(*assignment), i) {
+                    return None;
+                }
             }
             return Some(bound);
         }
         None
+    }
+
+    /// `i += 1`, `i = i + 1` or `i = i.wrapping_add(1)` (casts of `1` peeled).
+    fn steps_by_one(node: Node<'_>, i: HirId) -> bool {
+        let Node::Expr(e) = node else { return false };
+        let one = |e: &Expr<'_>| {
+            let mut e = peel_parens(e);
+            while let ExprKind::Cast(inner, _) = e.kind {
+                e = peel_parens(inner);
+            }
+            literal(e) == Some(1)
+        };
+        match e.kind {
+            ExprKind::AssignOp(op, lhs, rhs) => {
+                op.node == rustc_hir::AssignOpKind::AddAssign
+                    && local_of(peel_parens(lhs)) == Some(i)
+                    && one(rhs)
+            }
+            ExprKind::Assign(lhs, rhs, _) if local_of(peel_parens(lhs)) == Some(i) => {
+                match peel_parens(rhs).kind {
+                    ExprKind::Binary(op, l, r) => {
+                        op.node == BinOpKind::Add && local_of(peel_parens(l)) == Some(i) && one(r)
+                    }
+                    ExprKind::MethodCall(segment, receiver, [arg], _) => {
+                        segment.ident.name.as_str() == "wrapping_add"
+                            && local_of(peel_parens(receiver)) == Some(i)
+                            && one(arg)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// `var` is the counter `i` itself, or `i` under a value-preserving cast.
@@ -883,16 +953,6 @@ fn value_preserving(from: (u64, Sign), to: (u64, Sign)) -> bool {
     }
 }
 
-/// Casting can only keep or DECREASE the value (as a bound, over-approximated
-/// by the uncast operand): any unsigned source, or a widening signed one.
-fn never_increases(from: (u64, Sign), to: (u64, Sign)) -> bool {
-    match (from.1, to.1) {
-        (Sign::Unsigned, _) => true,
-        (Sign::Signed, Sign::Signed) => to.0 >= from.0,
-        (Sign::Signed, Sign::Unsigned) => false,
-    }
-}
-
 fn offset_call<'tcx>(e: &'tcx Expr<'tcx>) -> Option<(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>)> {
     match e.kind {
         ExprKind::MethodCall(segment, receiver, [arg], _)
@@ -932,7 +992,12 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                         }
                     }
                     self.visit_expr(cond);
-                    self.loops.push(LoopFrame { body, conjuncts });
+                    let exits = leaves_early(body);
+                    self.loops.push(LoopFrame {
+                        body,
+                        conjuncts,
+                        exits,
+                    });
                     self.visit_block(body);
                     self.loops.pop();
                     return;
@@ -940,6 +1005,7 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                 self.loops.push(LoopFrame {
                     body: block,
                     conjuncts: Vec::new(),
+                    exits: true,
                 });
                 intravisit::walk_expr(self, e);
                 self.loops.pop();
@@ -959,9 +1025,17 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                 let first = parents.next().map(|(_, n)| n);
                 let second = parents.next().map(|(_, n)| n);
                 // `{ …; return x; }` or `{ …; return x }`, as the block's end.
-                let tail = matches!(first, Some(Node::Block(b)) if b.expr.is_some_and(|x| x.hir_id == e.hir_id))
+                // Relay 107 (review 9): the BODY's own block, not any nested one.
+                let body_block = self.a.tcx.hir_maybe_body_owned_by(self.f).and_then(|body| {
+                    match body.value.kind {
+                        ExprKind::Block(b, _) => Some(b.hir_id),
+                        _ => None,
+                    }
+                });
+                let tail = matches!(first, Some(Node::Block(b)) if Some(b.hir_id) == body_block && b.expr.is_some_and(|x| x.hir_id == e.hir_id))
                     || matches!(second, Some(Node::Block(b))
-                        if b.expr.is_none()
+                        if Some(b.hir_id) == body_block
+                            && b.expr.is_none()
                             && b.stmts.last().is_some_and(|s| matches!(s.kind, StmtKind::Semi(x) if x.hir_id == e.hir_id)));
                 if !tail {
                     self.straight = false;
