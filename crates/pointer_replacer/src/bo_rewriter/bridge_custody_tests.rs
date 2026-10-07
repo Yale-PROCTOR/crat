@@ -3556,3 +3556,45 @@ pub unsafe fn callee(p: P) {}
         "a crate-level attribute that is not inert"
     );
 }
+
+/// **Relay 303 (jccc at the record, rq3-inator 018a) — the bridges that end in a
+/// raw-pointer method.** A delivered shared slice handed to a `*mut` position is
+/// bridged `x.as_ptr().cast_mut()` (`raw_boundary.rs`'s templates), an element
+/// view `core::ptr::from_ref(x).cast_mut()`, an optional one `x.as_deref().map_or(
+/// core::ptr::null_mut::<T>(), |v| ..)`: each is raw by construction (`cast`,
+/// `cast_mut` and `cast_const` exist only on raw pointers; `from_ref` / `from_mut`
+/// return one; a `map_or` whose default is a null pointer has its type), yet the
+/// variadic arm read only an outermost `as_ptr` / `as_mut_ptr` or a cast. jccc's
+/// `sprintf(end, fmt, op_str)` with `op_str` a delivered slice failed the
+/// comparison on it in all five trials.
+#[test]
+fn relay_303_a_variadic_argument_bridged_through_a_raw_method_is_raw() {
+    use crate::bo_rewriter::bridge_custody_match::pending_target_accepts_for_test as check;
+    const EMITTED: &str = "extern \"C\" {
+    fn sprintf(_: *mut i8, _: *const i8, _: ...) -> i32;
+}
+";
+    for raw in [
+        "op_str.as_ptr().cast_mut()",
+        "op_str.as_ptr().cast::<i8>().cast_mut()",
+        "core::ptr::from_ref(op_str).cast_mut()",
+        "core::ptr::from_mut(op_str)",
+        "op_str.as_deref().map_or(core::ptr::null_mut::<i8>(), |slice| slice.as_ptr().cast_mut())",
+        "op_str.cast_const()",
+    ] {
+        assert_eq!(check(EMITTED, "sprintf", 2, raw), Ok(()), "{raw}");
+    }
+    for not_raw in [
+        "op_str",
+        "&*op_str",
+        "op_str.first()",
+        "op_str.as_deref().map_or(0, |slice| slice.len())",
+        "core::ptr::addr_of_mut",
+    ] {
+        assert_eq!(
+            check(EMITTED, "sprintf", 2, not_raw),
+            Err("pending-variadic-argument-not-raw".to_owned()),
+            "{not_raw}"
+        );
+    }
+}
