@@ -8889,6 +8889,7 @@ fn finish_decide<'tcx>(
                         &a5_site_proofs,
                         &mut_facts,
                         coconv.pair_sites(),
+                        &retained_c9_plans,
                     ))
                 {
                     if forced.contains_key(&node) {

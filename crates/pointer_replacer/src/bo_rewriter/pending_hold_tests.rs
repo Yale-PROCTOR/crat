@@ -1098,7 +1098,9 @@ const POINTER_STATICS: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n
 fn r864_1_round2_two_pointer_statics_are_not_two_objects() {
     let out = outcome(POINTER_STATICS);
     assert!(
-        detail_of(&out, "zsqr::b").is_some_and(|d| d.contains("ref-beside-raw:")
+        // `ref-beside-ref` where the table still decides `a` a slice (no PAIR
+        // node: the round-3 review's R3-1 (b)), `ref-beside-raw` once it is raw.
+        detail_of(&out, "zsqr::b").is_some_and(|d| d.contains("ref-beside-")
             && d.contains("zsqr#2:peer#1")
             && d.contains(";unresolved")),
         "{:?}",
@@ -1106,4 +1108,47 @@ fn r864_1_round2_two_pointer_statics_are_not_two_objects() {
     );
     let zsqr = signature(&out.source, "zsqr");
     assert!(zsqr.contains("b: *mut Z"), "held raw: {zsqr}");
+}
+
+/// **The round-3 review's R3-1 (b) — two slice formals over one raw binding**,
+/// the control: `shift(buf.offset(1), buf, n - 1)`. `dst` and `src` deliver as
+/// slices, no PAIR nodes, and with no raw position the seam's twin has nothing to
+/// route; the seam's A5 gate reads the two converted positions of one root (pass
+/// 2) and places a raw view where A5 does not clear them. The predicate holds
+/// such a pair only on the classifier's clear (class 2), so here the A5 gate's
+/// raw view stands and nothing is held by it.
+const SHIFT_SLICES: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    pub unsafe fn shift(dst: *mut i32, src: *const i32, n: i32) {\n\
+        let mut i = n - 1;\n\
+        while i >= 0 {\n\
+            *dst.offset(i as isize) = *src.offset(i as isize);\n\
+            i -= 1;\n\
+        }\n\
+    }\n\
+    pub unsafe fn g(buf: *mut i32, n: i32) {\n\
+        let _a = buf as usize;\n\
+        shift(buf.offset(1), buf, n - 1);\n\
+    }\n\
+    pub unsafe fn entry() -> i32 {\n\
+        let mut x = [1i32, 2, 3, 4];\n\
+        g(x.as_mut_ptr(), 4);\n\
+        x[3]\n\
+    }\n";
+
+#[test]
+fn r864_1_round3_one_raw_root_at_two_slices_is_the_a5_gates() {
+    let out = census_outcome(SHIFT_SLICES);
+    for formal in ["shift::dst", "shift::src"] {
+        assert!(
+            detail_of(&out, formal).is_none_or(|d| !d.contains("ref-beside-")),
+            "{formal}: {:?}",
+            out.details
+        );
+    }
+    assert_eq!(
+        reason_of(&out, "shift::src"),
+        Some("pair-raw-view"),
+        "{:?}",
+        out.reasons
+    );
 }

@@ -12,7 +12,8 @@
 //! keeps both sides raw. **Its scope is R870-1's (a), the gaps only:** a
 //! contained pair, unresolved roots on both sides, one subject at a PAIR-owned
 //! `clear` call. The pairs the PAIR knows (its raw view and ordering proof), the
-//! seam's aliased-storage twin, and the field-load exemption keep their answers,
+//! seam's aliased-storage twin, the counted-void routes, A5's C-9 marks and the
+//! field-load exemption keep their answers,
 //! and the `overlapping` pairs are wave-5d's callee-peer rule's. The raw side is
 //! raw already; the reference side, the callee's formal, is held
 //! (`held:pair-not-shown-disjoint`, detail `ref-beside-raw`), and
@@ -47,10 +48,14 @@ use super::{
 /// One step from a root to the object an argument designates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// A field of the object so far. A union's fields are no step: they overlap.
+    /// A field of a struct (never of a union) of the object so far.
     Field(rustc_span::Symbol),
     /// The pointee of the pointer value stored in the object so far.
     Load,
+    /// A step the text does not place: a union member, a retyping cast, a byte
+    /// step (the round-3 review's R3-2; `pair_disjointness`'s Erratum 9d (ii)).
+    /// Two places past it are never disjoint.
+    Opaque,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +68,7 @@ pub(crate) enum Root {
 /// NEW-2), as a root and the steps from it: `&mut (*s).br` is `s / load / br`,
 /// `x.as_mut_ptr()` and `&mut *x.as_mut_ptr()` are `x`, a pointer static `G` is
 /// `G / load` (its value, not its storage), `(*s).p` is `s / load / p / load`.
-/// An index and a pointer step are no step: two elements may coincide.
+/// An index and a typed pointer step are no step: two elements may coincide.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Designation {
     pub(crate) root: Root,
@@ -76,13 +81,27 @@ pub(crate) fn pointer_designation<'tcx>(
     expr: &rustc_hir::Expr<'tcx>,
 ) -> Option<Designation> {
     use rustc_hir::ExprKind;
+    let opaque = |mut designation: Designation| {
+        designation.steps.push(Step::Opaque);
+        designation
+    };
+    // A cast that changes the pointee retypes the object (C's first-member rule).
+    let retypes = |from: &rustc_hir::Expr<'tcx>| {
+        let pointee = |ty: rustc_middle::ty::Ty<'tcx>| ty.builtin_deref(true);
+        pointee(typeck.expr_ty_adjusted(from)) != pointee(typeck.expr_ty(expr))
+    };
     match &expr.kind {
+        ExprKind::Cast(inner, _) if retypes(inner) => {
+            pointer_designation(typeck, inner).map(opaque)
+        }
         ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => pointer_designation(typeck, inner),
         ExprKind::AddrOf(_, _, place) => place_designation(typeck, place),
         ExprKind::MethodCall(segment, receiver, _, _) => match segment.ident.name.as_str() {
             "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
-            | "byte_offset" | "byte_add" | "byte_sub" | "cast" | "cast_mut" | "cast_const" => {
-                pointer_designation(typeck, receiver)
+            | "cast_mut" | "cast_const" => pointer_designation(typeck, receiver),
+            "cast" if !retypes(receiver) => pointer_designation(typeck, receiver),
+            "byte_offset" | "byte_add" | "byte_sub" | "cast" => {
+                pointer_designation(typeck, receiver).map(opaque)
             }
             // An array's or a slice's own elements.
             "as_ptr" | "as_mut_ptr"
@@ -131,9 +150,13 @@ fn place_designation<'tcx>(
         },
         ExprKind::Field(base, field) => {
             let mut designation = adjusted_place_designation(typeck, base)?;
-            if !typeck.expr_ty_adjusted(base).is_union() {
-                designation.steps.push(Step::Field(field.name));
-            }
+            designation
+                .steps
+                .push(if typeck.expr_ty_adjusted(base).is_union() {
+                    Step::Opaque
+                } else {
+                    Step::Field(field.name)
+                });
             Some(designation)
         }
         ExprKind::Index(base, _, _) => adjusted_place_designation(typeck, base),
@@ -226,14 +249,18 @@ pub(crate) fn normalized<'tcx>(
 /// How two designations under one root relate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Overlap {
-    /// One object, or one inside the other: equal steps, or one a prefix of the
-    /// other with no load past it.
+    /// One object, or one inside the other: equal steps, one a prefix of the
+    /// other with no load past it, or a divergence past an opaque step.
     Yes,
-    /// Distinct fields of one object, nothing loaded past them.
+    /// Distinct fields of one struct, nothing loaded or retyped before or past
+    /// them.
     Disjoint,
-    /// One is reached through a pointer stored inside the other, or both through
-    /// pointers loaded from distinct places: nothing the text shows.
-    Loaded,
+    /// One is reached through a pointer stored inside the other: nothing the text
+    /// shows, and the PAIR's or the exemption's (MED-3 (c)'s residual).
+    LoadedOne,
+    /// Both are reached through pointers loaded from distinct places: unresolved,
+    /// as two loads under two roots are (the round-3 review's R3-4).
+    LoadedBoth,
 }
 
 pub(crate) fn overlap(left: &Designation, right: &Designation) -> Overlap {
@@ -244,23 +271,20 @@ pub(crate) fn overlap(left: &Designation, right: &Designation) -> Overlap {
         .take_while(|(l, r)| l == r)
         .count();
     let rest_loads = |steps: &[Step]| steps[common..].contains(&Step::Load);
-    if common == left.steps.len() || common == right.steps.len() {
-        if rest_loads(&left.steps) || rest_loads(&right.steps) {
-            Overlap::Loaded
-        } else {
-            Overlap::Yes
-        }
-    } else {
-        match (left.steps[common], right.steps[common]) {
-            (Step::Field(_), Step::Field(_))
-                if !rest_loads(&left.steps) && !rest_loads(&right.steps) =>
+    match (rest_loads(&left.steps), rest_loads(&right.steps)) {
+        (true, true) => Overlap::LoadedBoth,
+        (true, false) | (false, true) => Overlap::LoadedOne,
+        (false, false) => match (left.steps.get(common), right.steps.get(common)) {
+            (Some(Step::Field(_)), Some(Step::Field(_)))
+                if !left.steps[..common].contains(&Step::Opaque) =>
             {
                 Overlap::Disjoint
             }
-            (Step::Field(_), Step::Field(_)) => Overlap::Loaded,
-            // A field beside a load of one place: types that cannot both hold.
+            // One a prefix of the other, a divergence past an opaque step or at
+            // one, or a field beside a load of one place (types that cannot both
+            // hold).
             _ => Overlap::Yes,
-        }
+        },
     }
 }
 
@@ -522,6 +546,7 @@ pub(crate) fn holds(
     proofs: &A5SeamProofIndex,
     mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
     pair_sites: &[PairSiteDecision],
+    c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
 ) -> Vec<((LocalDefId, HirId), DegradeReason)> {
     use super::seam::{Form, form_of};
     struct Formal<'a> {
@@ -624,33 +649,85 @@ pub(crate) fn holds(
                     })
                 })
             };
-            // Does `counted_void::aliased_storage_twin` take one binding at two
-            // positions here? It declines a converted position found as a slice,
-            // an option or a cursor (the round-2 review's HIGH-1 residual). Two
-            // converted borrows of one local that are not blind are borrowck's
-            // to refuse; the blind ones are the PAIR's (`OverlapRule`).
-            let twin_answers = |left: &Arg, right: &Arg| {
-                left.shape.place_root().is_some()
-                    && left.shape.place_root() == right.shape.place_root()
-                    && call
-                        .args
-                        .iter()
-                        .filter(|arg| {
-                            formals
-                                .get(&(callee, arg.index))
-                                .is_some_and(|formal| form_of(formal.decision) != Form::Raw)
-                        })
-                        .all(|arg| {
-                            !matches!(
-                                found(arg),
-                                Some(
-                                    Form::Slice { .. }
-                                        | Form::Opt { .. }
-                                        | Form::Cursor { .. }
-                                        | Form::NestedSlice { .. }
-                                )
+            // Does `counted_void::aliased_storage_twin` take this call (the round-3
+            // review's R3-1, its trigger mirrored)? A converted position whose root
+            // a raw argument shares, that argument no field load the exemption
+            // clears, and every converted position found raw or a reference (it
+            // declines a slice, an option or a cursor: the round-2 review's HIGH-1
+            // residual). The settled table is read for the seam's (R3-6).
+            let twin_fires = || {
+                let converted = |arg: &Arg| {
+                    formals
+                        .get(&(callee, arg.index))
+                        .is_some_and(|formal| form_of(formal.decision) != Form::Raw)
+                };
+                let aliased = call.args.iter().filter(|arg| converted(arg)).any(|arg| {
+                    let Some(root) = arg.shape.place_root() else {
+                        return false;
+                    };
+                    call.args.iter().any(|other| {
+                        !converted(other)
+                            && other.shape.place_root() == Some(root)
+                            && super::counted_void::field_load_exemption(tcx, call, root, other)
+                                .is_none()
+                    })
+                });
+                aliased
+                    && call.args.iter().filter(|arg| converted(arg)).all(|arg| {
+                        !matches!(
+                            found(arg),
+                            Some(
+                                Form::Slice { .. }
+                                    | Form::Opt { .. }
+                                    | Form::Cursor { .. }
+                                    | Form::NestedSlice { .. }
                             )
-                        })
+                        )
+                    })
+            };
+            // Two borrows of one local the compiler sees (`&mut x` at both
+            // positions, no dereference of a raw pointer): converted at both, they
+            // are borrowck's to refuse; one turned raw by the seam's own table is
+            // the twin's (one root, a raw sibling; heman's `kmQuaternionScale(&mut
+            // diff, &mut diff, t)`).
+            let checked_borrows = |left: &Arg, right: &Arg| match (left.shape, right.shape) {
+                (
+                    ArgShape::AddrOf {
+                        base: Some(a),
+                        through_deref: false,
+                        ..
+                    },
+                    ArgShape::AddrOf {
+                        base: Some(b),
+                        through_deref: false,
+                        ..
+                    },
+                ) => a == b,
+                _ => false,
+            };
+            // The PAIR's nodes: co-conversion builds the same-root edges of two of
+            // them (R3-1).
+            let pair_node = |decision: &Decision| {
+                matches!(
+                    decision,
+                    Decision::Ref { .. } | Decision::InferredRef { .. }
+                )
+            };
+            // A5's C-9 mark on this pair at this call: the shared side is a
+            // snapshot carried by the mark's effect proof (PAIR-W1's copy branch).
+            let c9_marked = |left: usize, right: usize| {
+                c9_marks.iter().any(|mark| {
+                    let (mark_span, site_span) = (
+                        mark.call_span.source_callsite(),
+                        call.span.source_callsite(),
+                    );
+                    let params = mark.key.pair.params();
+                    mark.caller_did == call.caller
+                        && (mark_span.contains(site_span) || site_span.contains(mark_span))
+                        && mark.key.pair.function() == callee.local_def_index.as_u32()
+                        && (params.first() as usize, params.second() as usize)
+                            == (left.min(right) + 1, left.max(right) + 1)
+                })
             };
             // The counted-void family routes its live counted positions found raw
             // (`count_argument`): one beside a raw sibling (`[only]`: the raw twin,
@@ -725,7 +802,9 @@ pub(crate) fn holds(
                     if matches!(edge, Edge::Ordered) {
                         continue;
                     }
-                    if counted_answers(kind, held[0].1, left.index, right.index) {
+                    if counted_answers(kind, held[0].1, left.index, right.index)
+                        || c9_marked(left.index, right.index)
+                    {
                         continue;
                     }
                     let typeck = tcx.typeck(call.caller);
@@ -735,10 +814,17 @@ pub(crate) fn holds(
                         .get(&call.span.source_callsite())
                         .copied();
                     let expression = |index: usize| expressions.and_then(|args| args.get(index));
+                    // The designation, normalized, and its root before normalization.
                     let designation = |arg: &Arg| {
                         expression(arg.index)
                             .and_then(|expr| pointer_designation(typeck, expr))
-                            .map(|designation| normalized(tcx, call.caller, typeck, designation))
+                            .map(|designation| {
+                                let original = designation.root;
+                                (
+                                    normalized(tcx, call.caller, typeck, designation).0,
+                                    original,
+                                )
+                            })
                     };
                     let (dl, dr) = (designation(left), designation(right));
                     let null = |arg: &Arg| matches!(arg.shape, ArgShape::NullLit);
@@ -747,20 +833,21 @@ pub(crate) fn holds(
                     } else {
                         match (&dl, &dr) {
                             // One root: equal steps or one inside the other is one
-                            // subject (through a single-definition local, a
-                            // containment); distinct fields defer; a pointer loaded
-                            // past the other is nothing the text shows.
-                            (Some((a, replaced_l)), Some((b, replaced_r))) if a.root == b.root => {
+                            // subject (through single-definition locals from two
+                            // roots, a containment: the round-3 review's R3-3);
+                            // distinct struct fields defer; a pointer loaded past the
+                            // other is nothing the text shows; two loaded pointers
+                            // are unresolved (R3-4).
+                            (Some((a, original_l)), Some((b, original_r))) if a.root == b.root => {
                                 match (overlap(a, b), a.root) {
                                     (Overlap::Yes, Root::Static(_)) => Relation::SameStatic,
-                                    (Overlap::Yes, Root::Local(_))
-                                        if *replaced_l || *replaced_r =>
-                                    {
+                                    (Overlap::Yes, Root::Local(_)) if original_l != original_r => {
                                         Relation::Contained
                                     }
                                     (Overlap::Yes, Root::Local(_)) => Relation::Same,
                                     (Overlap::Disjoint, _) => Relation::Disjoint,
-                                    (Overlap::Loaded, _) => Relation::Unknown,
+                                    (Overlap::LoadedOne, _) => Relation::Unknown,
+                                    (Overlap::LoadedBoth, _) => Relation::Unresolved,
                                 }
                             }
                             // A shape the designation does not read under one root
@@ -806,6 +893,24 @@ pub(crate) fn holds(
                         }
                     };
                     let certified = matches!(edge, Edge::CertifiedClear);
+                    let proof = || {
+                        proofs.lookup(
+                            call.caller.local_def_index.as_u32(),
+                            callee.local_def_index.as_u32(),
+                            left.index,
+                            right.index,
+                            left.span,
+                            right.span,
+                        )
+                    };
+                    // The classifier's own clear (`a5-proven-disjoint`) read `clear` on
+                    // one array at two positions (class 2), untraced, so it is not
+                    // taken (the round-2 review's MED-3); a certificate's or a
+                    // structural clear stands.
+                    let classifier_clear = |proof: &super::a5_site_proof::A5PeerProof| {
+                        proof.verdict == A5SiteProofVerdict::Clear
+                            && proof.reason == "a5-proven-disjoint"
+                    };
                     let why = match relation {
                         Relation::Disjoint | Relation::Unknown => continue,
                         Relation::Same | Relation::SameStatic | Relation::Contained
@@ -815,14 +920,37 @@ pub(crate) fn holds(
                         }
                         // One local at two positions of a call no PAIR row owns,
                         // which the seam's aliased-storage twin takes (a raw twin,
-                        // or the call held): R408-7, wave-6v.
-                        Relation::Same if !seam_pair_owned() && twin_answers(left, right) => {
+                        // or the call held: R408-7, wave-6v), the compiler checks,
+                        // or the PAIR's two nodes give it an edge.
+                        Relation::Same
+                            if !seam_pair_owned()
+                                && (twin_fires()
+                                    || checked_borrows(left, right)
+                                    || (pair_node(fl.decision) && pair_node(fr.decision))) =>
+                        {
                             continue;
+                        }
+                        // Two converted positions of one root are the seam's A5 gate's
+                        // (pass 2): a raw view unless A5 clears the pair, and only the
+                        // classifier's clear is not taken (the round-3 review's R3-1
+                        // (b)).
+                        Relation::Same if !seam_pair_owned() && kind == "ref-beside-ref" => {
+                            if !classifier_clear(&proof()) {
+                                continue;
+                            }
+                            "same-subject;proof=clear:a5-proven-disjoint".to_owned()
                         }
                         Relation::Same => "same-subject".to_owned(),
                         Relation::SameStatic => "same-static".to_owned(),
                         Relation::Contained => "contained".to_owned(),
-                        Relation::Unresolved if kind == "ref-beside-ref" => continue,
+                        // Two of the PAIR's nodes are its (an unresolved root is
+                        // its same root); a slice, an option or a cursor is no node
+                        // (R3-1 (b)).
+                        Relation::Unresolved
+                            if pair_node(fl.decision) && pair_node(fr.decision) =>
+                        {
+                            continue;
+                        }
                         Relation::Unresolved
                             if matches!(
                                 (expression(left.index), expression(right.index)),
@@ -833,27 +961,15 @@ pub(crate) fn holds(
                             continue;
                         }
                         Relation::Unresolved => {
-                            let proof = proofs.lookup(
-                                call.caller.local_def_index.as_u32(),
-                                callee.local_def_index.as_u32(),
-                                left.index,
-                                right.index,
-                                left.span,
-                                right.span,
-                            );
-                            // A certificate's or a structural clear stands; the
-                            // classifier's own (`a5-proven-disjoint`) read `clear`
-                            // on one array at two positions (class 2), untraced, so
-                            // it is not taken (the round-2 review's MED-3).
+                            let proof = proof();
                             match proof.verdict {
-                                A5SiteProofVerdict::Clear
-                                    if proof.reason != "a5-proven-disjoint" =>
-                                {
-                                    continue;
-                                }
-                                A5SiteProofVerdict::Clear => {
+                                A5SiteProofVerdict::Clear if classifier_clear(&proof) => {
                                     format!("unresolved;proof=clear:{}", proof.reason)
                                 }
+                                A5SiteProofVerdict::Clear => continue,
+                                // Two converted positions: the A5 gate's raw view
+                                // (an unresolved root is its same root).
+                                _ if kind == "ref-beside-ref" => continue,
                                 _ => format!("unresolved;proof={}", proof.verdict.key()),
                             }
                         }
