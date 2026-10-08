@@ -5245,6 +5245,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// wave-5d 145c: a local that stays raw, reborrowed through a
                 /// raw base (`&mut *p`) that borrowck does not see.
                 raw_local: bool,
+                /// wave-5d 146e (the fourth review's HIGH-1): a raw local at a
+                /// counted (non-handle) position. The counted route decides
+                /// its pairs with OTHER counted positions (`disjoint_roots`),
+                /// never one with a delivered sibling (`[only]` skips it).
+                counted_raw_local: bool,
                 /// A literal `None` carries no borrow and therefore cannot
                 /// participate in the site's overlap relation.
                 borrows: bool,
@@ -5495,17 +5500,19 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // COUNTED raw position: wave-6v's snapshot route proves its own
                 // disjointness there (`counted_void::disjoint_roots`: provably
                 // distinct allocations split, else the raw twin, else held).
-                let raw_local = match arg.shape {
+                let stays_raw_local = match arg.shape {
                     ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => {
                         !decision_of
                             .get(&(site.caller, binding))
                             .is_some_and(|d| !matches!(d, Decision::Degraded(_)))
-                            && !(found == Form::Raw
-                                && super::counted_void::parameter(table, *callee, arg.index)
-                                    .is_some())
                     }
                     _ => false,
                 };
+                let counted_raw_local = stays_raw_local
+                    && found == Form::Raw
+                    && super::counted_void::parameter(table, *callee, arg.index)
+                        .is_some_and(|contract| contract.handle.is_none());
+                let raw_local = stays_raw_local && !counted_raw_local;
                 // wave-6a (R422-5): a Box-decided argument the owner-view glue
                 // renders IS the expected form at the call (`&*x`,
                 // `x.as_deref().unwrap()`, ..): the position is a glue-arm
@@ -5532,6 +5539,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     root: arg.shape.place_root(),
                     blind,
                     raw_local,
+                    counted_raw_local,
                     borrows,
                     literal_null,
                     raw_boundary_observation,
@@ -6555,9 +6563,22 @@ pub(crate) fn synthesize_with_raw_boundary(
                     // local (`q = p; f(p, q)` renders `f(&mut *p, &*q)`), must
                     // ask the proof. A formal that stays raw beside a
                     // reference is R864-1 (a)'s class, out of 57 (145).
-                    let raw_local_pair = (positions[i].raw_local || positions[j].raw_local)
+                    // A counted raw local is exempt only from a pair whose other
+                    // side is counted too: the route decides that pair; beside a
+                    // delivered sibling it decides nothing (146e).
+                    // The counted-copy arm's own certificate answers where it
+                    // exists (R896-1): `disjoint_roots` never splits a copy.
+                    let raw_local_pair = (positions[i].raw_local
+                        || positions[j].raw_local
+                        || positions[i].counted_raw_local != positions[j].counted_raw_local)
                         && positions[i].expected != Form::Raw
-                        && positions[j].expected != Form::Raw;
+                        && positions[j].expected != Form::Raw
+                        && !super::counted_void::disjoint_argument_roots(
+                            tcx,
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                        );
                     if same_root
                         || positions[i].blind
                         || positions[j].blind

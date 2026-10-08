@@ -1251,6 +1251,30 @@ fn certified_disjoint(
     })
 }
 
+/// wave-5d 146e (R896-1): `disjoint_roots` for the arguments at positions
+/// `left` / `right` of `site`, so the site gate consumes the counted-copy
+/// arm's certificate (two provably distinct allocations, a fresh allocation
+/// beside a never-reassigned parameter, distinct locals' own storage, or a
+/// null literal) as its overlap proof. A copy `q = p` is neither fresh nor a
+/// parameter, so it never certifies.
+pub(crate) fn disjoint_argument_roots(
+    tcx: TyCtxt<'_>,
+    site: &super::emitability::CallSite,
+    left: usize,
+    right: usize,
+) -> bool {
+    let body = tcx.hir_body_owned_by(site.caller).value;
+    let Some(ExprKind::Call(_, args)) =
+        find_expr(body, site.span).map(|call| strip_casts(call).kind)
+    else {
+        return false;
+    };
+    let (Some(l), Some(r)) = (args.get(left), args.get(right)) else {
+        return false;
+    };
+    disjoint_roots(tcx, site.caller, l, r)
+}
+
 pub(crate) fn disjoint_roots<'tcx>(
     tcx: TyCtxt<'tcx>,
     caller: LocalDefId,
