@@ -335,9 +335,11 @@ fn wave6o_a_waived_sites_bridge_receipts_reconcile() {
     // the source stays raw, as the pair hold held it.
     let (key, detail) = degraded.expect("caller::buf is held raw");
     assert_eq!(key, "held:retained-alias", "{detail}");
+    // era-5c 160a (relay 308): the callee's store is sited at `caller`'s call, so the
+    // receipt names that call's derived store rather than the unsited `callee-store`.
     assert!(
-        detail.starts_with("evident:derived-store:callee-store | caller"),
-        "the hold names the callee's store: {detail}"
+        detail.starts_with("evident:derived-store:") && detail.contains("| caller |"),
+        "the hold names caller's store at the call: {detail}"
     );
     assert_eq!(waived, 0, "a held source has no bridge to waive");
     assert_eq!(reconciled, Ok(()), "and the bridge events reconcile");
