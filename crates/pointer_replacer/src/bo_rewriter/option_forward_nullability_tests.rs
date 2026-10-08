@@ -170,3 +170,27 @@ fn wave6o_hand_on_into_an_indexing_formal_two_levels_down_is_left_alone() {
     );
     assert!(verify::type_checks_str(&output), "{output}");
 }
+
+/// Relay 309 (wave-5d 146b §2.2): a crossing the seam blocks (here the unattested world's
+/// `seam-a5-attestation-absent` at a pair one blind argument makes the seam ask) holds the
+/// callee's class, which reverts to raw; the caller's delivered argument planned for the
+/// kept formal must then be bridged (the raw view at the call) or the caller reverted with
+/// the class — never left in its kept-world form (E0308).
+const BLOCKED_INTO_REVERTED: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case)]
+#[repr(C)] pub struct S { pub total: usize }
+unsafe fn Inject(mut out: *mut usize, mut s: *mut S) -> i32 { *out = (*s).total; return 1 as i32; }
+unsafe fn Stream(mut s: *mut S) -> i32 { let mut x: usize = 0; return Inject(&mut x as *mut usize, s); }
+"#;
+
+#[test]
+fn r309_a_blocked_crossing_into_a_reverted_class_bridges_or_reverts_its_caller() {
+    assert!(verify::type_checks_str(BLOCKED_INTO_REVERTED));
+    let output = ast_emitted_source_of(BLOCKED_INTO_REVERTED).expect("native emission");
+    let flat = output.split_whitespace().collect::<String>();
+    assert!(
+        flat.contains("fnInject(mutout:*mutusize,muts:*mutS)"),
+        "the premise: the blocked crossing holds Inject's class raw: {output}"
+    );
+    assert!(verify::type_checks_str(&output), "{output}");
+}
