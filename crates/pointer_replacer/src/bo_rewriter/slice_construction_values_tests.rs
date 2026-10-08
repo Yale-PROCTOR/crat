@@ -252,12 +252,27 @@ fn wave6k_copy_passed_to_a_local_callee_is_declined_and_the_callee_keeps_its_del
             "a copy on a shared interface is declined up front: {:?}",
             decision_of("transform::f")
         );
+        // Re-pinned under R896-1 (2) (wave-5d 146c; 145c, R892-1): at the
+        // Return stage `edt(f, z)` hands two raw locals derived from
+        // `transform`'s two formals, and `edt::z` is a cursor candidate beside
+        // the slice `f`. Nothing shows the pair disjoint (`transform` is dead,
+        // but `f` / `z` are not its formals: R819-2's local-copy control), so
+        // the site gate holds it and withdraws that one candidate. Nothing
+        // else may touch the callee, and `edt::f` keeps its delivery (above).
+        let callee_withdrawals = ctx
+            .raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .filter(|r| r.owner_path == "edt")
+            .collect::<Vec<_>>();
         assert!(
-            !ctx.raw_boundary_artifacts
-                .additive_family_receipts
+            callee_withdrawals.iter().all(|r| r.cause.contains(":pair:")
+                && r.subjects.iter().all(|subject| subject.0 == "edt::z#2")),
+            "only the pair hold's `edt::z` candidate may be withdrawn: {:?}",
+            callee_withdrawals
                 .iter()
-                .any(|r| r.owner_path == "edt"),
-            "no withdrawal may touch the callee"
+                .map(|r| (&r.cause, &r.subjects))
+                .collect::<Vec<_>>()
         );
     })
     .expect("input compiles");

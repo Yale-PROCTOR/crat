@@ -52,7 +52,18 @@ fn flat(source: &str) -> String {
 /// The seam edits' `(replacement, extent receipt)` for one fixture.
 fn edits(input: &str) -> Vec<(String, String)> {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        let (table, _ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).expect("decisions");
+        // R898-1 (2), wave-5d 146b: the attested census world. The unattested
+        // world answers every site-gate pair `seam-a5-attestation-absent` by
+        // design, so `PrepareH35(h, …, data)` would hold `data` there and the
+        // KX licence would never be asked.
+        let (table, _ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::A5Mode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decisions");
         table
             .seams
             .edits
@@ -68,7 +79,8 @@ fn edits(input: &str) -> Vec<(String, String)> {
 /// and the receipt names the list.
 #[test]
 fn w6l_kx1_a_listed_licence_is_refused_and_receipted() {
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(PREPARE_H35).unwrap();
+    let source =
+        crate::bo_rewriter::emit_tests::ast_emitted_source_of_attested(PREPARE_H35).unwrap();
     let flat_source = flat(&source);
     assert!(!flat_source.contains("(input_size) as usize"), "{source}");
     assert!(
@@ -90,7 +102,7 @@ fn w6l_kx1_a_listed_licence_is_refused_and_receipted() {
 #[test]
 fn w6l_kxc_an_unlisted_twin_keeps_its_licence() {
     let input = PREPARE_H35.replace("PrepareH35", "PrepareH36");
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of_attested(&input).unwrap();
     assert!(flat(&source).contains("(input_size) as usize"), "{source}");
 }
 
@@ -122,7 +134,8 @@ pub unsafe fn Create(mut addr: usize, mut ringbuffer_mask: usize, mut n: usize) 
 /// does not take it first (MK4 is the proven shape).
 #[test]
 fn w6l_mk1_a_mask_is_not_taken_as_a_count() {
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(MASK_AS_COUNT).unwrap();
+    let source =
+        crate::bo_rewriter::emit_tests::ast_emitted_source_of_attested(MASK_AS_COUNT).unwrap();
     assert!(
         !flat(&source).contains("(ringbuffer_mask) as usize"),
         "{source}"
@@ -156,7 +169,7 @@ fn w6l_mkc_a_count_that_is_not_a_mask_stays_licensed() {
     let input = mask_as_count_bounded()
         .replace("ring_buffer_mask", "ring_buffer_len")
         .replace("ringbuffer_mask", "ringbuffer_len");
-    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
+    let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of_attested(&input).unwrap();
     assert!(
         flat(&source).contains("(ringbuffer_len) as usize"),
         "{source}"

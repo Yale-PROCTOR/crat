@@ -527,7 +527,12 @@ const READ_READ_PEERS: &str = r#"
         let distance_code = CommandRestoreDistanceCode(last_command, &mut (*s).dist);
         (*last_command).dist_extra_ = distance_code;
         distance_code
-    }
+    }// R898-1 (wave-5d 146c): a live caller of unknown-provenance arguments, so the
+// scope's vacuity fact does not clear the pair this fixture exists to hold.
+extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+#[no_mangle]
+pub unsafe extern "C" fn __crat_test_live() { ExtendLastCommand(__crat_test_opaque() as *mut Command, __crat_test_opaque() as *mut State);; }
+
 "#;
 
 #[test]

@@ -40,6 +40,11 @@ pub(crate) const RECEIPT: &str = "pair-disjoint:premise-outside-byte-view";
 pub(crate) const SAME_POINTEE_MUT: &str = "exported-entry:same-pointee-mut-pair";
 /// The receipt of the scope's remaining instances.
 pub(crate) const SCOPE_CLOSED_PROGRAM: &str = "pair-disjoint:scope-closed-program";
+/// R898-1 (the seat, on R816 / R819): an UNEXPORTED function that nothing in
+/// the program calls or names (no call site, no address taken, no fn-pointer
+/// web) never runs inside the closed program, so its formals are disjoint by
+/// vacuity. A receipted scope fact, not a waiver.
+pub(crate) const SCOPE_UNCALLED_UNEXPORTED: &str = "pair-disjoint:scope=uncalled-unexported";
 
 /// One formal of an outside-only entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +59,9 @@ pub(crate) struct EntryFormal {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EntryFormals {
     pub by_binding: FxHashMap<HirId, EntryFormal>,
+    /// R898-1: not exported (`#[no_mangle]` / `export_name`), so the scope
+    /// covers it by vacuity rather than as an entry (R819).
+    pub unexported: bool,
 }
 
 /// The receipt of the instance a certified pair is.
@@ -117,12 +125,16 @@ pub(crate) fn certifies(
     if left.position == right.position {
         return None;
     }
+    if entry.unexported {
+        return Some(SCOPE_UNCALLED_UNEXPORTED);
+    }
     Some(instance(left, right))
 }
 
 /// The exported entries nothing in the program calls or names, each with its
-/// raw-pointer formals the body never assigns nor addresses.
-/// `facts` must already hold every call and reference in the crate.
+/// raw-pointer formals the body never assigns nor addresses — and (R898-1) the
+/// unexported functions nothing calls or names, whose formals are disjoint by
+/// vacuity. `facts` must already hold every call and reference in the crate.
 pub(crate) fn entry_formals(
     tcx: TyCtxt<'_>,
     facts: &EmitabilityFacts,
@@ -130,7 +142,9 @@ pub(crate) fn entry_formals(
     let mut out = FxHashMap::default();
     for owner in tcx.hir_body_owners() {
         if tcx.def_kind(owner) != rustc_hir::def::DefKind::Fn
-            || !super::exported_pair::exported(tcx, owner)
+            || tcx
+                .entry_fn(())
+                .is_some_and(|(entry, _)| entry == owner.to_def_id())
             || facts
                 .call_args
                 .get(&owner)
@@ -173,6 +187,7 @@ pub(crate) fn entry_formals(
                 },
             );
         }
+        formals.unexported = !super::exported_pair::exported(tcx, owner);
         if !formals.by_binding.is_empty() {
             out.insert(owner, formals);
         }

@@ -363,7 +363,12 @@ pub unsafe fn prefix_encode(distance_code: u64, code: *mut u32, extra_bits: *mut
 pub unsafe fn init_command(self_0: *mut Command, other: *mut Command, distance_code: u64) {
     (*self_0).insert_len_ = 1;
     prefix_encode(distance_code, &mut (*self_0).dist_prefix_, &mut (*other).dist_extra_);
-}
+}// R898-1 (wave-5d 146c): a live caller of unknown-provenance arguments, so the
+// scope's vacuity fact does not clear the pair this fixture exists to hold.
+extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+#[no_mangle]
+pub unsafe extern "C" fn __crat_test_live() { init_command(__crat_test_opaque() as *mut Command, __crat_test_opaque() as *mut Command, 0); }
+
 "#;
 
     /// The pair-charged raw partner no longer vetoes its class: `code` places
@@ -1356,8 +1361,7 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
     free(dd as *mut libc::c_void);
     free(zz as *mut libc::c_void);
     free(ww as *mut libc::c_void);
-}
-"####;
+}"####;
 
     /// **Re-pinned (R800-4, wave-6a relay 145).** With wave-5d's narrowing
     /// and the native producer's refresh of a stale formal proof, the owners
@@ -1384,16 +1388,15 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
                 got.subjects
             );
         }
-        // The clean twin delivered all four (one edit, in the CALLEE, was the
-        // whole difference). Under R833-1 (USER) it is held too: `cf` is a
-        // raw view at `transform_to_coordfield(sdf, cf)` not shown disjoint
-        // from `sdf`, so `sdf` is held (`pair-not-shown-disjoint`) and its
-        // class with it (wave-5d report 138).
+        // The clean twin delivers all four — one edit, in the CALLEE, is the
+        // whole difference (ownership-fields' `the-one-edit.diff`). R898-1
+        // (wave-5d 146c): `entry` is dead in the closed program, so its pair
+        // is disjoint by vacuity and 506347af4's R833-1 hold is gone.
         let clean = run(COORDFIELD_WITH_THE_CALLEE);
         assert_eq!(
-            column(&clean.subjects, "transform_to_coordfield::sdf#1", "reason"),
-            "pair-not-shown-disjoint",
-            "the clean twin's peer is held:\n{}",
+            column(&clean.subjects, "transform_to_coordfield::ff#8", "decision"),
+            "box",
+            "the clean twin still delivers:\n{}",
             clean.subjects
         );
     }
@@ -1672,8 +1675,7 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
     free(dd as *mut libc::c_void);
     free(zz as *mut libc::c_void);
     free(ww as *mut libc::c_void);
-}
-"####;
+}"####;
 
     /// **The owner already renders all four views** (wave-5d2 report 026).
     ///
@@ -1691,18 +1693,12 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
     /// to say what it does to it.
     #[test]
     fn the_owner_renders_all_four_views_itself() {
-        // R833-1 (USER): `cf` is a raw view at `transform_to_coordfield(sdf,
-        // cf)` that A5 does not show disjoint from `sdf`, so `sdf` is held
-        // beside it (`pair-not-shown-disjoint`) and the class with it: the
-        // four owners no longer deliver (wave-5d report 138 prices it).
+        // R898-1 (wave-5d 146c): `entry` is unexported and nothing calls it, so
+        // its formals are disjoint by vacuity (`scope=uncalled-unexported`):
+        // the R833-1 hold of 506347af4 no longer applies, and the witness is
+        // back to what it pinned.
         let got = run(COORDFIELD_WITH_THE_CALLEE);
         eprintln!("COORDFIELD\n{}", got.subjects);
-        assert_eq!(
-            column(&got.subjects, "transform_to_coordfield::sdf#1", "reason"),
-            "pair-not-shown-disjoint",
-            "{}",
-            got.subjects
-        );
         for key in [
             "transform_to_coordfield::ff#8",
             "transform_to_coordfield::dd#14",
@@ -1710,12 +1706,25 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf:
             "transform_to_coordfield::ww#32",
         ] {
             assert_eq!(
-                column(&got.subjects, key, "placed"),
-                "0",
-                "the held class takes its owners:\n{}",
+                column(&got.subjects, key, "decision"),
+                "box",
+                "the owner delivers:\n{}",
                 got.subjects
             );
         }
+        let tree = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        for view in ["(*(ff))[", "(*(dd))[", "(*(zz))[", "(*(ww))["] {
+            assert!(
+                tree.contains(view),
+                "the owner's plan renders the view `{view}`:\n{}",
+                got.tree()
+            );
+        }
+        assert!(
+            !tree.contains("FALLBACK_SLICE_EXTENT"),
+            "and none of them fabricates an extent:\n{}",
+            got.tree()
+        );
     }
 
     #[test]

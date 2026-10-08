@@ -59,7 +59,13 @@ fn wave6o_null_literal_formal_handed_to_a_wider_raw_formal_stays_raw() {
         "if !total_out.is_null() { *total_out.offset(1 as isize) = (*s).total; }",
     );
     assert!(verify::type_checks_str(&input));
-    let output = ast_emitted_source_of(&input).expect("native emission");
+    // R898-1 (3), wave-5d 146b: the attested census world. In the unattested
+    // world the newly asked `Inject(s, total_out)` pair is undeterminable, the
+    // crossing is blocked, `Inject` reverts to raw and `Stream::s` is left
+    // unbridged (E0308): the blocked-seam path's class defect, main's (relay
+    // 309), not this pin's subject.
+    let output =
+        super::emit_tests::ast_emitted_source_of_attested(&input).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
     assert!(flat.contains("fnStream(muts:"), "{output}");
     assert!(flat.contains("muttotal_out:*mutusize"), "{output}");

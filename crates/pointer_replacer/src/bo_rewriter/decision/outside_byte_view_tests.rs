@@ -108,14 +108,32 @@ fn r819_2_control_an_entry_the_program_calls_is_not_certified() {
     not_certified(&input, "binn_object_blob");
 }
 
-/// An unexported function.
+/// R898-1 (the seat, wave-5d 146c): an unexported function that nothing in
+/// the program calls or names never runs in the closed program, so its formals
+/// are disjoint by vacuity (`scope=uncalled-unexported`). This was R819-2's
+/// "an unexported function is not certified" control.
 #[test]
-fn r819_2_control_an_unexported_function_is_not_certified() {
+fn r898_1_an_unexported_function_nothing_names_is_certified_by_vacuity() {
     let input = BLOB.replace(
         "#[no_mangle]\npub unsafe extern \"C\" fn binn_object_blob(",
         "pub unsafe extern \"C\" fn binn_object_blob(",
     );
     assert!(input.contains("\npub unsafe extern \"C\" fn binn_object_blob("));
+    certified(
+        &input,
+        "binn_object_blob",
+        super::outside_byte_view::SCOPE_UNCALLED_UNEXPORTED,
+    );
+}
+
+/// R898-1's condition: an unexported function whose address is taken is a
+/// member of the fn-pointer web and may run, so the hold stands.
+#[test]
+fn r898_1_control_an_unexported_function_whose_address_is_taken_is_not_certified() {
+    let input = BLOB.replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn binn_object_blob(",
+        "pub unsafe extern \"C\" fn binn_object_blob(",
+    ) + "\npub static BLOB_FN: unsafe extern \"C\" fn(*mut core::ffi::c_void, *const i8, *mut i32) -> *mut core::ffi::c_void = binn_object_blob;\n";
     not_certified(&input, "binn_object_blob");
 }
 

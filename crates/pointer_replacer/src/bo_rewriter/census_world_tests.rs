@@ -266,16 +266,22 @@ fn r815_6_control_an_entry_called_in_the_program_is_not_certified() {
     assert!(signature.contains("psize: *mut i32"), "({signature})");
 }
 
-/// Not covered by P8: an entry that is not exported (no `#[no_mangle]`).
+/// Not covered by P8, but by R898-1 (wave-5d 146c): an unexported function
+/// nothing calls or names is dead in the closed program, so its pair is
+/// disjoint by vacuity (`scope=uncalled-unexported`) and `psize` delivers.
+/// This was R815-6's "an unexported function is not certified" control.
 #[test]
-fn r815_6_control_an_unexported_function_is_not_certified() {
+fn r898_1_an_unexported_uncalled_function_is_certified_by_vacuity() {
     let input = include_str!("testdata/r815_entry_byte_view_beside_typed.rs").replace(
         "#[no_mangle]\npub unsafe extern \"C\" fn binn_object_blob(",
         "pub unsafe extern \"C\" fn binn_object_blob(",
     );
     assert!(input.contains("\npub unsafe extern \"C\" fn binn_object_blob("));
     let signature = r815_6_callee_signature(&input);
-    assert!(signature.contains("psize: *mut i32"), "({signature})");
+    assert!(
+        signature.contains("psize: Option<&mut i32>"),
+        "({signature})"
+    );
 }
 
 /// R819-1 item 1 (§29): a subject with nullability evidence, its own or

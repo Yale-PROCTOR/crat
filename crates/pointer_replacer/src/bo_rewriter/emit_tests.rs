@@ -21,11 +21,35 @@ static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 /// lives in this test module so the one-production-emission-path ratchet keeps
 /// counting only shipping call sites.
 pub(super) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
+    ast_emitted_source_in(input, None)
+}
+
+/// The same emission in the ATTESTED census world (A5 `PreciseReplay`, the
+/// frozen benchmark graph): R898-1 (2) moves a pin here when its purpose is the
+/// rule, since the unattested world answers every site-gate pair
+/// `seam-a5-attestation-absent` by design (wave-5d 146b).
+pub(super) fn ast_emitted_source_of_attested(input: &str) -> Result<String, String> {
+    ast_emitted_source_in(
+        input,
+        Some((
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    )
+}
+
+fn ast_emitted_source_in(
+    input: &str,
+    world: Option<(super::A5Mode, Option<super::WholeProgramAttestation>)>,
+) -> Result<String, String> {
     match ::utils::compilation::run_compiler_on_input(
         ::utils::compilation::str_to_input(input),
         |tcx| {
             let capture = super::ast_transform::capture_ast(tcx)?;
-            let (table, ctx) = super::decide_table_with_ctx(tcx)?;
+            let (table, ctx) = match world {
+                None => super::decide_table_with_ctx(tcx)?,
+                Some(world) => super::decide_table_with_ctx_config(tcx, Some(world))?,
+            };
             let emission = emit_files(
                 tcx,
                 &table,
