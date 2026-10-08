@@ -171,21 +171,22 @@ fn wave6k_structural_pairs_are_never_narrowed() {
             )
         };
         let (caller, callee, grand) = (class_of("caller"), class_of("callee"), class_of("grand"));
-        // Restated (relay 305 / 307; R3-2, and R4-1's stop-gap; main 197 / 198a): `caller`
-        // and `grand` are held (a formal is not released on `callee`'s waiver), and
-        // `callee::p` is held too (its own foreign store beside the call into `leaf`: the
-        // stop-gap's callee store, with no program formal at `pick` to release it). The
-        // one bare adapter edge left is callee→leaf, and a pair given as structural is
-        // never narrowed into one.
+        // Restated (relay 305; R3-2; main 197 / 198): `grand::s` is held (its formal
+        // caller is not released on `callee`'s waiver), so grand→caller is no bare
+        // adapter edge any more; the classification is witnessed on callee→leaf.
         let leaf = class_of("leaf");
         let bare = super::revert_closure::call_adapter_only_edges(&table, []);
+        assert!(bare.contains(&(caller, callee)), "{bare:?}");
         assert!(bare.contains(&(callee, leaf)), "{bare:?}");
-        assert!(!bare.contains(&(caller, callee)), "{bare:?}");
         assert!(!bare.contains(&(grand, caller)), "{bare:?}");
         let with_structural =
-            super::revert_closure::call_adapter_only_edges(&table, [(callee, leaf)]);
+            super::revert_closure::call_adapter_only_edges(&table, [(caller, callee)]);
         assert!(
-            !with_structural.contains(&(callee, leaf)),
+            !with_structural.contains(&(caller, callee)),
+            "{with_structural:?}"
+        );
+        assert!(
+            with_structural.contains(&(callee, leaf)),
             "{with_structural:?}"
         );
     })
