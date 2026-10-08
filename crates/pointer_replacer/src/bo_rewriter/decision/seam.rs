@@ -5242,6 +5242,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 text_span: Span,
                 root: Option<HirId>,
                 blind: bool,
+                /// wave-5d 145c: a local that stays raw, reborrowed through a
+                /// raw base (`&mut *p`) that borrowck does not see.
+                raw_local: bool,
                 /// A literal `None` carries no borrow and therefore cannot
                 /// participate in the site's overlap relation.
                 borrows: bool,
@@ -5376,18 +5379,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                 // the two cast shapes read the OPERAND's snippet while every
                 // other shape reads the argument's own.
                 let (found, text, blind, borrows, literal_null) = match arg.shape {
-                    // wave-5d 145c: a local that stays raw is reborrowed
-                    // through a raw base (`&mut *p`), which borrowck does not
-                    // see, so it is blind exactly as a through-a-raw-deref
-                    // borrow is (§5a): `q = p; f(p, q)` must ask the proof.
                     ArgShape::BareLocal(hir) => (
                         decision_of
                             .get(&(site.caller, hir))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(arg.span).ok(),
-                        !decision_of
-                            .get(&(site.caller, hir))
-                            .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
+                        false,
                         true,
                         false,
                     ),
@@ -5436,9 +5433,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             .get(&(site.caller, binding))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(inner).ok(),
-                        !decision_of
-                            .get(&(site.caller, binding))
-                            .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
+                        false,
                         true,
                         false,
                     ),
@@ -5496,6 +5491,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                     ));
                     continue;
                 };
+                // wave-5d 145c / 146a: a local that stays raw. Not at a
+                // COUNTED raw position: wave-6v's snapshot route proves its own
+                // disjointness there (`counted_void::disjoint_roots`: provably
+                // distinct allocations split, else the raw twin, else held).
+                let raw_local = match arg.shape {
+                    ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => {
+                        !decision_of
+                            .get(&(site.caller, binding))
+                            .is_some_and(|d| !matches!(d, Decision::Degraded(_)))
+                            && !(found == Form::Raw
+                                && super::counted_void::parameter(table, *callee, arg.index)
+                                    .is_some())
+                    }
+                    _ => false,
+                };
                 // wave-6a (R422-5): a Box-decided argument the owner-view glue
                 // renders IS the expected form at the call (`&*x`,
                 // `x.as_deref().unwrap()`, ..): the position is a glue-arm
@@ -5521,6 +5531,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     text_span,
                     root: arg.shape.place_root(),
                     blind,
+                    raw_local,
                     borrows,
                     literal_null,
                     raw_boundary_observation,
@@ -6540,9 +6551,17 @@ pub(crate) fn synthesize_with_raw_boundary(
                     // retain the established same-root/blind trigger exactly.
                     let boundary_observation = positions[i].raw_boundary_observation
                         && positions[j].raw_boundary_observation;
+                    // wave-5d 145c: two DELIVERED formals, one handed a raw
+                    // local (`q = p; f(p, q)` renders `f(&mut *p, &*q)`), must
+                    // ask the proof. A formal that stays raw beside a
+                    // reference is R864-1 (a)'s class, out of 57 (145).
+                    let raw_local_pair = (positions[i].raw_local || positions[j].raw_local)
+                        && positions[i].expected != Form::Raw
+                        && positions[j].expected != Form::Raw;
                     if same_root
                         || positions[i].blind
                         || positions[j].blind
+                        || raw_local_pair
                         || boundary_observation
                         || shared_pairs.at(*callee, site).is_some()
                     {
