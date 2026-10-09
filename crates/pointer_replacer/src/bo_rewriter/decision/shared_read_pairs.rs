@@ -389,8 +389,16 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
                 let (text, rollbacks, _) =
                     crate::bo_rewriter::validate_plan(&withdrawn_plan, &emission.texts);
                 assert!(rollbacks.is_empty(), "withdrawn text plan must compose");
+                // A file no surviving edit touches is its original text
+                // (`validate_plan` returns only the files it splices): the
+                // caller's pair is held raw at its own in-program call
+                // (R833-1, the R898-1 driver), so the callee's class is the
+                // only one with edits here.
                 assert!(
-                    text.values()
+                    emission
+                        .texts
+                        .iter()
+                        .map(|(file, original)| text.get(file).unwrap_or(original))
                         .any(|source| source.contains("&mut (*s).dist"))
                 );
                 assert!(

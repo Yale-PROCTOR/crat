@@ -40,6 +40,16 @@ pub mod src {
                 PrepareH35(h, one_shot, input_size, data);
                 tag
             }
+            // wave-5d 149e (the 58 re-cut): a live caller handing two separate
+            // objects, so the attested world's pair rule (R833-1) at
+            // `PrepareH35 -> PrepareH3` is certified rather than held.
+            #[no_mangle]
+            pub unsafe extern "C" fn __crat_test_live() -> usize {
+                let mut buckets = [0u32; 65536];
+                let mut h = H35 { ha: H3 { buckets_: buckets.as_mut_ptr() } };
+                let buf = [0u8; 4096];
+                HasherPrepare(&mut h, 1, 16, buf.as_ptr())
+            }
         }
     }
 }
