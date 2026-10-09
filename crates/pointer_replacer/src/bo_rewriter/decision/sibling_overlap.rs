@@ -1280,6 +1280,7 @@ fn local_pair_proof(
                 caller,
                 arguments.get(site.key.argument_index)?,
                 arguments.get(argument_index)?,
+                (site.call_span, site.key.argument_index, argument_index),
             )?;
             Some(clear(
                 kind.key(),

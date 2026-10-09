@@ -515,6 +515,8 @@ pub(crate) struct LedgerRow {
     pub(crate) left: usize,
     pub(crate) right: usize,
     pub(crate) outcome: Result<CertificateKind, Unproved>,
+    /// The asked call's left argument (one per call): the P11 table's site.
+    pub(crate) site: Span,
 }
 
 /// Every certificate the caller bodies and callee signatures support, derived
@@ -552,7 +554,16 @@ pub(crate) struct PairDisjointnessIndex {
     ledger: RefCell<Vec<LedgerRow>>,
     /// P11 (R936-1): the foreign-callee pairs `certify_call_arguments` cleared
     /// by the premise, as (caller, left span, right span, kind).
-    premise_foreign: RefCell<Vec<(u32, Span, Span, super::global_or_integer::ProvenanceKind)>>,
+    #[allow(clippy::type_complexity)]
+    premise_foreign: RefCell<
+        Vec<(
+            u32,
+            Span,
+            usize,
+            usize,
+            super::global_or_integer::ProvenanceKind,
+        )>,
+    >,
     /// R544-3: every function's binding root classes, as the call sites read
     /// them, so a pair of bindings of ONE function can be certified without a
     /// call between them ([`Self::certify_bindings`]).
@@ -836,6 +847,8 @@ impl PairDisjointnessIndex {
         function: LocalDefId,
         left: &'tcx Expr<'tcx>,
         right: &'tcx Expr<'tcx>,
+        // The call and the two positions, for the P11 table's row.
+        call: (Span, usize, usize),
     ) -> Option<CertificateKind> {
         let classes = self.binding_roots.get(&function.local_def_index.as_u32())?;
         let typeck = tcx.typeck(function);
@@ -849,8 +862,9 @@ impl PairDisjointnessIndex {
             )?;
             self.premise_foreign.borrow_mut().push((
                 function.local_def_index.as_u32(),
-                left.span,
-                right.span,
+                call.0,
+                call.1.min(call.2),
+                call.1.max(call.2),
                 kind,
             ));
             Some(CertificateKind::GlobalOrIntegerPremise(kind))
@@ -1146,6 +1160,7 @@ impl PairDisjointnessIndex {
             left: left.min(right),
             right: left.max(right),
             outcome,
+            site: if left <= right { left_span } else { right_span },
         });
         outcome
     }
@@ -1597,14 +1612,8 @@ impl PairDisjointnessIndex {
             let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) = row.outcome else {
                 continue;
             };
-            let site = self
-                .sites
-                .get(&(row.caller, row.callee))
-                .and_then(|sites| sites.first())
-                .map_or_else(
-                    || "-".to_owned(),
-                    |site| source_map.span_to_diagnostic_string(site.call_span),
-                );
+            // The asked call's own argument span (round-4 MED-3).
+            let site = source_map.span_to_diagnostic_string(row.site);
             rows.insert(format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\n",
                 name(row.caller),
@@ -1615,13 +1624,13 @@ impl PairDisjointnessIndex {
                 kind.key(),
             ));
         }
-        for (caller, left, right, kind) in self.premise_foreign.borrow().iter() {
+        for (caller, call, left, right, kind) in self.premise_foreign.borrow().iter() {
             rows.insert(format!(
                 "{}\t<foreign>\t{}\t{}\t{}\t{}\n",
                 name(*caller),
-                source_map.span_to_diagnostic_string(left.source_callsite()),
-                source_map.span_to_diagnostic_string(*left),
-                source_map.span_to_diagnostic_string(*right),
+                source_map.span_to_diagnostic_string(call.source_callsite()),
+                left,
+                right,
                 kind.key(),
             ));
         }

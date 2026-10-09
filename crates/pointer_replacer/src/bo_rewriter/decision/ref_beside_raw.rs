@@ -429,7 +429,9 @@ fn edge_of(rest: &str) -> Edge {
     let reason = fields.next().unwrap_or_default();
     match verdict {
         "clear" if reason.contains("a5-proven-disjoint") => Edge::ClassifierClear,
-        "clear" if reason.contains("premise=global-or-integer-provenance") => Edge::PremiseClear,
+        // The certificate's reason holds colons (`pair-disjoint:premise=…:<kind>`),
+        // so the premise is found in the whole receipt (round-4 MED-1).
+        "clear" if rest.contains("premise=global-or-integer-provenance") => Edge::PremiseClear,
         "clear" => Edge::CertifiedClear,
         _ => Edge::Ordered,
     }
