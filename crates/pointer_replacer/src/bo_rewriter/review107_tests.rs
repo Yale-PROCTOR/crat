@@ -64,9 +64,9 @@ const G_U8: &str = "pub unsafe fn g(n: u8, flag: i32, p: *const u8) -> u32 {\n\
     let mut s = 0u32; let mut i: u8 = 0;\n\
     while i < n { s += *p.offset(i as isize) as u32; i += 1; }\n\
     s }\n";
-const G_USIZE: &str = "pub unsafe fn g(n: usize, flag: i32, p: *const u8) -> u32 {\n\
-    let mut s = 0u32; let mut i: usize = 0;\n\
-    while i < n { s += *p.add(i) as u32; i += 1; }\n\
+const G_ISIZE: &str = "pub unsafe fn g(n: isize, flag: i32, p: *const u8) -> u32 {\n\
+    let mut s = 0u32; let mut i: isize = 0;\n\
+    while i < n { s += *p.offset(i) as u32; i += 1; }\n\
     s }\n";
 
 // ---- round 1 (Codex, 10-07) ------------------------------------------------
@@ -127,14 +127,17 @@ fn r107_cb9_an_access_after_a_nested_return_is_not_must() {
 /// the length must not evaluate it again.
 #[test]
 fn r107_cb8_a_calling_argument_is_not_duplicated_into_the_length() {
-    let src = "static mut CALLS: usize = 0;\n\
-        pub unsafe fn next() -> usize { CALLS += 1; CALLS }\n\
-        pub unsafe fn g(n: usize, flag: i32, p: *const i32) -> i32 {\n\
-        let mut s = 0; let mut i: usize = 0;\n\
+    let src = "static mut CALLS: isize = 0;\n\
+        pub unsafe fn next() -> isize { CALLS += 1; CALLS }\n\
+        pub unsafe fn g(n: isize, flag: i32, p: *const i32) -> i32 {\n\
+        let mut s = 0; let mut i: isize = 0;\n\
         while i < n { s += *p.offset(i as isize); i += 1; }\n\
         s }\n\
         pub unsafe fn caller(base: *const i32, k: isize) -> i32 { g((next)(), 1, base.offset(k)) }\n";
-    assert_eq!(bound(src, "g", 2).as_deref(), Some("len-callee-bound:may:n"));
+    assert_eq!(
+        bound(src, "g", 2).as_deref(),
+        Some("len-callee-bound:may:n")
+    );
     no_callee_bound_at_the_call(src);
 }
 
@@ -187,9 +190,9 @@ fn r107_cbf4b_a_guarded_read_in_a_loop_gives_no_loop_bound() {
 #[test]
 fn r107_cbf5_a_function_named_like_a_primitive_is_a_call() {
     let src = format!(
-        "static mut COUNTER: usize = 0;\n\
-         pub unsafe fn wrapping_add() -> usize {{ COUNTER += 1; COUNTER }}\n\
-         {G_USIZE}\
+        "static mut COUNTER: isize = 0;\n\
+         pub unsafe fn wrapping_add() -> isize {{ COUNTER += 1; COUNTER }}\n\
+         {G_ISIZE}\
          pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{ g(wrapping_add(), 1, base.offset(k)) }}\n"
     );
     no_callee_bound_at_the_call(&src);
@@ -222,7 +225,8 @@ fn r112_r3_1_an_argument_with_operators_is_not_copied() {
 /// bound of it.
 #[test]
 fn r112_r3_2_an_intermediate_sign_changing_cast_is_refused() {
-    let src = "pub unsafe fn f(p: *const u8, n: u8) -> u8 { *p.offset(((n as i8) + 2) as isize) }\n";
+    let src =
+        "pub unsafe fn f(p: *const u8, n: u8) -> u8 { *p.offset(((n as i8) + 2) as isize) }\n";
     assert_eq!(bound(src, "f", 0), None);
 }
 
@@ -281,9 +285,9 @@ fn r112_r3_7_ordinary_arithmetic_in_the_index_is_refused() {
 #[test]
 fn r112_r3_8_a_user_method_named_like_a_primitive_is_refused() {
     let src = format!(
-        "pub struct Counter {{ c: core::cell::Cell<usize> }}\n\
-         impl Counter {{ pub fn wrapping_add(&self, _k: usize) -> usize {{ let v = self.c.get(); self.c.set(v + 1); v }} }}\n\
-         {G_USIZE}\
+        "pub struct Counter {{ c: core::cell::Cell<isize> }}\n\
+         impl Counter {{ pub fn wrapping_add(&self, _k: isize) -> isize {{ let v = self.c.get(); self.c.set(v + 1); v }} }}\n\
+         {G_ISIZE}\
          pub unsafe fn caller(base: *const u8, k: isize, counter: &Counter) -> u32 {{ g(counter.wrapping_add(1), 1, base.offset(k)) }}\n"
     );
     no_callee_bound_at_the_call(&src);

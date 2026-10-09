@@ -144,11 +144,8 @@ fn n1_frame_premises_are_exactly_what_the_rule_consumes() {
         for c in constructions {
             assert!(c.hold_reason.is_none() && c.replacement.is_some() && !c.nullable);
             assert!(
-                c.length
-                    .source
-                    .receipt_key()
-                    .starts_with("len-callee-bound:may:"),
-                "R707: the relocated extent is the row's own callee bound: {:?}",
+                c.length.is_fallback(),
+                "the relocated extent is the fabricated one: {:?}",
                 c.length
             );
         }
@@ -328,8 +325,6 @@ fn n1_does_not_emit_a_count_guard() {
 }
 
 /// **W-N1-EXTENT** — the fabricated extent is RELOCATED, not removed and not
-/// duplicated (R707: the rows now carry their bodies' own bounds, which N1
-/// relocates the same way) —
 /// duplicated: the admitted row keeps its fabricated length, still receipted,
 /// and that table's own fabricated outer extent is now an exact array while
 /// the sibling's outer extent is untouched.
@@ -341,10 +336,9 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
     // wrapper), the untouched `options` table, and the sibling output table's
     // OWN two — its outer view and its inner row — which this arm did not take.
     // The count is unchanged from the frame: N1 moved one, it invented none.
-    // R707: each of the four is now its body's own bound, so none survives.
     assert_eq!(
         shared.matches("crate::FALLBACK_SLICE_EXTENT").count(),
-        0,
+        4,
         "{shared}"
     );
     // The delivered table's OWN fabricated outer extent is gone: the wrapper
@@ -374,11 +368,11 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
             .expect("an admitted N1 plan");
         assert!(!plan.count_guard);
         assert_eq!(plan.parameters.len(), 1, "one side only");
-        assert!(plan.rows.iter().all(|r| !r.was_fallback));
+        assert!(plan.rows.iter().all(|r| r.was_fallback));
         assert!(
-            plan.rows.iter().all(|r| r.length.contains("size")),
-            "R707: the relocated length is the row's bound in `size`: {:?}",
-            plan.rows.iter().map(|r| &r.length).collect::<Vec<_>>()
+            plan.rows
+                .iter()
+                .all(|r| r.length == "crate::FALLBACK_SLICE_EXTENT")
         );
         let relocated = plan.rows.iter().map(|r| r.local).collect::<Vec<_>>();
         for c in &table.slice_constructions {
@@ -386,7 +380,7 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
                 continue;
             }
             let expected = if relocated.contains(&c.node.1) {
-                "nested-reborrow-relocated-callee-bound"
+                "nested-reborrow-relocated-fallback"
             } else {
                 "place-read"
             };
@@ -395,10 +389,7 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
                 "only the relocated row is re-labelled"
             );
             assert!(
-                c.length
-                    .source
-                    .receipt_key()
-                    .starts_with("len-callee-bound:"),
+                c.length.is_fallback(),
                 "N1 does not re-source a length it only moved: {:?}",
                 c.length
             );

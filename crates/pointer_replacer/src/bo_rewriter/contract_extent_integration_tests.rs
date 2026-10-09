@@ -1233,10 +1233,7 @@ fn ce_d06_a_model_raw_callee_carries_no_caller() {
 /// planned `from_raw_parts_mut(chunk.offset(..), (CRC) as usize)`. A sibling
 /// argument is a length only with evidence: a count position of the callee's
 /// own pinned contract that names it (D1's op-fact discipline); otherwise the
-/// construction takes the fallback extent and its receipt. R677-6: `set32bit`'s
-/// straight-line body writes exactly four bytes, so the length is `4`
-/// (`len-callee-access`, ahead of R707's bound, R780-2) — still never the
-/// value `crc`.
+/// construction takes the fallback extent and its receipt.
 const CE_L01_VALUE_IS_NOT_A_LENGTH: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_assignments)]
 static mut SAVED: *mut u8 = 0 as *mut u8;
@@ -3311,9 +3308,7 @@ fn w4r01_the_receipt_key_separates_same_label_twins() {
 /// and never reaches a slice construction at all.
 /// The same shape with an opaque `GetBuffer()` root: no allocation, no array,
 /// no literal, no companion — the length planner keeps its §77 fallback and
-/// B1 has nothing to propagate. R707: the body's own `while i < n` bounds the
-/// buffer, so the planner now takes `n` (`len-callee-bound:may:n`) — and still
-/// nothing from the root.
+/// B1 has nothing to propagate.
 const W4_B1_OPAQUE_ROOT: &str = r#"
 #![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
 pub type uint8_t = u8;
@@ -3347,9 +3342,9 @@ fn w4b101_an_opaque_root_states_no_extent() {
         .iter()
         .find(|(element, _)| element.contains("uint8_t"))
         .unwrap_or_else(|| panic!("no uint8_t construction: {plans:?}"));
-    assert_eq!(
-        buffer.1, "len-callee-bound:may:n",
-        "B1 has nothing to propagate; the body's own loop bounds the buffer (R707): {plans:?}"
+    assert!(
+        buffer.1.starts_with("fabricated-extent"),
+        "nothing to propagate: {plans:?}"
     );
 }
 

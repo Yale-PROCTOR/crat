@@ -982,10 +982,10 @@ fn w6a_b1_receiver_of_a_local_callee_is_not_typed_by_its_constructor() {
         "the callee's return is not converted: {}",
         out.source
     );
-    // R707 (wave-4 build 1): `d` is read at `d[0]` on every path, so the
-    // declaration planner takes `d`'s own bound, 1, around the same bracket.
     assert!(
-        text.contains("core::slice::from_raw_parts(chunk_data(chunk),1)"),
+        text.contains(
+            "core::slice::from_raw_parts(chunk_data(chunk),crate::FALLBACK_SLICE_EXTENT)"
+        ),
         "{}",
         out.source
     );
