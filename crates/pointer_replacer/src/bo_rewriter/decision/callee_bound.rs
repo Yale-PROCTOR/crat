@@ -1,150 +1,84 @@
-//! **R699-2 / R707 / R717-1 — the extent a function's own accesses prove**
-//! (wave-4 build 1, `len-callee-bound`).
+//! **R699-2 / R707 / R923-1 — the extent a function's own loop proves**
+//! (wave-4 build 1, `len-callee-bound`, narrowed by relay 112).
 //!
 //! A slice built over a raw pointer needs a length. Where no companion,
 //! contract, array or region names one, the §77 fallback (`1024`) is used. This
-//! module reads the length from the body that USES the pointer instead: every
-//! element the body touches is at an index the body itself bounds, so the
-//! maximum index plus one is a length the allocation has wherever that access
-//! runs (§28: a UB-free input stays inside its allocation).
+//! module reads the length from the body that USES the pointer instead, but
+//! only from an **arithmetic-free shape** (R923-1): the pointer is read or
+//! written at the counter of a loop
 //!
-//! The bound is a [`Bound`]: the `max` of linear expressions in the function's
-//! own integer parameters — a constant `k`, `p`, `p ± k`, `p − q`. Three forms
-//! of index produce one:
-//!   (a) a literal `c` (`*p`, `*p.offset(c)`) → `c + 1`;
-//!   (b) the variable `i` of an enclosing `while i < X` (`<= X` → `X + 1`),
-//!       optionally `i ± v` for a constant or parameter `v`, where `X` is itself
-//!       such an expression and `i` is written only after the access, at the
-//!       loop body's own top level → `X (± v)`;
-//!   (c) the pointer (or `p.offset(e)`, `&*p.offset(e)`) passed to a LOCAL
-//!       callee whose own bound for that parameter is instantiated with the
-//!       call's arguments → that bound (`+ e`).
-//! Anything else — an index read from memory, a bound on a local or a global,
-//! the pointer stored, cast, reassigned, compared or handed to a foreign
-//! function, a recursive callee — gives no bound, and the fallback stays.
+//! ```text
+//! while i < X { …; *p.offset(i as isize) …; i += 1 }
+//! ```
 //!
-//! **Must and may (R707-1).** A bound is `must` when every access runs on every
-//! call: the body has no branch, loop, early return or short-circuit, so the
-//! allocation has the bound's elements at the construction (R677-6's meaning).
-//! Every other bound is `may`: every access the body makes is below it (so the
-//! slice never panics where the C program reads), and the allocation has the
-//! bound's elements on every path that performs the maximal access; on a path
-//! that returns before reading, the length is a §77-class claim — never larger
-//! than what the body could read. The receipt carries the tag
-//! (`len-callee-bound:<must|may>:<expr>`) so the two are counted apart.
+//! whose limit `X` is a literal or one of the function's own integer
+//! parameters, never written; or it is passed UNCHANGED to a local callee whose
+//! own bound is instantiated with a literal or a never-written parameter. The
+//! bound is the `max` of such terms, each a constant or one parameter (no
+//! coefficient, no `±`): the C program computes no part of it, so no cast,
+//! wrap or overflow of the C program can make it smaller than the index.
 //!
-//! **Soundness of the arithmetic.** The bound must over-approximate the index,
-//! so every step that could make the rendered value SMALLER than the real one
-//! refuses: subtraction or a negative coefficient on an unsigned operand (it
-//! wraps), a cast that can increase a value (signed → unsigned, signed
-//! narrowing) on the bound side, a cast that can shrink the loop variable on
-//! the index side. The rendering evaluates in `i128` and clamps at zero:
+//! Everything else — a literal or parameter index outside a loop, any `+`,
+//! `-`, `*`, shift, method or cast on a limit or an argument, a loop with a
+//! branch, `break`, `continue`, `return`, closure or nested loop in its body,
+//! `<=`, a second conjunct, a counter written twice, a pointer passed at an
+//! offset or by address, a closure anywhere in the body — gives no bound, and
+//! the fallback stays with its receipt.
+//!
+//! **Only `may` (R707-1, R923-1).** Every access the body makes is below the
+//! bound, so the slice never panics where the C program reads; the allocation
+//! has the bound's elements on every path that runs the loop to its limit
+//! (§28: a UB-free input stays inside its allocation). On a path that leaves
+//! before that (a call that exits, a limit the counter starts above), the
+//! length is a §77-class claim, never larger than what the loop could read.
+//! The receipt is `len-callee-bound:may:<expr>`.
+//!
+//! The rendering evaluates in `i128` and clamps at zero:
 //! `((<expr>).max(0)) as usize`.
-
-use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    BinOpKind, Expr, ExprKind, HirId, LoopSource, Node, PatKind, QPath, StmtKind, UnOp,
+    BinOpKind, Expr, ExprKind, HirId, LoopSource, PatKind, QPath, StmtKind, UnOp,
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
-use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::ty::{
+    Ty, TyCtxt,
+    adjustment::{Adjust, AutoBorrow, AutoBorrowMutability},
+};
 
-/// One linear term set: `k + Σ c·param`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Lin {
-    pub(crate) k: i128,
-    /// parameter index → coefficient (never zero).
-    pub(crate) terms: BTreeMap<usize, i128>,
+/// One term of the bound: a constant, or parameter `index` itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Term {
+    Constant(i128),
+    Parameter(usize),
 }
 
-impl Lin {
-    fn constant(k: i128) -> Self {
-        Lin {
-            k,
-            terms: BTreeMap::new(),
+impl Term {
+    /// An `i128` expression usable as a method receiver.
+    fn render(self, argument: &dyn Fn(usize) -> String) -> String {
+        match self {
+            Term::Constant(k) => format!("{k}i128"),
+            Term::Parameter(p) => format!("(({}) as i128)", argument(p)),
         }
     }
 
-    fn param(index: usize) -> Self {
-        Lin {
-            k: 0,
-            terms: BTreeMap::from([(index, 1)]),
+    fn display(self, names: &[String]) -> String {
+        match self {
+            Term::Constant(k) => k.to_string(),
+            Term::Parameter(p) => names.get(p).cloned().unwrap_or_else(|| format!("arg{p}")),
         }
-    }
-
-    fn plus(&self, other: &Lin, sign: i128) -> Lin {
-        let mut out = self.clone();
-        out.k += sign * other.k;
-        for (p, c) in &other.terms {
-            let v = out.terms.entry(*p).or_insert(0);
-            *v += sign * c;
-        }
-        out.terms.retain(|_, c| *c != 0);
-        out
-    }
-
-    /// An `i128` expression usable as a method receiver: `3i128`,
-    /// `((n) as i128)`, or a parenthesised sum.
-    fn render(&self, argument: &dyn Fn(usize) -> String) -> String {
-        let mut parts = Vec::new();
-        for (p, c) in &self.terms {
-            let a = format!("(({}) as i128)", argument(*p));
-            parts.push(match c {
-                1 => a,
-                -1 => format!("-{a}"),
-                c => format!("{c} * {a}"),
-            });
-        }
-        if parts.is_empty() {
-            return if self.k < 0 {
-                format!("({}i128)", self.k)
-            } else {
-                format!("{}i128", self.k)
-            };
-        }
-        if self.k != 0 {
-            parts.push(format!("{}i128", self.k));
-        }
-        // F3 (relay 107): only `((p) as i128)` is a receiver as it stands; a
-        // product `c * ((p) as i128)` is parenthesized before `.max(…)`.
-        if parts.len() == 1 && parts[0].starts_with("((") {
-            return parts.remove(0);
-        }
-        format!("({})", parts.join(" + ").replace("+ -", "- "))
-    }
-
-    fn display(&self, names: &[String]) -> String {
-        let mut parts = Vec::new();
-        for (p, c) in &self.terms {
-            let n = names.get(*p).cloned().unwrap_or_else(|| format!("arg{p}"));
-            parts.push(match c {
-                1 => n,
-                -1 => format!("-{n}"),
-                c => format!("{c}*{n}"),
-            });
-        }
-        if self.k != 0 || parts.is_empty() {
-            parts.push(self.k.to_string());
-        }
-        parts.join("+").replace("+-", "-")
     }
 }
 
-/// The bound: the `max` of its terms, tagged must or may.
+/// The bound: the `max` of its terms (at most one constant, sorted, distinct).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Bound {
-    pub(crate) terms: Vec<Lin>,
-    pub(crate) must: bool,
+    pub(crate) terms: Vec<Term>,
 }
 
 impl Bound {
-    fn tag(&self) -> &'static str {
-        if self.must { "must" } else { "may" }
-    }
-
     /// The clamped count, an `i128`, with parameter `i` spelled
     /// `argument(i)` — for the glue, which casts a length `(len) as usize`
     /// itself.
@@ -171,13 +105,13 @@ impl Bound {
     /// The bound when it is one non-negative constant.
     fn constant(&self) -> Option<i128> {
         match self.terms.as_slice() {
-            [only] if only.terms.is_empty() && only.k >= 0 => Some(only.k),
+            [Term::Constant(k)] if *k >= 0 => Some(*k),
             _ => None,
         }
     }
 
-    /// `len-callee-bound:<must|may>:<expr>`, the expression in the bounded
-    /// function's own parameter names.
+    /// `len-callee-bound:may:<expr>`, the expression in the bounded function's
+    /// own parameter names.
     pub(crate) fn receipt(&self, names: &[String]) -> String {
         let expr = if self.terms.len() == 1 {
             self.terms[0].display(names)
@@ -191,18 +125,24 @@ impl Bound {
                     .join(",")
             )
         };
-        format!("len-callee-bound:{}:{expr}", self.tag())
+        format!("len-callee-bound:may:{expr}")
     }
 
-    /// The max of both. Terms over the same parameters differ only in their
-    /// constant, so the larger one dominates and the other is dropped (`max(1,
-    /// 4)` is `4`; `max(n, n + 1)` is `n + 1`).
+    /// The max of both: the larger constant, every parameter once.
     fn join(&mut self, other: Bound) {
-        self.must &= other.must;
         for t in other.terms {
-            match self.terms.iter_mut().find(|known| known.terms == t.terms) {
-                Some(known) => known.k = known.k.max(t.k),
-                None => self.terms.push(t),
+            let known = self
+                .terms
+                .iter()
+                .position(|k| matches!(k, Term::Constant(_)));
+            match (t, known) {
+                (Term::Constant(new), Some(at)) => {
+                    if let Term::Constant(k) = &mut self.terms[at] {
+                        *k = (*k).max(new);
+                    }
+                }
+                _ if self.terms.contains(&t) => {}
+                _ => self.terms.push(t),
             }
         }
         self.terms.sort();
@@ -236,74 +176,42 @@ pub(crate) fn of_local(tcx: TyCtxt<'_>, f: LocalDefId, local: HirId) -> Option<B
     Analysis::new(tcx).bound(f, local)
 }
 
-/// A call-site argument is admitted as an instantiation only when it is free
-/// of calls, assignments and blocks — it is duplicated into the length.
-/// The character before the identifier that ends at `i` (whitespace skipped):
-/// `.` for a method call (relay 107, F5).
-fn before_name(chars: &[char], i: usize) -> Option<char> {
-    chars[..i]
-        .iter()
-        .rev()
-        .skip_while(|c| c.is_whitespace())
-        .skip_while(|c| c.is_alphanumeric() || **c == '_')
-        .find(|c| !c.is_whitespace())
-        .copied()
-}
-
+/// An argument copied into a length is a plain name or a decimal literal
+/// (R923-1): its text then has the parameter's own type and value — Rust has
+/// no implicit integer conversion — and evaluating it again reads the same
+/// value and does nothing else.
 pub(crate) fn pure_argument_text(text: &str) -> bool {
-    // No block, index, address-of or assignment.
-    if text.contains('{') || text.contains('[') || text.contains('&') {
-        return false;
-    }
-    let chars = text.chars().collect::<Vec<_>>();
-    for (i, c) in chars.iter().enumerate() {
-        let prev = chars[..i]
-            .iter()
-            .rev()
-            .find(|c| !c.is_whitespace())
-            .copied();
-        let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        match c {
-            '=' => {
-                let before = i.checked_sub(1).map(|j| chars[j]);
-                if !matches!(before, Some('=' | '!' | '<' | '>')) && chars.get(i + 1) != Some(&'=')
-                {
-                    return false;
-                }
-            }
-            // A call — except the integer `wrapping_*` methods, which read
-            // nothing but their operands.
-            '(' if word(prev) || matches!(prev, Some('>' | ')' | ']')) => {
-                let name = chars[..i]
-                    .iter()
-                    .rev()
-                    .skip_while(|c| c.is_whitespace())
-                    .take_while(|c| c.is_alphanumeric() || **c == '_')
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>();
-                // F5 (relay 107): only as a METHOD (`x.wrapping_add(..)`); a
-                // free function of that name is an arbitrary call.
-                if !matches!(
-                    name.as_str(),
-                    "wrapping_add" | "wrapping_sub" | "wrapping_mul"
-                ) || before_name(&chars, i) != Some('.')
-                {
-                    return false;
-                }
-            }
-            // A dereference reads memory another argument's call may write.
-            '*' if !(word(prev) || prev == Some(')')) => return false,
-            _ => {}
-        }
-    }
-    true
+    let text = text.trim();
+    let name = text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let digits = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let literal = digits > 0
+        && matches!(
+            &text[digits..],
+            "" | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+        );
+    name || literal
 }
 
 /// Every argument of the call is free of assignments, blocks and calls (the
-/// pointer-arithmetic and integer methods excepted), so no argument's
-/// evaluation can change a value the duplicated length reads.
+/// pointer-arithmetic methods excepted), so no argument's evaluation can
+/// change a value the duplicated length reads.
 fn effect_free_text(text: &str) -> bool {
     if text.contains('{') {
         return false;
@@ -319,8 +227,8 @@ fn effect_free_text(text: &str) -> bool {
                 }
             }
             '(' => {
-                // Relay 107 (review 8b): `(f)()` / `t[k]()` call through a
-                // parenthesized or indexed callee.
+                // `(f)()` / `t[k]()` call through a parenthesized or indexed
+                // callee.
                 if matches!(
                     chars[..i].iter().rev().find(|c| !c.is_whitespace()),
                     Some(')' | ']')
@@ -336,21 +244,22 @@ fn effect_free_text(text: &str) -> bool {
                     .chars()
                     .rev()
                     .collect::<String>();
-                if !name.is_empty() && before_name(&chars, i) != Some('.') {
-                    return false;
+                if name.is_empty() {
+                    continue;
                 }
-                if !name.is_empty()
-                    && !matches!(
+                // A method, and one of the pointer methods that read nothing
+                // but their operands.
+                let method = chars[..i]
+                    .iter()
+                    .rev()
+                    .skip_while(|c| c.is_whitespace())
+                    .skip_while(|c| c.is_alphanumeric() || **c == '_')
+                    .find(|c| !c.is_whitespace())
+                    == Some(&'.');
+                if !method
+                    || !matches!(
                         name.as_str(),
-                        "offset"
-                            | "add"
-                            | "wrapping_offset"
-                            | "wrapping_add"
-                            | "wrapping_sub"
-                            | "wrapping_mul"
-                            | "is_null"
-                            | "as_ptr"
-                            | "as_mut_ptr"
+                        "offset" | "add" | "wrapping_offset" | "is_null" | "as_ptr" | "as_mut_ptr"
                     )
                 {
                     return false;
@@ -397,40 +306,16 @@ pub(crate) fn at_call_site(
     if !texts.values().all(|t| effect_free_text(t)) {
         return None;
     }
-    let needed = bound
-        .terms
-        .iter()
-        .flat_map(|t| t.terms.keys().copied())
-        .collect::<FxHashSet<_>>();
-    if !needed
-        .iter()
-        .all(|i| texts.get(i).is_some_and(|t| pure_argument_text(t)))
-    {
-        return None;
-    }
-    // F6 (relay 107): the copied text is re-typed as the callee's parameter
-    // (`!0` passed to a `u8` is 255, not the `i32` -1 it reads as alone).
-    let inputs = tcx
-        .fn_sig(callee)
-        .skip_binder()
-        .skip_binder()
-        .inputs()
-        .to_vec();
-    let typed = |i: usize| {
-        let ty = inputs.get(i).map(|t| t.to_string()).unwrap_or_default();
-        if ty.is_empty() {
-            texts[&i].clone()
-        } else {
-            format!("(({}) as {ty})", texts[&i])
+    let needed = bound.terms.iter().filter_map(|t| match t {
+        Term::Parameter(p) => Some(*p),
+        Term::Constant(_) => None,
+    });
+    for i in needed {
+        if !texts.get(&i).is_some_and(|t| pure_argument_text(t)) {
+            return None;
         }
-    };
-    if needed
-        .iter()
-        .any(|i| inputs.get(*i).is_none_or(|t| !t.is_integral()))
-    {
-        return None;
     }
-    let text = bound.render_count(&typed);
+    let text = bound.render_count(&|i| texts[&i].trim().to_owned());
     Some((text, intern(bound.receipt(&parameter_names(tcx, callee)))))
 }
 
@@ -445,15 +330,10 @@ pub(crate) fn in_own_parameters(
     count: bool,
 ) -> Option<(String, String)> {
     let names = parameter_names(tcx, f);
-    let needed = bound
-        .terms
-        .iter()
-        .flat_map(|t| t.terms.keys().copied())
-        .collect::<FxHashSet<_>>();
-    if needed
-        .iter()
-        .any(|i| names.get(*i).is_none_or(|n| n.starts_with("arg")))
-    {
+    if bound.terms.iter().any(|t| match t {
+        Term::Parameter(p) => names.get(*p).is_none_or(|n| n.starts_with("arg")),
+        Term::Constant(_) => false,
+    }) {
         return None;
     }
     let argument = |i: usize| names[i].clone();
@@ -484,7 +364,7 @@ impl<'tcx> Analysis<'tcx> {
         if let Some(known) = self.memo.get(&(f, target)) {
             return known.clone();
         }
-        // A recursive SCC refuses (build 1).
+        // A recursive SCC refuses.
         if !self.active.insert((f, target)) {
             return None;
         }
@@ -505,9 +385,14 @@ impl<'tcx> Analysis<'tcx> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut writes = Writes::default();
+        let mut writes = Writes::new_typeck(tcx.typeck(f));
         writes.visit_expr(body.value);
-        // The pointer itself is never re-pointed (a walker is build 2's).
+        // A closure, a `ref mut` binding or inline assembly writes locals this
+        // census does not see (relay 112, R3-3).
+        if writes.opaque {
+            return None;
+        }
+        // The pointer itself is never re-pointed.
         if writes.written.contains(&target) || writes.borrowed.contains(&target) {
             return None;
         }
@@ -524,33 +409,38 @@ impl<'tcx> Analysis<'tcx> {
             loops: Vec::new(),
             bound: None,
             refused: false,
-            straight: true,
         };
         walker.visit_expr(body.value);
         if walker.refused {
             return None;
         }
-        let straight = walker.straight;
-        // A pointer the body never reads or passes on is read at no index:
-        // its extent is 0, on every path.
-        let mut bound = walker.bound.unwrap_or(Bound {
-            terms: vec![Lin::constant(0)],
-            must: true,
-        });
-        bound.must &= straight;
-        Some(bound)
+        // A pointer read nowhere proves no length (R923-1: no constant of the
+        // module's own making).
+        walker.bound
     }
 }
 
 #[derive(Default)]
-struct Writes {
+struct Writes<'tcx> {
+    typeck: Option<&'tcx rustc_middle::ty::TypeckResults<'tcx>>,
     /// Locals assigned (`=`, `op=`) anywhere, with the assignment expression.
     written: FxHashSet<HirId>,
     assignments: Vec<(HirId, HirId)>,
-    /// Locals whose address is taken mutably.
+    /// Locals whose address is taken mutably, explicitly or by an autoref.
     borrowed: FxHashSet<HirId>,
     /// `let` bindings per local.
     lets: FxHashMap<HirId, usize>,
+    /// A closure, a `ref mut` binding or inline assembly anywhere in the body.
+    opaque: bool,
+}
+
+impl<'tcx> Writes<'tcx> {
+    fn new_typeck(typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>) -> Self {
+        Writes {
+            typeck: Some(typeck),
+            ..Writes::default()
+        }
+    }
 }
 
 fn local_of(e: &Expr<'_>) -> Option<HirId> {
@@ -570,7 +460,7 @@ fn peel_parens<'a, 'tcx>(mut e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
     e
 }
 
-impl<'tcx> Visitor<'tcx> for Writes {
+impl<'tcx> Visitor<'tcx> for Writes<'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
         match e.kind {
             ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _) => {
@@ -584,9 +474,37 @@ impl<'tcx> Visitor<'tcx> for Writes {
                     self.borrowed.insert(id);
                 }
             }
+            ExprKind::Closure(..) | ExprKind::InlineAsm(..) => self.opaque = true,
+            ExprKind::Path(..) => {
+                // A `&mut self` method on a local (`n.add_assign(1)`) borrows
+                // it through its autoref.
+                if let Some(id) = local_of(e)
+                    && let Some(typeck) = self.typeck
+                    && typeck.expr_adjustments(e).iter().any(|a| {
+                        matches!(
+                            a.kind,
+                            Adjust::Borrow(
+                                AutoBorrow::Ref(AutoBorrowMutability::Mut { .. })
+                                    | AutoBorrow::RawPtr(rustc_hir::Mutability::Mut)
+                            )
+                        )
+                    })
+                {
+                    self.borrowed.insert(id);
+                }
+            }
             _ => {}
         }
         intravisit::walk_expr(self, e);
+    }
+
+    fn visit_pat(&mut self, p: &'tcx rustc_hir::Pat<'tcx>) {
+        if let PatKind::Binding(mode, ..) = p.kind
+            && matches!(mode.0, rustc_hir::ByRef::Yes(rustc_hir::Mutability::Mut))
+        {
+            self.opaque = true;
+        }
+        intravisit::walk_pat(self, p);
     }
 
     fn visit_local(&mut self, l: &'tcx rustc_hir::LetStmt<'tcx>) {
@@ -597,30 +515,42 @@ impl<'tcx> Visitor<'tcx> for Writes {
     }
 }
 
-/// One enclosing `while` loop: its own expression, its body block and the
-/// conjuncts of its condition.
+/// One enclosing `while` loop: its body block, the conjuncts of its condition
+/// and whether the body is straight.
 struct LoopFrame<'tcx> {
     body: &'tcx rustc_hir::Block<'tcx>,
     conjuncts: Vec<&'tcx Expr<'tcx>>,
-    /// Relay 107 (review 1a): the body can leave the loop before its
-    /// condition fails (`break`, `return`), so the counter need not reach the
-    /// limit and the limit proves no extent.
-    exits: bool,
+    straight: bool,
 }
 
-/// Does `body` contain a `break` or a `return` anywhere (nested loops
-/// included: a labelled `break` may leave this one)?
-fn leaves_early(body: &rustc_hir::Block<'_>) -> bool {
+/// No branch, loop, `break`, `continue`, `return`, short-circuit, closure or
+/// `let` expression anywhere in `body`: every statement runs on every
+/// iteration, in order (relay 107 F4b, relay 112 R3-5).
+fn straight_block(body: &rustc_hir::Block<'_>) -> bool {
     struct V(bool);
     impl<'v> Visitor<'v> for V {
         fn visit_expr(&mut self, e: &'v Expr<'v>) {
-            if matches!(e.kind, ExprKind::Break(..) | ExprKind::Ret(..)) {
-                self.0 = true;
+            if matches!(
+                e.kind,
+                ExprKind::If(..)
+                    | ExprKind::Match(..)
+                    | ExprKind::Loop(..)
+                    | ExprKind::Break(..)
+                    | ExprKind::Continue(..)
+                    | ExprKind::Ret(..)
+                    | ExprKind::Closure(..)
+                    | ExprKind::Let(..)
+                    | ExprKind::InlineAsm(..)
+                    | ExprKind::Yield(..)
+                    | ExprKind::Become(..)
+            ) || matches!(e.kind, ExprKind::Binary(op, ..) if matches!(op.node, BinOpKind::And | BinOpKind::Or))
+            {
+                self.0 = false;
             }
             intravisit::walk_expr(self, e)
         }
     }
-    let mut v = V(false);
+    let mut v = V(true);
     v.visit_block(body);
     v.0
 }
@@ -630,12 +560,10 @@ struct Walk<'a, 'b, 'tcx> {
     f: LocalDefId,
     target: HirId,
     params: &'b [Option<HirId>],
-    writes: &'b Writes,
+    writes: &'b Writes<'tcx>,
     loops: Vec<LoopFrame<'tcx>>,
     bound: Option<Bound>,
     refused: bool,
-    /// No branch, loop, early return or short-circuit seen anywhere.
-    straight: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -655,12 +583,32 @@ fn int_info<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<(u64, Sign)> {
     ))
 }
 
+/// `to` holds every value of `from` exactly.
+fn value_preserving(from: (u64, Sign), to: (u64, Sign)) -> bool {
+    match (from.1, to.1) {
+        (Sign::Signed, Sign::Signed) | (Sign::Unsigned, Sign::Unsigned) => to.0 >= from.0,
+        (Sign::Unsigned, Sign::Signed) => to.0 > from.0,
+        (Sign::Signed, Sign::Unsigned) => false,
+    }
+}
+
 fn literal(e: &Expr<'_>) -> Option<i128> {
     match e.kind {
         ExprKind::Lit(lit) => match lit.node {
             rustc_ast::LitKind::Int(value, _) => i128::try_from(value.get()).ok(),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn offset_call<'tcx>(e: &'tcx Expr<'tcx>) -> Option<(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>)> {
+    match e.kind {
+        ExprKind::MethodCall(segment, receiver, [arg], _)
+            if matches!(segment.ident.name.as_str(), "offset" | "add") =>
+        {
+            Some((receiver, arg))
+        }
         _ => None,
     }
 }
@@ -685,7 +633,8 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
         self.a.tcx.typeck(self.f)
     }
 
-    /// A parameter of `f` usable in a bound: integer-typed and never written.
+    /// A parameter of `f` usable in a bound: integer-typed and never written
+    /// or borrowed mutably.
     fn bound_param(&self, id: HirId) -> Option<usize> {
         let index = self.params.iter().position(|p| *p == Some(id))?;
         if self.writes.written.contains(&id) || self.writes.borrowed.contains(&id) {
@@ -695,210 +644,102 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
         Some(index)
     }
 
-    /// A VALUE as a linear expression in `f`'s parameters, over-approximating
-    /// it from neither side: only exact steps are admitted (constants,
-    /// parameters, value-preserving casts, signed `±`, unsigned `+`).
-    fn value(&self, e: &'tcx Expr<'tcx>) -> Option<Lin> {
+    /// A limit or an argument as a term: a non-negative literal, a literal
+    /// under casts it fits through unchanged, or a bound parameter — with no
+    /// operator and no other cast (R923-1).
+    fn term(&self, e: &'tcx Expr<'tcx>) -> Option<Term> {
         let e = peel_parens(e);
         if let Some(k) = literal(e) {
-            return Some(Lin::constant(k));
+            return Some(Term::Constant(k));
         }
         match e.kind {
-            ExprKind::Path(..) => self.bound_param(local_of(e)?).map(Lin::param),
+            ExprKind::Path(..) => self.bound_param(local_of(e)?).map(Term::Parameter),
             ExprKind::Cast(inner, _) => {
-                let from = int_info(self.a.tcx, self.typeck().expr_ty(inner))?;
-                let to = int_info(self.a.tcx, self.typeck().expr_ty(e))?;
-                value_preserving(from, to).then(|| self.value(inner))?
+                let Term::Constant(k) = self.term(inner)? else { return None };
+                let ty = self.typeck().expr_ty(e);
+                let (bits, sign) = int_info(self.a.tcx, ty)?;
+                let max = match sign {
+                    Sign::Signed => (1i128 << (bits - 1)) - 1,
+                    Sign::Unsigned if bits >= 127 => i128::MAX,
+                    Sign::Unsigned => (1i128 << bits) - 1,
+                };
+                (k <= max).then_some(Term::Constant(k))
             }
-            ExprKind::Binary(op, l, r) => {
-                let sign = int_info(self.a.tcx, self.typeck().expr_ty(e))?.1;
-                match op.node {
-                    BinOpKind::Add => Some(self.value(l)?.plus(&self.value(r)?, 1)),
-                    BinOpKind::Sub if sign == Sign::Signed => {
-                        Some(self.value(l)?.plus(&self.value(r)?, -1))
-                    }
-                    _ => None,
-                }
-            }
-            // F2 (relay 107): no `wrapping_*` value or index: it may wrap, and
-            // nothing here proves it does not.
             _ => None,
         }
     }
 
-    /// `ub(idx)`: a linear expression `L` with `idx < L` at the access.
-    fn index_bound(&self, idx: &'tcx Expr<'tcx>, at: HirId) -> Option<Lin> {
+    /// The loop counter an index names: `i`, or `i` under value-preserving
+    /// widening casts (`i as isize`), and nothing else.
+    fn counter(&self, idx: &'tcx Expr<'tcx>) -> Option<HirId> {
         let idx = peel_parens(idx);
-        if let Some(k) = literal(idx) {
-            return Some(Lin::constant(k + 1));
-        }
         match idx.kind {
             ExprKind::Cast(inner, _) => {
                 let from = int_info(self.a.tcx, self.typeck().expr_ty(inner))?;
                 let to = int_info(self.a.tcx, self.typeck().expr_ty(idx))?;
-                // The index the access uses is the cast value; it equals the
-                // inner value whenever that is in range of the target, which a
-                // pointer offset of a real allocation always is.
-                // F1 (relay 107): a signed value cast to unsigned (or any
-                // narrowing) changes it; an unsigned one cast to a signed type
-                // of equal width is exact for every real offset (≤ isize::MAX).
-                let exact = from.0 <= to.0
-                    && (from.1 == to.1 || (from.1 == Sign::Unsigned && to.1 == Sign::Signed));
-                exact.then(|| self.index_bound(inner, at))?
+                value_preserving(from, to).then(|| self.counter(inner))?
             }
-            ExprKind::Path(..) => {
-                let id = local_of(idx)?;
-                if let Some(p) = self.bound_param(id) {
-                    return Some(Lin::param(p).plus(&Lin::constant(1), 1));
-                }
-                self.loop_bound(id, at)
-            }
-            ExprKind::Binary(op, l, r) => {
-                let sign = int_info(self.a.tcx, self.typeck().expr_ty(idx))?.1;
-                match op.node {
-                    BinOpKind::Add => {
-                        if let Some(v) = self.value(r) {
-                            Some(self.index_bound(l, at)?.plus(&v, 1))
-                        } else {
-                            Some(self.index_bound(r, at)?.plus(&self.value(l)?, 1))
-                        }
-                    }
-                    BinOpKind::Sub if sign == Sign::Signed => {
-                        Some(self.index_bound(l, at)?.plus(&self.value(r)?, -1))
-                    }
-                    _ => None,
-                }
-            }
-            // F2 (relay 107): no `wrapping_*` value or index: it may wrap, and
-            // nothing here proves it does not.
-            _ => None,
+            _ => local_of(idx),
         }
     }
 
-    /// `i < X` from the innermost enclosing `while` whose condition bounds `i`,
-    /// valid at `at` only when `i` is written in that loop nowhere but at the
-    /// loop body's top level, AFTER the statement that contains `at`.
-    fn loop_bound(&self, i: HirId, at: HirId) -> Option<Lin> {
+    /// `i < X` from the innermost enclosing loop, which must be a straight
+    /// `while i < X` whose body writes `i` once, as its last statement, by
+    /// one; `at` is a statement before that write.
+    fn loop_bound(&self, i: HirId, at: HirId) -> Option<Term> {
         let tcx = self.a.tcx;
-        // A counter whose address is taken may be written through it.
         if self.writes.borrowed.contains(&i) {
             return None;
         }
-        for frame in self.loops.iter().rev() {
-            let mut found = None;
-            // Relay 107 (review 1b): a second conjunct can end the loop before
-            // the counter reaches the limit; only `while i < X` alone is exact.
-            let sole = frame.conjuncts.len() == 1;
-            for c in &frame.conjuncts {
-                let ExprKind::Binary(op, l, r) = peel_parens(c).kind else { continue };
-                let (var, x, inclusive) = match op.node {
-                    BinOpKind::Lt => (l, r, false),
-                    BinOpKind::Le => (l, r, true),
-                    BinOpKind::Gt => (r, l, false),
-                    BinOpKind::Ge => (r, l, true),
-                    _ => continue,
-                };
-                if !self.is_counter(var, i) {
-                    continue;
-                }
-                // Relay 107 (review 2a): the limit is taken EXACTLY (`value`):
-                // a cast that can shrink it would make the bound larger than
-                // the loop's own extent.
-                let Some(x) = self.value(x) else { continue };
-                found = Some(if inclusive {
-                    x.plus(&Lin::constant(1), 1)
-                } else {
-                    x
-                });
-                break;
-            }
-            let Some(bound) = found else { continue };
-            if !sole || frame.exits {
-                return None;
-            }
-            // Position of the top-level statement containing `at`.
-            let contains = |stmt: &rustc_hir::Stmt<'_>, id: HirId| {
-                tcx.hir_parent_id_iter(id).any(|p| p == stmt.hir_id)
-            };
-            let at_position = frame.body.stmts.iter().position(|s| contains(s, at));
-            // F4b (relay 107): the access runs on every iteration only as a
-            // top-level statement, not under a branch, loop or short-circuit.
-            let Some(at_stmt) = at_position else { return None };
-            let stmt_id = frame.body.stmts[at_stmt].hir_id;
-            for (id, node) in tcx.hir_parent_iter(at) {
-                if id == stmt_id {
-                    break;
-                }
-                if let Node::Expr(p) = node
-                    && (matches!(
-                        p.kind,
-                        ExprKind::If(..)
-                            | ExprKind::Match(..)
-                            | ExprKind::Loop(..)
-                            | ExprKind::Closure(..)
-                    ) || matches!(p.kind, ExprKind::Binary(op, ..) if matches!(op.node, BinOpKind::And | BinOpKind::Or)))
-                {
-                    return None;
-                }
-            }
-            // F4a: exactly one write of the counter inside the loop.
-            let writes_inside = self
-                .writes
-                .assignments
-                .iter()
-                .filter(|(var, a)| {
-                    *var == i && tcx.hir_parent_id_iter(*a).any(|p| p == frame.body.hir_id)
-                })
-                .count();
-            if writes_inside != 1 {
-                return None;
-            }
-            for (var, assignment) in &self.writes.assignments {
-                if *var != i {
-                    continue;
-                }
-                let inside = tcx
-                    .hir_parent_id_iter(*assignment)
-                    .any(|p| p == frame.body.hir_id);
-                if !inside {
-                    continue;
-                }
-                // Admitted only as a top-level statement after `at`'s, or as
-                // the body's own tail (`{ …; i += 1 }`), which runs after every
-                // statement — provided `at` is in a statement.
-                let position = frame.body.stmts.iter().position(|s| {
-                    matches!(s.kind, StmtKind::Semi(e) | StmtKind::Expr(e) if e.hir_id == *assignment)
-                });
-                let is_tail = frame
-                    .body
-                    .expr
-                    .is_some_and(|tail| tail.hir_id == *assignment);
-                match (position, at_position) {
-                    (Some(w), Some(a)) if w > a => {}
-                    (None, Some(_)) if is_tail => {}
-                    _ => return None,
-                }
-                // Relay 107: the counter steps by exactly one, so it reaches
-                // the limit's last index (a larger step can skip it).
-                if !Self::steps_by_one(tcx.hir_node(*assignment), i) {
-                    return None;
-                }
-            }
-            return Some(bound);
+        let frame = self.loops.last()?;
+        if !frame.straight {
+            return None;
         }
-        None
+        // One conjunct, `i < X` or `X > i`, `i` bare.
+        let [cond] = frame.conjuncts.as_slice() else { return None };
+        let ExprKind::Binary(op, l, r) = peel_parens(cond).kind else { return None };
+        let (var, x) = match op.node {
+            BinOpKind::Lt => (l, r),
+            BinOpKind::Gt => (r, l),
+            _ => return None,
+        };
+        if local_of(peel_parens(var)) != Some(i) {
+            return None;
+        }
+        let bound = self.term(x)?;
+        // The counter's one write in the body: its last statement or its
+        // tail, `i += 1` or `i = i + 1`.
+        let inside = self
+            .writes
+            .assignments
+            .iter()
+            .filter(|(var, a)| {
+                *var == i && tcx.hir_parent_id_iter(*a).any(|p| p == frame.body.hir_id)
+            })
+            .map(|(_, a)| *a)
+            .collect::<Vec<_>>();
+        let [write] = inside.as_slice() else { return None };
+        let last = match frame.body.expr {
+            Some(tail) => tail.hir_id == *write,
+            None => frame.body.stmts.last().is_some_and(
+                |s| matches!(s.kind, StmtKind::Semi(e) | StmtKind::Expr(e) if e.hir_id == *write),
+            ),
+        };
+        if !last || !Self::steps_by_one(tcx.hir_node(*write), i) {
+            return None;
+        }
+        // `at` lies in a statement of the body other than the write.
+        let in_statement = frame.body.stmts.iter().any(|s| {
+            !matches!(s.kind, StmtKind::Semi(e) | StmtKind::Expr(e) if e.hir_id == *write)
+                && tcx.hir_parent_id_iter(at).any(|p| p == s.hir_id)
+        });
+        in_statement.then_some(bound)
     }
 
-    /// `i += 1`, `i = i + 1` or `i = i.wrapping_add(1)` (casts of `1` peeled).
-    fn steps_by_one(node: Node<'_>, i: HirId) -> bool {
-        let Node::Expr(e) = node else { return false };
-        let one = |e: &Expr<'_>| {
-            let mut e = peel_parens(e);
-            while let ExprKind::Cast(inner, _) = e.kind {
-                e = peel_parens(inner);
-            }
-            literal(e) == Some(1)
-        };
+    /// `i += 1` or `i = i + 1`, the `1` a bare literal.
+    fn steps_by_one(node: rustc_hir::Node<'_>, i: HirId) -> bool {
+        let rustc_hir::Node::Expr(e) = node else { return false };
+        let one = |e: &Expr<'_>| literal(peel_parens(e)) == Some(1);
         match e.kind {
             ExprKind::AssignOp(op, lhs, rhs) => {
                 op.node == rustc_hir::AssignOpKind::AddAssign
@@ -906,71 +747,29 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
                     && one(rhs)
             }
             ExprKind::Assign(lhs, rhs, _) if local_of(peel_parens(lhs)) == Some(i) => {
-                match peel_parens(rhs).kind {
-                    ExprKind::Binary(op, l, r) => {
-                        op.node == BinOpKind::Add && local_of(peel_parens(l)) == Some(i) && one(r)
-                    }
-                    ExprKind::MethodCall(segment, receiver, [arg], _) => {
-                        segment.ident.name.as_str() == "wrapping_add"
-                            && local_of(peel_parens(receiver)) == Some(i)
-                            && one(arg)
-                    }
-                    _ => false,
-                }
+                matches!(peel_parens(rhs).kind, ExprKind::Binary(op, l, r)
+                    if op.node == BinOpKind::Add && local_of(peel_parens(l)) == Some(i) && one(r))
             }
             _ => false,
         }
     }
 
-    /// `var` is the counter `i` itself, or `i` under a value-preserving cast.
-    fn is_counter(&self, var: &'tcx Expr<'tcx>, i: HirId) -> bool {
-        let var = peel_parens(var);
-        match var.kind {
-            ExprKind::Cast(inner, _) => {
-                let from = int_info(self.a.tcx, self.typeck().expr_ty(inner));
-                let to = int_info(self.a.tcx, self.typeck().expr_ty(var));
-                matches!((from, to), (Some(f), Some(t)) if value_preserving(f, t))
-                    && self.is_counter(inner, i)
-            }
-            _ => local_of(var) == Some(i),
-        }
-    }
-
-    fn access(&mut self, idx: Option<&'tcx Expr<'tcx>>, at: HirId) {
-        let lin = match idx {
-            None => Some(Lin::constant(1)),
-            Some(idx) => self.index_bound(idx, at),
-        };
-        match lin {
-            Some(lin) => {
-                let must = lin.terms.is_empty() && self.loops.is_empty();
-                self.add(Bound {
-                    terms: vec![lin],
-                    must,
-                })
-            }
+    /// `*p.offset(idx)` / `*p.add(idx)`: the index must be a loop counter.
+    fn access(&mut self, idx: &'tcx Expr<'tcx>, at: HirId) {
+        match self.counter(idx).and_then(|i| self.loop_bound(i, at)) {
+            Some(term) => self.add(Bound { terms: vec![term] }),
             None => self.refuse(),
         }
     }
 
-    /// The pointer (at offset `offset`) passed to `callee` at position `j`.
-    fn compose(
-        &mut self,
-        call: &'tcx Expr<'tcx>,
-        callee: &'tcx Expr<'tcx>,
-        args: &'tcx [Expr<'tcx>],
-        j: usize,
-        offset: Option<&'tcx Expr<'tcx>>,
-    ) {
+    /// The pointer passed unchanged to `callee` at position `j`.
+    fn compose(&mut self, callee: &'tcx Expr<'tcx>, args: &'tcx [Expr<'tcx>], j: usize) {
         let tcx = self.a.tcx;
         let ExprKind::Path(QPath::Resolved(None, path)) = callee.kind else {
             return self.refuse();
         };
         let Res::Def(DefKind::Fn, def) = path.res else { return self.refuse() };
         let Some(local) = def.as_local() else { return self.refuse() };
-        if tcx.hir_node_by_def_id(local).body_id().is_none() {
-            return self.refuse();
-        }
         let Some(callee_body) = tcx.hir_maybe_body_owned_by(local) else {
             return self.refuse();
         };
@@ -983,53 +782,19 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
         // Instantiate the callee's parameters with this call's arguments.
         let mut terms = Vec::new();
         for t in &inner.terms {
-            let mut lin = Lin::constant(t.k);
-            for (p, c) in &t.terms {
-                let Some(arg) = args.get(*p) else { return self.refuse() };
-                let Some(v) = self.value(arg) else { return self.refuse() };
-                // A negative coefficient subtracts: exact only when the
-                // argument's type is signed (an unsigned one wraps).
-                if *c < 0
-                    && int_info(tcx, self.typeck().expr_ty(arg)).map(|i| i.1) != Some(Sign::Signed)
-                {
-                    return self.refuse();
+            terms.push(match *t {
+                Term::Constant(k) => Term::Constant(k),
+                Term::Parameter(p) => {
+                    let Some(term) = args.get(p).and_then(|arg| self.term(arg)) else {
+                        return self.refuse();
+                    };
+                    term
                 }
-                for _ in 0..c.unsigned_abs() {
-                    lin = lin.plus(&v, c.signum());
-                }
-            }
-            if let Some(o) = offset {
-                let Some(o) = self.index_bound(o, call.hir_id) else { return self.refuse() };
-                // `p.offset(o)` with `o < O`: elements up to `o + bound - 1`.
-                lin = lin.plus(&o, 1).plus(&Lin::constant(1), -1);
-            }
-            terms.push(lin);
+            });
         }
-        let must = inner.must && self.loops.is_empty();
-        self.add(Bound { terms, must });
-    }
-}
-
-/// `to` holds every value of `from` exactly.
-fn value_preserving(from: (u64, Sign), to: (u64, Sign)) -> bool {
-    match (from.1, to.1) {
-        (Sign::Signed, Sign::Signed) | (Sign::Unsigned, Sign::Unsigned) => to.0 >= from.0,
-        (Sign::Unsigned, Sign::Signed) => to.0 > from.0,
-        (Sign::Signed, Sign::Unsigned) => false,
-    }
-}
-
-fn offset_call<'tcx>(e: &'tcx Expr<'tcx>) -> Option<(&'tcx Expr<'tcx>, &'tcx Expr<'tcx>)> {
-    match e.kind {
-        ExprKind::MethodCall(segment, receiver, [arg], _)
-            if matches!(
-                segment.ident.name.as_str(),
-                "offset" | "add" | "wrapping_offset" | "wrapping_add"
-            ) =>
-        {
-            Some((receiver, arg))
-        }
-        _ => None,
+        let mut bound = Bound { terms: Vec::new() };
+        bound.join(Bound { terms });
+        self.add(bound);
     }
 }
 
@@ -1040,7 +805,6 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
         }
         match e.kind {
             ExprKind::Loop(block, _, source, _) => {
-                self.straight = false;
                 if source == LoopSource::While
                     && let Some(tail) = block.expr
                     && let ExprKind::If(cond, then, _) = tail.kind
@@ -1058,11 +822,10 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                         }
                     }
                     self.visit_expr(cond);
-                    let exits = leaves_early(body);
                     self.loops.push(LoopFrame {
                         body,
                         conjuncts,
-                        exits,
+                        straight: straight_block(body),
                     });
                     self.visit_block(body);
                     self.loops.pop();
@@ -1071,76 +834,40 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                 self.loops.push(LoopFrame {
                     body: block,
                     conjuncts: Vec::new(),
-                    exits: true,
+                    straight: false,
                 });
                 intravisit::walk_expr(self, e);
                 self.loops.pop();
                 return;
             }
-            ExprKind::If(..)
-            | ExprKind::Match(..)
-            | ExprKind::Break(..)
-            | ExprKind::Continue(..)
-            | ExprKind::Closure(..) => self.straight = false,
-            ExprKind::Binary(op, ..) if matches!(op.node, BinOpKind::And | BinOpKind::Or) => {
-                self.straight = false
-            }
-            ExprKind::Ret(..) => {
-                // A tail `return` keeps the body straight; R677-6 admits it.
-                let mut parents = self.a.tcx.hir_parent_iter(e.hir_id);
-                let first = parents.next().map(|(_, n)| n);
-                let second = parents.next().map(|(_, n)| n);
-                // `{ …; return x; }` or `{ …; return x }`, as the block's end.
-                // Relay 107 (review 9): the BODY's own block, not any nested one.
-                let body_block = self.a.tcx.hir_maybe_body_owned_by(self.f).and_then(|body| {
-                    match body.value.kind {
-                        ExprKind::Block(b, _) => Some(b.hir_id),
-                        _ => None,
-                    }
-                });
-                let tail = matches!(first, Some(Node::Block(b)) if Some(b.hir_id) == body_block && b.expr.is_some_and(|x| x.hir_id == e.hir_id))
-                    || matches!(second, Some(Node::Block(b))
-                        if Some(b.hir_id) == body_block
-                            && b.expr.is_none()
-                            && b.stmts.last().is_some_and(|s| matches!(s.kind, StmtKind::Semi(x) if x.hir_id == e.hir_id)));
-                if !tail {
-                    self.straight = false;
+            // An address formed from the pointee (`&*p`, `&raw const *p`,
+            // `&mut *p.offset(i)`) escapes; it is no access (relay 112, R3-4).
+            ExprKind::AddrOf(_, _, inner) => {
+                if let ExprKind::Unary(UnOp::Deref, place) = peel_parens(inner).kind
+                    && (self.is_target(place)
+                        || offset_call(peel_parens(place)).is_some_and(|(r, _)| self.is_target(r)))
+                {
+                    return self.refuse();
                 }
             }
             ExprKind::Unary(UnOp::Deref, inner) => {
-                if self.is_target(inner) {
-                    return self.access(None, e.hir_id);
-                }
                 if let Some((receiver, idx)) = offset_call(peel_parens(inner))
                     && self.is_target(receiver)
                 {
                     self.visit_expr(idx);
-                    return self.access(Some(idx), e.hir_id);
+                    return self.access(idx, e.hir_id);
                 }
+                // `*p` reads a literal index (R923-1: no constant of the
+                // module's own making); it falls to the bare path below.
             }
             ExprKind::Call(callee, args) => {
                 self.visit_expr(callee);
                 for (j, arg) in args.iter().enumerate() {
-                    let a = peel_parens(arg);
-                    if self.is_target(a) {
-                        self.compose(e, callee, args, j, None);
-                        continue;
+                    if self.is_target(arg) {
+                        self.compose(callee, args, j);
+                    } else {
+                        self.visit_expr(arg);
                     }
-                    let derived = match a.kind {
-                        ExprKind::AddrOf(_, _, inner) => match peel_parens(inner).kind {
-                            ExprKind::Unary(UnOp::Deref, place) => offset_call(peel_parens(place)),
-                            _ => None,
-                        },
-                        _ => offset_call(a),
-                    };
-                    if let Some((receiver, idx)) = derived
-                        && self.is_target(receiver)
-                    {
-                        self.visit_expr(idx);
-                        self.compose(e, callee, args, j, Some(idx));
-                        continue;
-                    }
-                    self.visit_expr(arg);
                 }
                 return;
             }

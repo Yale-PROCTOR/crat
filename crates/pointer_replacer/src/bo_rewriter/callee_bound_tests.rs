@@ -1,11 +1,14 @@
-//! **R707 / R717-1 — wave-4 build 1: `len-callee-bound`.** The extent a
-//! function's own accesses prove, at the three call points: the seam's
-//! raw-argument arm, the exposure wrapper's view of an entry formal, and the
-//! declaration planner (whose nested rows N1 relocates to the wrapper).
+//! **R707 / R717-1 / R923-1 — wave-4 build 1: `len-callee-bound`, narrowed
+//! (relay 112).** The extent a function's own loop proves, at the three call
+//! points: the seam's raw-argument arm, the exposure wrapper's view of an
+//! entry formal, and the declaration planner (whose nested rows N1 relocates
+//! to the wrapper).
 //!
-//! `W4CB-*` are the RED witnesses (each one emitted `FALLBACK_SLICE_EXTENT` at
-//! the base `2961c2ec0`). `W4CB-F*` are the fault controls: each one fails when
-//! the guard it names is removed from `decision/callee_bound.rs`.
+//! `W4CB-*` are the witnesses: the shapes the narrowed rule keeps take their
+//! bound (each one emitted `FALLBACK_SLICE_EXTENT` at the base `2961c2ec0`);
+//! the shapes it gave up (constant indices, `must`) are pinned back to the
+//! fallback. `W4CB-F*` are the fault controls: each one fails when the guard it
+//! names is removed from `decision/callee_bound.rs`.
 
 use super::{A5Mode, WholeProgramAttestation};
 
@@ -74,11 +77,18 @@ fn receipt(src: &str, function: &str, index: usize) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// **W4CB-1 — seam × (a) constant, `may`.** The callee reads elements 0 and 2,
-/// behind a branch: the raw argument takes `3`, not the fallback. The signed
-/// delta `k` keeps the argument a raw expression (R394-2), so this is the raw
-/// arm and not the forward view.
+
+// ---------------------------------------------------------------------------
+// The seam's raw-argument arm.
+// ---------------------------------------------------------------------------
+
+/// **W4CB-1 — constant indices give no bound (R923-1).** The callee reads
+/// elements 0 and 2, behind a branch: a literal index is no length the caller
+/// passes, so the raw argument keeps the fallback. The signed delta `k` keeps
+/// the argument a raw expression (R394-2), so this is the raw arm and not the
+/// forward view.
 #[test]
-fn w4cb_1_seam_constant_indices_bound_a_raw_argument() {
+fn w4cb_1_seam_constant_indices_keep_the_fallback() {
     let src = format!(
         "{PRE}\
          pub unsafe fn pick(flag: i32, p: *const i32) -> i32 {{\n\
@@ -86,27 +96,21 @@ fn w4cb_1_seam_constant_indices_bound_a_raw_argument() {
          }}\n\
          pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ pick(1, base.offset(k)) }}\n"
     );
+    assert_eq!(receipt(&src, "pick", 1), None);
     let out = flat(&emitted(&src));
     assert!(
-        out.contains("from_raw_parts(base.offset(k), (3) as usize)"),
-        "{out}"
-    );
-    assert!(
-        !out.contains(
+        out.contains(
             "pick(1, core::slice::from_raw_parts(base.offset(k), crate::FALLBACK_SLICE_EXTENT))"
         ),
         "{out}"
     );
-    assert_eq!(
-        receipt(&src, "pick", 1).as_deref(),
-        Some("len-callee-bound:may:3")
-    );
 }
 
-/// **W4CB-2 — seam × (a) constant, `must`.** A straight-line callee (R677-6's
-/// shape): every access runs on every call, so the tag is `must`.
+/// **W4CB-2 — no `must` (R923-1, relay 112 R3-9).** A straight-line callee
+/// (R677-6's shape) reads two literal indices: the callee bound gives nothing,
+/// and R677-6 (ahead of it, R780-2) answers as on the record.
 #[test]
-fn w4cb_2_seam_straight_line_constant_is_must() {
+fn w4cb_2_seam_straight_line_constant_is_not_the_callee_bound_s() {
     let src = format!(
         "{PRE}\
          pub unsafe fn read32(buffer: *const u8) -> u32 {{\n\
@@ -115,30 +119,24 @@ fn w4cb_2_seam_straight_line_constant_is_must() {
          }}\n\
          pub unsafe fn caller(in_0: *mut u8, k: isize) -> u32 {{ read32(in_0.offset(k)) }}\n"
     );
-    assert_eq!(
-        receipt(&src, "read32", 0).as_deref(),
-        Some("len-callee-bound:must:4")
-    );
+    assert_eq!(receipt(&src, "read32", 0), None);
     let out = flat(&emitted(&src));
-    assert!(
-        out.contains("from_raw_parts(in_0.offset(k), (4) as usize)"),
-        "{out}"
-    );
+    assert!(!out.contains("len-callee-bound"), "{out}");
 }
 
-/// **W4CB-3 — seam × (b) loop.** `while i < n` bounds every index; `n` is not
+/// **W4CB-3 — seam × the loop.** `while i < n` bounds every index; `n` is not
 /// adjacent to the pointer, so no companion licence answers first. The call's
-/// own argument instantiates the bound.
+/// own argument, a plain name, instantiates the bound.
 #[test]
 fn w4cb_3_seam_loop_bound_is_instantiated_with_the_call_s_argument() {
     let src = format!(
         "{PRE}\
-         pub unsafe fn total(n: usize, flag: i32, p: *const i32) -> i32 {{\n\
-         \x20   let mut s = 0; let mut i: usize = 0;\n\
+         pub unsafe fn total(n: i32, flag: i32, p: *const i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
          \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n\
-         pub unsafe fn caller(base: *const i32, count: usize, k: isize) -> i32 {{\n\
+         pub unsafe fn caller(base: *const i32, count: i32, k: isize) -> i32 {{\n\
          \x20   total(count, 1, base.offset(k))\n\
          }}\n"
     );
@@ -148,30 +146,30 @@ fn w4cb_3_seam_loop_bound_is_instantiated_with_the_call_s_argument() {
     );
     let out = flat(&emitted(&src));
     assert!(
-        // F6 (relay 107): the argument is re-typed as the callee's parameter.
-        out.contains(
-            "from_raw_parts(base.offset(k), (((((count) as usize)) as i128).max(0)) as usize)"
-        ),
+        out.contains("from_raw_parts(base.offset(k), (((count) as i128).max(0)) as usize)"),
         "{out}"
     );
 }
 
-/// **W4CB-4 — seam × (c) composition.** `outer` reads `p[1]` and passes `p`
-/// on to a local callee whose loop bound is its own third parameter; `outer`
-/// passes the literal `4` there, so `outer`'s bound is `max(2, 4) = 4`. (`outer`
-/// reads `p` itself so that its own decision is a slice: a pointer it only
-/// passes on is decided `Ref`, which is the pass-on line's question, not this
-/// arm's.)
+/// **W4CB-4 — seam × composition, the pointer passed unchanged.** `outer`
+/// reads `p` under `i < 2` and passes `p` on to a local callee whose loop bound
+/// is its own third parameter; `outer` passes the literal `4` there, so
+/// `outer`'s bound is `max(2, 4) = 4`. (`outer` reads `p` itself so that its
+/// own decision is a slice.)
 #[test]
 fn w4cb_4_seam_bound_composes_through_a_local_callee() {
     let src = format!(
         "{PRE}\
-         pub unsafe fn inner(q: *const i32, flag: i32, m: usize) -> i32 {{\n\
-         \x20   let mut s = 0; let mut i: usize = 0;\n\
+         pub unsafe fn inner(q: *const i32, flag: i32, m: i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
          \x20   while i < m {{ s += *q.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n\
-         pub unsafe fn outer(flag: i32, p: *const i32) -> i32 {{ *p.offset(1) + inner(p, flag, 4) }}\n\
+         pub unsafe fn outer(flag: i32, p: *const i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i < 2 {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s + inner(p, flag, 4)\n\
+         }}\n\
          pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ outer(1, base.offset(k)) }}\n"
     );
     assert_eq!(
@@ -185,6 +183,25 @@ fn w4cb_4_seam_bound_composes_through_a_local_callee() {
     );
 }
 
+/// **W4CB-N1 — a length parameter passed through unchanged (R923-1).**
+/// `outer`'s own parameter `m` reaches `inner`'s loop limit as it is, so
+/// `outer`'s bound is `m`.
+#[test]
+fn w4cb_n1_a_length_parameter_passed_through_is_the_bound() {
+    let src = format!(
+        "{PRE}\
+         pub unsafe fn inner(q: *const i32, flag: i32, m: i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i < m {{ s += *q.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn outer(p: *const i32, len: i32) -> i32 {{ inner(p, 0, len) }}\n"
+    );
+    assert_eq!(
+        receipt(&src, "outer", 0).as_deref(),
+        Some("len-callee-bound:may:len")
+    );
+}
 // ---------------------------------------------------------------------------
 // The exposure wrapper and the nested rows (tulip's shape).
 // ---------------------------------------------------------------------------
@@ -238,35 +255,24 @@ fn wrapper<'a>(source: &'a str, owner: &str) -> &'a str {
         .expect("wrapper region")
 }
 
-/// **W4CB-5 — exposure wrapper × (a) constant and (c) composition.**
-/// `ti_sma_start` reads `options[0]` on every call (`must:1`); `ti_sma` reads
-/// `options[0]` and passes it to `ti_sma_start` behind branches (`may:1`). Both
-/// wrappers' `options` views take `1`, not the fallback.
+/// **W4CB-5 — the exposure wrapper × constant indices (R923-1).**
+/// `ti_sma_start` reads `options[0]` and `ti_sma` reads `options[0]` and passes
+/// it on: literal indices, so neither gives a bound and both wrappers' `options`
+/// views keep the fallback.
 #[test]
-fn w4cb_5_exposure_wrapper_views_take_the_entry_s_own_bound() {
-    assert_eq!(
-        receipt(TULIP, "ti_sma_start", 0).as_deref(),
-        Some("len-callee-bound:must:1")
-    );
-    assert_eq!(
-        receipt(TULIP, "ti_sma", 2).as_deref(),
-        Some("len-callee-bound:may:1")
-    );
+fn w4cb_5_exposure_wrapper_constant_views_keep_the_fallback() {
+    assert_eq!(receipt(TULIP, "ti_sma_start", 0), None);
+    assert_eq!(receipt(TULIP, "ti_sma", 2), None);
     let source = emitted_closed_world(TULIP);
     let start = flat(wrapper(&source, "ti_sma_start"));
+    assert!(!start.contains("len-callee-bound"), "{start}");
     assert!(
-        start.contains("from_raw_parts(options, (1) as usize)"),
+        !start.contains("from_raw_parts(options, (1) as usize)"),
         "{start}"
     );
-    let sma = flat(wrapper(&source, "ti_sma"));
-    assert!(
-        sma.contains("from_raw_parts(options, (1) as usize)"),
-        "{sma}"
-    );
-    assert!(!start.contains("FALLBACK_SLICE_EXTENT"), "{start}");
 }
 
-/// **W4CB-6 — the nested row × (b) loop.** `ti_sma`'s input row is read at
+/// **W4CB-6 — the nested row × the loop.** `ti_sma`'s input row is read only at
 /// `i < size`: the declaration planner sizes it `size` and N1 relocates that
 /// length to the wrapper, where the formal carries the same name.
 #[test]
@@ -279,7 +285,7 @@ fn w4cb_6_nested_row_takes_the_loop_bound_in_the_wrapper() {
     );
 }
 
-/// **W4CB-7 — the declaration planner × (b) loop, in a body.** A row loaded
+/// **W4CB-7 — the declaration planner × the loop, in a body.** A row loaded
 /// into a local and read under `i < n` is constructed with `n`, not the
 /// fallback.
 #[test]
@@ -301,25 +307,21 @@ fn w4cb_7_declaration_planner_sizes_a_local_by_its_loop() {
 // Fault controls: each fails when the named guard is removed.
 // ---------------------------------------------------------------------------
 
-/// **W4CB-F1 — a write beyond the loop variable.** `p[i + 1]` under `i < n`
-/// needs `n + 1`. Guard: `index_bound`'s `+ v` arithmetic.
+/// **W4CB-F1 — an index with arithmetic refuses (R923-1).** `p[i + 1]` under
+/// `i < n` would need `n + 1`. Guard: `counter` admits the bare counter only.
 #[test]
-fn w4cb_f1_an_offset_index_extends_the_bound() {
+fn w4cb_f1_an_index_with_arithmetic_refuses() {
     let src = format!(
         "{PRE}\
          pub unsafe fn shift(p: *mut i32, n: i32) {{\n\
          \x20   let mut i: i32 = 0;\n\
          \x20   while i < n {{ *p.offset((i + 1) as isize) = 0; i += 1 }}\n\
-         }}\n"
+         \x20   }}\n"
     );
-    assert_eq!(
-        receipt(&src, "shift", 0).as_deref(),
-        Some("len-callee-bound:may:n+1")
-    );
+    assert_eq!(receipt(&src, "shift", 0), None);
 }
 
-/// **W4CB-F2 — an index read from memory proves nothing.** Guard: `value`
-/// admits no dereference.
+/// **W4CB-F2 — an index read from memory proves nothing.** Guard: `counter`.
 #[test]
 fn w4cb_f2_an_index_from_memory_refuses() {
     let src = format!(
@@ -352,20 +354,24 @@ fn w4cb_f4_passed_onward_composes_locally_and_refuses_foreign() {
     let src = format!(
         "{PRE}\
          extern \"C\" {{ fn ext(p: *const i32) -> i32; }}\n\
-         pub unsafe fn two(q: *const i32) -> i32 {{ *q.offset(1) }}\n\
-         pub unsafe fn local(p: *const i32) -> i32 {{ two(p) }}\n\
+         pub unsafe fn two(q: *const i32, m: i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i < m {{ s += *q.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn local(p: *const i32) -> i32 {{ two(p, 2) }}\n\
          pub unsafe fn foreign(p: *const i32) -> i32 {{ ext(p) }}\n"
     );
     assert_eq!(
         receipt(&src, "local", 0).as_deref(),
-        Some("len-callee-bound:must:2")
+        Some("len-callee-bound:may:2")
     );
     assert_eq!(receipt(&src, "foreign", 0), None);
 }
 
 /// **W4CB-F5 — the loop variable written before the access refuses.** After
 /// `i += 1` inside the body, `i < n` no longer holds at the access. Guard: the
-/// write-position check in `loop_bound`.
+/// last-statement check in `loop_bound`.
 #[test]
 fn w4cb_f5_a_counter_written_before_the_access_refuses() {
     let src = format!(
@@ -395,26 +401,34 @@ fn w4cb_f6_a_reassigned_bound_parameter_refuses() {
     assert_eq!(receipt(&src, "grow", 0), None);
 }
 
-/// **W4CB-F7 — an impure instantiation argument keeps the fallback.** The
-/// bound is `n`, but the call passes `next()` there: duplicating it into the
-/// length would call it twice. Guard: `pure_argument_text` / `effect_free_text`.
+/// **W4CB-F7 — only a plain name or a decimal literal is copied into a length
+/// (R923-1).** Guard: `pure_argument_text` / `effect_free_text`.
 #[test]
-fn w4cb_f7_an_impure_instantiation_argument_keeps_the_fallback() {
-    assert!(!super::decision::callee_bound::pure_argument_text("next()"));
-    assert!(!super::decision::callee_bound::pure_argument_text("*count"));
-    assert!(!super::decision::callee_bound::pure_argument_text(
-        "{ n += 1; n }"
-    ));
-    assert!(super::decision::callee_bound::pure_argument_text("count"));
-    assert!(super::decision::callee_bound::pure_argument_text(
-        "count as usize"
-    ));
-    assert!(super::decision::callee_bound::pure_argument_text("a * 2"));
+fn w4cb_f7_an_argument_that_is_not_a_plain_name_keeps_the_fallback() {
+    use super::decision::callee_bound::pure_argument_text;
+    for refused in [
+        "next()",
+        "*count",
+        "{ n += 1; n }",
+        "count as usize",
+        "a * 2",
+        "!0",
+        "-5",
+        "n - 1",
+        "c.wrapping_add(1)",
+        "0x10",
+        "s.n",
+    ] {
+        assert!(!pure_argument_text(refused), "{refused}");
+    }
+    for kept in ["count", "_n", "16", "16usize", "7i32"] {
+        assert!(pure_argument_text(kept), "{kept}");
+    }
     let src = format!(
         "{PRE}\
-         pub unsafe fn next() -> usize {{ 3 }}\n\
-         pub unsafe fn total(n: usize, flag: i32, p: *const i32) -> i32 {{\n\
-         \x20   let mut s = 0; let mut i: usize = 0;\n\
+         pub unsafe fn next() -> i32 {{ 3 }}\n\
+         pub unsafe fn total(n: i32, flag: i32, p: *const i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
          \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n\
@@ -425,7 +439,7 @@ fn w4cb_f7_an_impure_instantiation_argument_keeps_the_fallback() {
 }
 
 /// **W4CB-F8 — a negative instantiated bound is an empty slice.** The rendering
-/// clamps at zero in `i128`, never `usize::MAX`. Guard: `Bound::render`'s
+/// clamps at zero in `i128`, never `usize::MAX`. Guard: `Bound::render_count`'s
 /// `.max(0)`.
 #[test]
 fn w4cb_f8_a_negative_bound_renders_an_empty_slice() {
@@ -436,44 +450,122 @@ fn w4cb_f8_a_negative_bound_renders_an_empty_slice() {
          \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n\
-         pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ total(-5, 1, base.offset(k)) }}\n"
+         pub unsafe fn caller(base: *const i32, c: i32, k: isize) -> i32 {{ total(c, 1, base.offset(k)) }}\n"
     );
     let out = flat(&emitted(&src));
-    // F6 (relay 107): re-typed as the callee's `i32`; still clamped to empty.
-    assert!(
-        out.contains("(((((-5) as i32)) as i128).max(0)) as usize"),
-        "{out}"
-    );
-    // The rendered arithmetic itself, evaluated.
-    assert_eq!(((-5i128).max(0)) as usize, 0);
+    assert!(out.contains("(((c) as i128).max(0)) as usize"), "{out}");
+    // The rendered arithmetic itself, evaluated at `c = -5`.
+    assert_eq!(((-5i32 as i128).max(0)) as usize, 0);
 }
 
-/// **W4CB-F9 — unsigned subtraction refuses (it wraps, so the rendered `i128`
-/// would under-state the real bound).** Guard: `value`'s signed-only `Sub`.
+/// **W4CB-F9 — arithmetic on the limit refuses.** Guard: `term` admits no
+/// method or operator.
 #[test]
-fn w4cb_f9_unsigned_subtraction_refuses() {
+fn w4cb_f9_arithmetic_on_the_limit_refuses() {
     let src = format!(
         "{PRE}\
-         pub unsafe fn head(p: *const u8, n: usize) -> u32 {{\n\
-         \x20   let mut s = 0u32; let mut i: usize = 0;\n\
-         \x20   while i < n.wrapping_sub(1) {{ s += *p.offset(i as isize) as u32; i += 1 }}\n\
+         pub unsafe fn head(p: *const u8, n: i32) -> u32 {{\n\
+         \x20   let mut s = 0u32; let mut i: i32 = 0;\n\
+         \x20   while i < n - 1 {{ s += *p.offset(i as isize) as u32; i += 1 }}\n\
          \x20   s\n\
          }}\n"
     );
     assert_eq!(receipt(&src, "head", 0), None);
 }
 
-/// **W4CB-F10 — a signed bound cast to unsigned refuses (`-1 as usize` is
-/// huge).** Guard: `never_increases`.
+/// **W4CB-F10 — a cast on the limit refuses (R923-1).** Guard: `term` admits
+/// a cast of a literal only.
 #[test]
-fn w4cb_f10_a_signed_to_unsigned_bound_cast_refuses() {
+fn w4cb_f10_a_cast_limit_refuses() {
     let src = format!(
         "{PRE}\
          pub unsafe fn widen(p: *const i32, n: i32) -> i32 {{\n\
-         \x20   let mut s = 0; let mut i: usize = 0;\n\
-         \x20   while i < n as usize {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   let mut s = 0; let mut i: i64 = 0;\n\
+         \x20   while i < n as i64 {{ s += *p.offset(i as isize); i += 1 }}\n\
          \x20   s\n\
          }}\n"
     );
     assert_eq!(receipt(&src, "widen", 0), None);
+}
+
+/// **W4CB-F11 — `<=` refuses (the bound would be `n + 1`).** Guard:
+/// `loop_bound`'s `Lt` / `Gt` only.
+#[test]
+fn w4cb_f11_an_inclusive_limit_refuses() {
+    let src = format!(
+        "{PRE}\
+         pub unsafe fn incl(p: *const i32, n: i32) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i <= n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n"
+    );
+    assert_eq!(receipt(&src, "incl", 0), None);
+}
+
+/// **W4CB-F12 — a literal index beside the loop refuses the whole bound**
+/// (`p[0]` read when `n = 0` would need `1`, not `n`). Guard: the bare `*p` /
+/// literal index refuses.
+#[test]
+fn w4cb_f12_a_constant_access_beside_the_loop_refuses() {
+    let src = format!(
+        "{PRE}\
+         pub unsafe fn first(p: *const i32, n: i32) -> i32 {{\n\
+         \x20   let mut s = *p.offset(0 as isize); let mut i: i32 = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn bare(p: *const i32, n: i32) -> i32 {{\n\
+         \x20   let mut s = *p; let mut i: i32 = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n"
+    );
+    assert_eq!(receipt(&src, "first", 0), None);
+    assert_eq!(receipt(&src, "bare", 0), None);
+}
+
+/// **W4CB-F13 — an index cast that changes signedness refuses** (`usize as
+/// isize`), and so does a counter stepped by `wrapping_add`. Guard: `counter`'s
+/// value-preserving casts and `steps_by_one`'s two forms.
+#[test]
+fn w4cb_f13_a_sign_changing_index_cast_and_a_wrapping_step_refuse() {
+    let src = format!(
+        "{PRE}\
+         pub unsafe fn sized(p: *const i32, n: usize) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: usize = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn wrapped(p: *const i32, n: isize) -> i32 {{\n\
+         \x20   let mut s = 0; let mut i: isize = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i); i = i.wrapping_add(1) }}\n\
+         \x20   s\n\
+         }}\n"
+    );
+    assert_eq!(receipt(&src, "sized", 0), None);
+    assert_eq!(receipt(&src, "wrapped", 0), None);
+}
+
+/// **W4CB-F14 — a limit written through a `ref mut` binding or a `&mut self`
+/// autoref refuses.** Guard: `Writes`' pattern and adjustment checks.
+#[test]
+fn w4cb_f14_a_limit_written_through_a_hidden_borrow_refuses() {
+    let src = format!(
+        "{PRE}\
+         pub unsafe fn by_ref(p: *const i32, n: i32) -> i32 {{\n\
+         \x20   let mut m = n; let ref mut r = m; *r += 0;\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n\
+         pub unsafe fn by_autoref(p: *const i32, mut n: i32) -> i32 {{\n\
+         \x20   use core::ops::AddAssign; n.add_assign(4);\n\
+         \x20   let mut s = 0; let mut i: i32 = 0;\n\
+         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
+         \x20   s\n\
+         }}\n"
+    );
+    assert_eq!(receipt(&src, "by_ref", 0), None);
+    assert_eq!(receipt(&src, "by_autoref", 0), None);
 }
