@@ -199,6 +199,8 @@ mod wave5r_helper_path;
 #[cfg(test)]
 mod wave5r_tests;
 #[cfg(test)]
+mod wave6a_a5_compose_tests;
+#[cfg(test)]
 mod wave6a_allocation_tests;
 #[cfg(test)]
 mod wave6a_allocator_contract_tests;
@@ -5745,37 +5747,43 @@ pub(crate) fn validate_plan(
         let Some(source) = texts.get(key) else {
             continue;
         };
-        // Wave-1 call adapters make one previously-zero composition live: a
-        // seam can strictly contain an ordinary `KindDecision` use edit. The AST
-        // choke point applies use first and seam second; this span projection is
-        // validation-only and cannot represent nesting. Suppress exactly the
-        // contained inner use from the obsolete splice projection while keeping
-        // both edits in the real plan for attribution, reverts, and AST
-        // consumption. Every other overlap still reaches `apply` and rolls back.
-        let validation_edits = kept
-            .iter()
-            .enumerate()
-            .filter(|(inner_index, inner)| {
-                (!matches!(
-                    inner.justification,
-                    plan::Justification::KindDecision { .. }
-                ) || !nested_kind_under_seam(kept, *inner_index))
-                    && (!matches!(
-                        inner.justification,
-                        plan::Justification::KindDecision { .. }
-                    ) || !exact_kind_composed_by_seam(kept, *inner_index))
-                    && !nested_c9_over_seam(kept, *inner_index)
-                    && !composed_by_slice_constructor(kept, *inner_index)
-                    && !nested_seam_under_seam(kept, *inner_index)
-            })
-            .map(|(_, edit)| edit.clone())
-            .collect::<Vec<_>>();
+        let validation_edits = validation_projection(kept);
         let applied = apply::apply(source, &validation_edits);
         rollbacks.extend(applied.rollbacks);
         maps.insert(key.clone(), applied.line_map);
         files.insert(key.clone(), applied.source);
     }
     (files, rollbacks, maps)
+}
+
+/// The byte projection `validate_plan` splices: one file's kept edits less the
+/// nestings the AST pass composes.
+///
+/// Wave-1 call adapters make one previously-zero composition live: a
+/// seam can strictly contain an ordinary `KindDecision` use edit. The AST
+/// choke point applies use first and seam second; this span projection is
+/// validation-only and cannot represent nesting. Suppress exactly the
+/// contained inner use from the obsolete splice projection while keeping
+/// both edits in the real plan for attribution, reverts, and AST
+/// consumption. Every other overlap still reaches `apply` and rolls back.
+fn validation_projection(kept: &[plan::Edit]) -> Vec<plan::Edit> {
+    kept.iter()
+        .enumerate()
+        .filter(|(inner_index, inner)| {
+            (!matches!(
+                inner.justification,
+                plan::Justification::KindDecision { .. }
+            ) || !nested_kind_under_seam(kept, *inner_index))
+                && (!matches!(
+                    inner.justification,
+                    plan::Justification::KindDecision { .. }
+                ) || !exact_kind_composed_by_seam(kept, *inner_index))
+                && !nested_c9_over_seam(kept, *inner_index)
+                && !composed_by_slice_constructor(kept, *inner_index)
+                && !nested_seam_under_seam(kept, *inner_index)
+        })
+        .map(|(_, edit)| edit.clone())
+        .collect()
 }
 
 /// Item-2 constructors seal the already-rendered inner adapter text into the
