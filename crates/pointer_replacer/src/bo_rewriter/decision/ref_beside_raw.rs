@@ -379,6 +379,10 @@ enum Edge {
     /// The PAIR places its raw view for this pair: overlapping or undeterminable.
     Ordered,
     CertifiedClear,
+    /// R936-1 (P11): cleared by the global-or-integer premise, an assumption.
+    /// It answers an unresolved pair, never one the text shows to be one
+    /// object or one inside the other (the round-3 review's M1).
+    PremiseClear,
     ClassifierClear,
     None,
 }
@@ -415,6 +419,9 @@ fn pair_edge(
             let reason = fields.next().unwrap_or_default();
             return match verdict {
                 "clear" if reason.contains("a5-proven-disjoint") => Edge::ClassifierClear,
+                "clear" if reason.contains("premise=global-or-integer-provenance") => {
+                    Edge::PremiseClear
+                }
                 "clear" => Edge::CertifiedClear,
                 _ => Edge::Ordered,
             };
@@ -986,6 +993,7 @@ pub(crate) fn holds(
                         continue;
                     }
                     let certified = matches!(edge, Edge::CertifiedClear);
+                    let premise_clear = matches!(edge, Edge::PremiseClear);
                     let proof = || {
                         proofs.lookup(
                             call.caller.local_def_index.as_u32(),
@@ -1045,7 +1053,9 @@ pub(crate) fn holds(
                         // edge (its `Ordered` edge was taken above); its classifier's
                         // clear is not (R4-2).
                         Relation::Unresolved
-                            if pair_node(fl.decision) && pair_node(fr.decision) && certified =>
+                            if pair_node(fl.decision)
+                                && pair_node(fr.decision)
+                                && (certified || premise_clear) =>
                         {
                             continue;
                         }

@@ -550,6 +550,9 @@ pub(crate) struct PairDisjointnessIndex {
     /// (e)'s memo, keyed by `(callee, i, j)` with `i < j`.
     parameter_pairs: RefCell<FxHashMap<(u32, usize, usize), Option<PairSeparation>>>,
     ledger: RefCell<Vec<LedgerRow>>,
+    /// P11 (R936-1): the foreign-callee pairs `certify_call_arguments` cleared
+    /// by the premise, as (caller, left span, right span, kind).
+    premise_foreign: RefCell<Vec<(u32, Span, Span, super::global_or_integer::ProvenanceKind)>>,
     /// R544-3: every function's binding root classes, as the call sites read
     /// them, so a pair of bindings of ONE function can be certified without a
     /// call between them ([`Self::certify_bindings`]).
@@ -806,6 +809,7 @@ impl PairDisjointnessIndex {
             address_taken,
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
+            premise_foreign: RefCell::new(Vec::new()),
             binding_roots,
         }
     }
@@ -839,11 +843,17 @@ impl PairDisjointnessIndex {
         let (b, _) = argument_provenance(tcx, typeck, classes, right);
         certify_roots(a, b).or_else(|| {
             // P11 (R936-1), the last arm.
-            super::global_or_integer::premise(
+            let kind = super::global_or_integer::premise(
                 super::global_or_integer::provenance(tcx, function, left),
                 super::global_or_integer::provenance(tcx, function, right),
-            )
-            .map(CertificateKind::GlobalOrIntegerPremise)
+            )?;
+            self.premise_foreign.borrow_mut().push((
+                function.local_def_index.as_u32(),
+                left.span,
+                right.span,
+                kind,
+            ));
+            Some(CertificateKind::GlobalOrIntegerPremise(kind))
         })
     }
 
@@ -1525,11 +1535,12 @@ impl PairDisjointnessIndex {
         self.ledger.borrow().clone()
     }
 
-    /// **P11 (R936-1) — the receipt table.** Every recorded pair of pointer
-    /// arguments the certificates clear only by the premise (the last arm), one
-    /// row each: `caller callee site left right kind left_root right_root`.
-    /// The census writes it as `<p>.raw-boundary-pair-premise.tsv`; its row
-    /// count is the program's P11 count.
+    /// **P11 (R936-1) — the receipt table.** Every pair a rule ASKED the
+    /// certificates about (the ledger) and the premise arm cleared, once per
+    /// pair, plus the foreign-callee pairs `certify_call_arguments` cleared by
+    /// it (the round-3 review's M3): `caller callee site left right kind`. The
+    /// census writes it as `<p>.raw-boundary-pair-premise.tsv`; its rows are
+    /// the program's P11 count. Read it after the rules have run.
     pub(crate) fn premise_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
         let name = |index: u32| {
             tcx.def_path_str(
@@ -1539,43 +1550,42 @@ impl PairDisjointnessIndex {
                 .to_def_id(),
             )
         };
-        let root = |premise: Option<super::global_or_integer::Provenance>| {
-            premise.map_or("-", |provenance| provenance.kind().key())
-        };
-        let mut keys: Vec<_> = self.sites.keys().copied().collect();
-        keys.sort_unstable();
-        let mut out =
-            String::from("caller\tcallee\tsite\tleft\tright\tkind\tleft_root\tright_root\n");
-        for (caller, callee) in keys {
-            for site in &self.sites[&(caller, callee)] {
-                for (position, a) in site.args.iter().enumerate() {
-                    for b in &site.args[position + 1..] {
-                        if !(a.is_pointer && b.is_pointer)
-                            || (a.premise.is_none() && b.premise.is_none())
-                        {
-                            continue;
-                        }
-                        if let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) =
-                            self.certify_inner(caller, callee, a.index, b.index, a.span, b.span)
-                        {
-                            out.push_str(&format!(
-                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                                name(caller),
-                                name(callee),
-                                tcx.sess
-                                    .source_map()
-                                    .span_to_diagnostic_string(site.call_span),
-                                a.index,
-                                b.index,
-                                kind.key(),
-                                root(a.premise),
-                                root(b.premise),
-                            ));
-                        }
-                    }
-                }
-            }
+        let source_map = tcx.sess.source_map();
+        let mut rows = std::collections::BTreeSet::new();
+        for row in self.ledger.borrow().iter() {
+            let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) = row.outcome else {
+                continue;
+            };
+            let site = self
+                .sites
+                .get(&(row.caller, row.callee))
+                .and_then(|sites| sites.first())
+                .map_or_else(
+                    || "-".to_owned(),
+                    |site| source_map.span_to_diagnostic_string(site.call_span),
+                );
+            rows.insert(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                name(row.caller),
+                name(row.callee),
+                site,
+                row.left.min(row.right),
+                row.left.max(row.right),
+                kind.key(),
+            ));
         }
+        for (caller, left, right, kind) in self.premise_foreign.borrow().iter() {
+            rows.insert(format!(
+                "{}\t<foreign>\t{}\t{}\t{}\t{}\n",
+                name(*caller),
+                source_map.span_to_diagnostic_string(left.source_callsite()),
+                source_map.span_to_diagnostic_string(*left),
+                source_map.span_to_diagnostic_string(*right),
+                kind.key(),
+            ));
+        }
+        let mut out = String::from("caller\tcallee\tsite\tleft\tright\tkind\n");
+        out.extend(rows);
         out
     }
 

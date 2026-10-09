@@ -1508,6 +1508,12 @@ fn rewrite_core_injected_with_config(
         let e1_subject_receipt = if census_once {
             decide_ctx.raw_boundary_artifacts.custody_expectations =
                 delivery_expectations(tcx, &table, &emission_plan);
+            // R936-1 (P11): the premise table, after every rule has asked.
+            decide_ctx.raw_boundary_artifacts.pair_premise_receipts = decide_ctx
+                .a5_site_proofs
+                .pair_certificates()
+                .map(|certificates| certificates.premise_receipts_tsv(tcx))
+                .unwrap_or_default();
             e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission_plan)?
         } else {
             String::new()

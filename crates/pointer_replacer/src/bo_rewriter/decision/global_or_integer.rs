@@ -12,8 +12,11 @@
 //! [`provenance`] answers from the text, on every path it shows: casts and
 //! pointer arithmetic, a local through ALL of its definitions (none of them its
 //! entry value, its address never taken), every branch of a conditional, the
-//! returned values of a local getter, a place in a static's storage or reached
-//! through such a pointer. Anything else is no premise, so the pair stays with
+//! returned values of a local getter, a pointer value read out of a static's
+//! storage (directly, or through a pointer to that storage), the address of a
+//! place in a static's storage. A pointer loaded from an object a global's
+//! VALUE or an integer designates is NOT (it was never in a static: 149f's
+//! core stays in scope). Anything else is no premise, so the pair stays with
 //! the rules that hold it (the conservative side).
 
 use rustc_hir::{
@@ -64,7 +67,8 @@ impl ProvenanceKind {
 }
 
 /// The premise for a pair, if one side's provenance passes through a global or
-/// an integer. Never for one global at both positions, nor for two integers:
+/// an integer. Never for one global at both positions (its value or its
+/// storage: `st.pos` may point into `st.buf`), nor for two integers:
 /// the premise is about ANOTHER argument's object, and those may visibly be
 /// the same.
 pub(crate) fn premise(
@@ -75,8 +79,10 @@ pub(crate) fn premise(
         (Some(a), Some(b)) => {
             let same = match (a, b) {
                 (Provenance::Integer, Provenance::Integer) => true,
-                (Provenance::GlobalValue(x), Provenance::GlobalValue(y))
-                | (Provenance::GlobalStorage(x), Provenance::GlobalStorage(y)) => x == y,
+                (
+                    Provenance::GlobalValue(x) | Provenance::GlobalStorage(x),
+                    Provenance::GlobalValue(y) | Provenance::GlobalStorage(y),
+                ) => x == y,
                 _ => false,
             };
             (!same).then_some(a.kind())
@@ -113,17 +119,17 @@ enum Tri {
     Neutral,
 }
 
+/// Every path's answer, and they agree: two paths through different globals
+/// (or a global and an integer) name no one root the same-object refusal can
+/// check, so they are no premise (the round-3 review's M2).
 fn all(items: impl IntoIterator<Item = Tri>) -> Tri {
     let mut out = Tri::Neutral;
     for item in items {
-        match item {
-            Tri::No => return Tri::No,
-            Tri::Yes(provenance) => {
-                if matches!(out, Tri::Neutral) {
-                    out = Tri::Yes(provenance);
-                }
-            }
-            Tri::Neutral => {}
+        match (item, out) {
+            (Tri::No, _) => return Tri::No,
+            (Tri::Yes(provenance), Tri::Neutral) => out = Tri::Yes(provenance),
+            (Tri::Yes(provenance), Tri::Yes(seen)) if provenance != seen => return Tri::No,
+            _ => {}
         }
     }
     out
@@ -188,7 +194,9 @@ impl<'tcx> Walk<'tcx> {
                     .collect();
                 all(answers)
             }
-            ExprKind::Block(block, _) => block
+            // A labelled block's value may leave by a `break` the tail does
+            // not show (the round-3 review's L1).
+            ExprKind::Block(block, None) => block
                 .expr
                 .map_or(Tri::No, |tail| self.value(owner, typeck, tail)),
             ExprKind::Call(callee, _) => self.returned(callee),
@@ -232,9 +240,14 @@ impl<'tcx> Walk<'tcx> {
                 Res::Def(DefKind::Static { .. }, def) => Tri::Yes(Provenance::GlobalValue(def)),
                 _ => Tri::No,
             },
+            // Only a value read out of a STATIC's storage is P11's (R936-1: "a
+            // pointer value stored in or read from a static"). A pointer loaded
+            // from an object a global's VALUE or an integer designates was never
+            // in a static: `(*CTX).data` is 149f's in-scope core (relay 197 item
+            // 3), so no premise (round-3 review H1).
             ExprKind::Unary(UnOp::Deref, pointer) => match self.value(owner, typeck, pointer) {
                 Tri::Yes(Provenance::GlobalStorage(def)) => Tri::Yes(Provenance::GlobalValue(def)),
-                other => other,
+                _ => Tri::No,
             },
             _ => Tri::No,
         }
@@ -262,8 +275,11 @@ impl<'tcx> Walk<'tcx> {
             .params
             .iter()
             .any(|param| matches!(param.pat.kind, PatKind::Binding(_, id, ..) if id == binding));
-        let (definitions, addressed) = definitions(body, binding);
-        if is_param || addressed || definitions.is_empty() {
+        let (definitions, addressed, plain_let) = definitions(body, binding);
+        // A binding a pattern destructures, a `match` arm binds, or a `let`
+        // without an initializer introduces holds a value the text does not
+        // give here (the round-3 review's L1).
+        if is_param || addressed || !plain_let || definitions.is_empty() {
             return Tri::No;
         }
         self.stack.push(binding);
@@ -331,23 +347,26 @@ impl<'tcx> Walk<'tcx> {
 }
 
 /// Every value `body` stores into `binding` (its `let` initializer, its
-/// assignments), and whether its address is taken anywhere.
+/// assignments), whether its address is taken anywhere, and whether a plain
+/// `let` with an initializer introduces it.
 fn definitions<'tcx>(
     body: &'tcx rustc_hir::Body<'tcx>,
     binding: HirId,
-) -> (Vec<&'tcx Expr<'tcx>>, bool) {
+) -> (Vec<&'tcx Expr<'tcx>>, bool, bool) {
     struct Defs<'tcx> {
         binding: HirId,
         found: Vec<&'tcx Expr<'tcx>>,
         addressed: bool,
+        plain_let: bool,
     }
     impl<'tcx> Visitor<'tcx> for Defs<'tcx> {
         fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
-            if let PatKind::Binding(_, id, _, _) = local.pat.kind
+            if let PatKind::Binding(_, id, _, None) = local.pat.kind
                 && id == self.binding
                 && let Some(init) = local.init
             {
                 self.found.push(init);
+                self.plain_let = true;
             }
             intravisit::walk_local(self, local);
         }
@@ -371,9 +390,10 @@ fn definitions<'tcx>(
         binding,
         found: Vec::new(),
         addressed: false,
+        plain_let: false,
     };
     defs.visit_body(body);
-    (defs.found, defs.addressed)
+    (defs.found, defs.addressed, defs.plain_let)
 }
 
 /// An integer literal under casts and negation.
