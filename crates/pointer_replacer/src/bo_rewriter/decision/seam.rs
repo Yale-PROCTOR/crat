@@ -5305,7 +5305,20 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 .expr_edits
                                 .iter()
                                 .any(|edit| edit.span.overlaps(arg.span)))
-                        });
+                        })
+                    // The stand-in review's HIGH-1: one owner at two positions of
+                    // the call takes no view here — each view is its own reborrow
+                    // of the Box, and the second invalidates the first (Stacked
+                    // Borrows pops it; under Tree Borrows a write through one
+                    // disables the other). The call keeps its text and the compile
+                    // gate takes the caller back.
+                    && owner_argument(arg).is_some_and(|root| {
+                        !site.args.iter().any(|other| {
+                            other.index != arg.index
+                                && (other.shape.place_root() == Some(root)
+                                    || other.element_of == Some(root))
+                        })
+                    });
                 if matches!(expected, Form::Raw)
                     && !raw_boundary_observation
                     && !late_raw_optional
