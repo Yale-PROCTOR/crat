@@ -412,14 +412,68 @@ fn r315_1_a_retained_access_hold_does_not_hold_its_class() {
     // The control: the held subject stays raw end to end.
     assert_eq!(reason("append::v").as_deref(), Some("held:retained-alias"));
     assert!(signature("append").contains("v:*mutsmall_vec"), "{out}");
-    // The control: a caller's binding handed whole to the held formal stays held.
-    assert!(
-        reason("other::w").is_some_and(|r| r.starts_with("held:")),
-        "{degradations:#?}"
-    );
+    // The control: a caller's binding handed whole to the held formal stays held,
+    // by the cascade (`run::v` is held by the check itself: `init` stores into it).
+    assert_eq!(reason("other::w").as_deref(), Some("held:into-held-formal"));
+    assert_eq!(reason("run::v").as_deref(), Some("held:retained-alias"));
     assert!(signature("other").contains("w:*mutsmall_vec"), "{out}");
     // The neighbours deliver: the hold does not hold its class.
     assert_eq!(reason("append::out"), None, "{degradations:#?}");
     assert_eq!(reason("append::y"), None, "{degradations:#?}");
     assert!(signature("append").contains("out:&mutu64"), "{out}");
+    assert!(signature("append").contains("y:&u64"), "{out}");
+}
+
+/// The negative controls (the stand-in review of item 1, LOW-2): a neighbour that
+/// reaches the retained memory stays raw without the class block — a formal handed
+/// the held object's own buffer, and a local taken from the held object, live across
+/// the write through `(*v).p`. The decision-level holds own them now: the class
+/// block was never their backstop.
+const NEIGHBOURS_INSIDE_THE_HELD_OBJECT: &str = r#"
+#[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
+pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
+pub unsafe fn append(v: *mut small_vec, x: u64, out: *mut u64) -> usize {
+    let mut q: *mut usize = &mut (*v).n;
+    *(*v).p.offset((*v).n as isize) = x;
+    *out = x;
+    *q += 1;
+    *q
+}
+pub unsafe fn run(v: *mut small_vec) -> usize {
+    init(v);
+    append(v, 1, (*v).buf.as_mut_ptr())
+}
+"#;
+
+#[test]
+fn r315_1_neighbours_inside_the_held_object_stay_raw() {
+    let source = format!("{ALLOW}{NEIGHBOURS_INSIDE_THE_HELD_OBJECT}");
+    let dir = std::env::temp_dir().join(format!("crat-r315-1n-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), &source).unwrap();
+    let result = super::rewrite_m1_path(&dir.join("lib.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let super::RewriteOutcome::Emitted {
+        source: out,
+        degradations,
+        ..
+    } = result
+    else {
+        panic!("the fixture must emit")
+    };
+    println!("SOURCE\n{out}");
+    for d in &degradations {
+        println!("DEGRADED {} {}", d.subject, d.reason.key());
+    }
+    assert!(super::verify::type_checks_str(&out), "{out}");
+    let signature: String = out
+        .lines()
+        .find(|line| line.contains("fn append("))
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert!(signature.contains("v:*mutsmall_vec"), "{out}");
+    assert!(signature.contains("out:*mutu64"), "out stays raw: {out}");
+    let flat: String = out.split_whitespace().collect();
+    assert!(flat.contains("letmutq:*mutusize"), "q stays raw: {out}");
 }

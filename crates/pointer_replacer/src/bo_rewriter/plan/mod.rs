@@ -1604,18 +1604,26 @@ pub(crate) fn finalize_signature_classes(
             // held subject neither requires an arm of its class nor blocks it
             // (brotli's decoder: the pair hold on `s` / `available_out` /
             // `total_out` held the whole class and dragged `next_out` raw).
-            // Relay 315 item 1 (main 207 / 208): R864-3's retained-access hold is
-            // one of them (`is_settled_hold`); left out, it held 82 identities'
-            // classes at 57's census (brotli's `blocked-subject:held:retained-alias`,
-            // quadtree's `split_node_` / `insert_` and the Box rows behind them).
             Decision::Degraded(super::decision::Degradation {
                 reason:
                     super::decision::DegradeReason::PairNotShownDisjoint { .. }
                     | super::decision::DegradeReason::ReleasedThroughIndirectCall { .. }
-                    | super::decision::DegradeReason::IntoHeldFormal { .. }
-                    | super::decision::DegradeReason::RetainedAlias { .. },
+                    | super::decision::DegradeReason::IntoHeldFormal { .. },
                 ..
             }) => continue,
+            // Relay 315 item 1 (main 207 / 208): R864-3's retained-access hold is
+            // one of them (`is_settled_hold`); left out, it held 82 identities'
+            // classes at 57's census (brotli's `blocked-subject:held:retained-alias`,
+            // quadtree's `split_node_` / `insert_` and the Box rows behind them).
+            // Its rows only (`evident:…`, the check's receipt): the stop-gap table's
+            // `RetainedAlias` (`observed:` / `observed-pair:` / `fixture:`, decided at
+            // the ladder) is raw in the hypothesis co-conversion read, so its arm
+            // requirements are current, and it is not a settled-table hold (the
+            // stand-in review of item 1, MED-1).
+            Decision::Degraded(super::decision::Degradation {
+                reason: super::decision::DegradeReason::RetainedAlias { detail },
+                ..
+            }) if detail.starts_with("evident:") => continue,
             Decision::Degraded(record) => (false, Some(record.reason.key())),
         };
         if emits {
