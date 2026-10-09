@@ -217,12 +217,20 @@ fn has_closure(body: &rustc_hir::Body<'_>) -> bool {
     visitor.0
 }
 
-/// Does the crate declare a foreign function with the entry's own name?
+/// Does the crate declare a foreign function with the entry's own symbol?
+/// wave-5d 149h (the round-2 review's MED): symbols, not item names: a local
+/// `#[export_name = "type"] fn type_0` and a foreign `#[link_name = "f"] fn
+/// f_ext` are the same symbol as `type` / `f`.
 pub(crate) fn declared_extern(tcx: TyCtxt<'_>, entry: LocalDefId) -> bool {
-    let name = tcx.item_name(entry.to_def_id());
-    tcx.hir_crate_items(())
-        .foreign_items()
-        .any(|item| tcx.item_name(item.owner_id.to_def_id()) == name)
+    let symbol = |did: rustc_hir::def_id::DefId, renamed: Option<rustc_span::Symbol>| {
+        renamed.unwrap_or_else(|| tcx.item_name(did))
+    };
+    let entry = entry.to_def_id();
+    let name = symbol(entry, tcx.codegen_fn_attrs(entry).export_name);
+    tcx.hir_crate_items(()).foreign_items().any(|item| {
+        let did = item.owner_id.to_def_id();
+        symbol(did, tcx.codegen_fn_attrs(did).link_name) == name
+    })
 }
 
 fn assigned_or_addressed(body: &rustc_hir::Body<'_>, binding: HirId) -> bool {

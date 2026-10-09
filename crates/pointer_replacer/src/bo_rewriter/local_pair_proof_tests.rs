@@ -390,7 +390,7 @@ fn r149g_an_address_taken_function_is_not_certified_static_vs_formal() {
 /// wave-5d 149g (the stand-in review's MED-2): a call inside a closure is a
 /// caller the records do not show.
 #[test]
-fn r149g_a_call_inside_a_closure_is_not_a_hidden_caller() {
+fn r149g_a_call_inside_a_closure_refuses_the_certificate() {
     let input = format!(
         "{CALLER_PAIR}pub unsafe fn via_closure(q: *mut i32) -> i32 {{\n\
          let g = |r: *mut i32| unsafe {{ f(r, r) }};\n    g(q)\n}}\n"
@@ -402,7 +402,7 @@ fn r149g_a_call_inside_a_closure_is_not_a_hidden_caller() {
 /// redeclaration of an exported local function is an in-program call the
 /// records do not show; the waiver covers the embedder's calls only.
 #[test]
-fn r149g_a_call_through_an_extern_redeclaration_is_not_a_hidden_caller() {
+fn r149g_a_call_through_an_extern_redeclaration_refuses_the_certificate() {
     let input = CALLER_PAIR.replace(
         "unsafe fn f(",
         "#[no_mangle]\npub unsafe extern \"C\" fn f(",
@@ -421,4 +421,16 @@ unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 pub unsafe fn m(buf: *mut u8) -> u8 { let r: &mut u8 = &mut *buf; cp2(&mut *r, buf); *buf }
 "#;
     assert!(verdict_at(input, "m", "cp2", 0, 1).is_err());
+}
+
+/// wave-5d 149h (the round-2 review's MED): a redeclaration under another
+/// name (`#[link_name]`) is the same symbol, so the same hidden caller.
+#[test]
+fn r149h_a_renamed_extern_redeclaration_refuses_the_certificate() {
+    let input = CALLER_PAIR.replace(
+        "unsafe fn f(",
+        "#[no_mangle]\npub unsafe extern \"C\" fn f(",
+    ) + "pub mod other {\n    extern \"C\" { #[link_name = \"f\"] pub fn f_ext(x: *mut i32, y: *const i32) -> i32; }\n\
+         pub unsafe fn g(q: *mut i32) -> i32 { f_ext(q, q) }\n}\n";
+    assert!(caller_pair_verdict(&input).is_err());
 }

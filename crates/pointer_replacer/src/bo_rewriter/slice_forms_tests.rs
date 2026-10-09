@@ -402,7 +402,7 @@ fn wave6s_strff_survives_its_raw_local_caller() {
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(
         source.contains("ptr: &[i8]"),
-        "the forward parameter is withdrawn by its caller: {receipts}\n{source}"
+        "the forward parameter delivers and its caller withdraws nothing: {receipts}\n{source}"
     );
     assert!(source.contains("url: &i8"), "{source}");
     assert!(
@@ -430,13 +430,11 @@ const STOREH2_WITH_STORE_RANGE: &str = r#"
     let mut i = ix_start;
     while i < ix_end { StoreH2(self_0, data, mask, i); i = i.wrapping_add(1); }
  }
- // R898-1 / R901-2 (wave-5d 147): a live caller of unknown-provenance
- // arguments, so the scope's vacuity fact does not clear the pairs this
- // fixture exists to exercise.
+ // A live caller (R898-1: an uncalled function's pairs are disjoint by
+ // vacuity). wave-5d 149g (the 58 re-cut): it hands two separate objects; the
+ // opaque twin (`STOREH2_OPAQUE_DRIVER`) hands two unknown pointers.
  extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
  #[no_mangle]
- // wave-5d 149g (the 58 re-cut): two separate objects, so the driver's own call
- // is not a pair R833-1 holds (two opaque pointers may name one object).
  pub unsafe extern "C" fn __crat_test_live() { let mut h: H2 = core::mem::zeroed(); let buf = [0u8; 64]; StoreRangeH2(&mut h, buf.as_ptr(), 0, 0, 0); }
 "#;
 
@@ -497,6 +495,26 @@ fn wave6s_storeh2_survives_its_thin_raw_caller() {
     assert!(compact.contains("StoreH2(self_0,data,mask,i);"), "{source}");
     assert!(
         !compact.contains("from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT)"),
+        "{source}"
+    );
+}
+
+/// wave-5d 149h (the round-2 review's MED): the opaque twin of the driver. Two
+/// unknown pointers may name one object, so `StoreRangeH2`'s pair is held at
+/// the driver's call (R833-1 / R864-1) and neither of its formals delivers;
+/// what is asserted is that nothing is delivered beside the unproven pair.
+#[test]
+fn wave6s_storeh2_opaque_driver_keeps_the_pair_raw() {
+    let input = STOREH2_WITH_STORE_RANGE.replace(
+        "let mut h: H2 = core::mem::zeroed(); let buf = [0u8; 64]; StoreRangeH2(&mut h, buf.as_ptr(), 0, 0, 0);",
+        "StoreRangeH2(__crat_test_opaque() as *mut H2, __crat_test_opaque() as *const u8, 0, 0, 0);",
+    );
+    assert_ne!(input, STOREH2_WITH_STORE_RANGE);
+    let (source, _) = emit_with_family_receipts(&input);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(
+        compact.contains("fnStoreRangeH2(mutself_0:*mutH2,mutdata:*constu8,"),
         "{source}"
     );
 }

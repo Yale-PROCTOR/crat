@@ -149,19 +149,17 @@ const CALLEE_PAIR_HELD: &str = r#"
     pair(p, q, n);
     a
  }
- // R898-1 / R901-2 (wave-5d 147): a live caller of unknown-provenance
- // arguments, so the scope's vacuity fact does not clear the pairs this
- // fixture exists to exercise.
+ // A live caller (R898-1: an uncalled function's pairs are disjoint by
+ // vacuity): `overlap` gets an unknown pointer; wave-5d 149g (the 58 re-cut):
+ // `caller` gets two distinct stack arrays, so its own pair is certified
+ // rather than held under R833-1 (two opaque pointers may name one object).
  extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
  #[no_mangle]
- // wave-5d 149g (the 58 re-cut): `caller` is handed two distinct stack
- // arrays, so its own pair is certified rather than held under R833-1 (two
- // opaque pointers may name one object).
  pub unsafe extern "C" fn __crat_test_live() { overlap(__crat_test_opaque() as *mut u8, 0); let s = [0u8; 4]; let mut t = [0u8; 4]; caller(s.as_ptr(), t.as_mut_ptr(), 0); }
 "#;
 
 #[test]
-fn wave6s2_pass_on_beside_an_a5_pair_fallback_edit_bridges() {
+fn wave6s2_pass_on_beside_a_certified_caller_pair_bridges() {
     let (source, receipts) = emit_with_receipts(CALLEE_PAIR_HELD);
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("mut p: &[u8]"), "{source}");
