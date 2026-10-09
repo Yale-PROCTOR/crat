@@ -1107,8 +1107,18 @@ fn blocking_subjects(candidate: &StageSnapshot, owner: SignatureClassId, key: &s
         .iter()
         .filter(|(subject, decided)| {
             subject.fn_did == owner.local_def_id()
-                && matches!(decided, decision::Decision::Degraded(degradation)
-                    if degradation.reason.key() == key)
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                && match decided {
+                    decision::Decision::Degraded(degradation) => degradation.reason.key() == key,
+                    decision::Decision::Cursor { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_) => false,
+                }
                 && candidate
                     .table
                     .arm_requirements
