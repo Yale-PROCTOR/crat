@@ -176,99 +176,67 @@ pub(crate) fn of_local(tcx: TyCtxt<'_>, f: LocalDefId, local: HirId) -> Option<B
     Analysis::new(tcx).bound(f, local)
 }
 
-/// An argument copied into a length is a plain name or a decimal literal
-/// (R923-1): its text then has the parameter's own type and value — Rust has
-/// no implicit integer conversion — and evaluating it again reads the same
-/// value and does nothing else.
-pub(crate) fn pure_argument_text(text: &str) -> bool {
-    let text = text.trim();
-    let name = text
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let digits = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let literal = digits > 0
-        && matches!(
-            &text[digits..],
-            "" | "u8"
-                | "u16"
-                | "u32"
-                | "u64"
-                | "u128"
-                | "usize"
-                | "i8"
-                | "i16"
-                | "i32"
-                | "i64"
-                | "i128"
-                | "isize"
-        );
-    name || literal
-}
-
-/// Every argument of the call is free of assignments, blocks and calls (the
-/// pointer-arithmetic methods excepted), so no argument's evaluation can
-/// change a value the duplicated length reads.
-fn effect_free_text(text: &str) -> bool {
-    if text.contains('{') {
+/// No argument's evaluation can change a value the duplicated length reads
+/// (relay 112, S1-M1): every argument of the call is, structurally, literals,
+/// paths, casts, built-in operators, field and built-in index projections,
+/// address-of, and std's own inherent pointer / slice methods — no call, no
+/// assignment, no block, no macro, no overloaded operator or index.
+fn effect_free<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+    e: &'tcx Expr<'tcx>,
+) -> bool {
+    if e.span.from_expansion() {
         return false;
     }
-    let chars = text.chars().collect::<Vec<_>>();
-    for (i, c) in chars.iter().enumerate() {
-        match c {
-            '=' => {
-                let before = i.checked_sub(1).map(|j| chars[j]);
-                if !matches!(before, Some('=' | '!' | '<' | '>')) && chars.get(i + 1) != Some(&'=')
-                {
-                    return false;
-                }
+    let free = |x: &'tcx Expr<'tcx>| effect_free(tcx, typeck, x);
+    match e.kind {
+        ExprKind::Lit(_) | ExprKind::Path(_) => true,
+        ExprKind::DropTemps(x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) => free(x),
+        ExprKind::AddrOf(_, _, x) => free(x),
+        ExprKind::Unary(_, x) => typeck.type_dependent_def(e.hir_id).is_none() && free(x),
+        ExprKind::Binary(_, l, r) | ExprKind::Index(l, r, _) => {
+            typeck.type_dependent_def(e.hir_id).is_none() && free(l) && free(r)
+        }
+        ExprKind::MethodCall(segment, receiver, args, _) => {
+            let Some((DefKind::AssocFn, def)) = typeck.type_dependent_def(e.hir_id) else {
+                return false;
+            };
+            let std_inherent = !def.is_local()
+                && tcx
+                    .impl_of_method(def)
+                    .is_some_and(|i| tcx.trait_id_of_impl(i).is_none());
+            std_inherent
+                && matches!(
+                    segment.ident.name.as_str(),
+                    "offset" | "add" | "wrapping_offset" | "is_null" | "as_ptr" | "as_mut_ptr"
+                )
+                && free(receiver)
+                && args.iter().all(free)
+        }
+        _ => false,
+    }
+}
+
+/// The call `caller` makes at `span`.
+fn call_at<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    span: rustc_span::Span,
+) -> Option<&'tcx Expr<'tcx>> {
+    struct Find<'tcx>(rustc_span::Span, Option<&'tcx Expr<'tcx>>);
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if matches!(e.kind, ExprKind::Call(..)) && e.span == self.0 {
+                self.1 = Some(e);
             }
-            '(' => {
-                // `(f)()` / `t[k]()` call through a parenthesized or indexed
-                // callee.
-                if matches!(
-                    chars[..i].iter().rev().find(|c| !c.is_whitespace()),
-                    Some(')' | ']')
-                ) {
-                    return false;
-                }
-                let name = chars[..i]
-                    .iter()
-                    .rev()
-                    .skip_while(|c| c.is_whitespace())
-                    .take_while(|c| c.is_alphanumeric() || **c == '_')
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>();
-                if name.is_empty() {
-                    continue;
-                }
-                // A method, and one of the pointer methods that read nothing
-                // but their operands.
-                let method = chars[..i]
-                    .iter()
-                    .rev()
-                    .skip_while(|c| c.is_whitespace())
-                    .skip_while(|c| c.is_alphanumeric() || **c == '_')
-                    .find(|c| !c.is_whitespace())
-                    == Some(&'.');
-                if !method
-                    || !matches!(
-                        name.as_str(),
-                        "offset" | "add" | "wrapping_offset" | "is_null" | "as_ptr" | "as_mut_ptr"
-                    )
-                {
-                    return false;
-                }
-            }
-            _ => {}
+            intravisit::walk_expr(self, e)
         }
     }
-    true
+    let body = tcx.hir_maybe_body_owned_by(caller)?;
+    let mut find = Find(span, None);
+    find.visit_expr(body.value);
+    find.1
 }
 
 /// The receipt keys, interned once each (a few hundred distinct strings per
@@ -289,31 +257,53 @@ fn intern(key: String) -> &'static str {
 }
 
 /// **The seam's raw-argument arm.** The length text for parameter `index` of
-/// `callee` at one call, instantiated with that call's own arguments, and its
-/// receipt key — or `None`, and the arm keeps its fallback.
+/// `callee` at the call `caller` makes at `call_span`, instantiated with that
+/// call's own arguments, and its receipt key — or `None`, and the arm keeps its
+/// fallback.
+///
+/// Each argument the length copies is an integer literal, or a local of the
+/// caller that is never written and never borrowed mutably (and the caller has
+/// no closure, `ref mut` or inline assembly): its value at the construction is
+/// the value the call passes, and reading it again does nothing else (R923-1,
+/// relay 112 S1-M1). Rust has no implicit integer conversion, so the copied
+/// text has the parameter's own type.
 pub(crate) fn at_call_site(
     tcx: TyCtxt<'_>,
     callee: LocalDefId,
     index: usize,
-    args: &[super::emitability::Arg],
+    caller: LocalDefId,
+    call_span: rustc_span::Span,
     sm: &rustc_span::source_map::SourceMap,
 ) -> Option<(String, &'static str)> {
     let bound = of_parameter(tcx, callee, index)?;
-    let texts = args
-        .iter()
-        .map(|a| Some((a.index, sm.span_to_snippet(a.span).ok()?)))
-        .collect::<Option<FxHashMap<_, _>>>()?;
-    if !texts.values().all(|t| effect_free_text(t)) {
+    let call = call_at(tcx, caller, call_span)?;
+    let ExprKind::Call(_, args) = call.kind else { return None };
+    if call.span.from_expansion() {
         return None;
     }
-    let needed = bound.terms.iter().filter_map(|t| match t {
-        Term::Parameter(p) => Some(*p),
-        Term::Constant(_) => None,
-    });
-    for i in needed {
-        if !texts.get(&i).is_some_and(|t| pure_argument_text(t)) {
+    let typeck = tcx.typeck(caller);
+    if !args.iter().all(|a| effect_free(tcx, typeck, a)) {
+        return None;
+    }
+    let mut writes = Writes::new_typeck(typeck);
+    writes.visit_expr(tcx.hir_maybe_body_owned_by(caller)?.value);
+    if writes.opaque {
+        return None;
+    }
+    let mut texts = FxHashMap::default();
+    for t in &bound.terms {
+        let Term::Parameter(p) = *t else { continue };
+        let arg = peel_parens(args.get(p)?);
+        let copyable = match arg.kind {
+            ExprKind::Lit(_) => literal(arg).is_some(),
+            ExprKind::Path(..) => local_of(arg)
+                .is_some_and(|id| !writes.written.contains(&id) && !writes.borrowed.contains(&id)),
+            _ => false,
+        };
+        if !copyable {
             return None;
         }
+        texts.insert(p, sm.span_to_snippet(arg.span).ok()?);
     }
     let text = bound.render_count(&|i| texts[&i].trim().to_owned());
     Some((text, intern(bound.receipt(&parameter_names(tcx, callee)))))
@@ -396,8 +386,15 @@ impl<'tcx> Analysis<'tcx> {
         if writes.written.contains(&target) || writes.borrowed.contains(&target) {
             return None;
         }
-        // A local target is bound once, at its `let`.
-        if !params.contains(&Some(target)) && writes.lets.get(&target) != Some(&1) {
+        // A local target is bound once, at its `let`, and not inside a loop: a
+        // pointer bound anew on every iteration is a different allocation each
+        // time (relay 112, S1-M3).
+        if !params.contains(&Some(target))
+            && (writes.lets.get(&target) != Some(&1)
+                || tcx.hir_parent_iter(target).any(|(_, node)| {
+                    matches!(node, rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::Loop(..)))
+                }))
+        {
             return None;
         }
         let mut walker = Walk {
@@ -754,6 +751,40 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
         }
     }
 
+    /// The place `*p.offset(i)` is read or written as a value: no address is
+    /// formed from it or from a field or element of it, explicitly (`&mut
+    /// (*p.offset(i)).f`) or by an autoref (`(*m.offset(i)).as_mut_ptr()`),
+    /// and no overloaded index reads it (relay 112, S1-M2).
+    fn value_use(&self, deref: &'tcx Expr<'tcx>) -> bool {
+        let tcx = self.a.tcx;
+        let typeck = self.typeck();
+        let mut place = deref;
+        loop {
+            if typeck
+                .expr_adjustments(place)
+                .iter()
+                .any(|a| matches!(a.kind, Adjust::Borrow(_)))
+            {
+                return false;
+            }
+            let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(place.hir_id) else {
+                return true;
+            };
+            match parent.kind {
+                ExprKind::Field(base, _) if base.hir_id == place.hir_id => place = parent,
+                ExprKind::Index(base, _, _) if base.hir_id == place.hir_id => {
+                    if typeck.type_dependent_def(parent.hir_id).is_some() {
+                        return false;
+                    }
+                    place = parent
+                }
+                ExprKind::DropTemps(_) => place = parent,
+                ExprKind::AddrOf(..) => return false,
+                _ => return true,
+            }
+        }
+    }
+
     /// `*p.offset(idx)` / `*p.add(idx)`: the index must be a loop counter.
     fn access(&mut self, idx: &'tcx Expr<'tcx>, at: HirId) {
         match self.counter(idx).and_then(|i| self.loop_bound(i, at)) {
@@ -854,6 +885,9 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, '_, 'tcx> {
                 if let Some((receiver, idx)) = offset_call(peel_parens(inner))
                     && self.is_target(receiver)
                 {
+                    if !self.value_use(e) {
+                        return self.refuse();
+                    }
                     self.visit_expr(idx);
                     return self.access(idx, e.hir_id);
                 }

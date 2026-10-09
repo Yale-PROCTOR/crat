@@ -6288,7 +6288,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                         ) =>
                     {
                         match super::callee_bound::at_call_site(
-                            tcx, *callee, pos.index, &site.args, sm,
+                            tcx,
+                            *callee,
+                            pos.index,
+                            site.caller,
+                            site.span,
+                            sm,
                         ) {
                             Some((text, key)) => {
                                 (Some(text), Some(LenEvidence::CalleeBound { key }))

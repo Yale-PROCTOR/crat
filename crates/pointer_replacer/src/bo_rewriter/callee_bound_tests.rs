@@ -401,41 +401,38 @@ fn w4cb_f6_a_reassigned_bound_parameter_refuses() {
     assert_eq!(receipt(&src, "grow", 0), None);
 }
 
-/// **W4CB-F7 — only a plain name or a decimal literal is copied into a length
-/// (R923-1).** Guard: `pure_argument_text` / `effect_free_text`.
+/// **W4CB-F7 — only a literal or a never-written local of the caller is
+/// copied into a length, and only when no argument of the call has an effect
+/// (R923-1, relay 112 S1-M1).** Guard: `at_call_site`'s argument checks and
+/// `effect_free`.
 #[test]
-fn w4cb_f7_an_argument_that_is_not_a_plain_name_keeps_the_fallback() {
-    use super::decision::callee_bound::pure_argument_text;
-    for refused in [
-        "next()",
-        "*count",
-        "{ n += 1; n }",
-        "count as usize",
-        "a * 2",
-        "!0",
-        "-5",
-        "n - 1",
-        "c.wrapping_add(1)",
-        "0x10",
-        "s.n",
+fn w4cb_f7_an_argument_that_is_not_a_plain_local_keeps_the_fallback() {
+    let total = "pub unsafe fn total(n: i32, flag: i32, p: *const i32) -> i32 {\n\
+        let mut s = 0; let mut i: i32 = 0;\n\
+        while i < n { s += *p.offset(i as isize); i += 1 }\n\
+        s }\n";
+    for caller in [
+        "pub unsafe fn next() -> i32 { 3 }\n\
+         pub unsafe fn caller(base: *const i32, k: isize) -> i32 { total(next(), 1, base.offset(k)) }\n",
+        "pub unsafe fn caller(base: *const i32, c: i32, k: isize) -> i32 { total(c + 1, 1, base.offset(k)) }\n",
+        "pub unsafe fn caller(base: *const i32, mut c: i32, k: isize) -> i32 { c += 1; total(c, 1, base.offset(k)) }\n",
+        "pub static mut C: i32 = 4;\n\
+         pub unsafe fn caller(base: *const i32, k: isize) -> i32 { total(C, 1, base.offset(k)) }\n",
+        "pub unsafe fn caller(base: *const i32, c: i32, k: isize) -> i32 { total(c as i32, 1, base.offset(k)) }\n",
     ] {
-        assert!(!pure_argument_text(refused), "{refused}");
+        let out = flat(&emitted(&format!("{PRE}{total}{caller}")));
+        assert!(
+            out.contains("from_raw_parts(base.offset(k), crate::FALLBACK_SLICE_EXTENT)"),
+            "{caller}\n{out}"
+        );
     }
-    for kept in ["count", "_n", "16", "16usize", "7i32"] {
-        assert!(pure_argument_text(kept), "{kept}");
-    }
-    let src = format!(
-        "{PRE}\
-         pub unsafe fn next() -> i32 {{ 3 }}\n\
-         pub unsafe fn total(n: i32, flag: i32, p: *const i32) -> i32 {{\n\
-         \x20   let mut s = 0; let mut i: i32 = 0;\n\
-         \x20   while i < n {{ s += *p.offset(i as isize); i += 1 }}\n\
-         \x20   s\n\
-         }}\n\
-         pub unsafe fn caller(base: *const i32, k: isize) -> i32 {{ total(next(), 1, base.offset(k)) }}\n"
+    let kept =
+        "pub unsafe fn caller(base: *const i32, k: isize) -> i32 { total(7, 1, base.offset(k)) }\n";
+    let out = flat(&emitted(&format!("{PRE}{total}{kept}")));
+    assert!(
+        out.contains("from_raw_parts(base.offset(k), (((7) as i128).max(0)) as usize)"),
+        "{out}"
     );
-    let out = flat(&emitted(&src));
-    assert!(!out.contains("next()) as i128"), "{out}");
 }
 
 /// **W4CB-F8 — a negative instantiated bound is an empty slice.** The rendering
