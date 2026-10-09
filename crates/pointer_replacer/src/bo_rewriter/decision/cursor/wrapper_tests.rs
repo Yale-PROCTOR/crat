@@ -2647,3 +2647,79 @@ fn slicecursor_a_mutable_cursor_into_a_foreign_callee_at_an_offset_is_reborrowed
         "both foreign arguments reborrow the cursor: {source}"
     );
 }
+
+/// **heman `qselect::v` (R785-5, relay 116).** A parameter cursor handed to its
+/// OWN parameter by a recursive call, bare and as an offset chain. During
+/// planning the callee's parameter is this very subject, still degraded, so
+/// both arguments used to read as raw formals and hold `RawBoundaryUnbuilt`;
+/// the class then held whole (`blocked-subject:slice-cursor-use`). The callee's
+/// parameter is a cursor parameter by construction: the arguments are this
+/// cursor's tail views.
+const QSELECT: &str = r#"
+unsafe extern "C" fn qselect(mut v: *mut f32, mut len: i32, mut k: i32) -> f32 {
+    let mut i: i32 = 0;
+    let mut st: i32 = 0;
+    i = 0 as i32;
+    st = i;
+    while i < len - 1 as i32 {
+        if !(*v.offset(i as isize) > *v.offset((len - 1 as i32) as isize)) {
+            let mut f = *v.offset(i as isize);
+            *v.offset(i as isize) = *v.offset(st as isize);
+            *v.offset(st as isize) = f;
+            st += 1;
+        }
+        i += 1;
+    }
+    let mut __0 = *v.offset((len - 1 as i32) as isize);
+    *v.offset((len - 1 as i32) as isize) = *v.offset(st as isize);
+    *v.offset(st as isize) = __0;
+    return if k == st {
+        *v.offset(st as isize)
+    } else if st > k {
+        qselect(v, st, k)
+    } else {
+        qselect(v.offset(st as isize), len - st, k - st)
+    };
+}
+pub unsafe fn median(n: i32) -> f32 {
+    let mut vals: [f32; 16] = [0.0; 16];
+    qselect(vals.as_mut_ptr(), n, n / 2)
+}
+"#;
+
+#[test]
+fn slicecursor_r116_a_cursor_handed_to_its_own_parameter_by_recursion_is_a_tail_view() {
+    let source = emitted(QSELECT);
+    let compact: String = source.split_whitespace().collect();
+    assert!(
+        compact.contains("fnqselect(mutv:&mut[f32]") && compact.contains("SliceCursorMut::new(v)"),
+        "qselect's v is a parameter cursor: {source}"
+    );
+    assert!(
+        compact.contains("qselect(v.as_slice_mut(),st,k)")
+            && compact.contains(".as_slice_mut(),len-st,k-st)"),
+        "both recursive arguments are the cursor's tail views: {source}"
+    );
+}
+
+/// **Control.** The same offset chain handed to ANOTHER local function whose
+/// parameter stays raw (it is only cast to an integer): not this subject's
+/// parameter, so it keeps the raw-formal rule and its hold.
+#[test]
+fn slicecursor_r116_control_a_chain_into_another_raw_parameter_keeps_its_hold() {
+    let src = QSELECT
+        .replace(
+            "unsafe extern \"C\" fn qselect(",
+            "unsafe extern \"C\" fn addr_of(p: *mut f32) -> usize { p as usize }\nunsafe extern \"C\" fn qselect(",
+        )
+        .replace(
+            "qselect(v.offset(st as isize), len - st, k - st)",
+            "addr_of(v.offset(st as isize)) as f32",
+        );
+    let source = emitted(&src);
+    let compact: String = source.split_whitespace().collect();
+    assert!(
+        compact.contains("fnqselect(mutv:*mutf32"),
+        "a chain into another function's raw parameter keeps the raw form: {source}"
+    );
+}
