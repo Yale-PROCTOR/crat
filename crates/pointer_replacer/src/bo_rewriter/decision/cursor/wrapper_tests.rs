@@ -2723,3 +2723,56 @@ fn slicecursor_r116_control_a_chain_into_another_raw_parameter_keeps_its_hold() 
         "a chain into another function's raw parameter keeps the raw form: {source}"
     );
 }
+
+/// **Control (review finding 1).** An OPTIONAL cursor (null-tested) handed to
+/// its own parameter: its formal is `Option<&mut [T]>` and C may pass null down
+/// the recursion, so the recursive arm does not apply; no `.expect` is passed.
+#[test]
+fn slicecursor_r116_control_an_optional_cursor_in_recursion_is_not_a_tail_view() {
+    let src = r#"
+unsafe extern "C" fn walk(mut p: *mut i32, mut n: i32) {
+    if p.is_null() || n == 0 as i32 {
+        return;
+    }
+    *p.offset(0 as isize) += 1;
+    *p.offset((n - 1 as i32) as isize) += 1;
+    walk(p, n - 1 as i32);
+}
+pub unsafe fn caller() {
+    let mut a: [i32; 4] = [0; 4];
+    walk(a.as_mut_ptr(), 4);
+}
+"#;
+    let source = emitted(src);
+    let compact: String = source.split_whitespace().collect();
+    assert!(
+        !compact.contains("walk(p.as_mut().expect"),
+        "an optional cursor is never unwrapped into its own recursive call: {source}"
+    );
+}
+
+/// **Control (review finding 2).** A recursive step that may go BACKWARD
+/// (`back(v.offset(step), ..)` with a parameter `step`, called with -1 on
+/// `a + 15`): the tail view would wrap below the callee's window, so the
+/// recursion keeps its hold and the function stays raw.
+#[test]
+fn slicecursor_r116_control_a_recursive_step_of_unknown_sign_keeps_its_hold() {
+    let src = r#"
+unsafe extern "C" fn back(mut v: *mut f32, mut n: i32, mut step: i32) -> f32 {
+    if n == 0 as i32 {
+        return 0 as f32;
+    }
+    *v.offset((n - 1 as i32) as isize) + back(v.offset(step as isize), n - 1 as i32, step)
+}
+pub unsafe fn caller() -> f32 {
+    let mut a: [f32; 16] = [0.0; 16];
+    back(a.as_mut_ptr().offset(15 as isize), 16, -1)
+}
+"#;
+    let source = emitted(src);
+    let compact: String = source.split_whitespace().collect();
+    assert!(
+        compact.contains("fnback(mutv:*mutf32"),
+        "a recursive step of unknown sign keeps the raw form: {source}"
+    );
+}
