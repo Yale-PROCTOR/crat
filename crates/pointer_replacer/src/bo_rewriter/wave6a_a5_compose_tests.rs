@@ -77,8 +77,14 @@ fn subject_use(text: &str, replacement: &str, owner: u32) -> Edit {
     )
 }
 
+/// The planner recorded the view's class depending on the caller's
+/// (`a5_wrapper_composition`'s unselected-argument case).
+fn composed(outer: SignatureClassId, inner: SignatureClassId) -> bool {
+    outer == class(CALLEE) && inner == class(CALLER)
+}
+
 fn rollbacks(edits: &[Edit]) -> usize {
-    super::apply::apply(CALL, &super::validation_projection(edits))
+    super::apply::apply(CALL, &super::validation_projection(edits, &composed))
         .rollbacks
         .len()
 }
@@ -126,6 +132,63 @@ fn w6a_158_an_edit_straddling_the_view_still_rolls_back() {
     );
     let mut text = CALL.to_owned();
     text.push(';');
-    let applied = super::apply::apply(&text, &super::validation_projection(&[a5_view(), straddle]));
+    let applied = super::apply::apply(
+        &text,
+        &super::validation_projection(&[a5_view(), straddle], &composed),
+    );
+    assert_eq!(applied.rollbacks.len(), 1);
+}
+
+/// Control (the stand-in review's F1): an edit ENCLOSING the call — a
+/// construction over an initializer that contains it — still collides with
+/// the view. The AST pass would re-parse the initializer before the A5 pass and
+/// lose the call's span; the projection must keep holding that one class.
+#[test]
+fn w6a_158_an_edit_enclosing_the_view_still_rolls_back() {
+    let text = format!("malloc({CALL} as u64)");
+    let shift = "malloc(".len();
+    let shifted = |mut e: Edit| {
+        e.lo += shift;
+        e.hi += shift;
+        e
+    };
+    let enclosing = edit(
+        0,
+        text.len(),
+        "x",
+        Justification::SeamAdapter {
+            family: "safe",
+            fabricated: false,
+        },
+        CALLER,
+        "slice-local-construction",
+    );
+    let edits = [
+        enclosing,
+        shifted(a5_view()),
+        shifted(subject_use(
+            "*depth.offset(lit as isize)",
+            "depth[(lit) as usize]",
+            CALLER,
+        )),
+    ];
+    let applied = super::apply::apply(&text, &super::validation_projection(&edits, &composed));
+    assert!(!applied.rollbacks.is_empty());
+}
+
+/// Control (the stand-in review's F2): without the planner's recorded
+/// composition the contained use is not suppressed.
+#[test]
+fn w6a_158_an_uncomposed_use_inside_the_view_still_rolls_back() {
+    let edits = [
+        a5_view(),
+        subject_use(
+            "*depth.offset(lit as isize)",
+            "depth[(lit) as usize]",
+            CALLER,
+        ),
+    ];
+    let none = |_: SignatureClassId, _: SignatureClassId| false;
+    let applied = super::apply::apply(CALL, &super::validation_projection(&edits, &none));
     assert_eq!(applied.rollbacks.len(), 1);
 }

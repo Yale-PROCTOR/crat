@@ -2219,7 +2219,13 @@ fn verify_and_revert(
                 nested_kind_under_seam(edits, index)
                     || exact_kind_composed_by_seam(edits, index)
                     || nested_seam_under_seam(edits, index)
-                    || nested_a5_over_use(edits, index)
+                    || nested_use_under_a5(edits, index, &|outer, inner| {
+                        emission_plan
+                            .class_finalization
+                            .classes
+                            .get(&outer)
+                            .is_some_and(|class| class.depends_on.contains(&inner))
+                    })
             })
         });
     let e1_edit_contexts = if census_once {
@@ -5750,7 +5756,13 @@ pub(crate) fn validate_plan(
         let Some(source) = texts.get(key) else {
             continue;
         };
-        let validation_edits = validation_projection(kept);
+        let validation_edits = validation_projection(kept, &|outer, inner| {
+            planned
+                .class_finalization
+                .classes
+                .get(&outer)
+                .is_some_and(|class| class.depends_on.contains(&inner))
+        });
         let applied = apply::apply(source, &validation_edits);
         rollbacks.extend(applied.rollbacks);
         maps.insert(key.clone(), applied.line_map);
@@ -5769,7 +5781,10 @@ pub(crate) fn validate_plan(
 /// contained inner use from the obsolete splice projection while keeping
 /// both edits in the real plan for attribution, reverts, and AST
 /// consumption. Every other overlap still reaches `apply` and rolls back.
-fn validation_projection(kept: &[plan::Edit]) -> Vec<plan::Edit> {
+fn validation_projection(
+    kept: &[plan::Edit],
+    composed: &dyn Fn(bridge_receipt::SignatureClassId, bridge_receipt::SignatureClassId) -> bool,
+) -> Vec<plan::Edit> {
     kept.iter()
         .enumerate()
         .filter(|(inner_index, inner)| {
@@ -5782,7 +5797,7 @@ fn validation_projection(kept: &[plan::Edit]) -> Vec<plan::Edit> {
                     plan::Justification::KindDecision { .. }
                 ) || !exact_kind_composed_by_seam(kept, *inner_index))
                 && !nested_c9_over_seam(kept, *inner_index)
-                && !nested_a5_over_use(kept, *inner_index)
+                && !nested_use_under_a5(kept, *inner_index, composed)
                 && !composed_by_slice_constructor(kept, *inner_index)
                 && !nested_seam_under_seam(kept, *inner_index)
         })
@@ -5908,27 +5923,39 @@ fn nested_c9_over_seam(edits: &[plan::Edit], c9_index: usize) -> bool {
     })
 }
 
-/// **wave-6a 158 (main 207a item 4).** An A5 raw view STRICTLY containing
-/// another class's `KindDecision` use edit: the caller's own subject-use in an
+/// **wave-6a 158 (main 207a item 4).** A `KindDecision` use edit STRICTLY
+/// inside another class's A5 raw view: the caller's own subject-use in an
 /// argument the view does not select (brotli's `EmitLiterals` →
-/// `BrotliWriteBits(*depth.offset(lit), …, storage)`). The class planner composed
-/// them (`a5_wrapper_composition`: the use overlaps no selected view, or it
-/// collides or the fallback yields and neither reaches here), and the AST pass
-/// grafts the use first and builds the view over the call's grafted children
-/// (`A5RawGraftVisitor`), as it does when a seam inside the call suppresses the
-/// view (`nested_c9_over_seam`). Suppress the view's projection only: the use
-/// stays in it, and every other overlap still reaches `apply`.
-fn nested_a5_over_use(edits: &[plan::Edit], a5_index: usize) -> bool {
-    let a5 = &edits[a5_index];
-    matches!(a5.justification, plan::Justification::A5RawView)
-        && edits.iter().enumerate().any(|(use_index, used)| {
-            use_index != a5_index
-                && matches!(used.justification, plan::Justification::KindDecision { .. })
-                && used.owner_class != a5.owner_class
-                && a5.lo <= used.lo
-                && used.hi <= a5.hi
-                && (a5.lo < used.lo || used.hi < a5.hi)
-        })
+/// `BrotliWriteBits(*depth.offset(lit), …, storage)`). The class planner
+/// recorded the composition (`a5_wrapper_composition`: the use overlaps no
+/// selected view, so the view's class depends on the use's; `composed`), and the
+/// AST pass grafts the use first and builds the view over the call's grafted
+/// children (`A5RawGraftVisitor`). At 56 a seam inside the call suppressed the
+/// view instead (`nested_c9_over_seam`); with the view's selected argument held
+/// raw at 57 no seam is left. The USE is suppressed, as under a seam
+/// (`nested_kind_under_seam`), and the view stays in the projection: an edit
+/// enclosing the call still collides with it (the stand-in review's F1).
+fn nested_use_under_a5(
+    edits: &[plan::Edit],
+    use_index: usize,
+    composed: &dyn Fn(bridge_receipt::SignatureClassId, bridge_receipt::SignatureClassId) -> bool,
+) -> bool {
+    let used = &edits[use_index];
+    let (plan::Justification::KindDecision { .. }, Some(use_owner)) =
+        (&used.justification, used.owner_class)
+    else {
+        return false;
+    };
+    edits.iter().enumerate().any(|(a5_index, a5)| {
+        a5_index != use_index
+            && matches!(a5.justification, plan::Justification::A5RawView)
+            && a5
+                .owner_class
+                .is_some_and(|a5_owner| a5_owner != use_owner && composed(a5_owner, use_owner))
+            && a5.lo <= used.lo
+            && used.hi <= a5.hi
+            && (a5.lo < used.lo || used.hi < a5.hi)
+    })
 }
 
 /// A source file's identity for editing. `None` for anything not written back
