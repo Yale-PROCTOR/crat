@@ -2053,3 +2053,71 @@ pub unsafe extern "C" fn use_make(mut n: usize) -> usize {
     assert!(text.contains("ifbuf.is_null(){returnNone;}"), "{context}");
     assert_eq!(out.reverted, 0, "{context}");
 }
+
+/// **main 202 (the hold census of 57): an owner lent to a formal a settled
+/// hold makes raw.** brotli's `BrotliCreateZopfliBackwardReferences` lends its
+/// contract owner `nodes` (`Option<Box<[ZopfliNode]>>`) to
+/// `BrotliZopfliComputeShortestPath`, whose `nodes` R864-1 holds raw
+/// (`ref-beside-ref` at another caller). The raw boundary planned on the
+/// hypothesis (the formal converting) and the owner-view glue serves only a
+/// converted formal, so the owner reached the raw formal bare (`E0308`, the
+/// whole program degraded). Here `Scan::symbols` is held by the pair at
+/// `aliased`'s call; the lend at `optional` takes the owner's raw view, the
+/// raw boundary's own optional-box template.
+#[test]
+fn main202_an_owner_lent_to_a_formal_a_settled_hold_makes_raw_takes_its_raw_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn Scan(mut symbols: *mut u32, mut other: *mut u32, mut n: usize) -> u32 {{\n\
+    let _k = other.offset(0 as isize);\n\
+    let mut i = 0 as usize;\n\
+    let mut max = 0 as u32;\n\
+    while i < n {{\n\
+        if *symbols.offset(i as isize) > max {{ max = *symbols.offset(i as isize); }}\n\
+        i = i.wrapping_add(1);\n\
+    }}\n\
+    *other = max;\n\
+    return max;\n\
+}}\n\
+pub static mut LOW: [u32; 4] = [0 as u32; 4];\n\
+pub unsafe extern \"C\" fn aliased() -> u32 {{\n\
+    return Scan(LOW.as_mut_ptr(), LOW.as_mut_ptr(), 4 as usize);\n\
+}}\n\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    let mut out = 0 as u32;\n\
+    *split = Scan(syms, &mut out, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("main202-held-lend", &src);
+    let text = compact(&out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "Scan::symbols").as_deref(),
+        Some("held:pair-not-shown-disjoint"),
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "optional::syms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutsyms:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains(
+            "*split=Scan(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()),"
+        ),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+}
