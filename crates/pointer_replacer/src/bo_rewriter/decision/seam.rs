@@ -6568,9 +6568,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                     // delivered sibling it decides nothing (146e).
                     // The counted-copy arm's own certificate answers where it
                     // exists (R896-1): `disjoint_roots` never splits a copy.
-                    let raw_local_pair = (positions[i].raw_local
-                        || positions[j].raw_local
-                        || positions[i].counted_raw_local != positions[j].counted_raw_local)
+                    // Only where the A5 proofs are available (the attested
+                    // census world): an unattested or baseline run has no audit
+                    // row, so the asked pair would carry no proof site and
+                    // break the receipt ledger's ownership invariant (wave-5d
+                    // 147); there the record's gate stands.
+                    let raw_local_pair = a5_site_proofs.is_available()
+                        && (positions[i].raw_local
+                            || positions[j].raw_local
+                            || positions[i].counted_raw_local != positions[j].counted_raw_local)
                         && positions[i].expected != Form::Raw
                         && positions[j].expected != Form::Raw
                         && !super::counted_void::disjoint_argument_roots(

@@ -12157,7 +12157,11 @@ fn r364_2_a_one_byte_mut_into_an_eight_byte_writer_is_held_as_a_write() {
                }\n\
                pub unsafe fn store(storage: *mut u8, at: *mut u64) {\n\
                    write_bits(at, storage)\n\
-               }\n";
+               }\n\
+               // R898-1 / R901-2 (wave-5d 147): a live caller of opaque arguments.\n\
+               extern \"C\" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }\n\
+               #[no_mangle]\n\
+               pub unsafe extern \"C\" fn __crat_test_live() { store(__crat_test_opaque() as *mut u8, __crat_test_opaque() as *mut u64) }\n";
     let got = decisions_of(src);
     let reason = reason_of(&got, "storage", true);
     assert!(

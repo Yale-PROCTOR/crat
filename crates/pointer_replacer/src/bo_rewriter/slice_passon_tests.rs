@@ -149,6 +149,12 @@ const CALLEE_PAIR_HELD: &str = r#"
     pair(p, q, n);
     a
  }
+ // R898-1 / R901-2 (wave-5d 147): a live caller of unknown-provenance
+ // arguments, so the scope's vacuity fact does not clear the pairs this
+ // fixture exists to exercise.
+ extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+ #[no_mangle]
+ pub unsafe extern "C" fn __crat_test_live() { overlap(__crat_test_opaque() as *mut u8, 0); caller(__crat_test_opaque() as *const u8, __crat_test_opaque() as *mut u8, 0); }
 "#;
 
 #[test]

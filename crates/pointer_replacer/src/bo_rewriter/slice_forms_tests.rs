@@ -447,6 +447,12 @@ const STOREH2_WITH_STORE_RANGE: &str = r#"
     let mut i = ix_start;
     while i < ix_end { StoreH2(self_0, data, mask, i); i = i.wrapping_add(1); }
  }
+ // R898-1 / R901-2 (wave-5d 147): a live caller of unknown-provenance
+ // arguments, so the scope's vacuity fact does not clear the pairs this
+ // fixture exists to exercise.
+ extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+ #[no_mangle]
+ pub unsafe extern "C" fn __crat_test_live() { StoreRangeH2(__crat_test_opaque() as *mut H2, __crat_test_opaque() as *const u8, 0, 0, 0); }
 "#;
 
 /// **Second caller-bearing witness (report 004; R401-4) — the `unrestored` form before the fix.**
