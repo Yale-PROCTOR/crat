@@ -174,3 +174,109 @@ fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
     let rows = held(INTEGER_CAST);
     assert!(is_raw(&rows, "cp2::s"), "{rows:?}");
 }
+
+/// R931-1 (USER; wave-5d 149): `f` hands two of its own formals to `write2`,
+/// whose pair another caller refutes (`write2(z, z)`), so (e) on the callee
+/// fails; every in-program call of `f` passes two distinct stack objects, so
+/// the CALLER's pair is disjoint at `f`'s call.
+const CALLER_PAIR: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+unsafe fn write2(a: *mut i32, b: *const i32) -> i32 {
+    *a = *b;
+    (b as usize) as i32
+}
+unsafe fn f(x: *mut i32, y: *const i32) -> i32 {
+    let _k = x as usize;
+    write2(x, y);
+    *y
+}
+pub unsafe fn other(z: *mut i32) -> i32 {
+    write2(z, z)
+}
+pub unsafe fn top() -> i32 {
+    let mut a: i32 = 1;
+    let mut b: i32 = 2;
+    f(&mut a, &b)
+}
+"#;
+
+#[test]
+fn r931_1_a_callers_formal_pair_every_call_separates_is_not_held() {
+    let rows = held(CALLER_PAIR);
+    assert!(!is_held(&rows, "f::y"), "{rows:?}");
+}
+
+/// Control: one object at both of `f`'s positions refutes the pair.
+#[test]
+fn r931_1_control_a_call_passing_one_object_twice_refutes_the_pair() {
+    let input = CALLER_PAIR.replace(
+        "    f(&mut a, &b)\n",
+        "    let p = &mut a as *mut i32;\n    f(p, p)\n",
+    );
+    let rows = held(&input);
+    assert!(is_raw(&rows, "f::y"), "{rows:?}");
+}
+
+/// Control: `f`'s address is taken, so callers the records do not show may
+/// reach it; nothing is certified from the direct calls.
+#[test]
+fn r931_1_control_an_address_taken_caller_is_not_certified() {
+    let input = format!(
+        "{CALLER_PAIR}pub static F: unsafe fn(*mut i32, *const i32) -> i32 = f;\n\
+         pub unsafe fn through(q: *mut i32) -> i32 {{ F(q, q) }}\n"
+    );
+    let rows = held(&input);
+    assert!(is_raw(&rows, "f::y"), "{rows:?}");
+}
+
+/// R931-1 at the certificate itself: the pair `f → write2(x, y)` of the
+/// caller's own formals.
+fn caller_pair_verdict(
+    src: &str,
+) -> Result<
+    super::decision::pair_disjointness::CertificateKind,
+    super::decision::pair_disjointness::Unproved,
+> {
+    let mut out = None;
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let program = super::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = super::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        out = Some(index.certify_recorded(function("f"), function("write2"), 0, 1));
+    })
+    .expect("fixture compilation");
+    out.expect("the compiler callback ran")
+}
+
+#[test]
+fn r931_1_the_certificate_proves_a_callers_formal_pair_every_call_separates() {
+    assert_eq!(
+        caller_pair_verdict(CALLER_PAIR),
+        Ok(super::decision::pair_disjointness::CertificateKind::ParameterPair)
+    );
+}
+
+#[test]
+fn r931_1_control_the_certificate_refuses_one_object_twice() {
+    let input = CALLER_PAIR.replace(
+        "    f(&mut a, &b)\n",
+        "    let p = &mut a as *mut i32;\n    f(p, p)\n",
+    );
+    assert!(caller_pair_verdict(&input).is_err());
+}
+
+#[test]
+fn r931_1_control_the_certificate_refuses_an_address_taken_caller() {
+    let input = format!("{CALLER_PAIR}pub static F: unsafe fn(*mut i32, *const i32) -> i32 = f;\n");
+    assert!(caller_pair_verdict(&input).is_err());
+}
