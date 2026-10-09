@@ -1402,6 +1402,47 @@ impl PairDisjointnessIndex {
         self.certify(caller, callee, left, right, left_span, right_span)
     }
 
+    /// Test surface (wave-5d 150d): certify the pair at EVERY recorded call
+    /// `caller → callee` (by item name), as a rule asking at each would.
+    #[cfg(test)]
+    pub(crate) fn certify_recorded_all(
+        &self,
+        tcx: TyCtxt<'_>,
+        caller: &str,
+        callee: &str,
+        left: usize,
+        right: usize,
+    ) -> Vec<Result<CertificateKind, Unproved>> {
+        let named = |index: u32, name: &str| {
+            tcx.item_name(
+                LocalDefId {
+                    local_def_index: rustc_hir::def_id::DefIndex::from_u32(index),
+                }
+                .to_def_id(),
+            )
+            .as_str()
+                == name
+        };
+        let mut out = Vec::new();
+        for (&(c, e), sites) in &self.sites {
+            if !named(c, caller) || !named(e, callee) {
+                continue;
+            }
+            for site in sites {
+                let span = |index: usize| {
+                    site.args
+                        .iter()
+                        .find(|arg| arg.index == index)
+                        .map(|arg| arg.span)
+                };
+                if let (Some(l), Some(r)) = (span(left), span(right)) {
+                    out.push(self.certify(c, e, left, right, l, r));
+                }
+            }
+        }
+        out
+    }
+
     /// R619-4: [`Self::certificate_family`] at the FIRST recorded call, for the
     /// witnesses.
     #[cfg(test)]

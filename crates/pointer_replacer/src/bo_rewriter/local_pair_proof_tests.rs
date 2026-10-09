@@ -688,3 +688,47 @@ pub unsafe fn shift() { cp2(ST.pos, ST.buf.as_ptr()); }
 "#;
     assert!(verdict_at(input, "shift", "cp2", 0, 1).is_err());
 }
+
+/// wave-5d 150d (the round-4 review's MED-3): two premise clears at two calls
+/// of one caller to one callee are two rows of the P11 table, each at its own
+/// call.
+#[test]
+fn r150d_two_premise_calls_are_two_rows() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub static mut G1: *mut u8 = 0 as *mut u8;
+pub static mut G2: *mut u8 = 0 as *mut u8;
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+pub unsafe fn c(q: *mut u8) {
+    cp2(G1, q);
+    cp2(G2, q);
+}
+"#;
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decisions");
+        let certificates = ctx
+            .a5_site_proofs
+            .pair_certificates()
+            .expect("certificates");
+        // Every recorded call, asked as a rule would ask.
+        for (left, right) in [(0, 1)] {
+            let _ = certificates.certify_recorded_all(tcx, "c", "cp2", left, right);
+        }
+        certificates.premise_receipts_tsv(tcx)
+    })
+    .expect("fixture compiles");
+    let rows: Vec<&str> = table.lines().skip(1).collect();
+    assert_eq!(rows.len(), 2, "{table}");
+    assert_ne!(
+        rows[0].split('\t').nth(2),
+        rows[1].split('\t').nth(2),
+        "each row names its own call: {table}"
+    );
+}

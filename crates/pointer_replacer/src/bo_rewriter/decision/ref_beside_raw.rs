@@ -375,6 +375,7 @@ enum Relation {
 /// The pair's own edge in the PAIR's receipts at this call (`l/r->…:verdict:
 /// reason:family`, the review's MED-1): its verdict and whether a `clear` is a
 /// certificate's (trusted) or the classifier's (`a5-proven-disjoint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Edge {
     /// The PAIR places its raw view for this pair: overlapping or undeterminable.
     Ordered,
@@ -413,21 +414,52 @@ fn pair_edge(
             let Some(rest) = receipt.strip_prefix(&key) else {
                 continue;
             };
-            let mut fields = rest.splitn(4, ':');
-            let _positions = fields.next();
-            let verdict = fields.next().unwrap_or_default();
-            let reason = fields.next().unwrap_or_default();
-            return match verdict {
-                "clear" if reason.contains("a5-proven-disjoint") => Edge::ClassifierClear,
-                "clear" if reason.contains("premise=global-or-integer-provenance") => {
-                    Edge::PremiseClear
-                }
-                "clear" => Edge::CertifiedClear,
-                _ => Edge::Ordered,
-            };
+            return edge_of(rest);
         }
     }
     Edge::None
+}
+
+/// One receipt's edge, from the text after its `l/r->` key:
+/// `positions:verdict:reason:family`.
+fn edge_of(rest: &str) -> Edge {
+    let mut fields = rest.splitn(4, ':');
+    let _positions = fields.next();
+    let verdict = fields.next().unwrap_or_default();
+    let reason = fields.next().unwrap_or_default();
+    match verdict {
+        "clear" if reason.contains("a5-proven-disjoint") => Edge::ClassifierClear,
+        "clear" if reason.contains("premise=global-or-integer-provenance") => Edge::PremiseClear,
+        "clear" => Edge::CertifiedClear,
+        _ => Edge::Ordered,
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::{Edge, edge_of};
+
+    /// wave-5d 150d (the round-4 review's MED-1): a certificate's reason holds
+    /// colons, so the premise's own key must be found in the whole receipt.
+    #[test]
+    fn r150d_a_premise_clear_receipt_is_a_premise_edge() {
+        assert_eq!(
+            edge_of(
+                "1/2:clear:pair-disjoint:premise=global-or-integer-provenance:global-value:\
+                 pair-disjointness-certificate:premise=global-or-integer-provenance"
+            ),
+            Edge::PremiseClear
+        );
+        assert_eq!(
+            edge_of("1/2:clear:pair-disjoint:distinct-roots:pair-disjointness-certificate"),
+            Edge::CertifiedClear
+        );
+        assert_eq!(
+            edge_of("1/2:clear:a5-proven-disjoint:a5"),
+            Edge::ClassifierClear
+        );
+        assert_eq!(edge_of("1/2:overlapping:x:y"), Edge::Ordered);
+    }
 }
 
 /// The MIR locals a local's value derives from by construction (the review's
