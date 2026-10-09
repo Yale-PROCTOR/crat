@@ -266,7 +266,7 @@ fn caller_pair_verdict(
 fn r931_1_the_certificate_proves_a_callers_formal_pair_every_call_separates() {
     assert_eq!(
         caller_pair_verdict(CALLER_PAIR),
-        Ok(super::decision::pair_disjointness::CertificateKind::ParameterPair)
+        Ok(super::decision::pair_disjointness::CertificateKind::CallerParameterPair)
     );
 }
 

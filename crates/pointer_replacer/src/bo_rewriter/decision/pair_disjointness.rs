@@ -78,6 +78,11 @@ pub(crate) enum CertificateKind {
     /// in-program call the two arguments are disjoint — by (a)/(b)/(c) at that
     /// caller, or by (e) again on the caller's own parameters.
     ParameterPair,
+    /// **R931-1** — (e) on the CALLER's side: the two arguments are distinct
+    /// formals of the caller (or places inside their pointees), and every
+    /// in-program call of the caller passes them disjoint objects. Its own key
+    /// so the census counts R931-1's share apart from (e)'s.
+    CallerParameterPair,
     /// R466-5, temporal rather than class-based: one side is the address of a
     /// stack local FIRST taken at this very call, and the callee never retains
     /// that position. No pointer VALUE computed before the call can name that
@@ -134,6 +139,7 @@ impl CertificateKind {
             Self::NullOperand => "pair-disjoint:null-operand",
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
+            Self::CallerParameterPair => "pair-disjoint:caller-parameter-pair",
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
             Self::StaticVsEntry(_) => "pair-disjoint:static-vs-entry",
             // R672-4: the waiver is in the census key, so its sites are counted
@@ -1018,6 +1024,11 @@ impl PairDisjointnessIndex {
             return None;
         }
         seen.push((function, q, p));
+        // wave-5d 149g (the stand-in review's HIGH-2): as in (e) (R931-1), a
+        // function reached indirectly has callers the records do not show.
+        if self.address_taken.contains(&function) {
+            return None;
+        }
         let exported = self.exported.contains(&function);
         let mut separation = if exported {
             PairSeparation::Waived
@@ -1297,7 +1308,7 @@ impl PairDisjointnessIndex {
         ) && up_left != up_right
         {
             match self.parameter_pair(caller, up_left, up_right, 0, &mut Vec::new()) {
-                Some(PairSeparation::Proven) => return Ok(CertificateKind::ParameterPair),
+                Some(PairSeparation::Proven) => return Ok(CertificateKind::CallerParameterPair),
                 Some(PairSeparation::Waived) => return Ok(CertificateKind::ExportedEntryWaiver),
                 None => {}
             }
@@ -1404,6 +1415,11 @@ impl PairDisjointnessIndex {
             return None;
         }
         seen.push((function, formal));
+        // wave-5d 149g (the stand-in review's HIGH-2): as in (e) (R931-1), a
+        // function reached indirectly has callers the records do not show.
+        if self.address_taken.contains(&function) {
+            return None;
+        }
         // R486-2: an exported entry's unseen callers are assumed not to pass
         // the static. Its IN-CRATE callers are still read below.
         let mut waived = self.exported.contains(&function);
@@ -1533,6 +1549,10 @@ fn predates_or_is_not_a_block(class: RootClass) -> bool {
 /// object or storage that existed at entry.
 /// R931-1: the local functions any body names other than as the callee of a
 /// direct call: an address taken, a fn-pointer cast, a static table's entry.
+/// wave-5d 149g (the stand-in review's MED-2): also any function named inside
+/// a closure (the call records do not visit closure bodies), and any function
+/// an `extern` block redeclares (calls through the redeclaration resolve to
+/// the foreign item, so the records do not show them).
 fn address_taken_functions(
     tcx: TyCtxt<'_>,
     local_functions: &FxHashSet<LocalDefId>,
@@ -1541,6 +1561,7 @@ fn address_taken_functions(
         tcx: TyCtxt<'tcx>,
         local_functions: &'a FxHashSet<LocalDefId>,
         found: FxHashSet<u32>,
+        in_closure: bool,
     }
     impl<'tcx> Visitor<'tcx> for Find<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1554,7 +1575,7 @@ fn address_taken_functions(
                     rustc_hir::Node::Expr(Expr { kind: ExprKind::Call(callee, _), .. })
                         if callee.hir_id == expr.hir_id
                 );
-                if !called {
+                if !called || self.in_closure {
                     self.found.insert(local.local_def_index.as_u32());
                 }
             }
@@ -1565,9 +1586,16 @@ fn address_taken_functions(
         tcx,
         local_functions,
         found: FxHashSet::default(),
+        in_closure: false,
     };
     for owner in tcx.hir_body_owners() {
+        find.in_closure = tcx.is_closure_like(owner.to_def_id());
         find.visit_body(tcx.hir_body_owned_by(owner));
+    }
+    for function in local_functions {
+        if super::outside_byte_view::declared_extern(tcx, *function) {
+            find.found.insert(function.local_def_index.as_u32());
+        }
     }
     find.found
 }

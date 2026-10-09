@@ -154,7 +154,10 @@ const CALLEE_PAIR_HELD: &str = r#"
  // fixture exists to exercise.
  extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
  #[no_mangle]
- pub unsafe extern "C" fn __crat_test_live() { overlap(__crat_test_opaque() as *mut u8, 0); caller(__crat_test_opaque() as *const u8, __crat_test_opaque() as *mut u8, 0); }
+ // wave-5d 149g (the 58 re-cut): `caller` is handed two distinct stack
+ // arrays, so its own pair is certified rather than held under R833-1 (two
+ // opaque pointers may name one object).
+ pub unsafe extern "C" fn __crat_test_live() { overlap(__crat_test_opaque() as *mut u8, 0); let s = [0u8; 4]; let mut t = [0u8; 4]; caller(s.as_ptr(), t.as_mut_ptr(), 0); }
 "#;
 
 #[test]
@@ -173,13 +176,15 @@ fn wave6s2_pass_on_beside_an_a5_pair_fallback_edit_bridges() {
         "the callee's read parameter converts, the write parameter stays raw: {source}"
     );
     let text = joined(&source);
+    // wave-5d 149g (the 58 re-cut): the driver hands `caller` two separate
+    // arrays, so R931-1 certifies `caller`'s own pair at `pair(p, q, n)` and
+    // A5 renders no raw view there; the write pass-on is the slice's raw
+    // bridge directly. (An unresolved delivered pair at that call is held by
+    // the pair rule now (R833-1 / R864-1), so the A5 collision this witness
+    // was written for no longer arises: coverage lost, named in 149g.)
     assert!(
-        text.contains("let __crat_a5_raw_") && text.contains(": *mut u8 = q.as_mut_ptr();"),
-        "the write pass-on is the A5 arm's raw view of the caller's slice: {source}"
-    );
-    assert!(
-        text.contains("pair(p, __crat_a5_raw_"),
-        "the read pass-on is zero syntax into the converted parameter: {source}"
+        text.contains("pair(p, q.as_mut_ptr(), n)"),
+        "the write pass-on is the caller's slice bridged raw, the read pass-on zero syntax: {source}"
     );
     assert!(
         receipts.contains("adapter=slice-mut-to-raw-mut"),

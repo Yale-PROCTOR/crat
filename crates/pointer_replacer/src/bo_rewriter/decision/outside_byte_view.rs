@@ -218,7 +218,7 @@ fn has_closure(body: &rustc_hir::Body<'_>) -> bool {
 }
 
 /// Does the crate declare a foreign function with the entry's own name?
-fn declared_extern(tcx: TyCtxt<'_>, entry: LocalDefId) -> bool {
+pub(crate) fn declared_extern(tcx: TyCtxt<'_>, entry: LocalDefId) -> bool {
     let name = tcx.item_name(entry.to_def_id());
     tcx.hir_crate_items(())
         .foreign_items()
