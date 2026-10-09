@@ -135,3 +135,40 @@ fn r924_1_control_an_entry_the_program_calls_stays_raw() {
     let rows = held(&input);
     assert!(is_raw(&rows, "entry::y"), "{rows:?}");
 }
+
+const STATIC_VALUE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+extern "C" { fn malloc(n: usize) -> *mut u8; }
+static mut G: *mut u8 = 0 as *mut u8;
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+unsafe fn cp(d: *mut u8, s: *const u8) { *d.offset(-1) = *s.offset(1); }
+pub unsafe fn both() -> u8 { let mut tmp = malloc(64); G = tmp; cp2(G, tmp); *tmp }
+pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); G = tmp; cp(G.offset(32), tmp); *tmp }
+"#;
+
+/// wave-5d 148b (the review's HIGH-1): a pointer static's VALUE is not the
+/// static's storage. `G == tmp`, so `cp2(G, tmp)` must not deliver both sides.
+#[test]
+fn r148b_a_pointer_statics_value_is_not_its_storage() {
+    let rows = held(STATIC_VALUE);
+    assert!(
+        is_raw(&rows, "cp2::d") || is_raw(&rows, "cp2::s"),
+        "{rows:?}"
+    );
+    // The raw-side shape: `d` writes inside the view `s` would take.
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+const INTEGER_CAST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+pub unsafe fn caller(buf: *mut u8, n: usize) -> u8 { cp2(n as *mut u8, buf); *buf }
+"#;
+
+/// wave-5d 148b (the review's HIGH-2): an integer cast to a pointer is not a
+/// stack object (`n` may be `(uintptr_t)buf` in C).
+#[test]
+fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
+    let rows = held(INTEGER_CAST);
+    assert!(is_raw(&rows, "cp2::s"), "{rows:?}");
+}
