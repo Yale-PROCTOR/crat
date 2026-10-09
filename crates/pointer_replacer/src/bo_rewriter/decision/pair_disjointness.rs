@@ -508,6 +508,11 @@ pub(crate) struct PairDisjointnessIndex {
     /// Functions the embedder can call: `#[no_mangle]` / `export_name`. Only
     /// these may bottom out on R462-1's waiver.
     exported: FxHashSet<u32>,
+    /// R931-1 (USER; wave-5d 149): the local functions referenced other than
+    /// as a direct callee (an address taken, a fn-pointer cast, a table
+    /// entry). Their callers are not all recorded, so no pair of their formals
+    /// is ever certified from the direct calls.
+    address_taken: FxHashSet<u32>,
     /// R466-5: `(caller, callee, argument index)` where that argument is the
     /// address of a stack local taken exactly once in the caller's body, at a
     /// callee position wave-6r's walk proves never retained.
@@ -705,6 +710,7 @@ impl PairDisjointnessIndex {
                 exported.insert(key);
             }
         }
+        let address_taken = address_taken_functions(tcx, &local_functions);
 
         // R466-5. The address-takings of every binding, then the sites where a
         // stack argument is the ONLY address-taking of its local and the
@@ -766,6 +772,7 @@ impl PairDisjointnessIndex {
             shared_reads,
             param_bindings,
             exported,
+            address_taken,
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
             binding_roots,
@@ -847,6 +854,14 @@ impl PairDisjointnessIndex {
         if depth > 8 || seen.contains(&key) {
             #[cfg(test)]
             Self::note_decline(callee, left, right, "recursion-or-depth");
+            return None;
+        }
+        // R931-1: a function reached indirectly has callers the records do not
+        // show; nothing about its formals is certified from the direct calls.
+        if self.address_taken.contains(&callee) {
+            #[cfg(test)]
+            Self::note_decline(callee, left, right, "address-taken");
+            self.parameter_pairs.borrow_mut().insert(key, None);
             return None;
         }
         seen.push(key);
@@ -1271,6 +1286,22 @@ impl PairDisjointnessIndex {
             Some(PairSeparation::Waived) => return Ok(CertificateKind::ExportedEntryWaiver),
             None => {}
         }
+        // **R931-1 (USER; wave-5d 149) — (e) on the CALLER's side.** Two of the
+        // caller's own formals (or places inside their pointees) handed on are
+        // disjoint at this call when every in-program call of the CALLER passes
+        // them disjoint objects (the same greatest fixpoint as (e), up the
+        // chain); the callee's other callers do not matter at this site.
+        if let (Some(up_left), Some(up_right)) = (
+            self.formal_of(caller, a.class),
+            self.formal_of(caller, b.class),
+        ) && up_left != up_right
+        {
+            match self.parameter_pair(caller, up_left, up_right, 0, &mut Vec::new()) {
+                Some(PairSeparation::Proven) => return Ok(CertificateKind::ParameterPair),
+                Some(PairSeparation::Waived) => return Ok(CertificateKind::ExportedEntryWaiver),
+                None => {}
+            }
+        }
         // Report the type rule's reason when it was consulted, the roots
         // otherwise: whichever is the most specific thing the input lacked.
         if union_members {
@@ -1500,6 +1531,47 @@ fn predates_or_is_not_a_block(class: RootClass) -> bool {
 
 /// (a): one side a fresh object of the caller, the other a distinct fresh
 /// object or storage that existed at entry.
+/// R931-1: the local functions any body names other than as the callee of a
+/// direct call: an address taken, a fn-pointer cast, a static table's entry.
+fn address_taken_functions(
+    tcx: TyCtxt<'_>,
+    local_functions: &FxHashSet<LocalDefId>,
+) -> FxHashSet<u32> {
+    struct Find<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        local_functions: &'a FxHashSet<LocalDefId>,
+        found: FxHashSet<u32>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Def(DefKind::Fn, did) = path.res
+                && let Some(local) = did.as_local()
+                && self.local_functions.contains(&local)
+            {
+                let called = matches!(
+                    self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(Expr { kind: ExprKind::Call(callee, _), .. })
+                        if callee.hir_id == expr.hir_id
+                );
+                if !called {
+                    self.found.insert(local.local_def_index.as_u32());
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut find = Find {
+        tcx,
+        local_functions,
+        found: FxHashSet::default(),
+    };
+    for owner in tcx.hir_body_owners() {
+        find.visit_body(tcx.hir_body_owned_by(owner));
+    }
+    find.found
+}
+
 fn certify_roots(a: RootClass, b: RootClass) -> Option<CertificateKind> {
     // R479-4a, same-base only. `(*base).f` holds a block the allocator returned
     // while `*base` was live, so it cannot overlap `*base` or any place inside
