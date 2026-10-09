@@ -226,6 +226,38 @@ impl A5SeamProofIndex {
         self.certificates.as_ref()
     }
 
+    /// **wave-5d 149.** A classifier clear the rewriter refused (R864-1 (b)
+    /// (ii)'s array decay, R838's loaded operand) is asked of the certificates
+    /// again: `lookup` returned the audited clear before asking them, and a
+    /// certificate's proof does not rest on the classifier's origin sets. Two
+    /// decays of ONE array (rule (i)) are never re-asked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn certify_refused(
+        &self,
+        proof: &mut A5PeerProof,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) {
+        if proof.reason != super::array_decay::OVER_A_DECAY
+            && proof.reason != super::loaded_operand::REASON
+        {
+            return;
+        }
+        let Some(certificates) = &self.certificates else {
+            return;
+        };
+        if let Ok(kind) = certificates.certify(caller, callee, left, right, left_span, right_span) {
+            proof.verdict = A5SiteProofVerdict::Clear;
+            proof.reason = kind.key();
+            proof.family =
+                certificates.certificate_family(caller, callee, left, right, left_span, right_span);
+        }
+    }
+
     fn from_audits(
         tcx: TyCtxt<'_>,
         program: &RustProgram<'_>,

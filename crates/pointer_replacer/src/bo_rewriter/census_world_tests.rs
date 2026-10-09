@@ -314,7 +314,10 @@ fn r819_1_a_nullable_entry_formal_never_falls_back_to_a_plain_reference() {
 fn r819_1_control_a_formal_without_nullability_evidence_keeps_its_reference() {
     let input = include_str!("testdata/r819_nullable_entry_formal_option_withdrawn.rs").replace(
         "    if !pid.is_null() {\n        *pid = pos;\n        keep(pid);\n    }\n",
-        "    *pid = pos;\n    keep(pid);\n",
+        // wave-5d 149 (the 58 re-cut): no `keep(pid)`. On 57's head main's
+        // retained-access hold (R864-3) rightly keeps a retained `&mut` raw;
+        // this control is about nullability evidence alone.
+        "    *pid = pos;\n",
     );
     assert!(!input.contains("pid.is_null()"));
     match super::rewrite_m1_census_world(&input) {

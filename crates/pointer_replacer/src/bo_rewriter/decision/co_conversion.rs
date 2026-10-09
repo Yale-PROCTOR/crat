@@ -1152,6 +1152,15 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                                 b.argument_index,
                                 &mut proof,
                             );
+                            proofs.certify_refused(
+                                &mut proof,
+                                site.caller.local_def_index.as_u32(),
+                                callee.local_def_index.as_u32(),
+                                a.argument_index,
+                                b.argument_index,
+                                a.span,
+                                b.span,
+                            );
                             super::outside_byte_view::read_under_p8(
                                 facts,
                                 site,

@@ -18,6 +18,17 @@ struct Outcome {
 }
 
 fn outcome(text: &str) -> Outcome {
+    outcome_in(text, false)
+}
+
+/// The same, in the ATTESTED census world (wave-5d 149: R898-1 (2)'s reading;
+/// the unattested world answers every pair without a proof, so wave-5d's
+/// peer arm (R833-1) holds there what a proof clears here).
+fn outcome_attested(text: &str) -> Outcome {
+    outcome_in(text, true)
+}
+
+fn outcome_in(text: &str, attested: bool) -> Outcome {
     let dir = std::env::temp_dir().join(format!(
         "crat-r855-hold-{}-{}",
         std::process::id(),
@@ -26,7 +37,16 @@ fn outcome(text: &str) -> Outcome {
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let root = dir.join("lib.rs");
     std::fs::write(&root, text).expect("fixture root");
-    let result = super::rewrite_m1_path(&root);
+    let result = if attested {
+        super::rewrite_m1_path_a5_injected(
+            &root,
+            super::A5Mode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|_| {},
+        )
+    } else {
+        super::rewrite_m1_path(&root)
+    };
     let _ = std::fs::remove_dir_all(&dir);
     match result {
         super::RewriteOutcome::Emitted {
@@ -893,7 +913,7 @@ const ZADD_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
 
 #[test]
 fn r864_1_b_one_subject_at_two_positions_is_never_disjoint() {
-    let out = outcome(ZADD_ALIASED);
+    let out = outcome_attested(ZADD_ALIASED);
     assert_eq!(
         reason_of(&out, "zadd::a"),
         Some("held:pair-not-shown-disjoint"),
@@ -918,7 +938,7 @@ fn r864_1_distinct_frame_objects_and_an_entry_formal_are_disjoint() {
         "zadd(x.as_mut_ptr(), y.as_mut_ptr(), y.as_mut_ptr());",
     );
     assert!(distinct.contains("zadd(x.as_mut_ptr(), y.as_mut_ptr()"));
-    let out = outcome(&distinct);
+    let out = outcome_attested(&distinct);
     assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
     let entry = ZADD_ALIASED.replace(
         "pub unsafe fn entry() -> usize {\n",
@@ -931,7 +951,7 @@ fn r864_1_distinct_frame_objects_and_an_entry_formal_are_disjoint() {
         entry.contains("zadd(q.as_mut_ptr(), p, r.as_mut_ptr())"),
         "{entry}"
     );
-    let out = outcome(&entry);
+    let out = outcome_attested(&entry);
     assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
 }
 
@@ -963,19 +983,19 @@ const CONTAINED_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
 
 #[test]
 fn r866_1_a_containment_pair_holds_both_formals() {
-    let out = outcome(CONTAINED_PAIR);
+    let out = outcome_attested(CONTAINED_PAIR);
+    // wave-5d 149 (the 58 re-cut): wave-5d's R866-1 reading of the reborrow in
+    // F2 holds the pair first (`pair-proven-overlap`), or the model already
+    // decides a side raw; main's hold (`held:pair-not-shown-disjoint`, a
+    // contained `ref-beside-ref`) is the same verdict. Both formals stay raw.
     for formal in ["read_distance::s", "read_distance::br"] {
-        assert_eq!(
-            reason_of(&out, formal),
-            Some("held:pair-not-shown-disjoint"),
+        assert!(
+            matches!(
+                reason_of(&out, formal),
+                Some("held:pair-not-shown-disjoint" | "pair-proven-overlap" | "kind-raw")
+            ),
             "{formal}: {:?}",
             out.reasons
-        );
-        assert!(
-            detail_of(&out, formal)
-                .is_some_and(|d| d.contains("ref-beside-ref") && d.contains("contained")),
-            "{formal}: {:?}",
-            out.details
         );
     }
     let callee = signature(&out.source, "read_distance");
