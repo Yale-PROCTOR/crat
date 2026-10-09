@@ -118,10 +118,28 @@ fn waived(rows: &[Row]) -> Option<&Row> {
 /// **W6O-T2-1 — the delivering witness.** The retaining site is bridged under
 /// the retention waiver, with the per-site receipt naming the subject and the
 /// callee, the site carries an atom, and the emitted program type-checks.
+/// Restated (relay 315 item 1; main 209): `GetValue::p` is held by the retained-access
+/// check (R864-3), and until 58 that hold also held `GetValue`'s class, so the later
+/// stages' hypothesis read the formal raw and the caller's site took the waiver. With the
+/// hold exempt from blocking its class (D5 (c)), `RETAINED`'s formal converts in the
+/// hypothesis and the site reads `raw-boundary-positive-retention` (the caller's `buf` is
+/// held by the check either way, R889-1 closure (i); the emission keeps it raw). The
+/// waiver's witness is a callee whose formal stays raw on its OWN evidence (an integer
+/// cast), binn's `target_stays_raw = 1` class.
+fn retained_raw_callee() -> String {
+    let shape = RETAINED.replace(
+        "    if value.is_null() { return 0; }\n    (*value).ptr = p;",
+        "    if value.is_null() { return 0; }\n    let _k = p as usize;\n    (*value).ptr = p;",
+    );
+    assert!(shape.contains("let _k = p as usize;"), "{shape}");
+    shape
+}
+
 #[test]
 fn wave6o_a_known_retaining_site_is_bridged_under_the_waiver() {
-    assert!(verify::type_checks_str(RETAINED));
-    let rows = dispositions(RETAINED, "caller");
+    let retained = retained_raw_callee();
+    assert!(verify::type_checks_str(&retained));
+    let rows = dispositions(&retained, "caller");
     let waived = waived(&rows).unwrap_or_else(|| panic!("no waived row: {rows:?}"));
     assert_eq!(waived.tier, "T2", "the waiver is a tier-2 bridge: {rows:?}");
     assert_eq!(waived.reason, "retention-positive-waived", "{rows:?}");

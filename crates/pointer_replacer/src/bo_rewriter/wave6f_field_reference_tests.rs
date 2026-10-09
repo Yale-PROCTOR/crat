@@ -311,11 +311,12 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
     // Restated (relay 305; R864-3's stand-in review, round 3, R3-1; main 198): `inflatev`
     // hands `in_0` to its custom-inflate callback, a call through a function pointer the
     // tier reads no retention at; the retained-access check of record's callee store is
-    // covered at no such call, so `inflatev::in_0` is held and its function stays raw
-    // (two deliveries lost: 10 -> 8). The field's own transaction stands.
+    // covered at no such call, so `inflatev::in_0` is held. The field's own transaction
+    // stands. Restated again (relay 315 item 1; main 209): the hold no longer holds its
+    // class (D5 (c)), so `inflatev`'s `out` and `settings` deliver beside the raw `in_0`.
     assert!(emitted_count >= 8, "{emitted_count}\n{source}");
     for needle in [
-        "fn inflatev(mut out: *mut u8, mut in_0: *const u8,",
+        "fn inflatev(mut out: &mut u8, mut in_0: *const u8,",
         "pub struct LodePNGBitReader<'a> {",
         "pub data: Option<&'a [u8]>,",
         "impl<'a> ::core::marker::Copy for LodePNGBitReader<'a> { }",
