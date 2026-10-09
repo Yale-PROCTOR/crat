@@ -341,3 +341,85 @@ fn r864_3_round5_an_integer_round_trip_to_a_keeper_is_not_covered() {
         "{d:#?}"
     );
 }
+
+/// **Relay 315 item 1 (main 207 / 208): a retained-access hold does not hold its
+/// class.** `append::v` is held (`held:retained-alias`: the self-reference `init`
+/// stores and `append` uses), and `out` / `y` are ordinary formals of the same
+/// function. The hold decides `v` raw on the settled table, in the input's raw form,
+/// after co-conversion set the class's arm requirements — D5 (c)'s reading of every
+/// settled-table hold (relay 297) — so it neither requires an arm of its class nor
+/// blocks it: `out` and `y` deliver (at 57's census the class was held,
+/// `blocked-subject:held:retained-alias`: brotli's 62, quadtree's `split_node_` /
+/// `insert_` and the Box rows behind them). The controls: `v` stays raw end to end,
+/// and `other`'s `w`, handed whole to the held formal, stays held
+/// (`into_held_formals` reads the retained holds).
+const RETAINED_BESIDE_NEIGHBOURS: &str = r#"
+#[repr(C)] pub struct small_vec { pub p: *mut u64, pub n: usize, pub buf: [u64; 16] }
+pub unsafe fn init(v: *mut small_vec) { (*v).p = (*v).buf.as_mut_ptr(); (*v).n = 0; }
+pub unsafe fn append(v: *mut small_vec, x: u64, out: *mut u64, y: *const u64) -> u64 {
+    *(*v).p.offset((*v).n as isize) = x;
+    (*v).n += 1;
+    *out = x;
+    *y
+}
+pub unsafe fn run(v: *mut small_vec) -> u64 {
+    let mut last: u64 = 0;
+    let k: u64 = 3;
+    init(v);
+    append(v, 1, &mut last, &k) + last
+}
+pub unsafe fn other(w: *mut small_vec) -> u64 {
+    let mut z: u64 = 0;
+    let k: u64 = 4;
+    append(w, 2, &mut z, &k) + z
+}
+"#;
+
+#[test]
+fn r315_1_a_retained_access_hold_does_not_hold_its_class() {
+    let source = format!("{ALLOW}{RETAINED_BESIDE_NEIGHBOURS}");
+    let dir = std::env::temp_dir().join(format!("crat-r315-1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), &source).unwrap();
+    let result = super::rewrite_m1_path(&dir.join("lib.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let super::RewriteOutcome::Emitted {
+        source: out,
+        degradations,
+        ..
+    } = result
+    else {
+        panic!("the fixture must emit")
+    };
+    println!("SOURCE\n{out}");
+    for d in &degradations {
+        println!("DEGRADED {} {}", d.subject, d.reason.key());
+    }
+    assert!(super::verify::type_checks_str(&out), "{out}");
+    let reason = |subject: &str| {
+        degradations
+            .iter()
+            .find(|d| d.subject == subject || d.subject.starts_with(&format!("{subject}#")))
+            .map(|d| d.reason.key().to_owned())
+    };
+    let signature = |function: &str| {
+        out.lines()
+            .find(|line| line.contains(&format!("fn {function}(")))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<String>()
+    };
+    // The control: the held subject stays raw end to end.
+    assert_eq!(reason("append::v").as_deref(), Some("held:retained-alias"));
+    assert!(signature("append").contains("v:*mutsmall_vec"), "{out}");
+    // The control: a caller's binding handed whole to the held formal stays held.
+    assert!(
+        reason("other::w").is_some_and(|r| r.starts_with("held:")),
+        "{degradations:#?}"
+    );
+    assert!(signature("other").contains("w:*mutsmall_vec"), "{out}");
+    // The neighbours deliver: the hold does not hold its class.
+    assert_eq!(reason("append::out"), None, "{degradations:#?}");
+    assert_eq!(reason("append::y"), None, "{degradations:#?}");
+    assert!(signature("append").contains("out:&mutu64"), "{out}");
+}
