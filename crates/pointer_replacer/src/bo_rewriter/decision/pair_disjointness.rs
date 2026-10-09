@@ -4671,10 +4671,15 @@ fn pointer_value_provenance_peeled<'tcx>(
     expr: &Expr<'_>,
 ) -> (RootClass, Option<PlacePath>) {
     match &expr.kind {
-        ExprKind::Path(..) if resolved_local(expr).is_none() => match resolved_static(expr) {
-            Some(did) => (RootClass::Static(did), None),
-            None => (RootClass::Unknown, None),
-        },
+        // wave-5d 148b: a static's VALUE is whatever was stored in it, not the
+        // static's own storage (that is `&mut G` / `G.as_mut_ptr()`, a place,
+        // read by `place_provenance`). `G = tmp; f(G, tmp)` is one block.
+        ExprKind::Path(..) if resolved_local(expr).is_none() => (RootClass::Unknown, None),
+        // wave-5d 148b: only a raw POINTER binding's value is classed by the
+        // binding. An integer (`n as *mut T`, possibly `(uintptr_t)buf`) or a
+        // reference binding's value addresses some other object, never the
+        // binding's own stack slot, which is what its `StackObject` class names.
+        ExprKind::Path(..) if !typeck.expr_ty(expr).is_raw_ptr() => (RootClass::Unknown, None),
         ExprKind::Path(..) => match resolved_local(expr) {
             Some(binding) => {
                 let class = classes.get(&binding).copied().unwrap_or(RootClass::Unknown);
@@ -4704,7 +4709,9 @@ fn pointer_value_provenance_peeled<'tcx>(
 fn derivation_base<'tcx>(typeck: &TypeckResults<'tcx>, expr: &Expr<'_>) -> Option<HirId> {
     let expr = peel_casts(expr);
     match &expr.kind {
-        ExprKind::Path(..) => resolved_local(expr),
+        // wave-5d 148b: only a raw pointer binding's value derives from it.
+        ExprKind::Path(..) if typeck.expr_ty(expr).is_raw_ptr() => resolved_local(expr),
+        ExprKind::Path(..) => None,
         ExprKind::AddrOf(_, _, operand) => derivation_place_base(typeck, peel_casts(operand)),
         ExprKind::MethodCall(segment, receiver, method_args, _) => {
             let receiver = peel_casts(receiver);
