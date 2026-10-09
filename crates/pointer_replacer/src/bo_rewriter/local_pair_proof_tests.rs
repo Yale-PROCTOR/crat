@@ -717,18 +717,45 @@ pub unsafe fn c(q: *mut u8) {
             .a5_site_proofs
             .pair_certificates()
             .expect("certificates");
-        // Every recorded call, asked as a rule would ask.
-        for (left, right) in [(0, 1)] {
-            let _ = certificates.certify_recorded_all(tcx, "c", "cp2", left, right);
-        }
-        certificates.premise_receipts_tsv(tcx)
+        // What the rules themselves asked (the census's table), before the
+        // helper asks at every recorded call (round-5 MED-A).
+        let asked = certificates.premise_receipts_tsv(tcx);
+        let _ = certificates.certify_recorded_all(tcx, "c", "cp2", 0, 1);
+        (asked, certificates.premise_receipts_tsv(tcx))
     })
     .expect("fixture compiles");
+    let (asked, table) = table;
+    // The census's own table already has both rows: the rules ask at each call.
+    assert_eq!(asked, table, "the rules asked at both calls");
     let rows: Vec<&str> = table.lines().skip(1).collect();
     assert_eq!(rows.len(), 2, "{table}");
     assert_ne!(
         rows[0].split('\t').nth(2),
         rows[1].split('\t').nth(2),
         "each row names its own call: {table}"
+    );
+}
+
+/// wave-5d 150e (the round-5 review's MED-B): a containment the text shows
+/// (`br` inside `*s`, through an integer round trip of `s`) is held though a
+/// premise clears the pair: the premise answers an unresolved pair only.
+#[test]
+#[ignore = "the frozen analysis panics on this input (rustc_middle mir/statement.rs:185 via analyses::borrow_ownership::borrow_engine::invalidates::route_compose, on `&mut (*r).x` with `r` made from an integer); kept as the reproduction for the analysis lane; wave-5d report 150e"]
+fn r150e_a_premise_never_answers_a_shown_containment() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+pub struct S { pub x: i32, pub y: i32 }
+unsafe fn upd(a: *mut S, b: *mut i32) { (*a).y = 1; *b = 2; }
+pub unsafe fn c(s: *mut S) {
+    let t = s as usize;
+    let r = t as *mut S;
+    let br = &mut (*r).x as *mut i32;
+    upd(s, br);
+}
+"#;
+    let rows = held(input);
+    assert!(
+        is_raw(&rows, "upd::a") && is_raw(&rows, "upd::b"),
+        "{rows:?}"
     );
 }

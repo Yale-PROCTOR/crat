@@ -1596,7 +1596,9 @@ impl PairDisjointnessIndex {
     /// pair, plus the foreign-callee pairs `certify_call_arguments` cleared by
     /// it (the round-3 review's M3): `caller callee site left right kind`. The
     /// census writes it as `<p>.raw-boundary-pair-premise.tsv`; its rows are
-    /// the program's P11 count. Read it after the rules have run.
+    /// the program's P11 count. Read it after the rules have run. The `site`
+    /// column is the asked pair's lower argument on an in-program row, and the
+    /// call itself on a `<foreign>` row (round-5 LOW-2).
     pub(crate) fn premise_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
         let name = |index: u32| {
             tcx.def_path_str(
@@ -1612,8 +1614,10 @@ impl PairDisjointnessIndex {
             let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) = row.outcome else {
                 continue;
             };
-            // The asked call's own argument span (round-4 MED-3).
-            let site = source_map.span_to_diagnostic_string(row.site);
+            // The asked call's own argument span (round-4 MED-3), at its macro
+            // call site (rules pass different spans for one argument: round-5
+            // LOW-1).
+            let site = source_map.span_to_diagnostic_string(row.site.source_callsite());
             rows.insert(format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\n",
                 name(row.caller),
