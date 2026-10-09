@@ -2217,6 +2217,7 @@ fn verify_and_revert(
                 nested_kind_under_seam(edits, index)
                     || exact_kind_composed_by_seam(edits, index)
                     || nested_seam_under_seam(edits, index)
+                    || nested_a5_over_use(edits, index)
             })
         });
     let e1_edit_contexts = if census_once {
@@ -5779,6 +5780,7 @@ fn validation_projection(kept: &[plan::Edit]) -> Vec<plan::Edit> {
                     plan::Justification::KindDecision { .. }
                 ) || !exact_kind_composed_by_seam(kept, *inner_index))
                 && !nested_c9_over_seam(kept, *inner_index)
+                && !nested_a5_over_use(kept, *inner_index)
                 && !composed_by_slice_constructor(kept, *inner_index)
                 && !nested_seam_under_seam(kept, *inner_index)
         })
@@ -5902,6 +5904,29 @@ fn nested_c9_over_seam(edits: &[plan::Edit], c9_index: usize) -> bool {
             && seam.hi <= c9.hi
             && (c9.lo < seam.lo || seam.hi < c9.hi)
     })
+}
+
+/// **wave-6a 158 (main 207a item 4).** An A5 raw view STRICTLY containing
+/// another class's `KindDecision` use edit: the caller's own subject-use in an
+/// argument the view does not select (brotli's `EmitLiterals` →
+/// `BrotliWriteBits(*depth.offset(lit), …, storage)`). The class planner composed
+/// them (`a5_wrapper_composition`: the use overlaps no selected view, or it
+/// collides or the fallback yields and neither reaches here), and the AST pass
+/// grafts the use first and builds the view over the call's grafted children
+/// (`A5RawGraftVisitor`), as it does when a seam inside the call suppresses the
+/// view (`nested_c9_over_seam`). Suppress the view's projection only: the use
+/// stays in it, and every other overlap still reaches `apply`.
+fn nested_a5_over_use(edits: &[plan::Edit], a5_index: usize) -> bool {
+    let a5 = &edits[a5_index];
+    matches!(a5.justification, plan::Justification::A5RawView)
+        && edits.iter().enumerate().any(|(use_index, used)| {
+            use_index != a5_index
+                && matches!(used.justification, plan::Justification::KindDecision { .. })
+                && used.owner_class != a5.owner_class
+                && a5.lo <= used.lo
+                && used.hi <= a5.hi
+                && (a5.lo < used.lo || used.hi < a5.hi)
+        })
 }
 
 /// A source file's identity for editing. `None` for anything not written back
