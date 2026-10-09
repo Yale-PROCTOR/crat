@@ -147,6 +147,8 @@ mod pair_type_rule_yield_tests;
 mod pair_view_of_formal_tests;
 #[cfg(test)]
 mod pending_hold_tests;
+#[cfg(test)]
+mod local_pair_proof_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) mod premise_census;
