@@ -126,6 +126,110 @@ pub(super) fn below_entry(
     loaded_index.then_some(super::CursorHold::LoadedIndexBelowEntry)
 }
 
+/// **Relay 116 (the stand-in review's finding 2).** Every pointer step whose
+/// result `function` passes to ITSELF (a recursive call's argument rooted at
+/// `subject`) moves forward by a non-negative amount: a forward `offset` / `add`
+/// whose delta is zero, positive or non-negative, or a `sub` by zero. A
+/// recursive step that may go backward wraps below the callee's window, which
+/// the tail view cannot represent.
+pub(super) fn recursive_steps_forward(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    subject: Local,
+) -> bool {
+    if !tcx.is_mir_available(function.to_def_id()) {
+        return false;
+    }
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    let body: &Body<'_> = &body;
+    let chain = copies(body, subject, true);
+    let addr_takens = addr_takens(body);
+    let mut cursor = Signedness {
+        tcx,
+        local_tys: body.local_decls.iter().map(|decl| decl.ty).collect(),
+        addr_takens: &addr_takens,
+        caller_param_vals: Default::default(),
+        branch_conditions: Default::default(),
+    }
+    .iterate_to_fixpoint(tcx, body, None)
+    .into_results_cursor(body);
+    // The locals handed to a recursive call.
+    let mut handed = FxHashSet::default();
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
+            continue;
+        };
+        let Some(constant) = func.constant() else { continue };
+        let ty::FnDef(callee, _) = *constant.const_.ty().kind() else { continue };
+        if callee != function.to_def_id() {
+            continue;
+        }
+        handed.extend(args.iter().filter_map(|arg| arg.node.place()?.as_local()));
+    }
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        if !destination
+            .as_local()
+            .is_some_and(|local| handed.contains(&local))
+        {
+            continue;
+        }
+        let Some(constant) = func.constant() else { continue };
+        let ty::FnDef(callee, _) = *constant.const_.ty().kind() else { continue };
+        let path = tcx.def_path(callee).to_string_no_crate_verbose();
+        if !path.contains("ptr::") {
+            continue;
+        }
+        let backward = match path.rsplit("::").next() {
+            Some("offset" | "add" | "wrapping_offset" | "wrapping_add") => false,
+            Some("sub" | "wrapping_sub") => true,
+            _ => continue,
+        };
+        let [receiver, delta] = &args[..] else { return false };
+        if !receiver
+            .node
+            .place()
+            .and_then(|place| place.as_local())
+            .is_some_and(|receiver| chain.contains(&receiver))
+        {
+            continue;
+        }
+        cursor.seek_before_primary_effect(Location {
+            block,
+            statement_index: data.statements.len(),
+        });
+        let value = match &delta.node {
+            Operand::Copy(place) | Operand::Move(place) => match place.as_local() {
+                Some(local) => cursor.get().0[local],
+                None => AbsValue::Top,
+            },
+            Operand::Constant(constant) => constant_value(constant),
+        };
+        let forward = if backward {
+            matches!(value, AbsValue::Zero)
+        } else {
+            matches!(
+                value,
+                AbsValue::Zero | AbsValue::Pos | AbsValue::NonNeg | AbsValue::ConstU(_)
+            ) || matches!(value, AbsValue::ConstI(c) if c > 0)
+        };
+        if !forward {
+            return false;
+        }
+    }
+    true
+}
+
 /// Is this operand, through copies and integer casts only, a load through a
 /// deref at EVERY definition of every local on the way?
 fn loaded(body: &Body<'_>, operand: &Operand<'_>, addr_takens: &FxHashSet<Local>) -> bool {

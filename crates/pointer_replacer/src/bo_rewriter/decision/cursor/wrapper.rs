@@ -1626,6 +1626,11 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         .kind()
                     && did.as_local() == Some(self.subject.fn_did)
                     && matches!(self.subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                    && super::negative_index::recursive_steps_forward(
+                        self.ctx.tcx,
+                        self.subject.fn_did,
+                        self.subject.local,
+                    )
                 {
                     match self.index(arg) {
                         Ok(d) => {
@@ -1756,9 +1761,12 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     // parameter (heman `qselect(v, st, k)`): the callee's
                     // parameter IS this subject, whose decision is the one being
                     // planned here, so it is a cursor parameter by construction.
-                    let recursive = target.is_some_and(|(s, _)| {
-                        s.fn_did == self.subject.fn_did && s.hir_id == self.subject.hir_id
-                    });
+                    // Not an optional cursor: its formal is `Option<&mut [T]>`,
+                    // and C may pass null down the recursion.
+                    let recursive = !self.optional
+                        && target.is_some_and(|(s, _)| {
+                            s.fn_did == self.subject.fn_did && s.hir_id == self.subject.hir_id
+                        });
                     let raw = !recursive && target.is_none_or(|(_, d)| raw_decision(d));
                     if raw
                         && !self.optional
