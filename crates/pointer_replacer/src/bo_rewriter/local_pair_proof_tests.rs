@@ -499,3 +499,63 @@ fn r149f_a_reference_beside_a_model_raw_written_formal_is_held() {
         );
     }
 }
+
+/// wave-5d 149h (the round-2 review's HIGH-1 residual): a list of shapes that
+/// may point anywhere is never complete. Each of these reaches `cp` beside
+/// `tmp` (the same block, `G = tmp`) through a shape the list does not name,
+/// and the relation answers unknown.
+fn residual(body: &str) -> Vec<(String, bool, bool)> {
+    held(&anywhere_shape(&format!(
+        "unsafe fn get_g() -> *mut u8 {{ G }}\nunsafe fn ld(o: *mut *mut u8) {{ *o = G; }}\n{body}"
+    )))
+}
+
+#[test]
+fn r149h_a_getter_of_a_statics_value_is_held() {
+    let rows = residual(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; cp(get_g().offset(32), tmp); *tmp }",
+    );
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r149h_a_conditional_over_a_statics_value_is_held() {
+    let rows = residual(
+        "pub unsafe fn a(c: bool, buf: *mut u8) -> u8 { let mut tmp = malloc(64); G = tmp; cp((if c { G } else { buf }).offset(32), tmp); *tmp }",
+    );
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r149h_an_out_parameter_loaded_with_a_statics_value_is_held() {
+    let rows = residual(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut p = 0 as *mut u8; ld(&mut p); cp(p.offset(32), tmp); *tmp }",
+    );
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
+    let rows = residual(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut c: C = core::mem::zeroed(); c.buf = G; cp(c.buf.offset(32), tmp); *tmp }",
+    );
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r149h_a_pointer_to_a_static_struct_is_held() {
+    let rows = residual(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); S.buf = tmp; let s: *mut C = &mut S; cp((*s).buf.offset(32), tmp); *tmp }",
+    );
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+/// Control: a fresh block beside a stack array at the same call is certified
+/// (distinct roots), so nothing is held.
+#[test]
+fn r149h_control_two_distinct_objects_are_not_held() {
+    let rows = residual(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); let mut arr = [0u8; 64]; cp(arr.as_mut_ptr().offset(32), tmp); *tmp }",
+    );
+    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
+}
