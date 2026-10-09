@@ -409,3 +409,67 @@ fn r112_s1_m3_a_local_bound_inside_the_loop_is_refused() {
         while i < n { let mut row: *mut i32 = *rows.offset(i as isize); *row.offset(i as isize) = 1; i += 1; } }\n";
     assert_eq!(local_bound(src, "tri", "row"), None);
 }
+
+// ---- relay 112, the narrowed module's round 2 (Claude stand-in, 10-09) -----
+
+/// S2-F1a: the limit written through a `&raw const` of it (defined under
+/// Tree Borrows): the loop runs to 10 with an entry `n` of 1.
+#[test]
+fn r112_s2_f1a_a_limit_written_through_a_raw_const_address_is_refused() {
+    let src = "static mut NP: *mut i32 = 0 as *mut i32;\n\
+        pub unsafe fn grow() { if *NP < 10 { *NP = 10; } }\n\
+        pub unsafe fn f(p: *mut i32, mut n: i32) {\n\
+        NP = &raw const n as *mut i32;\n\
+        let mut i: i32 = 0;\n\
+        while i < n { grow(); *p.offset(i as isize) = 0; i += 1; } }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// S2-F1b: the counter written through a `&raw const` of it.
+#[test]
+fn r112_s2_f1b_a_counter_written_through_a_raw_const_address_is_refused() {
+    let src = "static mut IP: *mut i32 = 0 as *mut i32;\n\
+        pub unsafe fn jump() { *IP = 100; }\n\
+        pub unsafe fn f(p: *mut i32, n: i32) {\n\
+        let mut i: i32 = 0;\n\
+        IP = &raw const i as *mut i32;\n\
+        while i < n { jump(); *p.offset(i as isize) = 0; i += 1; } }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// S2-F1c: an overloaded auto-deref in another argument runs user code that
+/// writes the copied `n` through a `&raw const` of it.
+#[test]
+fn r112_s2_f1c_an_overloaded_deref_in_another_argument_is_refused() {
+    let src = format!(
+        "static mut NP: *mut isize = 0 as *mut isize;\n\
+         pub struct Inner {{ pub v: i32 }}\n\
+         pub struct W(Inner);\n\
+         impl core::ops::Deref for W {{ type Target = Inner; fn deref(&self) -> &Inner {{ unsafe {{ *NP = 5; }} &self.0 }} }}\n\
+         {G_ISIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize, w: W) -> u32 {{\n\
+         let n: isize = 10; NP = &raw const n as *mut isize; g(n, w.v, base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// S2-F2: a `ref` binding of the pointee escapes its address; the program
+/// later reads one element past the loop's last.
+#[test]
+fn r112_s2_f2_a_ref_binding_of_the_pointee_is_refused() {
+    let src = "pub unsafe fn f(p: *const i32, n: i32) -> i32 {\n\
+        let mut q: *const i32 = core::ptr::null();\n\
+        let mut i: i32 = 0;\n\
+        while i < n { let ref x = *p.offset(i as isize); q = x; i += 1; }\n\
+        if q.is_null() { 0 } else { *q.offset(1) } }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// S2-F3: `let _ = *p.offset(i)` reads nothing; it is no access.
+#[test]
+fn r112_s2_f3_a_wildcard_let_is_no_access() {
+    let src = "pub unsafe fn f(p: *const i32, n: i32) {\n\
+        let mut i: i32 = 0;\n\
+        while i < n { let _ = *p.offset(i as isize); i += 1; } }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
