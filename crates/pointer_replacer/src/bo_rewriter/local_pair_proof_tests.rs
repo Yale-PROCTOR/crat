@@ -645,3 +645,46 @@ fn r149h_control_two_distinct_objects_are_not_held() {
     );
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
 }
+
+/// wave-5d 150 (the round-3 review's H1): `(*CTX).data` is a pointer loaded
+/// from a heap or stack object that a global's VALUE designates; it was never
+/// stored in or read from a static, so it is not P11 (R936-1) but 149f's core
+/// (relay 197 item 3): the reference beside the written raw formal is held.
+const LOADED_THROUGH_A_GLOBAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub struct Holder { pub data: *mut i32 }
+pub static mut CTX: *mut Holder = 0 as *mut Holder;
+pub unsafe fn update(dst: *mut i32, src: *const i32) { *(dst as *mut u32) = (*src + 1) as u32; }
+pub unsafe fn caller(src: *mut i32) { update((*CTX).data, src); }
+#[no_mangle]
+pub unsafe extern "C" fn entry() -> i32 {
+    let mut v = 1;
+    let p: *mut i32 = &mut v;
+    let mut h = Holder { data: p };
+    CTX = &mut h;
+    caller(p);
+    v
+}
+"#;
+
+#[test]
+fn r150_a_pointer_loaded_from_an_object_a_global_designates_is_not_p11() {
+    let rows = held(LOADED_THROUGH_A_GLOBAL);
+    assert!(is_raw(&rows, "update::src"), "{rows:?}");
+    assert!(verdict_at(LOADED_THROUGH_A_GLOBAL, "caller", "update", 0, 1).is_err());
+}
+
+/// wave-5d 150 (the round-3 review's M2): one global's value beside its own
+/// storage (`ST.pos` may point into `ST.buf`) is one global at both positions:
+/// no premise.
+#[test]
+fn r150_a_globals_value_beside_its_own_storage_is_no_premise() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub struct St { pub buf: [u8; 16], pub pos: *mut u8 }
+pub static mut ST: St = St { buf: [0; 16], pos: 0 as *mut u8 };
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+pub unsafe fn shift() { cp2(ST.pos, ST.buf.as_ptr()); }
+"#;
+    assert!(verdict_at(input, "shift", "cp2", 0, 1).is_err());
+}

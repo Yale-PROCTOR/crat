@@ -2071,10 +2071,10 @@ unsafe fn tree_insert(mut tree: *mut tree_t) -> i32 {
 /// loaded from the tree as a raw argument beside the shared view.
 #[test]
 fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
-    // wave-5d 150 (R934-1 (i)): the attested census world. The unattested world
-    // attaches no certificates, so `insert_`'s own recursive pair `(tree,
-    // (*root).nw)` (an unknown relation) is held there and `tree` never
-    // converts; in the census world the type rule (R542) clears it.
+    // wave-5d 150 (R934-1 (i)): the attested census world, on the fixture whose
+    // recursion is a node-only walk (see QT_INSERT: the recursive pair is
+    // not shown disjoint by any rule, R619-4's type-rule yield, and is pinned
+    // held by `w6v_qt_insert_recursion_holds_the_tree`).
     let source = super::emit_tests::ast_emitted_source_of_attested(QT_INSERT).unwrap();
     let c = compact(&source);
     assert!(
@@ -2283,4 +2283,39 @@ fn w6v_field_load_beside_a_writer_two_levels_up_still_overlaps() {
         compact(&source).contains("fninsert_(muttree:*muttree_t,"),
         "a writer that reaches the tree through two containers keeps the site overlapping: {source}"
     );
+}
+
+/// wave-5d 150 (the round-3 review's M4): quadtree's own recursion,
+/// `insert_(tree, (*root).nw, …)`, is a reference formal beside a raw one at an
+/// unknown relation that no rule shows disjoint (the type rule yields for entry
+/// beside internal storage, R619-4), so R934-1 (i) holds `tree` raw; pinned so
+/// the probe's quadtree row is read against it.
+#[test]
+fn w6v_qt_insert_recursion_holds_the_tree() {
+    let input = QT_INSERT.replace(
+        "    return insert_node((*root).nw, depth.wrapping_sub(1));",
+        "    return insert_(tree, (*root).nw, depth.wrapping_sub(1));",
+    );
+    assert_ne!(input, QT_INSERT);
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label == "insert_::tree")
+            .expect("insert_::tree");
+        assert!(
+            matches!(decision, super::decision::Decision::Degraded(d)
+                if matches!(d.reason, super::decision::DegradeReason::PairNotShownDisjoint { .. })),
+            "{decision:?}"
+        );
+    })
+    .unwrap();
 }
