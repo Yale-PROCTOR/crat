@@ -172,7 +172,11 @@ pub unsafe fn caller(buf: *mut u8, n: usize) -> u8 { cp2(n as *mut u8, buf); *bu
 #[test]
 fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
     let rows = held(INTEGER_CAST);
-    assert!(is_raw(&rows, "cp2::s"), "{rows:?}");
+    // R930-1: both sides raw (the stand-in review's LOW).
+    assert!(
+        is_raw(&rows, "cp2::s") && is_raw(&rows, "cp2::d"),
+        "{rows:?}"
+    );
 }
 
 /// R931-1 (USER; wave-5d 149): `f` hands two of its own formals to `write2`,
@@ -279,4 +283,142 @@ fn r931_1_control_the_certificate_refuses_one_object_twice() {
 fn r931_1_control_the_certificate_refuses_an_address_taken_caller() {
     let input = format!("{CALLER_PAIR}pub static F: unsafe fn(*mut i32, *const i32) -> i32 = f;\n");
     assert!(caller_pair_verdict(&input).is_err());
+}
+
+/// wave-5d 149g (the stand-in review's HIGH-1): R930-1's "may point anywhere"
+/// read only the argument's own text. A pointer static's value reaching the
+/// call through a local, an integer cast held in a local, and a pointer field
+/// of a static struct may address any object too.
+fn anywhere_shape(body: &str) -> String {
+    format!(
+        r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+extern "C" {{ fn malloc(n: usize) -> *mut u8; }}
+static mut G: *mut u8 = 0 as *mut u8;
+#[repr(C)]
+pub struct C {{ buf: *mut u8 }}
+static mut S: C = C {{ buf: 0 as *mut u8 }};
+unsafe fn cp(d: *mut u8, s: *const u8) {{ *d.offset(-1) = *s.offset(1); }}
+unsafe fn cp2(d: *mut u8, s: *const u8) {{ *d = *s; }}
+{body}
+"#
+    )
+}
+
+#[test]
+fn r149g_a_statics_value_through_a_local_may_point_anywhere() {
+    let rows = held(&anywhere_shape(
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut p = G; cp(p.offset(32), tmp); *tmp }",
+    ));
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
+    let rows = held(&anywhere_shape(
+        "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }",
+    ));
+    assert!(is_raw(&rows, "cp2::s"), "{rows:?}");
+}
+
+#[test]
+fn r149g_a_pointer_field_of_a_static_may_point_anywhere() {
+    let rows = held(&anywhere_shape(
+        "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); S.buf = tmp; cp(S.buf.offset(32), tmp); *tmp }",
+    ));
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+/// The certificate's verdict for `caller → callee(l, r)`.
+fn verdict_at(
+    src: &str,
+    caller: &'static str,
+    callee: &'static str,
+    l: usize,
+    r: usize,
+) -> Result<
+    super::decision::pair_disjointness::CertificateKind,
+    super::decision::pair_disjointness::Unproved,
+> {
+    let mut out = None;
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let program = super::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let index = super::decision::pair_disjointness::PairDisjointnessIndex::derive(
+            &program, &mut_facts, None,
+        );
+        let function = |name: &str| {
+            *program
+                .functions
+                .iter()
+                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        out = Some(index.certify_recorded(function(caller), function(callee), l, r));
+    })
+    .expect("fixture compilation");
+    out.expect("the compiler callback ran")
+}
+
+const STATIC_VS_FORMAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+static mut G: [u8; 4] = [0; 4];
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+unsafe fn f(p: *mut u8) -> u8 { cp2(p, G.as_ptr()); *p }
+pub unsafe fn top() -> u8 { let mut x = 0u8; f(&mut x) }
+"#;
+
+/// Control: every call of `f` passes a stack object, never `G`.
+#[test]
+fn r149g_control_a_static_beside_a_formal_every_call_separates_is_certified() {
+    assert!(verdict_at(STATIC_VS_FORMAL, "f", "cp2", 0, 1).is_ok());
+}
+
+/// wave-5d 149g (the stand-in review's HIGH-2): `f` reached through a fn
+/// pointer may be handed `G` itself; the static-vs-formal chain (R483-3 (f))
+/// certifies nothing about an address-taken function, as (e) does not.
+#[test]
+fn r149g_an_address_taken_function_is_not_certified_static_vs_formal() {
+    let input = format!(
+        "{STATIC_VS_FORMAL}pub static FP: unsafe fn(*mut u8) -> u8 = f;\n\
+         pub unsafe fn through() -> u8 {{ FP(G.as_mut_ptr()) }}\n"
+    );
+    assert!(verdict_at(&input, "f", "cp2", 0, 1).is_err());
+}
+
+/// wave-5d 149g (the stand-in review's MED-2): a call inside a closure is a
+/// caller the records do not show.
+#[test]
+fn r149g_a_call_inside_a_closure_is_not_a_hidden_caller() {
+    let input = format!(
+        "{CALLER_PAIR}pub unsafe fn via_closure(q: *mut i32) -> i32 {{\n\
+         let g = |r: *mut i32| unsafe {{ f(r, r) }};\n    g(q)\n}}\n"
+    );
+    assert!(caller_pair_verdict(&input).is_err());
+}
+
+/// wave-5d 149g (the stand-in review's MED-2): a call through an `extern "C"`
+/// redeclaration of an exported local function is an in-program call the
+/// records do not show; the waiver covers the embedder's calls only.
+#[test]
+fn r149g_a_call_through_an_extern_redeclaration_is_not_a_hidden_caller() {
+    let input = CALLER_PAIR.replace(
+        "unsafe fn f(",
+        "#[no_mangle]\npub unsafe extern \"C\" fn f(",
+    ) + "pub mod other {\n    extern \"C\" { pub fn f(x: *mut i32, y: *const i32) -> i32; }\n\
+         pub unsafe fn g(q: *mut i32) -> i32 { f(q, q) }\n}\n";
+    assert!(caller_pair_verdict(&input).is_err());
+}
+
+/// wave-5d 149g (the stand-in review's MED-1): a reference binding is not the
+/// object it borrows; `&mut *r` with `r = &mut *buf` is inside `buf`.
+#[test]
+fn r149g_a_reference_binding_is_not_a_stack_object() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+pub unsafe fn m(buf: *mut u8) -> u8 { let r: &mut u8 = &mut *buf; cp2(&mut *r, buf); *buf }
+"#;
+    assert!(verdict_at(input, "m", "cp2", 0, 1).is_err());
 }
