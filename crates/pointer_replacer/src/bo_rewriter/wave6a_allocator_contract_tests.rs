@@ -2121,3 +2121,53 @@ pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut spl
     );
     assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
 }
+
+/// **The stand-in review of main 202, HIGH-1: one owner at two positions of
+/// one call.** `Add(syms, syms, n)` with an in-place callee: the formals end
+/// raw late (the pair at the same subject), and a raw view per position takes
+/// two sibling reborrows of the one Box — the second invalidates the first
+/// (Stacked Borrows pops it; under Tree Borrows a write through one disables the
+/// other), so the callee's accesses through the first are UB the input does not
+/// have. `Add::a` is held by the pair at `aliased2`'s call (one static at both
+/// positions, R864-1); `Add::b` stays raw on its own evidence, so the raw
+/// boundary's arm A views the owner there. No late view is rendered where
+/// another argument of the call is rooted at the owner: the call keeps its input
+/// text, and the compile gate takes the caller back.
+#[test]
+fn main202_h1_one_owner_at_two_positions_of_a_call_takes_no_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn Add(mut a: *mut u32, mut b: *mut u32, mut n: usize) {{\n\
+    let _k = b as usize;\n\
+    let mut i = 0 as usize;\n\
+    while i < n {{\n\
+        *a.offset(i as isize) = (*a.offset(i as isize)).wrapping_add(*b.offset(i as isize));\n\
+        i = i.wrapping_add(1);\n\
+    }}\n\
+}}\n\
+pub static mut LOW2: [u32; 4] = [0 as u32; 4];\n\
+pub unsafe extern \"C\" fn aliased2() {{\n\
+    Add(LOW2.as_mut_ptr(), LOW2.as_mut_ptr(), 4 as usize);\n\
+}}\n\
+pub unsafe extern \"C\" fn twice(mut m: *mut MemoryManager, n: usize) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    Add(syms, syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("main202-h1-twice", &src);
+    let text = compact(&out.source);
+    let call = text
+        .find("Add(syms")
+        .map(|at| &text[at..at + text[at..].find(';').unwrap_or(0)])
+        .unwrap_or_default();
+    assert!(
+        call.matches("syms.as_deref_mut()").count() < 2
+            && call.matches("syms.as_mut_ptr()").count() < 2,
+        "two views of one owner in one call: {call}\n{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+}
