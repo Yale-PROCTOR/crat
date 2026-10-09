@@ -317,13 +317,16 @@ fn w6l_nulwalk_c_a_literal_with_an_inner_nul_keeps_the_fallback() {
 }
 
 /// An indexed walk that steps without testing for the NUL reads past it.
+/// R923-1 (wave-4 relay 112): without the `break`, `while i < 5` reads
+/// `s[0..5)` on every path that runs the loop, so the narrowed callee bound
+/// (behind the NUL walk, ahead of §77) takes `5` — never the NUL walk.
 #[test]
 fn w6l_nulwalk_c_an_indexed_walk_without_a_nul_test_keeps_the_fallback() {
     let out = emitted(&B_ARGV.replace("        if c as c_int == 0 { break; }\n", ""));
     assert!(!out.contains("nul-walk:"), "{out}");
     assert!(
-        takes_fallback(&out),
-        "the control constructs the slice with the fallback: {out}"
+        !takes_fallback(&out) && out.contains("(5) as usize"),
+        "the control constructs the slice with the loop's own bound: {out}"
     );
 }
 
