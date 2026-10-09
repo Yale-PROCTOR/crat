@@ -3952,6 +3952,80 @@ fn optional_into_raw_formal(
     })))
 }
 
+/// **main 202 — a formal that ended raw after the raw boundary's hypothesis.**
+/// The collateral reasons wave-6o reads (relay 121), and the pair hold (R864-1),
+/// which holds a formal for an overlap at ANOTHER call: the model's reading of
+/// the formal stands, so the lend the Box plan proved against it stands. A
+/// retained-access hold (the callee may keep the pointer) or a release through
+/// an indirect call (the callee may free it) is not read here: a lend to such a
+/// formal is exactly what the hold says is unproved, and the compile gate
+/// reverts the caller as before.
+fn late_raw_formal(decision: &Decision) -> bool {
+    match decision {
+        Decision::Degraded(record) => matches!(
+            record.reason,
+            super::DegradeReason::SilentCoercion { .. }
+                | super::DegradeReason::ClassBlocked { .. }
+                | super::DegradeReason::SignatureClassHeld { .. }
+                | super::DegradeReason::PairNotShownDisjoint { .. }
+        ),
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_) => false,
+    }
+}
+
+/// **main 202 — a `Box` owner lent to a formal that ended raw late.** The raw
+/// boundary's own owner templates (`BoxBorrowViewToRaw` /
+/// `OptionalBoxBorrowViewToRaw`, R452-3(3)): the owner's view, as raw as the
+/// formal (`x.as_deref_mut().map_or(null_mut(), |s| s.as_mut_ptr())`). The
+/// owner keeps its allocation; the callee borrows it for the call. A void or
+/// depth-2 formal needs a cast these templates do not spell: not bridged.
+fn owner_into_raw_formal(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    decision: Option<&Decision>,
+    text: &str,
+) -> Option<Result<Option<Candidate>, SeamBlock>> {
+    use super::raw_boundary::BridgeTemplate;
+    let Some(Decision::Box(plan)) = decision else { return None };
+    let formal = *tcx
+        .fn_sig(callee.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .inputs()
+        .get(index)?;
+    let target = super::raw_boundary::raw_target_type(tcx, formal)?;
+    if target.is_void_pointee() || target.depth2.is_some() {
+        return None;
+    }
+    let template = if plan.optional {
+        BridgeTemplate::OptionalBoxBorrowViewToRaw
+    } else {
+        BridgeTemplate::BoxBorrowViewToRaw
+    };
+    let spec = GlueSpec::raw_boundary_target(
+        template,
+        &target,
+        plan.shape == super::box_facts::BoxShape::Slice,
+        true,
+    );
+    let replacement = spec.render(text)?;
+    Some(Ok(Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })))
+}
+
 /// Test seam for [`optional_into_raw_formal`]: the rendered bridge, or the
 /// block's key.
 #[cfg(test)]
@@ -5144,6 +5218,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// ended raw COLLATERALLY (its class blocked or held), which no
                 /// earlier stage bridged.
                 late_raw_optional: bool,
+                /// main 202: a bare `Box` owner at a formal that ended raw
+                /// after the raw boundary's hypothesis (`late_raw_formal`),
+                /// which no earlier stage bridged.
+                late_raw_owner: bool,
                 source_shape: &'static str,
                 source_type: String,
                 target: Option<super::raw_boundary::RawTargetType>,
@@ -5199,7 +5277,39 @@ pub(crate) fn synthesize_with_raw_boundary(
                         if decision_of
                             .get(&(site.caller, hir))
                             .is_some_and(|d| matches!(form_of(d), Form::Opt { .. })));
-                if matches!(expected, Form::Raw) && !raw_boundary_observation && !late_raw_optional
+                // main 202: a `Box` owner does not coerce either. The owner
+                // view R422-5 renders is for a CONVERTED formal, and the raw
+                // boundary bridged only the formals its hypothesis read raw: a
+                // formal a later stage made raw (brotli's
+                // `BrotliZopfliComputeShortestPath::nodes`, held by R864-1's
+                // pair) received the owner bare (`E0308`). The boundary may
+                // track the argument and still render nothing: its site's
+                // target converted in the hypothesis. Only a lend the Box plan
+                // left unspelled: a hand-over or a cast argument is the plan's
+                // own edit.
+                let late_raw_owner = matches!(expected, Form::Raw)
+                    && !raw_boundary.renders_call_argument(
+                        site.caller,
+                        &tcx.def_path_str(callee.to_def_id()),
+                        arg.span,
+                        arg.index,
+                    )
+                    && param_key
+                        .get(&(*callee, arg.index))
+                        .and_then(|k| decision_of.get(k))
+                        .is_some_and(|d| late_raw_formal(d))
+                    && owner_argument(arg)
+                        .and_then(|root| decision_of.get(&(site.caller, root)))
+                        .is_some_and(|d| {
+                            matches!(d, Decision::Box(plan) if !plan
+                                .expr_edits
+                                .iter()
+                                .any(|edit| edit.span.overlaps(arg.span)))
+                        });
+                if matches!(expected, Form::Raw)
+                    && !raw_boundary_observation
+                    && !late_raw_optional
+                    && !late_raw_owner
                 {
                     continue;
                 }
@@ -5358,6 +5468,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     literal_null,
                     raw_boundary_observation,
                     late_raw_optional,
+                    late_raw_owner,
                     source_shape: arg.shape.key(),
                     source_type: arg.source_type.clone(),
                     target: arg.target.clone(),
@@ -6088,6 +6199,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                         shared_candidate(address, text)
                     } else if let Some(candidate) = owner_view {
                         Ok(Some(candidate))
+                    } else if let Some(bridged) = pos
+                        .late_raw_owner
+                        .then(|| {
+                            owner_into_raw_formal(
+                                tcx,
+                                *callee,
+                                pos.index,
+                                pos.root
+                                    .and_then(|root| decision_of.get(&(site.caller, root)).copied()),
+                                text,
+                            )
+                        })
+                        .flatten()
+                    {
+                        bridged
                     } else if let Some(bridged) = pos
                         .late_raw_optional
                         .then(|| {
@@ -6858,7 +6984,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             // the edit lives and reverts with the caller's class
                             // (a held callee class, brotli's `stat`, must not
                             // drop it).
-                            owner_class: if pos.late_raw_optional {
+                            owner_class: if pos.late_raw_optional || pos.late_raw_owner {
                                 SignatureClassId::of(site.caller)
                             } else {
                                 SignatureClassId::of(*callee)

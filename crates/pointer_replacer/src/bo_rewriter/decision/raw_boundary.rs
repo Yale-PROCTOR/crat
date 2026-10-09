@@ -7411,6 +7411,37 @@ impl RawBoundaryDispositionIndex {
             })
     }
 
+    /// main 202: [`Self::tracks_call_argument`], and the site renders its bridge
+    /// — the callee's formal stays raw in the hypothesis the boundary planned
+    /// against. An open site whose target converted there renders nothing: a
+    /// formal a later stage made raw (a settled hold) receives its argument as
+    /// the caller decided it.
+    pub(crate) fn renders_call_argument(
+        &self,
+        caller: LocalDefId,
+        callee_path: &str,
+        span: Span,
+        argument_index: usize,
+    ) -> bool {
+        let span = span.source_callsite();
+        self.site_lookup
+            .iter()
+            .any(|(candidate, site_span, index, key)| {
+                candidate.0 == caller
+                    && key.callee.path == callee_path
+                    && *index == argument_index
+                    && (site_span.contains(span) || span.contains(*site_span))
+                    && self
+                        .by_site
+                        .get(key)
+                        .is_some_and(RawBoundaryDisposition::is_open)
+                    && self
+                        .render_sites
+                        .get(key)
+                        .is_some_and(|site| site.target_stays_raw)
+            })
+    }
+
     pub(crate) fn block_reason(&self, node: (LocalDefId, HirId)) -> Option<RawBoundaryBlockReason> {
         self.blocked_nodes.get(&node).copied()
     }
