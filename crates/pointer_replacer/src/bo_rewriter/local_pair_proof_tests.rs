@@ -151,8 +151,10 @@ pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); G = tmp; cp(G.offset(
 #[test]
 fn r148b_a_pointer_statics_value_is_not_its_storage() {
     let rows = held(STATIC_VALUE);
+    // R930-1: both sides raw (R833-1's peer arm holds the primary beside the
+    // pair's raw view; on the composed 57 head).
     assert!(
-        is_raw(&rows, "cp2::d") || is_raw(&rows, "cp2::s"),
+        is_raw(&rows, "cp2::d") && is_raw(&rows, "cp2::s"),
         "{rows:?}"
     );
     // The raw-side shape: `d` writes inside the view `s` would take.
