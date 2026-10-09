@@ -1,6 +1,8 @@
-//! **Relay 107 — the adversarial review of `local/wave4-57` (Codex, 10-07).**
-//! One fixture per finding, each the review's own counterexample. Each is RED
-//! while the inference over-claims a length the input's accesses do not prove.
+//! **Relay 107 / relay 112 — the callee bound's adversarial reviews (Codex,
+//! 10-07).** One fixture per high finding of the three full-file rounds (3 + 6
+//! + 9), each the review's own counterexample. Under R923-1's narrowed rule
+//! (relay 112) every one of them takes the fallback: the module gives NO bound
+//! (or, at a call site, the seam row carries no `len-callee-bound`).
 //! (The field count's fixtures left with the field count, report 085.)
 
 const PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, unreachable_code)]\n\
@@ -44,7 +46,30 @@ fn bound(src: &str, function: &str, index: usize) -> Option<String> {
     out
 }
 
-// ---- callee_bound.rs -------------------------------------------------------
+/// The seam rows of the callee `g`'s raw argument: one exists, and none of
+/// them carries a callee bound (the narrowed rule refuses the argument).
+fn no_callee_bound_at_the_call(src: &str) {
+    let rows = seams(src);
+    assert!(
+        rows.lines().any(|l| l.starts_with("placed\tg\t")),
+        "the call is a seam site:\n{rows}"
+    );
+    assert!(!rows.contains("len-callee-bound"), "{rows}");
+}
+
+/// The loop shape the narrowed rule keeps: `g`'s own bound is `n`, so a
+/// refusal at the call is the argument's. `flag` keeps the length argument
+/// away from the pointer, so no companion licence answers first.
+const G_U8: &str = "pub unsafe fn g(n: u8, flag: i32, p: *const u8) -> u32 {\n\
+    let mut s = 0u32; let mut i: u8 = 0;\n\
+    while i < n { s += *p.offset(i as isize) as u32; i += 1; }\n\
+    s }\n";
+const G_USIZE: &str = "pub unsafe fn g(n: usize, flag: i32, p: *const u8) -> u32 {\n\
+    let mut s = 0u32; let mut i: usize = 0;\n\
+    while i < n { s += *p.add(i) as u32; i += 1; }\n\
+    s }\n";
+
+// ---- round 1 (Codex, 10-07) ------------------------------------------------
 
 /// Finding 1a: a loop that breaks after its first read reads one element; its
 /// limit `n` proves nothing about the allocation.
@@ -54,8 +79,7 @@ fn r107_cb1a_a_loop_that_breaks_bounds_nothing_by_its_limit() {
         let mut s = 0; let mut i: usize = 0;\n\
         while i < n { s += *p.offset(i as isize); break; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// Finding 1b: `i < 1 && i < n` runs to `min(1, n)`; the looser conjunct is
@@ -66,8 +90,7 @@ fn r107_cb1b_a_conjunction_of_limits_is_not_the_looser_one() {
         let mut s = 0; let mut i: usize = 0;\n\
         while i < 1 && i < n { s += *p.offset(i as isize); i += 1; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// Finding 2a: `i < n as u8` with `n: u16 = 257` runs once; the narrowing cast
@@ -78,8 +101,7 @@ fn r107_cb2a_a_narrowing_cast_on_the_limit_is_refused() {
         let mut s = 0; let mut i: u8 = 0;\n\
         while i < n as u8 { s += *p.offset(i as isize); i += 1; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// Finding 2b: `i < n.wrapping_add(2)` with `n: u8 = 255` runs once; the
@@ -90,22 +112,15 @@ fn r107_cb2b_wrapping_arithmetic_on_a_narrow_limit_is_refused() {
         let mut s = 0; let mut i: u8 = 0;\n\
         while i < n.wrapping_add(2) { s += *p.offset(i as isize); i += 1; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert!(
-        got.as_deref()
-            .is_none_or(|g| !g.contains("n+2") && !g.contains("n + 2")),
-        "{got:?}"
-    );
+    assert_eq!(bound(src, "f", 0), None);
 }
 
-/// Finding 9: an access after a nested block's `return` never runs; it is not
-/// a `must` access.
+/// Finding 9: an access after a nested block's `return` never runs.
 #[test]
 fn r107_cb9_an_access_after_a_nested_return_is_not_must() {
     let src = "pub unsafe fn f(p: *const i32) -> i32 {\n\
         let x = *p; { return x; } *p.offset(99) }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:must:100"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// Finding 8b: an integer argument that calls a function is not effect-free;
@@ -114,30 +129,22 @@ fn r107_cb9_an_access_after_a_nested_return_is_not_must() {
 fn r107_cb8_a_calling_argument_is_not_duplicated_into_the_length() {
     let src = "static mut CALLS: usize = 0;\n\
         pub unsafe fn next() -> usize { CALLS += 1; CALLS }\n\
-        pub unsafe fn g(p: *const i32, n: usize) -> i32 {\n\
+        pub unsafe fn g(n: usize, flag: i32, p: *const i32) -> i32 {\n\
         let mut s = 0; let mut i: usize = 0;\n\
         while i < n { s += *p.offset(i as isize); i += 1; }\n\
         s }\n\
-        pub unsafe fn caller(base: *const i32, k: isize) -> i32 { g(base.offset(k), (next)()) }\n";
-    let rows = seams(src);
-    let row = rows
-        .lines()
-        .find(|l| l.starts_with("placed\tg\t"))
-        .unwrap_or_else(|| panic!("{rows}"));
-    // The callee bound refuses a calling argument (its own length is not
-    // taken); what else answers here is printed for the record.
-    assert!(!row.contains("len-callee-bound"), "{row}");
-    println!("CB8 ROW {row}");
+        pub unsafe fn caller(base: *const i32, k: isize) -> i32 { g((next)(), 1, base.offset(k)) }\n";
+    assert_eq!(bound(src, "g", 2).as_deref(), Some("len-callee-bound:may:n"));
+    no_callee_bound_at_the_call(src);
 }
 
-// ---- the callee bound's full-file round (Codex, 10-07) ---------------------
+// ---- round 2, the full-file round (Codex, 10-07) --------------------------
 
 /// F1: `(n as u8)` with `n: i8 = -1` is index 255; `n + 1` would be 0.
 #[test]
 fn r107_cbf1_a_sign_changing_index_cast_is_refused() {
     let src = "pub unsafe fn f(p: *const u8, n: i8) -> u8 { *p.offset((n as u8) as isize) }\n";
-    let got = bound(src, "f", 0);
-    assert!(got.as_deref().is_none_or(|g| !g.contains('n')), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// F2: `n.wrapping_add(1)` with `n = usize::MAX` is index 0; `n + 2` would
@@ -145,29 +152,15 @@ fn r107_cbf1_a_sign_changing_index_cast_is_refused() {
 #[test]
 fn r107_cbf2_a_64_bit_wrapping_index_is_refused() {
     let src = "pub unsafe fn f(p: *const i32, n: usize) -> i32 { *p.offset(n.wrapping_add(1) as isize) + *p.offset(2) }\n";
-    let got = bound(src, "f", 0);
-    assert!(got.as_deref().is_none_or(|g| !g.contains('n')), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
-/// F3: `max(2n, 5)` must render with the product parenthesized (the bound's
-/// own rendering, read directly: the emission of a signed index is not this
-/// test's subject).
+/// F3: `max(2n, 5)` rendered without parentheses reads `2 * max(n, 5)`.
 #[test]
 fn r107_cbf3_a_product_term_renders_parenthesized() {
     let src =
         "pub unsafe fn f(p: *const i32, n: isize) -> i32 { *p.offset(n + n - 1) + *p.offset(4) }\n";
-    let mut out = None;
-    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
-        let def = tcx
-            .hir_body_owners()
-            .find(|d| tcx.item_name(d.to_def_id()).as_str() == "f")
-            .expect("f");
-        out = super::decision::callee_bound::of_parameter(tcx, def, 0)
-            .map(|b| b.render_count(&|_| "n".to_owned()));
-    })
-    .expect("fixture compiles");
-    let text = out.expect("a bound");
-    assert!(!text.starts_with("2 * ((n) as i128).max("), "{text}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// F4a: two increments per iteration skip the last index.
@@ -177,8 +170,7 @@ fn r107_cbf4a_two_increments_per_iteration_give_no_bound() {
         let mut s = 0; let mut i: usize = 0;\n\
         while i < n { s += *p.offset(i as isize); i += 1; i += 1; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// F4b: a read guarded inside the loop need not run at the last index.
@@ -188,27 +180,119 @@ fn r107_cbf4b_a_guarded_read_in_a_loop_gives_no_loop_bound() {
         let mut s = 0; let mut i: usize = 0;\n\
         while i < n { if i == 0 { s += *p.offset(i as isize); } i += 1; }\n\
         s }\n";
-    let got = bound(src, "f", 0);
-    assert_ne!(got.as_deref(), Some("len-callee-bound:may:n"), "{got:?}");
+    assert_eq!(bound(src, "f", 0), None);
 }
 
 /// F5: a user function NAMED `wrapping_add` is a call with effects.
 #[test]
 fn r107_cbf5_a_function_named_like_a_primitive_is_a_call() {
-    let src = "static mut COUNTER: usize = 0;\n\
-        pub unsafe fn wrapping_add() -> usize { COUNTER += 1; COUNTER }\n\
-        pub unsafe fn read_at(p: *const i32, n: usize) -> i32 { *p.offset(n as isize) }\n\
-        pub unsafe fn caller(base: *const i32, k: isize) -> i32 { read_at(base.offset(k), wrapping_add()) }\n";
-    let out = flat(&emitted(&format!("{PRE}{src}")));
-    let call = out.split("fn caller").nth(1).unwrap_or("");
-    assert!(call.matches("wrapping_add()").count() <= 1, "{out}");
+    let src = format!(
+        "static mut COUNTER: usize = 0;\n\
+         pub unsafe fn wrapping_add() -> usize {{ COUNTER += 1; COUNTER }}\n\
+         {G_USIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{ g(wrapping_add(), 1, base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
 }
 
-/// F6: `!0` for a `u8` parameter is 255; the copied text must keep that type.
+/// F6: `!0` for a `u8` parameter is 255; copied alone it reads as `i32` -1.
 #[test]
 fn r107_cbf6_an_instantiated_argument_keeps_its_parameter_type() {
-    let src = "pub unsafe fn read_at(p: *const u8, n: u8) -> u8 { *p.offset(n as isize) }\n\
-        pub unsafe fn caller(base: *const u8, k: isize) -> u8 { read_at(base.offset(k), !0) }\n";
-    let out = flat(&emitted(&format!("{PRE}{src}")));
-    assert!(!out.contains("((!0) as i128)"), "{out}");
+    let src = format!(
+        "{G_U8}\
+         pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{ g(!0, 1, base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+// ---- round 3, the second full-file round (Codex, 10-07) -------------------
+
+/// R3-1: `!0 / 2` for a `u8` parameter is 127; re-typing the copied text as
+/// `((!0 / 2) as u8)` evaluates the division in `i32` (0).
+#[test]
+fn r112_r3_1_an_argument_with_operators_is_not_copied() {
+    let src = format!(
+        "{G_U8}\
+         pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{ g(!0 / 2, 1, base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// R3-2: `n: u8 = 255` reads index `(255u8 as i8) + 2 = 1`; `n + 3` is no
+/// bound of it.
+#[test]
+fn r112_r3_2_an_intermediate_sign_changing_cast_is_refused() {
+    let src = "pub unsafe fn f(p: *const u8, n: u8) -> u8 { *p.offset(((n as i8) + 2) as isize) }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-3: a closure writes the limit before the loop; the entry value of `n`
+/// under-bounds the read.
+#[test]
+fn r112_r3_3_a_closure_writing_the_limit_is_refused() {
+    let src = "pub unsafe fn f(p: *const u8, mut n: usize) -> u32 {\n\
+        (|| n += 10)();\n\
+        let mut s = 0u32; let mut i: usize = 0;\n\
+        while i < n { s += *p.add(i) as u32; i += 1; }\n\
+        s }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-4: `&raw const *p` forms an address the callee reads at index 10; it is
+/// no one-element access.
+#[test]
+fn r112_r3_4_a_raw_address_of_the_pointee_is_refused() {
+    let src = "pub unsafe fn leaf(q: *const u8) -> u8 { *q.add(10) }\n\
+        pub unsafe fn f(p: *const u8) -> u8 { leaf(&raw const *p) }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-5: a labelled `continue` leaves the inner loop after index 0.
+#[test]
+fn r112_r3_5_a_labelled_continue_is_refused() {
+    let src = "pub unsafe fn f(p: *const u8, n: usize) -> u32 {\n\
+        let mut s = 0u32; let mut j = 0;\n\
+        'outer: while j < 1 { j += 1; let mut i: usize = 0;\n\
+        while i < n { if i == 1 { continue 'outer; } s += *p.add(i) as u32; i += 1; } }\n\
+        s }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-6: the callee reads only when `yes`; composed with the loop's offset,
+/// its bound need not run at the last index.
+#[test]
+fn r112_r3_6_a_composition_at_an_offset_is_refused() {
+    let src = "pub unsafe fn leaf(q: *const u8, yes: bool) -> u8 { if yes { *q } else { 0 } }\n\
+        pub unsafe fn f(p: *const u8, n: usize) -> u32 {\n\
+        let mut s = 0u32; let mut i: usize = 0;\n\
+        while i < n { s += leaf(p.add(i), i == 0) as u32; i += 1; }\n\
+        s }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-7: `n - 2` on `n: i8 = -128` wraps to 126 with overflow checks off.
+#[test]
+fn r112_r3_7_ordinary_arithmetic_in_the_index_is_refused() {
+    let src = "pub unsafe fn f(p: *const u8, n: i8) -> u8 { *p.offset((n - 2) as isize) }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}
+
+/// R3-8: a user METHOD named `wrapping_add` is a call with effects.
+#[test]
+fn r112_r3_8_a_user_method_named_like_a_primitive_is_refused() {
+    let src = format!(
+        "pub struct Counter {{ c: core::cell::Cell<usize> }}\n\
+         impl Counter {{ pub fn wrapping_add(&self, _k: usize) -> usize {{ let v = self.c.get(); self.c.set(v + 1); v }} }}\n\
+         {G_USIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize, counter: &Counter) -> u32 {{ g(counter.wrapping_add(1), 1, base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// R3-9: `gate(stop)` may exit before the read; `*p.add(9)` is no `must:10`.
+#[test]
+fn r112_r3_9_an_access_after_a_call_that_can_exit_is_refused() {
+    let src = "pub unsafe fn gate(stop: bool) { if stop { std::process::exit(0); } }\n\
+        pub unsafe fn f(p: *const u8, stop: bool) -> u8 { gate(stop); *p.add(9) }\n";
+    assert_eq!(bound(src, "f", 0), None);
 }
