@@ -549,6 +549,18 @@ pub(crate) fn collect_inventory_from(
             } else {
                 unknown_proof("sibling-a5-operand-inventory-unresolved")
             };
+            // **R924-1 (USER; wave-5d 148) — the local proofs where none ran.**
+            // A pair the audit and the certificates left unproved is cleared
+            // only by a proof local to this call: at a FOREIGN callee (no
+            // recorded site), the certificates' own root classes for the two
+            // arguments (a fresh allocation or a stack object beside storage
+            // that existed at entry). The same-subject rule below still
+            // overrides it.
+            let proof = if proof.verdict == A5SiteProofVerdict::Clear {
+                proof
+            } else {
+                local_pair_proof(tcx, ctx, caller, site, argument_index).unwrap_or(proof)
+            };
             // **R864-1 (b) (relay 299; fan-out 081 class 2) — the same-subject
             // rule, before any proof.** Two arguments rooted at one binding are
             // never disjoint, whatever a proof says (libzahl `zmul`'s
@@ -1238,6 +1250,45 @@ fn call_argument_is(
 /// An argument's root binding and the object it designates (normalized
 /// through single-definition locals), as `ref_beside_raw` reads them.
 type ArgumentRoot = (Option<HirId>, Option<super::ref_beside_raw::Designation>);
+
+/// R924-1's local proof for the pair `(site's argument, argument_index)`, as a
+/// clear proof carrying the certificate's own receipt.
+fn local_pair_proof(
+    tcx: TyCtxt<'_>,
+    ctx: &SiblingInputs<'_>,
+    caller: LocalDefId,
+    site: &super::raw_boundary::RawBoundarySiteFact,
+    argument_index: usize,
+) -> Option<A5PeerProof> {
+    let clear = |reason: &'static str, family: &'static str| A5PeerProof {
+        verdict: A5SiteProofVerdict::Clear,
+        reason,
+        family,
+        location: None,
+        left_site: None,
+        right_site: None,
+    };
+    match site.callee_local {
+        None => {
+            let certificates = ctx.a5_site_proofs.pair_certificates()?;
+            let arguments = super::ref_beside_raw::call_arguments(tcx, caller);
+            let arguments = arguments.get(&site.call_span.source_callsite())?;
+            let kind = certificates.certify_call_arguments(
+                tcx,
+                caller,
+                arguments.get(site.key.argument_index)?,
+                arguments.get(argument_index)?,
+            )?;
+            Some(clear(
+                kind.key(),
+                "pair-disjointness-certificate:call-arguments",
+            ))
+        }
+        // (2) the scope certificate at a local callee: on the composed 57
+        // head, where `outside_byte_view` (R819) and this hold meet.
+        Some(_) => None,
+    }
+}
 
 fn call_argument_roots(tcx: TyCtxt<'_>, caller: LocalDefId, call_span: Span) -> Vec<ArgumentRoot> {
     let typeck = tcx.typeck(caller);

@@ -779,6 +779,29 @@ impl PairDisjointnessIndex {
     /// allocation / stack object against another object or entry storage, and
     /// statics), never the type rule: there is no call, so there is no pair of
     /// pointee types fixed at one site. `None` when either binding is unknown.
+    /// **R924-1 (USER; wave-5d 148).** The root certificate for two ARGUMENTS of
+    /// one call in `function` that no recorded site covers — a foreign callee's
+    /// pair (`memcpy(ret, src, n)`), whose calls the collector does not record.
+    /// Each argument is classified exactly as a recorded site classifies its
+    /// own (`argument_provenance` over the function's binding roots), and the
+    /// pair is certified by `certify_roots` alone: distinct roots (a fresh
+    /// allocation, a stack object or storage that existed at entry, a static),
+    /// never by a rule that reads the callee (the type rule, the parameter
+    /// pair), which a foreign callee does not have.
+    pub(crate) fn certify_call_arguments<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        function: LocalDefId,
+        left: &Expr<'_>,
+        right: &Expr<'_>,
+    ) -> Option<CertificateKind> {
+        let classes = self.binding_roots.get(&function.local_def_index.as_u32())?;
+        let typeck = tcx.typeck(function);
+        let (a, _) = argument_provenance(tcx, typeck, classes, left);
+        let (b, _) = argument_provenance(tcx, typeck, classes, right);
+        certify_roots(a, b)
+    }
+
     pub(crate) fn certify_bindings(
         &self,
         function: LocalDefId,

@@ -148,19 +148,24 @@ mod tests {
             .iter()
             .filter(|p| p.source_form == "slice-shared")
             .collect::<Vec<_>>();
-        // R829-1 (relay 297, main 188): caller::p is held beside `dst.as_mut_ptr()` (arg0) at strncpy; one T1 `slice-shared` receipt → none, and p is held:pair-not-shown-disjoint.
-        assert!(rows.is_empty(), "{:#?}", table.slice_use_receipts);
+        // R924-1 (USER; wave-5d 148): `dst` is a stack array of `caller` and `p`
+        // is storage that existed at entry, so the pair at strncpy is disjoint
+        // by distinct roots, a proof local to this call. The R829-1 hold (relay
+        // 297, main 188) no longer applies in the attested world: the one T1
+        // `slice-shared` receipt is back and `p` is not held.
+        assert_eq!(rows.len(), 1, "{:#?}", table.slice_use_receipts);
         let (subject, decision) = table
             .entries
             .iter()
             .find(|(s, _)| s.label == "caller::p")
             .unwrap();
         assert!(
-            matches!(decision, super::super::Decision::Degraded(d) if matches!(&d.reason, super::super::DegradeReason::PairNotShownDisjoint { detail } if detail.contains("risky-siblings=arg0"))),
+            !matches!(decision, super::super::Decision::Degraded(d) if matches!(&d.reason, super::super::DegradeReason::PairNotShownDisjoint { .. })),
             "{subject:?} {decision:?}"
         );
         let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(input).unwrap();
-        // R829-1 (relay 297, main 188): caller::p is held beside `dst.as_mut_ptr()` at strncpy; `p: &[i8]` → `p: *const i8`.
+        // The UNATTESTED native world attaches no certificates, so there the
+        // R829-1 hold stands (relay 297, main 188): `p: *const i8`.
         assert!(
             emitted
                 .split_whitespace()
