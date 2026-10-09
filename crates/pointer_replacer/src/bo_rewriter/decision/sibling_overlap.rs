@@ -554,8 +554,10 @@ pub(crate) fn collect_inventory_from(
             // only by a proof local to this call: at a FOREIGN callee (no
             // recorded site), the certificates' own root classes for the two
             // arguments (a fresh allocation or a stack object beside storage
-            // that existed at entry). The same-subject rule below still
-            // overrides it.
+            // that existed at entry); at a local callee whose caller is an
+            // exported entry nothing in the program calls, the scope's
+            // separate-object certificate for two of its own formals (R816 /
+            // R819). The same-subject rule below still overrides either.
             let proof = if proof.verdict == A5SiteProofVerdict::Clear {
                 proof
             } else {
@@ -1251,8 +1253,8 @@ fn call_argument_is(
 /// through single-definition locals), as `ref_beside_raw` reads them.
 type ArgumentRoot = (Option<HirId>, Option<super::ref_beside_raw::Designation>);
 
-/// R924-1's local proof for the pair `(site's argument, argument_index)`, as a
-/// clear proof carrying the certificate's own receipt.
+/// R924-1's two local proofs for the pair `(site's argument, argument_index)`,
+/// as a clear proof carrying the certificate's own receipt.
 fn local_pair_proof(
     tcx: TyCtxt<'_>,
     ctx: &SiblingInputs<'_>,
@@ -1284,9 +1286,22 @@ fn local_pair_proof(
                 "pair-disjointness-certificate:call-arguments",
             ))
         }
-        // (2) the scope certificate at a local callee: on the composed 57
-        // head, where `outside_byte_view` (R819) and this hold meet.
-        Some(_) => None,
+        // (2) at a local callee whose caller is an exported entry nothing in the
+        // program calls: the scope's separate-object certificate for two of its
+        // own formals (R816 / R819), which this hold did not read.
+        Some(callee) => {
+            let call = ctx.facts.call_args.get(&callee)?.iter().find(|call| {
+                call.caller == caller
+                    && call.span.source_callsite() == site.call_span.source_callsite()
+            })?;
+            let receipt = super::outside_byte_view::certifies(
+                ctx.facts,
+                call,
+                site.key.argument_index,
+                argument_index,
+            )?;
+            Some(clear(receipt, "scope-separate-objects"))
+        }
     }
 }
 
