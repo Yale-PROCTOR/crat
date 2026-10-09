@@ -473,3 +473,14 @@ fn r112_s2_f3_a_wildcard_let_is_no_access() {
         while i < n { let _ = *p.offset(i as isize); i += 1; } }\n";
     assert_eq!(bound(src, "f", 0), None);
 }
+
+/// S2-F3b: `300` under `#[allow(overflowing_literals)]` is the `u8` 44.
+#[test]
+fn r112_s2_f3b_an_overflowing_literal_limit_is_refused() {
+    let src = "#[allow(overflowing_literals)]\n\
+        pub unsafe fn f(p: *const u8) -> u32 {\n\
+        let mut s = 0u32; let mut i: u8 = 0;\n\
+        while i < 300 { s += *p.offset(i as isize) as u32; i += 1; }\n\
+        s }\n";
+    assert_eq!(bound(src, "f", 0), None);
+}

@@ -45,7 +45,7 @@ use rustc_hir::{
 };
 use rustc_middle::ty::{
     Ty, TyCtxt,
-    adjustment::{Adjust, AutoBorrow, AutoBorrowMutability},
+    adjustment::{Adjust, AutoBorrow},
 };
 
 /// One term of the bound: a constant, or parameter `index` itself.
@@ -189,6 +189,14 @@ fn effect_free<'tcx>(
     if e.span.from_expansion() {
         return false;
     }
+    // An overloaded auto-deref runs user code (relay 112, S2-F1c).
+    if typeck
+        .expr_adjustments(e)
+        .iter()
+        .any(|a| matches!(a.kind, Adjust::Deref(Some(_))))
+    {
+        return false;
+    }
     let free = |x: &'tcx Expr<'tcx>| effect_free(tcx, typeck, x);
     match e.kind {
         ExprKind::Lit(_) | ExprKind::Path(_) => true,
@@ -202,10 +210,11 @@ fn effect_free<'tcx>(
             let Some((DefKind::AssocFn, def)) = typeck.type_dependent_def(e.hir_id) else {
                 return false;
             };
-            let std_inherent = !def.is_local()
-                && tcx
-                    .impl_of_method(def)
-                    .is_some_and(|i| tcx.trait_id_of_impl(i).is_none());
+            let std_inherent =
+                matches!(tcx.crate_name(def.krate).as_str(), "core" | "std" | "alloc")
+                    && tcx
+                        .impl_of_method(def)
+                        .is_some_and(|i| tcx.trait_id_of_impl(i).is_none());
             std_inherent
                 && matches!(
                     segment.ident.name.as_str(),
@@ -262,8 +271,8 @@ fn intern(key: String) -> &'static str {
 /// fallback.
 ///
 /// Each argument the length copies is an integer literal, or a local of the
-/// caller that is never written and never borrowed mutably (and the caller has
-/// no closure, `ref mut` or inline assembly): its value at the construction is
+/// caller that is never written and whose address is never taken (and the caller has
+/// no closure, `ref` binding or inline assembly): its value at the construction is
 /// the value the call passes, and reading it again does nothing else (R923-1,
 /// relay 112 S1-M1). Rust has no implicit integer conversion, so the copied
 /// text has the parameter's own type.
@@ -295,7 +304,7 @@ pub(crate) fn at_call_site(
         let Term::Parameter(p) = *t else { continue };
         let arg = peel_parens(args.get(p)?);
         let copyable = match arg.kind {
-            ExprKind::Lit(_) => literal(arg).is_some(),
+            ExprKind::Lit(_) => literal(arg).is_some_and(|k| fits(tcx, typeck.expr_ty(arg), k)),
             ExprKind::Path(..) => local_of(arg)
                 .is_some_and(|id| !writes.written.contains(&id) && !writes.borrowed.contains(&id)),
             _ => false,
@@ -377,7 +386,7 @@ impl<'tcx> Analysis<'tcx> {
             .collect::<Vec<_>>();
         let mut writes = Writes::new_typeck(tcx.typeck(f));
         writes.visit_expr(body.value);
-        // A closure, a `ref mut` binding or inline assembly writes locals this
+        // A closure, a `ref` binding or inline assembly writes locals this
         // census does not see (relay 112, R3-3).
         if writes.opaque {
             return None;
@@ -423,11 +432,11 @@ struct Writes<'tcx> {
     /// Locals assigned (`=`, `op=`) anywhere, with the assignment expression.
     written: FxHashSet<HirId>,
     assignments: Vec<(HirId, HirId)>,
-    /// Locals whose address is taken mutably, explicitly or by an autoref.
+    /// Locals whose address is taken, explicitly or by an autoref.
     borrowed: FxHashSet<HirId>,
     /// `let` bindings per local.
     lets: FxHashMap<HirId, usize>,
-    /// A closure, a `ref mut` binding or inline assembly anywhere in the body.
+    /// A closure, a `ref` binding or inline assembly anywhere in the body.
     opaque: bool,
 }
 
@@ -466,7 +475,9 @@ impl<'tcx> Visitor<'tcx> for Writes<'tcx> {
                     self.assignments.push((id, e.hir_id));
                 }
             }
-            ExprKind::AddrOf(_, rustc_hir::Mutability::Mut, inner) => {
+            // Any address of a local — `&raw const n` written through as
+            // `*mut` is defined under Tree Borrows (relay 112, S2-F1).
+            ExprKind::AddrOf(_, _, inner) => {
                 if let Some(id) = local_of(peel_parens(inner)) {
                     self.borrowed.insert(id);
                 }
@@ -480,10 +491,7 @@ impl<'tcx> Visitor<'tcx> for Writes<'tcx> {
                     && typeck.expr_adjustments(e).iter().any(|a| {
                         matches!(
                             a.kind,
-                            Adjust::Borrow(
-                                AutoBorrow::Ref(AutoBorrowMutability::Mut { .. })
-                                    | AutoBorrow::RawPtr(rustc_hir::Mutability::Mut)
-                            )
+                            Adjust::Borrow(AutoBorrow::Ref(_) | AutoBorrow::RawPtr(_))
                         )
                     })
                 {
@@ -497,8 +505,10 @@ impl<'tcx> Visitor<'tcx> for Writes<'tcx> {
 
     fn visit_pat(&mut self, p: &'tcx rustc_hir::Pat<'tcx>) {
         if let PatKind::Binding(mode, ..) = p.kind
-            && matches!(mode.0, rustc_hir::ByRef::Yes(rustc_hir::Mutability::Mut))
+            && matches!(mode.0, rustc_hir::ByRef::Yes(_))
         {
+            // A `ref` binding forms an address as a pattern (relay 112,
+            // S2-F2), out of the expression walk's sight.
             self.opaque = true;
         }
         intravisit::walk_pat(self, p);
@@ -589,6 +599,17 @@ fn value_preserving(from: (u64, Sign), to: (u64, Sign)) -> bool {
     }
 }
 
+/// `k` is a value of the integer type `ty`.
+fn fits<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, k: i128) -> bool {
+    let Some((bits, sign)) = int_info(tcx, ty) else { return false };
+    let max = match sign {
+        Sign::Signed => (1i128 << (bits - 1)) - 1,
+        Sign::Unsigned if bits >= 127 => i128::MAX,
+        Sign::Unsigned => (1i128 << bits) - 1,
+    };
+    (0..=max).contains(&k)
+}
+
 fn literal(e: &Expr<'_>) -> Option<i128> {
     match e.kind {
         ExprKind::Lit(lit) => match lit.node {
@@ -631,7 +652,7 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
     }
 
     /// A parameter of `f` usable in a bound: integer-typed and never written
-    /// or borrowed mutably.
+    /// or borrowed (relay 112, S2-F1: any address).
     fn bound_param(&self, id: HirId) -> Option<usize> {
         let index = self.params.iter().position(|p| *p == Some(id))?;
         if self.writes.written.contains(&id) || self.writes.borrowed.contains(&id) {
@@ -646,21 +667,17 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
     /// operator and no other cast (R923-1).
     fn term(&self, e: &'tcx Expr<'tcx>) -> Option<Term> {
         let e = peel_parens(e);
+        let fits = |k: i128| fits(self.a.tcx, self.typeck().expr_ty(e), k);
         if let Some(k) = literal(e) {
-            return Some(Term::Constant(k));
+            // A literal that overflows its type (`#[allow(overflowing_
+            // literals)]`) is not the value written (relay 112, S2-F3).
+            return fits(k).then_some(Term::Constant(k));
         }
         match e.kind {
             ExprKind::Path(..) => self.bound_param(local_of(e)?).map(Term::Parameter),
             ExprKind::Cast(inner, _) => {
                 let Term::Constant(k) = self.term(inner)? else { return None };
-                let ty = self.typeck().expr_ty(e);
-                let (bits, sign) = int_info(self.a.tcx, ty)?;
-                let max = match sign {
-                    Sign::Signed => (1i128 << (bits - 1)) - 1,
-                    Sign::Unsigned if bits >= 127 => i128::MAX,
-                    Sign::Unsigned => (1i128 << bits) - 1,
-                };
-                (k <= max).then_some(Term::Constant(k))
+                fits(k).then_some(Term::Constant(k))
             }
             _ => None,
         }
@@ -763,12 +780,16 @@ impl<'tcx> Walk<'_, '_, 'tcx> {
             if typeck
                 .expr_adjustments(place)
                 .iter()
-                .any(|a| matches!(a.kind, Adjust::Borrow(_)))
+                .any(|a| matches!(a.kind, Adjust::Borrow(_) | Adjust::Deref(Some(_))))
             {
                 return false;
             }
-            let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(place.hir_id) else {
-                return true;
+            let parent = match tcx.parent_hir_node(place.hir_id) {
+                rustc_hir::Node::Expr(parent) => parent,
+                // `let _ = *p.offset(i)` reads nothing (relay 112, S2-F3); a
+                // `ref` binding refused the body already (`Writes::opaque`).
+                rustc_hir::Node::LetStmt(l) => return !matches!(l.pat.kind, PatKind::Wild),
+                _ => return true,
             };
             match parent.kind {
                 ExprKind::Field(base, _) if base.hir_id == place.hir_id => place = parent,
