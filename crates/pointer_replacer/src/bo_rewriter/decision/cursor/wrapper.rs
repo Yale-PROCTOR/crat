@@ -1608,6 +1608,44 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                     }
                     continue;
                 }
+                // A recursive call handing this cursor's derived position to the
+                // same parameter (heman `qselect(v.offset(st), len - st, ..)`):
+                // the callee's parameter IS this subject, a cursor parameter by
+                // construction, so the argument is this cursor's tail view at the
+                // index, the form a slice or cursor parameter takes.
+                if !self.optional
+                    && local(arg) != Some(self.subject.hir_id)
+                    && matches!(arg.kind, hir::ExprKind::MethodCall(..))
+                    && source_binding(self.ctx.tcx, self.subject.fn_did, arg)
+                        == Some(self.subject.hir_id)
+                    && let ty::FnDef(did, _) = *self
+                        .ctx
+                        .tcx
+                        .typeck(self.subject.fn_did)
+                        .expr_ty(callee)
+                        .kind()
+                    && did.as_local() == Some(self.subject.fn_did)
+                    && matches!(self.subject.kind, SubjectKind::Param { hir_index } if hir_index == index)
+                {
+                    match self.index(arg) {
+                        Ok(d) => {
+                            let (lend, view) = if self.subject.mutable {
+                                (".as_deref_mut()", "as_slice_mut")
+                            } else {
+                                ("", "as_slice")
+                            };
+                            self.push(
+                                arg,
+                                format!("{}{lend}.offset_by({d}).{view}()", self.view()),
+                                "cursor-element",
+                            );
+                        }
+                        Err(hold) => {
+                            self.hold.get_or_insert(hold);
+                        }
+                    }
+                    continue;
+                }
                 // An offset chain rooted at this cursor handed to a raw formal
                 // (`strcmp(s.offset(k), ..)`): the chain is the derived cursor
                 // value at the argument, and the boundary's own Arm-A site
@@ -1714,7 +1752,14 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         return;
                     };
                     let target = did.as_local().and_then(|did| self.entries.iter().find(|(s, _)| s.fn_did == did && matches!(s.kind, SubjectKind::Param { hir_index } if hir_index == index)));
-                    let raw = target.is_none_or(|(_, d)| raw_decision(d));
+                    // A recursive call handing this cursor to the same
+                    // parameter (heman `qselect(v, st, k)`): the callee's
+                    // parameter IS this subject, whose decision is the one being
+                    // planned here, so it is a cursor parameter by construction.
+                    let recursive = target.is_some_and(|(s, _)| {
+                        s.fn_did == self.subject.fn_did && s.hir_id == self.subject.hir_id
+                    });
+                    let raw = !recursive && target.is_none_or(|(_, d)| raw_decision(d));
                     if raw
                         && !self.optional
                         && index == 0
@@ -1741,11 +1786,12 @@ impl<'v> Visitor<'v> for Uses<'_, '_> {
                         }) {
                             self.hold.get_or_insert(CursorHold::RawBoundaryUnbuilt);
                         }
-                    } else if target
-                        .and_then(|(_, d)| {
-                            slice_mutability(d).or_else(|| cursor_parameter_mutability(d))
-                        })
-                        .is_some()
+                    } else if recursive
+                        || target
+                            .and_then(|(_, d)| {
+                                slice_mutability(d).or_else(|| cursor_parameter_mutability(d))
+                            })
+                            .is_some()
                     {
                         // An optional cursor handed to a non-optional slice
                         // position: the C callee dereferences it, so `None` is
