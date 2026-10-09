@@ -304,6 +304,51 @@ enum Object {
     Unknown,
 }
 
+/// **wave-5d 148b (R930-1).** A pointer value that may address ANY object of the
+/// program: an integer cast to a pointer (`n as *mut T`, which a UB-free C
+/// program may have built as `(uintptr_t)buf`) or the value stored in a pointer
+/// static (`G`, `G.offset(k)`: whatever the program put there, a heap block it
+/// also holds included), read through pointer arithmetic and pointer casts.
+fn may_point_anywhere<'tcx>(typeck: &TypeckResults<'tcx>, expr: &rustc_hir::Expr<'_>) -> bool {
+    use rustc_hir::{
+        ExprKind, QPath,
+        def::{DefKind, Res},
+    };
+    let mut expr = expr;
+    loop {
+        match &expr.kind {
+            ExprKind::Cast(inner, _) => {
+                if typeck.expr_ty(inner).is_integral() {
+                    return true;
+                }
+                expr = inner;
+            }
+            ExprKind::DropTemps(inner) => expr = inner,
+            ExprKind::MethodCall(segment, receiver, _, _)
+                if matches!(
+                    segment.ident.name.as_str(),
+                    "offset"
+                        | "add"
+                        | "sub"
+                        | "wrapping_offset"
+                        | "wrapping_add"
+                        | "wrapping_sub"
+                        | "cast"
+                        | "cast_mut"
+                        | "cast_const"
+                ) && typeck.expr_ty(receiver).is_raw_ptr() =>
+            {
+                expr = receiver
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => {
+                return matches!(path.res, Res::Def(DefKind::Static { .. }, _))
+                    && typeck.expr_ty(expr).is_raw_ptr();
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn object_of(designation: Option<&Designation>, null: bool) -> Object {
     if null {
         return Object::Null;
@@ -883,8 +928,15 @@ pub(crate) fn holds(
                     };
                     let (dl, dr) = (designation(left), designation(right));
                     let null = |arg: &Arg| matches!(arg.shape, ArgShape::NullLit);
+                    // wave-5d 148b (R930-1): a value that may address ANY object
+                    // beside a non-null argument is unresolved, never unknown.
+                    let anywhere = |arg: &Arg| {
+                        expression(arg.index).is_some_and(|expr| may_point_anywhere(typeck, expr))
+                    };
                     let relation = if null(left) || null(right) {
                         Relation::Disjoint
+                    } else if anywhere(left) || anywhere(right) {
+                        Relation::Unresolved
                     } else {
                         match (&dl, &dr) {
                             // One root: equal steps or one inside the other is one
