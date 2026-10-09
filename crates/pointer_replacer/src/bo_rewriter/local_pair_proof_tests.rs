@@ -434,3 +434,68 @@ fn r149h_a_renamed_extern_redeclaration_refuses_the_certificate() {
          pub unsafe fn g(q: *mut i32) -> i32 { f_ext(q, q) }\n}\n";
     assert!(caller_pair_verdict(&input).is_err());
 }
+
+/// wave-6a 157b's three functions, the write through `dst` itself.
+const PLAIN_WRITE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+pub struct Holder { data: *mut i32 }
+pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }
+pub unsafe fn caller(holder: *const Holder, src: *const i32) { update((*holder).data, src); }
+pub unsafe fn outer(holder: *const Holder, v: *const i32) -> i32 { let x = *v; caller(holder, v); x + *v }
+#[no_mangle]
+pub unsafe extern "C" fn entry() -> i32 {
+    let mut value = 1;
+    let p: *mut i32 = &mut value;
+    let holder = Holder { data: p };
+    outer(&holder, p)
+}
+"#;
+
+/// wave-6a 157c §2: the very same write, through a pointer the callee rebuilt
+/// from an integer. Foster's mutability does not follow the integer, so
+/// `dst` reads as never written.
+fn integer_round_trip() -> String {
+    PLAIN_WRITE.replace(
+        "*dst = *src + 1;",
+        "let d = dst as usize as *mut i32; *d = *src + 1;",
+    )
+}
+
+/// wave-6a 157c §2 (soundness): a write through an integer round trip of the
+/// sibling formal hides nothing from the pair rule. What the plain write
+/// keeps raw beside `dst`, the round trip keeps raw too.
+#[test]
+fn r157c_a_write_through_an_integer_round_trip_hides_nothing_from_the_pair_rule() {
+    let plain = held(PLAIN_WRITE);
+    let round = held(&integer_round_trip());
+    let watched = ["update::src", "caller::src", "outer::v"];
+    assert!(
+        watched.iter().any(|label| is_raw(&plain, label)),
+        "the plain write keeps nothing raw: {plain:?}"
+    );
+    for label in watched {
+        assert!(
+            !is_raw(&plain, label) || is_raw(&round, label),
+            "{label}: raw beside the plain write, delivered beside the round trip: {round:?}"
+        );
+    }
+}
+
+/// wave-5d 149f (soundness): the same pair with `dst` model-raw through a
+/// retyping cast, the write Foster sees. One argument is a loaded pointer
+/// (`(*holder).data`), so the pair relation is unknown; no PAIR row exists for
+/// a formal raw from the outset. What the plain write keeps raw stays raw.
+#[test]
+fn r149f_a_reference_beside_a_model_raw_written_formal_is_held() {
+    let plain = held(PLAIN_WRITE);
+    let retyped = held(&PLAIN_WRITE.replace(
+        "*dst = *src + 1;",
+        "*(dst as *mut u32) = (*src + 1) as u32;",
+    ));
+    for label in ["update::src", "caller::src", "outer::v"] {
+        assert!(
+            !is_raw(&plain, label) || is_raw(&retyped, label),
+            "{label}: raw beside the plain write, delivered beside the retyped one: {retyped:?}"
+        );
+    }
+}
