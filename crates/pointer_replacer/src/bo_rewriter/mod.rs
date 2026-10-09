@@ -223,6 +223,8 @@ mod wave6a_receiver_handover_tests;
 #[cfg(test)]
 mod wave6a_return_certificate_tests;
 #[cfg(test)]
+mod wave6a_view_bridge_tests;
+#[cfg(test)]
 mod wave6f_field_reference_tests;
 #[cfg(test)]
 mod wave6k_reverted_class_naming_tests;
