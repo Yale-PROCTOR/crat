@@ -300,3 +300,112 @@ fn r112_r3_9_an_access_after_a_call_that_can_exit_is_refused() {
         pub unsafe fn f(p: *const u8, stop: bool) -> u8 { gate(stop); *p.add(9) }\n";
     assert_eq!(bound(src, "f", 0), None);
 }
+
+// ---- relay 112, the narrowed module's round 1 (Claude stand-in, 10-09) -----
+
+/// The callee bound of pointer LOCAL `local` of `function`.
+fn local_bound(src: &str, function: &str, local: &str) -> Option<String> {
+    let mut out = None;
+    ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
+        let def = tcx
+            .hir_body_owners()
+            .find(|d| {
+                matches!(tcx.def_kind(d.to_def_id()), rustc_hir::def::DefKind::Fn)
+                    && tcx.item_name(d.to_def_id()).as_str() == function
+            })
+            .unwrap_or_else(|| panic!("{function} in the fixture"));
+        struct Find(Option<rustc_hir::HirId>, String);
+        impl<'v> rustc_hir::intravisit::Visitor<'v> for Find {
+            fn visit_pat(&mut self, p: &'v rustc_hir::Pat<'v>) {
+                if let rustc_hir::PatKind::Binding(_, id, ident, _) = p.kind
+                    && ident.name.as_str() == self.1
+                {
+                    self.0 = Some(id);
+                }
+                rustc_hir::intravisit::walk_pat(self, p);
+            }
+        }
+        let mut find = Find(None, local.to_owned());
+        rustc_hir::intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(def));
+        let id = find.0.unwrap_or_else(|| panic!("{local} in {function}"));
+        out = super::decision::callee_bound::of_local(tcx, def, id)
+            .map(|b| b.receipt(&super::decision::callee_bound::parameter_names(tcx, def)));
+    })
+    .expect("fixture compiles");
+    out
+}
+
+/// S1-M1a: `(n >>= 1, 0).1` halves the copied `n` between its evaluation and
+/// the construction after it: length 5, the callee reads index 9.
+#[test]
+fn r112_s1_m1a_a_compound_shift_in_another_argument_is_refused() {
+    let src = format!(
+        "{G_ISIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{\n\
+         let mut n: isize = 10; g(n, (n >>= 1, 0).1, base.offset(k)) }}\n"
+    );
+    assert_eq!(
+        bound(&src, "g", 2).as_deref(),
+        Some("len-callee-bound:may:n")
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// S1-M1b: a macro in another argument writes the copied `n`; its call text
+/// shows no assignment.
+#[test]
+fn r112_s1_m1b_a_macro_in_another_argument_is_refused() {
+    let src = format!(
+        "macro_rules! halve {{ ($x:ident) => {{{{ $x >>= 1; 0 }}}} }}\n\
+         {G_ISIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize) -> u32 {{\n\
+         let mut n: isize = 10; g(n, halve!(n), base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// S1-M1c: a user method named `add` in another argument writes the global
+/// the length copies.
+#[test]
+fn r112_s1_m1c_a_user_method_named_add_writing_the_copied_global_is_refused() {
+    let src = format!(
+        "static mut N: isize = 10;\n\
+         pub struct W;\n\
+         impl W {{ pub fn add(&self, _k: isize) -> i32 {{ unsafe {{ N = 5; }} 1 }} }}\n\
+         {G_ISIZE}\
+         pub unsafe fn caller(base: *const u8, k: isize, w: &W) -> u32 {{ g(N, w.add(1), base.offset(k)) }}\n"
+    );
+    no_callee_bound_at_the_call(&src);
+}
+
+/// S1-M2a: `(*m.offset(i)).as_mut_ptr()` escapes row `i`'s address through an
+/// autoref; it is no read of row `i`.
+#[test]
+fn r112_s1_m2a_an_autoref_of_the_pointee_is_refused() {
+    let src = "extern \"C\" { fn memset(d: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }\n\
+        pub unsafe fn clear(m: *mut [i32; 4], n: i32) {\n\
+        let mut i: i32 = 0;\n\
+        while i < n { memset((*m.offset(i as isize)).as_mut_ptr() as *mut core::ffi::c_void, 0, 32); i += 1; } }\n";
+    assert_eq!(bound(src, "clear", 0), None);
+}
+
+/// S1-M2b: the address of a field of the pointee escapes.
+#[test]
+fn r112_s1_m2b_an_address_through_a_projection_is_refused() {
+    let src = "pub struct S { pub f: i32 }\n\
+        extern \"C\" { fn keep(q: *mut i32); }\n\
+        pub unsafe fn mark(p: *mut S, n: i32) {\n\
+        let mut i: i32 = 0;\n\
+        while i < n { keep(&mut (*p.offset(i as isize)).f); i += 1; } }\n";
+    assert_eq!(bound(src, "mark", 0), None);
+}
+
+/// S1-M3: a row pointer bound anew on every iteration (row `i` of a
+/// triangular table holds `i + 1` elements) is no allocation of `n`.
+#[test]
+fn r112_s1_m3_a_local_bound_inside_the_loop_is_refused() {
+    let src = "pub unsafe fn tri(rows: *const *mut i32, n: i32) {\n\
+        let mut i: i32 = 0;\n\
+        while i < n { let mut row: *mut i32 = *rows.offset(i as isize); *row.offset(i as isize) = 1; i += 1; } }\n";
+    assert_eq!(local_bound(src, "tri", "row"), None);
+}
