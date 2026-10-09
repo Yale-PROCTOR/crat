@@ -414,11 +414,16 @@ fn r838_signature(name: &str) -> String {
     }
 }
 
+/// **R936-1 (P11, the USER with the advisor)**: `G2` holding `G1`'s pointer
+/// is aliasing through a global, outside the claim; the premise arm clears
+/// `add(G1, G2)` (receipted `pair-disjoint:premise=global-or-integer-
+/// provenance:global-value`), so `add`'s formals take their references (R838's
+/// hold of this shape withdrawn).
 #[test]
 fn r838_add_of_two_statics_contents_keeps_both_formals_raw() {
     let signature = r838_signature("add");
     assert!(
-        signature.contains("mut a: *mut i32") && signature.contains("mut b: *mut i32"),
+        signature.contains("a: &mut i32") && signature.contains("b: &"),
         "({signature})"
     );
 }

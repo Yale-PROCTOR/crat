@@ -207,6 +207,16 @@ const TRANSFORM_EDT: &str = r#"
             x += 1;
         }
     }
+    // wave-5d 150 (R934-1 (i)): a live caller of two separate arrays, so
+    // `transform`'s own pair is certified (R931-1's caller side) at `edt(f, z)`
+    // rather than held as an unknown relation (an uncalled function's
+    // vacuity does not seed (e): R901-2, deferred).
+    #[no_mangle]
+    pub unsafe extern "C" fn __crat_test_live() {
+        let mut a = [0f32; 64];
+        let mut b = [0f32; 72];
+        transform(a.as_mut_ptr(), b.as_mut_ptr(), 8, 8);
+    }
 "#;
 
 #[test]

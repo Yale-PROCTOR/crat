@@ -105,6 +105,12 @@ fn is_slice(decision: &Decision, mutable: bool) -> bool {
     matches!(decision, Decision::Slice { mutable: m, .. } if *m == mutable)
 }
 
+/// R934-1 (i): held beside a pair not shown disjoint.
+fn is_pair_held(decision: &Decision) -> bool {
+    matches!(decision, Decision::Degraded(d)
+        if matches!(d.reason, DegradeReason::PairNotShownDisjoint { .. }))
+}
+
 fn is_pair_raw_view(decision: &Decision) -> bool {
     matches!(decision, Decision::Degraded(d) if d.reason == DegradeReason::PairRawView)
 }
@@ -249,11 +255,22 @@ pub unsafe fn get_value64(mut item: *mut binn, mut pos: libc::c_int, mut value: 
 
 /// The formals are byte regions of the scalar's size and the byte views
 /// deliver. On the base every formal is `arg-cast-form-unbuilt` and the views
-/// are withheld with them.
+/// are withheld with them. **R934-1 (i) (the seat on 149f; R833-1):**
+/// `copy_be16` / `copy_be64` are called at a pair the proofs do not clear (a
+/// cursor loaded from `item` beside the payload), so their written formal is
+/// held raw with the read one; `copy_be32`'s calls are certified and are the
+/// byte-region witness (wave-5d 150).
 #[test]
 fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
     let rows = decisions(COPY_BE);
-    for function in ["copy_be16", "copy_be32", "copy_be64"] {
+    for function in ["copy_be16", "copy_be64"] {
+        assert!(
+            is_pair_held(decision(&rows, function, "pdest")),
+            "{function}::pdest beside an unproven pair is held: {:?}",
+            decision(&rows, function, "pdest")
+        );
+    }
+    for function in ["copy_be32"] {
         assert!(
             is_slice(decision(&rows, function, "pdest"), true),
             "{function}::pdest is a mutable byte region: {:?}",
@@ -275,11 +292,7 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
     let (source, _) = emitted(COPY_BE);
     let c = compact(&source);
     // The count names the RESOLVED scalar, as W6B-6's views always have.
-    for (function, width) in [
-        ("copy_be16", "u16"),
-        ("copy_be32", "u32"),
-        ("copy_be64", "u64"),
-    ] {
+    for (function, width) in [("copy_be32", "u32")] {
         assert!(
             c.contains(&format!("fn{function}(mutpdest:&mut[u8],")),
             "{function}: the written formal is a byte region: {source}"
@@ -289,15 +302,15 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
             "{function}: the byte view is a child of the formal's region: {source}"
         );
     }
-    // The three read views deliver as exact byte slices — `copy_be64`'s too,
-    // whose index is the loop's `7 - i`: the view is one scalar's storage, so
-    // the cursor family does not take it over a fallback extent (R422-7).
-    assert_eq!(
+    // The read views deliver as exact byte slices where the region does
+    // (R422-7: one scalar's storage, never a fallback extent).
+    assert!(
         c.matches("letmutsource:&[u8]=core::slice::from_raw_parts(")
-            .count(),
-        3,
+            .count()
+            >= 1,
         "{source}"
     );
+    assert!(!c.contains("FALLBACK_SLICE_EXTENT)"), "{source}");
     assert!(
         c.contains("copy_be32(core::slice::from_raw_parts_mut(((pas*mutu32_0)as*mutu8),4)"),
         "a byte cursor is bridged as exactly four bytes, no typed reference: {source}"
@@ -344,52 +357,33 @@ fn w6b_byte_region_formals_run_identically() {
     assert_eq!(original, run_binary(&with_libc(&source)));
 }
 
-/// R609-4 (a): at a call the pair proofs do not clear, the READ side stays raw
-/// (`pair-raw-view`) and the WRITE side converts, its bridge at that call
-/// receipted T2 under the named waiver. The fixture's own two such calls are
-/// the corpus's shapes: `put_value16`'s cursor beside the void payload
+/// R609-4 (a) converted the WRITE side at a call the pair proofs do not clear,
+/// beside the READ side's raw view (a T2 bridge under the named waiver).
+/// **R934-1 (i) (the seat on 149f; R833-1):** a pair not shown disjoint keeps
+/// both sides raw, so at `put_value16`'s cursor beside the void payload
 /// (AddValue:1029) and `get_value64`'s union field beside a cursor
-/// (GetValue:1432). `copy_be32`'s calls are certified, and stay T1.
+/// (GetValue:1432) the written formal is held with the read one; `copy_be32`'s
+/// calls are certified, and its bridges stay T1 (wave-5d 150).
 #[test]
 fn w6b_an_unproven_byte_region_pair_keeps_the_read_side_raw() {
     let rows = decisions(COPY_BE);
     for function in ["copy_be16", "copy_be64"] {
         assert!(
-            is_slice(decision(&rows, function, "pdest"), true),
-            "{function}: the written side converts: {:?}",
+            is_pair_held(decision(&rows, function, "pdest")),
+            "{function}: the written side is held beside the unproven pair: {:?}",
             decision(&rows, function, "pdest")
         );
         assert!(
-            is_pair_raw_view(decision(&rows, function, "psource")),
+            matches!(decision(&rows, function, "psource"), Decision::Degraded(_)),
             "{function}: the read side of an unproven pair stays raw: {:?}",
             decision(&rows, function, "psource")
         );
     }
     let (source, events) = emitted(COPY_BE);
-    let c = compact(&source);
-    for (function, width) in [("copy_be16", "u16"), ("copy_be64", "u64")] {
-        assert!(
-            c.contains(&format!(
-                "fn{function}(mutpdest:&mut[u8],mutpsource:*mut{width}_0)"
-            )),
-            "{function}: {source}"
-        );
-    }
     let region_bridges = events
         .iter()
         .filter(|(kind, _, _)| kind.starts_with("c-raw-slice"))
         .collect::<Vec<_>>();
-    let t2 = region_bridges
-        .iter()
-        .filter(|(_, tier, waiver)| {
-            *tier == super::bridge_receipt::BridgeRetentionTier::T2
-                && waiver.as_deref() == Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
-        })
-        .count();
-    assert!(
-        t2 >= 2,
-        "the two unproven calls' write-side bridges carry the T2 receipt: {events:#?}"
-    );
     assert!(
         region_bridges
             .iter()
@@ -415,10 +409,11 @@ fn w6b_a_same_root_call_keeps_the_hold() {
             decision(&rows, "copy_be32", name)
         );
     }
-    assert!(
-        is_slice(decision(&rows, "copy_be16", "pdest"), true),
-        "the other callees are unaffected: {:?}",
-        decision(&rows, "copy_be16", "pdest")
+    let base = decisions(COPY_BE);
+    assert_eq!(
+        format!("{:?}", decision(&rows, "copy_be16", "pdest")),
+        format!("{:?}", decision(&base, "copy_be16", "pdest")),
+        "the other callees are unaffected"
     );
 }
 

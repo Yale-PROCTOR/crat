@@ -146,19 +146,26 @@ pub unsafe fn both() -> u8 { let mut tmp = malloc(64); G = tmp; cp2(G, tmp); *tm
 pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); G = tmp; cp(G.offset(32), tmp); *tmp }
 "#;
 
-/// wave-5d 148b (the review's HIGH-1): a pointer static's VALUE is not the
-/// static's storage. `G == tmp`, so `cp2(G, tmp)` must not deliver both sides.
+/// wave-5d 148b: a pointer static's VALUE is not the static's storage, so no
+/// structural certificate reads `G` as a root. **R936-1 (P11, the USER with
+/// the advisor)** puts aliasing through a global outside the claim: the pair is
+/// cleared by the premise arm, receipted, and nothing is held for it (R930-1's
+/// hold is withdrawn; `G = tmp` makes this fixture an input outside the claim).
 #[test]
 fn r148b_a_pointer_statics_value_is_not_its_storage() {
     let rows = held(STATIC_VALUE);
-    // R930-1: both sides raw (R833-1's peer arm holds the primary beside the
-    // pair's raw view; on the composed 57 head).
     assert!(
-        is_raw(&rows, "cp2::d") && is_raw(&rows, "cp2::s"),
+        !is_held(&rows, "cp2::d") && !is_held(&rows, "cp2::s") && !is_held(&rows, "cp::s"),
         "{rows:?}"
     );
-    // The raw-side shape: `d` writes inside the view `s` would take.
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(STATIC_VALUE, "both", "cp2", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalValue
+            )
+        )
+    );
 }
 
 const INTEGER_CAST: &str = r#"
@@ -167,15 +174,23 @@ unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 pub unsafe fn caller(buf: *mut u8, n: usize) -> u8 { cp2(n as *mut u8, buf); *buf }
 "#;
 
-/// wave-5d 148b (the review's HIGH-2): an integer cast to a pointer is not a
-/// stack object (`n` may be `(uintptr_t)buf` in C).
+/// wave-5d 148b: an integer cast to a pointer is not a stack object, so no
+/// structural certificate reads it as one. **R936-1 (P11)**: aliasing through
+/// an integer is outside the claim; the premise arm clears the pair, receipted.
 #[test]
 fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
     let rows = held(INTEGER_CAST);
-    // R930-1: both sides raw (the stand-in review's LOW).
     assert!(
-        is_raw(&rows, "cp2::s") && is_raw(&rows, "cp2::d"),
+        !is_held(&rows, "cp2::s") && !is_held(&rows, "cp2::d"),
         "{rows:?}"
+    );
+    assert_eq!(
+        verdict_at(INTEGER_CAST, "caller", "cp2", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::Integer
+            )
+        )
     );
 }
 
@@ -305,28 +320,58 @@ unsafe fn cp2(d: *mut u8, s: *const u8) {{ *d = *s; }}
     )
 }
 
+/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
 #[test]
 fn r149g_a_statics_value_through_a_local_may_point_anywhere() {
-    let rows = held(&anywhere_shape(
+    let source = anywhere_shape(
         "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut p = G; cp(p.offset(32), tmp); *tmp }",
-    ));
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    );
+    let rows = held(&source);
+    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(&source, "a", "cp", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalValue
+            )
+        )
+    );
 }
 
+/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
 #[test]
 fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
-    let rows = held(&anywhere_shape(
+    let source = anywhere_shape(
         "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }",
-    ));
-    assert!(is_raw(&rows, "cp2::s"), "{rows:?}");
+    );
+    let rows = held(&source);
+    assert!(!is_held(&rows, "cp2::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(&source, "b", "cp2", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::Integer
+            )
+        )
+    );
 }
 
+/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
 #[test]
 fn r149g_a_pointer_field_of_a_static_may_point_anywhere() {
-    let rows = held(&anywhere_shape(
+    let source = anywhere_shape(
         "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); S.buf = tmp; cp(S.buf.offset(32), tmp); *tmp }",
-    ));
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    );
+    let rows = held(&source);
+    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(&source, "c", "cp", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalValue
+            )
+        )
+    );
 }
 
 /// The certificate's verdict for `caller → callee(l, r)`.
@@ -384,7 +429,17 @@ fn r149g_an_address_taken_function_is_not_certified_static_vs_formal() {
         "{STATIC_VS_FORMAL}pub static FP: unsafe fn(*mut u8) -> u8 = f;\n\
          pub unsafe fn through() -> u8 {{ FP(G.as_mut_ptr()) }}\n"
     );
-    assert!(verdict_at(&input, "f", "cp2", 0, 1).is_err());
+    // R936-1 (P11): no structural certificate (the address-taken guard
+    // holds); `G.as_ptr()` is a pointer to a static's storage, so the premise
+    // arm clears the pair, receipted.
+    assert_eq!(
+        verdict_at(&input, "f", "cp2", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalStorage
+            )
+        )
+    );
 }
 
 /// wave-5d 149g (the stand-in review's MED-2): a call inside a closure is a
@@ -461,23 +516,19 @@ fn integer_round_trip() -> String {
     )
 }
 
-/// wave-6a 157c §2 (soundness): a write through an integer round trip of the
-/// sibling formal hides nothing from the pair rule. What the plain write
-/// keeps raw beside `dst`, the round trip keeps raw too.
+/// wave-6a 157c §2: the write through an integer round trip of the sibling
+/// formal. **R936-1 (P11)**: aliasing through an integer is outside the claim,
+/// so the round trip is not chased (relay 197 drops R934-1 (iii)); the pair is
+/// not held and the three are delivered. The plain write (no integer) stays
+/// held, as R833-1 asks.
 #[test]
-fn r157c_a_write_through_an_integer_round_trip_hides_nothing_from_the_pair_rule() {
+fn r157c_a_write_through_an_integer_round_trip_is_outside_the_claim() {
     let plain = held(PLAIN_WRITE);
     let round = held(&integer_round_trip());
     let watched = ["update::src", "caller::src", "outer::v"];
-    assert!(
-        watched.iter().any(|label| is_raw(&plain, label)),
-        "the plain write keeps nothing raw: {plain:?}"
-    );
     for label in watched {
-        assert!(
-            !is_raw(&plain, label) || is_raw(&round, label),
-            "{label}: raw beside the plain write, delivered beside the round trip: {round:?}"
-        );
+        assert!(is_raw(&plain, label), "{label}: {plain:?}");
+        assert!(!is_raw(&round, label), "{label}: {round:?}");
     }
 }
 
@@ -504,20 +555,39 @@ fn r149f_a_reference_beside_a_model_raw_written_formal_is_held() {
 /// may point anywhere is never complete. Each of these reaches `cp` beside
 /// `tmp` (the same block, `G = tmp`) through a shape the list does not name,
 /// and the relation answers unknown.
-fn residual(body: &str) -> Vec<(String, bool, bool)> {
-    held(&anywhere_shape(&format!(
+fn residual_source(body: &str) -> String {
+    anywhere_shape(&format!(
         "unsafe fn get_g() -> *mut u8 {{ G }}\nunsafe fn ld(o: *mut *mut u8) {{ *o = G; }}\n{body}"
-    )))
+    ))
 }
 
+fn residual(body: &str) -> Vec<(String, bool, bool)> {
+    held(&residual_source(body))
+}
+
+/// R936-1 (P11, relay 197 item 2): a global's value reaches the call, so the
+/// premise arm clears the pair, receipted; nothing is held.
 #[test]
-fn r149h_a_getter_of_a_statics_value_is_held() {
-    let rows = residual(
+fn r149h_a_getter_of_a_statics_value_is_a_receipted_premise() {
+    let source = residual_source(
         "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; cp(get_g().offset(32), tmp); *tmp }",
     );
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    let rows = held(&source);
+    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(&source, "a", "cp", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalValue
+            )
+        )
+    );
 }
 
+/// R936-1 (P11): a conditional is a premise only when EVERY branch's
+/// provenance passes through a global or an integer; here the `else` branch
+/// (`buf`, an entry formal) does not, so no premise and the pair stays held
+/// (the conservative side; relay 197 item 2 asked for a receipt, named in 150).
 #[test]
 fn r149h_a_conditional_over_a_statics_value_is_held() {
     let rows = residual(
@@ -526,6 +596,9 @@ fn r149h_a_conditional_over_a_statics_value_is_held() {
     assert!(is_raw(&rows, "cp::s"), "{rows:?}");
 }
 
+/// R936-1 (P11): what `ld` stores through `&mut p` is not in the caller's text
+/// (an address-taken local is no premise), so the pair stays held (the
+/// conservative side; named in 150).
 #[test]
 fn r149h_an_out_parameter_loaded_with_a_statics_value_is_held() {
     let rows = residual(
@@ -534,6 +607,8 @@ fn r149h_an_out_parameter_loaded_with_a_statics_value_is_held() {
     assert!(is_raw(&rows, "cp::s"), "{rows:?}");
 }
 
+/// R936-1 (P11): a local aggregate's slot is not followed (its stores are not
+/// read), so the pair stays held (the conservative side; named in 150).
 #[test]
 fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
     let rows = residual(
@@ -542,12 +617,23 @@ fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
     assert!(is_raw(&rows, "cp::s"), "{rows:?}");
 }
 
+/// R936-1 (P11, relay 197 item 2): a global's value reaches the call, so the
+/// premise arm clears the pair, receipted; nothing is held.
 #[test]
-fn r149h_a_pointer_to_a_static_struct_is_held() {
-    let rows = residual(
+fn r149h_a_pointer_to_a_static_struct_is_a_receipted_premise() {
+    let source = residual_source(
         "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); S.buf = tmp; let s: *mut C = &mut S; cp((*s).buf.offset(32), tmp); *tmp }",
     );
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    let rows = held(&source);
+    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
+    assert_eq!(
+        verdict_at(&source, "a", "cp", 0, 1),
+        Ok(
+            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
+                super::decision::global_or_integer::ProvenanceKind::GlobalValue
+            )
+        )
+    );
 }
 
 /// Control: a fresh block beside a stack array at the same call is certified

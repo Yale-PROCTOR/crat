@@ -89,6 +89,8 @@ mod exclusion_rederivation_tests;
 mod field_reference_ast;
 pub(crate) mod flexible_tail_ast;
 #[cfg(test)]
+mod local_pair_proof_tests;
+#[cfg(test)]
 mod nested_one_sided_tests;
 #[cfg(test)]
 mod one_element_guard_tests;
@@ -147,8 +149,6 @@ mod pair_type_rule_yield_tests;
 mod pair_view_of_formal_tests;
 #[cfg(test)]
 mod pending_hold_tests;
-#[cfg(test)]
-mod local_pair_proof_tests;
 pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) mod premise_census;
@@ -632,6 +632,10 @@ pub(crate) struct RawBoundaryArtifacts {
     /// census reader counts its rows as the view kind in place of its own view
     /// reading. Empty: the reader's own view reading stands.
     pub(crate) premise_view_sites: String,
+    /// **P11 (R936-1, the USER with the advisor)** — every pair the pair
+    /// certificates clear only by the global-or-integer provenance premise
+    /// (`<p>.raw-boundary-pair-premise.tsv`; its rows are the program's count).
+    pub(crate) pair_premise_receipts: String,
     /// Relay 297: the settled-table holds' receipts, one row per predicate that
     /// named a subject (`<p>.raw-boundary-settled-holds.tsv`).
     pub(crate) settled_hold_receipts: String,
@@ -10013,6 +10017,10 @@ fn finish_decide<'tcx>(
             ),
             allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
             premise_view_sites: String::new(),
+            pair_premise_receipts: a5_site_proofs
+                .pair_certificates()
+                .map(|certificates| certificates.premise_receipts_tsv(tcx))
+                .unwrap_or_default(),
             settled_hold_receipts: decision::settled_holds::receipts_tsv(tcx, &table),
             a5_hold_views: String::new(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),

@@ -12797,6 +12797,8 @@ mod run {
             ("premise-view-sites", artifact.premise_view_sites.as_str()),
             // Relay 297: the settled-table holds, one row per predicate.
             ("settled-holds", artifact.settled_hold_receipts.as_str()),
+            // R936-1 (P11): the pairs the certificates clear by the premise.
+            ("pair-premise", artifact.pair_premise_receipts.as_str()),
         ];
         for (suffix, contents) in artifact_rows {
             std::fs::write(

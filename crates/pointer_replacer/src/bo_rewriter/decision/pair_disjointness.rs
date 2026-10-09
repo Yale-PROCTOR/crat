@@ -83,6 +83,12 @@ pub(crate) enum CertificateKind {
     /// in-program call of the caller passes them disjoint objects. Its own key
     /// so the census counts R931-1's share apart from (e)'s.
     CallerParameterPair,
+    /// **P11 (R936-1, the USER with the advisor).** The LAST arm: one side's
+    /// provenance passes through a global or an integer, and the premise says
+    /// such a pointer designates no object another argument designates. An
+    /// assumption, never a proof: receipted per pair and counted
+    /// (`<p>.raw-boundary-pair-premise.tsv`).
+    GlobalOrIntegerPremise(super::global_or_integer::ProvenanceKind),
     /// R466-5, temporal rather than class-based: one side is the address of a
     /// stack local FIRST taken at this very call, and the callee never retains
     /// that position. No pointer VALUE computed before the call can name that
@@ -140,6 +146,17 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::CallerParameterPair => "pair-disjoint:caller-parameter-pair",
+            Self::GlobalOrIntegerPremise(kind) => match kind {
+                super::global_or_integer::ProvenanceKind::GlobalValue => {
+                    "pair-disjoint:premise=global-or-integer-provenance:global-value"
+                }
+                super::global_or_integer::ProvenanceKind::GlobalStorage => {
+                    "pair-disjoint:premise=global-or-integer-provenance:global-storage"
+                }
+                super::global_or_integer::ProvenanceKind::Integer => {
+                    "pair-disjoint:premise=global-or-integer-provenance:integer"
+                }
+            },
             Self::ExportedEntryWaiver => "pair-disjoint:exported-entry-waiver",
             Self::StaticVsEntry(_) => "pair-disjoint:static-vs-entry",
             // R672-4: the waiver is in the census key, so its sites are counted
@@ -171,6 +188,10 @@ impl CertificateKind {
 }
 
 pub(crate) const CERTIFICATE_FAMILY: &str = "pair-disjointness-certificate";
+
+/// P11's family: the premise, not the roots, clears the pair.
+pub(crate) const PREMISE_FAMILY: &str =
+    "pair-disjointness-certificate:premise=global-or-integer-provenance";
 
 /// R619-4: the certificate family with the root class of each side, in
 /// argument-index order — `entry` (a pointer parameter of the calling function
@@ -447,6 +468,9 @@ struct ArgRecord {
     stored_fields: Vec<(DefId, Symbol)>,
     /// R628-7 (f′): the argument's place is rooted at a stable binding.
     place_stable: bool,
+    /// P11 (R936-1): the argument's provenance passes through a global or an
+    /// integer on every path the text shows.
+    premise: Option<super::global_or_integer::Provenance>,
 }
 
 #[derive(Clone, Debug)]
@@ -617,6 +641,7 @@ impl PairDisjointnessIndex {
             let stable = stable_bindings(typeck, body);
             let mut collector = CallCollector {
                 tcx,
+                caller,
                 typeck,
                 locals: &local_functions,
                 classes: &classes,
@@ -805,14 +830,21 @@ impl PairDisjointnessIndex {
         &self,
         tcx: TyCtxt<'tcx>,
         function: LocalDefId,
-        left: &Expr<'_>,
-        right: &Expr<'_>,
+        left: &'tcx Expr<'tcx>,
+        right: &'tcx Expr<'tcx>,
     ) -> Option<CertificateKind> {
         let classes = self.binding_roots.get(&function.local_def_index.as_u32())?;
         let typeck = tcx.typeck(function);
         let (a, _) = argument_provenance(tcx, typeck, classes, left);
         let (b, _) = argument_provenance(tcx, typeck, classes, right);
-        certify_roots(a, b)
+        certify_roots(a, b).or_else(|| {
+            // P11 (R936-1), the last arm.
+            super::global_or_integer::premise(
+                super::global_or_integer::provenance(tcx, function, left),
+                super::global_or_integer::provenance(tcx, function, right),
+            )
+            .map(CertificateKind::GlobalOrIntegerPremise)
+        })
     }
 
     pub(crate) fn certify_bindings(
@@ -1318,6 +1350,10 @@ impl PairDisjointnessIndex {
         if union_members {
             return Err(Unproved::UnionSibling);
         }
+        // P11 (R936-1), the LAST arm: every structural certificate failed.
+        if let Some(kind) = super::global_or_integer::premise(a.premise, b.premise) {
+            return Ok(CertificateKind::GlobalOrIntegerPremise(kind));
+        }
         Err(match type_verdict {
             Err(Unproved::TypeUnresolved) => Unproved::RootsUnknown,
             Err(why) => why,
@@ -1487,6 +1523,60 @@ impl PairDisjointnessIndex {
 
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {
         self.ledger.borrow().clone()
+    }
+
+    /// **P11 (R936-1) — the receipt table.** Every recorded pair of pointer
+    /// arguments the certificates clear only by the premise (the last arm), one
+    /// row each: `caller callee site left right kind left_root right_root`.
+    /// The census writes it as `<p>.raw-boundary-pair-premise.tsv`; its row
+    /// count is the program's P11 count.
+    pub(crate) fn premise_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let name = |index: u32| {
+            tcx.def_path_str(
+                LocalDefId {
+                    local_def_index: rustc_hir::def_id::DefIndex::from_u32(index),
+                }
+                .to_def_id(),
+            )
+        };
+        let root = |premise: Option<super::global_or_integer::Provenance>| {
+            premise.map_or("-", |provenance| provenance.kind().key())
+        };
+        let mut keys: Vec<_> = self.sites.keys().copied().collect();
+        keys.sort_unstable();
+        let mut out =
+            String::from("caller\tcallee\tsite\tleft\tright\tkind\tleft_root\tright_root\n");
+        for (caller, callee) in keys {
+            for site in &self.sites[&(caller, callee)] {
+                for (position, a) in site.args.iter().enumerate() {
+                    for b in &site.args[position + 1..] {
+                        if !(a.is_pointer && b.is_pointer)
+                            || (a.premise.is_none() && b.premise.is_none())
+                        {
+                            continue;
+                        }
+                        if let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) =
+                            self.certify_inner(caller, callee, a.index, b.index, a.span, b.span)
+                        {
+                            out.push_str(&format!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                name(caller),
+                                name(callee),
+                                tcx.sess
+                                    .source_map()
+                                    .span_to_diagnostic_string(site.call_span),
+                                a.index,
+                                b.index,
+                                kind.key(),
+                                root(a.premise),
+                                root(b.premise),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[allow(
@@ -4224,6 +4314,7 @@ impl<'tcx> Visitor<'tcx> for LocalCollector<'_, 'tcx> {
 
 struct CallCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
     typeck: &'a TypeckResults<'tcx>,
     locals: &'a FxHashSet<LocalDefId>,
     classes: &'a FxHashMap<HirId, RootClass>,
@@ -4334,6 +4425,7 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                         field_of_formal,
                         stored_fields,
                         place_stable: pointee.is_some(),
+                        premise: super::global_or_integer::provenance(self.tcx, self.caller, arg),
                     }
                 })
                 .collect();

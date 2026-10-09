@@ -304,181 +304,6 @@ enum Object {
     Unknown,
 }
 
-/// **wave-5d 148b (R930-1).** A pointer value that may address ANY object of the
-/// program: an integer cast to a pointer (`n as *mut T`, which a UB-free C
-/// program may have built as `(uintptr_t)buf`) or the value stored in a pointer
-/// static (`G`, `G.offset(k)`: whatever the program put there, a heap block it
-/// also holds included), read through pointer arithmetic and pointer casts.
-/// **wave-5d 149g (the stand-in review's HIGH-1):** also through a local, by
-/// any of its definitions in the caller (`let p = G;`, `let q = n as *mut u8;`),
-/// and a pointer read out of a static's storage (`S.buf`, `T[k]`) or through
-/// such a value (`*G2`).
-fn may_point_anywhere<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: LocalDefId,
-    typeck: &TypeckResults<'tcx>,
-    expr: &rustc_hir::Expr<'tcx>,
-) -> bool {
-    anywhere(tcx, caller, typeck, expr, &mut Vec::new())
-}
-
-fn anywhere<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: LocalDefId,
-    typeck: &TypeckResults<'tcx>,
-    expr: &rustc_hir::Expr<'tcx>,
-    seen: &mut Vec<HirId>,
-) -> bool {
-    use rustc_hir::{
-        ExprKind, QPath,
-        def::{DefKind, Res},
-    };
-    let mut expr = expr;
-    loop {
-        match &expr.kind {
-            ExprKind::Cast(inner, _) => {
-                if typeck.expr_ty(inner).is_integral() {
-                    // A literal (`0 as *mut T`, a sentinel) addresses no
-                    // object; a computed integer may be any object's address.
-                    return !is_integer_literal(inner);
-                }
-                expr = inner;
-            }
-            ExprKind::DropTemps(inner) => expr = inner,
-            ExprKind::MethodCall(segment, receiver, _, _)
-                if matches!(
-                    segment.ident.name.as_str(),
-                    "offset"
-                        | "add"
-                        | "sub"
-                        | "wrapping_offset"
-                        | "wrapping_add"
-                        | "wrapping_sub"
-                        | "cast"
-                        | "cast_mut"
-                        | "cast_const"
-                ) && typeck.expr_ty(receiver).is_raw_ptr() =>
-            {
-                expr = receiver
-            }
-            ExprKind::Path(QPath::Resolved(None, path)) => {
-                return match path.res {
-                    Res::Def(DefKind::Static { .. }, _) => typeck.expr_ty(expr).is_raw_ptr(),
-                    // A local holds what any of its definitions put there; a
-                    // local met again on this walk adds nothing, and a walk
-                    // past the bound answers "anywhere".
-                    Res::Local(binding) if typeck.expr_ty(expr).is_raw_ptr() => {
-                        if seen.contains(&binding) {
-                            return false;
-                        }
-                        if seen.len() >= 16 {
-                            return true;
-                        }
-                        seen.push(binding);
-                        definitions(tcx, caller, binding)
-                            .into_iter()
-                            .any(|value| anywhere(tcx, caller, typeck, value, seen))
-                    }
-                    _ => false,
-                };
-            }
-            ExprKind::Field(..)
-            | ExprKind::Index(..)
-            | ExprKind::Unary(rustc_hir::UnOp::Deref, _)
-                if typeck.expr_ty(expr).is_raw_ptr() =>
-            {
-                return static_place(tcx, caller, typeck, expr, seen);
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// An integer literal under casts and negation.
-fn is_integer_literal(mut expr: &rustc_hir::Expr<'_>) -> bool {
-    use rustc_hir::ExprKind;
-    loop {
-        match &expr.kind {
-            ExprKind::Cast(inner, _)
-            | ExprKind::DropTemps(inner)
-            | ExprKind::Unary(rustc_hir::UnOp::Neg, inner) => expr = inner,
-            ExprKind::Lit(_) => return true,
-            _ => return false,
-        }
-    }
-}
-
-/// Is the place in a static's storage, or reached through a pointer that may
-/// point anywhere?
-fn static_place<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: LocalDefId,
-    typeck: &TypeckResults<'tcx>,
-    place: &rustc_hir::Expr<'tcx>,
-    seen: &mut Vec<HirId>,
-) -> bool {
-    use rustc_hir::{
-        ExprKind, QPath,
-        def::{DefKind, Res},
-    };
-    match &place.kind {
-        ExprKind::Field(base, _) | ExprKind::Index(base, _, _) | ExprKind::DropTemps(base) => {
-            static_place(tcx, caller, typeck, base, seen)
-        }
-        ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) => {
-            anywhere(tcx, caller, typeck, pointer, seen)
-        }
-        ExprKind::Path(QPath::Resolved(None, path)) => {
-            matches!(path.res, Res::Def(DefKind::Static { .. }, _))
-        }
-        _ => false,
-    }
-}
-
-/// Every value `caller`'s body stores into `binding`: its `let` initializer
-/// and the right-hand sides of its assignments.
-fn definitions<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    caller: LocalDefId,
-    binding: HirId,
-) -> Vec<&'tcx rustc_hir::Expr<'tcx>> {
-    use rustc_hir::intravisit::{self, Visitor};
-    struct Defs<'tcx> {
-        binding: HirId,
-        found: Vec<&'tcx rustc_hir::Expr<'tcx>>,
-    }
-    impl<'tcx> Visitor<'tcx> for Defs<'tcx> {
-        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
-            if let rustc_hir::PatKind::Binding(_, id, _, _) = local.pat.kind
-                && id == self.binding
-                && let Some(init) = local.init
-            {
-                self.found.push(init);
-            }
-            intravisit::walk_local(self, local);
-        }
-
-        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
-                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
-                && path.res == rustc_hir::def::Res::Local(self.binding)
-            {
-                self.found.push(rhs);
-            }
-            intravisit::walk_expr(self, expr);
-        }
-    }
-    let Some(body) = tcx.hir_maybe_body_owned_by(caller) else {
-        return Vec::new();
-    };
-    let mut defs = Defs {
-        binding,
-        found: Vec::new(),
-    };
-    defs.visit_body(body);
-    defs.found
-}
-
 fn object_of(designation: Option<&Designation>, null: bool) -> Object {
     if null {
         return Object::Null;
@@ -1058,16 +883,12 @@ pub(crate) fn holds(
                     };
                     let (dl, dr) = (designation(left), designation(right));
                     let null = |arg: &Arg| matches!(arg.shape, ArgShape::NullLit);
-                    // wave-5d 148b (R930-1): a value that may address ANY object
-                    // beside a non-null argument is unresolved, never unknown.
-                    let anywhere = |arg: &Arg| {
-                        expression(arg.index)
-                            .is_some_and(|expr| may_point_anywhere(tcx, call.caller, typeck, expr))
-                    };
+                    // R936-1 (P11, USER with the advisor): a value whose
+                    // provenance passes through a global or an integer is no
+                    // reason to hold here (R930-1's hold withdrawn); the
+                    // certificates' last arm clears such a pair, receipted.
                     let relation = if null(left) || null(right) {
                         Relation::Disjoint
-                    } else if anywhere(left) || anywhere(right) {
-                        Relation::Unresolved
                     } else {
                         match (&dl, &dr) {
                             // One root: equal steps or one inside the other is one
@@ -1130,6 +951,40 @@ pub(crate) fn holds(
                             },
                         }
                     };
+                    // **wave-5d 149f / 149h (an OPTION for the seat; R870-1's
+                    // reading (b) for this kind only).** A reference formal
+                    // beside a raw one has no PAIR row (A5 replays only pairs
+                    // both of whose formals convert), so "the PAIR, the twin or
+                    // the exemption answer" is false for it: an unknown relation
+                    // is unresolved, held unless a proof or a certificate clears
+                    // the pair (`lookup` falls back to the certificates).
+                    // wave-6v's field-load exemption (R538-7 / R541-6) answers a
+                    // raw `(*root).f` beside a reference rooted at `root`.
+                    let field_load = |reference: &Arg, raw: &Arg| {
+                        reference.shape.place_root().is_some_and(|root| {
+                            super::counted_void::field_load_exemption(tcx, call, root, raw)
+                                .is_some()
+                        })
+                    };
+                    let relation = match relation {
+                        Relation::Unknown
+                            if kind == "ref-beside-raw"
+                                && !field_load(left, right)
+                                && !field_load(right, left) =>
+                        {
+                            Relation::Unresolved
+                        }
+                        other => other,
+                    };
+                    // The scope's separate-object certificate (R816 / R819 /
+                    // R898-1, and P8 for a byte formal, R815-6): two formals of
+                    // an entry nothing in the program calls are two objects.
+                    if matches!(relation, Relation::Unresolved)
+                        && super::outside_byte_view::certifies(facts, call, left.index, right.index)
+                            .is_some()
+                    {
+                        continue;
+                    }
                     let certified = matches!(edge, Edge::CertifiedClear);
                     let proof = || {
                         proofs.lookup(
@@ -1209,6 +1064,26 @@ pub(crate) fn holds(
                         Relation::Unresolved => {
                             let proof = proof();
                             match proof.verdict {
+                                // wave-5d 149h: the classifier's clear is not
+                                // taken, but it hides the certificates `lookup`
+                                // would otherwise have asked; a certificate clears.
+                                A5SiteProofVerdict::Clear
+                                    if classifier_clear(&proof)
+                                        && proofs.pair_certificates().is_some_and(|index| {
+                                            index
+                                                .certify(
+                                                    call.caller.local_def_index.as_u32(),
+                                                    callee.local_def_index.as_u32(),
+                                                    left.index,
+                                                    right.index,
+                                                    left.span,
+                                                    right.span,
+                                                )
+                                                .is_ok()
+                                        }) =>
+                                {
+                                    continue;
+                                }
                                 A5SiteProofVerdict::Clear if classifier_clear(&proof) => {
                                     format!("unresolved;proof=clear:{}", proof.reason)
                                 }

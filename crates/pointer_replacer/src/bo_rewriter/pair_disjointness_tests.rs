@@ -552,7 +552,21 @@ fn w6p_read_read_pair_is_left_to_the_shared_read_consumer() {
                 .any(|row| row.outcome == Err(Unproved::ReadReadPeers)),
             "a READ/READ pair is refused to the shared-read consumer: {ledger:?}"
         );
-        assert!(ledger.iter().all(|row| row.outcome.is_err()), "{ledger:?}");
+        // wave-5d 150 (R934-1 (i)): the READ/READ pair's own call only; the
+        // driver's call `ExtendLastCommand(…)` is asked too now, and the type
+        // rule (R542, `Command` vs `State`) clears it.
+        let read_read = ledger
+            .iter()
+            .find(|row| row.outcome == Err(Unproved::ReadReadPeers))
+            .map(|row| (row.caller, row.callee))
+            .expect("the read/read row");
+        assert!(
+            ledger
+                .iter()
+                .filter(|row| (row.caller, row.callee) == read_read)
+                .all(|row| row.outcome.is_err()),
+            "{ledger:?}"
+        );
         let proof = table
             .seams
             .overlap_proofs

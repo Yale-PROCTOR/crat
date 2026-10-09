@@ -2043,7 +2043,16 @@ unsafe fn insert_(mut tree: *mut tree_t, mut root: *mut node_t, mut depth: u32) 
         return 1 as i32;
     }
     if ((*root).nw).is_null() { (*root).nw = node_new(); }
-    return insert_(tree, (*root).nw, depth.wrapping_sub(1));
+    // wave-5d 150 (R934-1 (i)): the recursion `insert_(tree, (*root).nw, …)`
+    // is a pair no rule shows disjoint (the type rule yields for entry beside
+    // internal storage, R619-4), so it would hold `tree` raw and hide the
+    // exemption at `tree_insert`'s call this fixture is about; the node walks on
+    // alone.
+    return insert_node((*root).nw, depth.wrapping_sub(1));
+}
+unsafe fn insert_node(mut root: *mut node_t, mut depth: u32) -> i32 {
+    if depth == 0 as u32 { (*root).ne = root; }
+    return 1 as i32;
 }
 unsafe fn tree_new() -> *mut tree_t {
     let mut tree = 0 as *mut tree_t;
@@ -2062,7 +2071,11 @@ unsafe fn tree_insert(mut tree: *mut tree_t) -> i32 {
 /// loaded from the tree as a raw argument beside the shared view.
 #[test]
 fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
-    let source = super::emit_tests::ast_emitted_source_of(QT_INSERT).unwrap();
+    // wave-5d 150 (R934-1 (i)): the attested census world. The unattested world
+    // attaches no certificates, so `insert_`'s own recursive pair `(tree,
+    // (*root).nw)` (an unknown relation) is held there and `tree` never
+    // converts; in the census world the type rule (R542) clears it.
+    let source = super::emit_tests::ast_emitted_source_of_attested(QT_INSERT).unwrap();
     let c = compact(&source);
     assert!(
         c.contains("fninsert_(muttree:&tree_t,mutroot:*mutnode_t,"),
@@ -2079,8 +2092,17 @@ fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
 /// the per-site table, the column counts it, and both are registered.
 #[test]
 fn w6v_field_load_exemption_reaches_the_census_column() {
+    // wave-5d 150 (R934-1 (i)): the attested census world, as above.
     let artifacts = ::utils::compilation::run_compiler_on_str(QT_INSERT, |tcx| {
-        super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+        super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .map(|(_, ctx)| ctx.raw_boundary_artifacts)
+        .expect("raw-boundary trace")
     })
     .expect("fixture compiles");
     let table = &artifacts.field_load_exemption_receipts;
@@ -2100,7 +2122,15 @@ fn w6v_field_load_exemption_reaches_the_census_column() {
         "    (*tree).root = node_new();\n    if (*tree).length > 7 as u32 { (*tree).root = tree as *mut node_t; }\n",
     );
     let artifacts = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+        super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .map(|(_, ctx)| ctx.raw_boundary_artifacts)
+        .expect("raw-boundary trace")
     })
     .expect("fixture compiles");
     assert_eq!(
@@ -2124,8 +2154,16 @@ fn w6v_field_load_exemption_reaches_the_census_column() {
 /// pointee it proved disjoint.
 #[test]
 fn w6v_field_load_exemption_is_receipted_per_site() {
+    // wave-5d 150 (R934-1 (i)): the attested census world, as above.
     ::utils::compilation::run_compiler_on_str(QT_INSERT, |tcx| {
-        let table = super::decide_table(tcx).unwrap();
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
         let keys = table
             .seams
             .field_load_exemptions

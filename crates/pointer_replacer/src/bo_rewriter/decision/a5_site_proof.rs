@@ -253,8 +253,16 @@ impl A5SeamProofIndex {
         if let Ok(kind) = certificates.certify(caller, callee, left, right, left_span, right_span) {
             proof.verdict = A5SiteProofVerdict::Clear;
             proof.reason = kind.key();
-            proof.family =
-                certificates.certificate_family(caller, callee, left, right, left_span, right_span);
+            proof.family = family_of(
+                certificates,
+                kind,
+                caller,
+                callee,
+                left,
+                right,
+                left_span,
+                right_span,
+            );
         }
     }
 
@@ -328,9 +336,18 @@ impl A5SeamProofIndex {
             Ok(kind) => A5PeerProof {
                 verdict: A5SiteProofVerdict::Clear,
                 reason: kind.key(),
-                // R619-4: the family names each side's root class.
-                family: certificates
-                    .certificate_family(caller, callee, left, right, left_span, right_span),
+                // R619-4: the family names each side's root class; P11's
+                // names the premise.
+                family: family_of(
+                    certificates,
+                    kind,
+                    caller,
+                    callee,
+                    left,
+                    right,
+                    left_span,
+                    right_span,
+                ),
                 location: audited.location,
                 left_site: audited.left_site,
                 right_site: audited.right_site,
@@ -492,5 +509,25 @@ mod tests {
         let proof = index.lookup(1, 2, 0, 1, Span::default(), Span::default());
         assert_eq!(proof.verdict, A5SiteProofVerdict::Undeterminable);
         assert_eq!(proof.reason, "seam-a5-site-unresolved");
+    }
+}
+
+/// The certificate's family: the roots of each side, or P11's premise.
+#[allow(clippy::too_many_arguments)]
+fn family_of(
+    certificates: &super::pair_disjointness::PairDisjointnessIndex,
+    kind: super::pair_disjointness::CertificateKind,
+    caller: u32,
+    callee: u32,
+    left: usize,
+    right: usize,
+    left_span: Span,
+    right_span: Span,
+) -> &'static str {
+    match kind {
+        super::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(_) => {
+            super::pair_disjointness::PREMISE_FAMILY
+        }
+        _ => certificates.certificate_family(caller, callee, left, right, left_span, right_span),
     }
 }
