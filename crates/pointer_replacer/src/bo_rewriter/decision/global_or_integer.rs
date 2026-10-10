@@ -66,6 +66,68 @@ impl ProvenanceKind {
     }
 }
 
+/// **R944-1 (relay 201) — which provenances P11 covers.** The user is pricing
+/// keeping globals inside the claim: under `integers-only` a global's value or
+/// storage is no premise (148b's classifier reads it as an Unknown root, and
+/// R934-1 holds the pair unless a structural certificate clears it); integer-
+/// made pointers stay outside the claim under both scopes (R936-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum P11Scope {
+    GlobalsAndIntegers,
+    IntegersOnly,
+}
+
+/// The marker a test fixture carries to select `integers-only` (the compiler
+/// runs its callback on its own thread and fixtures run concurrently, so a
+/// process-wide switch cannot be flipped per test).
+#[cfg(test)]
+pub(crate) const TEST_INTEGERS_ONLY_MARKER: &str = "crat-test-p11-scope: integers-only";
+
+impl P11Scope {
+    /// `CRAT_P11_SCOPE` (fail-loud; absent = `globals-and-integers`, the
+    /// offered behaviour).
+    pub(crate) fn of(tcx: TyCtxt<'_>) -> Self {
+        #[cfg(test)]
+        if tcx.sess.source_map().files().iter().any(|file| {
+            file.src
+                .as_ref()
+                .is_some_and(|src| src.contains(TEST_INTEGERS_ONLY_MARKER))
+        }) {
+            return Self::IntegersOnly;
+        }
+        let _ = tcx;
+        match std::env::var("CRAT_P11_SCOPE") {
+            Err(std::env::VarError::NotPresent) => Self::GlobalsAndIntegers,
+            Ok(value) if value == "globals-and-integers" => Self::GlobalsAndIntegers,
+            Ok(value) if value == "integers-only" => Self::IntegersOnly,
+            other => panic!(
+                "CRAT_P11_SCOPE={other:?}: expected globals-and-integers or integers-only (R944-1)"
+            ),
+        }
+    }
+
+    /// The provenance this scope takes as a premise.
+    fn admits(self, provenance: Option<Provenance>) -> Option<Provenance> {
+        match (self, provenance) {
+            (
+                Self::IntegersOnly,
+                Some(Provenance::GlobalValue(_) | Provenance::GlobalStorage(_)),
+            ) => None,
+            (_, provenance) => provenance,
+        }
+    }
+}
+
+/// The premise for a pair under `scope` (R944-1): a side whose provenance the
+/// scope does not cover is no premise.
+pub(crate) fn premise_in(
+    scope: P11Scope,
+    left: Option<Provenance>,
+    right: Option<Provenance>,
+) -> Option<ProvenanceKind> {
+    premise(scope.admits(left), scope.admits(right))
+}
+
 /// The premise for a pair, if one side's provenance passes through a global or
 /// an integer. Never for one global at both positions (its value or its
 /// storage: `st.pos` may point into `st.buf`), nor for two integers:

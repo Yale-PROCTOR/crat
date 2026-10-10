@@ -573,6 +573,8 @@ pub(crate) struct PairDisjointnessIndex {
     /// P5 (wave-5d 150g): the allocator contracts' deallocators among the
     /// program's functions, by the block argument's index.
     contract_frees: FxHashMap<u32, usize>,
+    /// R944-1: which provenances the P11 premise covers in this run.
+    p11_scope: super::global_or_integer::P11Scope,
     /// R466-5: `(caller, callee, argument index)` where that argument is the
     /// address of a stack local taken exactly once in the caller's body, at a
     /// callee position wave-6r's walk proves never retained.
@@ -861,6 +863,7 @@ impl PairDisjointnessIndex {
             exported,
             address_taken,
             contract_frees,
+            p11_scope: super::global_or_integer::P11Scope::of(tcx),
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
             premise_foreign: RefCell::new(Vec::new()),
@@ -904,7 +907,7 @@ impl PairDisjointnessIndex {
                 super::global_or_integer::provenance(tcx, function, left),
                 super::global_or_integer::provenance(tcx, function, right),
             );
-            let kind = super::global_or_integer::premise(pl, pr)?;
+            let kind = super::global_or_integer::premise_in(self.p11_scope, pl, pr)?;
             // R939-1 (the seat): never for a pair the caller's own text relates.
             if super::global_or_integer::shown_related(
                 &super::global_or_integer::flow_roots(tcx, function, left, pl),
@@ -1442,7 +1445,9 @@ impl PairDisjointnessIndex {
             return Ok(CertificateKind::AllocatorContractFree);
         }
         // P11 (R936-1), the LAST arm: every structural certificate failed.
-        if let Some(kind) = super::global_or_integer::premise(a.premise, b.premise) {
+        if let Some(kind) =
+            super::global_or_integer::premise_in(self.p11_scope, a.premise, b.premise)
+        {
             // R939-1 (the seat): never for a pair the caller's own text relates.
             if super::global_or_integer::shown_related(&a.flow_roots, &b.flow_roots) {
                 return Err(Unproved::PremiseShownRelation);
