@@ -34,6 +34,9 @@ use crate::{
 pub(super) struct NativeBorrowContext<'a> {
     pub(super) borrow: GBorrowInferCtxt,
     flows: &'a OriginFlowResults,
+    /// era-5c relay 208 (`CRAT_MERGE_LIVENESS`): the locals the replay demoted (provenance
+    /// disabled, unioned with their base), per function.
+    pub(super) demoted: FxHashMap<LocalDefId, FxHashSet<Local>>,
 }
 
 pub(super) struct NativeInference<'tcx> {
@@ -131,6 +134,7 @@ impl<'a> NativeBorrowContext<'a> {
                 field_users,
             },
             flows,
+            demoted: FxHashMap::default(),
         }
     }
 
@@ -218,6 +222,24 @@ impl<'a> NativeBorrowContext<'a> {
         );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        if crate::analyses::borrow_ownership::copy_relax::merge_liveness()
+            && let Some(demoted) = self.demoted.get(&f)
+        {
+            let location_map = &inference.location_map;
+            let mut liveness = std::mem::replace(
+                &mut inference.provenance_liveness,
+                SparseBitMatrix::new(provenance_set.provenance_data.len()),
+            );
+            crate::analyses::borrow_ownership::copy_relax::extend_merge_liveness(
+                tcx,
+                body,
+                provenance_set,
+                demoted,
+                location_map,
+                &mut liveness,
+            );
+            inference.provenance_liveness = liveness;
+        }
         use crate::analyses::borrow_ownership::licensing::traversal_replay;
         let expected = traversal_replay::begin_function(f);
         let mut installed = Vec::new();

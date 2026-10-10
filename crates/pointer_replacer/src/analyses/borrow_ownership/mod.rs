@@ -35,6 +35,11 @@ pub(crate) mod export;
 mod infer;
 // era-5c report 040: the A1 spare-set, for the MIR-walk market count.
 pub(crate) use infer::reseat_destinations;
+#[cfg(test)]
+mod copy_lend_guard_tests;
+pub(crate) mod copy_relax;
+#[cfg(test)]
+mod copy_relax_tests;
 pub(crate) mod field_moves;
 pub(crate) mod l2;
 pub(crate) mod licensing;
@@ -65,8 +70,6 @@ pub(crate) mod raw_cause;
 pub(crate) mod realloc;
 pub(crate) mod realloc_ssa;
 pub mod resolve;
-#[cfg(test)]
-mod copy_lend_guard_tests;
 pub(crate) mod retirement;
 pub(crate) mod safety_mono;
 pub(crate) mod slot_key;

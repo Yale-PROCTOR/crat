@@ -221,6 +221,13 @@ pub(crate) fn solver_identity(
         super::field_moves::move_store().to_string(),
     );
     fields.insert("era5c_lend", super::licensing::lend::lend().to_string());
+    // era-5c relay 208: present only when set, so the frame's identity is unchanged.
+    if super::copy_relax::copy_relax() {
+        fields.insert("era5c_copy_relax", "depth0-borrow-to-raw".to_owned());
+    }
+    if super::copy_relax::merge_liveness() {
+        fields.insert("era5c_merge_liveness", "on".to_owned());
+    }
     fields.insert(
         "era5c_typed_release",
         super::retirement::discharge::typed_release().to_string(),

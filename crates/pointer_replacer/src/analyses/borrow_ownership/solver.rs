@@ -1138,6 +1138,34 @@ impl KindSolver {
         }
     }
 
+    /// era-5c relay 208 (S39, `CRAT_COPY_RELAX=depth0-borrow-to-raw`): a bare depth-0 copy
+    /// `lhs := rhs` keeps the equal-kind reading or takes `lhs.raw ∧ rhs.ref` (a raw view of a
+    /// reference). Raw → Ref is never allowed and an Owning source stays equal.
+    pub(crate) fn copy_relax_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
+        let lhs_vars = self
+            .vars
+            .get(&lhs)
+            .unwrap_or_else(|| panic!("unknown slot: {lhs:?}"));
+        let rhs_vars = self
+            .vars
+            .get(&rhs)
+            .unwrap_or_else(|| panic!("unknown slot: {rhs:?}"));
+        let relax = Bool::and(&[&lhs_vars.raw, &rhs_vars.ref_]);
+        let tracker = self.tracker.as_ref();
+        for (bit, equal) in [
+            ("raw", !lhs_vars.raw.xor(&rhs_vars.raw)),
+            ("ref", !lhs_vars.ref_.xor(&rhs_vars.ref_)),
+            ("own", !lhs_vars.own.xor(&rhs_vars.own)),
+        ] {
+            assert_hard(
+                &self.solver,
+                tracker,
+                || format!("kind-copy-relax({lhs:?},{rhs:?},{bit})"),
+                &Bool::or(&[&relax, &equal]),
+            );
+        }
+    }
+
     /// The derived A12 branch guard, shared by kind coherence and ownership transfer.
     pub(crate) fn lend_guard(&self, lhs: SlotRef, rhs: SlotRef) -> Bool {
         let lhs_vars = self

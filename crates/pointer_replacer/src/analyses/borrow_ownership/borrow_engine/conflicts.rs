@@ -1302,6 +1302,7 @@ where
             drop(inference);
             let provenance_set = ctxt.borrow.provenances.get_mut(&f).unwrap();
             for (local, base) in to_demote {
+                ctxt.demoted.entry(f).or_default().insert(local);
                 // production: `provenance_set.disable_owner(ProvenanceOwner::Local(local));`
                 // (Local branch = this field write; return value is ignored here).
                 provenance_set.local_data[local] = None;
@@ -1615,6 +1616,7 @@ where
             drop(inference);
             let provenance_set = ctxt.borrow.provenances.get_mut(&f).unwrap();
             for (local, base) in to_demote {
+                ctxt.demoted.entry(f).or_default().insert(local);
                 provenance_set.local_data[local] = None;
                 provenance_set
                     .tree_borrow_local
