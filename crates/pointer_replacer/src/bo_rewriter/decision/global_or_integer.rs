@@ -408,3 +408,122 @@ fn is_integer_literal(mut expr: &Expr<'_>) -> bool {
         }
     }
 }
+
+/// R939-1: a binding or a static a pointer argument's value flows from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FlowRoot {
+    Local(HirId),
+    Static(DefId),
+}
+
+/// **R939-1 (the seat) — what the caller's text relates.** The bindings and
+/// statics whose values flow into pointer argument `expr` of a call in
+/// `caller`: through copies, casts, pointer and integer arithmetic, places and
+/// their bases, every definition of a local, every value the caller stores into
+/// a static it reads, every branch, a call's arguments. Over-approximate on
+/// purpose: two arguments whose sets meet are related by the text, and the P11
+/// premise is not asked for them (a refusal is a hold, the conservative side).
+pub(crate) fn flow_roots<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+    expr: &'tcx Expr<'tcx>,
+) -> Vec<FlowRoot> {
+    let Some(body) = tcx.hir_maybe_body_owned_by(caller) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<FlowRoot> = Vec::new();
+    let mut work = vec![expr];
+    let mut steps = 0usize;
+    while let Some(expr) = work.pop() {
+        steps += 1;
+        if steps > 512 {
+            break;
+        }
+        match expr.kind {
+            ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Field(inner, _)
+            | ExprKind::Unary(_, inner) => work.push(inner),
+            ExprKind::Index(base, index, _) | ExprKind::Binary(_, base, index) => {
+                work.push(base);
+                work.push(index);
+            }
+            ExprKind::MethodCall(_, receiver, arguments, _) => {
+                work.push(receiver);
+                work.extend(arguments.iter());
+            }
+            ExprKind::Call(_, arguments) => work.extend(arguments.iter()),
+            ExprKind::If(_, then, other) => {
+                work.push(then);
+                work.extend(other);
+            }
+            ExprKind::Match(_, arms, _) => work.extend(arms.iter().map(|arm| arm.body)),
+            ExprKind::Block(block, _) => work.extend(block.expr),
+            ExprKind::Path(QPath::Resolved(None, path)) => match path.res {
+                Res::Local(binding) => {
+                    let root = FlowRoot::Local(binding);
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                        work.extend(definitions(body, binding).0);
+                    }
+                }
+                Res::Def(DefKind::Static { .. }, def) => {
+                    let root = FlowRoot::Static(def);
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                        work.extend(stores_into_static(body, def));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    roots
+}
+
+/// Do two arguments' flow roots meet (R939-1)?
+pub(crate) fn shown_related(left: &[FlowRoot], right: &[FlowRoot]) -> bool {
+    left.iter().any(|root| right.contains(root))
+}
+
+/// Every value `body` stores into static `def` or a place inside it.
+fn stores_into_static<'tcx>(
+    body: &'tcx rustc_hir::Body<'tcx>,
+    def: DefId,
+) -> Vec<&'tcx Expr<'tcx>> {
+    struct Stores<'tcx> {
+        def: DefId,
+        found: Vec<&'tcx Expr<'tcx>>,
+    }
+    fn rooted_at(mut place: &Expr<'_>, def: DefId) -> bool {
+        loop {
+            match place.kind {
+                ExprKind::Field(base, _)
+                | ExprKind::Index(base, _, _)
+                | ExprKind::DropTemps(base) => place = base,
+                ExprKind::Path(QPath::Resolved(None, path)) => {
+                    return matches!(path.res, Res::Def(DefKind::Static { .. }, d) if d == def);
+                }
+                _ => return false,
+            }
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Stores<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) = expr.kind
+                && rooted_at(lhs, self.def)
+            {
+                self.found.push(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut stores = Stores {
+        def,
+        found: Vec::new(),
+    };
+    stores.visit_body(body);
+    stores.found
+}

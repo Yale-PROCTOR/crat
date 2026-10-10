@@ -477,6 +477,8 @@ struct ArgRecord {
     /// P11 (R936-1): the argument's provenance passes through a global or an
     /// integer on every path the text shows.
     premise: Option<super::global_or_integer::Provenance>,
+    /// R939-1: what the caller's text says this argument's value flows from.
+    flow_roots: Vec<super::global_or_integer::FlowRoot>,
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +510,15 @@ struct PairTypeVerdict {
     /// `Ok(())` when the type rule certifies; `Err(why)` otherwise.
     verdict: Result<(), Unproved>,
 }
+
+/// A foreign-callee premise row: (caller, call span, left, right, kind).
+type PremiseRow = (
+    u32,
+    Span,
+    usize,
+    usize,
+    super::global_or_integer::ProvenanceKind,
+);
 
 #[derive(Clone, Debug)]
 #[allow(
@@ -558,6 +569,9 @@ pub(crate) struct PairDisjointnessIndex {
     /// (e)'s memo, keyed by `(callee, i, j)` with `i < j`.
     parameter_pairs: RefCell<FxHashMap<(u32, usize, usize), Option<PairSeparation>>>,
     ledger: RefCell<Vec<LedgerRow>>,
+    /// R939-1: the foreign-callee pairs whose premise was refused for a shown
+    /// relation (counted apart).
+    premise_refused_foreign: RefCell<Vec<PremiseRow>>,
     /// P11 (R936-1): the foreign-callee pairs `certify_call_arguments` cleared
     /// by the premise, as (caller, left span, right span, kind).
     #[allow(clippy::type_complexity)]
@@ -827,6 +841,7 @@ impl PairDisjointnessIndex {
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
             premise_foreign: RefCell::new(Vec::new()),
+            premise_refused_foreign: RefCell::new(Vec::new()),
             binding_roots,
         }
     }
@@ -866,6 +881,20 @@ impl PairDisjointnessIndex {
                 super::global_or_integer::provenance(tcx, function, left),
                 super::global_or_integer::provenance(tcx, function, right),
             )?;
+            // R939-1 (the seat): never for a pair the caller's own text relates.
+            if super::global_or_integer::shown_related(
+                &super::global_or_integer::flow_roots(tcx, function, left),
+                &super::global_or_integer::flow_roots(tcx, function, right),
+            ) {
+                self.premise_refused_foreign.borrow_mut().push((
+                    function.local_def_index.as_u32(),
+                    call.0,
+                    call.1.min(call.2),
+                    call.1.max(call.2),
+                    kind,
+                ));
+                return None;
+            }
             self.premise_foreign.borrow_mut().push((
                 function.local_def_index.as_u32(),
                 call.0,
@@ -1383,6 +1412,10 @@ impl PairDisjointnessIndex {
         }
         // P11 (R936-1), the LAST arm: every structural certificate failed.
         if let Some(kind) = super::global_or_integer::premise(a.premise, b.premise) {
+            // R939-1 (the seat): never for a pair the caller's own text relates.
+            if super::global_or_integer::shown_related(&a.flow_roots, &b.flow_roots) {
+                return Err(Unproved::PremiseShownRelation);
+            }
             return Ok(CertificateKind::GlobalOrIntegerPremise(kind));
         }
         Err(match type_verdict {
@@ -1617,8 +1650,11 @@ impl PairDisjointnessIndex {
         let source_map = tcx.sess.source_map();
         let mut rows = std::collections::BTreeSet::new();
         for row in self.ledger.borrow().iter() {
-            let Ok(CertificateKind::GlobalOrIntegerPremise(kind)) = row.outcome else {
-                continue;
+            let kind = match row.outcome {
+                Ok(CertificateKind::GlobalOrIntegerPremise(kind)) => kind.key(),
+                // R939-1: a refusal for a shown relation, its own kind.
+                Err(Unproved::PremiseShownRelation) => "refused-shown-relation",
+                _ => continue,
             };
             // The asked call's own argument span (round-4 MED-3), at its macro
             // call site (rules pass different spans for one argument: round-5
@@ -1631,7 +1667,16 @@ impl PairDisjointnessIndex {
                 site,
                 row.left.min(row.right),
                 row.left.max(row.right),
-                kind.key(),
+                kind,
+            ));
+        }
+        for (caller, call, left, right, _) in self.premise_refused_foreign.borrow().iter() {
+            rows.insert(format!(
+                "{}\t<foreign>\t{}\t{}\t{}\trefused-shown-relation\n",
+                name(*caller),
+                source_map.span_to_diagnostic_string(call.source_callsite()),
+                left,
+                right,
             ));
         }
         for (caller, call, left, right, kind) in self.premise_foreign.borrow().iter() {
@@ -4496,6 +4541,11 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                         stored_fields,
                         place_stable: pointee.is_some(),
                         premise: super::global_or_integer::provenance(self.tcx, self.caller, arg),
+                        flow_roots: super::global_or_integer::flow_roots(
+                            self.tcx,
+                            self.caller,
+                            arg,
+                        ),
                     }
                 })
                 .collect();

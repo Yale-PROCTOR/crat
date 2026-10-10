@@ -142,8 +142,11 @@ extern "C" { fn malloc(n: usize) -> *mut u8; }
 static mut G: *mut u8 = 0 as *mut u8;
 unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 unsafe fn cp(d: *mut u8, s: *const u8) { *d.offset(-1) = *s.offset(1); }
-pub unsafe fn both() -> u8 { let mut tmp = malloc(64); G = tmp; cp2(G, tmp); *tmp }
-pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); G = tmp; cp(G.offset(32), tmp); *tmp }
+// R939-1: the store happens in another function, so the caller's text shows
+// no relation and P11 is literal (the same-function store is r939_1's).
+unsafe fn set_g(t: *mut u8) { G = t; }
+pub unsafe fn both() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp2(G, tmp); *tmp }
+pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(G.offset(32), tmp); *tmp }
 "#;
 
 /// wave-5d 148b: a pointer static's VALUE is not the static's storage, so no
@@ -315,6 +318,9 @@ pub struct C {{ buf: *mut u8 }}
 static mut S: C = C {{ buf: 0 as *mut u8 }};
 unsafe fn cp(d: *mut u8, s: *const u8) {{ *d.offset(-1) = *s.offset(1); }}
 unsafe fn cp2(d: *mut u8, s: *const u8) {{ *d = *s; }}
+// R939-1: stores in other functions, so a caller's text shows no relation.
+unsafe fn set_g(t: *mut u8) {{ G = t; }}
+unsafe fn set_s(t: *mut u8) {{ S.buf = t; }}
 {body}
 "#
     )
@@ -324,7 +330,7 @@ unsafe fn cp2(d: *mut u8, s: *const u8) {{ *d = *s; }}
 #[test]
 fn r149g_a_statics_value_through_a_local_may_point_anywhere() {
     let source = anywhere_shape(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut p = G; cp(p.offset(32), tmp); *tmp }",
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); let mut p = G; cp(p.offset(32), tmp); *tmp }",
     );
     let rows = held(&source);
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
@@ -360,7 +366,7 @@ fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
 #[test]
 fn r149g_a_pointer_field_of_a_static_may_point_anywhere() {
     let source = anywhere_shape(
-        "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); S.buf = tmp; cp(S.buf.offset(32), tmp); *tmp }",
+        "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); set_s(tmp); cp(S.buf.offset(32), tmp); *tmp }",
     );
     let rows = held(&source);
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
@@ -622,7 +628,7 @@ fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
 #[test]
 fn r149h_a_pointer_to_a_static_struct_is_a_receipted_premise() {
     let source = residual_source(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); S.buf = tmp; let s: *mut C = &mut S; cp((*s).buf.offset(32), tmp); *tmp }",
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_s(tmp); let s: *mut C = &mut S; cp((*s).buf.offset(32), tmp); *tmp }",
     );
     let rows = held(&source);
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
