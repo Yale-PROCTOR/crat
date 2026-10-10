@@ -877,14 +877,15 @@ impl PairDisjointnessIndex {
         let (b, _) = argument_provenance(tcx, typeck, classes, right);
         certify_roots(a, b).or_else(|| {
             // P11 (R936-1), the last arm.
-            let kind = super::global_or_integer::premise(
+            let (pl, pr) = (
                 super::global_or_integer::provenance(tcx, function, left),
                 super::global_or_integer::provenance(tcx, function, right),
-            )?;
+            );
+            let kind = super::global_or_integer::premise(pl, pr)?;
             // R939-1 (the seat): never for a pair the caller's own text relates.
             if super::global_or_integer::shown_related(
-                &super::global_or_integer::flow_roots(tcx, function, left),
-                &super::global_or_integer::flow_roots(tcx, function, right),
+                &super::global_or_integer::flow_roots(tcx, function, left, pl),
+                &super::global_or_integer::flow_roots(tcx, function, right, pr),
             ) {
                 self.premise_refused_foreign.borrow_mut().push((
                     function.local_def_index.as_u32(),
@@ -4545,6 +4546,7 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'_, 'tcx> {
                             self.tcx,
                             self.caller,
                             arg,
+                            super::global_or_integer::provenance(self.tcx, self.caller, arg),
                         ),
                     }
                 })

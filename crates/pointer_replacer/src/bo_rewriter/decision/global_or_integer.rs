@@ -414,29 +414,53 @@ fn is_integer_literal(mut expr: &Expr<'_>) -> bool {
 pub(crate) enum FlowRoot {
     Local(HirId),
     Static(DefId),
+    /// The walk could not see every store (its bound was reached, or an address
+    /// a store may go through is taken): related to everything, so the premise
+    /// is refused (the round-6 review's MED-1 / MED-2: fail closed).
+    Unbounded,
 }
 
 /// **R939-1 (the seat) — what the caller's text relates.** The bindings and
 /// statics whose values flow into pointer argument `expr` of a call in
 /// `caller`: through copies, casts, pointer and integer arithmetic, places and
-/// their bases, every definition of a local, every value the caller stores into
-/// a static it reads, every branch, a call's arguments. Over-approximate on
-/// purpose: two arguments whose sets meet are related by the text, and the P11
-/// premise is not asked for them (a refusal is a hold, the conservative side).
+/// their bases, aggregate literals, every store into a local or a place inside
+/// it, every value the caller stores into a static it reads, every branch, a
+/// call's arguments; `seed` (the argument's own P11 provenance) starts the
+/// walk at the static a getter reads (the round-6 review's MED-3).
+/// Over-approximate on purpose: two arguments whose sets meet are related by
+/// the text and the P11 premise is not asked (a refusal is a hold); an address
+/// that may carry a hidden store, or the walk's bound, is `Unbounded`.
 pub(crate) fn flow_roots<'tcx>(
     tcx: TyCtxt<'tcx>,
     caller: LocalDefId,
     expr: &'tcx Expr<'tcx>,
+    seed: Option<Provenance>,
 ) -> Vec<FlowRoot> {
     let Some(body) = tcx.hir_maybe_body_owned_by(caller) else {
-        return Vec::new();
+        return vec![FlowRoot::Unbounded];
     };
     let mut roots: Vec<FlowRoot> = Vec::new();
-    let mut work = vec![expr];
+    let mut work: Vec<&'tcx Expr<'tcx>> = vec![expr];
+    let mut add_static =
+        |def: DefId, roots: &mut Vec<FlowRoot>, work: &mut Vec<&'tcx Expr<'tcx>>| {
+            let root = FlowRoot::Static(def);
+            if !roots.contains(&root) {
+                roots.push(root);
+                let (stores, addressed) = stores_into_static(body, def);
+                if addressed {
+                    roots.push(FlowRoot::Unbounded);
+                }
+                work.extend(stores);
+            }
+        };
+    if let Some(Provenance::GlobalValue(def) | Provenance::GlobalStorage(def)) = seed {
+        add_static(def, &mut roots, &mut work);
+    }
     let mut steps = 0usize;
     while let Some(expr) = work.pop() {
         steps += 1;
         if steps > 512 {
+            roots.push(FlowRoot::Unbounded);
             break;
         }
         match expr.kind {
@@ -444,7 +468,8 @@ pub(crate) fn flow_roots<'tcx>(
             | ExprKind::DropTemps(inner)
             | ExprKind::AddrOf(_, _, inner)
             | ExprKind::Field(inner, _)
-            | ExprKind::Unary(_, inner) => work.push(inner),
+            | ExprKind::Unary(_, inner)
+            | ExprKind::Repeat(inner, _) => work.push(inner),
             ExprKind::Index(base, index, _) | ExprKind::Binary(_, base, index) => {
                 work.push(base);
                 work.push(index);
@@ -453,7 +478,15 @@ pub(crate) fn flow_roots<'tcx>(
                 work.push(receiver);
                 work.extend(arguments.iter());
             }
-            ExprKind::Call(_, arguments) => work.extend(arguments.iter()),
+            ExprKind::Call(_, arguments)
+            | ExprKind::Array(arguments)
+            | ExprKind::Tup(arguments) => work.extend(arguments.iter()),
+            ExprKind::Struct(_, fields, tail) => {
+                work.extend(fields.iter().map(|field| field.expr));
+                if let rustc_hir::StructTailExpr::Base(base) = tail {
+                    work.push(base);
+                }
+            }
             ExprKind::If(_, then, other) => {
                 work.push(then);
                 work.extend(other);
@@ -465,16 +498,14 @@ pub(crate) fn flow_roots<'tcx>(
                     let root = FlowRoot::Local(binding);
                     if !roots.contains(&root) {
                         roots.push(root);
-                        work.extend(definitions(body, binding).0);
+                        let (stores, addressed) = stores_into_local(body, binding);
+                        if addressed {
+                            roots.push(FlowRoot::Unbounded);
+                        }
+                        work.extend(stores);
                     }
                 }
-                Res::Def(DefKind::Static { .. }, def) => {
-                    let root = FlowRoot::Static(def);
-                    if !roots.contains(&root) {
-                        roots.push(root);
-                        work.extend(stores_into_static(body, def));
-                    }
-                }
+                Res::Def(DefKind::Static { .. }, def) => add_static(def, &mut roots, &mut work),
                 _ => {}
             },
             _ => {}
@@ -483,47 +514,121 @@ pub(crate) fn flow_roots<'tcx>(
     roots
 }
 
-/// Do two arguments' flow roots meet (R939-1)?
+/// Do two arguments' flow roots meet (R939-1)? `Unbounded` meets everything.
 pub(crate) fn shown_related(left: &[FlowRoot], right: &[FlowRoot]) -> bool {
-    left.iter().any(|root| right.contains(root))
+    left.contains(&FlowRoot::Unbounded)
+        || right.contains(&FlowRoot::Unbounded)
+        || left.iter().any(|root| right.contains(root))
 }
 
-/// Every value `body` stores into static `def` or a place inside it.
+/// Every value `body` stores into static `def` or a place inside it, and
+/// whether the body takes a MUTABLE address of it (a store may go through it
+/// where the text does not tie it to `def`; `S.as_ptr()` is the storage P11
+/// itself names).
 fn stores_into_static<'tcx>(
     body: &'tcx rustc_hir::Body<'tcx>,
     def: DefId,
-) -> Vec<&'tcx Expr<'tcx>> {
-    struct Stores<'tcx> {
-        def: DefId,
+) -> (Vec<&'tcx Expr<'tcx>>, bool) {
+    stores_into(
+        body,
+        true,
+        |res| matches!(res, Res::Def(DefKind::Static { .. }, d) if d == def),
+    )
+}
+
+/// Every value `body` stores into local `binding` or a place inside it (its
+/// `let` initializer, `x = v`, `x.f = v`, `x[i] = v`, `x += v`), and whether
+/// the body takes any address of it or holds a closure.
+fn stores_into_local<'tcx>(
+    body: &'tcx rustc_hir::Body<'tcx>,
+    binding: HirId,
+) -> (Vec<&'tcx Expr<'tcx>>, bool) {
+    struct Lets<'tcx> {
+        binding: HirId,
         found: Vec<&'tcx Expr<'tcx>>,
     }
-    fn rooted_at(mut place: &Expr<'_>, def: DefId) -> bool {
+    impl<'tcx> Visitor<'tcx> for Lets<'tcx> {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            let mut binds = false;
+            local.pat.walk_always(|pat| {
+                if let PatKind::Binding(_, id, ..) = pat.kind
+                    && id == self.binding
+                {
+                    binds = true;
+                }
+            });
+            if binds && let Some(init) = local.init {
+                self.found.push(init);
+            }
+            intravisit::walk_local(self, local);
+        }
+    }
+    let (mut stores, addressed) = stores_into(body, false, |res| res == Res::Local(binding));
+    let mut lets = Lets {
+        binding,
+        found: Vec::new(),
+    };
+    lets.visit_body(body);
+    stores.extend(lets.found);
+    (stores, addressed)
+}
+
+/// Stores into places whose root `names` accepts, and whether such a place's
+/// address is taken (any address, or only a mutable one) or a closure exists.
+fn stores_into<'tcx>(
+    body: &'tcx rustc_hir::Body<'tcx>,
+    mutable_only: bool,
+    names: impl Fn(Res) -> bool,
+) -> (Vec<&'tcx Expr<'tcx>>, bool) {
+    fn root_res(mut place: &Expr<'_>) -> Option<Res> {
         loop {
             match place.kind {
                 ExprKind::Field(base, _)
                 | ExprKind::Index(base, _, _)
                 | ExprKind::DropTemps(base) => place = base,
-                ExprKind::Path(QPath::Resolved(None, path)) => {
-                    return matches!(path.res, Res::Def(DefKind::Static { .. }, d) if d == def);
-                }
-                _ => return false,
+                ExprKind::Path(QPath::Resolved(None, path)) => return Some(path.res),
+                _ => return None,
             }
         }
     }
-    impl<'tcx> Visitor<'tcx> for Stores<'tcx> {
+    struct Stores<'tcx, F> {
+        names: F,
+        mutable_only: bool,
+        found: Vec<&'tcx Expr<'tcx>>,
+        addressed: bool,
+    }
+    impl<'tcx, F: Fn(Res) -> bool> Visitor<'tcx> for Stores<'tcx, F> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            if let ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) = expr.kind
-                && rooted_at(lhs, self.def)
-            {
-                self.found.push(rhs);
+            let named = |e: &Expr<'_>| root_res(e).is_some_and(|res| (self.names)(res));
+            match expr.kind {
+                ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) if named(lhs) => {
+                    self.found.push(rhs)
+                }
+                ExprKind::AddrOf(_, mutability, place)
+                    if named(place)
+                        && (!self.mutable_only || mutability == rustc_hir::Mutability::Mut) =>
+                {
+                    self.addressed = true
+                }
+                ExprKind::MethodCall(segment, receiver, _, _)
+                    if (segment.ident.name.as_str() == "as_mut_ptr"
+                        || (!self.mutable_only && segment.ident.name.as_str() == "as_ptr"))
+                        && named(receiver) =>
+                {
+                    self.addressed = true
+                }
+                ExprKind::Closure(..) => self.addressed = true,
+                _ => {}
             }
             intravisit::walk_expr(self, expr);
         }
     }
     let mut stores = Stores {
-        def,
+        names,
+        mutable_only,
         found: Vec::new(),
+        addressed: false,
     };
     stores.visit_body(body);
-    stores.found
+    (stores.found, stores.addressed)
 }
