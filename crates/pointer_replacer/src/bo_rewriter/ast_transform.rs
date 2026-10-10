@@ -1707,6 +1707,29 @@ impl MutVisitor for UseGraftVisitor<'_> {
                 return;
             }
             rustc_ast::mut_visit::walk_expr(self, e);
+            // **wave-6a 160 (wave-5d 150o §2).** The wrapper is parsed around a HOLE
+            // and the walked node itself is moved into it, as the construction
+            // bracket does (`ConstructionBracketVisitor`): every descendant keeps its
+            // span, so the passes after this one still find their targets inside —
+            // the seam pass's `&mut *m` at the allocator call's manager argument
+            // (brotli's `BrotliAllocate(m, ..)`, E0308 at 58 when the node's text was
+            // re-parsed). The wrapper carries the parser's erased span and id, so no
+            // span- or id-keyed pass meets the node twice. A hole the parse does not
+            // yield falls back to the text re-parse.
+            if let Ok(mut wrapper) = graft_expr(&format!("{open}{BRACKET_HOLE}{close}")) {
+                let mut filler = BracketHoleFiller {
+                    node: Some(e.clone()),
+                };
+                filler.visit_expr(&mut wrapper);
+                if filler.node.is_none() {
+                    *e = wrapper;
+                    self.stats.grafted += 1;
+                    self.stats
+                        .rendered
+                        .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                    return;
+                }
+            }
             let inner = rustc_ast_pretty::pprust::expr_to_string(e);
             match graft_expr(&format!("{open}{inner}{close}")) {
                 Ok(parsed) => {
