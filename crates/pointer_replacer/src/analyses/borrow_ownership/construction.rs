@@ -1849,6 +1849,14 @@ fn solve_bo_a5_config_with_source_events(
         CopyLendMode::RemovalOnly,
         "the A5 frame runs Baseline or the LendArm selector, never RemovalOnly"
     );
+    // era-5c relay 208 (S39 (b)): the copies the relaxation may take, for this solve.
+    if super::copy_relax::copy_relax() {
+        let (eligible, counts) = analyze_copy_relax_sites(program, slots, origins.native_flows());
+        if std::env::var_os("CRAT_E5C_CR_STATS").is_some() {
+            eprintln!("E5C_CR_SITES {counts:?}");
+        }
+        super::copy_relax::install(eligible);
+    }
 
     let baseline_solver = KindSolver::new(slots);
     let baseline_construction =
@@ -2297,6 +2305,59 @@ pub(crate) fn analyze_copy_lend_eligibility(
     }
     eligible.sites.sort_by_key(|site| site.sort_key());
     eligible
+}
+
+/// era-5c relay 208, S39 (b): the copies the depth-0 relaxation may take. A bare copy `q = p`
+/// between locals is eligible only when the destination's value never leaves the function: no
+/// store into a field, an aggregate or an unresolved place, no return, no call argument and no
+/// release over the destination's depth-0 value-flow closure (the copy-lend arm's C3 and S2-2,
+/// on the destination alone). Under Tree Borrows the raw copy carries its source's tag, and the
+/// merge liveness keeps the source's loans live only through the copy's uses in this function.
+pub(crate) fn analyze_copy_relax_sites(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+) -> (
+    FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>,
+    std::collections::BTreeMap<&'static str, usize>,
+) {
+    let mut eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>> = FxHashMap::default();
+    let mut counts = std::collections::BTreeMap::new();
+    for &fn_did in &program.functions {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(fn_did)
+            .borrow();
+        let sites = collect_copy_sites(slots, fn_did, &body);
+        if sites.is_empty() {
+            continue;
+        }
+        let flows = origin_flows
+            .get(&fn_did)
+            .unwrap_or_else(|| panic!("missing origin flow for {fn_did:?}"));
+        let value_flows = flows.body.depth0_value_flows();
+        let live_before = live_before_by_location(program.tcx, &body);
+        for site in sites {
+            let closure = owner_closure([SlotOwner::Local(site.lhs_local)], &value_flows);
+            let drop = if closure
+                .iter()
+                .any(|owner| matches!(owner, SlotOwner::Field(_)))
+            {
+                Some(CopyLendEligibilityDrop::C3FieldInClosure)
+            } else if destination_flows_to_deallocator(program.tcx, &body, &closure) {
+                Some(CopyLendEligibilityDrop::S22FreeDestination)
+            } else {
+                live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
+            };
+            *counts
+                .entry(drop.map_or("eligible", |drop| drop.label()))
+                .or_insert(0) += 1;
+            if drop.is_none() {
+                eligible.entry(fn_did).or_default().insert(site.location);
+            }
+        }
+    }
+    (eligible, counts)
 }
 
 pub(crate) fn analyze_copy_lend_candidates(

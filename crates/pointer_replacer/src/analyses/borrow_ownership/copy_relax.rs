@@ -9,17 +9,21 @@
 //!   live wherever it is live. Under Tree Borrows a raw view carries its source's tag, so the
 //!   loans the source's origin requires must stay live through the view's uses.
 
+use std::sync::Mutex;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::{
-    mir::{Body, Local, Location},
+    mir::{BasicBlock, Body, Local, Location},
     ty::TyCtxt,
 };
 use rustc_mir_dataflow::{
     Analysis,
     points::{DenseLocationMap, PointIndex},
 };
+use rustc_span::def_id::LocalDefId;
 
+use super::l2::MirLocationKey;
 use crate::analyses::{
     borrow::{Provenance, ProvenanceSet},
     liveness::MaybeLiveLocals,
@@ -31,6 +35,22 @@ pub(crate) fn copy_relax() -> bool {
         Ok("depth0-borrow-to-raw") => true,
         Ok(other) => panic!("CRAT_COPY_RELAX={other:?}: expected off or depth0-borrow-to-raw"),
     }
+}
+
+/// The copies the relaxation may take (S39 (b)), installed by the solve before any coherence is
+/// added (`construction::analyze_copy_relax_sites`). Nothing installed: nothing is relaxed.
+static ELIGIBLE: Mutex<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> = Mutex::new(None);
+
+pub(crate) fn install(eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>) {
+    *ELIGIBLE.lock().unwrap() = Some(eligible);
+}
+
+pub(crate) fn eligible(fn_did: LocalDefId, block: BasicBlock, statement_index: usize) -> bool {
+    ELIGIBLE.lock().unwrap().as_ref().is_some_and(|eligible| {
+        eligible.get(&fn_did).is_some_and(|sites| {
+            sites.contains(&MirLocationKey::new(block.as_u32(), statement_index))
+        })
+    })
 }
 
 pub(crate) fn merge_liveness() -> bool {

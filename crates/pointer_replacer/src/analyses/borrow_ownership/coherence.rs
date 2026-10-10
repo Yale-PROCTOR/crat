@@ -256,7 +256,8 @@ fn add_coherence_impl<'tcx>(
                     let relax_site = copy_relax
                         && matches!(rvalue, Rvalue::Use(_))
                         && lhs.projection.is_empty()
-                        && rhs.projection.is_empty();
+                        && rhs.projection.is_empty()
+                        && super::copy_relax::eligible(fn_did, block, statement_index);
                     with_use_track_context(solver, tag_uses, || {
                         if remove_copy_equates {
                             return;
