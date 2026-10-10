@@ -2336,9 +2336,12 @@ pub(crate) fn analyze_copy_relax_sites(
             .get(&fn_did)
             .unwrap_or_else(|| panic!("missing origin flow for {fn_did:?}"));
         let value_flows = flows.body.depth0_value_flows();
-        let live_before = live_before_by_location(program.tcx, &body);
         for site in sites {
-            let closure = owner_closure([SlotOwner::Local(site.lhs_local)], &value_flows);
+            let closure = copy_relax_closure(
+                program.tcx,
+                &body,
+                owner_closure([SlotOwner::Local(site.lhs_local)], &value_flows),
+            );
             let drop = if closure
                 .iter()
                 .any(|owner| matches!(owner, SlotOwner::Field(_)))
@@ -2347,7 +2350,7 @@ pub(crate) fn analyze_copy_relax_sites(
             } else if destination_flows_to_deallocator(program.tcx, &body, &closure) {
                 Some(CopyLendEligibilityDrop::S22FreeDestination)
             } else {
-                live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
+                copy_relax_escape(program, slots, fn_did, &body, &closure)
             };
             *counts
                 .entry(drop.map_or("eligible", |drop| drop.label()))
@@ -2358,6 +2361,127 @@ pub(crate) fn analyze_copy_relax_sites(
         }
     }
     (eligible, counts)
+}
+
+/// The relaxation's closure: the destination's value flows, plus every local assigned a
+/// pointer computed from a member (a copy, a cast, an address of a member's place) and the
+/// result of a core pointer method called on one, to a fixpoint.
+fn copy_relax_closure<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    mut closure: FxHashSet<SlotOwner>,
+) -> FxHashSet<SlotOwner> {
+    loop {
+        let mut changed = false;
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let location = Location {
+                    block,
+                    statement_index,
+                };
+                if lhs.projection.is_empty()
+                    && rvalue.ty(body, tcx).is_any_ptr()
+                    && rvalue_mentions_closure(rvalue, location, &closure)
+                {
+                    changed |= closure.insert(SlotOwner::Local(lhs.local));
+                }
+            }
+            if let Some(terminator) = data.terminator.as_ref()
+                && let Some(call) = terminator.as_call(tcx)
+                && matches!(call.func, CallKind::RustLib(_))
+                && call.destination.projection.is_empty()
+                && call.args.iter().any(|arg| {
+                    arg.node
+                        .place()
+                        .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
+                })
+            {
+                changed |= closure.insert(SlotOwner::Local(call.destination.local));
+            }
+        }
+        if !changed {
+            return closure;
+        }
+    }
+}
+
+/// S39 (b): whether a member of the closure leaves the function, wherever it is live: a store
+/// into memory (a field, an aggregate, through a pointer, an unresolved place), a return, or an
+/// argument of any call but a core pointer method.
+fn copy_relax_escape<'tcx>(
+    program: &RustProgram<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    closure: &FxHashSet<SlotOwner>,
+) -> Option<CopyLendEligibilityDrop> {
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                continue;
+            };
+            if !rvalue.ty(body, program.tcx).is_any_ptr()
+                && !matches!(rvalue, Rvalue::Aggregate(..))
+            {
+                continue;
+            }
+            if !rvalue_mentions_closure(rvalue, location, closure) {
+                continue;
+            }
+            if matches!(rvalue, Rvalue::Aggregate(..)) {
+                return Some(CopyLendEligibilityDrop::C3AggregateStore);
+            }
+            if lhs
+                .projection
+                .iter()
+                .any(|projection| matches!(projection, ProjectionElem::Field(..)))
+            {
+                return Some(CopyLendEligibilityDrop::C3FieldStore);
+            }
+            if lhs.local == RETURN_PLACE {
+                return Some(CopyLendEligibilityDrop::C3Return);
+            }
+            if !lhs.projection.is_empty() {
+                return Some(CopyLendEligibilityDrop::C3UnresolvedStore);
+            }
+            match resolve_place(slots, fn_did, body, *lhs, 0, None) {
+                Some(ResolvedSlot::Local(_)) => {}
+                Some(ResolvedSlot::Field(_)) => {
+                    return Some(CopyLendEligibilityDrop::C3FieldStore);
+                }
+                None => return Some(CopyLendEligibilityDrop::C3UnresolvedStore),
+            }
+        }
+        let Some(terminator) = data.terminator.as_ref() else {
+            continue;
+        };
+        let Some(call) = terminator.as_call(program.tcx) else {
+            continue;
+        };
+        if matches!(call.func, CallKind::RustLib(_)) {
+            continue;
+        }
+        if call.args.iter().any(|arg| {
+            arg.node
+                .place()
+                .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
+        }) {
+            return Some(match call.func {
+                CallKind::FreeStanding(_) | CallKind::Impl(_) => {
+                    CopyLendEligibilityDrop::C3OrdinaryCall
+                }
+                _ => CopyLendEligibilityDrop::C3OutwardUnknownCall,
+            });
+        }
+    }
+    None
 }
 
 pub(crate) fn analyze_copy_lend_candidates(
