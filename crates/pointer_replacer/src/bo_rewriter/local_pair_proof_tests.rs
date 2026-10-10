@@ -894,7 +894,7 @@ pub unsafe fn cleanup(mut m: *mut MemoryManager, mut s: *mut Model) {
         table
             .lines()
             .any(|row| row.starts_with("cleanup\tBrotliFree\t")
-                && row.ends_with("\tpremise=allocator-contract")),
+                && row.contains("\tpremise=allocator-contract\t")),
         "{table}"
     );
 }
@@ -919,8 +919,13 @@ fn premise_of(
 fn r944_1_integers_only_holds_a_statics_value() {
     let src = integers_only(STATIC_VALUE);
     assert!(verdict_at(&src, "both", "cp2", 0, 1).is_err());
+    assert!(verdict_at(&src, "raw_side", "cp", 0, 1).is_err());
+    // The hold itself, at the decision layer, against the default's delivery
+    // (the switch review's MED-2).
     let rows = held(&src);
-    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+    assert!(is_held(&rows, "cp::s"), "{rows:?}");
+    let default = held(STATIC_VALUE);
+    assert!(!is_held(&default, "cp::s"), "{default:?}");
 }
 
 #[test]
@@ -939,6 +944,8 @@ fn r944_1_integers_only_holds_the_global_shapes() {
     ] {
         let src = integers_only(&anywhere_shape(body));
         assert!(verdict_at(&src, caller, callee, 0, 1).is_err(), "{body}");
+        let rows = held(&src);
+        assert!(is_held(&rows, "cp::s"), "{body}: {rows:?}");
     }
     for body in [
         "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(get_g().offset(32), tmp); *tmp }",
@@ -973,4 +980,27 @@ fn r944_1_integer_made_pointers_stay_premises_under_both_scopes() {
     }
     let round = held(&integers_only(&integer_round_trip()));
     assert!(!is_raw(&round, "update::src"), "{round:?}");
+}
+
+/// R944-1, the mixed case: a global beside an integer-made pointer. Under
+/// `integers-only` the integer side alone gives the premise; under the default
+/// the receipt names the left side's kind (so a price that filters the table
+/// on `global-*` must check the other side: the switch review's LOW).
+#[test]
+fn r944_1_a_global_beside_an_integer_is_the_integers_premise() {
+    use super::decision::global_or_integer::ProvenanceKind;
+    let src = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub static mut G: *mut u8 = 0 as *mut u8;
+unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
+pub unsafe fn mixed(n: usize) -> u8 { cp2(G, n as *const u8); 0 }
+"#;
+    assert_eq!(
+        verdict_at(src, "mixed", "cp2", 0, 1),
+        Ok(premise_of(ProvenanceKind::GlobalValue))
+    );
+    assert_eq!(
+        verdict_at(&integers_only(src), "mixed", "cp2", 0, 1),
+        Ok(premise_of(ProvenanceKind::Integer))
+    );
 }

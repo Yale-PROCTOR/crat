@@ -87,6 +87,17 @@ impl P11Scope {
     /// `CRAT_P11_SCOPE` (fail-loud; absent = `globals-and-integers`, the
     /// offered behaviour).
     pub(crate) fn of(tcx: TyCtxt<'_>) -> Self {
+        // The environment first, always validated (fail-loud), so the default
+        // never rests on a source scan (the switch review's MED-1: the census
+        // of record is a test build).
+        let scope = match std::env::var("CRAT_P11_SCOPE") {
+            Err(std::env::VarError::NotPresent) => Self::GlobalsAndIntegers,
+            Ok(value) if value == "globals-and-integers" => Self::GlobalsAndIntegers,
+            Ok(value) if value == "integers-only" => Self::IntegersOnly,
+            other => panic!(
+                "CRAT_P11_SCOPE={other:?}: expected globals-and-integers or integers-only (R944-1)"
+            ),
+        };
         #[cfg(test)]
         if tcx.sess.source_map().files().iter().any(|file| {
             file.src
@@ -96,13 +107,14 @@ impl P11Scope {
             return Self::IntegersOnly;
         }
         let _ = tcx;
-        match std::env::var("CRAT_P11_SCOPE") {
-            Err(std::env::VarError::NotPresent) => Self::GlobalsAndIntegers,
-            Ok(value) if value == "globals-and-integers" => Self::GlobalsAndIntegers,
-            Ok(value) if value == "integers-only" => Self::IntegersOnly,
-            other => panic!(
-                "CRAT_P11_SCOPE={other:?}: expected globals-and-integers or integers-only (R944-1)"
-            ),
+        scope
+    }
+
+    /// The table's `scope` column.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::GlobalsAndIntegers => "globals-and-integers",
+            Self::IntegersOnly => "integers-only",
         }
     }
 

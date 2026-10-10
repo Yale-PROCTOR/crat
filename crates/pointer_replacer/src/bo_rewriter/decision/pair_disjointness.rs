@@ -1728,8 +1728,14 @@ impl PairDisjointnessIndex {
                 kind.key(),
             ));
         }
-        let mut out = String::from("caller\tcallee\tsite\tleft\tright\tkind\n");
-        out.extend(rows);
+        // R944-1: the scope this run took, on every row (a probe's table and a
+        // default run's are told apart).
+        let mut out = String::from("caller\tcallee\tsite\tleft\tright\tkind\tscope\n");
+        let scope = self.p11_scope.key();
+        out.extend(
+            rows.into_iter()
+                .map(|row| format!("{}\t{scope}\n", row.trim_end_matches('\n'))),
+        );
         out
     }
 
