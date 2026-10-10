@@ -759,3 +759,57 @@ pub unsafe fn c(s: *mut S) {
         "{rows:?}"
     );
 }
+
+/// R939-1 (the seat on 150d's MED-2): P11 covers unknown provenance only. Where
+/// the caller's own text relates the two arguments (`G = p; upd(G, p)`), the
+/// premise is not asked and the pair is held as any shown overlap is.
+const SHOWN_THROUGH_A_GLOBAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub static mut G: *mut i32 = 0 as *mut i32;
+unsafe fn upd(a: *mut i32, b: *mut i32) { *a += *b; }
+pub unsafe fn c(p: *mut i32) {
+    G = p;
+    upd(G, p);
+}
+"#;
+
+#[test]
+fn r939_1_a_relation_the_callers_text_shows_refuses_the_premise() {
+    assert_eq!(
+        verdict_at(SHOWN_THROUGH_A_GLOBAL, "c", "upd", 0, 1),
+        Err(super::decision::pair_disjointness::Unproved::PremiseShownRelation)
+    );
+    let rows = held(SHOWN_THROUGH_A_GLOBAL);
+    assert!(
+        is_raw(&rows, "upd::a") && is_raw(&rows, "upd::b"),
+        "{rows:?}"
+    );
+}
+
+/// R939-1 at a foreign callee: `G = p; strncpy(G, p, 2)` (the pending hold's
+/// local proof, `certify_call_arguments`).
+#[test]
+fn r939_1_a_shown_relation_at_a_foreign_callee_keeps_the_hold() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+extern "C" {
+    fn strncpy(dst: *mut i8, src: *const i8, n: usize) -> *mut i8;
+}
+pub static mut G: *mut i8 = 0 as *mut i8;
+pub unsafe fn c(p: *mut i8) -> i8 {
+    G = p;
+    strncpy(G, p, 2);
+    *p.offset(1)
+}
+"#;
+    let rows = held(input);
+    assert!(is_held(&rows, "c::p"), "{rows:?}");
+}
+
+/// Control (R939-1): with no relation in the caller's text the premise stays
+/// literal.
+#[test]
+fn r939_1_control_an_unrelated_global_keeps_the_premise() {
+    let input = SHOWN_THROUGH_A_GLOBAL.replace("    G = p;\n", "");
+    assert!(verdict_at(&input, "c", "upd", 0, 1).is_ok());
+}

@@ -255,6 +255,9 @@ pub(crate) enum Unproved {
     /// storage and the other program-internal, and no later rule separated
     /// them.
     EntryBesideInternal,
+    /// R939-1 (the seat): the P11 premise is not asked for a pair the caller's
+    /// own text relates (a copy flow or a store into the global); counted.
+    PremiseShownRelation,
 }
 
 impl Unproved {
@@ -275,6 +278,9 @@ impl Unproved {
             Self::RootsUnknown => "pair-disjointness-unproved:roots-unknown",
             Self::ReadReadPeers => "pair-disjointness-unproved:read-read-peers",
             Self::EntryBesideInternal => "pair-disjointness-unproved:entry-beside-internal",
+            Self::PremiseShownRelation => {
+                "pair-disjointness-unproved:premise-refused-shown-relation"
+            }
         }
     }
 }
