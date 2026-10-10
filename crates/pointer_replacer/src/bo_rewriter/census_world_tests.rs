@@ -399,9 +399,15 @@ fn r833_1_control_a_read_read_pair_keeps_shared_references() {
 /// R838 (relay 178 item 2): `add(G1, G2)` with `G2` able to hold `G1`'s
 /// pointer is not shown disjoint, so `add`'s formals both stay raw; the
 /// entry's certified pair (`add2(x, y)`) keeps its references.
-fn r838_signature(name: &str) -> String {
+fn r838_signature(name: &str, globals_premise: bool) -> String {
     let input = include_str!("testdata/r838_statics_pair.rs");
-    match super::rewrite_m1_census_world(input) {
+    // R959-1: the named `globals-and-integers` mode takes the global premise.
+    let input = if globals_premise {
+        format!("// crat-test-p11-scope: globals-and-integers\n{input}")
+    } else {
+        input.to_owned()
+    };
+    match super::rewrite_m1_census_world(&input) {
         super::RewriteOutcome::Emitted { source, .. } => {
             let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
             flat.split(&format!("fn {name}("))
@@ -414,14 +420,25 @@ fn r838_signature(name: &str) -> String {
     }
 }
 
-/// **R936-1 (P11, the USER with the advisor)**: `G2` holding `G1`'s pointer
-/// is aliasing through a global, outside the claim; the premise arm clears
-/// `add(G1, G2)` (receipted `pair-disjoint:premise=global-or-integer-
-/// provenance:global-value`), so `add`'s formals take their references (R838's
-/// hold of this shape withdrawn).
+/// **R959-1 (USER, relay 204): globals are inside the claim**, so R838's hold
+/// of this shape stands again by default: `G2` may hold `G1`'s pointer and no
+/// certificate separates them, so both of `add`'s formals stay raw.
 #[test]
 fn r838_add_of_two_statics_contents_keeps_both_formals_raw() {
-    let signature = r838_signature("add");
+    let signature = r838_signature("add", false);
+    assert!(
+        signature.contains("mut a: *mut i32") && signature.contains("mut b: *mut i32"),
+        "({signature})"
+    );
+}
+
+/// **R936-1 (P11) under the named `globals-and-integers` mode**: aliasing
+/// through a global outside the claim; the premise arm clears `add(G1, G2)`
+/// (receipted `pair-disjoint:premise=global-or-integer-provenance:global-value`),
+/// so `add`'s formals take their references.
+#[test]
+fn r838_under_the_global_premise_add_takes_its_references() {
+    let signature = r838_signature("add", true);
     assert!(
         signature.contains("a: &mut i32") && signature.contains("b: &"),
         "({signature})"
@@ -430,7 +447,7 @@ fn r838_add_of_two_statics_contents_keeps_both_formals_raw() {
 
 #[test]
 fn r838_control_the_entrys_certified_pair_keeps_its_references() {
-    let signature = r838_signature("add2");
+    let signature = r838_signature("add2", false);
     assert!(
         signature.contains("a: &mut i32") && signature.contains("b: &"),
         "({signature})"

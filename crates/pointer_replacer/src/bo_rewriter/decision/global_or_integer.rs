@@ -66,32 +66,34 @@ impl ProvenanceKind {
     }
 }
 
-/// **R944-1 (relay 201) — which provenances P11 covers.** The user is pricing
-/// keeping globals inside the claim: under `integers-only` a global's value or
-/// storage is no premise (148b's classifier reads it as an Unknown root, and
-/// R934-1 holds the pair unless a structural certificate clears it); integer-
-/// made pointers stay outside the claim under both scopes (R936-1).
+/// **R944-1 (relay 201) — which provenances P11 covers.** Under `integers-only`
+/// a global's value or storage is no premise (148b's classifier reads it as an
+/// Unknown root, and R934-1 holds the pair unless a structural certificate
+/// clears it); integer-made pointers stay outside the claim under both scopes
+/// (R936-1). **R959-1 (USER, relay 203/204): globals are inside the claim, so
+/// `integers-only` is the default;** `globals-and-integers` is the named
+/// alternative (the price line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum P11Scope {
     GlobalsAndIntegers,
     IntegersOnly,
 }
 
-/// The marker a test fixture carries to select `integers-only` (the compiler
-/// runs its callback on its own thread and fixtures run concurrently, so a
-/// process-wide switch cannot be flipped per test).
+/// The marker a test fixture carries to select the named `globals-and-integers`
+/// mode (the compiler runs its callback on its own thread and fixtures run
+/// concurrently, so a process-wide switch cannot be flipped per test).
 #[cfg(test)]
-pub(crate) const TEST_INTEGERS_ONLY_MARKER: &str = "crat-test-p11-scope: integers-only";
+pub(crate) const TEST_GLOBALS_AND_INTEGERS_MARKER: &str =
+    "crat-test-p11-scope: globals-and-integers";
 
 impl P11Scope {
-    /// `CRAT_P11_SCOPE` (fail-loud; absent = `globals-and-integers`, the
-    /// offered behaviour).
+    /// `CRAT_P11_SCOPE` (fail-loud; absent = `integers-only`, R959-1).
     pub(crate) fn of(tcx: TyCtxt<'_>) -> Self {
         // The environment first, always validated (fail-loud), so the default
         // never rests on a source scan (the switch review's MED-1: the census
         // of record is a test build).
         let scope = match std::env::var("CRAT_P11_SCOPE") {
-            Err(std::env::VarError::NotPresent) => Self::GlobalsAndIntegers,
+            Err(std::env::VarError::NotPresent) => Self::IntegersOnly,
             Ok(value) if value == "globals-and-integers" => Self::GlobalsAndIntegers,
             Ok(value) if value == "integers-only" => Self::IntegersOnly,
             other => panic!(
@@ -102,9 +104,9 @@ impl P11Scope {
         if tcx.sess.source_map().files().iter().any(|file| {
             file.src
                 .as_ref()
-                .is_some_and(|src| src.contains(TEST_INTEGERS_ONLY_MARKER))
+                .is_some_and(|src| src.contains(TEST_GLOBALS_AND_INTEGERS_MARKER))
         }) {
-            return Self::IntegersOnly;
+            return Self::GlobalsAndIntegers;
         }
         let _ = tcx;
         scope
