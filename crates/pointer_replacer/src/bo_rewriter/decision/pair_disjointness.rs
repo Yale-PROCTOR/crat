@@ -1661,7 +1661,8 @@ impl PairDisjointnessIndex {
         self.ledger.borrow().clone()
     }
 
-    /// **P11 (R936-1) — the receipt table.** Every pair a rule ASKED the
+    /// **P11 (R936-1) — the receipt table** (and, relay 200, P5's pairs at the
+    /// allocator contract's deallocator, kind `premise=allocator-contract`). Every pair a rule ASKED the
     /// certificates about (the ledger) and the premise arm cleared, once per
     /// pair, plus the foreign-callee pairs `certify_call_arguments` cleared by
     /// it (the round-3 review's M3): `caller callee site left right kind`. The
@@ -1685,6 +1686,8 @@ impl PairDisjointnessIndex {
                 Ok(CertificateKind::GlobalOrIntegerPremise(kind)) => kind.key(),
                 // R939-1: a refusal for a shown relation, its own kind.
                 Err(Unproved::PremiseShownRelation) => "refused-shown-relation",
+                // Relay 200: P5's pairs, receipted and counted beside P11's.
+                Ok(CertificateKind::AllocatorContractFree) => "premise=allocator-contract",
                 _ => continue,
             };
             // The asked call's own argument span (round-4 MED-3), at its macro
