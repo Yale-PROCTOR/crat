@@ -35,11 +35,12 @@ fn rewrite(input: &str) -> RewriteOutcome {
 
 /// The census shape: `BrotliFree(m, (*self_0).literal_costs_ as *mut c_void)`.
 /// The callee's wrapper owned the call, the caller's class the argument.
-/// **R934-1 (i) (the seat on 149f; R833-1):** `m`, a reference formal beside
-/// the raw `p` whose argument is a pointer loaded from memory, is not shown
-/// disjoint, so `m` is held raw with it and no A5 raw view is planned; the
-/// emission composes without a collision. (α)'s composition no longer arises
-/// on this fixture (wave-5d 150).
+/// **R934-1 (i) (the seat on 149f; R833-1)** would hold `m` beside the raw
+/// `p`, a pointer loaded from memory; **P5 (the pinned allocator contract,
+/// wave-5d 150g)** certifies the pair at the contract's deallocator (the block
+/// is a fresh allocation, never the manager), so `m` delivers and the call
+/// takes the caller's own raw product without an A5 wrapper. (α)'s composition
+/// no longer arises on this fixture.
 #[test]
 fn the_wrapper_takes_the_inner_class_product_as_its_raw_value() {
     let outcome = rewrite(fixture::A5_INNER_ARGUMENT);
@@ -67,10 +68,14 @@ fn the_wrapper_takes_the_inner_class_product_as_its_raw_value() {
     );
     let text = source.split_whitespace().collect::<String>();
     assert!(
-        text.contains("fnBrotliFree(mutm:*mutMemoryManager,mutp:*mutlibc::c_void)"),
-        "the reference beside the unproven raw partner is held raw: {source}"
+        text.contains("fnBrotliFree(mutm:&mutMemoryManager,mutp:*mutlibc::c_void)"),
+        "the manager delivers beside the certified block: {source}"
     );
     assert!(!text.contains("let__crat_a5_raw_"), "{source}");
+    assert!(
+        text.contains("__crat_raw"),
+        "the inner's product reaches the call: {source}"
+    );
     assert!(
         super::verify::type_checks_str(&source),
         "the composed emission must type/borrow-check: {source}"
@@ -88,7 +93,7 @@ fn the_wrapper_takes_the_inner_class_product_as_its_raw_value() {
 /// Witnessed on the plan: with both calls present for one span, exactly ONE
 /// whole-call edit is planned and no class carries the intra-class hold.
 #[test]
-#[ignore = "R934-1 (i) (the seat on 149f; R833-1): a reference beside a raw formal not shown disjoint is held, so this fixture plans no A5 raw-view call to compose with a PAIR rendering; the intra-class arm is unexercised here; wave-5d report 150"]
+#[ignore = "the pair is certified (P5, the allocator contract's deallocator; under R934-1 it would be held), so this fixture plans no A5 raw-view call to compose with a PAIR rendering; the intra-class arm is unexercised here; wave-5d reports 150 / 150g"]
 fn the_a5_fallback_yields_to_a_pair_rendering_of_the_same_call() {
     ::utils::compilation::run_compiler_on_str(fixture::A5_INNER_ARGUMENT, |tcx| {
         let (mut table, _) = super::decide_table_with_ctx_config(

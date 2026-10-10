@@ -89,6 +89,13 @@ pub(crate) enum CertificateKind {
     /// assumption, never a proof: receipted per pair and counted
     /// (`<p>.raw-boundary-pair-premise.tsv`).
     GlobalOrIntegerPremise(super::global_or_integer::ProvenanceKind),
+    /// **P5 (the pinned allocator contract, addendum 409; wave-5d 150g).** At
+    /// the contract's deallocator, the block argument is what one of the
+    /// contract's allocators returned: a fresh block, never the object another
+    /// argument designates (`BrotliFree(m, p)`: `p` is not the manager). Rests
+    /// on the stated premise P5 as `DistinctRootsUnderContract` does;
+    /// receipted.
+    AllocatorContractFree,
     /// R466-5, temporal rather than class-based: one side is the address of a
     /// stack local FIRST taken at this very call, and the callee never retains
     /// that position. No pointer VALUE computed before the call can name that
@@ -146,6 +153,7 @@ impl CertificateKind {
             Self::FreshStackAddress => "pair-disjoint:fresh-stack-address",
             Self::ParameterPair => "pair-disjoint:parameter-pair",
             Self::CallerParameterPair => "pair-disjoint:caller-parameter-pair",
+            Self::AllocatorContractFree => "pair-disjoint:allocator-contract-free",
             Self::GlobalOrIntegerPremise(kind) => match kind {
                 super::global_or_integer::ProvenanceKind::GlobalValue => {
                     "pair-disjoint:premise=global-or-integer-provenance:global-value"
@@ -562,6 +570,9 @@ pub(crate) struct PairDisjointnessIndex {
     /// entry). Their callers are not all recorded, so no pair of their formals
     /// is ever certified from the direct calls.
     address_taken: FxHashSet<u32>,
+    /// P5 (wave-5d 150g): the allocator contracts' deallocators among the
+    /// program's functions, by the block argument's index.
+    contract_frees: FxHashMap<u32, usize>,
     /// R466-5: `(caller, callee, argument index)` where that argument is the
     /// address of a stack local taken exactly once in the caller's body, at a
     /// callee position wave-6r's walk proves never retained.
@@ -776,6 +787,17 @@ impl PairDisjointnessIndex {
             }
         }
         let address_taken = address_taken_functions(tcx, &local_functions);
+        // P5: the contracts' deallocators, by the block argument's index.
+        let contract_frees: FxHashMap<u32, usize> = local_functions
+            .iter()
+            .filter_map(|function| {
+                let name = tcx.item_name(function.to_def_id());
+                super::allocator_contract::CONTRACTS
+                    .iter()
+                    .find(|contract| name.as_str() == contract.free)
+                    .map(|contract| (function.local_def_index.as_u32(), contract.pointer_index))
+            })
+            .collect();
 
         // R466-5. The address-takings of every binding, then the sites where a
         // stack argument is the ONLY address-taking of its local and the
@@ -838,6 +860,7 @@ impl PairDisjointnessIndex {
             param_bindings,
             exported,
             address_taken,
+            contract_frees,
             parameter_pairs: RefCell::new(FxHashMap::default()),
             ledger: RefCell::new(Vec::new()),
             premise_foreign: RefCell::new(Vec::new()),
@@ -1410,6 +1433,13 @@ impl PairDisjointnessIndex {
         // otherwise: whichever is the most specific thing the input lacked.
         if union_members {
             return Err(Unproved::UnionSibling);
+        }
+        // P5 (the pinned allocator contract): at the contract's deallocator the
+        // block is a fresh allocation, never the other argument's object.
+        if let Some(&block) = self.contract_frees.get(&callee)
+            && (left == block) != (right == block)
+        {
+            return Ok(CertificateKind::AllocatorContractFree);
         }
         // P11 (R936-1), the LAST arm: every structural certificate failed.
         if let Some(kind) = super::global_or_integer::premise(a.premise, b.premise) {
