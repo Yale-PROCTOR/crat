@@ -2358,27 +2358,30 @@ fn main321_f1_an_uncertified_owner_takes_no_cascade_view() {
 
 /// **wave-6a 160 (relay 160; wave-5d 150o §2): the bracketed construction keeps
 /// the manager's bridge.** brotli's `BrotliCreateZopfliBackwardReferences` at 58:
-/// the caller's `m` is held raw (R934-1 (i): beside a block loaded from a field
-/// at `BrotliFree`), `BrotliAllocate::m` is `&mut MemoryManager`, and the C arm
-/// bridges the argument `&mut *m` INSIDE the allocation this rule brackets. The
-/// use pass's bracket re-parsed the walked node's text, so the seam pass met no
-/// node at the argument's span: the bridge was dropped, `BrotliAllocate(m, ..)`
-/// stayed raw (`E0308`), and the compile gate reverted the function.
+/// the caller's `m` is raw (there R934-1 (i) holds it; here a foreign call
+/// sources it, as in `w6a_ac_the_construction_contains_no_edit_of_the_allocator_call`),
+/// `BrotliAllocate::m` is `&mut MemoryManager`, and the C arm bridges the argument
+/// `&mut *m` INSIDE the allocation this rule brackets. The use pass's bracket
+/// re-parsed the walked node's text, so the seam pass met no node at the
+/// argument's span: the bridge was dropped, `BrotliAllocate(m, ..)` stayed raw
+/// (`E0308`), and the compile gate reverted the function.
 #[test]
 fn w6a_160_the_bracketed_allocation_keeps_the_managers_bridge() {
     let src = format!(
         "{PRELUDE}\
-pub struct Holder {{ pub blk: *mut std::os::raw::c_void }}\n\
-pub unsafe extern \"C\" fn held_manager(mut m: *mut MemoryManager, mut h: *mut Holder, mut n: usize, mut split: *mut u32) {{\n\
+extern \"C\" {{\n\
+    fn get_manager() -> *mut MemoryManager;\n\
+}}\n\
+pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
+    let mut m = get_manager();\n\
     let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
     *syms.offset(0 as isize) = 3 as u32;\n\
     *split = *syms.offset(0 as isize);\n\
     BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
     syms = 0 as *mut u32;\n\
-    BrotliFree(m, (*h).blk);\n\
 }}\n"
     );
-    let out = emitted("w6a-160-held-manager", &src);
+    let out = emitted("w6a-160-raw-manager", &src);
     let text = compact(&out.source);
     assert!(
         text.contains("Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(&mut*m,"),
