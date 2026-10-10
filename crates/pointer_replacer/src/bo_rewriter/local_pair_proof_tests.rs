@@ -576,7 +576,7 @@ fn residual(body: &str) -> Vec<(String, bool, bool)> {
 #[test]
 fn r149h_a_getter_of_a_statics_value_is_a_receipted_premise() {
     let source = residual_source(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; cp(get_g().offset(32), tmp); *tmp }",
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(get_g().offset(32), tmp); *tmp }",
     );
     let rows = held(&source);
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
@@ -628,7 +628,7 @@ fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
 #[test]
 fn r149h_a_pointer_to_a_static_struct_is_a_receipted_premise() {
     let source = residual_source(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_s(tmp); let s: *mut C = &mut S; cp((*s).buf.offset(32), tmp); *tmp }",
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_s(tmp); let s: *const C = &S; cp((*s).buf.offset(32), tmp); *tmp }",
     );
     let rows = held(&source);
     assert!(!is_held(&rows, "cp::s"), "{rows:?}");
@@ -818,4 +818,39 @@ pub unsafe fn c(p: *mut i8) -> i8 {
 fn r939_1_control_an_unrelated_global_keeps_the_premise() {
     let input = SHOWN_THROUGH_A_GLOBAL.replace("    G = p;\n", "");
     assert!(verdict_at(&input, "c", "upd", 0, 1).is_ok());
+}
+
+/// The round-6 review's MED-1 / MED-2 / MED-3 (wave-5d 150h): relations the
+/// caller's text shows that the first R939-1 walk did not reach.
+fn refusal(src: &str, caller: &'static str, callee: &'static str) -> bool {
+    verdict_at(src, caller, callee, 0, 1)
+        == Err(super::decision::pair_disjointness::Unproved::PremiseShownRelation)
+}
+
+const R939_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
+pub static mut G: *mut i32 = 0 as *mut i32;
+#[repr(C)]
+pub struct C { pub buf: *mut i32, pub n: usize }
+pub static mut S: C = C { buf: 0 as *mut i32, n: 0 };
+unsafe fn upd(a: *mut i32, b: *mut i32) { *a += *b; }
+unsafe fn get_g() -> *mut i32 { G }
+pub unsafe fn getter(p: *mut i32) { G = p; upd(get_g(), p); }
+pub unsafe fn through_a_pointer(p: *mut i32) { let s: *mut C = &mut S; (*s).buf = p; upd((*s).buf, p); }
+pub unsafe fn aggregate(p: *mut i32) { let mut c = C { buf: 0 as *mut i32, n: 0 }; c.n = p as usize; upd(c.n as *mut i32, p); }
+"#;
+
+#[test]
+fn r150h_the_getters_static_is_where_the_refusal_starts() {
+    assert!(refusal(R939_SHAPES, "getter", "upd"));
+}
+
+#[test]
+fn r150h_a_store_through_a_pointer_to_the_static_refuses() {
+    assert!(refusal(R939_SHAPES, "through_a_pointer", "upd"));
+}
+
+#[test]
+fn r150h_a_store_into_a_local_aggregate_refuses() {
+    assert!(refusal(R939_SHAPES, "aggregate", "upd"));
 }
