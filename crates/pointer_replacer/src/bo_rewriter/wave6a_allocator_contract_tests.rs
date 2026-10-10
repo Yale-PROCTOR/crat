@@ -2250,3 +2250,76 @@ pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut spl
     );
     assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
 }
+
+/// **Relay 321's controls: the cascade's root decides.** A cascade rooted in a pair
+/// hold (directly or through a further cascade) takes the late view; one rooted in
+/// a retained-access hold or a release through an indirect call does not, nor a
+/// binding's cascade, a formal the resolver withholds (a retained or released
+/// predicate names it), or a cycle.
+#[test]
+fn main321_only_a_pair_rooted_cascade_takes_the_late_view() {
+    use super::decision::{Decision, Degradation, DegradeReason, seam::into_held_rooted_in_a_pair};
+    let held = |reason: DegradeReason| {
+        Decision::Degraded(Degradation {
+            subject: "-".to_owned(),
+            site: "-".to_owned(),
+            reason,
+        })
+    };
+    let cascade_to = |path: &str, k: usize| {
+        held(DegradeReason::IntoHeldFormal {
+            detail: format!("into-held-formal:{path}#{k}"),
+        })
+    };
+    let pair = held(DegradeReason::PairNotShownDisjoint {
+        detail: "pair-not-shown-disjoint:ref-beside-raw:m::Scan#1:peer#2".to_owned(),
+    });
+    let retained = held(DegradeReason::RetainedAlias {
+        detail: "evident:self-reference:v".to_owned(),
+    });
+    let released = held(DegradeReason::ReleasedThroughIndirectCall {
+        detail: "m::Free#1".to_owned(),
+    });
+    let mid = cascade_to("m::Scan", 1);
+    let looped = cascade_to("m::Loop", 1);
+    let lookup = |path: &str, index: usize| match (path, index) {
+        ("m::Scan", 0) => Some(&pair),
+        ("m::Keep", 0) => Some(&retained),
+        ("m::Free", 0) => Some(&released),
+        ("m::Mid", 0) => Some(&mid),
+        ("m::Loop", 0) => Some(&looped),
+        _ => None,
+    };
+    assert!(into_held_rooted_in_a_pair(
+        "into-held-formal:m::Scan#1",
+        &lookup
+    ));
+    assert!(into_held_rooted_in_a_pair(
+        "into-held-formal:m::Mid#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Keep#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Free#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-binding:m::f::x",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Loop#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Withheld#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Scan#0",
+        &lookup
+    ));
+}

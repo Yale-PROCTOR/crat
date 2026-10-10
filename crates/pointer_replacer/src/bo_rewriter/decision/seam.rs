@@ -3982,15 +3982,30 @@ fn optional_into_raw_formal(
 /// an indirect call (the callee may free it) is not read here: a lend to such a
 /// formal is exactly what the hold says is unproved, and the compile gate
 /// reverts the caller as before.
-fn late_raw_formal(decision: &Decision) -> bool {
+///
+/// **Relay 321 (main 213 §5): the cascade of a pair hold** (`into-held-formal`,
+/// the formal handed whole to a formal a pair hold makes raw) is read the same
+/// way, where its root is a pair hold ([`into_held_rooted_in_a_pair`]) and no
+/// retained-access or released-through-indirect-call predicate names the formal
+/// (`excluded`): the pair at the root claims nothing about what the callee does
+/// with the pointer it is lent. `formal_of` finds a formal's decision by the
+/// callee path and 0-based index the cascade's detail names.
+fn late_raw_formal<'d>(
+    decision: &Decision,
+    excluded: bool,
+    formal_of: &dyn Fn(&str, usize) -> Option<&'d Decision>,
+) -> bool {
     match decision {
-        Decision::Degraded(record) => matches!(
-            record.reason,
+        Decision::Degraded(record) => match &record.reason {
             super::DegradeReason::SilentCoercion { .. }
-                | super::DegradeReason::ClassBlocked { .. }
-                | super::DegradeReason::SignatureClassHeld { .. }
-                | super::DegradeReason::PairNotShownDisjoint { .. }
-        ),
+            | super::DegradeReason::ClassBlocked { .. }
+            | super::DegradeReason::SignatureClassHeld { .. }
+            | super::DegradeReason::PairNotShownDisjoint { .. } => true,
+            super::DegradeReason::IntoHeldFormal { detail } => {
+                !excluded && into_held_rooted_in_a_pair(detail, formal_of)
+            }
+            _ => false,
+        },
         Decision::Ref { .. }
         | Decision::InferredRef { .. }
         | Decision::Slice { .. }
@@ -3999,6 +4014,41 @@ fn late_raw_formal(decision: &Decision) -> bool {
         | Decision::Opt { .. }
         | Decision::Box(_) => false,
     }
+}
+
+/// **Relay 321: is this `into-held-formal` cascade rooted in a pair hold?** The
+/// detail names the held formal the binding is handed to
+/// (`into-held-formal:<callee>#<1-based index>`, `settled_holds`); follow it, and
+/// any further cascade, to the hold at the root. Only `held:pair-not-shown-disjoint`
+/// answers yes: a retained-access root, a release through an indirect call, a
+/// binding's cascade (`into-held-binding:`), a formal `formal_of` does not give
+/// (a retained or released predicate names it) or a chain longer than eight is no.
+pub(crate) fn into_held_rooted_in_a_pair<'d>(
+    detail: &str,
+    formal_of: &dyn Fn(&str, usize) -> Option<&'d Decision>,
+) -> bool {
+    let mut detail = detail.to_owned();
+    for _ in 0..8 {
+        let Some(rest) = detail.strip_prefix("into-held-formal:") else {
+            return false;
+        };
+        let Some((path, index)) = rest.rsplit_once('#') else {
+            return false;
+        };
+        let Some(index) = index.parse::<usize>().ok().and_then(|k| k.checked_sub(1)) else {
+            return false;
+        };
+        let next = match formal_of(path, index) {
+            Some(Decision::Degraded(record)) => match &record.reason {
+                super::DegradeReason::PairNotShownDisjoint { .. } => return true,
+                super::DegradeReason::IntoHeldFormal { detail } => detail.clone(),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        detail = next;
+    }
+    false
 }
 
 /// **main 202 — a `Box` owner lent to a formal that ended raw late.** The raw
@@ -5206,6 +5256,28 @@ pub(crate) fn synthesize_with_raw_boundary(
             );
         }
     }
+    // Relay 321: the late view's cascade reading (`late_raw_formal`) — a formal by
+    // the callee path and index a cascade's detail names, less the formals a
+    // retained-access or released-through-indirect-call predicate names.
+    let late_view_excluded: rustc_hash::FxHashSet<(LocalDefId, HirId)> = table
+        .settled_hold_receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.predicate == "held:retained-alias"
+                || receipt.predicate == super::released_indirect::KEY
+        })
+        .map(|receipt| receipt.node)
+        .collect();
+    let formal_by_path: FxHashMap<(String, usize), (LocalDefId, HirId)> = param_key
+        .iter()
+        .map(|((callee, index), key)| ((tcx.def_path_str(callee.to_def_id()), *index), *key))
+        .collect();
+    let formal_of = |path: &str, index: usize| {
+        formal_by_path
+            .get(&(path.to_owned(), index))
+            .filter(|key| !late_view_excluded.contains(*key))
+            .and_then(|key| decision_of.get(key).copied())
+    };
 
     // Deterministic callee order: `FxHashMap` iteration permutes between runs,
     // and D19 makes a report whose order permutes non-comparable.
@@ -5344,10 +5416,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                         arg.span,
                         arg.index,
                     )
-                    && param_key
-                        .get(&(*callee, arg.index))
-                        .and_then(|k| decision_of.get(k))
-                        .is_some_and(|d| late_raw_formal(d))
+                    && param_key.get(&(*callee, arg.index)).is_some_and(|k| {
+                        decision_of.get(k).is_some_and(|d| {
+                            late_raw_formal(d, late_view_excluded.contains(k), &formal_of)
+                        })
+                    })
                     && owner_argument(arg)
                         .and_then(|root| decision_of.get(&(site.caller, root)))
                         .is_some_and(|d| {
