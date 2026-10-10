@@ -3129,19 +3129,36 @@ fn w4b113_unrecorded_growth_states_no_extent() {
 /// Report 049's C6 was a claim about the roots the CALL SITES hand over, and
 /// that is what the column now names — counted, so one bad caller among five is
 /// visible rather than averaged away.
+///
+/// **wave-5d 58′ (relay 202 item 3), R934-1 (i) — re-pinned to the held form
+/// (150b).** `StoreOpaqueOuter` hands `&mut pos` beside `GetBuffer()`'s result,
+/// two roots no certificate separates, so the pair holds `buffer` raw
+/// (`held:pair-not-shown-disjoint`); `StoreMiddle::storage` then receives a raw
+/// root and is decided `slice-use-unsupported` before any extent is asked, so
+/// the parameter row this test was written to read does not form here. The
+/// caller's own root row still names its shape. (A reshaping with `pos` local
+/// to `StoreMiddle` delivers the whole chain and forms no held row either.)
 #[test]
 fn w4b114_a_parameter_row_names_its_callers_roots() {
     let rows = b1_rows(W4_B1_PARAM_OVER_OPAQUE_ROOT);
-    let parameter = rows
-        .iter()
-        .find(|(subject, ..)| subject.starts_with("StoreMiddle::storage"))
-        .unwrap_or_else(|| panic!("no StoreMiddle::storage row: {rows:?}"));
-    assert_eq!(parameter.1, "held", "{rows:?}");
-    assert_eq!(parameter.3, "caller-root-states-no-extent", "{rows:?}");
-    assert_eq!(
-        parameter.2, "callers:call-resultx1",
-        "the shape belongs to the caller's root, not to the parameter: {rows:?}"
+    assert!(
+        !rows
+            .iter()
+            .any(|(subject, ..)| subject.starts_with("StoreMiddle::storage")),
+        "{rows:?}"
     );
+    let decisions = super::emit_tests::decisions_of(W4_B1_PARAM_OVER_OPAQUE_ROOT);
+    for (name, is_param, reason) in [
+        ("buffer", false, "held:pair-not-shown-disjoint"),
+        ("storage", true, "slice-use-unsupported"),
+    ] {
+        assert!(
+            decisions
+                .iter()
+                .any(|(n, p, r)| n == name && *p == is_param && r == reason),
+            "{name}: {decisions:?}"
+        );
+    }
 }
 
 /// **W4B1-15 (report 057) — the admission reaches the CENSUS.**

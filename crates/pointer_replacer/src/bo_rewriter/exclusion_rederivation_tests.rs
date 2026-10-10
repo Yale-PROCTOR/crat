@@ -70,9 +70,13 @@ fn form<'a>(outcome: &'a Outcome, label: &str) -> &'a str {
 #[test]
 fn binn_failed_optional_candidate_excludes_only_itself() {
     let outcome = decide(BINN).expect("the failed candidate must not fail the program");
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): `is_bool_str::p` receives the
+    // loaded `(*value).ptr` beside the callee's raw `pbool` at an unknown
+    // relation (a pointer loaded from the entry's pointee may designate
+    // `*pbool`), so the pair is `ref-beside-raw` unresolved and `p` is held raw.
     assert_eq!(
         form(&outcome, "is_bool_str::p"),
-        "opt-ref-shared",
+        "raw",
         "{:?}",
         outcome.forms
     );
@@ -191,12 +195,19 @@ fn binn_failed_optional_candidate_excludes_only_itself() {
 #[test]
 fn binn_emits_the_prior_deliveries_with_the_candidate_excluded() {
     let rendered = super::emit_tests::ast_emitted_source_of(BINN).expect("emitted");
-    assert!(rendered.contains("p: Option<&i32>"), "{rendered}");
-    assert!(rendered.contains("value: Option<&Binn>"), "{rendered}");
-    assert!(rendered.contains("pbool: *mut i32"), "{rendered}");
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): `is_bool_str::p` is held raw
+    // (the loaded `(*value).ptr` beside the raw `pbool`, unresolved). With the
+    // callee's `p` raw, the A5 pair edit no longer collides with the `value`
+    // use inside the call, so the caller's Option candidate SUCCEEDS — the
+    // case the first test's comment names — and no exclusion is written.
     assert!(
-        !rendered.contains("pbool: Option<&mut i32>"),
-        "the failed candidate is excluded, not delivered by another route: {rendered}"
+        rendered.contains("is_bool_str(p: *mut i32, pbool: *mut i32)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("value: Option<&Binn>"), "{rendered}");
+    assert!(
+        rendered.contains("mut pbool: Option<&mut i32>"),
+        "the caller's candidate delivers once nothing collides: {rendered}"
     );
     assert!(
         super::verify::type_checks_str(&rendered),

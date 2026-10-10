@@ -70,11 +70,25 @@ fn r573_4_the_star_receipt_names_the_forced_cover() {
     // delivery lost). The star then has one primary, `m`, and `data` is its raw view: no
     // forced cover is needed and none is receipted. The rule stays witnessed at the plan
     // (`pair_plan_tests::r573_4_*`).
+    //
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): `Stitch::m` (`&mut (*s).mm`)
+    // now sits beside `data`, the loaded `(*s).buf`, at an unknown relation
+    // (the pointer may designate `*s`), so the pair holds `m` raw
+    // (`held:pair-not-shown-disjoint`) and, with `data` held beside it, no A5
+    // proof site forms at `Setup`: there is no star, ambiguous or forced. The
+    // rule stays witnessed at the plan (`pair_plan_tests::r573_4_*`).
     let tsv = seam_receipts(STAR);
     assert!(!tsv.contains("a5-primary-ambiguous"), "{tsv}");
-    let data = overlap_proof(&tsv, "Setup", 3);
-    assert!(data.contains("\ta5-site-proof-t2-fallback\t"), "{data}");
-    let m = overlap_proof(&tsv, "Setup", 0);
-    assert!(m.contains("\ta5-site-proof-pair-primary\t"), "{m}");
     assert!(!tsv.contains("pair-forced-cover"), "{tsv}");
+    assert!(
+        !tsv.lines()
+            .any(|row| row.starts_with("overlap-proof\tSetup\t")),
+        "{tsv}"
+    );
+    let rows = super::emit_tests::decisions_of(STAR);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "m" && *p && r == "held:pair-not-shown-disjoint"),
+        "{rows:?}"
+    );
 }

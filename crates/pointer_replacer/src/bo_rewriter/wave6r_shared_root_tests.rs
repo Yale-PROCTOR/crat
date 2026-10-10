@@ -32,13 +32,17 @@ pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
 /// disjoint from `*s` (`held:pair-not-shown-disjoint`). The root keeps its
 /// input form and its original mutable field addresses, so no read-only
 /// bridge is built; the callees' formals are unchanged.
+///
+/// **wave-5d 58′ (relay 202 item 3): the hold lifts.** `prepare_h65` is an
+/// uncalled entry, so its two formals are disjoint under R819 (the
+/// `pair-disjoint:caller-parameter-pair` certificate, R924-1): `s` beside
+/// `cache` at `prepare_hrolling` is certified, the root delivers `&H65`, and
+/// the read-only bridge this test was written for is back.
 #[test]
 fn wave6r_h65_shared_root_field_address_into_readonly_raw_formal() {
     let source = super::emitted(INPUT);
-    // R829-1 (relay 297, main 188): prepare_h65::s is held beside `cache` (arg1)
-    // at prepare_hrolling; `s: &H65` -> `s: *mut H65`.
     assert!(
-        source.contains("prepare_h65(s: *mut H65, cache: &mut i32)"),
+        source.contains("prepare_h65(s: &H65, cache: &mut i32)"),
         "{source}"
     );
     assert!(source.contains("prepare_h6(s: &H6"), "{source}");
@@ -49,17 +53,14 @@ fn wave6r_h65_shared_root_field_address_into_readonly_raw_formal() {
         source.contains("prepare_hrolling(s: *mut HROLLING"),
         "{source}"
     );
-    // R829-1 (relay 297, main 188): prepare_h65::s is held beside `cache` (arg1)
-    // at prepare_hrolling; the root passes its original mutable field
-    // addresses (was `prepare_h6(&(*s).ha` and
-    // `prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()`, with no
-    // `&mut (*s)`).
+    // wave-5d 58′: the certified root passes shared field addresses, and the
+    // never-written raw formal takes the read-only bridge.
     assert!(
-        source.contains("prepare_h6(&mut (*s).ha,")
-            && source.contains("prepare_hrolling(&mut (*s).hb,"),
-        "the held root keeps its mutable field addresses: {source}"
+        source.contains("prepare_h6(&(*s).ha,")
+            && source.contains("prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut(),"),
+        "the shared root bridges read-only: {source}"
     );
-    assert!(!source.contains("from_ref(&(*s)"), "{source}");
+    assert!(!source.contains("&mut (*s)"), "{source}");
 }
 
 /// The per-function placement where the callee class is withdrawn: the
@@ -69,28 +70,27 @@ fn wave6r_h65_shared_root_field_address_into_readonly_raw_formal() {
 /// bridges read-only: `prepare_h65::s` is held raw beside `cache` (arg1) at
 /// `prepare_hrolling` (`held:pair-not-shown-disjoint`), so the call keeps the
 /// root's original mutable field address. The name is kept.
+///
+/// **wave-5d 58′ (relay 202 item 3): the hold lifts** (R819's
+/// caller-parameter-pair certificate, as in the test above): the root is
+/// `&H65` again and the withdrawn callee's raw formals take the bridges.
 #[test]
 fn wave6r_h65_withdrawn_callee_class_keeps_shared_root_bridge() {
     let source = super::emitted_reverting(INPUT, Some("prepare_hrolling"));
-    // R829-1 (relay 297, main 188): prepare_h65::s is held beside `cache` (arg1)
-    // at prepare_hrolling; `s: &H65` -> `s: *mut H65`.
     assert!(
-        source.contains("prepare_h65(s: *mut H65, cache: &mut i32)"),
+        source.contains("prepare_h65(s: &H65, cache: &mut i32)"),
         "{source}"
     );
     assert!(
         source.contains("prepare_hrolling(s: *mut HROLLING"),
         "{source}"
     );
-    // R829-1 (relay 297, main 188): prepare_h65::s is held beside `cache` (arg1)
-    // at prepare_hrolling; the read-only bridge
-    // `prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut()` -> the
-    // original `prepare_hrolling(&mut (*s).hb, cache)`.
     assert!(
-        source.contains("prepare_hrolling(&mut (*s).hb, cache);"),
+        source.split_whitespace().collect::<String>().contains(
+            "prepare_hrolling(core::ptr::from_ref(&(*s).hb).cast_mut(),core::ptr::from_mut(&mut*cache));"
+        ),
         "{source}"
     );
-    assert!(!source.contains("from_ref(&(*s)"), "{source}");
 }
 
 /// A raw root keeps its original mutable address: nothing to re-spell.
@@ -121,17 +121,18 @@ fn wave6r_h65_reverted_caller_keeps_original_address() {
 /// `cache` (arg1) at `prepare_hrolling`, and `prepare_h65::cache` beside the
 /// now-written `&mut (*s).ha` (arg0) at `prepare_h6`. The root is raw rather
 /// than `&mut`; the mutable address still stands and no shared view is built.
+///
+/// **wave-5d 58′ (relay 202 item 3): both holds lift** under R819's
+/// caller-parameter-pair certificate (`prepare_h65` is uncalled): the root is
+/// `&mut H65` and `cache` `&mut i32`; the mutable address still stands.
 #[test]
 fn wave6r_h65_written_formal_keeps_mutable_root() {
     let source = super::emitted(&INPUT.replace(
         "*cache = (*s).num + (s as usize) as i32;",
         "(*s).num += 1; *cache = (s as usize) as i32;",
     ));
-    // R829-1 (relay 297, main 188): prepare_h65::s is held beside `cache` (arg1)
-    // at prepare_hrolling and prepare_h65::cache beside `&mut (*s).ha` (arg0)
-    // at prepare_h6; `s: &mut H65` -> `s: *mut H65, cache: *mut i32`.
     assert!(
-        source.contains("prepare_h65(s: *mut H65, cache: *mut i32)"),
+        source.contains("prepare_h65(s: &mut H65, cache: &mut i32)"),
         "{source}"
     );
     assert!(source.contains("prepare_h6(s: &mut H6"), "{source}");

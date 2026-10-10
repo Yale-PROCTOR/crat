@@ -107,10 +107,14 @@ fn r738_1_a_raw_twin_call_takes_the_original_arguments() {
     );
     assert_eq!(reverted, 0, "{source}");
     // Control: the other caller's call to the same callee is not the twin's,
-    // so its slice positions keep their bridges.
+    // so its slice positions keep their bridges. wave-5d 58′ (relay 202 item 3),
+    // R934-1 (i): `code_length_histo` is held raw — at `ReadSymbolCodeLengths`
+    // it is the arena's array beside the loaded `symbol_lists`, which may point
+    // into the arena (unknown relation) — so the control reads the slice
+    // position that still converts, `next_symbol`.
     assert!(
         flat.contains("ProcessSingleCodeLength(code_len, &mut symbol,")
-            && flat.contains("core::slice::from_raw_parts_mut(code_length_histo,"),
+            && flat.contains("core::slice::from_raw_parts_mut(next_symbol,"),
         "a call not routed to the twin keeps its bridges:\n{source}"
     );
 }

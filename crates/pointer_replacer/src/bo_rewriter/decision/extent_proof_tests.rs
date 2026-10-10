@@ -492,10 +492,17 @@ fn w6l_extent_ht_call_sites_take_the_capacity() {
     // tier's `SubjectNotSafe` rows at the sites into it say only that a bridge cannot be
     // built. Neither call site builds a slice (a delivery lost), and none takes the
     // fallback extent.
+    //
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): the hold that reaches
+    // `entries` first is now the pair's — at `ht_set`, the loaded
+    // `(*table).entries` sits beside the raw `&mut (*table).length` at an
+    // unknown relation (a pointer loaded from `*table` may designate it), so
+    // `held:pair-not-shown-disjoint`. Either hold builds no slice, which is
+    // what the rest of this test reads.
     let rows = crate::bo_rewriter::emit_tests::decisions_of(HT_CALLERS);
     assert!(
         rows.iter()
-            .any(|(n, p, r)| n == "entries" && *p && r == "held:retained-alias"),
+            .any(|(n, p, r)| n == "entries" && *p && r == "held:pair-not-shown-disjoint"),
         "{rows:?}"
     );
     let edits = seam_edits(HT_CALLERS);

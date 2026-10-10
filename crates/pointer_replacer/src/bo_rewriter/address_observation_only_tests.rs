@@ -70,16 +70,32 @@ fn reason_of<'a>(
 /// their reference forms.
 #[test]
 fn slicecursor_a_measured_only_end_sentinel_is_held_raw() {
-    // The census's A5 world (main 186, class C): with R829-1's hold on the
-    // settled table, the open world's proof-site assertion trips on the A5 peers
-    // the held table plans; the census never runs there.
-    let (source, degradations) = match super::rewrite_m1_census_world(REDUCTION) {
+    // wave-5d 58′ (relay 202 item 3): driven from a FILE, as the census is.
+    // Under R934-1 (i) `FastImpl::input` is held raw, and the third call
+    // (`input` beside `input.offset(input_size)`, one root) takes the raw twin
+    // (`aliased_storage_twin`). The twin is an AST graft; a string fixture
+    // without a nested seam composition verifies `root_text`, the span layer's
+    // second emitter, which never carries it (E0308 at the call, then no
+    // compiling subset). The census compiles the AST product, so the witness
+    // reads that product.
+    let dir = std::env::temp_dir().join(format!("crat-r739-sentinel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, REDUCTION).unwrap();
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &root,
+        super::A5Mode::PreciseReplay,
+        Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        &|_| {},
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    let (source, degradations) = match outcome {
         RewriteOutcome::Emitted {
             source,
             degradations,
             ..
         } => (source, degradations),
-        _ => panic!("the reduction must emit"),
+        RewriteOutcome::Degraded { reason, .. } => panic!("the reduction must emit: {reason}"),
     };
     assert_eq!(
         reason_of(&degradations, "EmitUncompressedMetaBlock::end"),

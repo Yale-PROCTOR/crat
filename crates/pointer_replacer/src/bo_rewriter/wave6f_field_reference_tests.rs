@@ -1596,59 +1596,36 @@ const HEMAN_RAY2: &str = include_str!("wave6f_fixture_heman_ray2.rs");
 fn w6f_heman_ray2_array_follows_its_owner_class() {
     let observed = observe(HEMAN_RAY2);
     let row = field_row(&observed, "kmRay2IntersectBox", "points");
-    assert_eq!(
-        (row.2.as_str(), row.3.as_str()),
-        ("applied", "array-opt-ref-shared"),
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): `kmRay2IntersectLineSegment`'s
+    // `p1` / `p2` are held raw — at `kmRay2IntersectBox` the array's loaded
+    // elements sit beside the raw `intersection` at an unknown relation
+    // (`ref-beside-raw`, unresolved; 150g) — so the loads that feed them are
+    // `into-held-formal`, and the owner is held by its load consumer: the array
+    // is not planned. The tripwire reads the other side, as written: an owner
+    // that is not planned keeps every line of its input and carries no retype.
+    assert_eq!((row.2.as_str(), row.3.as_str()), ("held", "-"), "{row:?}");
+    assert!(
+        row.4.starts_with("load-consumer-degraded:") && row.4.contains("into-held-formal"),
         "{row:?}"
     );
-    for label in [
-        "kmRay2IntersectBox::this_point",
-        "kmRay2IntersectBox::next_point",
-        "kmRay2IntersectBox::other_point",
-    ] {
-        assert_eq!(
-            decision_of(&observed, label),
-            "Ref { mutable: false }",
-            "{label}"
-        );
-    }
-    let withheld = decision_of(&observed, "kmRay2IntersectBox::ray").contains("Degraded");
     let outcome = emitted("heman_ray2", HEMAN_RAY2);
     let (source, _, reverted) = emitted_source(&outcome);
     assert_eq!(reverted, 0, "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    if withheld {
-        // The withheld owner keeps every line of its input, and its signature.
-        for input_text in [
-            "let mut points: [*const kmVec2; 4] = [0 as *const kmVec2; 4];",
-            "points[0 as i32 as usize] = p1;",
-            "let mut this_point = points[i as usize];",
-            "fn kmRay2IntersectBox(mut ray: *const kmRay2, mut p1: *const kmVec2,",
-        ] {
-            assert!(
-                flat.contains(input_text),
-                "missing {input_text:?} in\n{source}"
-            );
-        }
+    for input_text in [
+        "let mut points: [*const kmVec2; 4] = [0 as *const kmVec2; 4];",
+        "points[0 as i32 as usize] = p1;",
+        "let mut this_point = points[i as usize];",
+    ] {
         assert!(
-            !flat.contains("[Option<&kmVec2>; 4]"),
-            "the withheld class must carry no retype\n{source}"
+            flat.contains(input_text),
+            "missing {input_text:?} in\n{source}"
         );
-    } else {
-        // A planned owner delivers the array: the retype, the stores and the
-        // declared loads (modulo a composition's reborrow).
-        let reborrowless = flat.replace("&*", "");
-        for delivered in [
-            "let mut points: [Option<&kmVec2>; 4] = [None; 4];",
-            "points[0 as i32 as usize] = Some(p1);",
-            "let mut this_point: &crate::kmVec2 = points[i as usize].unwrap();",
-        ] {
-            assert!(
-                flat.contains(delivered) || reborrowless.contains(&delivered.replace("&*", "")),
-                "the planned owner must deliver: missing {delivered:?} in\n{source}"
-            );
-        }
     }
+    assert!(
+        !flat.contains("[Option<&kmVec2>; 4]"),
+        "the held owner must carry no retype\n{source}"
+    );
     // The five functions whose classes are not withheld DO deliver.
     for delivered in [
         "fn kmVec2Dot(mut pV1: &kmVec2, mut pV2: &kmVec2)",

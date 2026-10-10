@@ -12158,10 +12158,12 @@ fn r364_2_a_one_byte_mut_into_an_eight_byte_writer_is_held_as_a_write() {
                pub unsafe fn store(storage: *mut u8, at: *mut u64) {\n\
                    write_bits(at, storage)\n\
                }\n\
-               // R898-1 / R901-2 (wave-5d 147): a live caller of opaque arguments.\n\
-               extern \"C\" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }\n\
+               // R898-1 / R901-2 (wave-5d 147): a live caller. wave-5d 58′ (relay\n\
+               // 202 item 3): its two arguments are distinct locals, because two\n\
+               // opaque results sit at an unknown relation and R934-1 (i) holds\n\
+               // `storage` beside the raw `at` before the access is asked.\n\
                #[no_mangle]\n\
-               pub unsafe extern \"C\" fn __crat_test_live() { store(__crat_test_opaque() as *mut u8, __crat_test_opaque() as *mut u64) }\n";
+               pub unsafe extern \"C\" fn __crat_test_live() { let mut b = 0u8; let mut pos = 0u64; store(&mut b, &mut pos) }\n";
     let got = decisions_of(src);
     let reason = reason_of(&got, "storage", true);
     assert!(

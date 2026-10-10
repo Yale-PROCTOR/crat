@@ -79,11 +79,17 @@ fn w6l_seethrough_s1_a_nul_contract_behind_a_local_wrapper_lifts_the_thin_option
 
 /// S1c (item 2's control) — a thin optional at a ONE-element position behind
 /// the same wrapper (`stat`'s buffer) stays the thin optional.
+///
+/// wave-5d 58′ (relay 202 item 3), R934-1 (i): the path was a string literal,
+/// which sits beside `buf` at `stat` at an unknown relation (no certificate
+/// reads a literal's storage), so `buf` was held raw. The path is now a local
+/// array — a root the formal cannot designate — and the control is the one
+/// it was written to be.
 #[test]
 fn w6l_seethrough_s1c_a_one_element_position_behind_the_wrapper_stays_thin() {
     let input = COPY_STAT.replace(
         "pub unsafe fn CloseFiles(mut context: *mut Context) {",
-        "pub unsafe fn Look(mut buf: *mut StatBuf) -> i32 {\n    if buf.is_null() {\n        return 0;\n    }\n    stat(b\"/\\0\" as *const u8 as *const i8, buf)\n}\npub unsafe fn CloseFiles(mut context: *mut Context) {",
+        "pub unsafe fn Look(mut buf: *mut StatBuf) -> i32 {\n    if buf.is_null() {\n        return 0;\n    }\n    let mut path: [i8; 2] = [47 as i8, 0 as i8];\n    stat(path.as_mut_ptr() as *const i8, buf)\n}\npub unsafe fn CloseFiles(mut context: *mut Context) {",
     );
     let source = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
