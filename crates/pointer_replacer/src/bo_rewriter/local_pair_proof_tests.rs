@@ -854,3 +854,47 @@ fn r150h_a_store_through_a_pointer_to_the_static_refuses() {
 fn r150h_a_store_into_a_local_aggregate_refuses() {
     assert!(refusal(R939_SHAPES, "aggregate", "upd"));
 }
+
+/// Relay 200 (the seat on the P5 option): every pair AllocatorContractFree
+/// clears is receipted `premise=allocator-contract` at its call, in the
+/// premise table, and counted by program.
+#[test]
+fn r200_a_contract_free_pair_is_receipted_with_p5() {
+    let input = r#"
+#![allow(dead_code, unused_unsafe, unused_mut)]
+pub mod libc { pub use core::ffi::c_void; }
+#[repr(C)]
+pub struct MemoryManager { pub allocated: usize }
+#[repr(C)]
+pub struct Model { pub costs: *mut f32 }
+pub unsafe fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut libc::c_void) {
+    (*m).allocated = (*m).allocated - 1;
+    let _ = p;
+}
+pub unsafe fn cleanup(mut m: *mut MemoryManager, mut s: *mut Model) {
+    BrotliFree(m, (*s).costs as *mut libc::c_void);
+}
+"#;
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::A5Mode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("decisions");
+        ctx.a5_site_proofs
+            .pair_certificates()
+            .expect("certificates")
+            .premise_receipts_tsv(tcx)
+    })
+    .expect("fixture compiles");
+    assert!(
+        table
+            .lines()
+            .any(|row| row.starts_with("cleanup\tBrotliFree\t")
+                && row.ends_with("\tpremise=allocator-contract")),
+        "{table}"
+    );
+}
