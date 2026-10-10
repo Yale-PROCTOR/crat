@@ -3990,9 +3990,18 @@ fn optional_into_raw_formal(
 /// (`excluded`): the pair at the root claims nothing about what the callee does
 /// with the pointer it is lent. `formal_of` finds a formal's decision by the
 /// callee path and 0-based index the cascade's detail names.
+///
+/// **The stand-in review of relay 321 (F1 / F2): the cascade's view is read only
+/// for an owner a certificate made** (`certified`: the return-certificate, the
+/// allocator-contract and the Box-parameter plans, whose every lend the
+/// `LendOracle` walk proved to neither keep, release, copy nor hand the pointer to
+/// an indirect call). The hold bookkeeping cannot stand in for that proof: the
+/// retained-access check reads delivered subjects only, so a formal already held
+/// never carries its receipt, and a cascade records one root per binding.
 fn late_raw_formal<'d>(
     decision: &Decision,
     excluded: bool,
+    certified: bool,
     formal_of: &dyn Fn(&str, usize) -> Option<&'d Decision>,
 ) -> bool {
     match decision {
@@ -4002,7 +4011,7 @@ fn late_raw_formal<'d>(
             | super::DegradeReason::SignatureClassHeld { .. }
             | super::DegradeReason::PairNotShownDisjoint { .. } => true,
             super::DegradeReason::IntoHeldFormal { detail } => {
-                !excluded && into_held_rooted_in_a_pair(detail, formal_of)
+                certified && !excluded && into_held_rooted_in_a_pair(detail, formal_of)
             }
             _ => false,
         },
@@ -5272,6 +5281,12 @@ pub(crate) fn synthesize_with_raw_boundary(
         .iter()
         .map(|((callee, index), key)| ((tcx.def_path_str(callee.to_def_id()), *index), *key))
         .collect();
+    // The owners whose every lend a certificate's walk proved (the review's F1).
+    let certified_owner = |node: &(LocalDefId, HirId)| {
+        table.return_certificates.plans.contains_key(node)
+            || table.allocator_contracts.plans.contains_key(node)
+            || table.box_params.plans.contains_key(node)
+    };
     let formal_of = |path: &str, index: usize| {
         formal_by_path
             .get(&(path.to_owned(), index))
@@ -5418,7 +5433,13 @@ pub(crate) fn synthesize_with_raw_boundary(
                     )
                     && param_key.get(&(*callee, arg.index)).is_some_and(|k| {
                         decision_of.get(k).is_some_and(|d| {
-                            late_raw_formal(d, late_view_excluded.contains(k), &formal_of)
+                            late_raw_formal(
+                                d,
+                                late_view_excluded.contains(k),
+                                owner_argument(arg)
+                                    .is_some_and(|root| certified_owner(&(site.caller, root))),
+                                &formal_of,
+                            )
                         })
                     })
                     && owner_argument(arg)
