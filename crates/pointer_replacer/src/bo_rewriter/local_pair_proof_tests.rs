@@ -898,3 +898,79 @@ pub unsafe fn cleanup(mut m: *mut MemoryManager, mut s: *mut Model) {
         "{table}"
     );
 }
+
+/// R944-1 (relay 201): under `CRAT_P11_SCOPE=integers-only` (a fixture selects
+/// it with the marker below), a global's value or storage is no premise: the
+/// pair stays with the structural certificates, and R934-1 holds it where they
+/// fail. Integer-made pointers stay premises under both scopes.
+const INTEGERS_ONLY: &str = "// crat-test-p11-scope: integers-only\n";
+
+fn integers_only(src: &str) -> String {
+    format!("{INTEGERS_ONLY}{src}")
+}
+
+fn premise_of(
+    kind: super::decision::global_or_integer::ProvenanceKind,
+) -> super::decision::pair_disjointness::CertificateKind {
+    super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(kind)
+}
+
+#[test]
+fn r944_1_integers_only_holds_a_statics_value() {
+    let src = integers_only(STATIC_VALUE);
+    assert!(verdict_at(&src, "both", "cp2", 0, 1).is_err());
+    let rows = held(&src);
+    assert!(is_raw(&rows, "cp::s"), "{rows:?}");
+}
+
+#[test]
+fn r944_1_integers_only_holds_the_global_shapes() {
+    for (body, caller, callee) in [
+        (
+            "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); let mut p = G; cp(p.offset(32), tmp); *tmp }",
+            "a",
+            "cp",
+        ),
+        (
+            "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); set_s(tmp); cp(S.buf.offset(32), tmp); *tmp }",
+            "c",
+            "cp",
+        ),
+    ] {
+        let src = integers_only(&anywhere_shape(body));
+        assert!(verdict_at(&src, caller, callee, 0, 1).is_err(), "{body}");
+    }
+    for body in [
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(get_g().offset(32), tmp); *tmp }",
+        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_s(tmp); let s: *const C = &S; cp((*s).buf.offset(32), tmp); *tmp }",
+    ] {
+        let src = integers_only(&residual_source(body));
+        assert!(verdict_at(&src, "a", "cp", 0, 1).is_err(), "{body}");
+    }
+    let src = integers_only(&format!(
+        "{STATIC_VS_FORMAL}pub static FP: unsafe fn(*mut u8) -> u8 = f;\n\
+         pub unsafe fn through() -> u8 {{ FP(G.as_mut_ptr()) }}\n"
+    ));
+    assert!(verdict_at(&src, "f", "cp2", 0, 1).is_err());
+}
+
+#[test]
+fn r944_1_integer_made_pointers_stay_premises_under_both_scopes() {
+    use super::decision::global_or_integer::ProvenanceKind;
+    for src in [INTEGER_CAST.to_owned(), integers_only(INTEGER_CAST)] {
+        assert_eq!(
+            verdict_at(&src, "caller", "cp2", 0, 1),
+            Ok(premise_of(ProvenanceKind::Integer))
+        );
+    }
+    let body =
+        "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }";
+    for src in [anywhere_shape(body), integers_only(&anywhere_shape(body))] {
+        assert_eq!(
+            verdict_at(&src, "b", "cp2", 0, 1),
+            Ok(premise_of(ProvenanceKind::Integer))
+        );
+    }
+    let round = held(&integers_only(&integer_round_trip()));
+    assert!(!is_raw(&round, "update::src"), "{round:?}");
+}
