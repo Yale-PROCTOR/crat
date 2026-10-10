@@ -2324,57 +2324,34 @@ fn main321_only_a_pair_rooted_cascade_takes_the_late_view() {
     ));
 }
 
-/// **The stand-in review of relay 321 (F1): the cascade's view is a certified
-/// owner's only.** A plain owner (a `malloc` local the Box plan decides by itself,
-/// not a return-certificate, allocator-contract or Box-parameter plan) lent to the
-/// same cascade formal takes no late view: its lend rests on the model's reading
-/// of the formal, and the hold bookkeeping cannot show the callee keeps nothing.
+/// **The stand-in review of relay 321 (F1, round 2): the cascade's view is a
+/// certified owner's only** — a unit control. No uncertified owner that reaches
+/// this path was found (a plain `malloc` local lent to a local callee is held at
+/// the boundary and takes no `box_facts` plan), so the narrowing is defence in
+/// depth and is pinned here on the predicate itself. Main 202's direct pair path
+/// does not ask for a certificate.
 #[test]
-fn main321_f1_a_plain_owner_lent_to_a_cascade_takes_no_view() {
-    let src = format!(
-        "{PRELUDE}\
-pub unsafe extern \"C\" fn Scan(mut symbols: *mut u32, mut other: *mut u32, mut n: usize) -> u32 {{\n\
-    let _k = other.offset(0 as isize);\n\
-    let mut i = 0 as usize;\n\
-    let mut max = 0 as u32;\n\
-    while i < n {{\n\
-        if *symbols.offset(i as isize) > max {{ max = *symbols.offset(i as isize); }}\n\
-        i = i.wrapping_add(1);\n\
-    }}\n\
-    *other = max;\n\
-    return max;\n\
-}}\n\
-pub static mut LOW: [u32; 4] = [0 as u32; 4];\n\
-pub unsafe extern \"C\" fn aliased() -> u32 {{\n\
-    return Scan(LOW.as_mut_ptr(), LOW.as_mut_ptr(), 4 as usize);\n\
-}}\n\
-pub unsafe extern \"C\" fn Outer(mut symbols: *mut u32, mut n: usize) -> u32 {{\n\
-    let mut tmp = 0 as u32;\n\
-    return Scan(symbols, &mut tmp, n);\n\
-}}\n\
-extern \"C\" {{\n\
-    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;\n\
-    fn free(ptr: *mut core::ffi::c_void);\n\
-}}\n\
-pub unsafe extern \"C\" fn plain(mut split: *mut u32) {{\n\
-    let mut b = malloc(::core::mem::size_of::<u32>() as std::os::raw::c_ulong) as *mut u32;\n\
-    *b = 7 as u32;\n\
-    *split = Outer(b, 1 as usize);\n\
-    free(b as *mut core::ffi::c_void);\n\
-}}\n"
-    );
-    let out = emitted("main321-f1-plain", &src);
-    let text = compact(&out.source);
-    assert_eq!(
-        reason_of(&out.degradations, "Outer::symbols").as_deref(),
-        Some("held:into-held-formal"),
-        "{:#?}",
-        out.degradations
-    );
-    assert!(
-        !text.contains("Outer(b.as_deref_mut()") && !text.contains("Outer(b.as_mut_ptr()"),
-        "a plain owner took the cascade's view:\n{}\n{:#?}",
-        out.source,
-        out.degradations
-    );
+fn main321_f1_an_uncertified_owner_takes_no_cascade_view() {
+    use super::decision::{Decision, Degradation, DegradeReason, seam::late_raw_formal};
+    let held = |reason: DegradeReason| {
+        Decision::Degraded(Degradation {
+            subject: "-".to_owned(),
+            site: "-".to_owned(),
+            reason,
+        })
+    };
+    let pair = held(DegradeReason::PairNotShownDisjoint {
+        detail: "pair-not-shown-disjoint:ref-beside-raw:m::Scan#1:peer#2".to_owned(),
+    });
+    let cascade = held(DegradeReason::IntoHeldFormal {
+        detail: "into-held-formal:m::Scan#1".to_owned(),
+    });
+    let lookup = |path: &str, index: usize| match (path, index) {
+        ("m::Scan", 0) => Some(&pair),
+        _ => None,
+    };
+    assert!(late_raw_formal(&cascade, false, true, &lookup));
+    assert!(!late_raw_formal(&cascade, false, false, &lookup));
+    assert!(!late_raw_formal(&cascade, true, true, &lookup));
+    assert!(late_raw_formal(&pair, false, false, &lookup));
 }

@@ -3998,7 +3998,7 @@ fn optional_into_raw_formal(
 /// an indirect call). The hold bookkeeping cannot stand in for that proof: the
 /// retained-access check reads delivered subjects only, so a formal already held
 /// never carries its receipt, and a cascade records one root per binding.
-fn late_raw_formal<'d>(
+pub(crate) fn late_raw_formal<'d>(
     decision: &Decision,
     excluded: bool,
     certified: bool,
