@@ -2418,6 +2418,11 @@ fn copy_relax_escape<'tcx>(
     body: &Body<'tcx>,
     closure: &FxHashSet<SlotOwner>,
 ) -> Option<CopyLendEligibilityDrop> {
+    // era-5c relay 210: a copy INTO the return place (`_0 = p`, kazmath's `return pOut`) escapes
+    // by its destination itself.
+    if closure.contains(&SlotOwner::Local(RETURN_PLACE)) {
+        return Some(CopyLendEligibilityDrop::C3Return);
+    }
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
             let location = Location {

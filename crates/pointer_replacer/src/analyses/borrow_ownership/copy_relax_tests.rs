@@ -69,6 +69,20 @@ unsafe fn get(p: *mut i32) -> *mut i32 {
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 { let mut x: i32 = 0; let y = get(&mut x); *y = 3; return x; }
 "#;
 
+/// era-5c relay 210: the copy is the return itself (`_0 = p`; heman's kazmath `return pOut`).
+const RETURN_DIRECT: &str = r#"
+unsafe fn out(p: *mut i32, q: *mut i32) -> *mut i32 {
+    *p = *q + 1;
+    return p;
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 {
+    let mut x: i32 = 0; let mut z: i32 = 2;
+    let y = out(&mut x, &mut z);
+    let w = y as *mut u8; *w = 3;
+    return x;
+}
+"#;
+
 /// S39 (b): the raw copy escapes into a call.
 const ESCAPE_CALL: &str = r#"
 unsafe extern "C" { fn keep(p: *mut i32); }
@@ -212,6 +226,7 @@ fn e5c_inner_copy_relax() {
         Ok("ESCAPE_RETURN") => ESCAPE_RETURN,
         Ok("ESCAPE_CALL") => ESCAPE_CALL,
         Ok("ESCAPE_FIELD") => ESCAPE_FIELD,
+        Ok("RETURN_DIRECT") => RETURN_DIRECT,
         Ok("OWNING") => OWNING,
         Ok("CAST") => CAST,
         Ok("CAST_DEAD") => CAST_DEAD,
@@ -313,6 +328,19 @@ fn e5c_cr_b_an_escaping_copy_is_not_relaxed() {
     }
 }
 
+/// relay 210: a copy into the return place is not relaxed: the formal returned keeps its frame
+/// kind.
+#[test]
+fn e5c_cr_b_a_copy_into_the_return_place_is_not_relaxed() {
+    let frame = rows("RETURN_DIRECT", "off", "off");
+    let relaxed = rows("RETURN_DIRECT", RELAX, "on");
+    assert_eq!(
+        kind(&relaxed, "out::p"),
+        kind(&frame, "out::p"),
+        "{frame:#?} {relaxed:#?}"
+    );
+}
+
 /// (3) An Owning source stays equal: never Owning beside a Raw copy, never a reference.
 #[test]
 fn e5c_cr_3_an_owning_source_stays_equal() {
@@ -364,7 +392,7 @@ fn e5c_cr_identity_names_the_switches_only_when_set() {
             .expect("child");
         let text = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
-            text.contains("era5c_copy_relax=depth0-borrow-to-raw+c3-destination-v1"),
+            text.contains("era5c_copy_relax=depth0-borrow-to-raw+c3-destination-v2"),
             expect_relax,
             "{text}"
         );

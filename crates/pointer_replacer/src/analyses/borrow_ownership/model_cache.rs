@@ -225,7 +225,7 @@ pub(crate) fn solver_identity(
     if super::copy_relax::copy_relax() {
         fields.insert(
             "era5c_copy_relax",
-            "depth0-borrow-to-raw+c3-destination-v1".to_owned(),
+            "depth0-borrow-to-raw+c3-destination-v2".to_owned(),
         );
     }
     if super::copy_relax::merge_liveness() {
