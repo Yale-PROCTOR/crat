@@ -2780,8 +2780,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if region.is_some() => Form::Slice,
         // Relay 324 (R975-1): a formal with no raw use of its own whose copy
         // walks it (S39's raw view of a reference source) — the copy's walk is
-        // the need, fatness the licence, the -2 rule unchanged.
+        // the need, fatness the licence, the -2 rule unchanged. A formal with
+        // nullability evidence keeps the thin path and its null-init gate
+        // (R819-1: with its Option stage withdrawn it falls back to raw).
         None if matches!(subject.kind, SubjectKind::Param { .. })
+            && !nullable_evidence
             && fat.is_array(subject.fn_did, subject.local)
             && self::local_callee_extent::walked_by_a_copy(
                 tcx,
