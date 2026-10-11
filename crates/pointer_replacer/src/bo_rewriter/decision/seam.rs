@@ -3482,6 +3482,9 @@ pub(crate) struct AliasedTwinRefusal {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
+    /// wave-5d relay 205: the computed suffix views a callee class renders at
+    /// its converted slice formal, for that callee's withdrawn input form.
+    pub(crate) computed_view_inputs: Vec<super::slice_forms::ComputedViewInput>,
     /// **R801-2 (USER: P7 extended)**: sites whose delivered form rides a
     /// stated premise, one receipt each (`call_result_option`'s declaration
     /// views without a dereference on every non-null path).

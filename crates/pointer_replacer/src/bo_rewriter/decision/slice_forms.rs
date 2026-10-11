@@ -125,6 +125,24 @@ impl ForwardView {
     }
 }
 
+/// **wave-5d relay 205 (main 219 §4).** A computed suffix view the CALLEE
+/// class's seam renders at a converted slice formal. When that class is held
+/// or withdrawn, its formal is the raw input again and the view goes with the
+/// class; the caller's delivered base must still render its use inside the
+/// argument, so the withdrawn callee's input alternative seals the same suffix
+/// for the raw formal (`callee_parameter_input`), as the raw arm below does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputedViewInput {
+    pub(crate) caller: LocalDefId,
+    /// The whole boundary argument the view replaces.
+    pub(crate) argument_span: Span,
+    /// The base binding's name, the operand the sealed view wraps.
+    pub(crate) name: String,
+    /// The base's own mutability.
+    pub(crate) mutable: bool,
+    pub(crate) forward: ForwardView,
+}
+
 /// A computed sub-view of a delivered slice base that is itself a raw-boundary
 /// argument: `&*p.offset(e)`, `&mut *p.offset(e)`, `p.offset(e) as *const T`
 /// or a bare `p.offset(e)`. The boundary keeps its own disposition and
@@ -807,6 +825,7 @@ fn lower_computed_argument_views(
             .safety
             .is_unsafe();
         let mut seams = Vec::new();
+        let mut view_inputs = Vec::new();
         let mut element_uses = Vec::new();
         let mut retired: Vec<(usize, Span)> = Vec::new();
         let mut hold = None;
@@ -959,6 +978,15 @@ fn lower_computed_argument_views(
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
                 edit.bridge.bridge_kind = "computed-suffix-view".to_owned();
+                if !optional {
+                    view_inputs.push(ComputedViewInput {
+                        caller: node.0,
+                        argument_span: view.argument_span,
+                        name: name.clone(),
+                        mutable,
+                        forward: forward(view.borrowed && view.mutable && mutable),
+                    });
+                }
             } else if edit.spec.raw_boundary.is_none()
                 && let Form::Slice {
                     mutable: expected_mutable,
@@ -1008,6 +1036,7 @@ fn lower_computed_argument_views(
         for (index, edit) in seams {
             table.seams.edits[index] = edit;
         }
+        table.seams.computed_view_inputs.extend(view_inputs);
         // W6S-14: an inner subject's edit the view now carries is retired from
         // that subject, so the two never overlap.
         for (inner, span) in retired {

@@ -605,6 +605,76 @@ fn current_alternative(
             return Err("callee-parameter-input-raw-boundary-held");
         }
     };
+    // **wave-5d relay 205 (main 219 §4).** A computed suffix view of a
+    // delivered slice base (`&mut *bits.offset(64)`, `bits: &mut [u16]`) was
+    // planned as the callee class's safe view. The callee withdrawn, the
+    // formal is raw again and the argument's text still reads the base as a
+    // pointer (`bits.offset(..)`: E0599 on the slice). The same suffix is
+    // sealed for the raw formal, as `slice_forms`' raw arm seals it for a raw
+    // callee: `(&mut (bits)[64..]).as_mut_ptr()`.
+    if let Some(view) = table
+        .seams
+        .computed_view_inputs
+        .iter()
+        .find(|view| view.caller == caller && view.argument_span == arg.span)
+    {
+        let target_mutable = matches!(site.target.mutability, raw_boundary::RawMutability::Mut);
+        if target_mutable && !view.mutable {
+            return Err("callee-parameter-input-computed-view-immutable");
+        }
+        let source = Decision::Slice {
+            mutable: view.mutable,
+            uses: Vec::new(),
+        };
+        let template = raw_boundary::template_for(
+            &source,
+            &site.target,
+            None,
+            raw.negative_write_evidence(key).is_some(),
+        )
+        .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+        let mut spec = GlueSpec::raw_boundary_target(template, &site.target, false, false);
+        let mut forward = view.forward.clone();
+        forward.mutable = forward.mutable || target_mutable;
+        spec.forward_slice = Some(forward);
+        let found = seam::form_of(&source);
+        let unsafe_fn = tcx
+            .fn_sig(caller.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let replacement = spec
+            .render_in_context(&view.name, unsafe_fn)
+            .ok_or("callee-parameter-input-raw-view-unrenderable")?;
+        let bridge = BridgeSitePlan {
+            caller,
+            callee: BridgeCalleeId::Local(callee),
+            arm: "c".into(),
+            position: format!("arg{}", arg.index),
+            bridge_kind: template.key().into(),
+            expected_form: input_form.key().into(),
+            found_form: found.key().into(),
+            argument_kind: super::slice_forms::COMPUTED_SUFFIX_VIEW.into(),
+            extent: BridgeExtentKind::None,
+            retention,
+            waiver_id: waiver_id.clone(),
+            unsafe_context: seam::unsafe_context_for(tcx, caller, &spec),
+        };
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::Adapter {
+                replacement,
+                spec,
+                family: SeamFamily::Safe,
+                found,
+                len_arm: None,
+                retention,
+                waiver_id,
+            },
+            arg_span: view.argument_span,
+            bridge: Some(bridge),
+        });
+    }
     if let Some(owner) = owner {
         // The owner's view through the template every raw-boundary Box site
         // renders (`x.as_mut_ptr()`, `core::ptr::from_mut(x.as_mut())`, the
