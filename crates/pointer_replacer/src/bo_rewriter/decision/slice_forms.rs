@@ -134,8 +134,14 @@ impl ForwardView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ComputedViewInput {
     pub(crate) caller: LocalDefId,
-    /// The whole boundary argument the view replaces.
+    /// The whole boundary argument the view replaces, and its position.
     pub(crate) argument_span: Span,
+    pub(crate) param_index: usize,
+    /// Whether the input alternative can seal it: the suffix arm only. The
+    /// element (`Index0`) and width-read arms are recorded so that a withdrawn
+    /// callee refuses them typed rather than re-emitting the base's arithmetic
+    /// (the stand-in review's MED-2).
+    pub(crate) sealable: bool,
     /// The base binding's name, the operand the sealed view wraps.
     pub(crate) name: String,
     /// The base's own mutability.
@@ -950,6 +956,15 @@ fn lower_computed_argument_views(
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
                 edit.bridge.bridge_kind = "computed-suffix-view-element".to_owned();
+                view_inputs.push(ComputedViewInput {
+                    caller: node.0,
+                    argument_span: view.argument_span,
+                    param_index: edit.param_index,
+                    sealable: false,
+                    name: name.clone(),
+                    mutable,
+                    forward: forward(expected_mutable),
+                });
             } else if edit.spec.raw_boundary.is_none()
                 && let Form::Slice {
                     mutable: expected_mutable,
@@ -982,6 +997,8 @@ fn lower_computed_argument_views(
                     view_inputs.push(ComputedViewInput {
                         caller: node.0,
                         argument_span: view.argument_span,
+                        param_index: edit.param_index,
+                        sealable: true,
                         name: name.clone(),
                         mutable,
                         forward: forward(view.borrowed && view.mutable && mutable),
@@ -1007,6 +1024,15 @@ fn lower_computed_argument_views(
                 edit.spec = spec;
                 edit.family = SeamFamily::Safe;
                 edit.bridge.bridge_kind = "computed-suffix-view-width-read".to_owned();
+                view_inputs.push(ComputedViewInput {
+                    caller: node.0,
+                    argument_span: view.argument_span,
+                    param_index: edit.param_index,
+                    sealable: false,
+                    name: name.clone(),
+                    mutable,
+                    forward: forward(expected_mutable),
+                });
             } else {
                 hold = Some(view.use_span);
                 break;

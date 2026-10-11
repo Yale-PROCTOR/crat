@@ -457,6 +457,22 @@ fn current_alternative(
             .find(|(subject, _)| subject.fn_did == caller && subject.hir_id == root)
             .map(|(_, decision)| decision)
     });
+    // wave-5d relay 205: a computed suffix view of a delivered slice base this
+    // callee's class rendered (`slice_forms`). Looked up first: the raw
+    // expression's stability gate and the raw zero-syntax shortcut below read
+    // the argument's text as a raw pointer, which over a delivered base it is
+    // not (the stand-in review's LOW-3 / LOW-4).
+    let view = table
+        .seams
+        .computed_view_inputs
+        .iter()
+        .find(|view| {
+            view.caller == caller && view.argument_span == arg.span && view.param_index == arg.index
+        })
+        .filter(|_| matches!(root_decision, Some(Decision::Slice { .. })));
+    if view.is_some_and(|view| !view.sealable) {
+        return Err("callee-parameter-input-computed-view-unsealable");
+    }
     // R593-2 (main 120): a raw expression's found form is `Raw` by shape, which
     // holds only while its text still reads a raw pointer. (a1) Over a root that
     // stays raw (Degraded, or not a subject) it renders unchanged: the
@@ -464,6 +480,7 @@ fn current_alternative(
     // whose field no transaction delivers reads the same raw pointer. Anything
     // else keeps the stability gate.
     if matches!(arg.shape, ArgShape::RawExpr { .. })
+        && view.is_none()
         && !root_stays_raw(root_decision)
         && !expression.is_some_and(|expression| {
             stable_array_pointer(tcx, expression)
@@ -501,7 +518,7 @@ fn current_alternative(
         )
         | None => None,
     };
-    if owner.is_none() && found == Form::Raw {
+    if owner.is_none() && found == Form::Raw && view.is_none() {
         return Ok(zero(arg, found));
     }
     let matches = raw
@@ -612,12 +629,7 @@ fn current_alternative(
     // pointer (`bits.offset(..)`: E0599 on the slice). The same suffix is
     // sealed for the raw formal, as `slice_forms`' raw arm seals it for a raw
     // callee: `(&mut (bits)[64..]).as_mut_ptr()`.
-    if let Some(view) = table
-        .seams
-        .computed_view_inputs
-        .iter()
-        .find(|view| view.caller == caller && view.argument_span == arg.span)
-    {
+    if let Some(view) = view {
         let target_mutable = matches!(site.target.mutability, raw_boundary::RawMutability::Mut);
         if target_mutable && !view.mutable {
             return Err("callee-parameter-input-computed-view-immutable");
@@ -626,16 +638,45 @@ fn current_alternative(
             mutable: view.mutable,
             uses: Vec::new(),
         };
-        let template = raw_boundary::template_for(
+        let mut template = raw_boundary::template_for(
             &source,
             &site.target,
             None,
             raw.negative_write_evidence(key).is_some(),
         )
         .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+        let base = template;
+        // The stand-in review's HIGH-1: the returned-child permission and
+        // template, as the generic path below and the terminal sealing of
+        // `slice_forms`' raw arm ask them. A `*const` formal whose returned
+        // child the caller writes through takes the WRITABLE view
+        // (`{view}.as_mut_ptr().cast_const()`), never `.as_ptr()`.
+        let child = raw.returned_child_evidence(key);
+        seam::terminal_returned_child_permission(child, arg.shape.key(), found)
+            .map_err(|_| "callee-parameter-input-returned-child-permission")?;
+        if let Some(child) =
+            child.filter(|child| !(child.raw_field_parent && arg.shape.key() == "raw-expr"))
+        {
+            let selected = raw_boundary::returned_child_template(
+                &source,
+                &site.target,
+                child.child.as_ref().ok().map(|child| &child.access),
+                template,
+            )
+            .map_err(|_| "callee-parameter-input-returned-child-template")?;
+            if selected.mutable_binding_required {
+                return Err("callee-parameter-input-mutable-binding-unplanned");
+            }
+            template = selected.template;
+        }
+        // A selected writable view reads the suffix mutably.
+        let writable = template != base;
+        if writable && !view.mutable {
+            return Err("callee-parameter-input-computed-view-immutable");
+        }
         let mut spec = GlueSpec::raw_boundary_target(template, &site.target, false, false);
         let mut forward = view.forward.clone();
-        forward.mutable = forward.mutable || target_mutable;
+        forward.mutable = forward.mutable || target_mutable || writable;
         spec.forward_slice = Some(forward);
         let found = seam::form_of(&source);
         let unsafe_fn = tcx
