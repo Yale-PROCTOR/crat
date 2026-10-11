@@ -381,16 +381,35 @@ fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
     }
 }
 
-/// Fault F2 (`no-window,shared-loan`): with the loan shared as well, the read of `p` in `q`'s
-/// window is no conflict and the lend is taken -- what F1 and (ii″) would catch.
+/// Fault F2 (`no-window` + W52's `no-loan`): without the window check and without the lend's loan
+/// in the replay, the read of `p` in `q`'s window is no conflict and the lend is taken -- what
+/// (ii″) and F1 catch.
 #[test]
-fn e5c_cm_f2_a_shared_loan_lets_the_read_through() {
+fn e5c_cm_f2_without_the_window_or_the_loan_the_read_slips_through() {
+    let s = seen_with(
+        "READ_IN_WINDOW",
+        Some("on"),
+        &[
+            ("CRAT_E5C_CM_FAULT", "no-window"),
+            ("CRAT_E5C_W52_FAULT", "no-loan"),
+        ],
+    );
+    assert!(lent(&s), "{s:#?}");
+}
+
+/// F2′ (`no-window,shared-loan`), an observation of record: a SHARED loan catches the read here
+/// too. The mutability facts give a copy one qualifier, so the write through `q` makes `p` mutable,
+/// and the replay conflicts a read of `p` with any loan on it. The unique loan is the defense that
+/// does not rest on that propagation.
+#[test]
+fn e5c_cm_f2_a_shared_loan_is_caught_here_too() {
     let s = seen_with(
         "READ_IN_WINDOW",
         Some("on"),
         &[("CRAT_E5C_CM_FAULT", "no-window,shared-loan")],
     );
-    assert!(lent(&s), "{s:#?}");
+    assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
+    assert!(!lent(&s), "{s:#?}");
 }
 
 /// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend; the kinds
