@@ -2778,6 +2778,19 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if counted.is_some_and(|c| c.nullable) => Form::Opt { slice: true },
         None if counted.is_some() => Form::Slice,
         None if region.is_some() => Form::Slice,
+        // Relay 324 (R975-1): a formal with no raw use of its own whose copy
+        // walks it (S39's raw view of a reference source) — the copy's walk is
+        // the need, fatness the licence, the -2 rule unchanged.
+        None if matches!(subject.kind, SubjectKind::Param { .. })
+            && fat.is_array(subject.fn_did, subject.local)
+            && self::local_callee_extent::walked_by_a_copy(
+                tcx,
+                (subject.fn_did, subject.hir_id),
+                facts,
+            ) =>
+        {
+            Form::Slice
+        }
         None => Form::Plain,
     };
     // R422-5 (wave-4 × wave-6v): a subject the counted-void route claims —

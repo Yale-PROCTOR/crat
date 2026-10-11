@@ -400,6 +400,24 @@ pub(super) fn leaves_its_extent(
     extent_leaving_op(tcx, key, facts, false).is_some()
 }
 
+/// **Relay 324 (R975-1; era-5c 167c §2) — a copy walks the parameter.** S39
+/// lets a bare copy take a raw view of a reference source, so a parameter's
+/// arithmetic can live on its copy alone (`let inp = s; inp = inp.offset(1)`:
+/// tulipindicators' `get_array`). A copy other than the parameter itself that
+/// steps past the parameter's first element, by the arithmetic arm's own test
+/// in guard mode (the one the wide-access set reads).
+pub(crate) fn walked_by_a_copy(
+    tcx: TyCtxt<'_>,
+    key: (LocalDefId, HirId),
+    facts: &EmitabilityFacts,
+) -> bool {
+    copies_of(tcx, key)
+        .into_iter()
+        .filter(|copy| *copy != key.1)
+        .filter(|copy| steps_in_parameter_elements(tcx, facts, key.0, key.1, *copy))
+        .any(|copy| extent_leaving_op(tcx, (key.0, copy), facts, true).is_some())
+}
+
 /// **R641-2 — C's `p[0]` stays within the first element.** The arithmetic use
 /// at `span` is `*p.offset(0)` (c2rust writes `p[0]` as
 /// `*p.offset(0 as i32 as isize)`): a literal-0 offset dereferenced in place,
