@@ -420,6 +420,9 @@ mod wave6r_url_tests;
 #[path = "wave6r_returned_alias_tests.rs"]
 mod wave6r_returned_alias_tests;
 
+#[path = "wave5d_held_callee_view_tests.rs"]
+mod wave5d_held_callee_view_tests;
+
 #[path = "wave6r_static_dict_tests.rs"]
 mod wave6r_static_dict_tests;
 
