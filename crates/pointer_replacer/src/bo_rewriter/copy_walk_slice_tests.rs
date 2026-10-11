@@ -342,6 +342,13 @@ fn r324_control_a_byte_view_within_the_element_keeps_the_thin_form() {
 fn r324_med1_a_nullable_walked_formal_with_its_option_stage_withdrawn_stays_raw() {
     let withdrawn = rewrite_withdrawn("NULLABLE_ACTUAL", true, Some("get_array::s"));
     assert!(withdrawn.type_checks, "{}", withdrawn.source);
+    assert_eq!(withdrawn.reverted, 0, "{:#?}", withdrawn.degraded);
+    assert_eq!(
+        withdrawn.reason("get_array::s"),
+        Some("null-init"),
+        "{:#?}",
+        withdrawn.degraded
+    );
     assert!(
         withdrawn.signature("get_array").contains("s:*mutf64"),
         "{}",
@@ -349,15 +356,25 @@ fn r324_med1_a_nullable_walked_formal_with_its_option_stage_withdrawn_stays_raw(
     );
 }
 
-/// MED-1's companion: with the stage enabled the nullability is the optional
-/// form's, decided before the walk is read — never a bare slice.
+/// MED-1 without the hook: in this fixture the exclusion re-derivation
+/// withdraws the formal's Option stage itself, and the formal falls back to
+/// raw by the same gate. (With the stage enabled such a formal takes the thin
+/// optional form ahead of the walk — a residual of 58‴ this change does not
+/// touch, stated in main 220a.)
 #[test]
-fn r324_med1_control_a_nullable_walked_formal_is_never_a_bare_slice() {
-    let enabled = rewrite("NULLABLE_ACTUAL", true);
-    assert!(enabled.type_checks, "{}", enabled.source);
+fn r324_med1_the_natural_withdrawal_falls_back_to_raw() {
+    let natural = rewrite("NULLABLE_ACTUAL", true);
+    assert!(natural.type_checks, "{}", natural.source);
+    assert_eq!(natural.reverted, 0, "{:#?}", natural.degraded);
+    assert_eq!(
+        natural.reason("get_array::s"),
+        Some("null-init"),
+        "{:#?}",
+        natural.degraded
+    );
     assert!(
-        !enabled.signature("get_array").contains("s:&mut[f64]"),
+        natural.signature("get_array").contains("s:*mutf64"),
         "{}",
-        enabled.signature("get_array")
+        natural.signature("get_array")
     );
 }
