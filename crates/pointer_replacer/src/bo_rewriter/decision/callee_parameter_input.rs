@@ -469,7 +469,19 @@ fn current_alternative(
         .find(|view| {
             view.caller == caller && view.argument_span == arg.span && view.param_index == arg.index
         })
-        .filter(|_| matches!(root_decision, Some(Decision::Slice { .. })));
+        .filter(|_| match root_decision {
+            Some(Decision::Slice { .. }) => true,
+            Some(
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. }
+                | Decision::Degraded(_),
+            )
+            | None => false,
+        });
     if view.is_some_and(|view| !view.sealable) {
         return Err("callee-parameter-input-computed-view-unsealable");
     }
