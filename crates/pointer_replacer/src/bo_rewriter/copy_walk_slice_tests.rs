@@ -93,6 +93,34 @@ pub unsafe extern "C" fn run(mut v: u32) -> u32 {
 }
 "#;
 
+/// The stand-in review's MED-1: a caller hands the formal a pointer it has
+/// itself null-tested, so the formal carries the caller's nullability (not
+/// its own: no null literal reaches it). With the formal's Option stage
+/// withdrawn (an exclusion re-derivation; here the test hook) it must fall
+/// back to raw, never to a bare slice built on a possibly null base.
+const NULLABLE_ACTUAL: &str = r#"
+extern "C" {
+    fn next(n: i32) -> i32;
+}
+#[no_mangle]
+pub unsafe extern "C" fn get_array(mut n: i32, mut s: *mut f64) -> i32 {
+    if n == 0 as i32 { return 0 as i32 }
+    let mut inp: *mut f64 = s;
+    loop {
+        *inp = n as f64;
+        inp = inp.offset(1);
+        n = next(n);
+        if n == 0 as i32 { break; }
+    }
+    return inp.offset_from(s) as i64 as i32;
+}
+#[no_mangle]
+pub unsafe extern "C" fn run_maybe(mut n: i32, mut q: *mut f64) -> i32 {
+    if q.is_null() { return get_array(0 as i32, q); }
+    return get_array(n, q);
+}
+"#;
+
 /// The frame's arms: every `CRAT_` export of the frame's env file but the
 /// launch identity (`CRAT_ERA5_*`) and the raw-cause sidecar, which a fixture
 /// rewrite does not take (era-5c's `copy_relax_tests::frame_arms`).
@@ -118,8 +146,17 @@ fn r324_inner_rewrite() {
         Ok("GET_ARRAY") => GET_ARRAY,
         Ok("READ_ONLY_COPY") => READ_ONLY_COPY,
         Ok("BYTE_VIEW_COPY") => BYTE_VIEW_COPY,
+        Ok("NULLABLE_ACTUAL") => NULLABLE_ACTUAL,
         other => panic!("unknown shape {other:?}"),
     };
+    // The Option stage withdrawn for the labels named, as an exclusion
+    // re-derivation would (the R824-2 hook; the child is one decision).
+    if let Ok(labels) = std::env::var("CRAT_R324_WITHDRAW") {
+        super::decision::FORCED_OPTION_WITHDRAWALS
+            .lock()
+            .expect("hook")
+            .extend(labels.split(',').map(str::to_owned));
+    }
     let (source, degradations, reverted_count) =
         match super::rewrite_m1_census_world(&format!("{ALLOW}{code}")) {
             super::RewriteOutcome::Emitted {
@@ -176,6 +213,11 @@ impl Emitted {
 /// The shape rewritten in a child under the frame's arms, with S39's two
 /// switches on (`relax`) or as the frame has them (off).
 fn rewrite(shape: &str, relax: bool) -> Emitted {
+    rewrite_withdrawn(shape, relax, None)
+}
+
+/// [`rewrite`], with the Option stage withdrawn for the labels named.
+fn rewrite_withdrawn(shape: &str, relax: bool, withdrawn: Option<&str>) -> Emitted {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
     command.args([
@@ -189,6 +231,9 @@ fn rewrite(shape: &str, relax: bool) -> Emitted {
         command.env(key, value);
     }
     command.env("CRAT_R324_SHAPE", shape);
+    if let Some(labels) = withdrawn {
+        command.env("CRAT_R324_WITHDRAW", labels);
+    }
     let (copy_relax, merge_liveness) = if relax {
         ("depth0-borrow-to-raw", "on")
     } else {
@@ -287,5 +332,32 @@ fn r324_control_a_byte_view_within_the_element_keeps_the_thin_form() {
         relaxed.signature("put_be32").contains("s:&mutu32"),
         "{}",
         relaxed.signature("put_be32")
+    );
+}
+
+/// MED-1: with its Option stage withdrawn, a walked formal that carries a
+/// caller's nullability falls back to raw (R819-1's gate on the thin form),
+/// never to a bare slice.
+#[test]
+fn r324_med1_a_nullable_walked_formal_with_its_option_stage_withdrawn_stays_raw() {
+    let withdrawn = rewrite_withdrawn("NULLABLE_ACTUAL", true, Some("get_array::s"));
+    assert!(withdrawn.type_checks, "{}", withdrawn.source);
+    assert!(
+        withdrawn.signature("get_array").contains("s:*mutf64"),
+        "{}",
+        withdrawn.signature("get_array")
+    );
+}
+
+/// MED-1's companion: with the stage enabled the nullability is the optional
+/// form's, decided before the walk is read — never a bare slice.
+#[test]
+fn r324_med1_control_a_nullable_walked_formal_is_never_a_bare_slice() {
+    let enabled = rewrite("NULLABLE_ACTUAL", true);
+    assert!(enabled.type_checks, "{}", enabled.source);
+    assert!(
+        !enabled.signature("get_array").contains("s:&mut[f64]"),
+        "{}",
+        enabled.signature("get_array")
     );
 }
