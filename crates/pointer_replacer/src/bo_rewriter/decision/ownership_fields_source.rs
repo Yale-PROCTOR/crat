@@ -78,11 +78,17 @@ pub(crate) struct LentLocal {
 /// as a shared reference reborrowed from the Box (`&(*root)[0]` /
 /// `&*(root)`), so no second raw copy of the allocation's address stays in
 /// the function.
+///
+/// era-5c relay 213 (`CRAT_ERA5C_COPY_LEND_MUT=on`): `mutable` when a use is
+/// the target of an assignment through it (`*p = v`, `*p += v`): the analysis
+/// lent the copy `&mut` (its window is clean and its loan unique), and the
+/// owner renders `&mut (*root)[0]` / `&mut *(root)`, declared `&mut T`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LendAlias {
     pub(crate) hir_id: HirId,
     pub(crate) spelling: String,
     pub(crate) initializer_span: Span,
+    pub(crate) mutable: bool,
 }
 
 /// `let mut a = root.offset(start);` — a per-iteration alias of the owner
@@ -1261,12 +1267,14 @@ pub(crate) fn derive<'tcx>(
     // raw pointer derived from the reference (`p as *const T`) or an address
     // comparison through it compiles and changes meaning. Anything else holds.
     let mut lend_aliases = Vec::new();
+    let mutable_lend = crate::analyses::borrow_ownership::field_moves::copy_lend_mut();
     for (alias, init) in lend_bindings {
         let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
         let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
             return Err(SourceHold::Identity);
         };
         let mut reads = 0usize;
+        let mut writes = 0usize;
         for &expression in &expressions.0 {
             if !root_path(expression, alias) {
                 continue;
@@ -1275,20 +1283,28 @@ pub(crate) fn derive<'tcx>(
             let Node::Expr(read) = tcx.parent_hir_node(expression.hir_id) else {
                 return Err(SourceHold::UnsupportedOwnerUse);
             };
-            let read_only = matches!(read.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
-                && typeck.expr_ty(read) == *element
-                && !matches!(
-                    tcx.parent_hir_node(read.hir_id),
-                    Node::Expr(Expr {
-                        kind: ExprKind::Assign(target, ..)
-                            | ExprKind::AssignOp(_, target, _)
-                            | ExprKind::AddrOf(_, _, target),
-                        ..
-                    }) if target.hir_id == read.hir_id
-                );
-            if !read_only {
+            let deref = matches!(read.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                && typeck.expr_ty(read) == *element;
+            // relay 213: under the mutable copy-lend a use may be the target of an assignment
+            // through the alias (`*p = v`, `*p op= v`); an address of it never is.
+            let written = matches!(
+                tcx.parent_hir_node(read.hir_id),
+                Node::Expr(Expr {
+                    kind: ExprKind::Assign(target, ..) | ExprKind::AssignOp(_, target, _),
+                    ..
+                }) if target.hir_id == read.hir_id
+            );
+            let addressed = matches!(
+                tcx.parent_hir_node(read.hir_id),
+                Node::Expr(Expr {
+                    kind: ExprKind::AddrOf(_, _, target),
+                    ..
+                }) if target.hir_id == read.hir_id
+            );
+            if !deref || addressed || (written && !mutable_lend) {
                 return Err(SourceHold::UnsupportedOwnerUse);
             }
+            writes += written as usize;
         }
         // A copy never read is no lend: it stays the uncovered copy it was.
         if reads == 0 {
@@ -1298,6 +1314,7 @@ pub(crate) fn derive<'tcx>(
             hir_id: alias,
             spelling: ident.name.to_string(),
             initializer_span: init.span,
+            mutable: writes > 0,
         });
     }
     // Each view alias: every use is an element access the slice walker

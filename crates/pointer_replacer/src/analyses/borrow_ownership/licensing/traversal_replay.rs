@@ -132,6 +132,7 @@ pub(crate) fn begin(
                     return None;
                 };
                 let identity = SelectedCopyLendLoan {
+                    unique: false,
                     location: MirLocationKey {
                         block: candidate.call.block,
                         statement_index: candidate.call.statement,

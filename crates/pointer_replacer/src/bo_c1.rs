@@ -15916,6 +15916,7 @@ pub unsafe fn f() -> i32 {
                     "exactly one loan identity must be typed CopyLend"
                 );
                 let selected = SelectedCopyLendLoan {
+                    unique: false,
                     location: typed[0].key.location,
                     borrowed: typed[0].key.place.clone(),
                     borrower: typed[0].key.borrower,

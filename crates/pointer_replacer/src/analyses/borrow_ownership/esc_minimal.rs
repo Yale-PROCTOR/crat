@@ -671,6 +671,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             continue;
         }
         let loan = SelectedCopyLendLoan {
+            unique: false,
             location: row.loan_location,
             borrowed: row.loan_borrowed.clone(),
             borrower: row.borrower,
@@ -822,6 +823,7 @@ unsafe fn caller() -> i32 {
     #[test]
     fn one_effective_loan_has_one_exact_pruning_exemption() {
         let loan = SelectedCopyLendLoan {
+            unique: false,
             location: MirLocationKey::new(3, 7),
             borrowed: PlaceKey {
                 local: Local::from_u32(9),

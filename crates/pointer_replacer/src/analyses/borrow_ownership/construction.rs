@@ -8,7 +8,8 @@ use std::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::{
-    Body, Local, Location, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind,
+    BasicBlock, Body, Local, Location, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue,
+    StatementKind,
     visit::{PlaceContext, Visitor},
 };
 use rustc_mir_dataflow::Analysis;
@@ -183,6 +184,10 @@ pub(crate) enum CopyLendEligibilityDrop {
     /// function releases it, so the lend reading would make an owner of a value the
     /// function was only handed (R536-4).
     GuardCallerDerivedSource,
+    /// era-5c relay 213 (`CRAT_ERA5C_COPY_LEND_MUT=on`): the destination is written through and
+    /// `p`, or another copy of `p`, is used while `q` is live, so `q = &mut *p` would not be
+    /// unique.
+    C2MutableWindowAccess,
 }
 
 impl CopyLendEligibilityDrop {
@@ -199,6 +204,7 @@ impl CopyLendEligibilityDrop {
             Self::C3ReallocSource => "c3-realloc-source",
             Self::C3OutwardUnknownCall => "c3-outward-unknown-call",
             Self::GuardCallerDerivedSource => "guard-caller-derived-source",
+            Self::C2MutableWindowAccess => "c2-mutable-window-access",
         }
     }
 }
@@ -2495,6 +2501,7 @@ pub(crate) fn analyze_copy_lend_candidates(
     mut_facts: &MutFacts,
     origin_flows: &OriginFlowResults,
 ) -> Vec<CopyLendPairCandidate> {
+    let mutable_lend = super::field_moves::copy_lend_mut();
     let mut answer = Vec::new();
     for &fn_did in &program.functions {
         let body = program
@@ -2531,8 +2538,30 @@ pub(crate) fn analyze_copy_lend_candidates(
             );
             let destination_flow =
                 owner_closure([SlotOwner::Local(sites[0].lhs_local)], &value_flows);
-            let drop = if mut_facts.is_mutable(fn_did, lhs_local) {
+            // relay 213: under `CRAT_ERA5C_COPY_LEND_MUT`, a destination the facts call mutable
+            // is lent `&mut` when its window is clean; one the facts do not cover stays at C2.
+            let lent_mutably = mutable_lend
+                && mut_facts.is_mutable(fn_did, lhs_local)
+                && !mut_facts.is_defaulted(fn_did, lhs_local);
+            let pair = CopyLendPair {
+                mutable: lent_mutably,
+                ..pair
+            };
+            let drop = if mut_facts.is_mutable(fn_did, lhs_local) && !lent_mutably {
                 Some(CopyLendEligibilityDrop::C2MutableOrMissingDestination)
+            } else if lent_mutably
+                && copy_lend_window_access(
+                    &body,
+                    &sites,
+                    sites[0].lhs_local,
+                    sites[0].rhs_local,
+                    &value_flows,
+                    &destination_flow,
+                    &live_before,
+                )
+                .is_some()
+            {
+                Some(CopyLendEligibilityDrop::C2MutableWindowAccess)
             } else if closure
                 .iter()
                 .any(|owner| matches!(owner, SlotOwner::Field(_)))
@@ -2564,6 +2593,98 @@ pub(crate) fn analyze_copy_lend_candidates(
         )
     });
     answer
+}
+
+/// relay 213: the window check of a mutable copy-lend (era-5c 163's, shared by measurement and
+/// production). From just after each copy, every location where `q` may still be live is
+/// searched for a use of `p` or of a copy of `p` that is not a copy of `q` (a read, a write, a
+/// reassignment, a release or a pass to a call: any use of the local). Returns the first such
+/// location. The replay's unique loan is the judge; this is its static twin.
+fn copy_lend_window_access(
+    body: &Body<'_>,
+    sites: &[CopyLendSite],
+    q: Local,
+    p: Local,
+    value_flows: &[(SlotOwner, SlotOwner)],
+    destination_flow: &FxHashSet<SlotOwner>,
+    live_before: &FxHashMap<Location, DenseBitSet<Local>>,
+) -> Option<Location> {
+    struct Touch<'a> {
+        others: &'a FxHashSet<Local>,
+        hit: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Touch<'_> {
+        fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
+            if self.others.contains(&local) && !matches!(context, PlaceContext::NonUse(_)) {
+                self.hit = true;
+            }
+        }
+    }
+    #[cfg(test)]
+    if std::env::var("CRAT_E5C_CM_FAULT").as_deref() == Ok("no-window") {
+        return None;
+    }
+    let locals = |closure: FxHashSet<SlotOwner>| -> FxHashSet<Local> {
+        closure
+            .into_iter()
+            .filter_map(|owner| match owner {
+                SlotOwner::Local(local) => Some(local),
+                _ => None,
+            })
+            .collect()
+    };
+    // `p` and every copy of `p` that is not a copy of `q`.
+    let mut others = locals(owner_closure([SlotOwner::Local(p)], value_flows));
+    for local in locals(destination_flow.clone()) {
+        others.remove(&local);
+    }
+    others.insert(p);
+    others.remove(&q);
+    let successors = |l: Location| -> Vec<Location> {
+        let data = &body.basic_blocks[l.block];
+        if l.statement_index < data.statements.len() {
+            vec![l.successor_within_block()]
+        } else {
+            data.terminator()
+                .successors()
+                .map(|block| Location {
+                    block,
+                    statement_index: 0,
+                })
+                .collect()
+        }
+    };
+    for site in sites {
+        let copy = Location {
+            block: BasicBlock::from_u32(site.location.block),
+            statement_index: site.location.statement_index,
+        };
+        let mut seen: FxHashSet<Location> = FxHashSet::default();
+        let mut work = successors(copy);
+        while let Some(l) = work.pop() {
+            if !seen.insert(l) {
+                continue;
+            }
+            if !live_before.get(&l).is_some_and(|live| live.contains(q)) {
+                continue;
+            }
+            let data = &body.basic_blocks[l.block];
+            let mut touch = Touch {
+                others: &others,
+                hit: false,
+            };
+            if l.statement_index < data.statements.len() {
+                touch.visit_statement(&data.statements[l.statement_index], l);
+            } else {
+                touch.visit_terminator(data.terminator(), l);
+            }
+            if touch.hit {
+                return Some(l);
+            }
+            work.extend(successors(l));
+        }
+    }
+    None
 }
 
 /// The R804-1 guard; `CRAT_E5C_L14_FAULT=copy-lend-guard` removes it (the fault).

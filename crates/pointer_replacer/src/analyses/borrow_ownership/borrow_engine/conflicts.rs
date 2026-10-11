@@ -16,6 +16,7 @@ use rustc_span::def_id::LocalDefId;
 
 use super::{
     a5_places_conflict::ParameterOverlap,
+    invalidates::CopyLendLoans,
     origin_replay::{NativeBorrowContext, NativeInference},
 };
 use crate::{
@@ -109,7 +110,7 @@ fn overwrite_with_engine_facts<'tcx>(
     f: LocalDefId,
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
 ) -> Vec<(Local, Local)> {
     overwrite_with_engine_facts_recording(
@@ -131,7 +132,7 @@ fn overwrite_with_engine_facts_recording<'tcx>(
     f: LocalDefId,
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
     accesses: Option<&mut Vec<super::invalidates::InvalidationAccess>>,
 ) -> Vec<(Local, Local)> {
@@ -194,7 +195,7 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
     f: LocalDefId,
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
 ) -> (
     Vec<super::invalidates::InvalidationAccess>,
@@ -325,7 +326,7 @@ fn record_loan_identities(
     inference: &BorrowInferenceResults<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
 ) {
     use crate::analyses::borrow_ownership::export;
     if !export::capturing() {
@@ -942,7 +943,7 @@ where
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
-        let copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let copy_lends = CopyLendLoans::new_empty(inference.borrow_set.loans.len());
         let escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends, None);
         let invalid_loans = invalid_loan_set(&inference);
@@ -1939,6 +1940,7 @@ unsafe fn f(p: *mut i32) -> i32 {
                 .find(|loan| loan.key.fn_did == function)
                 .expect("fixture loan");
             let selected_identity = SelectedCopyLendLoan {
+                unique: false,
                 location: seed.key.location,
                 borrowed: seed.key.place.clone(),
                 borrower: seed.key.borrower,

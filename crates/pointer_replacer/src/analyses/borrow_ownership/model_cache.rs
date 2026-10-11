@@ -200,6 +200,10 @@ pub(crate) fn solver_identity(
         "era5c_copy_lend",
         super::field_moves::copy_lend().to_string(),
     );
+    // era-5c relay 213: present only when on, so the frame of record's identity is unchanged.
+    if super::field_moves::copy_lend_mut() {
+        fields.insert("era5c_copy_lend_mut", "on".to_owned());
+    }
     fields.insert(
         "era5c_deref_reader",
         super::field_moves::deref_reader().to_string(),

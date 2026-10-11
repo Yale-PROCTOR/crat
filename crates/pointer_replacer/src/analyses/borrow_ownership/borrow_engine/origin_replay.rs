@@ -44,7 +44,7 @@ pub(super) struct NativeInference<'tcx> {
     /// Virtual, owned parameter-entry obligations share no legacy Loan IDs.
     pub(super) entry_facts:
         Option<std::sync::Arc<crate::analyses::borrow_ownership::protected_entry::EntryAnalysis>>,
-    pub(super) copy_lends: DenseBitSet<Loan>,
+    pub(super) copy_lends: super::invalidates::CopyLendLoans,
     pub(super) escaped_lends: DenseBitSet<Loan>,
     /// Addendum 59: the selected feeder loan keeps its construction-time identity, while the
     /// repair boundary sees the resolved source issuer; the destination remains
@@ -148,7 +148,8 @@ impl<'a> NativeBorrowContext<'a> {
     ) -> NativeInference<'tcx> {
         crate::analyses::borrow_ownership::licensing::reader_replay::begin_function(f);
         let mut inference = borrow_inference(tcx, f, &self.borrow);
-        let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let mut copy_lends =
+            super::invalidates::CopyLendLoans::new_empty(inference.borrow_set.loans.len());
         let mut escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         let mut escaped_presentations = FxHashMap::default();
         let mut unmatched_selected = selected_copy_lends.clone();
@@ -164,16 +165,26 @@ impl<'a> NativeBorrowContext<'a> {
                 },
             };
             let identity = SelectedCopyLendLoan {
+                unique: false,
                 location: export::location_key(data.location()),
                 borrowed: export::PlaceKey::from_place(data.borrowed),
                 borrower,
             };
-            if selected_copy_lend_contains(selected_copy_lends, &identity) {
+            if let Some(selected) = selected_copy_lends.get(&identity) {
                 assert!(
                     unmatched_selected.remove(&identity),
                     "selected CopyLend identity matched multiple BorrowSet loans: {identity:?}"
                 );
-                copy_lends.insert(loan);
+                copy_lends.all.insert(loan);
+                // relay 213: a mutable copy-lend's loan is unique.
+                #[cfg(test)]
+                let fault_shared =
+                    std::env::var("CRAT_E5C_CM_FAULT").as_deref() == Ok("shared-loan");
+                #[cfg(not(test))]
+                let fault_shared = false;
+                if selected.unique && !fault_shared {
+                    copy_lends.unique.insert(loan);
+                }
             }
             if selected_copy_lend_contains(escaped_copy_lends, &identity) {
                 assert!(
@@ -251,6 +262,7 @@ impl<'a> NativeBorrowContext<'a> {
                 .filter_map(|(loan, data)| {
                     let Borrower::CallArg(callee, arg_index) = data.assigned else { return None };
                     let identity = SelectedCopyLendLoan {
+                        unique: false,
                         location: export::location_key(data.location()),
                         borrowed: export::PlaceKey::from_place(data.borrowed),
                         borrower: export::BorrowerKind::CallArg {
@@ -519,6 +531,7 @@ pub unsafe fn f() -> i32 {
             let mut projection = cell.projection.clone();
             projection.push(export::ProjKey::Deref);
             let identity = SelectedCopyLendLoan {
+    unique: false,
                 location: export::location_key(rustc_middle::mir::Location {
                     block: rustc_middle::mir::BasicBlock::from_u32(effect.scalar_read.block.unwrap()),
                     statement_index: effect.scalar_read.statement.unwrap(),
@@ -663,6 +676,7 @@ mod copy_lend_identity_tests {
     #[test]
     fn same_location_companion_is_not_copy_lend() {
         let selected = SelectedCopyLendLoan {
+            unique: false,
             location: MirLocationKey::new(3, 7),
             borrowed: PlaceKey {
                 local: Local::from_u32(1),
@@ -673,6 +687,7 @@ mod copy_lend_identity_tests {
             },
         };
         let companion = SelectedCopyLendLoan {
+            unique: false,
             location: selected.location,
             borrowed: PlaceKey {
                 local: Local::from_u32(9),
@@ -755,6 +770,7 @@ unsafe fn caller() -> i32 {
                     (
                         loan,
                         SelectedCopyLendLoan {
+    unique: false,
                             location: crate::analyses::borrow_ownership::export::location_key(
                                 data.location(),
                             ),
@@ -781,6 +797,7 @@ unsafe fn caller() -> i32 {
                 other => panic!("allowlist assignment is not a pointer copy: {other:?}"),
             };
             let store_expected = SelectedCopyLendLoan {
+    unique: false,
                 location,
                 borrowed: PlaceKey::from_place(source.project_deeper(&[PlaceElem::Deref], tcx)),
                 borrower: BorrowerKind::Assign {
@@ -877,6 +894,7 @@ impl NativeConstraintGraph {
             graph.membership.push((loan, lhs));
 
             let identity = SelectedCopyLendLoan {
+                unique: false,
                 location: export::location_key(data.location()),
                 borrowed: export::PlaceKey::from_place(data.borrowed),
                 borrower: export::BorrowerKind::Assign {

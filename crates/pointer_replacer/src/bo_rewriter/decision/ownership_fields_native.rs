@@ -1656,24 +1656,34 @@ fn derive_bundle(
         if !lent_ref {
             return Err(NativeHold::Missing("native-lend-alias-not-ref"));
         }
+        // relay 213: a lend written through is a mutable reborrow, declared `&mut T`.
+        let reference = if alias.mutable { "&mut " } else { "&" };
         edits.push(BoxExprEdit {
             span: alias.initializer_span,
             replacement: match source.shape() {
-                BoxShape::Slice => format!("&(*({name}))[0]"),
-                BoxShape::Sized => format!("&*({name})"),
+                BoxShape::Slice => format!("{reference}(*({name}))[0]"),
+                BoxShape::Sized => format!("{reference}*({name})"),
             },
             receipt: "native-box-lend-alias",
         });
         receipts.push(format!(
-            "{VIEW_ALIAS_TYPE_RECEIPT} {} &{}",
+            "{VIEW_ALIAS_TYPE_RECEIPT} {} {reference}{}",
             alias.hir_id.local_id.as_u32(),
             source.element_spelling()
         ));
-        receipts.push(format!(
-            "native-box-lend-alias alias={} form=&{} reads-only=yes owner-live-while-lent=borrow-checker (R805-3)",
-            alias.spelling,
-            source.element_spelling()
-        ));
+        if alias.mutable {
+            receipts.push(format!(
+                "native-box-lend-alias alias={} form=&mut {} writes-through=yes owner-untouched-while-lent=analysis-window+borrow-checker (R805-3, relay 213)",
+                alias.spelling,
+                source.element_spelling()
+            ));
+        } else {
+            receipts.push(format!(
+                "native-box-lend-alias alias={} form=&{} reads-only=yes owner-live-while-lent=borrow-checker (R805-3)",
+                alias.spelling,
+                source.element_spelling()
+            ));
+        }
     }
     receipts.push(format!("native-box-slice-uses count={} element={} length-unchanged=closed-root-uses source-aliases={:?} indexing=delivered-slice-walker",source.count(),source.element(),source.mir_aliases()));
     receipts.push(format!("native-generated-unwind-permit operations=allocation-helpers-and-slice-bounds-checks all-roots=fresh-local-closed-uses-and-verified-T1 payload={}/nonrecursive; actual-waiver-sites=emitted-MIR-ledger",source.element()));

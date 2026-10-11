@@ -120,11 +120,49 @@ pub(crate) fn copy_lend_guards_for_body(
 /// Stable identity of the one loan synthesized by a selected copy-lend arm. Location alone is not
 /// sufficient: grouped provenance can synthesize companion loans at the same statement, and those
 /// retain the existing-loan invalidation semantics.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// era-5c relay 213: `unique` marks the loan of a mutable copy-lend (`q = &mut *p`): the replay
+/// counts every access to `p` while it is live as a conflict, a read as much as a write. Like
+/// `CopyLendPair::mutable` it is an attribute, not identity: equality and hashing read
+/// `(location, borrowed, borrower)`, so an identity rebuilt from a BorrowSet loan finds it, and
+/// `Debug` names it only when set.
+#[derive(Clone)]
 pub(crate) struct SelectedCopyLendLoan {
     pub(crate) location: MirLocationKey,
     pub(crate) borrowed: PlaceKey,
     pub(crate) borrower: BorrowerKind,
+    pub(crate) unique: bool,
+}
+
+impl PartialEq for SelectedCopyLendLoan {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.location, &self.borrowed, &self.borrower)
+            == (&other.location, &other.borrowed, &other.borrower)
+    }
+}
+
+impl Eq for SelectedCopyLendLoan {}
+
+impl std::hash::Hash for SelectedCopyLendLoan {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.location.hash(state);
+        self.borrowed.hash(state);
+        self.borrower.hash(state);
+    }
+}
+
+impl std::fmt::Debug for SelectedCopyLendLoan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("SelectedCopyLendLoan");
+        debug
+            .field("location", &self.location)
+            .field("borrowed", &self.borrowed)
+            .field("borrower", &self.borrower);
+        if self.unique {
+            debug.field("unique", &true);
+        }
+        debug.finish()
+    }
 }
 
 pub(crate) type SelectedCopyLendLoans = FxHashMap<LocalDefId, FxHashSet<SelectedCopyLendLoan>>;
@@ -159,7 +197,7 @@ pub(crate) fn selected_copy_lend_sites(
                     continue;
                 };
                 let pair = CopyLendPair::new(to_slot_ref(lhs, fn_did), to_slot_ref(rhs, fn_did));
-                if copy_lends.contains(&pair)
+                if let Some(lent) = copy_lends.get(&pair)
                     && model.get(&pair.lhs) == Some(&SlotKind::Ref)
                     && model.get(&pair.rhs) == Some(&SlotKind::Owning)
                 {
@@ -168,6 +206,7 @@ pub(crate) fn selected_copy_lend_sites(
                         .entry(fn_did)
                         .or_insert_with(FxHashSet::default)
                         .insert(SelectedCopyLendLoan {
+                            unique: lent.mutable,
                             location: MirLocationKey::new(block.as_u32(), statement_index),
                             borrowed: PlaceKey::from_place(borrowed),
                             borrower: BorrowerKind::Assign {

@@ -268,6 +268,7 @@ pub(crate) fn begin_round(
                 let mut projection = candidate.source.projection.clone();
                 projection.push(ProjKey::Deref);
                 let identity = SelectedCopyLendLoan {
+                    unique: false,
                     location: MirLocationKey::new(candidate.block, candidate.statement),
                     borrowed: PlaceKey {
                         local: Local::from_u32(candidate.source.local),
@@ -399,6 +400,7 @@ pub(crate) fn begin_round(
                 let mut projection = cell.projection.clone();
                 projection.push(ProjKey::Deref);
                 let identity = SelectedCopyLendLoan {
+                    unique: false,
                     location: MirLocationKey::new(block, statement),
                     borrowed: PlaceKey {
                         local: Local::from_u32(cell.local),

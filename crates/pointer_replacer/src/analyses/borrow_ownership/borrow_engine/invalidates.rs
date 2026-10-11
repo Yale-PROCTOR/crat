@@ -59,7 +59,7 @@ pub fn compute_invalidates<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> Invalidates {
-    let copy_lends = DenseBitSet::new_empty(borrow_set.loans.len());
+    let copy_lends = CopyLendLoans::new_empty(borrow_set.loans.len());
     compute_invalidates_inner(
         tcx,
         body,
@@ -73,13 +73,39 @@ pub fn compute_invalidates<'tcx>(
     )
 }
 
+/// The typed CopyLend loans of one function: `all` the selected copy-lends (A12's shared
+/// invalidation), `unique` the subset lent `&mut` (era-5c relay 213), whose loans conflict with
+/// every access to their owner. Derefs to `all`, so a reader that asks only "is this a copy
+/// lend?" is unchanged.
+pub(crate) struct CopyLendLoans {
+    pub(crate) all: DenseBitSet<Loan>,
+    pub(crate) unique: DenseBitSet<Loan>,
+}
+
+impl CopyLendLoans {
+    pub(crate) fn new_empty(domain_size: usize) -> Self {
+        Self {
+            all: DenseBitSet::new_empty(domain_size),
+            unique: DenseBitSet::new_empty(domain_size),
+        }
+    }
+}
+
+impl std::ops::Deref for CopyLendLoans {
+    type Target = DenseBitSet<Loan>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.all
+    }
+}
+
 pub(crate) fn compute_invalidates_with_copy_lends<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
 ) -> Invalidates {
     compute_invalidates_inner(
         tcx,
@@ -107,7 +133,7 @@ pub(crate) fn compute_invalidates_capturing<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> (Invalidates, Vec<InvalidationAccess>) {
-    let copy_lends = DenseBitSet::new_empty(borrow_set.loans.len());
+    let copy_lends = CopyLendLoans::new_empty(borrow_set.loans.len());
     compute_invalidates_capturing_with_copy_lends(
         tcx,
         body,
@@ -124,7 +150,7 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
 ) -> (Invalidates, Vec<InvalidationAccess>) {
     let mut accesses = Vec::new();
     let invalidates = compute_invalidates_inner(
@@ -150,7 +176,7 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends_and_parameter_overla
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
 ) -> (Invalidates, Vec<InvalidationAccess>, Vec<(Local, Local)>) {
     let mut accesses = Vec::new();
@@ -190,7 +216,7 @@ pub(crate) fn compute_invalidates_recording<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
     accesses: &mut Vec<InvalidationAccess>,
 ) -> (Invalidates, Vec<(Local, Local)>) {
@@ -254,7 +280,7 @@ pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: &ParameterOverlap,
 ) -> (Invalidates, Vec<(Local, Local)>) {
     let mut parameter_accesses = Vec::new();
@@ -279,7 +305,7 @@ fn compute_invalidates_inner<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
-    copy_lends: &DenseBitSet<Loan>,
+    copy_lends: &CopyLendLoans,
     parameter_overlap: Option<&ParameterOverlap>,
     accesses: Option<&mut Vec<InvalidationAccess>>,
     parameter_accesses: Option<&mut Vec<ParameterAccess<'tcx>>>,
@@ -454,7 +480,7 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     borrow_set: &'g BorrowSet<'tcx>,
     provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
-    copy_lends: &'g DenseBitSet<Loan>,
+    copy_lends: &'g CopyLendLoans,
     /// A5 effective may-overlap among this function's depth-zero parameters.
     parameter_overlap: Option<&'g ParameterOverlap>,
     /// A5-only access stream used to derive conflicts without synthesizing CallArg loans.
@@ -640,7 +666,10 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     );
                     continue;
                 }
-                let copy_lend_write = kind == AccessKind::Write && self.copy_lends.contains(loan);
+                // relay 213: a unique (mutable) copy-lend conflicts with every access to its
+                // owner, a read as much as a write.
+                let copy_lend_write = (kind == AccessKind::Write && self.copy_lends.contains(loan))
+                    || self.copy_lends.unique.contains(loan);
                 if !copy_lend_write
                     && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
                     && !self.provenance_set.provenance_data[p].is_mutable()
@@ -753,8 +782,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     ) {
                         continue;
                     }
-                    let copy_lend_write =
-                        kind == AccessKind::Write && self.copy_lends.contains(loan);
+                    let copy_lend_write = (kind == AccessKind::Write
+                        && self.copy_lends.contains(loan))
+                        || self.copy_lends.unique.contains(loan);
                     if !copy_lend_write
                         && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
                         && !self.provenance_set.provenance_data[p].is_mutable()

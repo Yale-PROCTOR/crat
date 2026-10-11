@@ -100,6 +100,20 @@ pub(crate) fn copy_lend() -> bool {
     }
 }
 
+/// `CRAT_ERA5C_COPY_LEND_MUT=on|off` (fail-loud, absent = off): **era-5c relay 213 (R988-1,
+/// USER)**, the MUTABLE copy-lend. Under the copy-lend arm, a copy `q = p` whose destination the
+/// mutability facts call mutable is no longer dropped at C2: it is lent `q = &mut *p` when no read,
+/// write, reassignment, release or call argument of `p` (or of another copy of `p`) happens while
+/// `q` is live (the window check), every other clause unchanged; the lend's loan is unique in the
+/// replay. A destination the facts do not cover stays dropped at C2.
+pub(crate) fn copy_lend_mut() -> bool {
+    match std::env::var("CRAT_ERA5C_COPY_LEND_MUT").ok().as_deref() {
+        None | Some("off") => false,
+        Some("on") => true,
+        Some(other) => panic!("CRAT_ERA5C_COPY_LEND_MUT must be `on` or `off`, got {other:?}"),
+    }
+}
+
 /// `CRAT_ERA5C_DEREF_READER=on|off` (fail-loud, absent = off): **L01⁹ rule 1b**
 /// (R563-1, era-5c report 055). A deref-only field read -- `t = CopyForDeref((*p).f)`,
 /// which rustc emits only for a place used as a dereference base -- is a Ref reader
