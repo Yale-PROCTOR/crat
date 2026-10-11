@@ -85,6 +85,8 @@ mod conformance_tests;
 #[cfg(test)]
 mod construction_values_tests;
 #[cfg(test)]
+mod copy_lend_mut_emit_tests;
+#[cfg(test)]
 mod copy_walk_slice_tests;
 #[cfg(test)]
 mod exclusion_rederivation_tests;
