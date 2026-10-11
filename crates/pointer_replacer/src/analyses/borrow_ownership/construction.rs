@@ -2621,7 +2621,9 @@ fn copy_lend_window_access(
         }
     }
     #[cfg(test)]
-    if std::env::var("CRAT_E5C_CM_FAULT").as_deref() == Ok("no-window") {
+    if std::env::var("CRAT_E5C_CM_FAULT")
+        .is_ok_and(|faults| faults.split(',').any(|f| f == "no-window"))
+    {
         return None;
     }
     let locals = |closure: FxHashSet<SlotOwner>| -> FxHashSet<Local> {

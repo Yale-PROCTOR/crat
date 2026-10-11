@@ -43,6 +43,20 @@ const WRITE_IN_WINDOW: &str = r#"
 }
 "#;
 
+/// (ii″) `p` READ while `q` is live: no lend. A shared copy-lend's loan already conflicts with a
+/// write to its owner; only a unique loan conflicts with this read.
+const READ_IN_WINDOW: &str = r#"
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 {
+    let p: *mut i32 = malloc(4) as *mut i32;
+    let q: *mut i32 = p;
+    *q = 1;
+    let r = *p;
+    *q = 3;
+    free(p as *mut core::ffi::c_void);
+    r
+}
+"#;
+
 /// (ii′) another copy of `p` written while `q` is live: no lend.
 const OTHER_COPY_IN_WINDOW: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
@@ -69,8 +83,9 @@ const FREE_DESTINATION: &str = r#"
 }
 "#;
 
-/// (iii′) `free(p)` inside `q`'s window (`q` used after it): no lend.
-const FREE_IN_WINDOW: &str = r#"
+/// (iii′) `free(p)` on a path after `q`'s last use: outside the window (`q`'s liveness ends at
+/// `*q = 1` on that path), so the lend is taken.
+const FREE_AFTER_LAST_USE: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run(c: i32) -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
     let q: *mut i32 = p;
@@ -82,6 +97,19 @@ const FREE_IN_WINDOW: &str = r#"
     *q = 2;
     free(p as *mut core::ffi::c_void);
     1
+}
+"#;
+
+/// (iii″) `free(p)` while `q` is live: `q` is used after the release, so the input itself is UB
+/// (§28 owes it nothing); the window check still refuses the lend.
+const FREE_IN_WINDOW: &str = r#"
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 {
+    let p: *mut i32 = malloc(4) as *mut i32;
+    let q: *mut i32 = p;
+    *q = 1;
+    free(p as *mut core::ffi::c_void);
+    *q = 2;
+    0
 }
 "#;
 
@@ -97,11 +125,13 @@ const READ_ONLY: &str = r#"
 }
 "#;
 
-const SHAPES: [(&str, &str); 7] = [
+const SHAPES: [(&str, &str); 9] = [
     ("MUT_LEND", MUT_LEND),
     ("WRITE_IN_WINDOW", WRITE_IN_WINDOW),
+    ("READ_IN_WINDOW", READ_IN_WINDOW),
     ("OTHER_COPY_IN_WINDOW", OTHER_COPY_IN_WINDOW),
     ("FREE_DESTINATION", FREE_DESTINATION),
+    ("FREE_AFTER_LAST_USE", FREE_AFTER_LAST_USE),
     ("FREE_IN_WINDOW", FREE_IN_WINDOW),
     ("READ_ONLY", READ_ONLY),
     ("BOTH", ""),
@@ -327,6 +357,42 @@ fn e5c_cm_2_an_access_in_the_window_refuses_the_lend() {
     }
 }
 
+/// (ii″) `p` read while `q` is live: the window check refuses, and the kinds are the frame's.
+#[test]
+fn e5c_cm_2_a_read_of_the_owner_in_the_window_refuses_the_lend() {
+    let on = seen("READ_IN_WINDOW", Some("on"));
+    assert_eq!(row(&on, "q", "p"), "c2-mutable-window-access", "{on:#?}");
+    assert_eq!(on.kinds, seen("READ_IN_WINDOW", Some("off")).kinds);
+}
+
+/// Whether the shape's solve took the mutable lend (`p` owning beside `q` a reference).
+fn lent(seen: &Seen) -> bool {
+    kind(seen, "run::p") == "owning" && kind(seen, "run::q") == "ref"
+}
+
+/// Fault F1 (`no-window`): without the static window check the classifier keeps both window
+/// shapes, and the replay's unique loan still refuses the lend: the replay is the judge.
+#[test]
+fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
+    for name in ["WRITE_IN_WINDOW", "READ_IN_WINDOW"] {
+        let s = seen_with(name, Some("on"), &[("CRAT_E5C_CM_FAULT", "no-window")]);
+        assert_eq!(row(&s, "q", "p"), "eligible-mut", "{name}: {s:#?}");
+        assert!(!lent(&s), "{name}: {s:#?}");
+    }
+}
+
+/// Fault F2 (`no-window,shared-loan`): with the loan shared as well, the read of `p` in `q`'s
+/// window is no conflict and the lend is taken -- what F1 and (ii″) would catch.
+#[test]
+fn e5c_cm_f2_a_shared_loan_lets_the_read_through() {
+    let s = seen_with(
+        "READ_IN_WINDOW",
+        Some("on"),
+        &[("CRAT_E5C_CM_FAULT", "no-window,shared-loan")],
+    );
+    assert!(lent(&s), "{s:#?}");
+}
+
 /// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend; the kinds
 /// are the frame's.
 #[test]
@@ -339,12 +405,27 @@ fn e5c_cm_3_a_release_refuses_the_lend() {
     assert_eq!(on.kinds, seen("FREE_IN_WINDOW", Some("off")).kinds);
 }
 
-/// (iv) a read-only copy: the shared lend, unchanged by the switch.
+/// (iii′) the window is `q`'s liveness, path by path: `free(p)` after `q`'s last use is outside it.
+#[test]
+fn e5c_cm_3_a_release_after_the_last_use_is_outside_the_window() {
+    let s = seen("FREE_AFTER_LAST_USE", Some("on"));
+    assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
+}
+
+/// (iv) a read-only copy: the shared lend and the kinds, unchanged by the switch. (Another pair
+/// of the fixture, `free`'s temporary, may report its next clause instead of C2: the switch
+/// moves C2 off the front for a mutable destination, never the pair's fate.)
 #[test]
 fn e5c_cm_4_a_read_only_copy_is_unchanged() {
     let on = seen("READ_ONLY", Some("on"));
+    let off = seen("READ_ONLY", Some("off"));
     assert_eq!(row(&on, "q", "p"), "eligible", "{on:#?}");
-    assert_eq!(on, seen("READ_ONLY", Some("off")));
+    assert_eq!(row(&off, "q", "p"), "eligible", "{off:#?}");
+    assert_eq!(on.kinds, off.kinds);
+    assert!(
+        on.rows.iter().all(|r| !r.ends_with("eligible-mut")),
+        "{on:#?}"
+    );
 }
 
 /// (v) the switch absent is `off`, byte for byte, on every shape.
