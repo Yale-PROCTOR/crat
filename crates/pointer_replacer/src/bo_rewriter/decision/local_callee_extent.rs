@@ -403,17 +403,20 @@ pub(super) fn leaves_its_extent(
 /// **Relay 324 (R975-1; era-5c 167c §2) — a copy walks the parameter.** S39
 /// lets a bare copy take a raw view of a reference source, so a parameter's
 /// arithmetic can live on its copy alone (`let inp = s; inp = inp.offset(1)`:
-/// tulipindicators' `get_array`). A copy other than the parameter itself that
+/// tulipindicators' `get_array`). A copy other than the parameter itself, one
+/// `kept_raw` names (the model keeps it raw beside its reference source; a copy
+/// the model equates with the source takes its own slice construction), that
 /// steps past the parameter's first element, by the arithmetic arm's own test
 /// in guard mode (the one the wide-access set reads).
 pub(crate) fn walked_by_a_copy(
     tcx: TyCtxt<'_>,
     key: (LocalDefId, HirId),
     facts: &EmitabilityFacts,
+    kept_raw: &dyn Fn(HirId) -> bool,
 ) -> bool {
     copies_of(tcx, key)
         .into_iter()
-        .filter(|copy| *copy != key.1)
+        .filter(|copy| *copy != key.1 && kept_raw(*copy))
         .filter(|copy| steps_in_parameter_elements(tcx, facts, key.0, key.1, *copy))
         .any(|copy| extent_leaving_op(tcx, (key.0, copy), facts, true).is_some())
 }

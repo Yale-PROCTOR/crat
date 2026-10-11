@@ -2779,10 +2779,11 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None if counted.is_some() => Form::Slice,
         None if region.is_some() => Form::Slice,
         // Relay 324 (R975-1): a formal with no raw use of its own whose copy
-        // walks it (S39's raw view of a reference source) — the copy's walk is
-        // the need, fatness the licence, the -2 rule unchanged. A formal with
-        // nullability evidence keeps the thin path and its null-init gate
-        // (R819-1: with its Option stage withdrawn it falls back to raw).
+        // walks it (S39's raw view of a reference source: a copy the model
+        // keeps Raw) — the copy's walk is the need, fatness the licence, the -2
+        // rule unchanged. A formal with nullability evidence keeps the thin
+        // path and its null-init gate (R819-1: with its Option stage withdrawn
+        // it falls back to raw).
         None if matches!(subject.kind, SubjectKind::Param { .. })
             && !nullable_evidence
             && fat.is_array(subject.fn_did, subject.local)
@@ -2790,6 +2791,18 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 tcx,
                 (subject.fn_did, subject.hir_id),
                 facts,
+                &|copy| {
+                    subjects
+                        .iter()
+                        .find(|s| s.fn_did == subject.fn_did && s.hir_id == copy)
+                        .and_then(|s| universe.slot_for_local_depth(s.local, 0))
+                        .is_some_and(|slot| {
+                            matches!(
+                                model.get(&SlotRef::Local(subject.fn_did, slot)),
+                                Some(SlotKind::Raw)
+                            )
+                        })
+                },
             ) =>
         {
             Form::Slice
