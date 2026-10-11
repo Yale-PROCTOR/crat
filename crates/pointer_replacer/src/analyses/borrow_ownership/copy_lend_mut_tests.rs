@@ -90,7 +90,7 @@ const READ_ONLY: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
     *p = 7;
-    let q: *const i32 = p;
+    let q: *mut i32 = p;
     let r = *q;
     free(p as *mut core::ffi::c_void);
     r
