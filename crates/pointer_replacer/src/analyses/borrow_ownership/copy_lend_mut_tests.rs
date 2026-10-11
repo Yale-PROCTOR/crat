@@ -381,11 +381,13 @@ fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
     }
 }
 
-/// Fault F2 (`no-window` + W52's `no-loan`): without the window check and without the lend's loan
-/// in the replay, the read of `p` in `q`'s window is no conflict and the lend is taken -- what
-/// (ii″) and F1 catch.
+/// F2 (`no-window` + W52's `no-loan`), an observation of record: even without the window check and
+/// without the lend's loan, the replay refuses the read of `p` in `q`'s window, because the copy
+/// itself issues an ordinary loan and `p` is mutable (the facts give a copy one qualifier). The
+/// read is caught three times: the window check, the unique loan, the copy's own loan. A fault that
+/// lets it through would have to remove the base borrow inference; none is built.
 #[test]
-fn e5c_cm_f2_without_the_window_or_the_loan_the_read_slips_through() {
+fn e5c_cm_f2_without_the_window_or_the_lends_loan_the_copys_own_loan_catches_the_read() {
     let s = seen_with(
         "READ_IN_WINDOW",
         Some("on"),
@@ -394,7 +396,8 @@ fn e5c_cm_f2_without_the_window_or_the_loan_the_read_slips_through() {
             ("CRAT_E5C_W52_FAULT", "no-loan"),
         ],
     );
-    assert!(lent(&s), "{s:#?}");
+    assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
+    assert!(!lent(&s), "{s:#?}");
 }
 
 /// F2′ (`no-window,shared-loan`), an observation of record: a SHARED loan catches the read here
