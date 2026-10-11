@@ -37,6 +37,8 @@ mod infer;
 pub(crate) use infer::reseat_destinations;
 #[cfg(test)]
 mod copy_lend_guard_tests;
+#[cfg(test)]
+mod copy_lend_mut_tests;
 pub(crate) mod copy_relax;
 #[cfg(test)]
 mod copy_relax_tests;

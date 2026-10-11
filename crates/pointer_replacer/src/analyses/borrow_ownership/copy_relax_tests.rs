@@ -153,7 +153,7 @@ const CAST_DEAD: &str = r#"
 "#;
 
 /// The settled kinds of a fixture's solve, by name: `fn::local` for a named local at depth 0.
-fn kinds(code: &str) -> BTreeMap<String, String> {
+pub(super) fn kinds(code: &str) -> BTreeMap<String, String> {
     use rustc_hir::{ItemKind, OwnerNode};
     let mut rows = BTreeMap::new();
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
