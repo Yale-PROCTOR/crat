@@ -1193,6 +1193,8 @@ pub(crate) struct DecisionTable {
     pub option_value_initializers: Vec<(LocalDefId, rustc_hir::HirId)>,
     pub option_mut_bindings: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
     pub option_composed_uses: Vec<((LocalDefId, rustc_hir::HirId), Span)>,
+    /// Relay 327: K21's compositions, for the containers joint (c) retires.
+    pub(crate) composed_use_edits: Vec<ComposedUseEdit>,
     /// Contract-driven slice promotions, keyed by the exact compiler subject.
     pub(crate) contract_extent_promotions:
         FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
@@ -1600,6 +1602,7 @@ pub(crate) fn decide_with_raw_fallbacks(
         option_value_initializers: Vec::new(),
         option_mut_bindings,
         option_composed_uses: Vec::new(),
+        composed_use_edits: Vec::new(),
         contract_extent_promotions,
         licensed_lifts,
         root_extents,
@@ -1833,6 +1836,113 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
     }
 }
 
+/// **Relay 327 (main 222 §2.1, brotli's class #1498).** One K21 composition, kept
+/// so a container that is later retired gives the inner subject its own edit
+/// back: R556-4 joint (c) retires a Box owner's element edit under its base
+/// view (`retire_box_edits_under_base_views`), and the inner use composed into
+/// that edit (`*all_histograms.offset(*clusters.offset(j_0) as isize)`'s index)
+/// would otherwise be spelled nowhere.
+#[derive(Clone, Debug)]
+pub(crate) struct ComposedUseEdit {
+    pub(crate) outer: (LocalDefId, rustc_hir::HirId),
+    pub(crate) outer_span: Span,
+    pub(crate) inner: (LocalDefId, rustc_hir::HirId),
+    /// The inner span's input text, the splice key when two restored edits nest.
+    pub(crate) inner_source: String,
+    pub(crate) edit: ComposedInner,
+}
+
+/// The inner edit as it stood when K21 moved its text into the container.
+#[derive(Clone, Debug)]
+pub(crate) enum ComposedInner {
+    Use(emitability::UseEdit),
+    Box(box_facts::BoxExprEdit),
+}
+
+impl ComposedInner {
+    pub(crate) fn span(&self) -> Span {
+        match self {
+            ComposedInner::Use(edit) => edit.span,
+            ComposedInner::Box(edit) => edit.span,
+        }
+    }
+
+    fn replacement_mut(&mut self) -> &mut String {
+        match self {
+            ComposedInner::Use(edit) => &mut edit.replacement,
+            ComposedInner::Box(edit) => &mut edit.replacement,
+        }
+    }
+
+    /// Give the edit back to its subject's decision; false when the decision no
+    /// longer plans edits of that kind.
+    pub(crate) fn restore(self, decision: &mut Decision) -> bool {
+        match (self, decision) {
+            (
+                ComposedInner::Use(edit),
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. },
+            ) => {
+                uses.push(edit);
+                true
+            }
+            (ComposedInner::Box(edit), Decision::Box(plan)) => {
+                plan.expr_edits.push(edit);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The edits K21 composed into the containers at `retired` of `outer`, nested
+/// pairs among them composed again (the same textual splice, keyed by the
+/// inner's input text), in the order to restore.
+pub(crate) fn composed_inner_edits(
+    composed: &mut Vec<ComposedUseEdit>,
+    outer: (LocalDefId, rustc_hir::HirId),
+    retired: &[Span],
+) -> Vec<ComposedUseEdit> {
+    let (mut taken, kept): (Vec<_>, Vec<_>) = std::mem::take(composed)
+        .into_iter()
+        .partition(|record| record.outer == outer && retired.contains(&record.outer_span));
+    *composed = kept;
+    taken.sort_by_key(|record| {
+        let span = record.edit.span();
+        (span.lo(), std::cmp::Reverse(span.hi()))
+    });
+    let mut restored: Vec<ComposedUseEdit> = Vec::new();
+    for mut record in taken {
+        let span = record.edit.span();
+        let Some(container) = restored
+            .iter_mut()
+            .rev()
+            .find(|container| container.edit.span().contains(span))
+        else {
+            restored.push(record);
+            continue;
+        };
+        // Exactly one occurrence, as K21 itself requires; otherwise the inner
+        // stays unrestored (two edits over one interval would not apply).
+        if container
+            .edit
+            .replacement_mut()
+            .matches(record.inner_source.as_str())
+            .count()
+            == 1
+        {
+            let inner = std::mem::take(record.edit.replacement_mut());
+            let text = container
+                .edit
+                .replacement_mut()
+                .replace(record.inner_source.as_str(), &inner);
+            *container.edit.replacement_mut() = text;
+        }
+    }
+    restored
+}
+
 /// Splice one nested use edit into its container. Returns whether it composed.
 ///
 /// Both edits keep their own subject: the outer subject's replacement simply
@@ -1861,10 +1971,44 @@ fn compose_nested_use_edit(
         return false;
     }
     let composed = outer_replacement.replace(inner_source.as_str(), &inner_replacement);
+    let inner_edit = match &table.entries[inner_entry].1 {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter()
+            .find(|u| u.span == inner_span)
+            .cloned()
+            .map(ComposedInner::Use),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter()
+            .find(|e| e.span == inner_span)
+            .cloned()
+            .map(ComposedInner::Box),
+        _ => None,
+    };
     if !set_use_edit_replacement(&mut table.entries[outer_entry].1, outer_span, composed) {
         return false;
     }
-    drop_use_edit(&mut table.entries[inner_entry].1, inner_span)
+    if !drop_use_edit(&mut table.entries[inner_entry].1, inner_span) {
+        return false;
+    }
+    // Relay 327: kept for a container joint (c) retires later.
+    if let Some(edit) = inner_edit {
+        let key = |entry: usize| {
+            let subject = &table.entries[entry].0;
+            (subject.fn_did, subject.hir_id)
+        };
+        let record = ComposedUseEdit {
+            outer: key(outer_entry),
+            outer_span,
+            inner: key(inner_entry),
+            inner_source,
+            edit,
+        };
+        table.composed_use_edits.push(record);
+    }
+    true
 }
 
 /// The spans a decision's own use edits claim.
@@ -3550,6 +3694,7 @@ mod self_consistency_tests {
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
+            composed_use_edits: Vec::new(),
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),

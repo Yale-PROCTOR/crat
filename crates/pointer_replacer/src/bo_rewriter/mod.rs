@@ -14320,6 +14320,7 @@ fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
         ..
     } in retirements
     {
+        let mut retired = Vec::new();
         for (subject, decision) in &mut table.entries {
             let decision::Decision::Box(plan) = decision else {
                 continue;
@@ -14328,12 +14329,39 @@ fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
                 continue;
             }
             let before = plan.expr_edits.len();
-            plan.expr_edits
-                .retain(|edit| edit.span.source_callsite() != element.source_callsite());
+            plan.expr_edits.retain(|edit| {
+                let kept = edit.span.source_callsite() != element.source_callsite();
+                if !kept {
+                    retired.push(edit.span);
+                }
+                kept
+            });
             if plan.expr_edits.len() != before {
                 plan.receipts
                     .push("box-expression:retired-under-base-view".to_owned());
             }
+        }
+        // Relay 327 (main 222 §2.1, brotli's class #1498): a use K21 composed into
+        // a retired container is spelled nowhere else — its subject takes its own
+        // edit back (`*clusters.offset(j_0 as isize)` inside the base view's
+        // `.offset(..)` operand).
+        for record in
+            decision::composed_inner_edits(&mut table.composed_use_edits, (owner, root), &retired)
+        {
+            let Some((_, decision)) = table
+                .entries
+                .iter_mut()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == record.inner)
+            else {
+                continue;
+            };
+            if let (decision::ComposedInner::Box(_), decision::Decision::Box(plan)) =
+                (&record.edit, &mut *decision)
+            {
+                plan.receipts
+                    .push("box-expression:restored-from-retired-container".to_owned());
+            }
+            record.edit.restore(decision);
         }
     }
 }

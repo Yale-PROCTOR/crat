@@ -503,7 +503,7 @@ fn r327_the_index_inside_a_base_view_operand_keeps_its_own_edit() {
     );
     assert!(
         text.contains(
-            "Combine(&mut*clusters.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()).offset((idx.as_deref().unwrap()[(0)asusize])asisize),"
+            "Combine(&mut*clusters.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()).offset(idx.as_deref().unwrap()[(0)asusize]asisize),"
         ),
         "{}",
         out.source

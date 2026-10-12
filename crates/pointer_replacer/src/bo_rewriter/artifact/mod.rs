@@ -243,6 +243,7 @@ mod tests {
             option_value_initializers: Vec::new(),
             option_mut_bindings: rustc_hash::FxHashSet::default(),
             option_composed_uses: Vec::new(),
+            composed_use_edits: Vec::new(),
             contract_extent_promotions: Default::default(),
             licensed_lifts: Vec::new(),
             root_extents: Vec::new(),
