@@ -97,13 +97,23 @@ fn emitted(source: &str, tag: &str) -> (String, usize) {
 fn r738_1_a_raw_twin_call_takes_the_original_arguments() {
     let (source, reverted) = emitted(SHAPE, "twin");
     let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    // wave-5d relay 207 (R785-6): `SafeReadSymbolCodeLengths`' arguments are
+    // distinct fields of `*h`, every pair `a5-site-proof-clear`, so the twin
+    // check (decided by root before) no longer routes the call to the raw
+    // twin: it calls the converted callee, the slice position bridged with the
+    // array field's own extent. The twin itself, where a raw argument IS an
+    // alias of a converted one, stays witnessed by the twin family's own tests
+    // (`counted_void*`, `raw_twin_supersede_tests`), which pass unchanged.
     assert!(
-        flat.contains("__crat_raw_ProcessSingleCodeLength("),
-        "the aliased call is routed to the raw twin:\n{source}"
+        !flat.contains("__crat_raw_ProcessSingleCodeLength("),
+        "proven-disjoint fields do not route the call to the raw twin:\n{source}"
     );
     assert!(
-        flat.contains("((*h).code_length_histo).as_mut_ptr(), ((*h).next_symbol).as_mut_ptr())"),
-        "the twin takes the input's arguments:\n{source}"
+        flat.contains("ProcessSingleCodeLength(code_len, &mut (*h).symbol, &mut (*h).repeat,")
+            && flat.contains(
+                "core::slice::from_raw_parts_mut(((*h).next_symbol).as_mut_ptr(), (32) as usize)"
+            ),
+        "the converted callee is called with its bridges:\n{source}"
     );
     assert_eq!(reverted, 0, "{source}");
     // Control: the other caller's call to the same callee is not the twin's,
