@@ -43,6 +43,8 @@ pub(crate) mod copy_relax;
 #[cfg(test)]
 mod copy_relax_tests;
 pub(crate) mod field_moves;
+#[cfg(test)]
+mod kind_order_tests;
 pub(crate) mod l2;
 pub(crate) mod licensing;
 pub(crate) mod model_cache;
