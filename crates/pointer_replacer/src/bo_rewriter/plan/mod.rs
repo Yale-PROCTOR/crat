@@ -825,7 +825,35 @@ fn a5_wrapper_composition(
                     && (view.key.lo, view.key.hi) != (inner.key.lo, inner.key.hi)
                     && inner.state == ClassSiteState::EditReady
                     && view.expected_form == "raw";
-                duplicate_rendering || inner_product || base_view_inner
+                // **Relay 327 (main 222 §2.1; the stand-in review's MED) — an edit
+                // beside that base view, inside the same argument.** The use pass and
+                // the seam pass both run before the A5 pass, and an argument carrying
+                // the base view is one the wrapper takes from the AST
+                // (`a5_inner_arguments`), so another subject's edit there — brotli's
+                // class #1498 index `*clusters.offset(j_0)`, its edit restored from
+                // the element edit joint (c) retires — rides inside the wrapper's raw
+                // value too. The edit must not overlap the base view itself.
+                let beside_base_view = inner.state == ClassSiteState::EditReady
+                    && view.expected_form == "raw"
+                    && view.key.lo <= inner.key.lo
+                    && inner.key.hi <= view.key.hi
+                    && (view.key.lo, view.key.hi) != (inner.key.lo, inner.key.hi)
+                    && all_sites.iter().any(|base| {
+                        base.key.arm == "c"
+                            && matches!(
+                                base.key.bridge_kind.as_str(),
+                                "box-borrow-view-to-raw" | "optional-box-borrow-view-to-raw"
+                            )
+                            && base.key.caller == view.key.caller
+                            && base.key.position == view.key.position
+                            && base.key.file == view.key.file
+                            && view.key.lo <= base.key.lo
+                            && base.key.hi <= view.key.hi
+                            && (view.key.lo, view.key.hi) != (base.key.lo, base.key.hi)
+                            && base.state == ClassSiteState::EditReady
+                            && (inner.key.hi <= base.key.lo || base.key.hi <= inner.key.lo)
+                    });
+                duplicate_rendering || inner_product || base_view_inner || beside_base_view
             }
         }
     };
