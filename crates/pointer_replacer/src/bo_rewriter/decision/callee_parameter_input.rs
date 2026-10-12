@@ -793,9 +793,30 @@ pub(crate) fn computed_view_template(
     base: raw_boundary::BridgeTemplate,
     child: Option<Option<&super::returned_child::ChildAccess>>,
 ) -> Result<(raw_boundary::BridgeTemplate, bool), &'static str> {
-    // RED (relay 206): the returned-child query is not asked.
-    let _ = (view_mutable, actual_view, target, child);
-    Ok((base, false))
+    let Some(access) = child else {
+        return Ok((base, false));
+    };
+    // The argument's own view must permit what the caller does with the
+    // child (`&*p.offset(e)` written through is refused), as
+    // `seam::terminal_returned_child_permission` asks it.
+    if let Some(actual) = seam::decision_for_safe_form(actual_view) {
+        raw_boundary::returned_child_permission(&actual, access)
+            .map_err(|_| "callee-parameter-input-returned-child-permission")?;
+    }
+    let source = Decision::Slice {
+        mutable: view_mutable,
+        uses: Vec::new(),
+    };
+    let selected = raw_boundary::returned_child_template(&source, target, access, base)
+        .map_err(|_| "callee-parameter-input-returned-child-template")?;
+    if selected.mutable_binding_required {
+        return Err("callee-parameter-input-mutable-binding-unplanned");
+    }
+    let writable = selected.template != base;
+    if writable && !view_mutable {
+        return Err("callee-parameter-input-computed-view-immutable");
+    }
+    Ok((selected.template, writable))
 }
 
 #[allow(clippy::too_many_arguments)]

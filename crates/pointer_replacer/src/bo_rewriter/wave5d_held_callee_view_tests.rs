@@ -224,12 +224,25 @@ mod computed_view_template {
         );
     }
 
+    /// An unknown access (no child evidence to read) is treated as a write:
+    /// the writable view where the argument permits it, refused where the
+    /// argument is a shared borrow.
     #[test]
-    fn w5d_206_an_unknown_child_access_is_refused() {
-        assert!(
+    fn w5d_206_an_unknown_child_access_takes_the_writable_view_or_refuses() {
+        assert_eq!(
             computed_view_template(
                 true,
                 Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(None),
+            ),
+            Ok((BridgeTemplate::SliceMutToWritableRawConst, true))
+        );
+        assert!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: false },
                 &target(RawMutability::Const),
                 BridgeTemplate::SliceToRawConst,
                 Some(None),
