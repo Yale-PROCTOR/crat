@@ -454,3 +454,58 @@ fn r556_4_i_the_a5_wrapper_takes_the_base_view_argument() {
         out.source
     );
 }
+
+/// **Relay 327 (R1026-1; main 222 §2.1): the index inside a base view's operand
+/// keeps its own edit.** brotli's class #1498 at 59m: `ClusterBlocksDistance`
+/// hands `&mut *all_histograms.offset(*clusters.offset(j_0) as isize)` to a raw
+/// formal. K21 composed `clusters`' element edit into `all_histograms`' and
+/// dropped it; joint (c) then views the owner at the base and retires the
+/// owner's element edit, with `clusters`' composed text inside it. The operand
+/// kept `*clusters.offset(j_0 as isize)` on a delivered `Option<Box<[u32]>>`
+/// (E0599; the class reverted, 16 subjects). The retired container gives the
+/// index its own edit back.
+const INDEXED_AT_RAW: &str = r#"
+pub unsafe extern "C" fn Indexed(mut m: *mut MemoryManager, n: usize) -> usize {
+    let mut clusters = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut idx = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    if n > 0 as usize {
+        *clusters.offset(0 as isize) = 1 as u32;
+        *idx.offset(0 as isize) = 0 as u32;
+    }
+    let r = Combine(&mut *clusters.offset(*idx.offset(0 as isize) as isize), n);
+    BrotliFree(m, idx as *mut std::os::raw::c_void);
+    BrotliFree(m, clusters as *mut std::os::raw::c_void);
+    return r;
+}
+"#;
+
+#[test]
+fn r327_the_index_inside_a_base_view_operand_keeps_its_own_edit() {
+    let out = emitted(
+        "r327-base-view-index",
+        &format!("{PRELUDE}{INDEXED_AT_RAW}"),
+    );
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        super::verify::type_checks_str(&out.source),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("letmutidx:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains(
+            "Combine(&mut*clusters.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()).offset((idx.as_deref().unwrap()[(0)asusize])asisize),"
+        ),
+        "{}",
+        out.source
+    );
+}
