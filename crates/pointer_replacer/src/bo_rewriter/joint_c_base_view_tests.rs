@@ -509,3 +509,68 @@ fn r327_the_index_inside_a_base_view_operand_keeps_its_own_edit() {
         out.source
     );
 }
+
+/// **Relay 327, the stand-in review's MED: (i)'s A5 geometry with an index
+/// through another owner.** `CombineCounted`'s A5 T2 fallback selects the
+/// element address's argument as a raw view, the caller's base view sits inside
+/// it, and the index `*idx.offset(0)` is another owner's use K21 composed into
+/// the retired element edit. Restored, it is a site strictly inside the
+/// wrapper's argument; the wrapper must still apply, its raw value carrying the
+/// index's delivered spelling.
+const COMPOSED_INDEXED: &str = r#"
+pub unsafe extern "C" fn CombineCounted(mut symbols: *mut u32, mut clusters: *mut u32, n: usize) -> usize {
+    *symbols.offset(0 as isize) = 7 as u32;
+    let mut i = 0 as usize;
+    while i < n {
+        *clusters.offset(i as isize) = *symbols.offset(0 as isize);
+        i = i.wrapping_add(1);
+    }
+    return n;
+}
+pub unsafe extern "C" fn ClusterIndexed(mut m: *mut MemoryManager, mut symbols: *mut u32, n: usize) -> usize {
+    let mut clusters = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut idx = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    if n > 0 as usize {
+        *clusters.offset(0 as isize) = 1 as u32;
+        *idx.offset(0 as isize) = 0 as u32;
+    }
+    let _raw_symbols = symbols as usize;
+    let r = CombineCounted(symbols, &mut *clusters.offset(*idx.offset(0 as isize) as isize), n);
+    BrotliFree(m, idx as *mut std::os::raw::c_void);
+    BrotliFree(m, clusters as *mut std::os::raw::c_void);
+    return r;
+}
+"#;
+
+#[test]
+fn r327_the_a5_wrapper_takes_the_base_view_argument_with_the_restored_index() {
+    let out = emitted(
+        "r327-composed-indexed",
+        &format!("{PRELUDE}{COMPOSED_INDEXED}"),
+    );
+    let text = compact(&out.source);
+    let events = &out.artifacts.bridge_events;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        events.iter().any(
+            |event| event.site.bridge_kind == "a5-site-proof-t2-fallback"
+                && event.state == super::bridge_receipt::BridgeReceiptState::Applied
+        ),
+        "the wrapper applies: {events:#?}\n{}",
+        out.source
+    );
+    assert!(
+        text.contains(".offset(idx.as_deref().unwrap()[(0)asusize]asisize)"),
+        "{}",
+        out.source
+    );
+    assert!(
+        super::verify::type_checks_str(&out.source),
+        "{}",
+        out.source
+    );
+}
