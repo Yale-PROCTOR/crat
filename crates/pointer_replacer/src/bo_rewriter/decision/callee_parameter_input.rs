@@ -650,42 +650,31 @@ fn current_alternative(
             mutable: view.mutable,
             uses: Vec::new(),
         };
-        let mut template = raw_boundary::template_for(
+        let template = raw_boundary::template_for(
             &source,
             &site.target,
             None,
             raw.negative_write_evidence(key).is_some(),
         )
         .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
-        let base = template;
         // The stand-in review's HIGH-1: the returned-child permission and
         // template, as the generic path below and the terminal sealing of
-        // `slice_forms`' raw arm ask them. A `*const` formal whose returned
-        // child the caller writes through takes the WRITABLE view
-        // (`{view}.as_mut_ptr().cast_const()`), never `.as_ptr()`.
-        let child = raw.returned_child_evidence(key);
-        seam::terminal_returned_child_permission(child, arg.shape.key(), found)
-            .map_err(|_| "callee-parameter-input-returned-child-permission")?;
-        if let Some(child) =
-            child.filter(|child| !(child.raw_field_parent && arg.shape.key() == "raw-expr"))
-        {
-            let selected = raw_boundary::returned_child_template(
-                &source,
-                &site.target,
-                child.child.as_ref().ok().map(|child| &child.access),
-                template,
-            )
-            .map_err(|_| "callee-parameter-input-returned-child-template")?;
-            if selected.mutable_binding_required {
-                return Err("callee-parameter-input-mutable-binding-unplanned");
-            }
-            template = selected.template;
-        }
-        // A selected writable view reads the suffix mutably.
-        let writable = template != base;
-        if writable && !view.mutable {
-            return Err("callee-parameter-input-computed-view-immutable");
-        }
+        // `slice_forms`' raw arm ask them (`computed_view_template`).
+        let child = raw
+            .returned_child_evidence(key)
+            .filter(|child| !(child.raw_field_parent && arg.shape.key() == "raw-expr"));
+        let actual_view = match arg.shape.key() {
+            "addr-of" | "addr-of-cast" => Form::Ref { mutable: false },
+            "addr-of-mut" | "addr-of-mut-cast" => Form::Ref { mutable: true },
+            _ => found,
+        };
+        let (template, writable) = computed_view_template(
+            view.mutable,
+            actual_view,
+            &site.target,
+            template,
+            child.map(|child| child.child.as_ref().ok().map(|child| &child.access)),
+        )?;
         let mut spec = GlueSpec::raw_boundary_target(template, &site.target, false, false);
         let mut forward = view.forward.clone();
         forward.mutable = forward.mutable || target_mutable || writable;
@@ -787,6 +776,26 @@ fn current_alternative(
     adapter(
         tcx, caller, callee, arg, site, template, spec, found, input_form, retention, waiver_id,
     )
+}
+
+/// **wave-5d relay 206 (the stand-in review's HIGH-1, made testable).** The
+/// template a withdrawn callee's sealed computed view takes under the site's
+/// returned child: `child` is `None` when no child descends from the argument,
+/// `Some(access)` otherwise. A `*const` formal whose child the caller writes
+/// through takes the WRITABLE view (`{view}.as_mut_ptr().cast_const()`), never
+/// `.as_ptr()` — a shared-derived pointer is Frozen under Tree Borrows, and the
+/// caller's write would be UB on a UB-free input. Returns the template and
+/// whether it is the writable one.
+pub(crate) fn computed_view_template(
+    view_mutable: bool,
+    actual_view: Form,
+    target: &raw_boundary::RawTargetType,
+    base: raw_boundary::BridgeTemplate,
+    child: Option<Option<&super::returned_child::ChildAccess>>,
+) -> Result<(raw_boundary::BridgeTemplate, bool), &'static str> {
+    // RED (relay 206): the returned-child query is not asked.
+    let _ = (view_mutable, actual_view, target, child);
+    Ok((base, false))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -145,3 +145,184 @@ fn w5d_205_control_a_kept_callee_takes_the_suffix_view() {
     assert!(text.contains("bits: &mut [u16]"), "{source}");
     assert!(!text.contains("bits.offset(64"), "{source}");
 }
+
+/// **Relay 206 (152 item 1 (a)): the HIGH-1 query of the new arm, witnessed
+/// where it lives.** No fixture reaches the arm with a returned child: a
+/// formal decided `Slice` whose child the caller writes through degrades
+/// before planning ends (`SliceCursorUse` / `SliceUseUnsupported` on every
+/// shape tried — a returned `p.offset(k)` const or written, a stored child),
+/// so the arm only ever meets formals with no child. The selection is
+/// therefore a pure function of the view, the target and the child's access,
+/// witnessed directly; dropping the query (the RED stub) returns the shared
+/// base `slice-to-raw-const` for a written-through child and these go red.
+mod computed_view_template {
+    use crate::bo_rewriter::decision::{
+        callee_parameter_input::computed_view_template,
+        raw_boundary::{BridgeTemplate, RawMutability, RawTargetType},
+        returned_child::ChildAccess,
+        seam::Form,
+    };
+
+    fn target(mutability: RawMutability) -> RawTargetType {
+        RawTargetType {
+            rendered: "*const u16".to_owned(),
+            pointee: "u16".to_owned(),
+            mutability,
+            depth2: None,
+        }
+    }
+
+    fn writes() -> ChildAccess {
+        ChildAccess::Writes {
+            sites: Vec::new(),
+            unknown_frontiers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn w5d_206_a_written_through_child_takes_the_writable_view() {
+        let access = writes();
+        assert_eq!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(Some(&access)),
+            ),
+            Ok((BridgeTemplate::SliceMutToWritableRawConst, true))
+        );
+    }
+
+    #[test]
+    fn w5d_206_a_shared_argument_written_through_is_refused() {
+        let access = writes();
+        assert!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: false },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(Some(&access)),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn w5d_206_a_shared_base_never_takes_the_writable_view() {
+        let access = writes();
+        assert!(
+            computed_view_template(
+                false,
+                Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(Some(&access)),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn w5d_206_an_unknown_child_access_is_refused() {
+        assert!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(None),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn w5d_206_control_a_read_only_child_keeps_the_shared_base() {
+        let access = ChildAccess::ReadOnly {
+            checked_uses: Vec::new(),
+        };
+        assert_eq!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                Some(Some(&access)),
+            ),
+            Ok((BridgeTemplate::SliceToRawConst, false))
+        );
+    }
+
+    #[test]
+    fn w5d_206_control_no_child_keeps_the_base() {
+        assert_eq!(
+            computed_view_template(
+                true,
+                Form::Ref { mutable: true },
+                &target(RawMutability::Const),
+                BridgeTemplate::SliceToRawConst,
+                None,
+            ),
+            Ok((BridgeTemplate::SliceToRawConst, false))
+        );
+    }
+}
+
+/// **Relay 206 (152 item 1 (b)): the element and width-read arms, reached.**
+/// The callee's formal is planned as a thin reference (`Index0`) or a byte
+/// region read as a width (`u32::from_ne_bytes`), and is withdrawn: the
+/// caller's computed view is recorded unsealable and the input alternative
+/// refuses typed, so the caller's base is held raw and no `bits.offset(4)`
+/// is left over a slice. The fault — the arm sealing them — delivers `bits`
+/// through a suffix and these go red.
+const ELEMENT_BARE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+unsafe fn rd(p: *const u8) -> u32 {
+    *(p as *const u32)
+}
+pub unsafe fn build(bits: *mut u8) -> u32 {
+    *bits.offset(0) = 1;
+    *bits.offset(1) = 2;
+    rd(bits.offset(4))
+}
+"#;
+
+const WIDTH_READ: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]
+unsafe fn rd(p: *const core::ffi::c_void) -> u32 {
+    *(p as *const u32)
+}
+pub unsafe fn build(bits: *mut u8) -> u32 {
+    *bits.offset(0) = 1;
+    *bits.offset(1) = 2;
+    rd(bits.offset(4) as *const core::ffi::c_void)
+}
+"#;
+
+#[test]
+fn w5d_206_a_held_element_view_is_refused_typed() {
+    let source = super::emitted_reverting(ELEMENT_BARE, Some("rd"));
+    let text = flat(&source);
+    assert!(text.contains("fn rd(p: *const u8) -> u32"), "{source}");
+    assert!(
+        text.contains("build(bits: *mut u8)"),
+        "the base is held raw:\n{source}"
+    );
+    assert!(text.contains("rd(bits.offset(4))"), "{source}");
+}
+
+#[test]
+fn w5d_206_a_held_width_read_view_is_refused_typed() {
+    let source = super::emitted_reverting(WIDTH_READ, Some("rd"));
+    let text = flat(&source);
+    assert!(
+        text.contains("fn rd(p: *const core::ffi::c_void) -> u32"),
+        "{source}"
+    );
+    assert!(
+        text.contains("build(bits: *mut u8)"),
+        "the base is held raw:\n{source}"
+    );
+}
