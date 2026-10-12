@@ -100,6 +100,24 @@ pub(crate) fn copy_lend() -> bool {
     }
 }
 
+/// `CRAT_ERA5C_KIND_ORDER=ref-raw|ref-own-raw` (fail-loud, absent = `ref-raw`): **era-5c relay 215
+/// (R1022-1, USER)**, the objective's order of kinds. `ref-raw` is the frame's: `ref_` weighted
+/// `vars.len() + 1`, `raw` 1, `own` nothing, so a slot whose reference is refused settles Raw for want
+/// of a preference. `ref-own-raw` (relay 216, R1024-1) weights `own` at 1 on EVERY slot (fields and
+/// locals) IN PLACE OF the raw term (raw no weight; `ref_` unchanged): Owning is preferred over Raw
+/// wherever the hard constraints allow it, and never over a reference. Nothing hard changes; the
+/// three Owning levers (`CRAT_ERA5C_OWN_NAMED`, `CRAT_ERA5C_OWN_PREFER_LOCAL`, the unsinked-fields
+/// term) are separate.
+pub(crate) fn kind_order_own() -> bool {
+    match std::env::var("CRAT_ERA5C_KIND_ORDER").ok().as_deref() {
+        None | Some("ref-raw") => false,
+        Some("ref-own-raw") => true,
+        Some(other) => {
+            panic!("CRAT_ERA5C_KIND_ORDER must be `ref-raw` or `ref-own-raw`, got {other:?}")
+        }
+    }
+}
+
 /// `CRAT_ERA5C_COPY_LEND_MUT=on|off` (fail-loud, absent = off): **era-5c relay 213 (R988-1,
 /// USER)**, the MUTABLE copy-lend. Under the copy-lend arm, a copy `q = p` whose destination the
 /// mutability facts call mutable is no longer dropped at C2: it is lent `q = &mut *p` when no read,
