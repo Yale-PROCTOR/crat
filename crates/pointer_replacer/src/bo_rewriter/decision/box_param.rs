@@ -1641,18 +1641,26 @@ pub(crate) fn derive<'tcx>(
                         (param.label.clone(), callee_path.clone(), owned_fields),
                     );
                 }
-                // **W6A-A9.** The three sinks are all absent, so nothing in
-                // this body releases the allocation and the caller keeps the
-                // owner. The one act left that could carry it out — handing
-                // the formal BACK — needs no clause of its own at this frame:
-                // a lend that returns its formal is not Owning-modeled, so it
-                // never reaches here. The `..._returns_...` control measures
-                // exactly that, and a guard goes in the moment it fails.
-                out.lends.insert((param.fn_did, param.hir_id));
-                out.lend_receipts.push((
-                    param.label.clone(),
-                    format!("box-param-lend-leaves-owning:{callee_path}"),
-                ));
+                // **W6A-A9, withheld (R1078-1, USER; relay wave-6a/162).** The
+                // three sinks are all absent, so nothing in this body releases
+                // the allocation. A9 lent such a formal as a reference on the
+                // model's Owning claim as evidence of unique ownership (report
+                // 044 / R487-3(d)). Under the Ref > Owning > Raw order an Owning
+                // is assigned exactly where Ref failed the hard constraints, so
+                // the pointee has an observed alias and the label certifies
+                // nothing; and the frame exports no per-slot licensing
+                // provenance (an Owning reached by `link-own` from an allocation
+                // vs. one the order chose) for this family to read. So no A9 lend
+                // is made: the formal stays raw, held and receipted, as it was
+                // before A9 (`box-param-callee-lends`). `lends` stays empty; the
+                // owned-field bookkeeping above is unchanged.
+                out.holds.insert(
+                    (param.fn_did, param.hir_id),
+                    (
+                        param.label.clone(),
+                        format!("box-param-lend-withheld:no-ownership-evidence:{callee_path}"),
+                    ),
+                );
             }
             continue;
         }

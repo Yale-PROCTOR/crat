@@ -474,8 +474,8 @@ fn w6a_c1_qselect_lend_is_not_a_box_parameter() {
     assert!(
         out.artifacts
             .box_param_receipts
-            .contains("qselect::v\tyielded\tbox-param-lend-leaves-owning:qselect"),
-        "{}",
+            .contains("qselect::v\theld\tbox-param-lend-withheld:no-ownership-evidence:qselect"),
+        "restated for R1078-1 (relay wave-6a/162): the lend is withheld\n{}",
         out.artifacts.box_param_receipts
     );
 }
@@ -1430,21 +1430,15 @@ fn w6a_a9_qselect_leaves_the_owning_arm() {
         "a lend is not an owner\n{}",
         out.source
     );
+    // Restated for R1078-1 (relay wave-6a/162): the model's Owning label is no
+    // evidence of unique ownership under the Ref > Owning > Raw order, so the
+    // lend is withheld and the formal is held raw by this family on purpose.
     assert!(
         out.artifacts
             .box_param_receipts
-            .contains("qselect::v\tyielded\tbox-param-lend-leaves-owning:qselect"),
-        "the lend must be receipted as leaving the owning arm\n{}",
+            .contains("qselect::v\theld\tbox-param-lend-withheld:no-ownership-evidence:qselect"),
+        "the lend must be receipted as withheld\n{}",
         out.artifacts.box_param_receipts
-    );
-    assert_ne!(
-        reason_of(&out.degradations, "qselect::v").as_deref(),
-        Some("box-failure"),
-        "the owning arm must not claim a proven lend\n{:?}",
-        out.degradations
-            .iter()
-            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
-            .collect::<Vec<_>>()
     );
 }
 
@@ -1617,24 +1611,28 @@ fn w6a_a9_the_nine_shapes_take_their_form_from_the_write_facts() {
     //   fill           element stores          ->  &mut [f32]
     // The last answers relay 050's open question for heman's four: the slice
     // arm DOES render a callee's `offset` element uses as indexing.
+    // Restated for R1078-1 (relay wave-6a/162): no A9 lend is made without
+    // ownership evidence, so the three model-`Owning` lends stay raw, held
+    // `box-param-lend-withheld:no-ownership-evidence`; the model-`Ref` `area`
+    // still lends with no rule.
     let out = emitted("boxparam-nine", &with_prelude(NINE_SHAPES));
     let text = compact(&out.source);
     for (signature, why) in [
         (
-            "fnrestore_state(mutto:&mutReader,mutfrom:&Reader)",
-            "the written and read halves split",
+            "fnrestore_state(mutto:*mutReader,mutfrom:*mutReader)",
+            "a withheld lend stays raw",
         ),
         (
             "fnarea(mutsettings:&Settings)",
             "a read-only lend is shared",
         ),
         (
-            "fnadvance(mutreader:&mutReader)",
-            "a field write takes &mut",
+            "fnadvance(mutreader:*mutReader)",
+            "a withheld lend stays raw",
         ),
         (
-            "fnfill(muttarget:&mut[f32],mutn:i32)",
-            "element stores take a mutable slice",
+            "fnfill(muttarget:*mutf32,mutn:i32)",
+            "a withheld lend stays raw",
         ),
     ] {
         assert!(
@@ -1652,9 +1650,9 @@ fn w6a_a9_the_nine_shapes_take_their_form_from_the_write_facts() {
     ] {
         assert!(
             receipts.contains(&format!(
-                "{parameter}\tyielded\tbox-param-lend-leaves-owning:"
+                "{parameter}\theld\tbox-param-lend-withheld:no-ownership-evidence:"
             )),
-            "{parameter} must be a declined claim\n{receipts}"
+            "{parameter} must be a withheld lend\n{receipts}"
         );
     }
     assert!(
@@ -1716,8 +1714,11 @@ fn w6a_a9_an_owned_field_keeps_the_formal() {
     super::test_model_override::clear();
     let receipts = &out.artifacts.box_param_receipts;
     assert!(
-        receipts.contains("bump::o\theld\tbox-param-callee-lends-owned-field:"),
-        "bump::o must keep its formal for the owned field\n{receipts}"
+        // Restated for R1078-1 (relay wave-6a/162): every A9 lend is withheld
+        // before the owned-field gate is asked, so the formal is kept under the
+        // withheld receipt.
+        receipts.contains("bump::o\theld\tbox-param-lend-withheld:no-ownership-evidence:"),
+        "bump::o must keep its formal\n{receipts}"
     );
     // Re-pinned at the L01⁸ frame landing (era-5c report 064): `read_count`
     // stores nothing and frees nothing, so era 5b's reader certificate
@@ -1766,8 +1767,9 @@ fn w6a_r531_a9_a_held_owned_field_declines_the_lend() {
     super::test_model_override::clear();
     let receipts = &out.artifacts.box_param_receipts;
     assert!(
-        receipts.contains("bump::o\tyielded\tbox-param-lend-leaves-owning:"),
-        "bump::o is declined: its field's transaction is held\n{receipts}"
+        // Restated for R1078-1 (relay wave-6a/162): the lend is withheld.
+        receipts.contains("bump::o\theld\tbox-param-lend-withheld:no-ownership-evidence:"),
+        "bump::o's lend is withheld\n{receipts}"
     );
     // Re-pinned at the L01⁸ frame landing (era-5c report 064): era 5b's
     // reader certificate lends `read_count`'s formal (see the control above).
