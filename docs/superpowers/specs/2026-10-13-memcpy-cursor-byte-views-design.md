@@ -115,15 +115,11 @@ memcpy(
 );
 ```
 
-Representative output (temporary names are illustrative):
+Representative output:
 
 ```rust
-{
-    let __crat_offset = left as isize;
-    let __crat_count = fill as usize;
-    __crat_borrowed_S.buf[__crat_offset as usize..][..__crat_count]
-        .copy_from_slice(&data.as_slice()[..__crat_count]);
-}
+(&mut __crat_borrowed_S.buf)[(left as isize) as usize..][..fill as usize]
+    .copy_from_slice(&data.as_slice()[..fill as usize]);
 ```
 
 Preserve the original signed offset expression before converting its result to
@@ -167,11 +163,23 @@ Preserve wrapping operations verbatim when accepted. Exclude expressions whose
 evaluation mutates or invalidates another operand; do not create a general
 expression-staging analysis.
 
-Evaluate accepted offsets and the count once, retaining their relative argument
-order, before introducing the final copy borrows. Moving pure operand-place
-projection past these scalar evaluations is permitted by the restricted matcher.
-Keep any cursor temporary alive through the copy, and use collision-free names.
-Do not extend a mutable reborrow beyond the generated block.
+Prefer the original offset and count expressions directly in slice indexing,
+as the existing memcpy emitter does. Offsets appear once each; the count may
+appear twice. Permit repeated or reordered evaluation only when it preserves
+behavior and does not conflict with the generated borrows. Stable scalar
+expressions such as `fill as usize` and `(datalen >> 3) as usize` need no bindings.
+Do not introduce unconditional offset/count temporaries.
+
+Side-effect freedom alone does not guarantee borrow compatibility. For example,
+inlining `dst.len()` as the count conflicts with the mutable destination borrow
+in `(&mut *dst)[..dst.len()].copy_from_slice(&src[..dst.len()])`. For a supported
+expression that needs a binding, evaluate it before the conflicting borrow while
+preserving the original evaluation semantics. Otherwise, leave the unsupported
+call unchanged; do not add a general expression-staging mechanism.
+
+Keep any cursor temporary alive through the copy. Use collision-free names for
+bindings that are actually needed. Keep mutable reborrows local to the copy
+expression or its generated block; do not extend them into subsequent statements.
 
 Only replace memcpy calls whose result is discarded as a semicolon statement.
 Put this eligibility check at memcpy dispatch so a used-return call cannot fall
@@ -215,6 +223,8 @@ Use existing Crat test conventions. Add meaningful coverage for:
 - Zero-length, one-past empty, and exact-end copies; verify copied bytes,
   unchanged surrounding bytes, and unchanged cursor position in runtime checks.
 - Preservation of the original offset cast and byte-count arithmetic.
+- Direct indexing of stable scalar offsets/counts without unnecessary bindings,
+  plus binding or fallback when a count reads the mutably borrowed destination.
 - Legacy same-array behavior and fallback for conflicting same-cursor borrows,
   interior negative raw offsets, unsupported raw pointers, side-effecting
   operands, borrow wrappers, and consumed memcpy results.
