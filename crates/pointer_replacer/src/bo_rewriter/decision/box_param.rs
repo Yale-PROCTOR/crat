@@ -68,7 +68,11 @@ pub(crate) struct Chains {
     /// same pre-model hook.
     pub(crate) store_members: FxHashSet<(LocalDefId, HirId)>,
     /// **W6A-A9** — the formals whose bodies PROVE a lend, so the owning arm
-    /// declines them and the borrowing arms below decide.
+    /// declines them and the borrowing arms below decide. **Dormant since
+    /// R1078-1** (relay wave-6a/162): no lend is made without ownership
+    /// evidence, so this set stays empty (and with it `lend_receipts`,
+    /// `lend_leaves_owning` and R531-4 (vii)'s withdrawal) until the frame
+    /// exports per-slot licensing provenance.
     pub(crate) lends: FxHashSet<(LocalDefId, HirId)>,
     /// One `yielded` receipt per declined ownership claim: (label, reason).
     pub(crate) lend_receipts: Vec<(String, String)>,
@@ -744,8 +748,10 @@ pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut Decision
 
 /// The hold's family as a stable reason key (the receipt keeps the detail).
 fn typed_key(hold: &str) -> &'static str {
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
         "chain-endpoint-raw",
+        // R1078-1 (relay wave-6a/162): the withheld A9 lend, typed.
+        "box-param-lend-withheld",
         "box-param-callee-lends",
         "box-param-no-callers",
         "box-param-indirect-callers",
