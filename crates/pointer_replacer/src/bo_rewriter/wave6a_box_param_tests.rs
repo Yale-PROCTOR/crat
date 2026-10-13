@@ -3649,6 +3649,17 @@ fn w6a_162_a_lend_without_ownership_evidence_is_withheld() {
         "the formal stays raw\n{}",
         out.source
     );
+    // The stand-in review's F1: the degradation names the withholding, never
+    // the untyped `box-param-caller-unknown`.
+    assert_eq!(
+        reason_of(&out.degradations, "qselect::v").as_deref(),
+        Some("box-param-lend-withheld"),
+        "{:?}",
+        out.degradations
+            .iter()
+            .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+            .collect::<Vec<_>>()
+    );
     assert!(
         super::verify::type_checks_str(&out.source),
         "{}",
