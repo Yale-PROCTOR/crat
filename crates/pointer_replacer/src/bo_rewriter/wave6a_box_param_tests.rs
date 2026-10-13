@@ -3615,3 +3615,41 @@ fn w6a_r698_the_loop_composes_with_128s_null_actual() {
     assert!(src.contains("drop_0(Some(l));"), "{context}");
     assert_eq!(out.reverted, 0, "{context}");
 }
+
+/// **R1078-1 (USER; relay wave-6a/162): an A9 reference lend needs ownership
+/// EVIDENCE, not the Owning label.** Under the Ref > Owning > Raw order (60s) an
+/// Owning is assigned exactly where Ref failed the hard constraints, so the label
+/// no longer certifies unique ownership (R487-3(d)'s premise), and the frame
+/// exports no per-slot licensing provenance to tell an evidenced Owning from an
+/// order-chosen one: every A9 lend is withheld. The model-`Owning` lent formal
+/// (heman `qselect`, lodepng's scalar out-parameters) stays raw, receipted
+/// `box-param-lend-withheld:no-ownership-evidence`, and the program compiles.
+#[test]
+fn w6a_162_a_lend_without_ownership_evidence_is_withheld() {
+    let out = emitted("boxparam-a9-withheld", &with_prelude(QSELECT));
+    let text = compact(&out.source);
+    assert!(
+        out.artifacts
+            .box_param_receipts
+            .contains("qselect::v\theld\tbox-param-lend-withheld:no-ownership-evidence:qselect"),
+        "the withheld lend is receipted\n{}",
+        out.artifacts.box_param_receipts
+    );
+    assert!(
+        !out.artifacts
+            .box_param_receipts
+            .contains("box-param-lend-leaves-owning"),
+        "no A9 lend\n{}",
+        out.artifacts.box_param_receipts
+    );
+    assert!(
+        text.contains("fnqselect(mutv:*mutf32,"),
+        "the formal stays raw\n{}",
+        out.source
+    );
+    assert!(
+        super::verify::type_checks_str(&out.source),
+        "{}",
+        out.source
+    );
+}
