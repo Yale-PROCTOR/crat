@@ -1,0 +1,18 @@
+batch58pp	fnkey=1	d6=17	decisions_of_reverted=['box', 'ref', 'slice']
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::all_histograms#45
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::block_ids#5
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::block_lengths#18
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::cluster_size#59
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::clusters#116
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::data#2
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::histogram_symbols#7
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::histograms#72
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::m#1
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::new_array#306
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::new_array_0#368
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::new_array_1#762
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::new_array_2#818
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::new_index#118
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::pairs#103
+#  batch58pp d6-xor-fnkey brotli src::enc::block_splitter::ClusterBlocksDistance::split#6
+batch58pps39	fnkey=4	d6=4	decisions_of_reverted=['optional', 'ref', 'slice']

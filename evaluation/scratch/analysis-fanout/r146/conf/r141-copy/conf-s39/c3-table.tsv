@@ -1,0 +1,10 @@
+ref	e1 (&*p / &mut *p formation), e4 (from_ref/from_mut bridges), e14 (declaration types)
+inferred-ref	e1, e13 (return-lifetime spelling), e14
+slice	e2 (from_raw_parts[_mut]), e5 (as_ptr/as_mut_ptr bridges), e8 (singleton / first)
+optional	e3 (as_ref/as_mut), e6 (map_or(null, view)), e7 (as_mut().unwrap()), e9 (unwrap)
+opt-slice	e2 (from_raw_parts under the null test), e3 (the optional presentation), e5 / e6 (as_deref().map_or(null, as_ptr) bridges)
+box	NO e-row (extension)	owning form: the Extension (appendix X), outside Theorem A's LocalFragment
+box-slice	NO e-row (extension)	owning slice (Box<[T]>): the Extension, as box
+opt-box-slice	NO e-row (extension)	optional owning slice (Option<Box<[T]>>): the Extension, as box
+owner-view	NO e-row (extension)	a borrowed view of a Box owner (&*owner / as_deref): the Extension's owner view (A1-d), as box
+cursor	NO e-row (administrative)	runtime-helper administrative form (SliceCursor): AdministrativeSafety / RuntimeIsolation, no e-row

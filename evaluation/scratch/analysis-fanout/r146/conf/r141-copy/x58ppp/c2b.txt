@@ -1,0 +1,10 @@
+conformance RetainedLifecycle program=avl implicit_release_sites=2 overwrite=2 scope_exit=0 unwind=0 none_drops=9 explicit_drop_calls=0 waiver_drop=0 unreceipted=2 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=brotli implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=129 explicit_drop_calls=0 waiver_drop=0 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=bst implicit_release_sites=2 overwrite=2 scope_exit=0 unwind=0 none_drops=6 explicit_drop_calls=4 waiver_drop=0 unreceipted=2 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=buffer implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=1 explicit_drop_calls=2 waiver_drop=1 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=heman implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=0 explicit_drop_calls=38 waiver_drop=0 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=ht implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=0 explicit_drop_calls=4 waiver_drop=0 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=lodepng implicit_release_sites=2 overwrite=0 scope_exit=2 unwind=0 none_drops=0 explicit_drop_calls=0 waiver_drop=2 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=quadtree implicit_release_sites=6 overwrite=0 scope_exit=6 unwind=0 none_drops=5 explicit_drop_calls=4 waiver_drop=15 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=tulipindicators implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=0 explicit_drop_calls=2 waiver_drop=0 unreceipted=0 frame=era5c-l01p14-v1
+conformance RetainedLifecycle program=urlparser implicit_release_sites=0 overwrite=0 scope_exit=0 unwind=0 none_drops=0 explicit_drop_calls=0 waiver_drop=0 unreceipted=0 frame=era5c-l01p14-v1

@@ -1,0 +1,14 @@
+[package]
+name = "release-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+
+[profile.release]
+debug = false
+
+[workspace]

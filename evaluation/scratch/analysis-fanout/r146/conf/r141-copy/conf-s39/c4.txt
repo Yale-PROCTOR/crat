@@ -1,0 +1,34 @@
+ref-of-deref	core	e1 borrow(q, deref(p))
+borrow-of-place	core	§3 borrow(q,P)
+raw-address-of	core	§3 addr_raw(P)
+raw-cast	core	§3 cast_raw(u,τ)
+ptr-offset	core	§3 offset(mode,u,k,T)
+ptr-offset-from	outside	pointer difference: no §3 instruction
+is-null	core	§3 is_null
+null-constant	core	§1 null operand
+slice-from-raw-parts	core	e2 borrow_slice
+slice-as-ptr	core	e5 raw_view + thin
+slice-len	core	§3 slice_len
+slice-first	core	e8 first
+subslice-range	outside	range index s[a..b]: no §3/§7 row
+option-some	core	§3 some(u)
+option-none	core	§3 none
+option-test	core	§3 is_none (is_some = its negation)
+option-unwrap	core	e9 required unwrap / extract_some
+option-as-ref-mut	core	e3 as_ref / as_mut
+option-map-or	core	e6 optional-to-raw
+option-as-deref	outside	as_deref[_mut]: owning-optional view, no §7 row
+closure	outside	closures: no core route
+from-ref-mut	core	e4 raw_view of a reference
+ptr-read-write	core	§3 load / store
+ptr-copy	core	§3 byte_copy
+unsafe-block	core	e16 context-sensitive unsafe
+exposure-twin-call	core	§5.3 local call (the delivered body)
+alloc-primitive	core	§3 alloc/calloc/realloc/free
+imported-byte-copy	outside	imported memcpy/memmove: outside the program-call domain (core.md §4, l.438)
+foreign-call	outside	undeclared foreign call: NoCoreRoute
+box	outside	owning form: the Extension (appendix X)
+box-release	outside	drop of an owner: the Extension (W2)
+nonnull	outside	NonNull: no core type
+cursor	outside	SliceCursor runtime helper: body not in the core's §7 table
+transmute	outside	transmute / byte reinterpretation: no core route

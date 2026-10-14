@@ -1,0 +1,3 @@
+reverted_count>0: {'libzahl': 2, 'brotli': 7} ; reverted rows: {'brotli': 7, 'libzahl': 2}
+verify.rejected-programs 2; verify.unit-lost-rate 9/3375 = 0.27 %; verify.wholecrate-lost-rate 1485/3375 = 44.00 %
+compiler-rejected only (['libzahl']): programs 1; rows 2 = 0.06 %; wholecrate 120 = 3.56 %; planning-time (no diagnostic) 7

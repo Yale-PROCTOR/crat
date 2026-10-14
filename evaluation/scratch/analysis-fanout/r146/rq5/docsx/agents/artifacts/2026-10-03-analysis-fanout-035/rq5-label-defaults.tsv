@@ -1,0 +1,29 @@
+label	default_cause	rule
+a5-site-proof-reclassified	side-condition	A5 non-proof on a raw-from-raw argument (adapters.tsv)
+aliased-storage-withdrawn	side-condition	R575-6 aliased-storage gate: storage-root overlap not excluded
+arg-null-literal	generator	the null-literal fact exists (option_ops.rs param_receives_null_literal); the family did not take it
+borrowed-into-raw-param	side-condition	raw flow (R774-1 label default)
+box-param-caller-unknown	generator	prior label; heman generator dependency cycle (548/549); native Missing(NativeIdentity)
+box-param-indirect-callers	no-safe-form	type-erased allocator callback (fn-pointer signature, void pointee)
+contract-allocation:overwrite	generator	allocator_contract.rs peel_casts does not peel a Block (a shape)
+contract-allocation:use	side-condition	call-argument-not-a-lend: the callee is not proven a lend
+dependency-class-held	generator	cascade; root per final-reverts
+escapes-via-field-store	side-condition	the value escapes into raw storage (a field); no escape proof
+escapes-via-foreign-arg	side-condition	write-through-shared-view at a foreign callee (no returned-child permission)
+escapes-via-return	side-condition	the value escapes through the return
+flows-into-raw-param	side-condition	raw flow (R774-1 label default)
+held:address-observation-only	side-condition	the address is interior on every UB-free run but no in-bounds fact establishes it
+held:io-domain:type	held	stream (the I/O pass)
+held:local-callee-access-extent	generator	the extent is supplied (R481-1 fallback); the lift declines on a generator shape (licensed-lifts receipt)
+held:thin-extent	generator	a fat rendering exists (R481-1 / NUL-contract); no absent fact
+held:void-pointee	no-safe-form	void pointee used as a handle; R608-1 (wave-6b 028)
+pair-raw-view	side-condition	A5 does not prove the pair disjoint (pairs.tsv a5-not-proven-disjoint)
+pending-sibling-overlap	side-condition	pending sibling overlap not excluded
+ptr-comparison	undefined	a reference at a cursor / past-the-end operand is UB at creation (wave-6a 122 §2, R774-1)
+return-certificate-indirect-callers	no-safe-form	type-erased allocator callback (fn-pointer signature, void pointee)
+return-lifetime-permit-absent	form-fact	the returned reference's origin permit is absent (lifetime.rs return_permit)
+seam-positive-retention	side-condition	no output-storage / retention certificate at the seam
+seam-shared-to-mut	generator	no census receipt names an absent fact (strict evidence standard)
+slice-neg-or-unknown-offset	generator	the cursor route was planned and withdrawn by family exclusion (additive-family-fallbacks.json)
+verify-reverted	generator	class reverted at planning or verify; root per final-reverts
+(any other label)	generator	R770-1: the default

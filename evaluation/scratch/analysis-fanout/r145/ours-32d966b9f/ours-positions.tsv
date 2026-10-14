@@ -1,0 +1,318 @@
+program	kind	owner	index	name	c2rust	emitted	twin	ours	model	raw_cause	inator	inator_bucket
+amp	field	amp_t	2	buf	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<Rc<Cell<i8>>>	ghost
+amp	param	amp_decode	0	msg	*mut amp_t	*mut amp_t	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::amp_decode#1:peer#2:caller=src::source::main_0;unresolved;proof=clear:a5-proven-disjoint)	&'703 mut struct(struct.amp_t)<'618, >	mut
+amp	param	amp_decode	1	buf	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason slice-cursor-use	Rc<Cell<i8>>	rc
+amp	param	amp_decode_arg	0	msg	*mut amp_t	&mut amp_t	no	mut	ref		&'637 mut struct(struct.amp_t)<'559, >	mut
+amp	param	amp_encode	0	argv	*mut *mut ::core::ffi::c_char	*mut *mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 2) decision degraded reason kind-raw	&'685 &'565 unknown	ref
+amp	param	read_u32_be	0	buf	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'679 Cell<i8>	ref
+amp	param	write_u32_be	0	buf	*mut ::core::ffi::c_char	&mut [::core::ffi::c_char]	no	mut	ref		&'674 Cell<i8>	ref
+amp	return	amp_decode_arg	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	Rc<Cell<unknown>>	rc
+amp	return	amp_encode	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	Rc<Cell<i8>>	rc
+carrays	param	call_compar	1	a	*const ::core::ffi::c_void	*const ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2347 unknown	ref
+carrays	param	call_compar	2	b	*const ::core::ffi::c_void	*const ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2348 unknown	ref
+carrays	param	call_compar	3	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2349 unknown	ref
+carrays	param	call_searchf	1	_val	*const ::core::ffi::c_void	*const ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2351 i8	ref
+carrays	param	call_searchf	2	_arg	*const ::core::ffi::c_void	*const ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2352 unknown	ref
+carrays	param	gca_bsearch	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2211 i8	ref
+carrays	param	gca_bsearch	4	arg	*mut ::core::ffi::c_void	&[u8]	no	ref	ref		&'2209 unknown	ref
+carrays	param	gca_cycle_left	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2229 Cell<unknown>	ref
+carrays	param	gca_cycle_right	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_cycle_right)	Box<unknown>	box
+carrays	param	gca_heap_make	0	heap	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_heap_make)	&'2236 Cell<unknown>	ref
+carrays	param	gca_heap_make	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_heap_make)	&'2237 unknown	ref
+carrays	param	gca_heap_pushdwn	0	heap	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2317 Cell<unknown>	ref
+carrays	param	gca_heap_pushdwn	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2316 unknown	ref
+carrays	param	gca_heap_pushup	0	heap	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2258 Cell<unknown>	ref
+carrays	param	gca_heap_pushup	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2259 unknown	ref
+carrays	param	gca_heap_sort	0	heap	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<Cell<unknown>>	rc
+carrays	param	gca_heap_sort	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_heap_sort)	&'2223 unknown	ref
+carrays	param	gca_imerge	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_imerge	5	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2291 unknown	ref
+carrays	param	gca_isortr	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_isortr	5	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2250 unknown	ref
+carrays	param	gca_itr_next	0	pp	*mut *mut size_t	*mut *mut size_t	no	raw	ref	model ref; census (depth 2) decision degraded reason held:retained-alias (evident:cycle:elem:*mut usize | src::source::gca_itr_next | elem:*mut usize | <program>/lib.rs:649)	&'2269 mut Rc<Cell<unknown>>	mut
+carrays	param	gca_itr_next	2	init	*mut size_t	*mut size_t	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::gca_itr_next:17:2:src::source::memcpy:1:HirId(DefId(0:41 ~ lib[b071]::src::source::gca_itr_next).6);risky-siblings=arg0)	&'2267 unknown	ref
+carrays	param	gca_itr_reset	0	p	*mut size_t	*mut size_t	no	raw	raw	model raw; census (depth 1) decision degraded reason return-certificate-return-locals (return-certificate-return-locals:src::source::gca_itr_reset:not-a-subject)	Box<i64>	box
+carrays	param	gca_lsearch	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2204 i8	ref
+carrays	param	gca_lsearch	4	arg	*mut ::core::ffi::c_void	&[u8]	no	ref	ref		&'2203 unknown	ref
+carrays	param	gca_median3	0	p0	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_median3	1	p1	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_median3	2	p2	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_median3	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2214 unknown	ref
+carrays	param	gca_median5	0	p0	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2164 unknown	ref
+carrays	param	gca_median5	1	p1	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2163 unknown	ref
+carrays	param	gca_median5	2	p2	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2153 unknown	ref
+carrays	param	gca_median5	3	p3	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2157 unknown	ref
+carrays	param	gca_median5	4	p4	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	&'2160 unknown	ref
+carrays	param	gca_median5	6	arg	*mut ::core::ffi::c_void	&[u8]	no	ref	ref		&'2158 unknown	ref
+carrays	param	gca_merge	0	_dst	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Box<unknown>	box
+carrays	param	gca_merge	5	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_merge)	&'2191 unknown	ref
+carrays	param	gca_qpart	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<Cell<unknown>>	rc
+carrays	param	gca_qpart	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2301 unknown	ref
+carrays	param	gca_qselect	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<Cell<unknown>>	rc
+carrays	param	gca_qselect	5	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-lend-withheld (box-param-lend-withheld:no-ownership-evidence:src::source::gca_qselect)	&'2175 unknown	ref
+carrays	param	gca_qsort	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<Cell<unknown>>	rc
+carrays	param	gca_qsort	4	arg	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'2239 unknown	ref
+carrays	param	gca_reverse	0	_ptr	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_sample	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_shuffle	0	base	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:cycle:unknown | src::source::gca_sample | unknown | <program>/lib.rs:244)	Box<unknown>	box
+carrays	param	gca_swapm	0	aa	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	param	gca_swapm	1	bb	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref; census (depth 1) decision degraded reason held:void-pointee	Rc<Cell<unknown>>	rc
+carrays	return	gca_bsearch	-1	return	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref	&'2332 i8	ref
+carrays	return	gca_itr_next	-1	return	*mut size_t	*mut size_t	no	raw	raw	model raw	Rc<Cell<unknown>>	rc
+carrays	return	gca_itr_reset	-1	return	*mut size_t	*mut size_t	no	raw	raw	model raw	Rc<Cell<i64>>	rc
+carrays	return	gca_lsearch	-1	return	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref	&'2338 i8	ref
+carrays	return	gca_median3	-1	return	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref	Rc<Cell<unknown>>	rc
+carrays	return	gca_median5	-1	return	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	ref	model ref	&'2343 unknown	ref
+carrays	return	gca_qselect	-1	return	*mut ::core::ffi::c_void	*mut ::core::ffi::c_void	no	raw	raw	model raw	Rc<Cell<unknown>>	rc
+jccc	field	BucketNode	0	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<Cell<Rc<Cell<i8>>>>	ghost
+jccc	field	BucketNode	1	value	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<Cell<&'0 i8>>	ghost
+jccc	field	BucketNode	2	next	*mut BucketNode	*mut BucketNode	no	raw	ref	model ref	ghost<Cell<&'0 unknown>>	ghost
+jccc	field	Hashmap	0	buckets	*mut *mut BucketNode	*mut *mut BucketNode	no	raw	raw	model raw	ghost<Box<Rc<struct(struct.BucketNode)<'0, >>>>	ghost
+jccc	field	Lexer	0	fp	*mut FILE	*mut FILE	no	raw	raw	model raw	ghost<&'0 unknown>	ghost
+jccc	field	List	0	head	*mut ListBlock	*mut ListBlock	no	raw	raw	model raw	ghost<Rc<struct(struct.ListBlock)<'0, >>>	ghost
+jccc	field	List	1	tail	*mut ListBlock	*mut ListBlock	no	raw	raw	model raw	ghost<Rc<struct(struct.ListBlock)<'0, >>>	ghost
+jccc	field	ListBlock	0	array	*mut ::core::ffi::c_int	*mut ::core::ffi::c_int	no	raw	raw	model raw	ghost<Cell<Box<i32>>>	ghost
+jccc	field	ListBlock	3	next	*mut ListBlock	*mut ListBlock	no	raw	raw	model raw	ghost<Cell<Rc<struct(struct.ListBlock)<'0, >>>>	ghost
+jccc	param	create_bucket	0	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store)	Box<i8>	box
+jccc	param	create_bucket	1	value	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store)	&'6409 i8	ref
+jccc	param	destroy_hashmap	0	h	*mut Hashmap	Option<Box<Hashmap>>	no	box	owning		&'6367 struct(struct.Hashmap)<'6113, >	ref
+jccc	param	destroy_list	0	l	*mut List	*mut List	no	raw	owning	model owning; census (depth 1) decision degraded reason box-param-caller-retains (box-param-caller-retains:src::source::basic_100_test:not-an-allocation)	&'6189 struct(struct.List)<'6130, >	ref
+jccc	param	double_cap	0	h	*mut Hashmap	&mut Hashmap	no	mut	ref		&'6830 mut struct(struct.Hashmap)<'6081, >	mut
+jccc	param	equal_key	0	a	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision slice reason - exclusion terminal-not-applied:cross-class-interval-collision; function reverted by the compile check	&'6706 i8	ref
+jccc	param	equal_key	1	b	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision slice reason - exclusion terminal-not-applied:cross-class-interval-collision; function reverted by the compile check	&'6707 i8	ref
+jccc	param	fnva1	0	value	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		Rc<Cell<i8>>	rc
+jccc	param	hm_get	0	h	*mut Hashmap	*mut Hashmap	no	raw	ref	model ref; census (depth 1) decision degraded reason pair-not-shown-disjoint (pair-not-shown-disjoint); function reverted by the compile check	&'6388 struct(struct.Hashmap)<'6126, >	ref
+jccc	param	hm_get	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason pair-raw-view; function reverted by the compile check	Rc<Cell<i8>>	rc
+jccc	param	hm_set	0	h	*mut Hashmap	*mut Hashmap	no	raw	ref	model ref; census (depth 1) decision ref reason - exclusion terminal-not-applied:blocked-subject:escapes-via-field-store; function reverted by the compile check	&'6423 mut struct(struct.Hashmap)<'6053, >	mut
+jccc	param	hm_set	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	Rc<Cell<i8>>	rc
+jccc	param	hm_set	2	value	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	&'6425 i8	ref
+jccc	param	in_string	1	s	*mut ::core::ffi::c_char	&::core::ffi::c_char	no	ref	ref		Rc<i8>	rc
+jccc	param	ladd_element	0	l	*mut List	&mut List	no	mut	ref		&'6200 mut struct(struct.List)<'6076, >	mut
+jccc	param	lex	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6702 mut struct(struct.Lexer)<'6127, >	mut
+jccc	param	lex	1	t	*mut Token	&mut Token	no	mut	ref		&'6703 mut struct(struct.Token)<'6095, >	mut
+jccc	param	lexer_getchar	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6727 mut struct(struct.Lexer)<'5264, >	mut
+jccc	param	lexer_ungetchar	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6245 mut struct(struct.Lexer)<'5592, >	mut
+jccc	param	lfind_index	0	l	*mut List	*mut List	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'6756 struct(struct.List)<'6139, >	ref
+jccc	param	lfind_index	1	lb	*mut *mut ListBlock	Option<&mut *mut ListBlock>	no	mut	ref		&'6757 mut Rc<struct(struct.ListBlock)<'6056, >>	mut
+jccc	param	lfind_index	2	i	*mut ::core::ffi::c_int	&mut ::core::ffi::c_int	no	mut	ref		&'6755 mut i32	mut
+jccc	param	lget_element	0	l	*mut List	Option<&mut List>	no	mut	ref		&'6530 struct(struct.List)<'6055, >	ref
+jccc	param	lset_element	0	l	*mut List	&mut List	no	mut	ref		&'6866 struct(struct.List)<'6079, >	ref
+jccc	param	make_cst	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6995 unknown	ref
+jccc	param	make_cst	1	tree	*mut ConcreteFileTree	&ConcreteFileTree	no	ref	ref		&'6996 unknown	ref
+jccc	param	new_block	0	l	*mut List	&List	no	ref	ref		&'6567 struct(struct.List)<'6582, >	ref
+jccc	param	parse	0	filename	*const ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6621 unknown	ref
+jccc	param	parse_blockstmt	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'7017 unknown	ref
+jccc	param	parse_blockstmt	1	bs	*mut BlockStatement	&BlockStatement	no	ref	ref		&'7018 unknown	ref
+jccc	param	parse_expr	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'7008 unknown	ref
+jccc	param	parse_expr	1	ex	*mut Expression	&Expression	no	ref	ref		&'7009 unknown	ref
+jccc	param	parse_funccall	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'7010 unknown	ref
+jccc	param	parse_funccall	1	ex	*mut Expression	&Expression	no	ref	ref		&'7011 unknown	ref
+jccc	param	parse_funcdecl	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6987 unknown	ref
+jccc	param	parse_funcdecl	1	fd	*mut FunctionDeclaration	&FunctionDeclaration	no	ref	ref		&'6988 unknown	ref
+jccc	param	real_lex	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6272 mut struct(struct.Lexer)<'6062, >	mut
+jccc	param	real_lex	1	t	*mut Token	*mut Token	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'6270 mut struct(struct.Token)<'6131, >	mut
+jccc	param	skip_to_token	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6199 mut struct(struct.Lexer)<'6066, >	mut
+jccc	param	testing_cleanup_internal	0	func_name	*const ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6708 unknown	ref
+jccc	param	testing_setup_internal	0	func_name	*const ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6882 unknown	ref
+jccc	param	testing_single_test_internal	0	func_name	*const ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6377 unknown	ref
+jccc	param	ttype_from_string	0	contents	*const ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6910 i8	ref
+jccc	param	ttype_many_chars	0	contents	*const ::core::ffi::c_char	Option<&[::core::ffi::c_char]>	no	ref	ref		&'6521 i8	ref
+jccc	param	unlex	0	l	*mut Lexer	*mut Lexer	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'6716 mut struct(struct.Lexer)<'6143, >	mut
+jccc	param	unlex	1	t	*mut Token	*mut Token	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::unlex:7:0:src::source::memcpy:1:HirId(DefId(0:328 ~ lib[b071]::src::source::unlex).4);risky-siblings=arg0)	&'6717 unknown	ref
+jccc	param	valid_operator_sequence	0	op	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'6371 i8	ref
+jccc	return	create_bucket	-1	return	*mut BucketNode	Box<BucketNode>	no	box	owning		ghost<struct(struct.BucketNode)<'6933, >>	ghost
+jccc	return	create_hashmap	-1	return	*mut Hashmap	*mut Hashmap	no	raw	raw	model raw; function reverted by the compile check	ghost<struct(struct.Hashmap)<'6937, >>	ghost
+jccc	return	create_list	-1	return	*mut List	*mut List	no	raw	owning	model owning	ghost<struct(struct.List)<'6925, >>	ghost
+jccc	return	end_func	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'6931 unknown	ref
+jccc	return	end_main	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'6939 unknown	ref
+jccc	return	end_main_custom_return	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	ghost<unknown>	ghost
+jccc	return	hm_get	-1	return	*mut BucketNode	*mut BucketNode	no	raw	ref	model ref; function reverted by the compile check	Rc<struct(struct.BucketNode)<'6941, >>	rc
+jccc	return	init_int_literal	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	ghost<unknown>	ghost
+jccc	return	new_block	-1	return	*mut ListBlock	*mut ListBlock	no	raw	raw	model raw	ghost<struct(struct.ListBlock)<'6914, >>	ghost
+jccc	return	op_on_rax_with_rdi	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	ghost<unknown>	ghost
+jccc	return	r_start_main	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'6921 unknown	ref
+jccc	return	start_func	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'6938 unknown	ref
+jccc	return	start_main	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'6947 unknown	ref
+jccc	return	ttype_name	-1	return	*const ::core::ffi::c_char	*const ::core::ffi::c_char	no	raw	ref	model ref	&'6946 unknown	ref
+leftpad	param	leftpad	0	str	*const ::core::ffi::c_char	Option<&[::core::ffi::c_char]>	no	ref	ref		&'401 i8	ref
+leftpad	param	leftpad	1	padding	*const ::core::ffi::c_char	*const ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason pair-raw-view	&'399 i8	ref
+leftpad	param	leftpad	3	dest	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason pair-raw-view	&'398 mut i8	mut
+leftpad	param	main_0	1	argv	*mut *mut ::core::ffi::c_char	&mut [*mut ::core::ffi::c_char]	no	mut	ref		&'418 &'362 i8	ref
+nandc	param	add_bit	3	carry_result	*mut bool	&mut bool	no	mut	ref		&'1020 mut i8	mut
+nandc	param	half_sub	2	carry_result	*mut bool	&mut bool	no	mut	ref		&'1055 mut i8	mut
+nandc	param	sub_bit	3	carry_result	*mut bool	*mut bool	no	raw	ref	model ref; census (depth 1) decision degraded reason aliased-storage-withdrawn (src::source::sub_u4@<program>/lib.rs:230:30: 233:111;src::source::sub_u4@<program>/lib.rs:237:30: 240:111;src::source::sub_u4@<program>/lib.rs:244:30: 247:111;src::source::sub_u4@<program>/lib.rs:251:30: 254:111)	&'1031 mut i8	mut
+nandc	return	bll	-1	return	*const ::core::ffi::c_char	*const ::core::ffi::c_char	no	raw	raw	model raw	&'1058 unknown	ref
+rbtree	field	node_t	2	parent	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Cell<Rc<struct(struct.node_t)<'0, >>>>	ghost
+rbtree	field	node_t	3	left	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Cell<Rc<struct(struct.node_t)<'0, >>>>	ghost
+rbtree	field	node_t	4	right	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Cell<Rc<struct(struct.node_t)<'0, >>>>	ghost
+rbtree	field	rbtree	0	root	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Rc<struct(struct.node_t)<'0, >>>	ghost
+rbtree	field	rbtree	1	nil	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Rc<struct(struct.node_t)<'0, >>>	ghost
+rbtree	param	REFINATOR_FREE_node	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:cycle:node_t.left | src::source::REFINATOR_FREE_node | node_t.left | <program>/lib.rs:127)	&'3629 struct(struct.rbtree)<'2784, >	ref
+rbtree	param	REFINATOR_FREE_node	1	x	*mut node_t	*mut node_t	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::REFINATOR_FREE_node | node_t.left | <program>/lib.rs:127)	&'3628 struct(struct.node_t)<'2797, >	ref
+rbtree	param	delete_rbtree	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:cycle:node_t.left | src::source::REFINATOR_FREE_node | node_t.left | <program>/lib.rs:127)	&'3615 struct(struct.rbtree)<'2876, >	ref
+rbtree	param	left_rotation	0	tree	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::left_rotation | node_t.left | <program>/lib.rs:112)	&'3072 mut struct(struct.rbtree)<'2827, >	mut
+rbtree	param	left_rotation	1	x	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<struct(struct.node_t)<'2718, >>	rc
+rbtree	param	rbtree_delete_fixup	0	t	*mut rbtree	*mut rbtree	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'3456 mut struct(struct.rbtree)<'2717, >	mut
+rbtree	param	rbtree_delete_fixup	1	x	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<struct(struct.node_t)<'3015, >>	rc
+rbtree	param	rbtree_erase	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::left_rotation | node_t.left | <program>/lib.rs:112)	&'3369 mut struct(struct.rbtree)<'2858, >	mut
+rbtree	param	rbtree_erase	1	p	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'3363 struct(struct.node_t)<'2720, >	ref
+rbtree	param	rbtree_find	0	t	*const rbtree	&rbtree	no	ref	ref		&'3143 struct(struct.rbtree)<'2095, >	ref
+rbtree	param	rbtree_insert	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::left_rotation | node_t.left | <program>/lib.rs:112)	&'3312 mut struct(struct.rbtree)<'2744, >	mut
+rbtree	param	rbtree_insert_fixup	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::left_rotation | node_t.left | <program>/lib.rs:112)	&'3164 mut struct(struct.rbtree)<'2808, >	mut
+rbtree	param	rbtree_insert_fixup	1	z	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<struct(struct.node_t)<'2795, >>	rc
+rbtree	param	rbtree_max	0	t	*const rbtree	&rbtree	no	ref	ref		&'3051 struct(struct.rbtree)<'2097, >	ref
+rbtree	param	rbtree_min	0	t	*const rbtree	&rbtree	no	ref	ref		&'3684 struct(struct.rbtree)<'2484, >	ref
+rbtree	param	rbtree_transplant	0	t	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.parent | src::source::rbtree_transplant | node_t.parent | <program>/lib.rs:249)	&'3650 mut struct(struct.rbtree)<'2392, >	mut
+rbtree	param	rbtree_transplant	1	u	*mut node_t	*mut node_t	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::rbtree_transplant#2:peer#3:caller=src::source::rbtree_erase;contained)	&'3648 struct(struct.node_t)<'2771, >	ref
+rbtree	param	rbtree_transplant	2	v	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<struct(struct.node_t)<'2732, >>	rc
+rbtree	param	right_rotation	0	tree	*mut rbtree	*mut rbtree	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.left | src::source::right_rotation | node_t.left | <program>/lib.rs:102)	&'3706 mut struct(struct.rbtree)<'2769, >	mut
+rbtree	param	right_rotation	1	x	*mut node_t	*mut node_t	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<struct(struct.node_t)<'2724, >>	rc
+rbtree	return	new_rbtree	-1	return	*mut rbtree	*mut rbtree	no	raw	raw	model raw	ghost<struct(struct.rbtree)<'3780, >>	ghost
+rbtree	return	rbtree_find	-1	return	*mut node_t	*mut node_t	no	raw	raw	model raw	Rc<struct(struct.node_t)<'3768, >>	rc
+rbtree	return	rbtree_insert	-1	return	*mut node_t	*mut node_t	no	raw	raw	model raw	Rc<struct(struct.node_t)<'3782, >>	rc
+rbtree	return	rbtree_max	-1	return	*mut node_t	*mut node_t	no	raw	raw	model raw	Rc<struct(struct.node_t)<'3776, >>	rc
+rbtree	return	rbtree_min	-1	return	*mut node_t	*mut node_t	no	raw	raw	model raw	Rc<struct(struct.node_t)<'3772, >>	rc
+running-example	field	node_t	1	next	*mut node_t	*mut node_t	no	raw	raw	model raw	ghost<Rc<Cell<struct(struct.node_t)<'0, >>>>	ghost
+running-example	param	first	0	list	*mut node_t	&node_t	no	ref	ref		&'159 struct(struct.node_t)<'151, >	ref
+running-example	param	push	0	list	*mut node_t	&mut node_t	no	mut	ref		&'170 mut struct(struct.node_t)<'150, >	mut
+running-example	param	replace	0	dst	*mut ::core::ffi::c_int	&mut ::core::ffi::c_int	no	mut	ref		&'165 mut i32	mut
+running-example	param	replace_first	0	list	*mut node_t	*mut node_t	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:node_t.next | src::source::replace_first | node_t.next | <program>/lib.rs:69)	&'182 struct(struct.node_t)<'148, >	ref
+running-example	return	new	-1	return	*mut node_t	*mut node_t	no	raw	raw	model raw; function reverted by the compile check	ghost<struct(struct.node_t)<'193, >>	ghost
+tisp	field	Entry	0	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	ghost<Cell<Rc<i8>>>	ghost
+tisp	field	Entry	1	val	Val_0	Val_0	no	raw	raw	model raw	ghost<Cell<unknown>>	ghost
+tisp	field	Rec_0	2	items	*mut Entry	*mut Entry	no	raw	raw	model raw	ghost<Rc<struct(struct.Entry)<'0, >>>	ghost
+tisp	field	Rec_0	3	next	*mut Rec_0	*mut Rec_0	no	raw	ref	model ref	ghost<Rc<struct(struct.Rec)<'0, >>>	ghost
+tisp	field	Tsp	0	file	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	ghost<Rc<i8>>	ghost
+tisp	field	Tsp	2	none	Val_0	Val_0	no	raw	raw	model raw	ghost<unknown>	ghost
+tisp	field	Tsp	3	nil	Val_0	Val_0	no	raw	raw	model raw	ghost<unknown>	ghost
+tisp	field	Tsp	4	t	Val_0	Val_0	no	raw	raw	model raw	ghost<unknown>	ghost
+tisp	field	Tsp	5	env	Rec	Rec	no	raw	raw	model raw	ghost<ghost<struct(struct.Rec)<'0, >>>	ghost
+tisp	field	Tsp	6	strs	Rec	Rec	no	raw	raw	model raw	ghost<ghost<struct(struct.Rec)<'0, >>>	ghost
+tisp	field	Tsp	7	syms	Rec	Rec	no	raw	raw	model raw	ghost<Cell<ghost<struct(struct.Rec)<'0, >>>>	ghost
+tisp	field	Tsp	8	libh	*mut *mut ::core::ffi::c_void	*mut *mut ::core::ffi::c_void	no	raw	ref	model ref	ghost<&'0 unknown>	ghost
+tisp	field	C2RustUnnamed_11	0	s	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<&'0 unknown>	ghost
+tisp	field	C2RustUnnamed_11	5	r	Rec	Rec	no	raw	ref	model ref	ghost<ghost<struct(struct.Rec)<'0, >>>	ghost
+tisp	field	C2RustUnnamed_14	0	name	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<Rc<i8>>	ghost
+tisp	field	C2RustUnnamed_14	1	pr	Prim	Prim	no	raw	ref	model ref	ghost<unknown>	ghost
+tisp	field	C2RustUnnamed_13	0	name	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref	ghost<Rc<i8>>	ghost
+tisp	field	C2RustUnnamed_13	1	args	Val_0	Val_0	no	raw	ref	model ref	ghost<unknown>	ghost
+tisp	field	C2RustUnnamed_13	2	body	Val_0	Val_0	no	raw	ref	model ref	ghost<unknown>	ghost
+tisp	field	C2RustUnnamed_13	3	env	Rec	Rec	no	raw	ref	model ref	ghost<Rc<struct(struct.Rec)<'0, >>>	ghost
+tisp	field	C2RustUnnamed_12	0	car	Val_0	Val_0	no	raw	ref	model ref	ghost<unknown>	ghost
+tisp	field	C2RustUnnamed_12	1	cdr	Val_0	Val_0	no	raw	ref	model ref	ghost<unknown>	ghost
+tisp	param	entry_get	0	rec	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::entry_get#1:peer#2:caller=src::source::rec_get;unresolved;proof=overlapping)	&'11325 struct(struct.Rec)<'9827, >	ref
+tisp	param	entry_get	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::entry_get#2:peer#1:caller=src::source::rec_get;unresolved;proof=overlapping)	Rc<i8>	rc
+tisp	param	esc_str	0	s	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		Rc<i8>	rc
+tisp	param	eval_proc	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-binding:src::source::eval_proc::args)	&'11157 struct(struct.Tsp)<'10002, >	ref
+tisp	param	eval_proc	1	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-binding:src::source::eval_proc::args)	&'11163 struct(struct.Rec)<'9886, >	ref
+tisp	param	eval_proc	2	f	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::prepend_bt#3)	unknown	other
+tisp	param	eval_proc	3	args	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::eval_proc:64:11:src::source::rec_extend:2:HirId(DefId(0:359 ~ lib[b071]::src::source::eval_proc).8);risky-siblings=arg1)	unknown	other
+tisp	param	frac_reduce	0	num	*mut ::core::ffi::c_int	&mut ::core::ffi::c_int	no	mut	ref		&'11244 mut i32	mut
+tisp	param	frac_reduce	1	den	*mut ::core::ffi::c_int	&mut ::core::ffi::c_int	no	mut	ref		&'11243 mut i32	mut
+tisp	param	hash	0	key	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		Rc<i8>	rc
+tisp	param	isnum	0	str	*mut ::core::ffi::c_char	&[::core::ffi::c_char]	no	ref	ref		&'10888 i8	ref
+tisp	param	main_0	1	argv	*mut *mut ::core::ffi::c_char	*mut *mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 2) decision degraded reason kind-raw	&'10773 Rc<i8>	ref
+tisp	param	mk_func	1	name	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	Box<i8>	box
+tisp	param	mk_func	2	args	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	unknown	other
+tisp	param	mk_func	3	body	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	unknown	other
+tisp	param	mk_func	4	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	ghost<struct(struct.Rec)<'9807, >>	ghost
+tisp	param	mk_list	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11494 struct(struct.Tsp)<'10474, >	ref
+tisp	param	mk_pair	0	a	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:derived-store:C2RustUnnamed_12.car | src::source::mk_pair | C2RustUnnamed_12.car | <program>/lib.rs:1149)	unknown	other
+tisp	param	mk_pair	1	b	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:derived-store:C2RustUnnamed_12.cdr | src::source::mk_pair | C2RustUnnamed_12.cdr | <program>/lib.rs:1150)	unknown	other
+tisp	param	mk_prim	1	pr	Prim	Prim	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	unknown	other
+tisp	param	mk_prim	2	name	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason escapes-via-field-store (escapes-via-field-store); function reverted by the compile check	Rc<i8>	rc
+tisp	param	mk_rec	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	&'11887 struct(struct.Tsp)<'10160, >	ref
+tisp	param	mk_rec	1	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	ghost<struct(struct.Rec)<'10056, >>	ghost
+tisp	param	mk_rec	2	assoc	Val_0	Val_0	no	raw	raw	model raw; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	unknown	other
+tisp	param	mk_str	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::mk_str#1:peer#2:caller=src::source::tisp_env_init;unresolved;proof=overlapping)	&'11616 mut struct(struct.Tsp)<'10480, >	mut
+tisp	param	mk_str	1	s	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<i8>	rc
+tisp	param	mk_sym	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::mk_sym#1:peer#2:caller=src::source::read_sym;unresolved;proof=overlapping)	&'10904 struct(struct.Tsp)<'9999, >	ref
+tisp	param	mk_sym	1	s	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<i8>	rc
+tisp	param	prepend_bt	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::prepend_bt:17:11:src::source::mk_sym:0:HirId(DefId(0:358 ~ lib[b071]::src::source::prepend_bt).2);risky-siblings=arg1)	&'11247 struct(struct.Tsp)<'10470, >	ref
+tisp	param	prepend_bt	1	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-binding:src::source::prepend_bt::e)	&'11248 struct(struct.Rec)<'10280, >	ref
+tisp	param	prepend_bt	2	f	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:Entry.val | src::source::mk_sym | Entry.val | <program>/lib.rs:1078)	unknown	other
+tisp	param	prim_func	0	t	Tsp_0	&crate::src::source::Tsp	no	ref	ref		&'12067 struct(struct.Tsp)<'12068, >	ref
+tisp	param	prim_func	1	r	Rec	&crate::src::source::Rec_0	no	ref	ref		&'12069 struct(struct.Rec)<'12070, >	ref
+tisp	param	prim_func	2	v	Val_0	Option<&crate::src::source::Val>	no	ref	ref		unknown	other
+tisp	param	read_int	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:Tsp.file | src::source::read_int | Tsp.file | <program>/lib.rs:1184)	&'11588 mut struct(struct.Tsp)<'11609, >	mut
+tisp	param	read_num	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:elem:*mut src::source::_IO_FILE | src::source::mk_rat | elem:*mut src::source::_IO_FILE | <program>/lib.rs:1047)	&'11633 mut struct(struct.Tsp)<'9953, >	mut
+tisp	param	read_pair	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11546 mut struct(struct.Tsp)<'10053, >	mut
+tisp	param	read_parse_eval	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11775 struct(struct.Tsp)<'9792, >	ref
+tisp	param	read_parse_eval	1	file	Val_0	Val_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	unknown	other
+tisp	param	read_sci	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:cycle:unknown | src::source::read_sci | unknown | <program>/lib.rs:1204)	&'11794 mut struct(struct.Tsp)<'10175, >	mut
+tisp	param	read_sign	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:Tsp.file | src::source::read_sign | Tsp.file | <program>/lib.rs:1169)	&'11410 mut struct(struct.Tsp)<'11418, >	mut
+tisp	param	read_str	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:elem:*mut src::source::_IO_FILE | src::source::read_str | elem:*mut src::source::_IO_FILE | <program>/lib.rs:1310)	&'11461 mut struct(struct.Tsp)<'11491, >	mut
+tisp	param	read_sym	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11992 mut struct(struct.Tsp)<'10509, >	mut
+tisp	param	rec_add	0	rec	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::rec_add#1:peer#2:caller=src::source::rec_extend;unresolved;proof=overlapping); function reverted by the compile check	&'11782 mut struct(struct.Rec)<'10407, >	mut
+tisp	param	rec_add	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw; function reverted by the compile check	Rc<i8>	rc
+tisp	param	rec_add	2	val	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::rec_add#3:peer#2:caller=src::source::rec_extend;unresolved;proof=overlapping); function reverted by the compile check	unknown	other
+tisp	param	rec_extend	0	rec	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:Rec_0.items | src::source::rec_add | Rec_0.items | <program>/lib.rs:971)	Rc<struct(struct.Rec)<'10030, >>	rc
+tisp	param	rec_extend	1	args	Val_0	Val_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	unknown	other
+tisp	param	rec_extend	2	vals	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::rec_extend#3:peer#2:caller=src::source::tisp_eval_body;unresolved;proof=overlapping)	unknown	other
+tisp	param	rec_get	0	rec	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::rec_get#1:peer#2:caller=src::source::mk_str;unresolved;proof=overlapping)	&'10670 struct(struct.Rec)<'10084, >	ref
+tisp	param	rec_get	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::rec_get:5:6:src::source::entry_get:1:HirId(DefId(0:325 ~ lib[b071]::src::source::rec_get).4);risky-siblings=arg0)	Rc<i8>	rc
+tisp	param	rec_grow	0	rec	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:raw-boundary-site:src::source::rec_grow:14:3:src::source::rec_add:0:HirId(DefId(0:326 ~ lib[b071]::src::source::rec_grow).2);risky-siblings=arg1)	&'11340 mut struct(struct.Rec)<'10118, >	mut
+tisp	param	rec_new	1	next	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:derived-store:Rec_0.next | src::source::rec_new | Rec_0.next | <program>/lib.rs:917)	Rc<struct(struct.Rec)<'9829, >>	rc
+tisp	param	skip_ws	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:Tsp.file | src::source::skip_ws | Tsp.file | <program>/lib.rs:843)	&'11075 mut struct(struct.Tsp)<'11111, >	mut
+tisp	param	tib_env_core	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::tisp_env_add#1)	&'11805 mut struct(struct.Tsp)<'9881, >	mut
+tisp	param	tib_env_io	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::tisp_env_add#1)	&'11457 mut struct(struct.Tsp)<'9803, >	mut
+tisp	param	tib_env_math	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::tisp_env_add#1)	&'11040 mut struct(struct.Tsp)<'9789, >	mut
+tisp	param	tib_env_os	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::tisp_env_add#1)	&'11651 mut struct(struct.Tsp)<'10101, >	mut
+tisp	param	tib_env_string	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::tisp_env_add#1)	&'11631 mut struct(struct.Tsp)<'10213, >	mut
+tisp	param	tisp_env_add	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::tisp_env_add#1:peer#2:caller=src::source::tisp_env_init;unresolved;proof=overlapping)	&'11851 mut struct(struct.Tsp)<'10190, >	mut
+tisp	param	tisp_env_add	1	key	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Rc<i8>	rc
+tisp	param	tisp_env_add	2	v	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:pair-not-shown-disjoint (pair-not-shown-disjoint:ref-beside-raw:src::source::tisp_env_add#3:peer#2:caller=src::source::tisp_env_init;unresolved;proof=overlapping)	unknown	other
+tisp	param	tisp_env_lib	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11978 mut struct(struct.Tsp)<'10438, >	mut
+tisp	param	tisp_env_lib	1	lib	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	Box<i8>	box
+tisp	param	tisp_eval	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	&'11391 struct(struct.Tsp)<'9925, >	ref
+tisp	param	tisp_eval	1	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	&'11389 struct(struct.Rec)<'10038, >	ref
+tisp	param	tisp_eval	2	v	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	unknown	other
+tisp	param	tisp_eval_body	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:into-held-formal (into-held-formal:src::source::eval_proc#1)	&'11666 struct(struct.Tsp)<'10203, >	ref
+tisp	param	tisp_eval_body	1	env	Rec	Rec	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11665 struct(struct.Rec)<'10346, >	ref
+tisp	param	tisp_eval_body	2	v	Val_0	Val_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	unknown	other
+tisp	param	tisp_eval_list	0	st	Tsp_0	Tsp_0	no	raw	ref	model ref; census (depth 1) decision degraded reason unsupported-decl-shape (alias)	&'11823 struct(struct.Tsp)<'9914, >	ref
+tisp	param	tisp_eval_list	1	env	Rec	Rec	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:C2RustUnnamed_11.s | src::source::eval_proc | C2RustUnnamed_11.s | <program>/lib.rs:1767)	&'11822 struct(struct.Rec)<'10206, >	ref
+tisp	param	tisp_eval_list	2	v	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:C2RustUnnamed_11.s | src::source::eval_proc | C2RustUnnamed_11.s | <program>/lib.rs:1767)	unknown	other
+tisp	param	tisp_print	0	f	*mut FILE	*mut FILE	no	raw	ref	model ref; census (depth 1) decision degraded reason held:io-domain:type	&'10931 unknown	ref
+tisp	param	tisp_print	1	v	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision degraded reason held:retained-alias (evident:self-reference:C2RustUnnamed_11.s | src::source::tisp_print | C2RustUnnamed_11.s | <program>/lib.rs:1877)	unknown	other
+tisp	param	tisp_read	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11525 mut struct(struct.Tsp)<'10210, >	mut
+tisp	param	tisp_read_line	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'11112 mut struct(struct.Tsp)<'10445, >	mut
+tisp	param	tisp_read_sexpr	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'10679 mut struct(struct.Tsp)<'9849, >	mut
+tisp	param	tisp_read_sugar	0	st	Tsp_0	Tsp_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	&'10840 mut struct(struct.Tsp)<'9889, >	mut
+tisp	param	tisp_read_sugar	1	v	Val_0	Val_0	no	raw	raw	model raw; census (depth 1) decision degraded reason kind-raw	unknown	other
+tisp	param	tsp_lstlen	0	v	Val_0	Val_0	no	raw	ref	model ref; census (depth 1) decision ref reason -; function reverted by the compile check	unknown	other
+tisp	return	entry_get	-1	return	Entry_0	Entry_0	no	raw	ref	model ref	Rc<struct(struct.Entry)<'12029, >>	rc
+tisp	return	esc_str	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	Box<i8>	box
+tisp	return	eval_proc	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	mk_dec	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_func	-1	return	Val_0	Val_0	no	raw	raw	model raw; function reverted by the compile check	unknown	other
+tisp	return	mk_int	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_list	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_pair	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_prim	-1	return	Val_0	Val_0	no	raw	raw	model raw; function reverted by the compile check	unknown	other
+tisp	return	mk_rat	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_rec	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_str	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_sym	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	mk_val	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	prim_func	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	read_num	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	read_pair	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	read_parse_eval	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	read_sci	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	read_str	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	read_sym	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	rec_extend	-1	return	Rec	Rec	no	raw	raw	model raw	ghost<struct(struct.Rec)<'12075, >>	ghost
+tisp	return	rec_get	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	rec_new	-1	return	Rec	Rec	no	raw	raw	model raw	ghost<struct(struct.Rec)<'12015, >>	ghost
+tisp	return	tisp_env_init	-1	return	Tsp_0	Tsp_0	no	raw	raw	model raw	ghost<struct(struct.Tsp)<'12017, >>	ghost
+tisp	return	tisp_eval	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	tisp_eval_body	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	tisp_eval_list	-1	return	Val_0	Val_0	no	raw	ref	model ref	unknown	other
+tisp	return	tisp_read	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	tisp_read_line	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	tisp_read_sexpr	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	tisp_read_sugar	-1	return	Val_0	Val_0	no	raw	raw	model raw	unknown	other
+tisp	return	tsp_type_str	-1	return	*mut ::core::ffi::c_char	*mut ::core::ffi::c_char	no	raw	raw	model raw	&'12032 i8	ref
+ulidgen	param	main_0	1	argv	*mut *mut ::core::ffi::c_char	*mut *mut ::core::ffi::c_char	no	raw	ref	model ref; census (depth 2) decision degraded reason held:retained-alias (evident:derived-store:elem:*mut i8 | src::source::main_0 | elem:*mut i8 | <program>/lib.rs:276)	&'575 unknown	ref
+ulidgen	param	ulidgen_r	0	ulid	*mut ::core::ffi::c_char	&mut [::core::ffi::c_char]	no	mut	ref		&'547 Cell<i8>	ref

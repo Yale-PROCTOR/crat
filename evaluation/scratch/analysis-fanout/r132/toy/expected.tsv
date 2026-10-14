@@ -1,0 +1,77 @@
+tag	fn	kind	call	dest	dest_detail	formal_ty	formal_safe	via	excluded	excl_reason	null_dom	null_test	src_ty	raw_derefs	post_raw_derefs	in_wrapper	macro
+t01	t01_decl	a:mut-ref	-	decl	r	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t02a	t02_assign	a:ref	-	decl	r	-	-	*	no	-	no	-	*const i32	1	0	no	no
+t02b	t02_assign	a:ref	-	assign	r	-	-	*	no	-	no	-	*const i32	1	0	no	no
+t03	t03_ret	a:mut-ref	-	return	*	-	-	reborrow	no	-	no	-	*mut i32	1	0	yes	no
+t04	t04_call	a:mut-ref	-	call-arg	safe_mut	mut i32	safe	*	no	-	no	-	*mut i32	1	0	no	no
+t05	t05_some	a:mut-ref	-	call-arg	safe_opt	Option<	safe	Some	no	-	no	-	*mut i32	1	0	no	no
+t06	t06_autoref	a:mut-ref	-	call-arg	push	*	safe	*	no	-	no	-	Vec<i32>	1	0	no	no
+t07	t07_field	a:mut-ref	-	field-store	Holder.f	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t08	t08_init	a:mut-ref	-	field-store	init:Holder.f>return	-	-	*	no	-	no	-	*mut i32	1	0	yes	no
+t09	t09_excl	a:mut-ref	-	return	*	-	-	rawptr-of-deref	yes	rawptr-of-deref	no	-	*mut i32	1	0	no	no
+t10	t10_strncmp	a:mut-ref	-	call-arg	strncmp	*const i8	raw	rawptr-of-deref	yes	rawptr-of-deref	no	-	*mut i8	1	0	no	no
+t10	t10_strncmp	a:ref	-	call-arg	strncmp	*const i8	raw	rawptr-of-deref	yes	rawptr-of-deref	no	-	*const i8	1	0	no	no
+t11	t11_cast2	a:mut-ref	-	call-arg	takes_raw	*mut i32	raw	rawptr-of-deref	yes	rawptr-of-deref	no	-	*mut i32	1	0	no	no
+t12	t12_arr	a:mut-ref	-	return	*	-	-	rawptr-of-deref	yes	rawptr-of-deref	no	-	*mut [i32; 4]	1	0	no	no
+t13	t13_deref	a:mut-ref	-	other	deref-use	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	1	0	no	no
+t14	t14_nd	a:ref	-	decl	r	-	-	*	no	-	yes	is_null@	*const i32	1	0	no	no
+t15	t15_early	b:ptr-as_mut	as_mut	return	*	-	-	*	no	-	yes	is_null@	*mut i32	0	0	yes	no
+t16	t16_unwrap	b:ptr-as_ref	as_ref	other	deref-use	-	-	unwrap	no	-	no	-	*const i32	0	0	no	no
+t17	t17_iflet	b:ptr-as_mut	as_mut	decl	r	-	-	match-some	no	-	no	-	*mut i32	0	0	no	no
+t18	t18_box	b:box-from_raw	from_raw	call-arg	drop	Box<	safe	*	no	-	yes	is_null@	re:^\*mut (crate::)?S$	0	0	no	no
+t19	t19_dropped	b:box-from_raw	from_raw	other	drop	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	0	0	no	no
+t20	t20_ne	b:box-from_raw	from_raw	decl	b	-	-	*	no	-	yes	ne-null@	re:^\*mut (crate::)?S$	0	0	no	no
+t21	t21_eq0	b:box-from_raw	from_raw	decl	b	-	-	*	no	-	yes	eq-null@	re:^\*mut (crate::)?S$	0	0	no	no
+t22	t22_slice	b:slice-from_raw_parts	from_raw_parts	decl	s	-	-	*	no	-	no	-	*const i32	0	0	no	no
+t23	t23_slice_arg	b:slice-from_raw_parts_mut	from_raw_parts_mut	call-arg	safe_slice	mut [i32]	safe	*	no	-	no	-	*mut i32	0	0	no	no
+t24	t24_nonnull	b:nonnull-as_ref	as_ref	other	deref-use	-	-	*	no	-	n/a	-	re:^(std::ptr::|core::ptr::)?NonNull<i32>$	0	0	no	no
+w1	mk_ref	a:mut-ref	-	return	*	-	-	*	no	-	no	-	*mut i32	1	0	yes	no
+w2	mk_ref2	h	mk_ref	return	*	-	-	*	no	-	no	-	*mut i32	0	0	yes	no
+t25a	t25_helper	h	mk_ref	call-arg	safe_mut	mut i32	safe	*	no	-	no	-	*mut i32	0	0	no	no
+t25b	t25_helper	h	mk_ref2	decl	r	-	-	*	no	-	no	-	*const i32	0	0	no	no
+w3	from_raw	b:slice-from_raw_parts	from_raw_parts	field-store	init:Cur.base>return	-	-	*	no	-	no	-	*const i32	0	0	yes	no
+t26	t26_cursor	h	from_raw	decl	c	-	-	*	no	-	no	-	*const i32	0	0	no	no
+t27	{closure	a:mut-ref	-	return	*	-	-	*	no	-	*	*	*	*	*	no	no
+t28	t28_transmute	x:transmute	transmute	return	*	-	-	*	no	-	no	-	*mut i32	0	0	yes	no
+t29	t29_cstr	x:cstr-from_ptr	from_ptr	decl	c	-	-	*	no	-	no	-	*	0	0	no	no
+t30	t30_inner	a:mut-ref	-	decl	r	-	-	*	no	-	yes	is_null@	*mut i32	2	0	no	no
+t31	t31_base	a:ref	-	decl	r	-	-	*	no	-	yes-base	is_null@	*const i32	1	0	no	no
+t32	t32_nodom	a:ref	-	decl	r	-	-	*	no	-	no	-	*const i32	1	0	no	no
+t33a	t33_opt	b:ptr-as_ref	as_ref	other	observed-only	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	0	0	no	no
+t33b	t33_opt	b:box-from_raw	from_raw	call-arg	drop	Box<	safe	*	no	-	yes	opt-is_some@	re:^\*mut (crate::)?S$	0	0	no	no
+t34	t34_store	a:mut-ref	-	other	store-deref	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t35	t35_fieldref	a:mut-ref	-	decl	rx	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	1	0	no	no
+t36	t36_retsome	a:mut-ref	-	return	*	-	-	Some	no	-	no	-	*mut i32	1	0	yes	no
+t37	t37_fresh	a:mut-ref	-	decl	fresh0	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t38	t38_letcast	a:mut-ref	-	decl	r	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t40	t40_boxfield	b:box-from_raw	from_raw	field-store	BoxHolder.b@raw	-	-	Some	no	-	no	-	re:^\*mut (crate::)?S$	0	0	no	no
+t42	t42_asmutptr	a:mut-ref	-	return	*	-	-	method-to-raw:as_mut_ptr	yes	method-to-raw	no	-	re:^\*mut (crate::)?Buf$	1	0	no	no
+t43	t43_asptr	a:ref	-	call-arg	takes_rawc	*const i32	raw	method-to-raw:as_ptr	yes	method-to-raw	no	-	re:^\*const (crate::)?Buf$	1	0	no	no
+t44	t44_vecptr	a:mut-ref	-	return	*	-	-	method-to-raw:as_mut_ptr	yes	method-to-raw	no	-	re:^\*mut (crate::)?Buf$	1	0	no	no
+t45	t45_strptr	a:ref	-	return	*	-	-	method-to-raw:as_ptr	yes	method-to-raw	no	-	*const str	1	0	no	no
+t46	t46_len	a:ref	-	call-arg	len	[i32]	safe	*	no	-	no	-	re:^\*const (crate::)?Buf$	1	0	no	no
+t50a	t50_optdiscr	b:ptr-as_ref	as_ref	other	observed-only	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	0	0	no	no
+t50b	t50_optdiscr	b:box-from_raw	from_raw	call-arg	drop	Box<	safe	*	no	-	yes	opt-discr@	re:^\*mut (crate::)?S$	0	0	no	no
+t51	t51_notstmt	b:box-from_raw	from_raw	call-arg	drop	Box<	safe	*	no	-	yes	is_null@	re:^\*mut (crate::)?S$	0	0	no	no
+t52a	t52_isnone	b:ptr-as_ref	as_ref	other	observed-only	-	-	*	no	-	no	-	re:^\*mut (crate::)?S$	0	0	no	no
+t52b	t52_isnone	b:box-from_raw	from_raw	decl	b	-	-	*	no	-	yes	opt-is_none@	re:^\*mut (crate::)?S$	0	0	no	no
+t53	t53_ptrnull	a:ref	-	decl	r	-	-	*	no	-	yes	eq-null@	re:^\*const (crate::)?S$	1	0	no	no
+t54	t54_exposure	b:box-from_raw	from_raw	call-arg	__crat_safe_t54	Option<	safe	Some	no	-	yes	is_null@	re:^\*mut (crate::)?S$	0	0	no	no
+t55	t55_quad	b:box-from_raw	from_raw	call-arg	qfree	Option<	safe	Some	no	-	yes	is_null@	re:^\*mut (crate::)?QN$	0	0	no	no
+t61	t61_loop	a:ref	-	decl	r	-	-	*	no	-	yes-place	is_null@	re:^\*mut (crate::)?L$	1	0	no	no
+t62	t62_fieldcall	a:ref	-	decl	r	-	-	*	no	-	yes-place	is_null@	*mut i32	2	0	no	no
+t56a	t56_vec	x:vec-from_raw_parts	from_raw_parts	decl	v	-	-	*	no	-	no	-	*mut i32	0	0	no	no
+t56b	t56_vec	x:rc-from_raw	from_raw	decl	r	-	-	*	no	-	no	-	*const i32	0	0	no	no
+t57	t57_subplace	a:mut-ref	-	return	*	-	-	rawptr-of-subplace	yes	rawptr-of-subplace	no	-	re:^\*mut (crate::)?S$	1	0	no	no
+t58	t58_rawslice	a:ref	-	decl	s	-	-	*	no	-	no	-	*const [i32]	1	0	no	no
+t59	t59_macro	a:mut-ref	-	call-arg	safe_mut	mut i32	safe	*	no	-	no	-	*mut i32	1	0	no	yes
+t60a	t60_viasafe	a:mut-ref	-	decl	a	-	-	*	no	-	no	-	re:^\*mut (crate::)?RS$	1	1	no	no
+t60b	t60_viasafe	a:ref	-	decl	c	-	-	*	no	-	no	-	re:^\*mut (crate::)?RS$	1	1	no	no
+t63	t63_formal	a:ref	-	assign	r	-	-	*	no	-	no	-	*const i32	1	0	no	no
+t64	t64_elem	a:mut-ref	-	other	elem-store	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t65	t65_unused	a:ref	-	other	unused	-	-	*	no	-	no	-	*const i32	1	0	no	no
+t66	t66_tuple	a:mut-ref	-	other	elem:tuple.0>decl	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t67	t67_late	a:mut-ref	-	assign	r	-	-	*	no	-	no	-	*mut i32	1	0	no	no
+t68	t68_boxslice	b:box-from_raw	from_raw	decl	b	-	-	Some	no	-	no	-	*mut [i32]	0	0	no	no
+w4a	w4_mixed	a:mut-ref	-	call-arg	safe_mut	mut i32	safe	*	no	-	no	-	*mut i32	1	0	no	no
+w4b	w4_mixed	a:mut-ref	-	return	*	-	-	reborrow	no	-	no	-	*mut i32	1	0	yes	no

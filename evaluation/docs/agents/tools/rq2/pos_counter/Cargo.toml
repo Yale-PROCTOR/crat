@@ -1,0 +1,14 @@
+[package]
+name = "rq2_pos_counter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# analysis-fanout 031 (relay 043, R753-1): crat's typed pointer-position counter (T1 positions, T2 uses) under crat's
+# pinned nightly-2025-06-23; a rustc driver with no crate dependencies (rustc_private only).
+[dependencies]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[workspace]
