@@ -3698,6 +3698,109 @@ pub(crate) fn known_raw_operand(local: Option<Option<&Decision>>, text: Option<&
     }
 }
 
+/// Deliberate faults for [`raw_expression_operand`]'s witness, test builds only.
+#[cfg(test)]
+pub(crate) static RAW_EXPRESSION_FAULT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// The witness's function: a fault reaches only it (the suite runs in parallel).
+#[cfg(test)]
+pub(crate) const RAW_EXPRESSION_TEST_FN: &str = "__crat_w6a_167_f";
+
+fn raw_expression_fault(tcx: TyCtxt<'_>, owner: LocalDefId, n: u8) -> bool {
+    #[cfg(test)]
+    {
+        RAW_EXPRESSION_FAULT.load(std::sync::atomic::Ordering::SeqCst) == n
+            && tcx.item_name(owner.to_def_id()).as_str() == RAW_EXPRESSION_TEST_FN
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (tcx, owner, n);
+        false
+    }
+}
+
+/// **R1128-1 / relay wave-6a/167 — a raw EXPRESSION operand KNOWN to be raw as emitted**, so its
+/// non-null reborrow takes the `CRAT_BRIDGE_SPELLING` method form like a degraded local's (libtree's
+/// `strncmp(&mut *((*st).arr).offset(i), …)`, json.h's `&*((*value).payload as …)`). The argument at
+/// `span` in `owner`'s body is raw by its emitted type when, peeling `offset`-family steps:
+/// - it is a cast to a raw pointer type, or an array decay (`as_mut_ptr()` / `as_ptr()`): raw by
+///   construction, whatever its operand became;
+/// - it reads a field of a raw-pointer type that no field transaction converts (`field_kept_raw`),
+///   whatever the base became;
+/// - it is a local `local_raw` admits (a subject whose final decision is `Degraded`).
+///
+/// Anything else (a call result, a converted field, a reference or `Box` local, a non-subject
+/// binding) is not known raw and keeps `&*` / `&mut *`.
+pub(crate) fn raw_expression_operand(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    span: Span,
+    local_raw: &dyn Fn(HirId) -> bool,
+    field_kept_raw: &dyn Fn(LocalDefId, usize) -> bool,
+) -> bool {
+    use rustc_hir::{ExprKind, QPath, def::Res, intravisit};
+    struct At<'tcx> {
+        span: Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for At<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.span {
+                self.found = Some(e);
+                return;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut at = At { span, found: None };
+    intravisit::Visitor::visit_body(&mut at, tcx.hir_body_owned_by(owner));
+    let Some(mut e) = at.found else {
+        return false;
+    };
+    let typeck = tcx.typeck(owner);
+    let raw = |e: &rustc_hir::Expr<'_>| {
+        matches!(
+            typeck.expr_ty(e).kind(),
+            rustc_middle::ty::TyKind::RawPtr(..)
+        )
+    };
+    loop {
+        if !raw(e) {
+            return false;
+        }
+        e = match e.kind {
+            ExprKind::Cast(..) if !raw_expression_fault(tcx, owner, 3) => return true,
+            ExprKind::MethodCall(segment, receiver, ..) => match segment.ident.as_str() {
+                "as_mut_ptr" | "as_ptr" => return true,
+                "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub" => {
+                    receiver
+                }
+                _ => return false,
+            },
+            ExprKind::Field(base, _) => {
+                let Some(index) = typeck.opt_field_index(e.hir_id) else {
+                    return false;
+                };
+                let base_ty = typeck.expr_ty_adjusted(base).peel_refs();
+                let rustc_middle::ty::TyKind::Adt(adt, _) = base_ty.kind() else {
+                    return false;
+                };
+                return adt.did().as_local().is_some_and(|did| {
+                    raw_expression_fault(tcx, owner, 2) || field_kept_raw(did, index.as_usize())
+                });
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => {
+                return match path.res {
+                    Res::Local(local) => raw_expression_fault(tcx, owner, 1) || local_raw(local),
+                    _ => false,
+                };
+            }
+            _ => return false,
+        };
+    }
+}
+
 /// The form a decision emits.
 pub(crate) fn form_of(decision: &Decision) -> Form {
     match decision {
@@ -5675,7 +5778,25 @@ pub(crate) fn synthesize_with_raw_boundary(
                         _ => None,
                     },
                     text.as_deref(),
-                );
+                ) || (matches!(arg.shape, ArgShape::RawExpr { .. })
+                    && found == Form::Raw
+                    // relay wave-6a/167: a raw EXPRESSION operand, raw by its emitted type.
+                    && raw_expression_operand(
+                        tcx,
+                        site.caller,
+                        arg.span,
+                        &|local| {
+                            matches!(
+                                decision_of.get(&(site.caller, local)),
+                                Some(Decision::Degraded(_))
+                            )
+                        },
+                        &|did, index| {
+                            !table.field_transactions.applied.iter().any(|t| {
+                                t.key.struct_did == did && t.key.field_index == index
+                            })
+                        },
+                    ));
                 // wave-6a (R422-5): a Box-decided argument the owner-view glue
                 // renders IS the expected form at the call (`&*x`,
                 // `x.as_deref().unwrap()`, ..): the position is a glue-arm
@@ -8894,5 +9015,88 @@ mod bridge_spelling_operand_tests {
                 view.replacement
             );
         });
+    }
+}
+
+/// **Relay wave-6a/167**: a raw EXPRESSION operand known raw by its emitted type takes the bridge
+/// spelling; a reference operand (a converted local, a converted field) keeps `&*`.
+#[cfg(test)]
+mod raw_expression_operand_tests {
+    use std::sync::atomic::Ordering;
+
+    use rustc_hir::{ExprKind, intravisit};
+    use rustc_span::Span;
+
+    use super::{RAW_EXPRESSION_FAULT, RAW_EXPRESSION_TEST_FN, raw_expression_operand};
+
+    /// libtree's `((*st).arr).offset(i)` (a raw field, not converted), json.h's
+    /// `(*value).payload as *mut u8` (a cast), `src.offset(k)` (a degraded local), and the
+    /// controls: `q.offset(k)` (a local delivered as a reference), `(*st).conv` (a converted field).
+    const SRC: &str = "#![allow(dead_code, unused_mut)]\n\
+        pub struct st_t { pub arr: *mut u8, pub conv: *mut u8, pub payload: *mut u8 }\n\
+        unsafe fn take(_: *mut u8) {}\n\
+        pub unsafe fn __crat_w6a_167_f(mut st: *mut st_t, mut src: *mut u8, mut q: *mut u8, mut i: isize) {\n\
+            take(((*st).arr).offset(i));\n\
+            take((*st).payload as *mut u8);\n\
+            take(src.offset(i));\n\
+            take(q.offset(i));\n\
+            take((*st).conv);\n\
+        }\n";
+
+    /// Per call argument of `take`, in order: whether it is known raw.
+    fn observe() -> Vec<bool> {
+        ::utils::compilation::run_compiler_on_str(SRC, |tcx| {
+            let owner = tcx
+                .hir_body_owners()
+                .find(|&owner| tcx.item_name(owner.to_def_id()).as_str() == RAW_EXPRESSION_TEST_FN)
+                .expect("the witness function");
+            struct Args(Vec<Span>);
+            impl<'tcx> intravisit::Visitor<'tcx> for Args {
+                fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+                    if let ExprKind::Call(_, [argument]) = e.kind {
+                        self.0.push(argument.span);
+                    }
+                    intravisit::walk_expr(self, e);
+                }
+            }
+            let mut args = Args(Vec::new());
+            intravisit::Visitor::visit_body(&mut args, tcx.hir_body_owned_by(owner));
+            let name_of = |local| tcx.hir_name(local).to_string();
+            args.0
+                .into_iter()
+                .map(|span| {
+                    raw_expression_operand(
+                        tcx,
+                        owner,
+                        span,
+                        // `src` degraded; `q` delivered as a reference.
+                        &|local| name_of(local) == "src",
+                        // `conv` (field 1) is converted by a field transaction.
+                        &|_, index| index != 1,
+                    )
+                })
+                .collect()
+        })
+        .expect("compiles")
+    }
+
+    #[test]
+    fn w6a_167_a_raw_expression_operand_known_raw_takes_the_spelling_and_a_reference_keeps_deref() {
+        RAW_EXPRESSION_FAULT.store(0, Ordering::SeqCst);
+        assert_eq!(observe(), vec![true, true, true, false, false]);
+        // Three faults, each caught: the local check off makes `q` raw; the field check off makes
+        // `conv` raw; the cast arm off loses json.h's payload cast.
+        let mut caught = Vec::new();
+        for fault in 1..=3u8 {
+            RAW_EXPRESSION_FAULT.store(fault, Ordering::SeqCst);
+            let seen = observe();
+            caught.push(match fault {
+                1 => seen[3],
+                2 => seen[4],
+                _ => !seen[1],
+            });
+        }
+        RAW_EXPRESSION_FAULT.store(0, Ordering::SeqCst);
+        assert_eq!(caught, vec![true; 3], "every fault is caught");
     }
 }
