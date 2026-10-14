@@ -292,6 +292,24 @@ fn view_operand(mut expression: &ast::Expr) -> &ast::Expr {
     expression
 }
 
+/// **R1128-1 (main 230) — the respelled reborrow.** Under
+/// `CRAT_BRIDGE_SPELLING=as-ref-unwrap` the bridge `&*e` / `&mut *e` is spelled
+/// `e.as_ref().unwrap()` / `e.as_mut().unwrap()`: the operand `e` of exactly that
+/// two-call chain (no arguments, no turbofish), or `None` for any other shape.
+/// lodepng's `let mut bpp = lodepng_get_bpp(color.as_ref().unwrap());` — R328-4's
+/// own line — took its ten `filterScanline` stamps with it on `batch61`.
+fn respelled_reborrow_operand(expression: &ast::Expr) -> Option<&ast::Expr> {
+    let ast::ExprKind::MethodCall(unwrap) = &unparen(expression).kind else { return None };
+    let ast::ExprKind::MethodCall(view) = &unparen(&unwrap.receiver).kind else { return None };
+    (unwrap.seg.ident.name.as_str() == "unwrap"
+        && unwrap.args.is_empty()
+        && unwrap.seg.args.is_none()
+        && matches!(view.seg.ident.name.as_str(), "as_ref" | "as_mut")
+        && view.args.is_empty()
+        && view.seg.args.is_none())
+    .then_some(&*view.receiver)
+}
+
 /// **R328-4 — the emitted initializer is the original with the emission's own
 /// call adapters applied.**
 ///
@@ -318,6 +336,12 @@ fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr
             if matches!(&unparen(inner).kind, ast::ExprKind::Unary(ast::UnOp::Deref, _))
     );
     if reborrowed && initializer_matches_modulo_adapters(original, view_operand(emitted)) {
+        return true;
+    }
+    // **R1128-1 (main 230)** -- the same reborrow under `CRAT_BRIDGE_SPELLING=as-ref-unwrap`.
+    if let Some(operand) = respelled_reborrow_operand(emitted)
+        && initializer_matches_modulo_adapters(original, operand)
+    {
         return true;
     }
     // **R494-1(b)** -- the outbound native-result block is the call it binds.

@@ -3598,3 +3598,55 @@ fn relay_303_a_variadic_argument_bridged_through_a_raw_method_is_raw() {
         );
     }
 }
+
+/// **R1128-1 (main 230) — the respelled reborrow is the reborrow.** Under
+/// `CRAT_BRIDGE_SPELLING=as-ref-unwrap` a non-null bridge reads
+/// `p.as_ref().unwrap()` / `p.as_mut().unwrap()` where it read `&*p` / `&mut *p`.
+/// lodepng's `filter` then opens `let mut bpp = lodepng_get_bpp(color.as_ref().unwrap());`,
+/// R328-4's very line, and its ten `filterScanline` stamps refused again on
+/// `batch61` (`initializer-original-binding-correspondence-unresolved`) because
+/// R328-4's relation knew only the deref spelling.
+///
+/// The strings are the real ones: the original from the derived lodepng source,
+/// the emitted from `batch61`'s own tree.
+#[test]
+fn r1128_1_the_respelled_reborrow_corresponds_in_an_initializer() {
+    use crate::bo_rewriter::bridge_custody_match::initializer_adapter_correspondence_for_test as corresponds;
+    let under = |original: &str, emitted: &str| {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || corresponds(original, emitted),
+        )
+    };
+
+    const ORIGINAL: &str = "lodepng_get_bpp(color)";
+    assert!(
+        under(ORIGINAL, "lodepng_get_bpp(&*color)"),
+        "control: R328-4's deref spelling"
+    );
+    assert!(
+        under(ORIGINAL, "lodepng_get_bpp(color.as_ref().unwrap())"),
+        "the shared respelling is the same reborrow"
+    );
+    assert!(
+        under(ORIGINAL, "lodepng_get_bpp(color.as_mut().unwrap())"),
+        "the mutable respelling is the same reborrow"
+    );
+
+    // Faults: each must refuse. Only the exact two-method chain over the SAME
+    // operand is the reborrow; anything else is a different value.
+    for other in [
+        "lodepng_get_bpp(other.as_ref().unwrap())",
+        "lodepng_get_bpp(color.as_ref())",
+        "lodepng_get_bpp(color.unwrap())",
+        "lodepng_get_bpp(color.as_ref().unwrap_or(fallback))",
+        "lodepng_get_bpp(color.as_ref().expect(\"color\"))",
+        "lodepng_get_bpp(color.offset(1).as_ref().unwrap())",
+        "lodepng_get_bpp(color.as_deref().unwrap())",
+        "lodepng_get_other(color.as_ref().unwrap())",
+    ] {
+        assert!(!under(ORIGINAL, other), "{other}");
+    }
+}
