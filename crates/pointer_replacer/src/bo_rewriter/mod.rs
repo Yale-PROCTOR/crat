@@ -73,6 +73,7 @@ pub(crate) mod additive;
 pub(crate) mod apply;
 pub(crate) mod artifact;
 pub(crate) mod bridge_receipt;
+pub(crate) mod bridge_spelling;
 pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;

@@ -2731,11 +2731,25 @@ impl<'a> SeamGraftVisitor<'a> {
         let core = match shape {
             None => core_arg,
             Some(shape) => {
-                let Some(kind) = glue_expr(shape, spec.mutable, core_arg, len) else {
-                    // `glue_expr` declines exactly one way: a length-bearing
-                    // shape with no length.
-                    self.stats.len_absent += 1;
-                    return None;
+                // R1128-1: the non-null raw-to-reference bridge takes the switch's spelling (the
+                // text renderer's condition: no unwrapped optional, not a `Some(..)` form).
+                let spelled = (matches!(shape, GlueShape::Reborrow)
+                    && !spec.optional
+                    && spec.unwrap.is_none()
+                    && spec.null_arm != NullArm::Checked)
+                    .then(|| super::bridge_spelling::expr_kind(core_arg.clone(), spec.mutable))
+                    .flatten();
+                let kind = match spelled {
+                    Some(kind) => kind,
+                    None => {
+                        let Some(kind) = glue_expr(shape, spec.mutable, core_arg, len) else {
+                            // `glue_expr` declines exactly one way: a length-bearing
+                            // shape with no length.
+                            self.stats.len_absent += 1;
+                            return None;
+                        };
+                        kind
+                    }
                 };
                 expr(kind)
             }
@@ -4083,9 +4097,15 @@ fn surface_argument(
             enclosing_unsafe_fn,
         )
     } else if matches!(form, Some(Form::Ref { mutable: true })) {
-        super::mechanical_receipt::present_unsafe_text(format!("&mut *{name}"), enclosing_unsafe_fn)
+        super::mechanical_receipt::present_unsafe_text(
+            super::bridge_spelling::text(&name, true, format!("&mut *{name}")),
+            enclosing_unsafe_fn,
+        )
     } else if matches!(form, Some(Form::Ref { mutable: false })) {
-        super::mechanical_receipt::present_unsafe_text(format!("&*{name}"), enclosing_unsafe_fn)
+        super::mechanical_receipt::present_unsafe_text(
+            super::bridge_spelling::text(&name, false, format!("&*{name}")),
+            enclosing_unsafe_fn,
+        )
     } else if ty.starts_with("Box<") && !ty.starts_with("Box<[") {
         // wave-6a W6A-T1: an owning parameter re-enters ownership from the raw
         // allocation the C ABI carried (every in-crate producer is

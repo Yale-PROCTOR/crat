@@ -654,10 +654,19 @@ pub(crate) fn render_bridge(
         let pointee = counted.handle_pointee?;
         // SAFETY: the input passes a pointer to one `T` here (its own
         // contract); the reborrow is of exactly that element.
+        // R1128-1: a non-null raw-to-reference bridge; the switch spells it.
         return Some(if spec.mutable {
-            format!("&mut *(({text}) as *mut {pointee})")
+            crate::bo_rewriter::bridge_spelling::text(
+                &format!("({text}) as *mut {pointee}"),
+                true,
+                format!("&mut *(({text}) as *mut {pointee})"),
+            )
         } else {
-            format!("&*(({text}) as *const {pointee})")
+            crate::bo_rewriter::bridge_spelling::text(
+                &format!("({text}) as *const {pointee}"),
+                false,
+                format!("&*(({text}) as *const {pointee})"),
+            )
         });
     }
     // R464-3: the count is read through `SeamLen::text()` — the single

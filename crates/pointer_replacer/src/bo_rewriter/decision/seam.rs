@@ -1830,7 +1830,20 @@ impl GlueSpec {
         };
         let inner = match self.core {
             GlueCore::Bare => base,
-            GlueCore::Reborrow => unsafe_expr(format!("{}*{base}", amp(self.mutable))),
+            GlueCore::Reborrow => {
+                let deref = format!("{}*{base}", amp(self.mutable));
+                // R1128-1: the NON-NULL raw-to-reference bridge (`c-raw-reborrow-*`) takes the
+                // switch's spelling; an unwrapped optional and the `Some(..)` forms keep `&*`.
+                if self.unwrap.is_none() && !self.optional && self.null_arm != NullArm::Checked {
+                    unsafe_expr(crate::bo_rewriter::bridge_spelling::text(
+                        &base,
+                        self.mutable,
+                        deref,
+                    ))
+                } else {
+                    unsafe_expr(deref)
+                }
+            }
             GlueCore::RawOption => {
                 let method = if self.mutable { "as_mut" } else { "as_ref" };
                 unsafe_expr(format!("{base}.{method}()"))

@@ -113,5 +113,10 @@ export CRAT_ERA5_EXECUTION_ROLE=derive
 export CRAT_ERA5_TOOLCHAIN_DIGEST=6735e704a73322e53cb1232d13385c3d34cf74df769eb40dba88a5eeac8bf951
 export CRAT_ERA5_DEPENDENCY_DIGEST=a69f265575ecd9b6ee35fde64f4f36e5c766f59cd743d68c343abad5ce987a51
 
+# R1128-1 (USER; main relay 332): the emission spelling of a NON-NULL raw-to-reference bridge --
+# p.as_ref().unwrap() / p.as_mut().unwrap() for &*p / &mut *p (bo_rewriter/bridge_spelling.rs; absent = deref).
+# Emission only: not in the solver identity, so the configuration digest and the model cache are unchanged.
+export CRAT_BRIDGE_SPELLING=as-ref-unwrap
+
 # NOT set here, because they are per program and the job JSON supplies them:
 #   CRAT_ERA5_PROGRAM, CRAT_ERA5_INPUT_ROOT, CRAT_ERA5_LAUNCH_DIGEST, DIR
