@@ -1,6 +1,0 @@
-key	value	provenance
-conf.fact.subjects	6015	scratch/analysis-fanout/r141/conf/conf-s39/c1.txt: sum of subjects= over 20 programs (wave-6o C1 FactFidelity); cross-check from census: subjects.tsv rows with model_kind!=unmodeled = 6015
-conf.cert.total	143	scratch/main/batch58pps39: realized subjects (subject-outcomes delivery=realized-as-predicted) whose delivered class (box-forms=owning; raw/unchanged=raw; else ref) != subjects.model_kind; pairs raw->box 43, raw->ref 3, ref->box-slice 2, ref->opt-box-slice 95; per program matched/total brotli 95/95, buffer 25/29, heman 0/3, quadtree 11/12, urlparser 4/4
-conf.cert.matched	135	of conf.cert.total, fn::local member-name join to the census certificate receipts (box-param, return-certificate, allocator-contract, field-transactions); by family allocator-contract 103, box-param 1, box-param+return-certificate 22, return-certificate 9; rows in departures-batch58pps39.tsv
-conf.retire.sites	382	scratch/analysis-fanout/r141/conf/conf-s39/c2.txt: sum of source_release_sites= over 20 programs (wave-6o C2 RetainedLifecycle)
-conf.retire.matched	382	scratch/analysis-fanout/r141/conf/conf-s39/c2.txt: sum of matched= over 20 programs (= ec2.mapped)

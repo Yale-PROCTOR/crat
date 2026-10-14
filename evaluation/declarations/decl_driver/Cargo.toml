@@ -1,0 +1,15 @@
+[package]
+name = "rq2_decl_driver"
+version = "0.1.0"
+edition = "2021"
+
+# CROWN's official declaration metric, as the crown_artifact_inventory library (unmodified) implements it
+# and as it reproduces the artifact's evaluation.tsv 20 / 20; this driver only lets the universe and the
+# emitted program be any pair (a Laertes output against CROWN's analysis of the same program).
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+crown_artifact_inventory = { path = "../../../crates/pointer_replacer/tools/crown_artifact_inventory" }
+
+[workspace]
