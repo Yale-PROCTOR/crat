@@ -117,6 +117,11 @@ export CRAT_ERA5_DEPENDENCY_DIGEST=a69f265575ecd9b6ee35fde64f4f36e5c766f59cd743d
 # p.as_ref().unwrap() / p.as_mut().unwrap() for &*p / &mut *p (bo_rewriter/bridge_spelling.rs; absent = deref).
 # Emission only: not in the solver identity, so the configuration digest and the model cache are unchanged.
 export CRAT_BRIDGE_SPELLING=as-ref-unwrap
+# R1130-1 / R1160-1 (USER; wave-6a relays 164/169, main relay 337): c2rust's read-modify-write temporary restored on a
+# raw-remaining root (`let __crat_fresh_N = &mut PLACE; *__crat_fresh_N op= ..`; bo_rewriter/rmw_relet.rs; absent = off),
+# the Tree Borrows rule: the RHS makes no call and has no side effect. Emission only: outside the solver identity, like
+# the bridge spelling.
+export CRAT_RMW_RELET=on
 
 # NOT set here, because they are per program and the job JSON supplies them:
 #   CRAT_ERA5_PROGRAM, CRAT_ERA5_INPUT_ROOT, CRAT_ERA5_LAUNCH_DIGEST, DIR
