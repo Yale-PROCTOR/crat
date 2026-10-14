@@ -2,10 +2,10 @@
 """relay 104: SLOC (seed_numbers.py's definition of record: non-blank, not-wholly-comment lines over .rs files except build.rs)
 per program, total and excluding data tables (a file at least 99.9 % of whose physical lines lie inside static/const initializers)."""
 import glob, importlib.util, json, os, sys
-sp = importlib.util.spec_from_file_location('sn', 'docs/agents/tools/seed_numbers.py')
+sp = importlib.util.spec_from_file_location('sn', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'record', 'seed_numbers.py'))
 spec2 = importlib.util.spec_from_file_location('fr', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frac_lib.py'))
 fr = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(fr)
-src = open('docs/agents/tools/seed_numbers.py').read()
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'record', 'seed_numbers.py')).read()
 ns = {}; exec(src[src.index('def sloc_of_text'):src.index('def sloc(root)')], ns); sloc_of_text = ns['sloc_of_text']
 base = sys.argv[1]; out = {}
 for prog in sorted(p for p in os.listdir(base) if os.path.isdir(os.path.join(base, p))):

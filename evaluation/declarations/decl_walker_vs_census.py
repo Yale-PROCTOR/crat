@@ -17,7 +17,7 @@ import argparse, csv, json, os, re, subprocess, sys
 from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'record'))
 import seed_numbers as SN  # noqa: E402
 
 csv.field_size_limit(10**9)

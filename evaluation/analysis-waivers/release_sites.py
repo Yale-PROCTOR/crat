@@ -11,9 +11,9 @@ From each of the L01^13 frame's twenty model-cache entries (mmap, windowed decod
     strdup), another foreign C function ('foreign'), an indirect call ('indirect'), a parameter, a load (a field or `*p`),
     a null / constant, or 'unresolved'.
   'opaque-origin' = a retracted release one of whose origins is 'indirect' or 'foreign'."""
-import collections, glob, json, mmap, re, sys
+import collections, glob, json, mmap, os, re, sys
 
-C = 'worktrees/era5c-l01p13-night-solve/cache/era5b-model-cache-v1'
+C = os.environ.get('MODEL_CACHE', 'worktrees/era5c-r215-kindorder/cache/era5b-model-cache-v1')  # the solve of record's cache (039 counted L01^13's; 127 re-counted this one)
 DEC = json.JSONDecoder()
 ALLOC = {'malloc', 'calloc', 'realloc', 'strdup'}
 
