@@ -64,7 +64,7 @@ fn check_origin(input: &str, held: bool) {
             "callee stays raw: {source}"
         );
         assert!(
-            !source.contains("&mut *"),
+            !source.contains("&mut *") && !source.contains(".as_mut().unwrap()"),
             "no mutable reference from shared origin: {source}"
         );
     } else {

@@ -236,12 +236,12 @@ fn w5c_mixed_boundary_output_state_delivers() {
     let text = flat(&emitted);
     // Where the owner's class is NOT applied (this reduction alone: its
     // `available_out` sibling flows into `WriteRingBuffer`'s raw parameter)
-    // the decided form shows at the bridged call, `&mut *s`; where the
+    // the decided form shows at the bridged call, `s.as_mut().unwrap()`; where the
     // composition applies it (batch 9's frame: `s: &mut …` in the signature)
     // the argument is already `&mut` and needs no bridge. Both are this
     // rule's claim — `s` reaches the converting callee as a reference.
     assert!(
-        text.contains("BrotliEnsureRingBuffer(&mut *s) == 0")
+        text.contains("BrotliEnsureRingBuffer(s.as_mut().unwrap()) == 0")
             || text.contains("BrotliEnsureRingBuffer(s) == 0"),
         "{emitted}"
     );

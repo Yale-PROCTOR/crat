@@ -10472,7 +10472,9 @@ mod arm2_witnesses {
             assert_eq!(guard.refused[0].holder, "use");
             let text = pprust::item_to_string(&krate.items[0]);
             assert!(
-                text.contains("p[1]") && !text.contains("&mut *"),
+                text.contains("p[1]")
+                    && !text.contains("&mut *")
+                    && !text.contains(".as_mut().unwrap()"),
                 "the holder's transform stands and the refused one did not \
                  land: {text}"
             );

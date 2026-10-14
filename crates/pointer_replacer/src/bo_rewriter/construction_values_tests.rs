@@ -178,7 +178,10 @@ fn wave6k_function_withdrawal_restores_both_copy_sites() {
     assert!(source.contains("p: *const u8"), "{source}");
     assert!(source.contains("let q = p"), "{source}");
     assert!(!source.contains("q: &u8"), "{source}");
-    assert!(!source.contains("&*p"), "{source}");
+    assert!(
+        !source.contains("&*p") && !source.contains("p.as_ref().unwrap()"),
+        "{source}"
+    );
 }
 
 /// heman `heman_ops_sobel::fresh13#271` (A12, relay 031): the copy's source is

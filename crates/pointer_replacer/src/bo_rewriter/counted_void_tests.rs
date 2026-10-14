@@ -1202,7 +1202,7 @@ fn w6v_void_handle_to_one_struct_takes_the_reference_form() {
     // The raw forwarder bridges its handle at the call: cast to the declared
     // pointee, reborrowed as one element.
     assert!(
-        c.contains("BZ2_bzRead(&mutbzerr,&*((b)as*constbzFile),len)"),
+        c.contains("BZ2_bzRead(&mutbzerr,((b)as*constbzFile).as_ref().unwrap(),len)"),
         "the raw argument is cast to the declared pointee and reborrowed: {source}"
     );
     assert!(super::verify::type_checks_str(&source));
@@ -1526,7 +1526,7 @@ fn w6v_raw_twin_is_refused_when_the_callee_body_calls_a_converted_local() {
     );
     assert!(
         c.contains("fnkmQuaternionLength(mutq:&kmQuaternion)")
-            && c.contains("kmQuaternionLength(&*pOut)"),
+            && c.contains("kmQuaternionLength(pOut.as_ref().unwrap())"),
         "the helper converts and the callee bridges into it: {source}"
     );
     assert!(
@@ -2082,7 +2082,7 @@ fn w6v_field_load_of_the_converted_root_is_not_its_alias() {
         "the tree takes its shared view; the node stays raw: {source}"
     );
     assert!(
-        c.contains("insert_(&*tree,(*tree).root,3asu32)"),
+        c.contains("insert_(tree.as_ref().unwrap(),(*tree).root,3asu32)"),
         "the loaded node pointer rides raw beside the view: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");

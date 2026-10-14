@@ -120,7 +120,10 @@ fn slicecursor_a_measured_only_end_sentinel_is_held_raw() {
         );
     }
     assert!(
-        !source.contains("&*input.offset("),
+        !source.contains("&*input.offset(")
+            && !regex::Regex::new(r"input\.offset\([^;]*\)\.as_ref\(\)\.unwrap\(\)")
+                .unwrap()
+                .is_match(&source),
         "no caller claims an element at an end pointer: {source}"
     );
 }

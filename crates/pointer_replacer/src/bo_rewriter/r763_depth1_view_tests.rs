@@ -286,7 +286,11 @@ fn r761_1_a_refused_element_address_of_a_raw_base_takes_the_fabricated_extent() 
         "{}",
         out.source
     );
-    assert!(!text.contains("from_ref(&*in_0"), "{}", out.source);
+    assert!(
+        !text.contains("from_ref(&*in_0") && !text.contains("from_ref(in_0.as_ref().unwrap()"),
+        "{}",
+        out.source
+    );
     assert!(
         !out.artifacts
             .subjects

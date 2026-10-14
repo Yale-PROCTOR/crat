@@ -77,7 +77,10 @@ fn wave6o_a_local_read_from_a_null_written_raw_field_is_not_plain() {
     let output = ast_emitted_source_of(INPUT).expect("native emission");
     let flat = output.split_whitespace().collect::<String>();
     assert!(!flat.contains("letmutelement:&element_s"), "{output}");
-    assert!(!flat.contains("&*(*element).next"), "{output}");
+    assert!(
+        !flat.contains("&*(*element).next") && !flat.contains("(*element).next.as_ref().unwrap()"),
+        "{output}"
+    );
     eprintln!("WAVE6O_RAW_FIELD_NULL_BEGIN\n{output}\nWAVE6O_RAW_FIELD_NULL_END");
     assert!(verify::type_checks_str(&output), "{output}");
 }

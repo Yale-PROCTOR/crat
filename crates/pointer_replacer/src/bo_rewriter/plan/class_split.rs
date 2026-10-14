@@ -923,7 +923,8 @@ pub unsafe fn check(chunk: *const u8, out: *mut u8, n: usize) {
         if let Some(tree) = got.emitted.as_deref() {
             let text = tree.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                !text.contains("from_ref(&*chunk.offset"),
+                !text.contains("from_ref(&*chunk.offset")
+                    && !text.contains("from_ref(chunk.offset("),
                 "the stale original text must not be emitted:\n{tree}"
             );
         }

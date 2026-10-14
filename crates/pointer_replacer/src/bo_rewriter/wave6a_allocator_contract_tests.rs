@@ -2384,7 +2384,9 @@ pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
     let out = emitted("w6a-160-raw-manager", &src);
     let text = compact(&out.source);
     assert!(
-        text.contains("Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(&mut*m,"),
+        text.contains(
+            "Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(m.as_mut().unwrap(),"
+        ),
         "the manager's bridge renders inside the bracketed construction:\n{}",
         out.source
     );

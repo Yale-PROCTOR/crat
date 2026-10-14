@@ -229,7 +229,11 @@ unsafe fn FindAllStaticDictionaryMatches(data: *const u8, l: usize, k: usize, n:
         "the one-element carrier must be a typed hold, or the row must deliver as the suffix: {receipts:?}"
     );
     let output = ast_emitted_source_of(input).expect("hold emission");
-    assert!(!output.contains("core::slice::from_ref(&*data"), "{output}");
+    assert!(
+        !output.contains("core::slice::from_ref(&*data")
+            && !output.contains("core::slice::from_ref(data.as_ref().unwrap()"),
+        "{output}"
+    );
     assert!(verify::type_checks_str(&output), "{output}");
 }
 

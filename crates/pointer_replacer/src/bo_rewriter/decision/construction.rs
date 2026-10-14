@@ -2699,7 +2699,10 @@ mod slice_construction_tests {
         let nullable = render_slice_constructor("next_ptr()", "i32", true, true, "8usize", true, 4);
         assert_eq!(nullable.matches("next_ptr()").count(), 1);
         assert!(nullable.contains("__crat_slice_ptr_4.as_mut().map("));
-        assert!(!nullable.contains("&mut *next_ptr()"));
+        assert!(
+            !nullable.contains("&mut *next_ptr()")
+                && !nullable.contains("next_ptr().as_mut().unwrap()")
+        );
     }
 }
 

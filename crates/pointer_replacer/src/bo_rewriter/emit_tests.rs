@@ -7227,12 +7227,14 @@ fn u0_w1_bridge_wrapper_tracks_enclosing_function_safety() {
     let attempt = e3_attempt_with(U0_W1_CONTEXT_PAIR, true, &force_u0_w1_target);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("unsafe fn unsafe_caller(p: *const i32) -> i32 { target(&*p) }"),
+        source.contains(
+            "unsafe fn unsafe_caller(p: *const i32) -> i32 { target(p.as_ref().unwrap()) }"
+        ),
         "unsafe caller must emit a bare legacy-edition bridge:\n{source}"
     );
     assert!(
         source
-            .contains("fn safe_caller(p: *const i32) -> i32 { unsafe { target(unsafe { &*p }) } }"),
+            .contains("fn safe_caller(p: *const i32) -> i32 { unsafe { target(unsafe { p.as_ref().unwrap() }) } }"),
         "safe caller must retain the bridge wrapper:\n{source}"
     );
     assert!(source.contains("pub unsafe fn unsafe_caller("), "{source}");
@@ -7323,11 +7325,11 @@ fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
     let attempt = e3_attempt_with(BR_W1_RAW_SCALARS, true, &force_br_w1_scalar_targets);
     let source = e2_root_text(&attempt);
     assert!(
-        source.contains("read_target(&*read_p)"),
+        source.contains("read_target(read_p.as_ref().unwrap())"),
         "shared raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
     );
     assert!(
-        source.contains("write_target(&mut *write_p)"),
+        source.contains("write_target(write_p.as_mut().unwrap())"),
         "mutable raw inbound bridge must be explicit and evaluate its operand once:\n{source}"
     );
 
@@ -7695,11 +7697,11 @@ fn br_w2_raw_optional_inbound_uses_as_ref_and_as_mut_once() {
         "mutable optional bridge must use as_mut exactly once:\n{source}"
     );
     assert!(
-        !source.contains("&*read_p"),
+        !source.contains("&*read_p") && !source.contains("read_p.as_ref().unwrap()"),
         "unchecked shared deref survived: {source}"
     );
     assert!(
-        !source.contains("&mut *write_p"),
+        !source.contains("&mut *write_p") && !source.contains("write_p.as_mut().unwrap()"),
         "unchecked mutable deref survived: {source}"
     );
     assert_eq!(source.matches("read_p.as_ref()").count(), 1, "{source}");
@@ -9116,7 +9118,10 @@ fn br_w13_raw_tail_to_safe_return_reuses_reborrow_and_lifetime_permit() {
         panic!("BR-W13 inbound return must emit: {outcome:#?}");
     };
     assert!(emitted.contains("&*p"), "{emitted}");
-    assert!(!emitted.contains("unsafe { &*p }"), "{emitted}");
+    assert!(
+        !emitted.contains("unsafe { &*p }") && !emitted.contains("unsafe { p.as_ref().unwrap() }"),
+        "{emitted}"
+    );
     let pair = raw_boundary_artifacts
         .bridge_events
         .iter()
@@ -9296,7 +9301,11 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
     );
     if let Some(emitted) = text_for(&emission, "lib.rs") {
         assert!(emitted.contains("p: *const i32"), "{emitted}");
-        assert!(!emitted.contains("unsafe { &*p }"), "{emitted}");
+        assert!(
+            !emitted.contains("unsafe { &*p }")
+                && !emitted.contains("unsafe { p.as_ref().unwrap() }"),
+            "{emitted}"
+        );
     }
 }
 
@@ -9330,7 +9339,11 @@ fn life_w1_kazmath_return_reuses_the_origin_parameter_lifetime() {
     assert!(source.contains(") -> &'a mut i32"), "{source}");
     assert!(!source.contains("'b"), "{source}");
     assert!(source.contains("&mut *p_out"), "{source}");
-    assert!(!source.contains("unsafe { &mut *p_out }"), "{source}");
+    assert!(
+        !source.contains("unsafe { &mut *p_out }")
+            && !source.contains("unsafe { p_out.as_mut().unwrap() }"),
+        "{source}"
+    );
 }
 
 /// LIFE-W2 RED: every permitted source of a multi-branch return joins the
@@ -10805,7 +10818,12 @@ fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
         reference_source.contains("core::ptr::from_mut(&mut *p)"),
         "{reference_source}"
     );
-    assert!(!reference_source.contains("&mut *__crat_a5_raw_"));
+    assert!(
+        !reference_source.contains("&mut *__crat_a5_raw_")
+            && !regex::Regex::new(r"__crat_a5_raw_\w*\.as_mut\(\)\.unwrap\(\)")
+                .unwrap()
+                .is_match(&reference_source)
+    );
     assert!(reference_source.contains("b: *mut i32"));
     assert!(super::verify::type_checks_str(&reference_source));
 
@@ -12274,7 +12292,10 @@ fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
     );
     assert!(source.contains("fn __crat_safe_api<'"), "{source}");
     assert!(source.contains("__crat_safe_api(&*p)"), "{source}");
-    assert!(!source.contains("unsafe { &*p }"), "{source}");
+    assert!(
+        !source.contains("unsafe { &*p }") && !source.contains("unsafe { p.as_ref().unwrap() }"),
+        "{source}"
+    );
     assert!(!source.contains("unsafe { __crat_safe_api"), "{source}");
     let surface_context = raw_boundary_artifacts
         .unsafe_context_events

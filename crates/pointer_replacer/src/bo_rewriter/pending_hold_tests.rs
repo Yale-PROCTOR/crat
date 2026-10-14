@@ -535,7 +535,9 @@ fn r861_1_a_held_operand_of_a_comparison_keeps_its_raw_text() {
     let or = signature(&out.source, "or");
     assert!(or.contains("c: *mut Num"), "held raw: {or}");
     assert!(
-        !out.source.contains("from_ref(c)") && !out.source.contains("from_mut(&mut *c)"),
+        !out.source.contains("from_ref(c)")
+            && !out.source.contains("from_mut(&mut *c)")
+            && !out.source.contains("from_mut(c.as_mut().unwrap())"),
         "no reference view of a held formal: {}",
         out.source
     );
