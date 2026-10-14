@@ -63,6 +63,86 @@ pub(crate) struct Facts {
     pub(crate) traversal_native: Option<super::traversal_native::Inputs>,
     pub(crate) fold_types: Option<super::fold_types::Inputs>,
     pub(crate) fold_declarations: Option<Vec<super::fold_declaration::Declaration>>,
+    /// R1165-1: the digest of every other field when `licensing` was frozen from them
+    /// ([`licensing_inputs_digest`]); the snapshot is read only by facts that still digest to it.
+    pub(crate) licensing_inputs: Option<[u8; 32]>,
+}
+
+/// R1165-1 (era-5c relay 232): sha256 over the `Debug` form of everything the licensing snapshot
+/// is built from -- every field but the snapshot and this digest. Equal digests mean the snapshot's
+/// derivation (a function of these facts) would come out the same, so a reader compares this
+/// instead of re-deriving the snapshot.
+pub(crate) fn licensing_inputs_digest(facts: &Facts) -> [u8; 32] {
+    use std::fmt::Write;
+
+    use sha2::Digest;
+
+    struct Sink(sha2::Sha256);
+    impl Write for Sink {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    let Facts {
+        frame_attested,
+        constructions,
+        licensing: _,
+        body_rosters,
+        return_selections,
+        phi_edges,
+        equations,
+        consumes,
+        terminals,
+        boundary_substitutions,
+        call_arg_registrations,
+        guards,
+        ownership_asts,
+        source_occurrences,
+        slot_refs,
+        raw_pointer_heads,
+        unit_locals,
+        reader_inputs,
+        reader_plan,
+        lend_plan,
+        field_support_inputs,
+        caller_coverage,
+        traversal_native,
+        fold_types,
+        fold_declarations,
+        licensing_inputs: _,
+    } = facts;
+    let mut sink = Sink(sha2::Sha256::new());
+    let fields: [&dyn std::fmt::Debug; 23] = [
+        frame_attested,
+        constructions,
+        body_rosters,
+        return_selections,
+        phi_edges,
+        equations,
+        consumes,
+        terminals,
+        boundary_substitutions,
+        call_arg_registrations,
+        guards,
+        ownership_asts,
+        source_occurrences,
+        slot_refs,
+        raw_pointer_heads,
+        unit_locals,
+        reader_inputs,
+        reader_plan,
+        lend_plan,
+        field_support_inputs,
+        caller_coverage,
+        traversal_native,
+        fold_types,
+    ];
+    for field in fields {
+        write!(sink, "{field:?}\u{1f}").expect("digest sink");
+    }
+    write!(sink, "{fold_declarations:?}").expect("digest sink");
+    sink.0.finalize().into()
 }
 
 /// R351-3: which pass this construction is. Pass 1 is the era-5a solve as the
@@ -225,5 +305,6 @@ pub(crate) fn freeze(builder: Builder, ownership_asts: IndexVec<Var, Bool>) -> R
         .into_inner();
     facts.ownership_asts = ownership_asts;
     facts.licensing = Some(Rc::new(super::snapshot::FrozenTransport::build(&facts)));
+    facts.licensing_inputs = Some(licensing_inputs_digest(&facts));
     Rc::new(facts)
 }

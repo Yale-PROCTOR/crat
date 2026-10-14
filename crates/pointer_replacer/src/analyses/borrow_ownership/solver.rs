@@ -1805,25 +1805,19 @@ impl KindSolver {
             .licensing
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("first-permission facts missing"))?;
-        let current_matched = super::licensing::matched::MatchedTransport::build(facts);
-        let current_origins = super::licensing::value_origins::ValueOrigins::build(facts);
-        let mut fields = super::licensing::field_support::audit(
-            facts,
-            &facts.field_support_inputs,
-            &current_matched,
-            &current_origins,
-        );
-        let checked = super::licensing::first_permission::plan(
-            facts,
-            &mut fields,
-            current_matched.guard_aliases(),
-        );
+        // R1165-1 (era-5c relay 232): the frozen snapshot's plan, field support and transport are
+        // read as they are, once these facts still digest to the ones they were frozen from. The
+        // preflight re-derived all three from the facts and compared them, which cost as much as
+        // the snapshot (`MatchedTransport::build` again); equal inputs give equal derivations.
         anyhow::ensure!(
-            checked == frozen.first_permissions && fields == frozen.field_support,
+            facts.licensing_inputs == Some(super::licensing::facts::licensing_inputs_digest(facts)),
             "first-permission preflight differs"
         );
+        let checked = &frozen.first_permissions;
+        let fields = &frozen.field_support;
+        let guard_aliases = frozen.matched.guard_aliases();
         let mut clauses = Vec::new();
-        for decision in &checked {
+        for decision in checked {
             let guard = &facts
                 .guards
                 .iter()
@@ -1858,12 +1852,8 @@ impl KindSolver {
                     .find(|field| field.field_key == chain.put.field_key && field.supported())
                     .ok_or_else(|| anyhow::anyhow!("complete-chain all-store proof missing"))?;
                 anyhow::ensure!(
-                    super::licensing::chain_permission::certify(
-                        facts,
-                        field,
-                        current_matched.guard_aliases()
-                    )
-                    .as_ref()
+                    super::licensing::chain_permission::certify(facts, field, guard_aliases)
+                        .as_ref()
                         == Some(chain.as_ref()),
                     "complete-chain current proof differs"
                 );
