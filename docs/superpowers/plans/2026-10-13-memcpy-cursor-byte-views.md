@@ -1,5 +1,7 @@
 # Memcpy Cursor Byte Views Implementation Plan
 
+> **Needs revision (2026-10-14):** The [current spec](../specs/2026-10-13-memcpy-cursor-byte-views-design.md) now extends `ArrayPtr` and reuses the existing memcpy branches. The separate `MemcpyByteView` / `transform_memcpy_bytes` architecture below is superseded. Do not execute this plan until its architecture and affected tasks are aligned with the revised spec.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the 360 measured SPHINCS cursor-source memcpy calls with bounded `copy_from_slice` operations, without changing cursor owners.
