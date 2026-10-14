@@ -5506,6 +5506,21 @@ fn transform_with<'tcx>(
     super::arg_order_hoist::apply(table, &mut krate, &mut guard);
     apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
     super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
+    // R1130-1 (relay wave-6a/164): after every other pass, emission only.
+    let rmw = super::rmw_relet::apply(tcx, table, reverts, &mut krate, &mut guard);
+    if rmw != super::rmw_relet::RmwStats::default() {
+        eprintln!(
+            "RMW-RELET relet={} skipped_call_index={} skipped_unresolved={} safe_root={} claimed={} reverted={} rhs_touches_memory={} packed={}",
+            rmw.relet,
+            rmw.skipped_call_index,
+            rmw.skipped_unresolved,
+            rmw.safe_root,
+            rmw.claimed,
+            rmw.reverted,
+            rmw.rhs_touches_memory,
+            rmw.packed
+        );
+    }
 
     // **Each pass counts its OWN refusals**, at the site where it was turned
     // away. This used to recompute `decls.refused` here by summing

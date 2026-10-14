@@ -178,6 +178,9 @@ mod retention_waiver_tests;
 pub(crate) mod revert_closure;
 #[cfg(test)]
 mod revert_closure_tests;
+mod rmw_relet;
+#[cfg(test)]
+mod rmw_relet_tests;
 mod shared_pair_ast;
 #[cfg(test)]
 mod shared_pair_tests;
