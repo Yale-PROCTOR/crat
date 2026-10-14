@@ -31,12 +31,14 @@ extern crate smallvec;
 extern crate thin_vec;
 
 mod analyses;
+mod bo_pipeline;
 mod bo_rewriter;
 mod coverage_recon;
 mod raw_boundary_census_schema;
 mod rewriter;
 mod utils;
 
+pub use bo_pipeline::{BoReceipt, env_from_file as bo_env_from_file, rewrite_bo};
 pub use rewriter::{
     BytemuckDependency, Config, replace_local_borrows, rewrite_array_local_provenance,
     rewrite_epoch_split, rewrite_struct_arrays,

@@ -131,6 +131,13 @@ struct Args {
     points_to_file: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
+    #[arg(
+        long,
+        help = "File of analysis switches for the bo pass (default: $DIR/config/analysis-env.sh, else the frame env of record under $DIR/crates/pointer_replacer/frames)"
+    )]
+    bo_env: Option<PathBuf>,
+    #[arg(long, help = "Write the bo pass's emission receipt to this file")]
+    bo_receipt: Option<PathBuf>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -166,6 +173,7 @@ enum Pass {
     Enum,
     Io,
     Pointer,
+    Bo,
     Static,
     Simpl,
 }
@@ -383,6 +391,9 @@ fn main() {
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
 
+    let bo_env = args.bo_env;
+    let bo_receipt = args.bo_receipt;
+
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
             eprintln!("Analysis output is not supported when running passes");
@@ -582,6 +593,38 @@ fn main() {
                     utils::bytemuck::ensure_bytemuck_with_derive(&dir);
                 } else if bytemuck.needs_runtime() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+            }
+            Pass::Bo => {
+                let env_file = bo_env.clone().or_else(|| {
+                    let dir = PathBuf::from(std::env::var_os("DIR")?);
+                    [
+                        dir.join("config/analysis-env.sh"),
+                        dir.join("crates/pointer_replacer/frames/l01p14u-s39-mutlend-o-env.sh"),
+                    ]
+                    .into_iter()
+                    .find(|path| path.is_file())
+                });
+                if let Some(path) = &env_file {
+                    let n = pointer_replacer::bo_env_from_file(path).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    });
+                    if config.verbose {
+                        println!("bo: {n} variables set from {}", path.display());
+                    }
+                }
+                let receipt = pointer_replacer::rewrite_bo(
+                    &file,
+                    config.pointer.c_exposed_fns.iter().cloned(),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                println!("{}", receipt.summary());
+                if let Some(path) = &bo_receipt {
+                    std::fs::write(path, receipt.render()).unwrap();
                 }
             }
             Pass::Static => {

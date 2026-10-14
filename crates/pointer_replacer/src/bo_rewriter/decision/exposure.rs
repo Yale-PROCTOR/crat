@@ -61,6 +61,22 @@ impl ConfiguredExposureInput {
         })
     }
 
+    /// The names as configured by the driver (`--c-exposed-fn`), digested here rather than
+    /// claimed by a TSV row.
+    pub(crate) fn from_names(
+        provenance: impl Into<String>,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<Self, ExposureInputFailure> {
+        let mut canonical = BTreeSet::new();
+        for name in names {
+            if !canonical.insert(name.clone()) {
+                return Err(ExposureInputFailure::DuplicateName(name));
+            }
+        }
+        let digest = sha256(&canonical_name_bytes(&canonical));
+        Self::checked(provenance, canonical, digest)
+    }
+
     pub(crate) fn explicit_empty(provenance: impl Into<String>) -> Self {
         Self::checked(
             provenance,
