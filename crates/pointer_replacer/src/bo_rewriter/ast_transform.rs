@@ -2734,6 +2734,7 @@ impl<'a> SeamGraftVisitor<'a> {
                 // R1128-1: the non-null raw-to-reference bridge takes the switch's spelling (the
                 // text renderer's condition: no unwrapped optional, not a `Some(..)` form).
                 let spelled = (matches!(shape, GlueShape::Reborrow)
+                    && spec.raw_operand
                     && !spec.optional
                     && spec.unwrap.is_none()
                     && spec.null_arm != NullArm::Checked)

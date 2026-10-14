@@ -1336,6 +1336,11 @@ pub(crate) struct GlueSpec {
     /// declaration planner's rendering), never a slice of the length on a
     /// null pointer.
     pub(crate) null_base_empty: bool,
+    /// **R1128-1 / relay 334**: the operand is KNOWN to be a raw pointer (a subject whose final decision is
+    /// `Degraded`, or an array decay `….as_mut_ptr()` / `.as_ptr()`), so a non-null reborrow of it may take
+    /// the `CRAT_BRIDGE_SPELLING` method form. False by default: a reference or `Box` operand (a converted
+    /// formal, a copy source, an owner view, a delivered field) keeps `&*` / `&mut *`.
+    pub(crate) raw_operand: bool,
 }
 
 impl GlueSpec {
@@ -1373,6 +1378,8 @@ impl GlueSpec {
             checked_binding_type: None,
             option_view: None,
             null_base_empty: false,
+
+            raw_operand: false,
         }
     }
 
@@ -1441,6 +1448,8 @@ impl GlueSpec {
             checked_binding_type: None,
             option_view: None,
             null_base_empty: false,
+
+            raw_operand: false,
         }
     }
 
@@ -1473,6 +1482,8 @@ impl GlueSpec {
             checked_binding_type: None,
             option_view: None,
             null_base_empty: false,
+
+            raw_operand: false,
         }
     }
 
@@ -1834,7 +1845,11 @@ impl GlueSpec {
                 let deref = format!("{}*{base}", amp(self.mutable));
                 // R1128-1: the NON-NULL raw-to-reference bridge (`c-raw-reborrow-*`) takes the
                 // switch's spelling; an unwrapped optional and the `Some(..)` forms keep `&*`.
-                if self.unwrap.is_none() && !self.optional && self.null_arm != NullArm::Checked {
+                if self.raw_operand
+                    && self.unwrap.is_none()
+                    && !self.optional
+                    && self.null_arm != NullArm::Checked
+                {
                     unsafe_expr(crate::bo_rewriter::bridge_spelling::text(
                         &base,
                         self.mutable,
@@ -3667,6 +3682,22 @@ impl SeamPlan {
     }
 }
 
+/// **R1128-1 / relay 334 — whether a seam operand is KNOWN to be a raw pointer**, so that a non-null
+/// reborrow of it may take the `CRAT_BRIDGE_SPELLING` method form. `local` is `Some(decision)` for a
+/// bare (or cast) local argument, `None` for any other shape. A local is raw only as a subject whose
+/// final decision is `Degraded` (a `Box` or a reference subject, and a non-subject binding such as a
+/// `let ref mut` reference, are not); another shape only as an array decay (`….as_mut_ptr()` /
+/// `….as_ptr()`, a raw pointer by its type). Anything else keeps `&*` / `&mut *`.
+pub(crate) fn known_raw_operand(local: Option<Option<&Decision>>, text: Option<&str>) -> bool {
+    match local {
+        Some(decision) => matches!(decision, Some(Decision::Degraded(_))),
+        None => text.is_some_and(|text| {
+            let text = text.trim_end();
+            text.ends_with(".as_mut_ptr()") || text.ends_with(".as_ptr()")
+        }),
+    }
+}
+
 /// The form a decision emits.
 pub(crate) fn form_of(decision: &Decision) -> Form {
     match decision {
@@ -4221,6 +4252,7 @@ fn build_candidate(
     counted: Option<(&super::counted_void::Contract, super::counted_void::Route)>,
     field_tied: bool,
     region: Option<&super::void_region::Region>,
+    raw_operand: bool,
 ) -> Result<Option<Candidate>, SeamBlock> {
     if counted.is_some() && found != Form::Raw {
         return Err(SeamBlock::UnnameableOperand);
@@ -4244,9 +4276,10 @@ fn build_candidate(
     } else {
         glue(expected, found, len_text)?
     };
-    let Some((spec, family)) = answer else {
+    let Some((mut spec, family)) = answer else {
         return Ok(None);
     };
+    spec.raw_operand = raw_operand;
     // **R622-1 / R628-2 — the extent conjunct on the `(Slice, Ref)` row
     // (R416-5).** `from_ref` / `from_mut` hands the callee ONE element; a formal
     // the callee accesses past it (offset or index, a cast from `c_void`, or a
@@ -5359,6 +5392,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// its pairs with OTHER counted positions (`disjoint_roots`),
                 /// never one with a delivered sibling (`[only]` skips it).
                 counted_raw_local: bool,
+                /// R1128-1 / relay 334: the argument is KNOWN raw (see `GlueSpec::raw_operand`).
+                raw_operand: bool,
                 /// A literal `None` carries no borrow and therefore cannot
                 /// participate in the site's overlap relation.
                 borrows: bool,
@@ -5629,6 +5664,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                     && super::counted_void::parameter(table, *callee, arg.index)
                         .is_some_and(|contract| contract.handle.is_none());
                 let raw_local = stays_raw_local && !counted_raw_local;
+                // R1128-1 / relay 334: the operand is KNOWN raw only as a subject whose final decision is
+                // `Degraded` (not a `Box`, not a non-subject binding such as a `let ref mut` reference)
+                // or as an array decay; anything else keeps `&*` under the bridge spelling.
+                let raw_operand = known_raw_operand(
+                    match arg.shape {
+                        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => {
+                            Some(decision_of.get(&(site.caller, binding)).copied())
+                        }
+                        _ => None,
+                    },
+                    text.as_deref(),
+                );
                 // wave-6a (R422-5): a Box-decided argument the owner-view glue
                 // renders IS the expected form at the call (`&*x`,
                 // `x.as_deref().unwrap()`, ..): the position is a glue-arm
@@ -5656,6 +5703,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     blind,
                     raw_local,
                     counted_raw_local,
+                    raw_operand,
                     borrows,
                     literal_null,
                     raw_boundary_observation,
@@ -6495,6 +6543,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             None,
                             field_tied_params.contains(&pos.index),
                             None,
+                            false,
                         )
                         .map(|candidate| candidate.map(mark_refused))
                     } else {
@@ -6520,6 +6569,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             counted,
                             field_tied_params.contains(&pos.index),
                             region,
+                            pos.raw_operand,
                         )
                         // wave-6b (R609-4 (a)): a byte-region write side whose
                         // read-side peer stayed raw because the pair is not
@@ -6609,6 +6659,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             None,
                             field_tied_params.contains(&pos.index),
                             None,
+                            false,
                         )
                         .map(|candidate| candidate.map(mark_refused))
                     } else {
@@ -6650,6 +6701,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             counted,
                             field_tied_params.contains(&pos.index),
                             region,
+                            pos.raw_operand,
                         )
                         .map(|candidate| candidate.map(mark_refused))
                     };
@@ -8762,5 +8814,85 @@ mod r738_1_census_n_override {
             receipt.ends_with(&format!("FALLBACK_SLICE_EXTENT={expected}")),
             "{receipt}"
         );
+    }
+}
+
+/// R1128-1 / relay 334 (wave-5d 154): the method spelling reaches only an operand KNOWN to be raw.
+#[cfg(test)]
+mod bridge_spelling_operand_tests {
+    use super::{Decision, Form, GlueCore, GlueSpec, known_raw_operand, owner_view_candidate};
+    use crate::bo_rewriter::{
+        bridge_spelling::with_spelling,
+        decision::{
+            Degradation, DegradeReason,
+            box_facts::{BoxPlan, BoxShape},
+        },
+    };
+
+    fn degraded() -> Decision {
+        Decision::Degraded(Degradation {
+            subject: "p".to_owned(),
+            site: "-".to_owned(),
+            reason: DegradeReason::ReturnNotAdapted,
+        })
+    }
+
+    fn boxed() -> Decision {
+        Decision::Box(BoxPlan {
+            shape: BoxShape::Sized,
+            optional: true,
+            expr_edits: Vec::new(),
+            delete_statements: Vec::new(),
+            receipts: Vec::new(),
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: false,
+            overwrite_spans: Vec::new(),
+            retained_sink: false,
+            implicit_scope_close: false,
+        })
+    }
+
+    /// A reference operand (a converted formal, a copy source) keeps `&*`: its subject decides `Ref`,
+    /// so it is not KNOWN raw, and a spec not marked raw renders the deref spelling with the switch on.
+    #[test]
+    fn a_reference_operand_keeps_the_deref_spelling() {
+        let reference = Decision::Ref { mutable: false };
+        assert!(!known_raw_operand(Some(Some(&reference)), Some("p")));
+        assert!(
+            !known_raw_operand(Some(None), Some("fresh")),
+            "a non-subject binding (`let ref mut`)"
+        );
+        assert!(
+            !known_raw_operand(None, Some("(*s).ptr")),
+            "a field place: its delivered form is not seen"
+        );
+        assert!(known_raw_operand(Some(Some(&degraded())), Some("p")));
+        assert!(known_raw_operand(None, Some("tmp.as_mut_ptr()")));
+        with_spelling(true, || {
+            let mut spec = GlueSpec::core(GlueCore::Reborrow, false);
+            let text = spec.render("p").unwrap();
+            assert!(text.contains("&*p") && !text.contains("as_ref"), "{text}");
+            spec.raw_operand = true;
+            let text = spec.render("p").unwrap();
+            assert!(text.contains("p.as_ref().unwrap()"), "{text}");
+        });
+    }
+
+    /// A `Box` operand keeps `&*`: its subject is not KNOWN raw, and the owner's view (wave-6a's
+    /// `area(&*s)`) renders the deref spelling with the switch on (`s.as_ref()` would be `AsRef`).
+    #[test]
+    fn a_box_operand_keeps_the_deref_spelling() {
+        let owner = boxed();
+        assert!(!known_raw_operand(Some(Some(&owner)), Some("s")));
+        with_spelling(true, || {
+            let view = owner_view_candidate(Some(&owner), Form::Ref { mutable: false }, "s")
+                .expect("an optional owner has a reference view");
+            assert!(
+                view.replacement.contains("&*s") && !view.replacement.contains("as_ref"),
+                "{}",
+                view.replacement
+            );
+        });
     }
 }
