@@ -2543,6 +2543,11 @@ pub(crate) struct RetentionSummaries {
     /// CONSUMES where it is produced — the result is only read through in the
     /// caller's body. Keyed by (caller, block, statement index of the call).
     consumed_results: FxHashSet<(LocalDefId, u32, u32)>,
+    /// R1181-1 / R1187-1 (era-5c relays 238 / 239, fix (iii)): `verify_certificate`'s replay of
+    /// the retention fixpoint, computed once. It is `evaluate_retention(&facts, attested)` -- a
+    /// pure function of fields `derive` sets and nothing mutates afterwards -- so every site's
+    /// replay was the same map; filled by the first `verify_certificate`, read by the rest.
+    replay: std::sync::OnceLock<FxHashMap<(LocalDefId, usize), RetentionVerdict>>,
     /// wave-6r (relay 021): the (caller, callee, argument) positions whose
     /// Return-only retention is settled at EVERY call in that caller — the
     /// returned alias is discarded or consumed there. The seam reads the
@@ -4755,6 +4760,7 @@ impl RetentionSummaries {
             settled_returned_aliases,
             type_backed_children,
             pointer_free_parameters,
+            replay: std::sync::OnceLock::new(),
         }
     }
 
@@ -4950,7 +4956,9 @@ impl RetentionSummaries {
         argument_index: usize,
         certificate: &RetentionCertificate,
     ) -> Result<(), &'static str> {
-        let replay = evaluate_retention(&self.facts, self.attested);
+        let replay = self
+            .replay
+            .get_or_init(|| evaluate_retention(&self.facts, self.attested));
         let sorted_unique = certificate.steps.windows(2).all(|pair| pair[0] < pair[1]);
         match replay.get(&(function, argument_index)) {
             Some(RetentionVerdict::NoRetain {
@@ -4958,6 +4966,14 @@ impl RetentionSummaries {
             }) if expected == certificate && sorted_unique => Ok(()),
             _ => Err("retention-certificate-invalid"),
         }
+    }
+
+    /// R1181-1's witness: the memoized replay equals a fresh one (the pre-fix per-call path).
+    #[cfg(test)]
+    pub(crate) fn replay_is_fresh(&self) -> bool {
+        self.replay
+            .get()
+            .is_some_and(|memo| *memo == evaluate_retention(&self.facts, self.attested))
     }
 
     pub(crate) fn to_tsv(&self) -> String {
@@ -8188,7 +8204,15 @@ mod tests {
                 .clone();
             let verification = match &verdict {
                 RetentionVerdict::NoRetain { certificate } => {
-                    summaries.verify_certificate(function, 0, certificate)
+                    let first = summaries.verify_certificate(function, 0, certificate);
+                    // R1181-1 (fix (iii)): the second call reads the memoized replay, which
+                    // must answer as the first and equal a fresh fixpoint.
+                    assert_eq!(
+                        summaries.verify_certificate(function, 0, certificate),
+                        first
+                    );
+                    assert!(summaries.replay_is_fresh(), "memoized replay is stale");
+                    first
                 }
                 _ => Err("not-a-certificate"),
             };
