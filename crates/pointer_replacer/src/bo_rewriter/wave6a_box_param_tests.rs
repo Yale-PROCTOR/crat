@@ -2506,7 +2506,7 @@ fn w6a_r564_a_box_owner_field_crosses_at_the_c_arm_around_the_owner_edit() {
         out.source
     );
     assert!(
-        src.contains("walk(&mut*(*tree.as_deref_mut().unwrap()).root);"),
+        src.contains("walk((*tree.as_deref_mut().unwrap()).root.as_mut().unwrap());"),
         "{}\n{receipts}",
         out.source
     );

@@ -855,7 +855,9 @@ fn w6a_a1b_quadtree_assignment_receivers_stores_and_the_stored_call_deliver() {
         out.source
     );
     assert!(
-        src.contains("quadtree_bounds_extend(&mut*(*node).bounds,maxx,maxy);returnSome(node);}"),
+        src.contains(
+            "quadtree_bounds_extend((*node).bounds.as_mut().unwrap(),maxx,maxy);returnSome(node);}"
+        ),
         "{}",
         out.source
     );

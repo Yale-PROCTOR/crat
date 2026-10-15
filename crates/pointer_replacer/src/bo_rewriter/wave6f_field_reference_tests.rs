@@ -525,7 +525,7 @@ fn w6f_indirect_call_argument_bridges_under_t2() {
     for needle in [
         "pub unsafe extern \"C\" fn quadtree_walk(mut root: &mut quadtree_node_t,",
         ".expect(\"non-null function pointer\")(root);",
-        "quadtree_walk(&mut *(*root).nw, descent, ascent);",
+        "quadtree_walk((*root).nw.as_mut().unwrap(), descent, ascent);",
     ] {
         assert!(source.contains(needle), "missing {needle:?} in\n{source}");
     }

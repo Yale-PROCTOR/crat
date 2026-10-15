@@ -6088,7 +6088,7 @@ fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
         "the raw-expression bridge must be typed as the scalar template:\n{seams}"
     );
     assert!(
-        emitted.contains("scalar(&*base.offset(k))"),
+        emitted.contains("scalar(base.offset(k).as_ref().unwrap())"),
         "the call-scoped shared reborrow must surround the whole expression:\n{emitted}"
     );
 }
