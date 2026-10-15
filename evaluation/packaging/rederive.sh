@@ -45,8 +45,8 @@ mkdir -p $W/config; grep -E '^export ' $W/$ENVREL | sed -E 's/[[:space:]]+#.*$//
 { echo '#!/bin/bash'; cat $ZS/env-exports.txt; echo 'export SYSROOT="$(rustc --print sysroot)"'; echo 'export LD_LIBRARY_PATH="$SYSROOT/lib:$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'; } > $W/config/analysis-env.sh; chmod +x $W/config/analysis-env.sh
 echo "   config/analysis-env.sh: $(grep -c '^export' $W/config/analysis-env.sh) exports from $ENVREL"
 
-step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/packaging = this pipeline, which carries the identity list and the rename map)"
-for p in .compound-engineering .github .gitignore .claudignore CLAUDE.md AGENTS.md .claude .codex .vscode M0-KNOWN-DEFECTS.md README.md LICENSE benchmarks tool.py rustfmt.toml examples crates/pointer_replacer/frames crates/pointer_replacer/tools crates/finders crates/io_replacer crates/merger crates/outparam_replacer crates/static_replacer crates/union_replacer src/bin/crat-finder.rs src/bin/crat-merge.rs crat-finder crat-merge crates/passes/src/bin_file_adder.rs crates/passes/src/enum_replacer crates/passes/src/formatter.rs crates/passes/src/interface_fixer.rs crates/passes/src/libc_replacer crates/passes/src/simplifier crates/passes/src/simplifier.rs crates/passes/src/splitter.rs crates/passes/src/unexpander.rs crates/passes/src/unsafe_resolver crates/utils/src/bit_set.rs crates/utils/src/unsafety.rs evaluation/packaging; do [ -e $W/$p ] && git -C $W rm -r -q -f -- $p; done
+step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/ whole: the kit is not in the zip, USER 10-15 08:2xZ)"
+for p in .compound-engineering .github .gitignore .claudignore CLAUDE.md AGENTS.md .claude .codex .vscode M0-KNOWN-DEFECTS.md README.md LICENSE benchmarks tool.py rustfmt.toml examples crates/pointer_replacer/frames crates/pointer_replacer/tools crates/finders crates/io_replacer crates/merger crates/outparam_replacer crates/static_replacer crates/union_replacer src/bin/crat-finder.rs src/bin/crat-merge.rs crat-finder crat-merge crates/passes/src/bin_file_adder.rs crates/passes/src/enum_replacer crates/passes/src/formatter.rs crates/passes/src/interface_fixer.rs crates/passes/src/libc_replacer crates/passes/src/simplifier crates/passes/src/simplifier.rs crates/passes/src/splitter.rs crates/passes/src/unexpander.rs crates/passes/src/unsafe_resolver crates/utils/src/bit_set.rs crates/utils/src/unsafety.rs evaluation; do [ -e $W/$p ] && git -C $W rm -r -q -f -- $p; done
 find $W/crates $W/src -type f \( -name '*_tests.rs' -o -name 'tests.rs' -o -name 'test_*.py' \) -print0 | xargs -0 -r git -C $W rm -q -f --
 find $W/crates $W/src -type d -name tests -print0 | xargs -0 -r git -C $W rm -r -q -f --
 python3 - <<'PY'
@@ -91,15 +91,14 @@ $TOOLS/rslex strip $(cat $KEPT) > $ZS/strip-rs.tsv; awk -F'\t' '{f++; c+=$2} END
 python3 -I $P/strip_misc.py toml $W/Cargo.toml $W/crates/*/Cargo.toml $W/deps_crate/Cargo.toml $W/deps_crate/Cargo.lock > $ZS/strip-toml.tsv; awk -F'\t' '{c+=$2} END {printf "   toml comments_removed=%d\n", c}' $ZS/strip-toml.tsv
 commit "Packaging C: the comment strip"
 
-step "5 rename crat -> jobcrat (rules 1-6, the kit included) + file moves"
+step "5 rename crat -> jobcrat (rules 1-6) + file moves"
 python3 -I $P/rename.py apply > $ZS/rename-map.tsv 2> $ZS/rename-map.err; grep '#COUNTS' $ZS/rename-map.err
-echo "   in evaluation/: $(grep -c '^evaluation/' $ZS/rename-map.tsv) occurrences in $(cut -f1 $ZS/rename-map.tsv | grep '^evaluation/' | sort -u | wc -l) files"
 git -C $W mv src/bin/crat.rs src/bin/jobcrat.rs; git -C $W mv crat jobcrat
 commit "Packaging D: the rename"
 
 step "6 string edits (001 s4, 003, 005), the kit copy's edits (007), lint reasons"
 python3 -I $P/edits.py | tee $ZS/edits.txt | tail -3
-python3 -I $P/kit_edits.py | tee $ZS/kit-edits.txt | tail -1
+[ -d $W/evaluation ] && python3 -I $P/kit_edits.py | tee $ZS/kit-edits.txt | tail -1 || echo "   no kit in the tree (kit_edits.py not run)"
 git -C $W grep -l -E 'reason\s*=\s*"' -- '*.rs' | sort > $ZS/reason-files.txt; python3 -I $P/strip_reasons.py $ZS/reason-files.txt > $ZS/reasons-deleted.tsv 2> $ZS/reasons.err; cat $ZS/reasons.err
 commit "Packaging E: the string edits, the kit copy's edits and the lint reasons"
 
@@ -115,7 +114,7 @@ echo "   fingerprints: $(git -C $W grep -n -E -e '@2026-|"r[0-9]{3}-|"s23-|s23-f
 find $W/crates $W/src $W/deps_crate -name '*.rs' -type f | sort > $KEPT; echo "   comments left: $($TOOLS/rslex count $(cat $KEPT) | awk -F'\t' '{c+=$2} END {print c}')"
 rm -rf $ZS/tok; mkdir -p $ZS/tok; for f in $(cat $KEPT); do $TOOLS/rslex dump "$f" > "$ZS/tok/$(echo ${f#$W/} | tr '/' '_')"; done
 echo "   list-2 in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -i -w -E -c 'seat|relay|lane|wave|era5|batch|census'); comment markers in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -c -E '\\n\s*(//|/\*)'); README internal words: $(grep -n -i -w -E 'expand|extern|preprocess|bo|wave|era5|census|crat' $W/README.md | wc -l)"
-echo "   kit (evaluation/): files $(git -C $W ls-files -- evaluation | wc -l); bare CRAT words: $(git -C $W grep -n -w -e CRAT -- evaluation | wc -l); _CRAT suffix: $(git -C $W grep -n -P '_CRAT\b' -- evaluation | wc -l); list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- evaluation | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- evaluation | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- evaluation | wc -l)"
+echo "   evaluation/ in the tree: $(git -C $W ls-files -- evaluation | wc -l) files (must be 0); bare CRAT words: $(git -C $W grep -n -w -e CRAT -- evaluation | wc -l); _CRAT suffix: $(git -C $W grep -n -P '_CRAT\b' -- evaluation | wc -l); list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- evaluation | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- evaluation | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- evaluation | wc -l)"
 
 step "8 zip + from-zip build"
 $P/mkzip.sh | tail -4
