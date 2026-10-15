@@ -38,10 +38,11 @@ to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the auth
   `CRAT` alone are untouched (`rename.py untouched` lists them). The binary and the wrapper are renamed.
 - **E. String edits.** `edits.py`: host names, dated and numbered process ids and label strings become neutral; the
   `reason = "..."` arguments of lint attributes go (`strip_reasons.py`). `kit_edits.py` (relay 007): the kit copy
-  drives the binary with the zip's pass name, names `config/analysis-env.sh`, and its manifest's sources carry no URL.
+  drives the binary with the zip's pass name, names `config/analysis-env.sh`, its manifest's sources carry no URL, and no
+  commit hash of our repositories or branch name remains (`HASH_REPOS`: every hash-like token is resolved against them).
 - **F. Build and checks.** `cargo build --release` of the derived tree; the lockfile as cargo resolved it, header
   stripped. The checks printed: the old names (0), the identity grep (0; the crates.io registry URL in lockfiles is
-  exempt), process fingerprints in Rust sources (0), comments left (0), list-2 words in string literals (0), and the
+  exempt), commit hashes of our repositories (0), process fingerprints in Rust sources (0), comments left (0), list-2 words in string literals (0), and the
   kit's residue (its `CRAT` identifiers, list-2 words and ruling ids are reported, not edited).
 - **The zip.** `mkzip.sh`: the tree under `jobcrat-source/`, zipped in sorted order with Python's zipfile; unzipped
   and compared with the staged copy; `cargo build --release --locked` from the unpacked zip.

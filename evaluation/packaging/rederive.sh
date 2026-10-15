@@ -12,6 +12,7 @@
 #   ENVREL             the environment of record, relative to the head (default: the final frame's env file)
 #   IDENTITY_PATTERNS  the identity grep (grep -E, case-insensitive) that must be empty before the zip; the default
 #                      covers paths and services, the operator adds the names of the authors and of the hosts.
+#   HASH_REPOS         repositories (space-separated) whose commit hashes must not appear in the tree (default: REPO)
 set -u
 HEAD=${1:?head}; TAG=${2:?tag}
 P=$(cd "$(dirname "$0")" && pwd)
@@ -22,6 +23,7 @@ TOOLS_TARGET=${TOOLS_TARGET:-$SCRATCH/tools-target}; TOOLS=$TOOLS_TARGET/release
 CARGO=${CARGO:-cargo}
 ENVREL=${ENVREL:-crates/pointer_replacer/frames/l01p14u-s39-mutlend-o-env.sh}
 IDENTITY_PATTERNS=${IDENTITY_PATTERNS:-'/home/|agent-worktrees|anthropic|claude|codex|openai|github\.com|Co-Authored'}
+HASH_REPOS=${HASH_REPOS:-$REPO}
 SR=$(rustup run nightly-2025-06-23 rustc --print sysroot); export LD_LIBRARY_PATH=$SR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export W ZS KEPT=$ZS/kept-rs-files.txt ORPHANS=$ZS/orphans.txt CARGO_INCREMENTAL=0
 mkdir -p $ZS $WORKTREES; rm -rf $ZS/stage $ZS/unzipped $ZS/tok; log=$ZS/rederive.log; : > $log; exec > >(tee -a $log) 2>&1
@@ -107,6 +109,8 @@ python3 -I $P/strip_misc.py toml $W/Cargo.lock > /dev/null; git -C $W add -A; gi
 echo "   TREE $(git -C $W rev-parse HEAD^{tree}) files $(git -C $W ls-files | wc -l)"
 echo "   crat word: $(git -C $W grep -n -w -e crat -- . | wc -l); bCRAT_: $(git -C $W grep -n -P '\bCRAT_' -- . | wc -l); __crat_: $(git -C $W grep -n -e '__crat_' -e '__CRAT_' -- . | wc -l); Crat: $(git -C $W grep -n -w -e Crat -- . | wc -l)"
 echo "   identity grep (minus the registry URL in lockfiles): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- . | grep -v -F 'registry+https://github.com/rust-lang/crates.io-index' | wc -l)"
+ours=$(git -C $W grep -o -h -I -E '\b[0-9a-f]{7,40}\b' -- . | sort -u | while read t; do case $t in *[a-f]*) ;; *) continue;; esac; case $t in *[0-9]*) ;; *) continue;; esac; for r in $HASH_REPOS; do git -C $r rev-parse --verify --quiet "$t^{commit}" >/dev/null 2>&1 && { echo $t; break; }; done; done)
+echo "   commit hashes of our repositories in the tree: $(printf '%s' "$ours" | grep -c .)${ours:+ -- $(echo $ours)}"
 echo "   fingerprints: $(git -C $W grep -n -E -e '@2026-|"r[0-9]{3}-|"s23-|s23-force|r385-force|wave5p|era5c-l01p14|-PORT subset tripwire|addendum|user ruling|\bR[0-9]{3,4}-[0-9]\b' -- '*.rs' ':!evaluation' | wc -l); reason attrs: $(git -C $W grep -n -E '^\s*reason\s*=\s*"' -- '*.rs' ':!evaluation' | wc -l); cfg(test): $(git -C $W grep -n -E '#\!?\[cfg\(test\)\]|^\s*#\[test\]' -- '*.rs' ':!evaluation' | wc -l)"
 find $W/crates $W/src $W/deps_crate -name '*.rs' -type f | sort > $KEPT; echo "   comments left: $($TOOLS/rslex count $(cat $KEPT) | awk -F'\t' '{c+=$2} END {print c}')"
 rm -rf $ZS/tok; mkdir -p $ZS/tok; for f in $(cat $KEPT); do $TOOLS/rslex dump "$f" > "$ZS/tok/$(echo ${f#$W/} | tr '/' '_')"; done
