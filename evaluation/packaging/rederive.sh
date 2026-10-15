@@ -111,14 +111,16 @@ python3 -I $P/rename.py apply > $ZS/rename-map.tsv 2> $ZS/rename-map.err; grep '
 git -C $W mv src/bin/crat.rs src/bin/jobcrat.rs; git -C $W mv crat jobcrat
 commit "Packaging D: the rename"
 
-step "6 string edits (001 s4, 003, 005), the kit copy's edits (007), lint reasons"
+step "6 string edits (001 s4, 003, 005), the kit copy's edits (007), lint reasons, allow(warnings)"
 python3 -I $P/edits.py | tee $ZS/edits.txt | tail -3
 [ -d $W/evaluation ] && python3 -I $P/kit_edits.py | tee $ZS/kit-edits.txt | tail -1 || echo "   no kit in the tree (kit_edits.py not run)"
 git -C $W grep -l -E 'reason\s*=\s*"' -- '*.rs' | sort > $ZS/reason-files.txt; python3 -I $P/strip_reasons.py $ZS/reason-files.txt > $ZS/reasons-deleted.tsv 2> $ZS/reasons.err; cat $ZS/reasons.err
-commit "Packaging E: the string edits, the kit copy's edits and the lint reasons"
+python3 -I $P/allow_warnings.py
+commit "Packaging E: the string edits, the kit copy's edits, the lint reasons, allow(warnings) at the crate roots"
 
 step "7 build, lock, checks"
 export CARGO_TARGET_DIR=$ZS/target; build derived $W || { echo "the derived tree does not build: $ZS/build-derived.log"; tail -30 $ZS/build-derived.log; exit 1; }
+echo "   warnings in the derived build: $(grep -c -E '^warning' $ZS/build-derived.log)"
 python3 -I $P/strip_misc.py toml $W/Cargo.lock > /dev/null; git -C $W add -A; git -C $W -c user.name=submission -c user.email=submission@localhost commit -q -m "Packaging F: the lockfile as cargo resolved it, header stripped" 2>/dev/null && echo "   lock committed"
 echo "   TREE $(git -C $W rev-parse HEAD^{tree}) files $(git -C $W ls-files | wc -l)"
 echo "   crat word: $(git -C $W grep -n -w -e crat -- . | wc -l); bCRAT_: $(git -C $W grep -n -P '\bCRAT_' -- . | wc -l); __crat_: $(git -C $W grep -n -e '__crat_' -e '__CRAT_' -- . | wc -l); Crat: $(git -C $W grep -n -w -e Crat -- . | wc -l)"
@@ -134,5 +136,6 @@ echo "   evaluation/ in the tree: $(git -C $W ls-files -- evaluation | wc -l) fi
 step "8 zip + from-zip build"
 $P/mkzip.sh | tail -4
 rm -rf $ZS/zip-target; export CARGO_TARGET_DIR=$ZS/zip-target; build from-zip $ZS/unzipped/jobcrat-source --locked || { echo "the zip does not build: $ZS/build-from-zip.log"; tail -30 $ZS/build-from-zip.log; exit 1; }
+echo "   warnings in the from-zip build: $(grep -c -E '^warning' $ZS/build-from-zip.log)"
 echo "ZIP $ZS/jobcrat-source.zip sha256=$(sha256sum $ZS/jobcrat-source.zip | cut -c1-64) bytes=$(stat -c %s $ZS/jobcrat-source.zip) entries=$(unzip -Z1 $ZS/jobcrat-source.zip | wc -l)"
 echo "END $(date -u +%FT%TZ)"

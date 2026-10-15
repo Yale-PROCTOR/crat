@@ -42,6 +42,8 @@ to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the auth
 - **E. String edits.** `edits.py`: host names, dated and numbered process ids and label strings become neutral; the
   `reason = "..."` arguments of lint attributes go (`strip_reasons.py`). `kit_edits.py` runs only when a kit copy is
   in the tree (it is not, since the user's ruling); `HASH_REPOS`: every hash-like token is resolved against our repositories.
+  `allow_warnings.py`: `#![allow(warnings)]` after the last inner attribute of every crate root, so the zip builds
+  without warnings (the trims leave dead code behind).
 - **F. Build and checks.** `cargo build --release` of the derived tree; the lockfile as cargo resolved it, header
   stripped. The checks printed: the old names (0), the identity grep (0; the crates.io registry URL in lockfiles is
   exempt), commit hashes of our repositories (0), process fingerprints in Rust sources (0), comments left (0), list-2 words in string literals (0), and
