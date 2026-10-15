@@ -1,0 +1,19 @@
+[package]
+name = "pkgtools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn = { version = "2.0.117", default-features = false, features = ["full", "visit", "parsing", "printing", "proc-macro", "clone-impls"] }
+proc-macro2 = { version = "1.0.95", features = ["span-locations"] }
+quote = "1.0.45"
+
+[[bin]]
+name = "cfgcut"
+path = "src/bin/cfgcut.rs"
+
+[[bin]]
+name = "rslex"
+path = "src/bin/rslex.rs"
+
+[workspace]
