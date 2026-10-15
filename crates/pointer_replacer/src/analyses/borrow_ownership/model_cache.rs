@@ -681,6 +681,11 @@ pub(crate) struct CachedModel {
 struct Prepared {
     entry: std::sync::Arc<super::cache_contract::StreamedEntry>,
     cached: CachedModel,
+    /// R1178-1 (era-5c relay 236, fix (i)): on the writer side, the arm-(a) receipts as `prepare`
+    /// wrote them into the entry -- the same rows, order and not-recorded reason a read of the
+    /// staged file decodes -- so the hoist's loader never re-opens that file. `None` on the
+    /// reader side, whose `Metadata` captured them while the entry was read.
+    arg_order_applied: Option<Result<Vec<super::portable_export::ArgOrderRow>, String>>,
 }
 thread_local! {
     static PREPARED: std::cell::RefCell<Option<Prepared>> = const { std::cell::RefCell::new(None) };
@@ -997,6 +1002,7 @@ pub(crate) fn prepare(
                 baseline_model: verified.baseline_model.clone(),
                 a5_receipt: verified.receipt.clone(),
             },
+            arg_order_applied: Some(writer_arg_order_applied(program, slots, captured)),
         })
     })();
     match result {
@@ -1017,21 +1023,60 @@ pub(crate) fn prepare(
 pub(crate) fn prepared_arg_order_applied(
     fingerprint: &str,
 ) -> Result<Vec<super::portable_export::ArgOrderRow>, String> {
-    let (path, metadata) = PREPARED
+    // R1178-1 (era-5c relays 236 / 237): the writer side reads the receipts `prepare` kept (fix
+    // (i)); the reader side decodes them from the borrowed `Metadata` (fix (ii): no clone of it).
+    // Only a writer-side entry prepared without them falls back to reading the staged file.
+    PREPARED.with(|prepared| {
+        let prepared = prepared.borrow();
+        let prepared = prepared
+            .as_ref()
+            .filter(|prepared| prepared.entry.metadata.key == fingerprint)
+            .ok_or("no prepared entry for this fingerprint")?;
+        if let Some(rows) = &prepared.arg_order_applied {
+            return rows.clone();
+        }
+        match prepared.entry.metadata.arg_order {
+            super::cache_contract::stream::MoveStoreCapture::Missing => {
+                super::cache_contract::validate_file(&prepared.entry.path)?.arg_order_applied()
+            }
+            _ => prepared.entry.metadata.arg_order_applied(),
+        }
+    })
+}
+
+/// R1178-1: the arm-(a) receipts as the entry's `arg-order-applied` family records them, decoded
+/// as a read of that family would: `portable_export::arg_order_rows` (the writer's own rows,
+/// sorted by the reader's order), or the family's not-recorded refusal when the arm is off.
+fn writer_arg_order_applied(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    captured: &super::export::BoExport,
+) -> Result<Vec<super::portable_export::ArgOrderRow>, String> {
+    match super::portable_export::arg_order_rows(program, slots, captured)? {
+        Some(rows) => Ok(rows),
+        None => Err(format!(
+            "arg-order receipts not recorded: {}",
+            super::portable_export::ARG_ORDER_NOT_RECORDED
+        )),
+    }
+}
+
+/// R1178-1's witness: the receipts read back from the prepared entry's staged FILE, as the loader
+/// read them before fix (i).
+#[cfg(test)]
+pub(crate) fn prepared_arg_order_from_file(
+    fingerprint: &str,
+) -> Result<Vec<super::portable_export::ArgOrderRow>, String> {
+    let path = PREPARED
         .with(|prepared| {
             prepared
                 .borrow()
                 .as_ref()
                 .filter(|prepared| prepared.entry.metadata.key == fingerprint)
-                .map(|prepared| (prepared.entry.path.clone(), prepared.entry.metadata.clone()))
+                .map(|prepared| prepared.entry.path.clone())
         })
         .ok_or("no prepared entry for this fingerprint")?;
-    match metadata.arg_order {
-        super::cache_contract::stream::MoveStoreCapture::Missing => {
-            super::cache_contract::validate_file(&path)?.arg_order_applied()
-        }
-        _ => metadata.arg_order_applied(),
-    }
+    super::cache_contract::validate_file(&path)?.arg_order_applied()
 }
 
 /// L01¹¹ (R666-1, the loader): the prepared entry's arm-(a) receipts as the
@@ -1290,6 +1335,7 @@ pub(crate) fn load(
         *p.borrow_mut() = Some(Prepared {
             entry: std::sync::Arc::new(super::cache_contract::existing_streamed(path, entry)),
             cached: cached.clone(),
+            arg_order_applied: None,
         })
     });
     Some(cached)

@@ -4414,6 +4414,13 @@ fn e5c_inner_w63() {
                 attestation,
             );
             let entry = super::model_cache::prepared_arg_order_applied(&key);
+            // R1178-1 (fix (i)): the receipts the loader now takes from memory equal the ones
+            // the staged entry's file decodes, rows and refusal alike.
+            let from_file = super::model_cache::prepared_arg_order_from_file(&key);
+            eprintln!(
+                "E5C_W63 arg-order-memory-vs-file equal={}",
+                entry == from_file
+            );
             let describe =
                 |rows: &Result<Vec<super::portable_export::ArgOrderRow>, String>| match rows {
                     Ok(rows) => format!("ok:{}", rows.len()),
@@ -5663,6 +5670,12 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
         .find(|l| l.starts_with("arg-order model="))
         .unwrap_or_else(|| panic!("{on:?}"));
     assert!(summary.ends_with("equal=true"), "{summary}");
+    // R1178-1: the loader's rows from memory = the staged file's.
+    assert!(
+        on.iter()
+            .any(|l| l == "arg-order-memory-vs-file equal=true"),
+        "{on:?}"
+    );
     assert!(
         on.iter().any(|l| l.starts_with("arg-order-row ")
             && l.contains("quadtree_insert")
@@ -5686,6 +5699,11 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
     assert!(
         summary.starts_with("arg-order model=none") && summary.contains("not recorded"),
         "{summary}"
+    );
+    assert!(
+        off.iter()
+            .any(|l| l == "arg-order-memory-vs-file equal=true"),
+        "{off:?}"
     );
 }
 
