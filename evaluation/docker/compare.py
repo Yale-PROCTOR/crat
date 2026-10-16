@@ -7,8 +7,9 @@ produce carries `skipped (<why>)`). Writes results/compare.txt: one row per cite
   key <TAB> expected <TAB> produced <TAB> verdict
 with the verdict
   equal       a count, rate, size or verdict, equal to the paper's as printed
-  reported    a time or a factor (and the host line): printed beside the paper's, with produced / expected; times
-              depend on the machine and are never compared
+  reported    a time or a factor, both numbers (and the host line): printed beside the paper's, with produced /
+              expected; times depend on the machine and are never compared (a status word in place of a time,
+              e.g. `crash`, must be equal)
   skipped     the run wrote `skipped (<why>)`, or that research question's run has not been made
   differ      anything else (`differ (missing)`: the research question ran but did not write the key)
 then the keys a run produced that the paper does not cite, and a last line
@@ -64,9 +65,11 @@ def main():
             p = produced[k]
             if p.startswith('skipped'):
                 verdict = 'skipped'
-            elif reported(k):
+            elif k == 'setup.host':
+                verdict = 'reported'
+            elif reported(k) and num(p) is not None and num(e) is not None:
                 a, b = num(p), num(e)
-                verdict = f'reported ({a / b:.2f}x)' if a is not None and b else 'reported'
+                verdict = f'reported ({a / b:.2f}x)' if b else 'reported'
             elif p == e:
                 verdict = 'equal'
             else:

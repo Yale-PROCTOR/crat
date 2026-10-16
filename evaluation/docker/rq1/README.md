@@ -26,7 +26,7 @@ The definitions are in `lib/measure.py` and `lib/inator_types.py`.
 
 ## `--small`
 - **Our side:** lil and brotli are not translated, so their four ours rates and the four pooled ours totals are written `skipped (--small)`. Everything else is counted on all twenty, because the input / CROWN / Laertes sides take seconds.
-- **&inator:** under `--small` it runs on five of the eight, so the other three programs' &inator columns are skipped.
+- **&inator:** `third-party/run.sh --small` runs it on five of the eight. The other three programs' &inator columns, and their totals, are then skipped, because their outputs are absent; rq1's own `--small` does not change them.
 
 ## Expected values
 `../expected.tsv` holds every key the paper cites, as the paper prints it. `../compare.py` writes `results/compare.txt`:

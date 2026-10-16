@@ -33,16 +33,20 @@ def tex_escape(s):
 
 def setup_keys():
     v = {'setup.programs': str(len([p for p in C.PROGS if os.path.isdir(os.path.join(C.INPUT, p))]))}
-    o = subprocess.run(['rustc', f'+{C.TOOLCHAIN}', '-V'], capture_output=True, text=True)
-    v['setup.rustc'] = o.stdout.split()[1] if o.returncode == 0 else 'skipped (no rustc)'
+    try:
+        o = subprocess.run(['rustc', f'+{C.TOOLCHAIN}', '-V'], capture_output=True, text=True)
+        v['setup.rustc'] = o.stdout.split()[1] if o.returncode == 0 else 'skipped (no rustc)'
+    except OSError:
+        v['setup.rustc'] = 'skipped (no rustc)'
     ver = None
     try:
         import z3  # noqa: F401
         ver = z3.get_version_string()
     except Exception:
-        cands = [os.path.join(d, 'libz3.so') for d in
-                 (os.environ.get('Z3_LIBRARY_PATH_OVERRIDE', ''), *os.environ.get('LD_LIBRARY_PATH', '').split(':')) if d]
-        cands += [ctypes.util.find_library('z3') or '']
+        cands = [os.path.join(d, n) for d in
+                 (os.environ.get('Z3_LIBRARY_PATH_OVERRIDE', ''), *os.environ.get('LD_LIBRARY_PATH', '').split(':')) if d
+                 for n in ('libz3.so', 'libz3.so.4.15')]
+        cands += [f for f in (ctypes.util.find_library('z3'),) if f]
         for f in cands:
             try:
                 lib = ctypes.CDLL(f)
@@ -50,7 +54,7 @@ def setup_keys():
                 lib.Z3_get_version(ctypes.byref(a), ctypes.byref(b), ctypes.byref(c), ctypes.byref(d))
                 ver = f'{a.value}.{b.value}.{c.value}'
                 break
-            except OSError:
+            except (OSError, AttributeError):
                 continue
     v['setup.solver'] = f'Z3 {".".join(ver.split(".")[:3])}' if ver else 'skipped (no z3 library found)'
     model, threads, cores = '', os.cpu_count(), set()
