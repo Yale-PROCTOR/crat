@@ -482,7 +482,12 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
                 "memcpy" => {
                     let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
-                    if let Some(e) = self.transform_memcpy(arg1, arg2, arg3) {
+                    if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                        && let rustc_hir::Node::Stmt(stmt) =
+                            self.tcx.parent_hir_node(hir_expr.hir_id)
+                        && matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                        && let Some(e) = self.transform_memcpy(arg1, arg2, arg3)
+                    {
                         *expr = e;
                     }
                 }

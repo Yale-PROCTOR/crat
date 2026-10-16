@@ -19,6 +19,33 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::Transfor
 }
 
 #[test]
+fn test_memcpy_used_results_are_preserved() {
+    for source in [
+        "src.as_ptr() as *const _",
+        "&value as *const u32 as *const _",
+    ] {
+        for body in ["let result = COPY; result", "COPY", "identity(COPY)"] {
+            let copy = format!(
+                "memcpy(dst.as_mut_ptr() as *mut _, {source}, core::mem::size_of::<u32>())"
+            );
+            let code = format!(
+                r#"
+extern "C" {{
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+}}
+fn identity(p: *mut core::ffi::c_void) -> *mut core::ffi::c_void {{ p }}
+pub unsafe fn copy(dst: &mut [u8], src: &[u8], value: u32) -> *mut core::ffi::c_void {{
+    {}
+}}
+"#,
+                body.replace("COPY", &copy)
+            );
+            run_test(&code, &["memcpy(dst.as_mut_ptr()"], &["copy_from_slice"]);
+        }
+    }
+}
+
+#[test]
 fn test_memcpy_autoref() {
     run_test(
         r#"
