@@ -4,8 +4,9 @@ Date: 2026-10-13
 
 Revised: 2026-10-14
 
-Status: simpler architecture accepted for planning, retaining the accepted
-borrowing and inline-expression rules. Implementation has not started. This
+Status: implemented and validated on 2026-10-16, retaining the accepted
+borrowing and inline-expression rules. Final code review completed and its finding fixed. See the
+[revision-pinned validation report](/home/ubuntu/crat-workspace/memcpy-cursor-validation-de8934c7/REPORT.md). This
 revision replaces the separate byte-copy path with an extension of the existing
 operand model and memcpy emitter. The [implementation plan](../plans/2026-10-13-memcpy-cursor-byte-views.md)
 was aligned with this design on 2026-10-16.
