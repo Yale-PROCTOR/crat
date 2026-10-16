@@ -1059,3 +1059,51 @@ pub unsafe fn copy(dst: {dst_type}, src: &[{ty}; 8], raw: *const u8) {{
         );
     }
 }
+
+fn run_memcpy_runtime(code: &str) {
+    use std::{
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let res = run_test(code, &["copy_from_slice"], &[]);
+    assert_eq!(res.code.matches("memcpy(").count(), 1, "{}", res.code);
+    let dir = std::env::temp_dir().join(format!(
+        "crat-memcpy-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let input = dir.join("main.rs");
+    let binary = dir.join("copy-test");
+    std::fs::write(&input, &res.code).unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-Awarnings"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        res.code
+    );
+    let output = Command::new(&binary).output().unwrap();
+    assert!(
+        output.status.success(),
+        "status: {:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_memcpy_cursor_runtime() {
+    run_memcpy_runtime(&format!(
+        "{MEMCPY_CURSOR_TYPES}\n{}",
+        include_str!("fixtures/memcpy_cursor.rs")
+    ));
+}
