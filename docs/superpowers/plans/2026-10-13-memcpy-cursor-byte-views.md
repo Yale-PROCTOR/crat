@@ -1,27 +1,28 @@
-# Memcpy Cursor Byte Views Implementation Plan
-
-> **Needs revision (2026-10-14):** The [current spec](../specs/2026-10-13-memcpy-cursor-byte-views-design.md) now extends `ArrayPtr` and reuses the existing memcpy branches. The separate `MemcpyByteView` / `transform_memcpy_bytes` architecture below is superseded. Do not execute this plan until its architecture and affected tasks are aligned with the revised spec.
+# Cursor-Aware ArrayPtr for Memcpy Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the 360 measured SPHINCS cursor-source memcpy calls with bounded `copy_from_slice` operations, without changing cursor owners.
 
-**Architecture:** Add a conservative byte-view route to the libc replacer before its existing typed/object routes. Reuse generated cursor projections and existing byte casts, trust promoted borrows, and emit original scalar expressions directly in indexing. Gate every memcpy replacement on a discarded result; preserve legacy fallback and same-array handling.
+**Architecture:** Extend `ArrayPtr` with cursor backing and representation-aware slice projection. A memcpy-only recognizer admits byte cursors into the existing numeric byte-copy arm; a narrow local exception admits full-array offsets previously blocked by the whole-function raw-dereference guard. Reuse the existing emitters, trust promoted borrows, and keep original scalar expressions inline.
 
 **Tech Stack:** Rust, rustc-private AST/HIR/type APIs, existing bytemuck support, `nightly-2025-06-23`, Cargo, Python corpus harness.
 
-**Spec:** [Approved design, including inline-expression revision](../specs/2026-10-13-memcpy-cursor-byte-views-design.md)
+**Spec:** [Simpler ArrayPtr design, revised 2026-10-14](../specs/2026-10-13-memcpy-cursor-byte-views-design.md)
+
+**Plan revised:** 2026-10-16. Aligned with the simpler spec; implementation has not started.
 
 ## Global Constraints
 
-- Worktree: `/home/ubuntu/.config/superpowers/worktrees/crat/representation-aware-cursor-resolution`; planning starts at `cbddd420`, with product baseline `cecfed7b3554ed016b1613c6ec8b5da4dacf4531`.
+- Worktree: `/home/ubuntu/.config/superpowers/worktrees/crat/representation-aware-cursor-resolution`; this revision starts at `e0fb6bb9`, with product baseline `cecfed7b3554ed016b1613c6ec8b5da4dacf4531`.
 - Do not restore or assume changes from `blake-mask-cursor-proof`.
 - Treat the original C program as UB-free. Trust existing promoted Rust references and generated cursor backing slices.
 - Do not repeat borrow-promotion or whole-array alias analysis in the libc pass.
 - Do not infer that unsigned arithmetic cannot wrap, or that unsigned-to-signed casts preserve nonnegativity.
 - Do not introduce unconditional offset/count temporaries.
 - No changes to pointer representations, ABI wrappers, field/return/function-pointer demotion, `memmove`/`memset` policy, or general sign/alias analysis.
-- Support initialized `u8`/`i8` views; retain existing typed/object routes and their guards.
+- Support initialized `u8`/`i8` operands on both sides of newly admitted calls. Preserve existing array-only typed/object behavior; guard exceptions apply only to eligible byte copies.
+- Extend `ArrayPtr`; do not add `MemcpyByteView`, `transform_memcpy_bytes`, or another copy emitter.
 - Target all 360 candidates: 120 plain/sliced destinations and 240 offset destinations; expected cursor-owner change is zero.
 - Never access `aws-translate` or `bundles`; never run `scripts/translate.py` or `scripts/translate_all.py`.
 - Preserve `/home/ubuntu/crat-workspace/sphincs-diagnosis-cecfed7b-20260928` and `/home/ubuntu/crat-workspace/transformed` as immutable baselines.
@@ -30,7 +31,7 @@
 ## Review Focus
 
 - A used memcpy return value must not fall through to a legacy unit-valued replacement (Task 1).
-- Pointer/integer casts, wider-pointee offsets, or an unrelated type named `SliceCursor` must not enter the new route (Tasks 2–3).
+- Shared helper changes must not enable cursor `memmove`/`memset`, object-to-cursor copies, non-byte cursor copies, or lookalike cursor types (Task 2).
 - A pure count that reads the destination may still conflict with the generated borrow; use conservative fallback (Task 2).
 - Mutable cursor offset temporaries must remain alive without extending a reborrow into the next statement (Tasks 2 and 4).
 - Empty one-past copies and exact-end copies must preserve bytes and cursor positions (Task 4).
@@ -42,7 +43,7 @@
 | File | Change |
 | --- | --- |
 | `crates/passes/src/libc_replacer/mod.rs` | Discarded-result gate at memcpy dispatch |
-| `crates/passes/src/libc_replacer/mem_utils.rs` | New byte-view matcher, expression eligibility, and copy emission |
+| `crates/passes/src/libc_replacer/mem_utils.rs` | Extend `ArrayPtr` and its projection, add memcpy-only recognition and local eligibility, reuse existing copy arms |
 | `crates/passes/src/libc_replacer/str_utils.rs` | Expose existing pure cursor projection helper to its sibling module |
 | `crates/passes/src/libc_replacer/tests.rs` | Typechecked rewrite tests and one small runtime-test helper |
 | `crates/passes/src/libc_replacer/fixtures/memcpy_cursor.rs` | Self-contained u8 runtime fixture transformed by the real libc pass |
@@ -63,50 +64,71 @@ or Cargo dependencies. Read `src/bin/crat.rs` for pass integration, not to edit 
 - [ ] Run the new test and `cargo test -p passes libc_replacer::tests::test_memcpy -- --nocapture`. Existing semicolon-statement replacements must continue to pass.
 - [ ] Commit only this change: `fix(libc): preserve consumed memcpy return values`.
 
-## Task 2: Recover ordinary cursor byte views and emit inline copies
+## Task 2: Extend ArrayPtr for cursor operands in existing memcpy emission
 
 **Files:** Modify `mem_utils.rs`, minimally expose helpers in `str_utils.rs`, add tests in `tests.rs`.
 
-**Interfaces:** Add these private interfaces in `mem_utils.rs`; they are shared with Task 3:
+**Interfaces:** Retain `ArrayPtr` and its current element type, original receiver,
+and optional outer raw offset. Add a small array/cursor backing distinction and
+the cursor projection information needed by `slice`; the exact enum layout is
+left to the builder. Keep these existing methods and meanings:
 
 ```rust
-struct MemcpyByteView<'e, 'tcx> {
-    slice: String,             // Typed slice expression before optional i8 byte cast.
-    receiver: &'e Expr,         // Original place/cursor receiver for local conflict checks.
-    elem_ty: ty::Ty<'tcx>,      // Only u8 or i8.
-    is_cursor: bool,
-}
+// ArrayPtr methods; cursor destination mutability is checked at recognition.
+fn slice(&self, mutable: bool) -> String;
+fn byte_slice(&self, mutable: bool) -> String;
+fn same_array(&self, other: &Self) -> bool;
+fn is_plain(&self) -> bool; // No outer raw offset; not a safety classification.
+fn is_cursor(&self) -> bool; // New backing-kind query.
 
-fn transform_memcpy_bytes(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr>;
-fn memcpy_byte_view<'e>(&self, s: &'e Expr, mutable: bool)
-    -> Option<MemcpyByteView<'e, 'tcx>>;
+// TransformVisitor methods; these do not emit copies or mutate dependencies.
+fn memcpy_ptr_or_offset<'e>(&self, expr: &'e Expr, mutable: bool)
+    -> Option<ArrayPtr<'e, 'tcx>>;
+fn memcpy_byte_copy_is_eligible(
+    &self, dst: &ArrayPtr<'_, 'tcx>, src: &ArrayPtr<'_, 'tcx>, n: &Expr,
+) -> bool;
 fn memcpy_scalar_is_repeatable(&self, expr: &Expr, dst: &Expr) -> bool;
 ```
+
+`array_of_ptr_or_offset` remains array-only and keeps its current signature for
+`memmove`/`memset`. The memcpy recognizer tries it before adding cursor recognition;
+it does not restrict previously recognized arrays. The eligibility predicate
+validates both operands together before admitting a cursor-containing copy.
+Task 2 conservatively rejects outer raw offsets for these new calls; Task 3
+extends this same predicate to full-array offsets and uses it for guard exceptions.
 
 Expose the existing `slice_cursor_of_as_ptr(&self, s: &Expr, mutable: bool,
 method_names: &[&str]) -> Option<(String, ty::Ty<'tcx>)>` as `pub(super)` without
 changing its behavior for string callers. Other helpers remain private unless
 the implementation actually needs their existing logic.
 
-- [ ] Add `test_memcpy_cursor_byte_views`: array/slice and generated cursor source/destination combinations, including already-sliced arrays, immutable cursors, mutable cursors, and mixed `i8`/`u8`. Follow the existing `test_slice_cursor_offset_by_as_ptr_uses_safe_byte_slice` fixture convention. Assert `copy_from_slice` and the appropriate `as_slice`/`as_slice_mut` projections; exclude the original memcpy call and source cursor `.as_ptr()` adapter. Assert `res.bytemuck` only for selected i8 rewrites.
+- [ ] Add `test_memcpy_cursor_byte_views`: array/slice and generated cursor source/destination combinations, including already-sliced arrays, immutable cursors, mutable cursors, and mixed `i8`/`u8`. Follow the existing `test_slice_cursor_offset_by_as_ptr_uses_safe_byte_slice` fixture convention. Assert `copy_from_slice` and the appropriate `as_slice`/`as_slice_mut` projections; exclude the original memcpy call and source cursor `.as_ptr()` adapter. Assert selected i8 rewrites use the existing bytemuck casts; do not independently redesign the existing emitter's dependency flags.
 - [ ] Add `test_memcpy_cursor_inline_scalars`: `fill as usize`, `(datalen >> 3) as usize`, disjoint field counts, and typed primitive wrapping expressions. Assert the original expression remains in both bounds and no scalar `let` was added. Include narrow unsigned-to-signed casts in expressions without simplifying them.
 - [ ] Add `test_memcpy_cursor_fallbacks`: arbitrary calls/assignments in operands or count, borrow-wrapper calls, raw destinations, mutable statics, pointer/integer round trips, a foreign `other::SliceCursor`, conflicting projections of the same mutable cursor, and counts reading the destination (`dst.len()` and `dst[0]`). Use a cursor operand so rejection cannot accidentally succeed through an unrelated legacy array route. Assert the call is retained, the result typechecks, and rejected i8 candidates do not alone set `res.bytemuck`.
+- [ ] Add `test_memcpy_cursor_scope_is_local`: cursor `memmove` and `memset`, a `SliceCursor<u32>` memcpy, an object copied into a mutable cursor, and a cursor paired with a non-byte array all stay unchanged. Existing array-to-array typed copies and same-array temporary copies still transform. Include a nontrivial wrapping byte-count expression in a byte-cursor copy and assert it survives verbatim rather than being converted to an element count.
 - [ ] Run `cargo test -p passes libc_replacer::tests::test_memcpy_cursor -- --nocapture`. Confirm the positive cases fail because current memcpy recognition excludes cursors. Negative characterization cases may already pass.
-- [ ] Implement the pure view matcher for non-offset array/slice pointers and generated cursor projections. Validate actual byte element types, pointer-only cast chains, stable places through references (no new raw dereference), and known cursor identity in `crate::slice_cursor`. Keep that extra identity validation local to memcpy; do not alter existing string recognition semantics. Preserve `as_deref()` for mutable cursor offset temporaries and explicit `&mut *receiver` reborrows where needed.
-- [ ] Implement the scalar whitelist using resolved primitive types and stable local/constant reads, safe field projections, casts, arithmetic/bitwise operators, and explicitly recognized primitive wrapping methods. Reject arbitrary calls, static/raw reads, or accesses conflicting with the destination place. A read of `state.count` is allowed beside a borrow of `state.buf`; a read of `dst` itself is not. This is a local syntactic/type eligibility check, not new alias analysis. Choose fallback for destination-dependent counts; no scalar hoisting machinery is needed.
-- [ ] Call the byte route at the start of `transform_memcpy`, before its current destination `?` can reject cursors. Complete eligibility for both operands and count before setting `self.bytemuck`. Cast i8 views to u8 only for the selected rewrite; emit equal prefixes with the original count expression repeated. Exclude conflicting same-cursor forms. Let existing recognized same-array inputs reach their legacy temporary-buffer path. Keep every legacy route and guard otherwise unchanged.
+- [ ] Extend `ArrayPtr` backing and make `slice` select the original array borrow or a cursor projection supplied by the existing cursor helper. Keep `byte_slice` wrapping `slice`; keep array-to-array `same_array` behavior and `is_plain` semantics. Reject conflicting same-cursor projections separately instead of treating receiver text as backing-allocation identity. Preserve `as_deref()` for mutable cursor offset temporaries and mutable reference reborrows where needed. Existing non-memcpy callers must continue to construct only array-backed operands.
+- [ ] Implement `memcpy_ptr_or_offset` and `memcpy_byte_copy_is_eligible` for ordinary cursor copies. Validate byte element types on both sides, pointer-only cast chains, stable places through references (no new raw dereference), and known cursor identity in `crate::slice_cursor`. Check actual destination writability; a const pointer cast to mutable does not establish a mutable view. Keep extra eligibility and identity checks local to memcpy; do not alter existing string recognition semantics or previously accepted array-only inputs.
+- [ ] Implement the scalar whitelist using resolved primitive types and stable local/constant reads, safe field projections, casts, arithmetic/bitwise operators, explicitly recognized primitive wrapping methods, and the resolved zero-argument `size_of::<T>()` constant query. Preserve that query and any wrapping multiplication verbatim; it is not permission to cancel element sizes. Reject arbitrary calls, static/raw reads, or accesses conflicting with the destination place. A read of `state.count` is allowed beside a borrow of `state.buf`; a read of `dst` itself is not. This is a local syntactic/type eligibility check, not new alias analysis. Choose fallback for destination-dependent counts; no scalar hoisting machinery is needed.
+- [ ] Change only memcpy's operand lookups to `memcpy_ptr_or_offset`. If either operand is a cursor, require the combined eligibility check and skip the typed-length arm so the existing numeric byte-copy arm uses the original byte count. Reuse that arm's `slice`, `byte_slice`, and copy emission without adding another emitter. Finish new-call eligibility before dependency flags change. Preserve the existing branch selection for array-only calls and restrict object-copy fallback to array-backed destinations with no cursor operand; unsupported cursor-containing calls return `None`.
 - [ ] Run `cargo test -p passes libc_replacer::tests -- --nocapture`. This verifies generated Rust typechecking, existing string projection tests, same-array behavior, and padded-object exclusions. Commit: `feat(libc): copy through existing cursor byte views`.
 
 ## Task 3: Support full-array offsets at the call site
 
 **Files:** Extend `mem_utils.rs`; add tests in `tests.rs`.
 
-**Interfaces:** Extend Task 2's `memcpy_byte_view` without changing its signature. Offset information is rendered into `slice`; no new general memory-view abstraction is needed.
+**Interfaces:** Extend Task 2's `memcpy_byte_copy_is_eligible` to validate the
+existing `ArrayPtr::offset` and its original pointer expression. Retain original
+cast-chain provenance as a small field if the eligibility check needs it; do not
+attempt to infer offset units from the final byte element type alone. The
+recognizer and slice-emitter signatures remain unchanged.
 
 - [ ] Add `test_memcpy_cursor_full_array_offsets`: a state with `[u8; 64]` and `[u8; 128]` fields, existing mutable state references, and an unrelated raw dereference in the same function. Exercise both destination and source full-array offsets with cursor counterparts. Assert the replacements survive the enclosing raw dereference, retain `(left as isize) as usize`, use suffix-then-prefix indexing, and introduce no offset/count bindings.
 - [ ] Add `test_memcpy_cursor_offset_fallbacks`: raw offsets from an interior slice/cursor suffix that can validly be negative, offsets through a `u32` cast, effectful offsets, and fields reached by a newly introduced raw dereference. Assert memcpy remains for these new cursor combinations. Also exercise a cursor's own valid negative `offset_by` from a positive position: retain the cursor operation rather than converting it to suffix indexing.
-- [ ] Run `cargo test -p passes libc_replacer::tests::test_memcpy_cursor_ -- --nocapture`. The newly supported raw-offset cases should fail before this task's code change.
-- [ ] Recognize exactly an outer raw `.offset(k)` on a full byte-array base pointer with unchanged offset units. Use receiver HIR type to distinguish a full array from a slice; peel reference types without accepting raw-pointer dereferences. Apply the scalar eligibility rule to `k` and retain its original signed cast before `as usize`. Render the view with the existing slicing convention. Do not consult `current_fn_has_raw_deref` for this verified byte route; leave all old guards intact.
+- [ ] Add `test_memcpy_array_offset_guard_exception`: array-only byte copies through existing references qualify under the same local rule even with an unrelated raw dereference. Non-byte offset copies and byte copies through raw-derived places retain their previous rejection under that guard. Include an eligible array-only call whose count matches the old typed-length pattern: it must reach the existing byte arm rather than return early from the old typed arm's guard.
+- [ ] Run `cargo test -p passes libc_replacer::tests::test_memcpy_ -- --nocapture`. The newly supported cursor and array-only guard-exception cases should fail before this task's code change.
+- [ ] Extend eligibility to exactly an outer raw `.offset(k)` on a full byte-array base pointer with unchanged offset units. Use receiver HIR type to distinguish a full array from a slice; peel reference types without accepting raw-pointer dereferences. Apply the scalar rule to each offset as well as the count, retain original signed casts, and use existing `ArrayPtr::slice` suffix indexing. Do not reinterpret a cursor's own `offset_by` as an outer raw offset.
+- [ ] Compute the narrow exception when the original memcpy guard would reject and the combined byte eligibility predicate succeeds. A newly admitted offset call skips the typed-length arm and uses the existing numeric byte-copy arm. Suppress that arm's raw-dereference rejection only for the eligible exception. Preserve original rejection for every other call and leave object-copy, `memmove`, and `memset` guards untouched. Do not redefine `is_plain` or delete `current_fn_has_raw_deref`.
 - [ ] Run `cargo test -p passes libc_replacer::tests -- --nocapture`, including `test_offset_memory_calls_use_slice_replacements` and `test_memcpy_autoref`. The latter remains supported through its existing legacy route. Commit: `feat(libc): copy cursor bytes into offset array fields`.
 
 ## Task 4: Execute transformed copies at boundaries
@@ -136,10 +158,12 @@ the implementation actually needs their existing logic.
 
 ## Self-review and handoff
 
-Task 1 covers result semantics; Tasks 2–3 cover both measured obstacles, byte
-types, casts, stable inline expressions, temporary lifetimes, and conservative
-fallback; Task 4 checks actual boundary-copy behavior; Task 5 establishes pinned
-metrics and regressions. Existing borrow promotion remains trusted throughout.
+Task 1 covers result semantics. Task 2 extends the existing operand and emitter,
+with cursor recognition confined to memcpy. Task 3 addresses the second measured
+obstacle through an explicit local guard exception. Their tests cover byte types,
+cast units, original byte counts, inline expressions, temporary lifetimes, and
+legacy behavior. Task 4 checks actual boundary-copy behavior; Task 5 establishes
+pinned metrics and regressions. Existing borrow promotion remains trusted.
 
 The implementer should keep these tasks sequential because they share the
 matcher/emitter and tests. No product work or corpus runs are performed merely

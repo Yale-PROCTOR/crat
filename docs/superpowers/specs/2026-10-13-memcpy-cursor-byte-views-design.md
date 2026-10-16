@@ -4,10 +4,11 @@ Date: 2026-10-13
 
 Revised: 2026-10-14
 
-Status: proposed simpler architecture, retaining the accepted borrowing and
-inline-expression rules. Implementation has not started. This revision replaces
-the separate byte-copy path with an extension of the existing operand model and
-memcpy emitter. The earlier implementation plan needs alignment before execution.
+Status: simpler architecture accepted for planning, retaining the accepted
+borrowing and inline-expression rules. Implementation has not started. This
+revision replaces the separate byte-copy path with an extension of the existing
+operand model and memcpy emitter. The [implementation plan](../plans/2026-10-13-memcpy-cursor-byte-views.md)
+was aligned with this design on 2026-10-16.
 
 ## Intent and baseline
 
