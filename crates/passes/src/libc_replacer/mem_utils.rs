@@ -19,8 +19,12 @@ impl<'tcx> super::TransformVisitor<'tcx> {
             if cursor_copy && !self.memcpy_byte_copy_is_eligible(&ptr1, &ptr2, n) {
                 return None;
             }
+            let guard_exception = self.current_fn_has_raw_deref
+                && (!ptr1.is_plain() || !ptr2.is_plain())
+                && self.memcpy_byte_copy_is_eligible(&ptr1, &ptr2, n);
             let hir_n = self.ast_to_hir.get_expr(n.id, self.tcx)?;
             if !cursor_copy
+                && !guard_exception
                 && ptr1.ty == ptr2.ty
                 && let Some(len_expr) =
                     self.get_len_from_size(n, ptr1.ty, hir_n.hir_id.owner.def_id)
@@ -42,6 +46,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
                 }
             } else if is_numeric_or_numeric_array(ptr1.ty) && is_numeric_or_numeric_array(ptr2.ty) {
                 if self.current_fn_has_raw_deref
+                    && !guard_exception
                     && (!ptr1.is_plain()
                         || !ptr2.is_plain()
                         || !ptr1.ty.is_numeric()
@@ -342,17 +347,37 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         src: &ArrayPtr<'_, 'tcx>,
         n: &Expr,
     ) -> bool {
-        if !is_i8_or_u8(dst.ty, self.tcx)
-            || !is_i8_or_u8(src.ty, self.tcx)
-            || dst.offset.is_some()
-            || src.offset.is_some()
-        {
+        if !is_i8_or_u8(dst.ty, self.tcx) || !is_i8_or_u8(src.ty, self.tcx) {
             return false;
         }
         for (ptr, mutable) in [(dst, true), (src, false)] {
-            let Some(e) = self.memcpy_pointer_expr(ptr.original) else {
+            let Some(mut e) = self.memcpy_pointer_expr(ptr.original) else {
                 return false;
             };
+            if let Some(offset) = ptr.offset {
+                // An outer raw offset is only recoverable from the full array base,
+                // and must have been performed in byte units before any final cast.
+                if !self
+                    .memcpy_expr_ty(ptr.array)
+                    .is_some_and(|t| matches!(t.peel_refs().kind(), ty::TyKind::Array(..)))
+                    || !self.memcpy_scalar_is_repeatable(offset, dst.array)
+                {
+                    return false;
+                }
+                let ExprKind::MethodCall(call) = &e.kind else {
+                    return false;
+                };
+                if !self.memcpy_expr_ty(&call.receiver).is_some_and(|t| {
+                    matches!(t.kind(),
+                    ty::TyKind::RawPtr(elem, _) if is_i8_or_u8(*elem, self.tcx))
+                }) {
+                    return false;
+                }
+                let Some(base) = self.memcpy_pointer_expr(&call.receiver) else {
+                    return false;
+                };
+                e = base;
+            }
             let ExprKind::MethodCall(call) = &e.kind else {
                 return false;
             };

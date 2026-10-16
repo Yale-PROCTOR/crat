@@ -968,3 +968,94 @@ pub unsafe fn copy(dst: &mut Wrapper, src: SliceCursor<'_, u8>) {
         false,
     );
 }
+
+#[test]
+fn test_memcpy_cursor_full_array_offsets() {
+    for width in [64, 128] {
+        for count in ["fill as usize", "(datalen >> 3) as usize"] {
+            let res = run_cursor_copy(
+                &format!(
+                    r#"
+struct State {{ buf: [u8; {width}], count: usize }}
+pub unsafe fn copy(dst: &mut State, src: SliceCursor<'_, u8>, raw: *const u8, left: i32, fill: i32, datalen: u64) {{
+    let _value = *raw;
+    memcpy(dst.buf.as_mut_ptr().offset(left as isize) as *mut _, src.as_ptr() as *const _, {count});
+}}
+"#
+                ),
+                true,
+            );
+            assert!(res.code.contains("left as isize"));
+            assert!(!res.code.contains("let __"));
+        }
+    }
+    run_cursor_copy(
+        "pub unsafe fn copy(mut dst: SliceCursorMut<'_, i8>, src: &[u8; 8], offset: isize, raw: *const u8) { let _value = *raw; memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr().offset(offset) as *const _, 2); }",
+        true,
+    );
+}
+
+#[test]
+fn test_memcpy_cursor_offset_fallbacks() {
+    for dst in [
+        "dst[2..].as_mut_ptr().offset(-1)",
+        "(dst.as_mut_ptr() as *mut u32).offset(1) as *mut u8",
+        "dst.as_mut_ptr().offset(next())",
+    ] {
+        run_cursor_copy(
+            &format!(
+                "fn next() -> isize {{ 1 }} pub unsafe fn copy(dst: &mut [u8; 16], src: SliceCursor<'_, u8>) {{ memcpy({dst} as *mut _, src.as_ptr() as *const _, 1); }}"
+            ),
+            false,
+        );
+    }
+    run_cursor_copy(
+        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr().offset(-1) as *const _, 1); }",
+        false,
+    );
+    run_cursor_copy(
+        "struct State { buf: [u8; 8] } pub unsafe fn copy(dst: *mut State, src: SliceCursor<'_, u8>) { memcpy((*dst).buf.as_mut_ptr().offset(1) as *mut _, src.as_ptr() as *const _, 1); }",
+        false,
+    );
+    run_cursor_copy(
+        "pub unsafe fn copy(dst: &mut [u8; 8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr().offset(1) as *mut _, src.offset_by(-1).as_ptr() as *const _, 1); }",
+        true,
+    );
+}
+
+#[test]
+fn test_memcpy_array_offset_guard_exception() {
+    for count in ["2", "core::mem::size_of::<u8>().wrapping_mul(n)"] {
+        run_test(
+            &format!(
+                r#"
+extern "C" {{ fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8; }}
+pub unsafe fn copy(dst: &mut [u8; 8], src: &[u8; 8], raw: *const u8, n: usize) {{
+    let _value = *raw;
+    memcpy(dst.as_mut_ptr().offset(1), src.as_ptr(), {count});
+}}
+"#
+            ),
+            &["copy_from_slice"],
+            &["memcpy(dst."],
+        );
+    }
+    for (ty, dst_type, dst) in [
+        ("u32", "&mut [u32; 8]", "dst.as_mut_ptr().offset(1)"),
+        ("u8", "*mut [u8; 8]", "(*dst).as_mut_ptr().offset(1)"),
+    ] {
+        run_test(
+            &format!(
+                r#"
+extern "C" {{ fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void; }}
+pub unsafe fn copy(dst: {dst_type}, src: &[{ty}; 8], raw: *const u8) {{
+    let _value = *raw;
+    memcpy({dst} as *mut _, src.as_ptr() as *const _, 1);
+}}
+"#
+            ),
+            &["memcpy("],
+            &["copy_from_slice"],
+        );
+    }
+}
