@@ -1024,6 +1024,21 @@ fn test_memcpy_cursor_offset_fallbacks() {
 }
 
 #[test]
+fn test_memcpy_array_offset_conflicting_views_are_preserved() {
+    run_test(
+        r#"
+extern "C" { fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8; }
+pub unsafe fn copy(dst: &mut [u8; 8], raw: *const u8) {
+    let _value = *raw;
+    memcpy(dst.as_mut_ptr().offset(4), dst[..4].as_ptr(), 4);
+}
+"#,
+        &["memcpy("],
+        &["copy_from_slice"],
+    );
+}
+
+#[test]
 fn test_memcpy_array_offset_guard_exception() {
     for count in ["2", "core::mem::size_of::<u8>().wrapping_mul(n)"] {
         run_test(

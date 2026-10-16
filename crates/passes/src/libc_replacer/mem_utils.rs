@@ -388,7 +388,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
                 return false;
             }
         }
-        if dst.is_cursor() && src.is_cursor() && self.memcpy_places_overlap(dst.array, src.array) {
+        if self.memcpy_places_overlap(dst.array, src.array) && !dst.same_array(src) {
             return false;
         }
         self.memcpy_scalar_is_repeatable(n, dst.array)
