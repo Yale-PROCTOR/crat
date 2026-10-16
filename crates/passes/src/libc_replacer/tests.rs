@@ -19,6 +19,87 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::Transfor
 }
 
 #[test]
+fn test_memcpy_discarded_block_results() {
+    for source_ty in ["&[u8]", "SliceCursor<'_, u8>"] {
+        for wrapper in ["{ COPY };", "{ { COPY } };", "unsafe { COPY };"] {
+            let body = wrapper.replace(
+                "COPY",
+                "let borrowed = &mut *dst; memcpy(borrowed.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 4)",
+            );
+            run_test(
+                &format!(
+                    "{MEMCPY_CURSOR_TYPES}\nstruct State {{ buf: [u8; 8] }} pub unsafe fn copy(dst: &mut State, src: {source_ty}) {{ {body} }}"
+                ),
+                &["copy_from_slice"],
+                &["memcpy(borrowed"],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_strncpy_discarded_block_results() {
+    for wrapper in ["{ COPY };", "{ { COPY } };", "unsafe { COPY };"] {
+        let body = wrapper.replace("COPY", "strncpy(dst.as_mut_ptr(), src.as_ptr(), 63)");
+        run_test(
+            &format!(
+                r#"
+extern "C" {{ fn strncpy(dst: *mut i8, src: *const i8, n: usize) -> *mut i8; }}
+pub unsafe fn copy(src: &[i8]) {{ let mut dst = [1i8; 64]; {body} }}
+"#
+            ),
+            &[
+                "___dst.fill(0)",
+                "copy_from_slice(&___src[..___len])",
+                ".min(___n)",
+            ],
+            &["strncpy(dst.as_mut_ptr()"],
+        );
+    }
+}
+
+#[test]
+fn test_libc_block_results_are_preserved() {
+    for (name, elem, pointee, source) in [
+        (
+            "memcpy",
+            "u8",
+            "core::ffi::c_void",
+            "src.as_ptr() as *const _",
+        ),
+        (
+            "memcpy",
+            "u8",
+            "core::ffi::c_void",
+            "&value as *const u32 as *const _",
+        ),
+        ("strncpy", "i8", "i8", "src.as_ptr() as *const _"),
+    ] {
+        for body in [
+            "let result = { COPY }; result",
+            "{ COPY }",
+            "return { COPY };",
+            "identity({ COPY })",
+            "'out: { COPY }; other",
+        ] {
+            let copy = format!("{name}(dst.as_mut_ptr() as *mut _, {source}, 4)");
+            run_test(
+                &format!(
+                    r#"
+extern "C" {{ fn {name}(dst: *mut {pointee}, src: *const {pointee}, n: usize) -> *mut {pointee}; }}
+fn identity(p: *mut {pointee}) -> *mut {pointee} {{ p }}
+pub unsafe fn copy(dst: &mut [{elem}], src: &[{elem}], value: u32, cond: bool, other: *mut {pointee}) -> *mut {pointee} {{ {} }}
+"#,
+                    body.replace("COPY", &copy),
+                ),
+                &[&format!("{name}(dst.as_mut_ptr()")],
+                &["copy_from_slice"],
+            );
+        }
+    }
+}
+
+#[test]
 fn test_memcpy_used_results_are_preserved() {
     for source in [
         "src.as_ptr() as *const _",
