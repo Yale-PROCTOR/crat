@@ -99,7 +99,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
             })
     }
 
-    fn slice_cursor_of_as_ptr(
+    pub(super) fn slice_cursor_of_as_ptr(
         &self,
         s: &Expr,
         mutable: bool,

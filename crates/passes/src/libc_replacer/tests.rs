@@ -773,3 +773,198 @@ pub unsafe fn foo(mut i: core::ffi::c_int, mut x: f64, mut y: f64) -> f64 {
         &["abs(i)", "sin(x)", "cos(y)", "atan2(y, x)", "difftime(i"],
     );
 }
+
+const MEMCPY_CURSOR_TYPES: &str = r#"
+extern "C" {
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+    fn memmove(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+    fn memset(dst: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void;
+}
+pub mod slice_cursor {
+    pub struct SliceCursor<'a, T> { pub base: &'a [T], pub pos: usize }
+    pub struct SliceCursorMut<'a, T> { pub base: &'a mut [T], pub pos: usize }
+    impl<T> Copy for SliceCursor<'_, T> {}
+    impl<T> Clone for SliceCursor<'_, T> { fn clone(&self) -> Self { *self } }
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn as_ptr(&self) -> *const T { self.base[self.pos..].as_ptr() }
+        pub fn as_slice(&self) -> &'a [T] { &self.base[self.pos..] }
+        pub fn offset_by(mut self, n: isize) -> Self { self.pos = self.pos.wrapping_add_signed(n); self }
+    }
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn as_ptr(&self) -> *const T { self.base[self.pos..].as_ptr() }
+        pub fn as_mut_ptr(&mut self) -> *mut T { self.base[self.pos..].as_mut_ptr() }
+        pub fn as_slice(&self) -> &[T] { &self.base[self.pos..] }
+        pub fn as_slice_mut(&mut self) -> &mut [T] { &mut self.base[self.pos..] }
+        pub fn as_deref(self) -> SliceCursor<'a, T> { SliceCursor { base: self.base, pos: self.pos } }
+        pub fn as_deref_mut(&mut self) -> SliceCursorMut<'_, T> { SliceCursorMut { base: &mut *self.base, pos: self.pos } }
+        pub fn offset_by(mut self, n: isize) -> Self { self.pos = self.pos.wrapping_add_signed(n); self }
+    }
+}
+use slice_cursor::SliceCursor;
+use slice_cursor::SliceCursorMut;
+"#;
+
+fn run_cursor_copy(code: &str, replaces: bool) -> super::TransformationResult {
+    let (includes, excludes): (&[&str], &[&str]) = if replaces {
+        (&["copy_from_slice"], &["memcpy(dst."])
+    } else {
+        (&["memcpy("], &["copy_from_slice"])
+    };
+    run_test(
+        &format!("{MEMCPY_CURSOR_TYPES}\n{code}"),
+        includes,
+        excludes,
+    )
+}
+
+#[test]
+fn test_memcpy_cursor_byte_views() {
+    for ty in ["u8", "i8"] {
+        for (dst_ty, dst, src_ty, src) in [
+            (
+                format!("&mut [{ty}]"),
+                "dst.as_mut_ptr()",
+                format!("SliceCursor<'_, {ty}>"),
+                "src.as_ptr()",
+            ),
+            (
+                format!("SliceCursorMut<'_, {ty}>"),
+                "dst.as_mut_ptr()",
+                "&[u8]".into(),
+                "src.as_ptr()",
+            ),
+            (
+                "&mut [u8]".into(),
+                "dst[1..].as_mut_ptr()",
+                format!("SliceCursorMut<'_, {ty}>"),
+                "src.as_ptr()",
+            ),
+            (
+                "&mut [u8]".into(),
+                "dst.as_mut_ptr()",
+                format!("SliceCursorMut<'_, {ty}>"),
+                "src.offset_by(1).as_ptr()",
+            ),
+            (
+                format!("SliceCursorMut<'_, {ty}>"),
+                "dst.as_mut_ptr()",
+                format!("SliceCursor<'_, {ty}>"),
+                "src.offset_by(-1).as_ptr()",
+            ),
+        ] {
+            let res = run_cursor_copy(
+                &format!(
+                    "pub unsafe fn copy(mut dst: {dst_ty}, src: {src_ty}) {{ memcpy({dst} as *mut _, {src} as *const _, 2); }}"
+                ),
+                true,
+            );
+            if ty == "i8" {
+                assert!(res.bytemuck);
+                assert!(res.code.contains("cast_slice"));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_memcpy_cursor_inline_scalars() {
+    for count in [
+        "fill as usize",
+        "(datalen >> 3) as usize",
+        "fill.wrapping_mul(2) as usize",
+        "(fill as u8 as i8) as usize",
+        "core::mem::size_of::<u8>().wrapping_mul(fill as usize)",
+    ] {
+        let res = run_cursor_copy(
+            &format!(
+                "pub unsafe fn copy(mut dst: &mut [u8], src: SliceCursor<'_, u8>, fill: u32, datalen: u64) {{ memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, {count}); }}"
+            ),
+            true,
+        );
+        assert!(!res.code.contains("let "), "{}", res.code);
+        let compact: String = res.code.chars().filter(|c| !c.is_whitespace()).collect();
+        let expr: String = count.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(compact.matches(&expr).count(), 2, "{}", res.code);
+    }
+    run_cursor_copy(
+        "struct State { buf: [u8; 8], count: usize } pub unsafe fn copy(dst: &mut State, src: SliceCursor<'_, u8>) { memcpy(dst.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, dst.count); }",
+        true,
+    );
+}
+
+#[test]
+fn test_memcpy_cursor_fallbacks() {
+    for count in ["next()", "{ n += 1; n }", "dst.len()", "dst[0] as usize"] {
+        run_cursor_copy(
+            &format!(
+                "fn next() -> usize {{ 1 }} pub unsafe fn copy(mut dst: &mut [u8], src: SliceCursor<'_, u8>, mut n: usize) {{ memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, {count}); }}"
+            ),
+            false,
+        );
+    }
+    for code in [
+        "pub unsafe fn copy(dst: *mut u8, src: SliceCursor<'_, u8>) { memcpy(dst as *mut _, src.as_ptr() as *const _, 1); }",
+        "pub unsafe fn copy(dst: &[u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_ptr() as *mut _, src.as_ptr() as *const _, 1); }",
+        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as usize as *const _, 1); }",
+        "pub unsafe fn copy(mut dst: SliceCursorMut<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, dst.as_ptr() as *const _, 0); }",
+        "static mut DST: [u8; 8] = [0; 8]; pub unsafe fn copy(src: SliceCursor<'_, i8>) { memcpy(DST.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); }",
+        "fn destination(x: &mut [u8]) -> &mut [u8] { x } pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(destination(dst).as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); }",
+        "fn with_borrow(x: &[u8]) -> &[u8] { x } pub unsafe fn copy(mut dst: SliceCursorMut<'_, u8>, src: &[u8]) { memcpy(dst.as_mut_ptr() as *mut _, with_borrow(src).as_ptr() as *const _, 1); }",
+    ] {
+        let res = run_cursor_copy(code, false);
+        assert!(!res.bytemuck);
+    }
+    let code = format!(
+        "{}\npub unsafe fn copy(dst: &mut [u8], src: other::SliceCursor<'_, u8>) {{ memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); }}",
+        MEMCPY_CURSOR_TYPES
+            .replace("pub mod slice_cursor", "pub mod other")
+            .replace("use slice_cursor", "use other")
+    );
+    run_test(&code, &["memcpy(dst."], &["copy_from_slice"]);
+}
+
+#[test]
+fn test_memcpy_cursor_scope_is_local() {
+    for code in [
+        "pub unsafe fn copy(mut dst: SliceCursorMut<'_, u8>, src: SliceCursor<'_, u8>) { memmove(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); memset(dst.as_mut_ptr() as *mut _, 0, 1); }",
+        "pub unsafe fn copy(dst: &mut [u32], src: SliceCursor<'_, u32>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 4); }",
+        "pub unsafe fn copy(dst: &mut [u32], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 4); }",
+        "pub unsafe fn copy(mut dst: SliceCursorMut<'_, u8>, value: u32) { memcpy(dst.as_mut_ptr() as *mut _, &value as *const u32 as *const _, core::mem::size_of::<u32>()); }",
+    ] {
+        run_cursor_copy(code, false);
+    }
+    run_test(
+        "extern \"C\" { fn memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8; } pub unsafe fn copy(mut dst: &mut [u8]) { memcpy(dst.as_mut_ptr().offset(4), dst.as_ptr(), 4); }",
+        &["copy_from_slice"],
+        &[],
+    );
+}
+
+#[test]
+fn test_memcpy_cursor_reborrows_slice_parameter() {
+    run_cursor_copy(
+        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); dst[0] += 1; }",
+        true,
+    );
+}
+
+#[test]
+fn test_memcpy_cursor_rejects_overloaded_deref() {
+    run_cursor_copy(
+        r#"
+struct State { buf: [u8; 8], count: usize }
+struct Wrapper(State);
+impl core::ops::Deref for Wrapper {
+    type Target = State;
+    fn deref(&self) -> &State { &self.0 }
+}
+impl core::ops::DerefMut for Wrapper {
+    fn deref_mut(&mut self) -> &mut State { &mut self.0 }
+}
+pub unsafe fn copy(dst: &mut Wrapper, src: SliceCursor<'_, u8>) {
+    memcpy(dst.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, dst.count);
+}
+"#,
+        false,
+    );
+}
