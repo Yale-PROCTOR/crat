@@ -1,0 +1,14 @@
+[package]
+name = "typed_counter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The typed pointer-position counter (T1 positions, T2 uses): a rustc driver with no crate dependencies
+# (rustc_private only), on the translator's pinned nightly-2025-06-23.
+[dependencies]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[workspace]

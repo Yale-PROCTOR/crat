@@ -1,0 +1,14 @@
+[package]
+name = "decl_counter"
+version = "0.1.0"
+edition = "2021"
+
+# CROWN's official declaration metric, as the vendored inventory library implements it and as it reproduces
+# CROWN's evaluation table 20 / 20; this driver only lets the universe and the emitted program be any pair.
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+crown_artifact_inventory = { path = "inventory" }
+
+[workspace]
