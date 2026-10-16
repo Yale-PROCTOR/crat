@@ -893,6 +893,14 @@ fn test_memcpy_cursor_inline_scalars() {
 }
 
 #[test]
+fn test_memcpy_cursor_count_conflicts_with_source_reborrow() {
+    run_cursor_copy(
+        "pub unsafe fn copy(dst: &mut [u8], mut src: SliceCursorMut<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_deref_mut().offset_by(0).as_ptr() as *const _, src.pos); }",
+        false,
+    );
+}
+
+#[test]
 fn test_memcpy_cursor_fallbacks() {
     for count in ["next()", "{ n += 1; n }", "dst.len()", "dst[0] as usize"] {
         run_cursor_copy(

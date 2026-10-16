@@ -391,7 +391,9 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         if self.memcpy_places_overlap(dst.array, src.array) && !dst.same_array(src) {
             return false;
         }
+        // A source cursor projection can retain a mutable reborrow through the copy.
         self.memcpy_scalar_is_repeatable(n, dst.array)
+            && self.memcpy_scalar_is_repeatable(n, src.array)
     }
 
     fn memcpy_place_path(&self, e: &Expr) -> Option<(HirId, Vec<Symbol>)> {
