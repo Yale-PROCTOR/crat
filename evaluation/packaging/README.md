@@ -13,7 +13,10 @@ bash evaluation/packaging/smoke.sh <tag> [program ...]  # the driver from the un
 ```
 
 Needs the pinned toolchain (`rust-toolchain.toml`), the solver and libclang variables the top-level README names,
-python3 >= 3.11 and `unzip`. Everything else is a parameter with a default under `target/packaging/<tag>`: `REPO`,
+python3 >= 3.11 and `unzip`. Two inputs are required, because the evaluation's inputs are not in the repository:
+`BENCH` (a zip whose `jobcrat-source/benchmarks/` holds them, e.g. an earlier submission zip, or a directory laid out
+as `benchmarks/`) and `BENCH_SHA256SUMS` (the SHA-256 of its `SHA256SUMS`; the derivation stops unless it matches,
+every file checks and none but `README.md` is unlisted). Everything else is a parameter with a default under `target/packaging/<tag>`: `REPO`,
 `SCRATCH`, `WORKTREES`, `TOOLS_TARGET`, `CARGO` (the cargo command), `ENVREL` (the environment of record, relative
 to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the authors' and hosts' names). For
 `smoke.sh`: `INPUTS` (prepared inputs), `REF_TREES` (the emitted trees of record), `DEPS_TARGET`.
@@ -23,7 +26,8 @@ to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the auth
 - **A. Removals and the trim** (relays 001 s2, 002, 003, 004, 005 s1). Development files, `benchmarks/`,
   `examples/`, `evaluation/`, `LICENSE`, the frames and tools directories; every crate and pass the evaluated pipeline did not
   run (kept: `passes` trimmed to expander / extern_resolver / preprocessor, `pointer_replacer`, `points_to`,
-  `utils`, `deps_crate`); `dev-dependencies`. **Option 3** (`option3.py`): the legacy rewriter out, keeping
+  `utils`, `deps_crate`); `dev-dependencies`. `BENCH`'s `benchmarks/` becomes the zip's `benchmarks/`, byte for
+  byte, exempt from the rename and reported separately by the identity grep. **Option 3** (`option3.py`): the legacy rewriter out, keeping
   `collect_fn_ptrs`, `DiagnosticsMode` and `Config`, and the seven analyses only it used. The driver
   (`driver-template.crat.rs`) with the passes `prepare` (expand, extern, preprocess), `translate` (the analysis
   and emission path of record, `--analysis-env`, `--receipt`, `--c-exposed-fn`) and `check`. The README

@@ -13,8 +13,14 @@
 #   IDENTITY_PATTERNS  the identity grep (grep -E, case-insensitive) that must be empty before the zip; the default
 #                      covers paths and services, the operator adds the names of the authors and of the hosts.
 #   HASH_REPOS         repositories (space-separated) whose commit hashes must not appear in the tree (default: REPO)
+# Environment (required): the evaluation's inputs, which are not in the repository (they become the zip's benchmarks/):
+#   BENCH              a zip whose jobcrat-source/benchmarks/ holds them (e.g. an earlier submission zip), or a directory
+#                      laid out as benchmarks/ (crown/, inator/, README.md, SHA256SUMS)
+#   BENCH_SHA256SUMS   the SHA-256 of that benchmarks/SHA256SUMS; the derivation stops unless it matches and every file
+#                      but README.md and SHA256SUMS is listed in it and checks
 set -u
 HEAD=${1:?head}; TAG=${2:?tag}
+BENCH=${BENCH:?BENCH: a zip carrying jobcrat-source/benchmarks/ or a benchmarks/ directory}; BENCH_SHA256SUMS=${BENCH_SHA256SUMS:?BENCH_SHA256SUMS: the SHA-256 of benchmarks/SHA256SUMS}
 P=$(cd "$(dirname "$0")" && pwd)
 REPO=${REPO:-$(git -C "$P" rev-parse --show-toplevel)}
 SCRATCH=${SCRATCH:-$REPO/target/packaging/$TAG}; ZS=$SCRATCH
@@ -45,7 +51,15 @@ mkdir -p $W/config; grep -E '^export ' $W/$ENVREL | sed -E 's/[[:space:]]+#.*$//
 { echo '#!/bin/bash'; cat $ZS/env-exports.txt; echo 'export SYSROOT="$(rustc --print sysroot)"'; echo 'export LD_LIBRARY_PATH="$SYSROOT/lib:$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'; } > $W/config/analysis-env.sh; chmod +x $W/config/analysis-env.sh
 echo "   config/analysis-env.sh: $(grep -c '^export' $W/config/analysis-env.sh) exports from $ENVREL"
 
-step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/ whole: the kit is not in the zip, USER 10-15 08:2xZ)"
+step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/ whole: the kit is not in the zip, USER 10-15 08:2xZ); the inputs from BENCH -> benchmarks/ (USER 10-15 08:4xZ)"
+rm -rf $ZS/bench-keep $ZS/bench-unzip
+if [ -d "$BENCH" ]; then cp -a "$BENCH" $ZS/bench-keep; else mkdir -p $ZS/bench-unzip; unzip -q "$BENCH" 'jobcrat-source/benchmarks/*' -d $ZS/bench-unzip && mv $ZS/bench-unzip/jobcrat-source/benchmarks $ZS/bench-keep; rm -rf $ZS/bench-unzip; fi
+[ -f $ZS/bench-keep/SHA256SUMS ] || { echo "BENCH has no benchmarks/SHA256SUMS: $BENCH"; exit 1; }
+got=$(sha256sum $ZS/bench-keep/SHA256SUMS | cut -c1-64); [ "$got" = "$BENCH_SHA256SUMS" ] || { echo "benchmarks/SHA256SUMS is $got, not BENCH_SHA256SUMS $BENCH_SHA256SUMS"; exit 1; }
+( cd $ZS/bench-keep && sha256sum -c --quiet SHA256SUMS ) || { echo "benchmarks/: a file does not match SHA256SUMS"; exit 1; }
+unlisted=$(cd $ZS/bench-keep && find . -type f ! -path ./SHA256SUMS ! -path ./README.md | sed 's#^\./##' | sort | comm -23 - <(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS | sort))
+[ -z "$unlisted" ] || { echo "benchmarks/: files not in SHA256SUMS: $unlisted"; exit 1; }
+echo "   BENCH $BENCH: SHA256SUMS sha256 $got, $(grep -c . $ZS/bench-keep/SHA256SUMS) entries checked, no unlisted file"
 for p in .compound-engineering .github .gitignore .claudignore CLAUDE.md AGENTS.md .claude .codex .vscode M0-KNOWN-DEFECTS.md README.md LICENSE benchmarks tool.py rustfmt.toml examples crates/pointer_replacer/frames crates/pointer_replacer/tools crates/finders crates/io_replacer crates/merger crates/outparam_replacer crates/static_replacer crates/union_replacer src/bin/crat-finder.rs src/bin/crat-merge.rs crat-finder crat-merge crates/passes/src/bin_file_adder.rs crates/passes/src/enum_replacer crates/passes/src/formatter.rs crates/passes/src/interface_fixer.rs crates/passes/src/libc_replacer crates/passes/src/simplifier crates/passes/src/simplifier.rs crates/passes/src/splitter.rs crates/passes/src/unexpander.rs crates/passes/src/unsafe_resolver crates/utils/src/bit_set.rs crates/utils/src/unsafety.rs evaluation; do [ -e $W/$p ] && git -C $W rm -r -q -f -- $p; done
 find $W/crates $W/src -type f \( -name '*_tests.rs' -o -name 'tests.rs' -o -name 'test_*.py' \) -print0 | xargs -0 -r git -C $W rm -q -f --
 find $W/crates $W/src -type d -name tests -print0 | xargs -0 -r git -C $W rm -r -q -f --
@@ -67,6 +81,7 @@ for root,_,files in os.walk(W+'/crates'):
             p=os.path.join(root,f); s=open(p).read(); n=re.sub(r'\n\[dev-dependencies\]\n(?:[^\[\n][^\n]*\n|\n)*?(?=\[|\Z)','\n',s)
             if n!=s: open(p,'w').write(n); print('   dev-dependencies removed:',p.replace(W+'/',''))
 PY
+[ -d $ZS/bench-keep ] && { mkdir -p $W/benchmarks; mv $ZS/bench-keep/* $W/benchmarks/; echo "   benchmarks/: $(find $W/benchmarks -type f | wc -l) files from BENCH (byte for byte)"; }
 python3 -I $P/option3.py
 cp $P/driver-template.crat.rs $W/src/bin/crat.rs
 cp $P/README-template.md $W/README.md
@@ -107,7 +122,7 @@ export CARGO_TARGET_DIR=$ZS/target; build derived $W || { echo "the derived tree
 python3 -I $P/strip_misc.py toml $W/Cargo.lock > /dev/null; git -C $W add -A; git -C $W -c user.name=submission -c user.email=submission@localhost commit -q -m "Packaging F: the lockfile as cargo resolved it, header stripped" 2>/dev/null && echo "   lock committed"
 echo "   TREE $(git -C $W rev-parse HEAD^{tree}) files $(git -C $W ls-files | wc -l)"
 echo "   crat word: $(git -C $W grep -n -w -e crat -- . | wc -l); bCRAT_: $(git -C $W grep -n -P '\bCRAT_' -- . | wc -l); __crat_: $(git -C $W grep -n -e '__crat_' -e '__CRAT_' -- . | wc -l); Crat: $(git -C $W grep -n -w -e Crat -- . | wc -l)"
-echo "   identity grep (minus the registry URL in lockfiles): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- . | grep -v -F 'registry+https://github.com/rust-lang/crates.io-index' | wc -l)"
+echo "   identity grep (minus the registry URL in lockfiles, outside benchmarks/): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- . ':!benchmarks' | grep -v -F 'registry+https://github.com/rust-lang/crates.io-index' | wc -l); in benchmarks/ (third-party inputs, kept byte for byte): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) lines in $(git -C $W grep -l -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) files"
 ours=$(git -C $W grep -o -h -I -E '\b[0-9a-f]{7,40}\b' -- . | sort -u | while read t; do case $t in *[a-f]*) ;; *) continue;; esac; case $t in *[0-9]*) ;; *) continue;; esac; for r in $HASH_REPOS; do git -C $r rev-parse --verify --quiet "$t^{commit}" >/dev/null 2>&1 && { echo $t; break; }; done; done)
 echo "   commit hashes of our repositories in the tree: $(printf '%s' "$ours" | grep -c .)${ours:+ -- $(echo $ours)}"
 echo "   fingerprints: $(git -C $W grep -n -E -e '@2026-|"r[0-9]{3}-|"s23-|s23-force|r385-force|wave5p|era5c-l01p14|-PORT subset tripwire|addendum|user ruling|\bR[0-9]{3,4}-[0-9]\b' -- '*.rs' ':!evaluation' | wc -l); reason attrs: $(git -C $W grep -n -E '^\s*reason\s*=\s*"' -- '*.rs' ':!evaluation' | wc -l); cfg(test): $(git -C $W grep -n -E '#\!?\[cfg\(test\)\]|^\s*#\[test\]' -- '*.rs' ':!evaluation' | wc -l)"

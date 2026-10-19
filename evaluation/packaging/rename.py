@@ -7,7 +7,7 @@ TEXT_EXT = {'.rs', '.toml', '.sh', '.py', '.tsv', '.csv', '.json', '.md', '.c', 
 SKIP = {'Cargo.lock', '.git'}
 def files():
     for root, dirs, fs in os.walk(W):
-        dirs[:] = [d for d in dirs if d not in ('.git', 'target')]
+        dirs[:] = [d for d in dirs if d not in ('.git', 'target') and not (root == W and d == 'benchmarks')]
         for f in fs:
             p = os.path.join(root, f)
             if os.path.islink(p): continue

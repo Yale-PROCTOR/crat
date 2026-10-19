@@ -47,6 +47,13 @@ already set in the environment win). Functions exposed to C are named with
 `--c-exposed-fn`. `check` type-checks the current state of the program and
 changes nothing.
 
+## Benchmarks
+
+`benchmarks/crown/` holds the twenty programs of CROWN's benchmark suite as its artifact ships them
+(C2Rust output), `benchmarks/inator/` the eight programs of &inator's suite translated the same way;
+`benchmarks/README.md` and `SHA256SUMS` describe them. `./jobcrat --pass prepare,translate -o OUT
+benchmarks/crown/avl` translates one.
+
 ## Configuration of record
 
 `config/analysis-env.sh` exports the analysis switches the paper's numbers were
