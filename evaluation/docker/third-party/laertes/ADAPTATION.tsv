@@ -1,0 +1,13 @@
+program	root	added	removed
+avl	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+binn	lib.rs	#![feature(rustc_private)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+bst	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+buffer	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+heman	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+ht	lib.rs	#![feature(const_mut_refs)] #![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+json.h	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+libtree	lib.rs	-	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+lodepng	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+quadtree	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+rgba	lib.rs	#![feature(const_fn_fn_ptr_basics)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]
+brotli	lib.rs	#![feature(const_fn_fn_ptr_basics)] #![feature(const_mut_refs)]	#![feature(strict_provenance)] #![feature(core_intrinsics)] #![feature(raw_ref_op)]

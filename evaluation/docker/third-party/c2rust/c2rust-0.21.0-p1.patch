@@ -1,0 +1,35 @@
+diff --git a/c2rust-transpile/src/build_files/mod.rs b/c2rust-transpile/src/build_files/mod.rs
+index 5ab50d9..fdc764d 100644
+--- a/c2rust-transpile/src/build_files/mod.rs
++++ b/c2rust-transpile/src/build_files/mod.rs
+@@ -259,8 +259,8 @@ fn emit_lib_rs(
+ /// If we translate variadic functions, the output will only compile
+ /// on a nightly toolchain until the `c_variadics` feature is stable.
+ fn emit_rust_toolchain(tcfg: &TranspilerConfig, build_dir: &Path) {
+-    let output_path = build_dir.join("rust-toolchain.toml");
+-    let output = include_str!("generated-rust-toolchain.toml").to_string();
++    let output_path = build_dir.join("rust-toolchain");
++    let output = "nightly-2025-06-23".to_string();
+     maybe_write_to_file(&output_path, output, tcfg.overwrite_existing);
+ }
+ 
+diff --git a/c2rust-transpile/src/translator/mod.rs b/c2rust-transpile/src/translator/mod.rs
+index 9ce3b88..f173ecf 100644
+--- a/c2rust-transpile/src/translator/mod.rs
++++ b/c2rust-transpile/src/translator/mod.rs
+@@ -3867,7 +3867,14 @@ impl<'c> Translation<'c> {
+                                 };
+ 
+                             let mul = self.compute_size_of_expr(pointee_type_id.ctype);
+-                            Ok(pointer_offset(lhs, rhs, mul, false, true))
++                            let mut val = pointer_offset(lhs, rhs, mul, false, true);
++                            if let Some(expected_ty) = override_ty {
++                                if expected_ty != pointee_type_id {
++                                    let ty = self.convert_type(expected_ty.ctype)?;
++                                    val = mk().cast_expr(val, ty);
++                                }
++                            }
++                            Ok(val)
+                         })
+                     }
+                 })
