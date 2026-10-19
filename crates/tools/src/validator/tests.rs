@@ -1213,7 +1213,7 @@ fn two_argument_main_0_accepts_matching_wildcard_parameters() {
 }
 
 #[test]
-fn wildcard_parameter_support_is_limited_to_two_argument_main_0() {
+fn ordinary_and_one_argument_main_0_accept_matching_wildcard_parameters() {
     for (name, skeleton) in [
         ("f", "unsafe fn f(_: i32, _: i32) { #[proctor(0)] return; }"),
         (
@@ -1227,11 +1227,32 @@ fn wildcard_parameter_support_is_limited_to_two_argument_main_0() {
             transformation: skeleton.to_owned(),
         };
         assert_eq!(
-            codes(&validate(&validation_request)),
-            ["invalid_expected_skeleton"],
+            validate(&validation_request),
+            ValidationResponse::Valid,
             "{skeleton}"
         );
     }
+}
+
+#[test]
+fn ordinary_wildcard_parameters_preserve_patterns_types_and_count() {
+    let skeleton = "unsafe fn f(_: i32, value: i32) -> i32 { #[proctor(0)] todo!() }";
+    for transformation in [
+        "unsafe fn f(named: i32, value: i32) -> i32 { #[proctor(0)] value }",
+        "unsafe fn f(_: i32, _: i32) -> i32 { #[proctor(0)] 0 }",
+    ] {
+        assert_codes(skeleton, transformation, &["parameter_name_mismatch"]);
+    }
+    assert_codes(
+        skeleton,
+        "unsafe fn f(_: u32, value: i32) -> i32 { #[proctor(0)] value }",
+        &["parameter_type_mismatch"],
+    );
+    assert_codes(
+        skeleton,
+        "unsafe fn f(_: i32) -> i32 { #[proctor(0)] 0 }",
+        &["parameter_count_mismatch"],
+    );
 }
 
 #[test]

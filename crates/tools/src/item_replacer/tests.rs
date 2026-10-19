@@ -2292,13 +2292,105 @@ fn source_target_resolution_and_normalized_safety_fail_atomically() {
 }
 
 #[test]
-fn wildcard_and_destructuring_parameters_remain_unsupported_elsewhere() {
+fn adds_mechanical_function_with_wildcard_parameter() {
+    let source = "pub unsafe fn initialize(_: *mut i32) {}";
+    let record = run_compiler_on_str(source, |tcx| {
+        crate::make_skeletons(source, tcx).unwrap().pop().unwrap()
+    })
+    .unwrap();
+    let crate::ItemRecord::Function(record) = record else { panic!("expected function record") };
+    let view = record.applied;
+    assert!(!view.needs_transformation);
+    let transformation = view.skeleton.clone();
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![ReplacementItem {
+            id: record.id,
+            path: record.path,
+            name: record.name,
+            view,
+        }],
+        transformation: transformation.clone(),
+        accepted_correspondence: vec![],
+    };
+    let output = add_source(source, &request).unwrap();
+    assert_function_at_path(&output, "initialize", &transformation);
+    compile_checked(&output);
+}
+
+#[test]
+fn wildcard_parameter_preserves_used_pointer_observations() {
+    let source = "pub unsafe fn read(_: *const i32, pointer: *const i32) -> i32 { *pointer }";
+    let skeleton = "unsafe fn read(_: *const i32, pointer: &i32) -> i32 { #[proctor(0)] todo!() }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(7, "read", "read", skeleton, vec![0])],
+        transformation:
+            "unsafe fn read(_: *const i32, pointer: &i32) -> i32 { #[proctor(0)] *pointer }"
+                .to_owned(),
+        accepted_correspondence: vec![],
+    };
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![crate::ExpectedFunction {
+                id: 7,
+                name: "read".to_owned(),
+                view: request.items[0].view.clone(),
+            }],
+            transformation: request.transformation.clone(),
+        }),
+        crate::ValidationResponse::Valid
+    );
+    let initial = make_initial_source(source).unwrap();
+    let output = add(source, &initial, &request).unwrap();
+    compile_checked(&output.replacement.source);
+    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"pairs",
+        output.observation_source.as_bytes(),
+    );
+    let document =
+        crate::extract_observations_from_source(&output.observation_source, &metadata).unwrap();
+    assert_eq!(document.observations.len(), 1);
+    assert_eq!(document.observations[0].pointer_anchors.len(), 1);
+    let anchor = &document.observations[0].pointer_anchors[0];
+    assert!(matches!(
+        anchor.source_type,
+        crate::TypeTree::RawPointer { .. }
+    ));
+    assert!(matches!(
+        anchor.target_type,
+        crate::TypeTree::Reference { .. }
+    ));
+}
+
+#[test]
+fn wildcard_parameter_patterns_must_be_preserved() {
+    for (source, transformation) in [
+        ("unsafe fn f(value: i32) {}", "unsafe fn f(_: i32) {}"),
+        ("unsafe fn f(_: i32) {}", "unsafe fn f(value: i32) {}"),
+    ] {
+        let mut request = request("f", "f", transformation);
+        request.items[0].view = skeleton_view(transformation, vec![], false);
+        let error = add_source(source, &request).unwrap_err();
+        assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
+        assert!(
+            error.message.contains("returned parameter 0 uses pattern"),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn destructuring_parameters_remain_unsupported() {
     for (source, path, name, transformation) in [
         (
-            "unsafe fn f(value: i32) { let _ = value; }",
+            "unsafe fn f(pair: (i32, i32)) {}",
             "f",
             "f",
-            "unsafe fn f(_: i32) { #[proctor(0)] return; }",
+            "unsafe fn f((_, _): (i32, i32)) {}",
         ),
         (
             r#"unsafe fn main_0(first: (i32, i32), second: i32) { let _ = (first, second); }

@@ -1443,18 +1443,17 @@ fn validate_supported_transformation(
             "returned variadic functions are unsupported".to_owned(),
         ));
     }
-    let allow_wildcards = is_supported_two_argument_main_0(function);
     if function
         .sig
         .decl
         .inputs
         .iter()
-        .any(|parameter| simple_parameter_pattern(parameter, allow_wildcards).is_none())
+        .any(|parameter| simple_parameter_pattern(parameter).is_none())
     {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
             requested,
-            "every returned parameter must use a simple by-value identifier pattern (or `_` for two-argument `main_0`)"
+            "every returned parameter must use a simple by-value identifier pattern or `_`"
                 .to_owned(),
         ));
     }
@@ -1676,7 +1675,6 @@ fn validate_transformed_header(
             ),
         ));
     }
-    let allow_wildcards = is_supported_two_argument_main_0(current);
     for (index, (source, target)) in current
         .sig
         .decl
@@ -1685,16 +1683,14 @@ fn validate_transformed_header(
         .zip(&transformed.sig.decl.inputs)
         .enumerate()
     {
-        let source_pattern =
-            simple_parameter_pattern(source, allow_wildcards).ok_or_else(|| {
-                item_error(
-                    ReplacementErrorKind::TargetResolution,
-                    requested,
-                    format!("current parameter {index} is not a supported parameter pattern"),
-                )
-            })?;
-        let target_pattern =
-            simple_parameter_pattern(target, allow_wildcards).expect("returned header was checked");
+        let source_pattern = simple_parameter_pattern(source).ok_or_else(|| {
+            item_error(
+                ReplacementErrorKind::TargetResolution,
+                requested,
+                format!("current parameter {index} is not a supported parameter pattern"),
+            )
+        })?;
+        let target_pattern = simple_parameter_pattern(target).expect("returned header was checked");
         if source_pattern != target_pattern {
             return Err(item_error(
                 ReplacementErrorKind::InvalidTransformation,
@@ -1725,15 +1721,12 @@ impl SimpleParameterPattern {
     }
 }
 
-fn simple_parameter_pattern(
-    parameter: &rustc_ast::Param,
-    allow_wildcard: bool,
-) -> Option<SimpleParameterPattern> {
+fn simple_parameter_pattern(parameter: &rustc_ast::Param) -> Option<SimpleParameterPattern> {
     match &parameter.pat.kind {
         PatKind::Ident(BindingMode(ByRef::No, _), ident, None) => {
             Some(SimpleParameterPattern::Identifier(ident.to_string()))
         }
-        PatKind::Wild if allow_wildcard => Some(SimpleParameterPattern::Wildcard),
+        PatKind::Wild => Some(SimpleParameterPattern::Wildcard),
         _ => None,
     }
 }

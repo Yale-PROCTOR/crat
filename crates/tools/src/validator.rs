@@ -19,7 +19,6 @@ use crate::{
         canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
-    skeleton::is_supported_two_argument_main_0,
 };
 
 const SCHEMA_VERSION: u64 = 1;
@@ -528,17 +527,14 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     if function.sig.decl.c_variadic() {
         return Err("variadic functions are unsupported");
     }
-    let allow_wildcards = is_supported_two_argument_main_0(function);
     if function
         .sig
         .decl
         .inputs
         .iter()
-        .any(|parameter| !is_supported_parameter_pattern(&parameter.pat, allow_wildcards))
+        .any(|parameter| !is_supported_parameter_pattern(&parameter.pat))
     {
-        return Err(
-            "every parameter must be a simple by-value identifier pattern (or `_` for two-argument `main_0`)",
-        );
+        return Err("every parameter must be a simple by-value identifier pattern or `_`");
     }
     if function
         .generics
@@ -562,11 +558,11 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     Ok(())
 }
 
-fn is_supported_parameter_pattern(pattern: &Pat, allow_wildcard: bool) -> bool {
+fn is_supported_parameter_pattern(pattern: &Pat) -> bool {
     matches!(
         pattern.kind,
-        PatKind::Ident(BindingMode(ByRef::No, _), _, None)
-    ) || allow_wildcard && matches!(pattern.kind, PatKind::Wild)
+        PatKind::Ident(BindingMode(ByRef::No, _), _, None) | PatKind::Wild
+    )
 }
 
 fn validate_expected_block(
