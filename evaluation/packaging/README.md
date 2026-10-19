@@ -2,8 +2,9 @@
 
 This directory re-derives the submission source zip (the translator under the paper's name, `jobcrat`) from a
 `borrow-ownership` head. The zip builds on its own and is not an artifact-evaluation package. Its SHA-256 and file
-count are recorded in the packaging lane's report, not here. `evaluation/` as a whole is excluded from the zip (the
-user's ruling of 10-15; `packaging/` holds the identity grep and the rename map).
+count are recorded in the packaging lane's report, not here. `evaluation/` is excluded from the zip (the user's
+ruling of 10-15; `packaging/` holds the identity grep and the rename map), except `evaluation/docker/`, which becomes
+the zip's `artifact/` (R1236-1) and goes through the rename and every check like the rest of the tree.
 
 ## Running
 

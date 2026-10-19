@@ -57,7 +57,14 @@ benchmarks/crown/avl` translates one.
 ## Configuration of record
 
 `config/analysis-env.sh` exports the analysis switches the paper's numbers were
-produced with; the `translate` pass reads it.
+produced with; the `translate` pass reads it. The evaluation also set, per
+program, `JOBCRAT_ERA5_PROGRAM=<program>` and `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`,
+and, for CROWN's twenty, `JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`;
+`artifact/run.sh` sets them.
 
-This source accompanies the submission; it builds, and it is not packaged for
-artifact evaluation.
+## Evaluation
+
+`artifact/` reproduces the paper's evaluation (RQ1 to RQ3) in a container:
+`docker build -f artifact/Dockerfile -t jobcrat-artifact .` from this
+directory, then `artifact/README.md` for the runs, the hardware and the map
+from each table to its results.

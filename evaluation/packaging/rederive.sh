@@ -51,7 +51,7 @@ mkdir -p $W/config; grep -E '^export ' $W/$ENVREL | sed -E 's/[[:space:]]+#.*$//
 { echo '#!/bin/bash'; cat $ZS/env-exports.txt; echo 'export SYSROOT="$(rustc --print sysroot)"'; echo 'export LD_LIBRARY_PATH="$SYSROOT/lib:$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'; } > $W/config/analysis-env.sh; chmod +x $W/config/analysis-env.sh
 echo "   config/analysis-env.sh: $(grep -c '^export' $W/config/analysis-env.sh) exports from $ENVREL"
 
-step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/ whole: the kit is not in the zip, USER 10-15 08:2xZ); the inputs from BENCH -> benchmarks/ (USER 10-15 08:4xZ)"
+step "2 removals (001 s2, 002 item 1, 003, 004, 005 s1; evaluation/ whole: the kit is not in the zip, USER 10-15 08:2xZ); the inputs from BENCH -> benchmarks/ (USER 10-15 08:4xZ); evaluation/docker -> artifact/ (R1236-1)"
 rm -rf $ZS/bench-keep $ZS/bench-unzip
 if [ -d "$BENCH" ]; then cp -a "$BENCH" $ZS/bench-keep; else mkdir -p $ZS/bench-unzip; unzip -q "$BENCH" 'jobcrat-source/benchmarks/*' -d $ZS/bench-unzip && mv $ZS/bench-unzip/jobcrat-source/benchmarks $ZS/bench-keep; rm -rf $ZS/bench-unzip; fi
 [ -f $ZS/bench-keep/SHA256SUMS ] || { echo "BENCH has no benchmarks/SHA256SUMS: $BENCH"; exit 1; }
@@ -60,6 +60,7 @@ got=$(sha256sum $ZS/bench-keep/SHA256SUMS | cut -c1-64); [ "$got" = "$BENCH_SHA2
 unlisted=$(cd $ZS/bench-keep && find . -type f ! -path ./SHA256SUMS ! -path ./README.md | sed 's#^\./##' | sort | comm -23 - <(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS | sort))
 [ -z "$unlisted" ] || { echo "benchmarks/: files not in SHA256SUMS: $unlisted"; exit 1; }
 echo "   BENCH $BENCH: SHA256SUMS sha256 $got, $(grep -c . $ZS/bench-keep/SHA256SUMS) entries checked, no unlisted file"
+rm -rf $ZS/artifact-keep; [ -d $W/evaluation/docker ] && cp -a $W/evaluation/docker $ZS/artifact-keep
 for p in .compound-engineering .github .gitignore .claudignore CLAUDE.md AGENTS.md .claude .codex .vscode M0-KNOWN-DEFECTS.md README.md LICENSE benchmarks tool.py rustfmt.toml examples crates/pointer_replacer/frames crates/pointer_replacer/tools crates/finders crates/io_replacer crates/merger crates/outparam_replacer crates/static_replacer crates/union_replacer src/bin/crat-finder.rs src/bin/crat-merge.rs crat-finder crat-merge crates/passes/src/bin_file_adder.rs crates/passes/src/enum_replacer crates/passes/src/formatter.rs crates/passes/src/interface_fixer.rs crates/passes/src/libc_replacer crates/passes/src/simplifier crates/passes/src/simplifier.rs crates/passes/src/splitter.rs crates/passes/src/unexpander.rs crates/passes/src/unsafe_resolver crates/utils/src/bit_set.rs crates/utils/src/unsafety.rs evaluation; do [ -e $W/$p ] && git -C $W rm -r -q -f -- $p; done
 find $W/crates $W/src -type f \( -name '*_tests.rs' -o -name 'tests.rs' -o -name 'test_*.py' \) -print0 | xargs -0 -r git -C $W rm -q -f --
 find $W/crates $W/src -type d -name tests -print0 | xargs -0 -r git -C $W rm -r -q -f --
@@ -82,6 +83,7 @@ for root,_,files in os.walk(W+'/crates'):
             if n!=s: open(p,'w').write(n); print('   dev-dependencies removed:',p.replace(W+'/',''))
 PY
 [ -d $ZS/bench-keep ] && { mkdir -p $W/benchmarks; mv $ZS/bench-keep/* $W/benchmarks/; echo "   benchmarks/: $(find $W/benchmarks -type f | wc -l) files from BENCH (byte for byte)"; }
+[ -d $ZS/artifact-keep ] && { mv $ZS/artifact-keep $W/artifact; echo "   artifact/: $(find $W/artifact -type f | wc -l) files from evaluation/docker (renamed and checked with the rest)"; }
 python3 -I $P/option3.py
 cp $P/driver-template.crat.rs $W/src/bin/crat.rs
 cp $P/README-template.md $W/README.md
@@ -131,6 +133,7 @@ echo "   fingerprints: $(git -C $W grep -n -E -e '@2026-|"r[0-9]{3}-|"s23-|s23-f
 find $W/crates $W/src $W/deps_crate -name '*.rs' -type f | sort > $KEPT; echo "   comments left: $($TOOLS/rslex count $(cat $KEPT) | awk -F'\t' '{c+=$2} END {print c}')"
 rm -rf $ZS/tok; mkdir -p $ZS/tok; for f in $(cat $KEPT); do $TOOLS/rslex dump "$f" > "$ZS/tok/$(echo ${f#$W/} | tr '/' '_')"; done
 echo "   list-2 in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -i -w -E -c 'seat|relay|lane|wave|era5|batch|census'); comment markers in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -c -E '\\n\s*(//|/\*)'); README internal words: $(grep -n -i -w -E 'expand|extern|preprocess|bo|wave|era5|census|crat' $W/README.md | wc -l)"
+echo "   artifact/ in the tree: $(git -C $W ls-files -- artifact | wc -l) files; list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- artifact | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- artifact | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- artifact | wc -l)"
 echo "   evaluation/ in the tree: $(git -C $W ls-files -- evaluation | wc -l) files (must be 0); bare CRAT words: $(git -C $W grep -n -w -e CRAT -- evaluation | wc -l); _CRAT suffix: $(git -C $W grep -n -P '_CRAT\b' -- evaluation | wc -l); list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- evaluation | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- evaluation | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- evaluation | wc -l)"
 
 step "8 zip + from-zip build"
