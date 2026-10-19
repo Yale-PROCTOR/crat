@@ -1,0 +1,3 @@
+# Read by `docker build -f artifact/Dockerfile .` (BuildKit): build products and run outputs stay out of the image.
+**/target
+results
