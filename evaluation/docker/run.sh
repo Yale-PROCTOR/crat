@@ -41,7 +41,7 @@ export RECEIPTS=$RUNS TIMES=$RUNS
 mkdir -p "$TREES" "$SUBSTRATE" "$RUNS" "$RESULTS/tables" "$RESULTS/logs"
 if [ $TP = 1 ] && [ ! -d "$THIRD_PARTY" ]; then
   echo "run.sh: --third-party needs $THIRD_PARTY; on the host (with Docker), first run:" >&2
-  echo "  bash artifact/third-party/run.sh all$([ $SMALL = 1 ] && echo ' --small') --results \"\$PWD/results\"" >&2
+  echo "  bash artifact/third-party/run.sh$([ $SMALL = 1 ] && echo ' --small')     (from the source root)" >&2
   exit 2
 fi
 cd "$SRC"
@@ -82,7 +82,7 @@ run_rq() {  # run_rq <rqN> <script> <args...>: runs a research question's script
 rq1() { run_rq rq1 rq1/run.sh $(small_flag); }
 rq2() { run_rq rq2 rq2/run.sh $(small_flag); }
 rq3() {
-  local tools=ours; [ -d "$THIRD_PARTY/miri-trees" ] && tools=ours,crown,laertes
+  local tools=ours; [ -d "$THIRD_PARTY/trees/crown" ] && [ -d "$THIRD_PARTY/comparison" ] && tools=ours,crown,laertes
   run_rq rq3 rq3/run_rq3.sh "$TREES" "$SUBSTRATE" "$RESULTS/rq3" $(small_flag) ${CAP:+--cap "$CAP"} --tools $tools
 }
 

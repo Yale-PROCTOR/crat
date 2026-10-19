@@ -48,13 +48,16 @@ Some columns come from the comparison tools:
 - C2Rust's time.
 
 These columns need `third-party/run.sh`. It fetches the tools' own artifacts from their Zenodo records and runs
-them with their published configurations. It runs **on the host**, because it needs a Docker daemon. It writes
-`results/third-party/`, which the container's steps then read:
+them with their published configurations. It runs **on the host**, from the source root, because it needs a Docker
+daemon (and `curl`, `unzip`, `python3`). It writes `results/third-party/`, which the container's steps then read:
 
 ```
-bash artifact/third-party/run.sh all [--small] --results "$PWD/results"     # about 8.5 GB of downloads
+bash artifact/third-party/run.sh [--small]        # about 8.5 GB of downloads, about 70 GB of disk with the images
 docker run --rm -v "$PWD/results:/jobcrat-source/results" jobcrat-artifact all [--small] --third-party
 ```
+
+`third-party/README.md` gives its steps, walls and options (e.g. `TP_DOWNLOADS`, a directory of archives fetched
+beforehand, since the downloads can be slow).
 
 Without this step, those keys read `skipped` and every other column is still produced. `--third-party` makes the
 container stop if `results/third-party/` is missing.
