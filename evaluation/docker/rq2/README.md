@@ -1,7 +1,7 @@
 # rq2/ — Table scale (running times)
 
 `rq2/run.sh [--small]` reads the translate step's receipts and time files and the comparison tools' times. It translates nothing: the artifact's `run.sh` times the translate pass first. It writes:
-- `results/rq2/keys.txt`: one `key = value` line per key; `skipped (<why>)` where a key was not produced, `failed (<why>)` where a run failed;
+- `results/rq2/keys.txt`: one `key = value` line per key. A key that was not produced reads `skipped (<why>)`; one whose run failed (an exit status, a signal, no receipt or time file) reads `failed (<why>)`; a total reads `no total (...)` where a status word stands in one of its cells. compare.py counts the last two as differences;
 - `results/rq2/runs.tsv`: per program, the exit status, the receipt's outcome / verify rounds / reverted functions / files changed, the wall, the solve time and the peak memory;
 - `results/tables/scale.csv`: both halves of the table (the sizes come from `results/rq1/keys.txt`);
 - `results/tables/scale.tex`: the produced keys as the paper's `numbers.tex` rows.
@@ -25,7 +25,7 @@ The twenty print to 0.1 s, the eight to 0.01 s.
 **The wall.** The paper's walls were measured around the invocation. If the translate step leaves `<p>.wall` (seconds) beside `<p>.time`, that value is used; otherwise GNU time's "Elapsed (wall clock)" line is read. That line truncates to 10 ms and reads about 0.01 s lower per program. On the paper's own runs, 29 of the 161 keys then move by one unit in their last digit, and the factor reads 166 instead of 165.
 
 ## `--small`
-- **Not translated:** lil and brotli. Their keys, the twenty's totals, `rq3.largest.analysis-s` and the CROWN / Laertes totals read `skipped (--small)`.
+- **Not translated:** lil and brotli. Our keys for them, the twenty's totals, `rq3.largest.analysis-s` and the CROWN / Laertes totals read `skipped (--small)`; so do CROWN's and Laertes's cells for them when `times.tsv` has no row.
 - **&inator:** `third-party/run.sh --small` runs it on five of the eight. The `host-s` of rbtree, jccc and tisp, their total and the factor then read `skipped (--small)`.
 - **c2rust:** runs on all eight, so `with-c2rust-s` is produced throughout.
 

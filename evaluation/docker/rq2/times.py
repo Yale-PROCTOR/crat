@@ -24,7 +24,7 @@ The definitions, as the paper's values were derived:
   rq3.inator.<q>.with-c2rust-s c2rust-s + total-s, both as printed (the total the same way)
   rq3.inator.total.vs-inator-with-c2rust.factor   host-s total / with-c2rust-s total, rounded half up to a whole number
 usage: times.py   (environment: SRC, RESULTS, RECEIPTS, TIMES, THIRD_PARTY; SMALL=1 under --small)"""
-import os, re
+import os, re, sys
 from decimal import Decimal as D, ROUND_HALF_UP
 
 SRC = os.path.abspath(os.environ.get('SRC', os.getcwd()))
@@ -37,13 +37,14 @@ SMALL = os.environ.get('SMALL', '0') == '1'
 
 TWENTY = ['avl', 'binn', 'brotli', 'bst', 'buffer', 'bzip2', 'genann', 'heman', 'ht', 'json.h', 'libcsv', 'libtree',
           'libzahl', 'lil', 'lodepng', 'quadtree', 'rgba', 'robotfindskitten', 'tulipindicators', 'urlparser']
-LARGE = ('lil', 'brotli')          # not translated under --small
+LARGE = ('lil', 'brotli')          # not translated under --small (nor by CROWN / Laertes there)
 LARGEST = 'brotli'                 # the largest of the twenty by lines
 EIGHT = ['ulidgen', 'leftpad', 'amp', 'nandc', 'rbtree', 'carrays', 'jccc', 'tisp']
+INATOR_LARGE = ('rbtree', 'jccc', 'tisp')    # &inator does not run them under --small
 SOLVE_RE = re.compile(r'solve_wall_s: "?([0-9.]+)')
 ELAPSED_RE = re.compile(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\): (\S+)')
 NUM_RE = re.compile(r'[0-9]+(\.[0-9]+)?')
-STATUS = 'skipped (a status in place of a time)'
+STATUS = 'no total (a status in place of a time)'
 
 
 def K(p):
@@ -56,9 +57,10 @@ def dec(cell):
 
 
 def reason(*cells):
-    """Why a value built from these cells is not a number: the first `skipped` / `failed` cell, else STATUS."""
+    """Why a value built from these cells is not a number: the first `failed` / `skipped` cell, else STATUS (a status
+    word such as `crash` where the paper has a time; compare.py reads it as a difference, not as skipped)."""
     words = [c for c in cells if dec(c) is None]
-    return next((c for c in words if c.startswith(('skipped', 'failed'))), STATUS)
+    return next((c for c in words if c.startswith(('failed', 'skipped', 'no total'))), STATUS)
 
 
 def show(x, places):
@@ -74,8 +76,9 @@ def read_run(p):
         why = 'skipped (--small)' if SMALL and p in LARGE else 'skipped (not run)'
         return why, why, row
     tv = open(tim, errors='replace').read() if os.path.exists(tim) else ''
+    sig = re.search(r'Command terminated by signal (\d+)', tv)      # GNU time then still prints "Exit status: 0"
     m = re.search(r'Exit status: (\d+)', tv)
-    row['exit'] = m.group(1) if m else ('signal' if 'terminated by signal' in tv else '-')
+    row['exit'] = f'signal {sig.group(1)}' if sig else (m.group(1) if m else '-')
     m = re.search(r'Maximum resident set size \(kbytes\): (\d+)', tv)
     row['max_rss_gib'] = f'{int(m.group(1)) / 1048576:.1f}' if m else '-'
     first = open(rec, errors='replace').readline() if os.path.exists(rec) else ''
@@ -84,7 +87,9 @@ def read_run(p):
         row[k] = kv.get(k, '-')
     wall = None
     if os.path.exists(wal):
-        wall, row['wall_from'] = D(open(wal).read().split()[0]), 'wall'
+        row['wall_from'] = 'wall'
+        w = open(wal, errors='replace').read().split()
+        wall = D(w[0]) if w and NUM_RE.fullmatch(w[0]) else None
     else:
         row['wall_from'] = 'time'
         m = ELAPSED_RE.search(tv)
@@ -93,14 +98,16 @@ def read_run(p):
             for part in m.group(1).split(':'):
                 wall = wall * 60 + D(part)
     sw = SOLVE_RE.search(first)
-    if row['exit'] != '0':
+    if not tv:
+        why = 'failed (no time file)'
+    elif row['exit'] != '0':
         why = f"failed (exit {row['exit']})"
     elif kv.get('outcome') != 'emitted':
         why = f"failed (outcome {kv.get('outcome', 'missing')})"
     elif not sw:
         why = 'failed (no solve time in the receipt)'
     elif wall is None:
-        why = 'failed (no wall time)'
+        why = 'failed (no wall time)' if row['wall_from'] == 'time' else 'failed (unreadable wall file)'
     else:
         solve = D(str(float(sw.group(1))))
         row['wall_s'], row['solve_wall_s'] = str(wall), str(solve)
@@ -114,12 +121,18 @@ def third_party():
     if not os.path.exists(f):
         return None
     cells = {}
-    for line in open(f, encoding='utf-8'):
+    for n, line in enumerate(open(f, encoding='utf-8'), 1):
         c = [x.strip() for x in line.rstrip('\n').split('\t')]
-        if len(c) < 4 or c[0] in ('', 'key') or c[0].startswith('#'):
+        if c[0] in ('', 'key') or c[0].startswith('#'):
+            continue
+        if len(c) < 4:
+            print(f'rq2: times.tsv line {n} has {len(c)} of 4 columns; read as absent', file=sys.stderr)
             continue
         key, _trials, low, status = c[:4]
-        cells[key] = format(float(low), '.2f') if status in ('ok', '') and NUM_RE.fullmatch(low) else status
+        if status in ('ok', ''):
+            cells[key] = format(float(low), '.2f') if NUM_RE.fullmatch(low) else 'failed (times.tsv: ok without a time)'
+        else:
+            cells[key] = status
     return cells
 
 
@@ -153,10 +166,11 @@ def main():
     v = {}
     tp = third_party()
 
-    def tp_cell(key):
+    def tp_cell(key, p):
         if tp is None:
             return 'skipped (no third-party)'
-        return tp.get(key, 'skipped (--small)' if SMALL else 'skipped (not in times.tsv)')
+        left_out = p in LARGE or (key.endswith('.host-s') and p in INATOR_LARGE)
+        return tp.get(key, 'skipped (--small)' if SMALL and left_out else 'skipped (not in times.tsv)')
 
     # the twenty (0.1 s), and CROWN's and Laertes's times on them
     tot, rows = measured(v, [(f'rq3.{K(p)}', p) for p in TWENTY], 1)
@@ -164,7 +178,7 @@ def main():
         v[f'rq3.total.{fam}-s'] = unrounded_total(tot[fam], 1)
     v['rq3.largest.analysis-s'] = v[f'rq3.{K(LARGEST)}.solve-s']
     for tool in ('crown', 'laertes'):
-        cells = [tp_cell(f'rq3.{K(p)}.{tool}-s') for p in TWENTY]
+        cells = [tp_cell(f'rq3.{K(p)}.{tool}-s', p) for p in TWENTY]
         for p, c in zip(TWENTY, cells):
             v[f'rq3.{K(p)}.{tool}-s'] = c
         v[f'rq3.total.{tool}-s'] = printed_total(cells, completing=(tool == 'laertes'))
@@ -179,7 +193,7 @@ def main():
     for fam in tot8:
         v[f'rq3.inator.total.{fam}-s'] = unrounded_total(tot8[fam], 2)
     for fam in ('c2rust', 'host'):
-        cells = [tp_cell(f'rq3.inator.{q}.{fam}-s') for q in EIGHT]
+        cells = [tp_cell(f'rq3.inator.{q}.{fam}-s', q) for q in EIGHT]
         for q, c in zip(EIGHT, cells):
             v[f'rq3.inator.{q}.{fam}-s'] = c
         v[f'rq3.inator.total.{fam}-s'] = printed_total(cells)
