@@ -1,13 +1,13 @@
 # rq3/ — Table miri and the shipped test suites
 
-`rq3/run.sh [--small] [--cap SECONDS] [--jobs N]` runs two things, both on the emitted trees (`results/trees/<p>`):
+`rq3/run_rq3.sh <trees> <substrate> <out> [--small] [--cap SECONDS] [--jobs N] [--tools ours,crown,laertes]` (the artifact's `run.sh rq3` calls it with `results/trees results/substrate results/rq3`) runs two things, both on the emitted trees:
 
 - **The shipped test suites, natively.** These are the six programs of CROWN's benchmark that ship a suite: buffer, genann, libtree, quadtree, rgba, urlparser.
   - libtree's suite is nine `make check` directories.
   - Each of the other five suites is one test program built with the library; every assert must hold.
 - **Miri under Tree Borrows on five of them.** These are buffer, genann, libtree, quadtree and rgba. urlparser is left out because its C original has an out-of-bounds access of its own.
   - The run covers our translations.
-  - It also covers Laertes's and CROWN's, when `results/third-party/` holds their outputs (`third-party/run.sh`).
+  - With `--tools ours,crown,laertes` it also covers CROWN's and Laertes's, read from `results/third-party/` (`third-party/run.sh`).
 
 It writes:
 - `results/rq3/keys.txt`: one `key = value` line per key Table miri and the test line cite. `../compare.py` sets them against `../expected.tsv`;

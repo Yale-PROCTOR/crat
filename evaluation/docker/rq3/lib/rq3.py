@@ -16,6 +16,7 @@ Environment (set by the artifact's run.sh; defaults for a run from the unpacked 
                comparison/laertes-{crown,laertes}/after/<p>/ (the Laertes translations CROWN's artifact distributes)
   SMALL        1: the 8-hour genann runs are skipped
   MIRI_CAP     seconds per Miri run (default 28800, eight hours)
+  RQ3_OUT      this step's results (default $RESULTS/rq3)
   RQ3_JOBS     Miri processes at a time (default 1)
   MIRI_TOOLCHAIN  the rustup toolchain whose miri runs the programs (default nightly-2026-09-17)
 
@@ -36,7 +37,7 @@ THIRD_PARTY = os.path.abspath(os.environ.get('THIRD_PARTY', os.path.join(RESULTS
 SMALL = os.environ.get('SMALL', '0') == '1'
 CAP = int(os.environ.get('MIRI_CAP', '28800'))
 JOBS = int(os.environ.get('RQ3_JOBS', '1'))
-OUT = os.path.join(RESULTS, 'rq3')
+OUT = os.path.abspath(os.environ.get('RQ3_OUT', os.path.join(RESULTS, 'rq3')))
 TABLES = os.path.join(RESULTS, 'tables')
 os.environ.setdefault('SUBSTRATE', os.path.join(RESULTS, 'substrate'))
 
