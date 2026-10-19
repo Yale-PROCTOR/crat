@@ -2,7 +2,7 @@
 
 Date: 2026-10-13
 
-Revised: 2026-10-14
+Revised: 2026-10-16
 
 Status: implemented and validated on 2026-10-16, retaining the accepted
 borrowing and inline-expression rules. Final code review completed and its finding fixed. See the
@@ -252,12 +252,20 @@ Keep any cursor temporary alive through the copy. Use collision-free names for
 bindings that are actually needed. Keep mutable reborrows local to the copy
 expression or its generated block; do not extend them into subsequent statements.
 
-Only replace memcpy calls whose result is discarded as a semicolon statement.
-Put this eligibility check at memcpy dispatch so a used-return call cannot fall
-through to an existing unit-returning replacement. This is the one intentional
-eligibility restriction shared with legacy memcpy routes: C memcpy returns its
-destination pointer, whereas `copy_from_slice` returns unit. Supporting consumed
-return values is deferred.
+Only replace memcpy calls whose result is proven discarded by the shared
+`utils::hir::is_expr_result_discarded` query. It accepts direct semicolon statements
+and ordinary/unsafe block-tail chains ending at a semicolon statement. It stops
+at consumed values, body boundaries, labeled/break-targeted blocks, and other
+unsupported contexts. The same query is used by strncpy; it contains no libc or
+cursor-specific rules.
+
+Keep this eligibility check at memcpy dispatch so a used-return call cannot fall
+through to an existing unit-returning replacement. C memcpy returns its destination
+pointer, whereas `copy_from_slice` returns unit. Supporting consumed return values
+is deferred. This extends the original direct-semicolon restriction according to
+the [discarded-result plan](../plans/2026-10-16-discarded-expression-results.md);
+the original validation report's 512 retained block-tail calls describe the prior
+implementation and remain a historical result.
 
 Zero-length copies through valid views and copies ending exactly at a view's
 boundary must work. Do not manufacture references for arbitrary null/raw
@@ -337,3 +345,5 @@ separate byte-copy route duplicated logic already present in `mem_utils.rs` and
 is superseded. Byte-only eligibility keeps the first change bounded without
 requiring a separate byte-copy implementation. General sign/alias extensions and
 the bounded unsigned-expression proof remain separate work.
+
+The discarded-result follow-up is implemented at `624bb8e9`. Its [validation report](/home/ubuntu/crat-workspace/discarded-results-validation-624bb8e9/REPORT.md) verifies recovery of all 512 formerly retained SPHINCS block-tail calls, unchanged pointer owners, and preservation of the original 360 cursor-adapter removals.
