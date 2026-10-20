@@ -258,6 +258,65 @@ pub unsafe fn value(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
 }
 
 #[test]
+fn printf_argument_statements_stay_inside_the_call_boundary() {
+    for argument in [
+        r#"if flag {
+            b"yes\0" as *const u8 as *const i8
+        } else {
+            b"no\0" as *const u8 as *const i8
+        }"#,
+        r#"{
+            let text: *const i8 = if flag {
+                b"yes\0" as *const u8 as *const i8
+            } else {
+                b"no\0" as *const u8 as *const i8
+            };
+            text
+        }"#,
+    ] {
+        for (format, extra_argument, template) in [("%s", "", true), ("%*s", "4, ", false)] {
+            let source = format!(
+                r#"
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+pub unsafe fn show(flag: bool) {{
+    printf(b"{format}\0" as *const u8 as *const i8, {extra_argument}{argument});
+    return;
+}}
+"#
+            );
+            run_compiler_on_str(&source, |tcx| {
+                let empty = crate::RuleDocument::default();
+                for rules in [None, Some(&empty)] {
+                    let records = make_skeletons_with_rules(&source, rules, tcx).unwrap();
+                    let record = function(&records, "show");
+                    assert_eq!(labels(&record.annotated_source), [0, 1]);
+                    assert!(record.annotated_source.contains("if flag"));
+                    for view in [&record.baseline, &record.applied] {
+                        assert_eq!(labels(&view.skeleton), [0, 1]);
+                        assert_eq!(view.transform_labels(), [0]);
+                        assert_eq!(view.statement_dispositions.len(), 2);
+                        assert!(view.statement_dispositions[0].children.is_empty());
+                        assert_eq!(
+                            view.statement_dispositions[1].disposition,
+                            crate::StatementDispositionKind::Preserve
+                        );
+                        let [metadata] = &view.statement_pair_metadata[..] else {
+                            panic!("only the printf statement should have transformation metadata")
+                        };
+                        assert_eq!(metadata.label, 0);
+                        assert!(metadata.pointer_variables_complete);
+                        assert!(metadata.pointer_variables.is_empty());
+                        assert_eq!(metadata.printf_template.is_some(), template);
+                        assert_eq!(view.skeleton.contains("::std::print!"), template);
+                    }
+                }
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[test]
 fn printf_specifier_summary_is_sorted_deduplicated_and_complete() {
     let source = r#"
 unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }

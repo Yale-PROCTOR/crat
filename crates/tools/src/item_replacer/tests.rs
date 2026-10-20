@@ -1414,6 +1414,64 @@ fn expanded_printf_templates_restore_exact_literals() {
 }
 
 #[test]
+fn printf_argument_statements_keep_source_copy_labels_aligned() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn show(flag: bool, pointer: *const i32) -> i32 {
+    printf(b"%s\0" as *const u8 as *const i8, {
+        let text: *const i8 = if flag {
+            b"yes\0" as *const u8 as *const i8
+        } else {
+            b"no\0" as *const u8 as *const i8
+        };
+        text
+    });
+    return *pointer;
+}
+"#;
+    let skeleton = r#"
+unsafe fn show(flag: bool, pointer: &i32) -> i32 {
+    #[proctor(0)] ::std::print!("{}", todo!());
+    #[proctor(1)] return todo!();
+}
+"#;
+    let transformation = r#"
+unsafe fn show(flag: bool, pointer: &i32) -> i32 {
+    #[proctor(0)] ::std::print!("{}", if flag { "yes" } else { "no" });
+    #[proctor(1)] return *pointer;
+}
+"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(7, "show", "show", skeleton, vec![0, 1])],
+        transformation: transformation.to_owned(),
+        accepted_correspondence: vec![],
+    };
+    let initial = make_initial_source(source).unwrap();
+    let output = add(source, &initial, &request).unwrap();
+    compile_checked(&output.replacement.source);
+    assert_eq!(
+        output
+            .replacement
+            .statement_pairs
+            .iter()
+            .map(|pair| pair.label)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"pairs",
+        output.observation_source.as_bytes(),
+    );
+    let observations =
+        crate::extract_observations_from_source(&output.observation_source, &metadata).unwrap();
+    assert_eq!(observations.observations.len(), 1);
+    assert_eq!(observations.observations[0].pointer_anchors.len(), 1);
+}
+
+#[test]
 fn replacer_rechecks_expanded_printf_literal_without_validator() {
     let skeleton =
         r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", todo!()); }"#;

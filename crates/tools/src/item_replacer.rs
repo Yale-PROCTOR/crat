@@ -31,7 +31,7 @@ use crate::{
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
     skeleton::{
-        annotate_function, collect_opaque_nested_ifs, is_supported_two_argument_main_0,
+        annotate_function, collect_opaque_expressions, is_supported_two_argument_main_0,
         render_statement_group,
     },
 };
@@ -476,13 +476,14 @@ pub fn add_functions_with_observations(
         let mut copy = original.clone();
         copy.attrs.clear();
         copy.vis = crate_visible();
-        let opaque = collect_opaque_nested_ifs(&copy, &plan.requested.path).map_err(|error| {
-            item_error(
-                ReplacementErrorKind::RewriteFailure,
-                &plan.requested,
-                error.message,
-            )
-        })?;
+        let opaque = collect_opaque_expressions(&copy, &plan.requested.path, &ast_to_hir, tcx)
+            .map_err(|error| {
+                item_error(
+                    ReplacementErrorKind::RewriteFailure,
+                    &plan.requested,
+                    error.message,
+                )
+            })?;
         let ItemKind::Fn(box function) = &mut copy.kind else { unreachable!() };
         function.ident = parsed_ident(&plan.source_copy_name);
         function.sig.header.ext = Extern::None;

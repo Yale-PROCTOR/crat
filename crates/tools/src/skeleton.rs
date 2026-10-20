@@ -437,14 +437,12 @@ fn make_function_record<'tcx>(
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     validate_function_body(&source, &surface.path)?;
-    let opaque_printf_payloads = supported_printf_expression_ids(&source, ast_to_hir, tcx);
-    let opaque_nested_ifs =
-        collect_opaque_nested_ifs_with_skips(&source, &surface.path, &opaque_printf_payloads)?;
-    annotate_function(&mut source, &opaque_nested_ifs);
+    let opaque_expressions = collect_opaque_expressions(&source, &surface.path, ast_to_hir, tcx)?;
+    annotate_function(&mut source, &opaque_expressions);
     PresentationBindingNormalizer.visit_item(&mut source);
     let statement_classification = classify_function_statements(
         &source,
-        &opaque_nested_ifs,
+        &opaque_expressions,
         ast_to_hir,
         decisions,
         preservation_overrides,
@@ -949,7 +947,8 @@ impl<'ast> visit::Visitor<'ast> for SourceLocalCatalogCollector<'_, '_> {
         if self.error.is_some() {
             return;
         }
-        if let StmtKind::Let(local) = &statement.kind
+        if let Some(declaration_label) = statement_numeric_label(statement)
+            && let StmtKind::Let(local) = &statement.kind
             && let PatKind::Ident(_, name, None) = local.pat.kind
             && let Some(pattern_hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
             && let Some(pattern) = self.ast_to_hir.get_pat(local.pat.id, self.tcx)
@@ -985,10 +984,7 @@ impl<'ast> visit::Visitor<'ast> for SourceLocalCatalogCollector<'_, '_> {
                     hir_id,
                     PointerVariableMetadata {
                         name: name.to_string(),
-                        origin: PointerVariableOrigin::Local {
-                            declaration_label: statement_numeric_label(statement)
-                                .expect("annotated source statements have labels"),
-                        },
+                        origin: PointerVariableOrigin::Local { declaration_label },
                         before_type,
                         selected_target_type,
                         before_type_is_inferred: local.ty.is_none(),
@@ -1282,7 +1278,7 @@ fn validate_function_body(item: &Item, path: &str) -> Result<(), GenerationError
 
 struct Labeler<'a> {
     next: u32,
-    opaque_nested_ifs: &'a FxHashSet<NodeId>,
+    opaque_expressions: &'a FxHashSet<NodeId>,
 }
 
 impl MutVisitor for Labeler<'_> {
@@ -1296,7 +1292,7 @@ impl MutVisitor for Labeler<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        if self.opaque_nested_ifs.contains(&expr.id) {
+        if self.opaque_expressions.contains(&expr.id) {
             return;
         }
         mut_visit::walk_expr(self, expr);
@@ -1313,10 +1309,10 @@ fn stmt_attrs_mut(stmt: &mut Stmt) -> &mut rustc_ast::AttrVec {
     }
 }
 
-pub(crate) fn annotate_function(item: &mut Item, opaque_nested_ifs: &FxHashSet<NodeId>) {
+pub(crate) fn annotate_function(item: &mut Item, opaque_expressions: &FxHashSet<NodeId>) {
     let mut labeler = Labeler {
         next: 0,
-        opaque_nested_ifs,
+        opaque_expressions,
     };
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
     labeler.visit_block(function.body.as_mut().unwrap());
@@ -3693,7 +3689,7 @@ struct StatementClassification {
 
 fn classify_function_statements(
     item: &Item,
-    opaque_nested_ifs: &FxHashSet<NodeId>,
+    opaque_expressions: &FxHashSet<NodeId>,
     ast_to_hir: &utils::ir::AstToHir,
     decisions: &InitialPointerDecisions,
     preservation_overrides: &PreservationDecisionOverrides,
@@ -3704,7 +3700,7 @@ fn classify_function_statements(
         ast_to_hir,
         decisions,
         preservation_overrides,
-        opaque_nested_ifs,
+        opaque_expressions,
         tcx,
         transformed: BTreeSet::new(),
         preserved_shells: BTreeSet::new(),
@@ -3725,7 +3721,7 @@ struct StatementClassifier<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
     preservation_overrides: &'a PreservationDecisionOverrides,
-    opaque_nested_ifs: &'a FxHashSet<NodeId>,
+    opaque_expressions: &'a FxHashSet<NodeId>,
     tcx: TyCtxt<'tcx>,
     transformed: BTreeSet<u32>,
     preserved_shells: BTreeSet<u32>,
@@ -3758,7 +3754,7 @@ impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if self.opaque_nested_ifs.contains(&expression.id) {
+        if self.opaque_expressions.contains(&expression.id) {
             return;
         }
         visit::walk_expr(self, expression);
@@ -4675,6 +4671,18 @@ impl OpaqueNestedIfCollector<'_> {
             _ => unreachable!(),
         }
     }
+}
+
+pub(crate) fn collect_opaque_expressions(
+    item: &Item,
+    path: &str,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Result<FxHashSet<NodeId>, GenerationError> {
+    let mut opaque = supported_printf_expression_ids(item, ast_to_hir, tcx);
+    let nested_ifs = collect_opaque_nested_ifs_with_skips(item, path, &opaque)?;
+    opaque.extend(nested_ifs);
+    Ok(opaque)
 }
 
 pub(crate) fn collect_opaque_nested_ifs(
