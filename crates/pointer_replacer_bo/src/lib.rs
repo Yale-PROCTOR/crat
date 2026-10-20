@@ -54,7 +54,7 @@ mod raw_boundary_census_schema;
 pub use bo_pipeline::{BoReceipt, Config, env_from_file as bo_env_from_file, rewrite_bo};
 // The legacy crate's root items the moved measurement tests name as `crate::…`.
 #[cfg(test)]
-pub(crate) use pointer_replacer::{BytemuckDependency, Config, replace_local_borrows};
+pub(crate) use pointer_replacer::{BytemuckDependency, replace_local_borrows};
 pub use pointer_replacer::{rewriter, utils};
 
 #[cfg(test)]

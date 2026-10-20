@@ -14993,7 +14993,8 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
-        let (generated, _) = crate::replace_local_borrows(&crate::Config::default(), tcx);
+        let (generated, _) =
+            crate::replace_local_borrows(&pointer_replacer::Config::default(), tcx);
         drop(generated);
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
         row.set("status", "ok");
@@ -36034,7 +36035,7 @@ fn l2_feature_off_capture() -> (String, String, crate::BytemuckDependency) {
     ));
     let (output, bytemuck) =
         ::utils::compilation::run_compiler_on_str(L2_FEATURE_OFF_SOURCE_DROP, |tcx| {
-            crate::replace_local_borrows(&crate::Config::default(), tcx)
+            crate::replace_local_borrows(&pointer_replacer::Config::default(), tcx)
         })
         .unwrap_or_else(|error| error.raise());
     writeln!(snapshot, "rewrite.source_drop.bytemuck={bytemuck:?}").unwrap();
