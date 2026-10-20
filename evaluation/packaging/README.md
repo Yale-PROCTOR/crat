@@ -22,7 +22,10 @@ every file checks and none but `README.md` is unlisted). Everything else is a pa
 to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the authors' and hosts' names),
 `IDENTITY_ALLOW` (fixed strings the identity grep ignores: the crates.io index, the third parties' own repositories
 the artifact fetches from), `PROVENANCE_PATTERNS` (the internal-provenance grep over `artifact/`: lane names, relay /
-report numbers, ruling ids, addenda, batch names). A hit of either grep stops the derivation before the zip. For
+report numbers, ruling ids, addenda, batch names), `ARTIFACT_REV` (the revision whose `evaluation/docker/` becomes
+`artifact/`; default: the head). The translator is derived from the head, which stays the frozen source the paper
+evaluated; `ARTIFACT_REV` lets the artifact come from the working branch (R1253-5). A hit of either grep stops the
+derivation before the zip. For
 `smoke.sh`: `INPUTS` (prepared inputs), `REF_TREES` (the emitted trees of record), `DEPS_TARGET`.
 
 ## The derivation, one commit per step on the branch `rederive-<tag>`

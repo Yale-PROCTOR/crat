@@ -18,13 +18,15 @@
 #   PROVENANCE_PATTERNS  the internal-provenance grep over artifact/ (grep -E): lane names, relay / report numbers,
 #                      ruling ids, addenda, our batch names (R1251-2); must be empty before the zip
 #   HASH_REPOS         repositories (space-separated) whose commit hashes must not appear in the tree (default: REPO)
+#   ARTIFACT_REV       the revision whose evaluation/docker/ becomes artifact/ (default: <head>). The translator comes from
+#                      <head>, the frozen source the paper evaluated; the artifact may come from a later revision (R1253-5)
 # Environment (required): the evaluation's inputs, which are not in the repository (they become the zip's benchmarks/):
 #   BENCH              a zip whose jobcrat-source/benchmarks/ holds them (e.g. an earlier submission zip), or a directory
 #                      laid out as benchmarks/ (crown/, inator/, README.md, SHA256SUMS)
 #   BENCH_SHA256SUMS   the SHA-256 of that benchmarks/SHA256SUMS; the derivation stops unless it matches and every file
 #                      but README.md and SHA256SUMS is listed in it and checks
 set -u
-HEAD=${1:?head}; TAG=${2:?tag}
+HEAD=${1:?head}; TAG=${2:?tag}; ARTIFACT_REV=${ARTIFACT_REV:-$HEAD}
 BENCH=${BENCH:?BENCH: a zip carrying jobcrat-source/benchmarks/ or a benchmarks/ directory}; BENCH_SHA256SUMS=${BENCH_SHA256SUMS:?BENCH_SHA256SUMS: the SHA-256 of benchmarks/SHA256SUMS}
 P=$(cd "$(dirname "$0")" && pwd)
 REPO=${REPO:-$(git -C "$P" rev-parse --show-toplevel)}
@@ -43,7 +45,7 @@ export IDENTITY_PATTERNS IDENTITY_ALLOW
 SR=$(rustup run nightly-2025-06-23 rustc --print sysroot); export LD_LIBRARY_PATH=$SR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export W ZS KEPT=$ZS/kept-rs-files.txt ORPHANS=$ZS/orphans.txt CARGO_INCREMENTAL=0
 mkdir -p $ZS $WORKTREES; rm -rf $ZS/stage $ZS/unzipped $ZS/tok; log=$ZS/rederive.log; : > $log; exec > >(tee -a $log) 2>&1
-echo "START $(date -u +%FT%TZ) head=$HEAD tag=$TAG env=$ENVREL repo=$REPO scratch=$ZS"
+echo "START $(date -u +%FT%TZ) head=$HEAD artifact=$ARTIFACT_REV tag=$TAG env=$ENVREL repo=$REPO scratch=$ZS"
 step() { echo "== $(date -u +%T) $*"; }
 commit() { git -C $W add -A >/dev/null; git -C $W -c user.name=submission -c user.email=submission@localhost commit -q -m "$1" && echo "   commit $(git -C $W rev-parse --short=9 HEAD): $1"; }
 build() { local label=$1 dir=$2; shift 2; echo "   build $label: $CARGO build --release --manifest-path $dir/Cargo.toml $* (target $CARGO_TARGET_DIR)"; $CARGO build --release --manifest-path $dir/Cargo.toml "$@" > $ZS/build-$label.log 2>&1; local rc=$?; echo "   build $label END $(date -u +%FT%TZ) rc=$rc"; return $rc; }
@@ -70,7 +72,11 @@ got=$(sha256sum $ZS/bench-keep/SHA256SUMS | cut -c1-64); [ "$got" = "$BENCH_SHA2
 unlisted=$(cd $ZS/bench-keep && find . -type f ! -path ./SHA256SUMS ! -path ./README.md | sed 's#^\./##' | sort | comm -23 - <(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS | sort))
 [ -z "$unlisted" ] || { echo "benchmarks/: files not in SHA256SUMS: $unlisted"; exit 1; }
 echo "   BENCH $BENCH: SHA256SUMS sha256 $got, $(grep -c . $ZS/bench-keep/SHA256SUMS) entries checked, no unlisted file"
-rm -rf $ZS/artifact-keep; [ -d $W/evaluation/docker ] && cp -a $W/evaluation/docker $ZS/artifact-keep
+rm -rf $ZS/artifact-keep
+if git -C $REPO cat-file -e "$ARTIFACT_REV:evaluation/docker" 2>/dev/null; then
+  mkdir -p $ZS/artifact-keep; git -C $REPO archive "$ARTIFACT_REV" evaluation/docker | tar -x -C $ZS/artifact-keep --strip-components=2
+  echo "   artifact/ from $ARTIFACT_REV ($(git -C $REPO rev-parse --short=9 "$ARTIFACT_REV^{commit}")): evaluation/docker tree $(git -C $REPO rev-parse "$ARTIFACT_REV:evaluation/docker")"
+elif [ "$ARTIFACT_REV" != "$HEAD" ]; then echo "ARTIFACT_REV $ARTIFACT_REV has no evaluation/docker"; exit 1; fi
 for p in .compound-engineering .github .gitignore .claudignore CLAUDE.md AGENTS.md .claude .codex .vscode M0-KNOWN-DEFECTS.md README.md LICENSE benchmarks tool.py rustfmt.toml examples crates/pointer_replacer/frames crates/pointer_replacer/tools crates/finders crates/io_replacer crates/merger crates/outparam_replacer crates/static_replacer crates/union_replacer src/bin/crat-finder.rs src/bin/crat-merge.rs crat-finder crat-merge crates/passes/src/bin_file_adder.rs crates/passes/src/enum_replacer crates/passes/src/formatter.rs crates/passes/src/interface_fixer.rs crates/passes/src/libc_replacer crates/passes/src/simplifier crates/passes/src/simplifier.rs crates/passes/src/splitter.rs crates/passes/src/unexpander.rs crates/passes/src/unsafe_resolver crates/utils/src/bit_set.rs crates/utils/src/unsafety.rs evaluation; do [ -e $W/$p ] && git -C $W rm -r -q -f -- $p; done
 find $W/crates $W/src -type f \( -name '*_tests.rs' -o -name 'tests.rs' -o -name 'test_*.py' \) -print0 | xargs -0 -r git -C $W rm -q -f --
 find $W/crates $W/src -type d -name tests -print0 | xargs -0 -r git -C $W rm -r -q -f --
