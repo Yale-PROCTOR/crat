@@ -33,4 +33,6 @@ The definitions are in `lib/measure.py` and `lib/inator_types.py`.
 - counts and rates must be `equal`;
 - times are `reported` with their ratio to the paper's.
 
-`../expected-trees.tsv` lists the sha256 of every file of the distributed CROWN and Laertes trees the counts read, relative to `results/third-party/`.
+`../expected-trees.tsv` lists the sha256 of every file of the distributed CROWN and Laertes trees the counts read, relative to `results/third-party/`: `path<TAB>sha256`.
+- A JSON file has a third field: the sha256 of `json.dumps(obj, sort_keys=True, separators=(",", ":"))` of the record's file.
+- CROWN writes `analysis_results/{ownership,mutability,fatness}.json` in hash order, so their bytes change from run to run while their content does not. A tree check compares those files by the third field.
