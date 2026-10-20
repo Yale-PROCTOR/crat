@@ -10,6 +10,6 @@ edition = "2021"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
-crown_artifact_inventory = { path = "../../../crates/pointer_replacer/tools/crown_artifact_inventory" }
+crown_artifact_inventory = { path = "../../../crates/pointer_replacer_bo/tools/crown_artifact_inventory" }
 
 [workspace]
