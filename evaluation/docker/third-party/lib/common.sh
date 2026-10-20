@@ -49,22 +49,35 @@ wall_of() {
   awk -F': ' '/Elapsed \(wall clock\)/{n=split($2,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print s}' "$1" 2>/dev/null
 }
 
-# fetch <name>: download one row of sources.tsv into $TP_DOWNLOADS and check its size and digest (resumable)
+# fetch <name>: one row of sources.tsv into $TP_DOWNLOADS, checked by size and digest. A file already there (fetched
+# earlier, or placed there beforehand) is used when it checks; a partial one is resumed.
+check_file() {  # file bytes digest
+  if [ "$2" != - ] && [ "$(stat -c %s "$1")" != "$2" ]; then return 1; fi
+  case $3 in
+    md5:*) [ "$(md5sum "$1" | cut -d' ' -f1)" = "${3#md5:}" ] ;;
+    sha256:*) [ "$(sha256sum "$1" | cut -d' ' -f1)" = "${3#sha256:}" ] ;;
+    *) return 0 ;;   # files:<manifest>: checked file by file after unpacking
+  esac
+}
 fetch() {
-  local name=$1 row url bytes digest f
+  local name=$1 row url bytes digest f i
   row=$(awk -F'\t' -v n="$name" '$1==n' "$TP_HOME/sources.tsv")
   [ -n "$row" ] || die "no source named $name"
   url=$(cut -f2 <<<"$row"); bytes=$(cut -f3 <<<"$row"); digest=$(cut -f4 <<<"$row")
   f=$TP_DOWNLOADS/$name
-  if [ -f "$f.ok" ]; then return 0; fi
+  [ -f "$f.ok" ] && return 0
+  if [ -f "$f" ] && [ "$bytes" != - ] && [ "$(stat -c %s "$f")" -ge "$bytes" ]; then
+    check_file "$f" "$bytes" "$digest" && { touch "$f.ok"; log "using $name (already present, $digest)"; return 0; }
+    rm -f "$f"   # complete in size but not in content: fetch it again
+  fi
   log "fetch $name ($url)"
-  curl -fL --retry 5 --retry-delay 10 -C - -o "$f" "$url" || curl -fL --retry 5 -o "$f" "$url" || die "download failed: $name"
-  if [ "$bytes" != - ] && [ "$(stat -c %s "$f")" != "$bytes" ]; then die "$name: $(stat -c %s "$f") bytes, expected $bytes"; fi
-  case $digest in
-    md5:*) [ "$(md5sum "$f" | cut -d' ' -f1)" = "${digest#md5:}" ] || die "$name: md5 differs from the record" ;;
-    sha256:*) [ "$(sha256sum "$f" | cut -d' ' -f1)" = "${digest#sha256:}" ] || die "$name: sha256 differs" ;;
-    files:*) : ;;   # checked file by file after unpacking
-  esac
+  [ "$bytes" = - ] && rm -f "$f"   # no size of record: not resumable, fetch whole
+  for i in $(seq 1 30); do   # Zenodo can be slow and drop long transfers: resume until complete
+    curl -fL --retry 5 --retry-delay 10 -C - -o "$f" "$url" && break
+    [ "$bytes" != - ] && [ -f "$f" ] && [ "$(stat -c %s "$f")" -ge "$bytes" ] && break
+    log "fetch $name: interrupted at $(stat -c %s "$f" 2>/dev/null || echo 0) bytes, resuming ($i)"; sleep 10
+  done
+  check_file "$f" "$bytes" "$digest" || die "$name: size or digest differs from the record (expected $bytes bytes, $digest)"
   touch "$f.ok"; log "fetched $name ($(stat -c %s "$f") bytes, $digest)"
 }
 

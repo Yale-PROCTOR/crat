@@ -13,7 +13,7 @@ artifact/third-party/run.sh --small     # ≈ 10 min after the downloads
 artifact/third-party/run.sh crown laertes tables   # any subset of steps, in that order
 ```
 
-The top-level `run.sh all --third-party` calls it before the RQ steps. Outputs go to `results/third-party/` (`THIRD_PARTY`).
+Run it on the host from the source root, before the container's `run.sh … --third-party`, which reads what it writes. Outputs go to `results/third-party/` (`THIRD_PARTY`).
 
 ## The sources
 
@@ -27,6 +27,20 @@ The top-level `run.sh all --third-party` calls it before the RQ steps. Outputs g
 | &inator's carrays, jccc, tisp | the authors' repository at the pinned commit `4fdf3309` (Zenodo's `benchmarks.tar.gz` carries the other six) | every one of the 58 benchmark files is checked against `inator/inputs-sha256.tsv`. `INATOR_BENCHMARKS=<dir>` supplies a local copy instead |
 | c2rust 0.21.0-p1 | upstream c2rust `v0.21.0` (`93471e6`) + `c2rust/c2rust-0.21.0-p1.patch` (13 lines) | `c2rust/Dockerfile` checks the patched tree's git hash (`e2631f82`) and builds `tp-c2rust:0.21.0-p1` |
 | GNU time 1.9 | the GNU mirror, sha256 `fbacf0c8…` | built static once, mounted read-only into every tool's container as the clock |
+
+**Downloads take hours.** Zenodo can serve one connection at about 150–200 KB/s, so the ≈ 8.5 GB below may take many hours. `fetch` resumes an interrupted transfer. Files fetched beforehand, for example with a downloader that opens several connections, are used from a directory given as `TP_DOWNLOADS=<dir>`. Each is checked by size and md5 before use:
+
+| file name in `TP_DOWNLOADS` | bytes | md5 |
+|---|---:|---|
+| `crown-artifact.zip` | 2,612,422,584 | `7436500a8342131d252dbe866b09fab3` |
+| `aliasing-limits-oopsla23.tar.gz` | 5,227,965,191 | `f443644380803c1e230d5731f08000ca` |
+| `refinator-linux-amd64.tar.gz` | 635,034,527 | `75be10de6694ea022595a457f93e62a2` |
+| `refinator-src.tar.gz` | 107,046 | `702f2fdea6589d368bbe9e3878380bce` |
+| `inator-benchmarks.tar.gz` | 26,002 | `7892009f0317c6f30328a0b7293f0f97` |
+| `time-1.9.tar.gz` | 596,779 | sha256 `fbacf0c81e62429df3e33bda4cee38756604f18e01d977338e23306a3e3b521e` |
+| `inator-impl-4fdf3309.tar.gz` | — | its 58 benchmark files are checked against `inator/inputs-sha256.tsv` |
+
+An image that is already loaded (`crown:latest`, `aliasing-limits-oopsla23:final`, `refinator:latest`) is used as it is, and its archive is not fetched.
 
 ## The steps and the protocol of record
 
@@ -56,7 +70,7 @@ The keys in `times.tsv`:
 ## What to expect
 
 - **CROWN:** `check.txt` reports every source file of `trees/crown/` and all of `comparison/` `equal` to `expected-trees.tsv`.
-  - CROWN writes `analysis_results/{ownership,mutability,fatness}.json` in hash order, so their bytes change from run to run. They are reported `order-variant` when the content is the same in every trial and only the bytes differ from the record's.
+  - CROWN writes `analysis_results/{ownership,mutability,fatness}.json` in hash order, so their bytes change from run to run. `expected-trees.tsv`'s third column holds the digest of the record's file with its keys sorted, and such a file is reported `equal (content)` when that matches.
   - `statistics.json` is stable.
 - **Laertes:**
   - **In the mode of record**, 15 of the twenty complete. binn, brotli, heman, quadtree and rgba do not (`crash`): on the distributed inputs, the tool stops on a diagnostic it cannot handle, or on the initial program.

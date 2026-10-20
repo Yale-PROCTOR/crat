@@ -15,8 +15,10 @@ Writes, under $THIRD_PARTY:
   check.txt  the trees and inputs against the record: CROWN's output trees and the artifact's comparison/ against
              expected-trees.tsv (beside third-party/ in the artifact), &inator's outputs present, c2rust's identity.
              CROWN's analysis_results/{ownership,mutability,fatness}.json are maps written in hash order, so their
-             bytes differ from trial to trial; they are reported as `order-variant` when their content (keys sorted)
-             is the same across this run's trials and only their bytes differ from the record."""
+             bytes differ from trial to trial. expected-trees.tsv's third column is the sha256 of the record's file
+             as json.dumps(obj, sort_keys=True, separators=(",", ":")): such a file is `equal (content)` when that
+             digest matches. Without the column, `order-variant` means the content (keys sorted) is the same
+             across this run's trials and only the bytes differ from the record."""
 import hashlib, json, os, re, sys
 
 T = os.path.abspath(os.environ['THIRD_PARTY'])
@@ -109,9 +111,9 @@ with open(os.path.join(T, 'times.tsv'), 'w') as f:
 out = []
 exp_path = os.environ.get('EXPECTED_TREES') or os.path.join(os.path.dirname(HOME), 'expected-trees.tsv')
 if os.path.exists(exp_path):
-    exp = [l.rstrip('\n').split('\t') for l in open(exp_path) if l.strip()]
+    exp = [(l.rstrip('\n').split('\t') + [''])[:3] for l in open(exp_path) if l.strip()]
     groups = {}
-    for path, h in exp:
+    for path, h, canon_h in exp:
         g = 'trees/crown/' + path.split('/')[2] if path.startswith('trees/crown/') else path.split('/')[0]
         if path == 'crown/evaluation.csv' and os.environ.get('SMALL') == '1':
             continue   # CROWN's table covers the twenty: a full run only
@@ -122,6 +124,9 @@ if os.path.exists(exp_path):
             v = 'missing'
         elif hashlib.sha256(open(f, 'rb').read()).hexdigest() == h:
             v = 'equal'
+        elif canon_h:
+            c = json.dumps(json.load(open(f)), sort_keys=True, separators=(',', ':'))
+            v = 'equal (content)' if hashlib.sha256(c.encode()).hexdigest() == canon_h else 'differs'
         elif re.search(r'/analysis_results/(ownership|mutability|fatness)\.json$', path):
             p = path.split('/')[2]
             canon = set()
@@ -135,7 +140,7 @@ if os.path.exists(exp_path):
         groups.setdefault(g, {}).setdefault(v, []).append(path)
     for g in sorted(groups):
         c = groups[g]
-        out.append('%-40s %s' % (g, ', '.join('%s %d' % (v, len(c[v])) for v in ('equal', 'order-variant', 'differs', 'missing') if v in c)))
+        out.append('%-40s %s' % (g, ', '.join('%s %d' % (v, len(c[v])) for v in ('equal', 'equal (content)', 'order-variant', 'differs', 'missing') if v in c)))
         for v in ('differs', 'missing'):
             for path in c.get(v, [])[:20]:
                 out.append('    %s %s' % (v, path))
