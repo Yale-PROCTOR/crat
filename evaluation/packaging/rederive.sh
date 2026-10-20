@@ -12,6 +12,11 @@
 #   ENVREL             the environment of record, relative to the head (default: the final frame's env file)
 #   IDENTITY_PATTERNS  the identity grep (grep -E, case-insensitive) that must be empty before the zip; the default
 #                      covers paths and services, the operator adds the names of the authors and of the hosts.
+#   IDENTITY_ALLOW     fixed strings (one per line) removed from a line before the identity grep reads it: the crates.io
+#                      index in lockfiles, and the third parties' own public repositories the artifact fetches from
+#                      (upstream c2rust; &inator's authors' repository at its pinned commit; R1249-1)
+#   PROVENANCE_PATTERNS  the internal-provenance grep over artifact/ (grep -E): lane names, relay / report numbers,
+#                      ruling ids, addenda, our batch names (R1251-2); must be empty before the zip
 #   HASH_REPOS         repositories (space-separated) whose commit hashes must not appear in the tree (default: REPO)
 # Environment (required): the evaluation's inputs, which are not in the repository (they become the zip's benchmarks/):
 #   BENCH              a zip whose jobcrat-source/benchmarks/ holds them (e.g. an earlier submission zip), or a directory
@@ -30,6 +35,11 @@ CARGO=${CARGO:-cargo}
 ENVREL=${ENVREL:-crates/pointer_replacer/frames/l01p14u-s39-mutlend-o-env.sh}
 IDENTITY_PATTERNS=${IDENTITY_PATTERNS:-'/home/|agent-worktrees|anthropic|claude|codex|openai|github\.com|Co-Authored'}
 HASH_REPOS=${HASH_REPOS:-$REPO}
+IDENTITY_ALLOW=${IDENTITY_ALLOW:-'registry+https://github.com/rust-lang/crates.io-index
+https://github.com/immunant/c2rust.git
+https://codeload.github.com/PLaSSticity/refinator-impl/tar.gz/4fdf3309d2a3763786b0090ae956940d97661855'}
+PROVENANCE_PATTERNS=${PROVENANCE_PATTERNS:-'\b(wave-[0-9][a-z0-9]*|era-5c|analysis-fanout|fan-out|rq3-inator|crat-packaging|slicecursor|ownership-fields|assembler)\b|\b[Rr]elays? [0-9]+|\b[Rr]eports? [0-9]+|\bR[0-9]{3,4}-[0-9]+\b|\b[Aa]ddend(um|a)\b|\b[Bb]atch(es)? [0-9]+|\b60s\b|\bL01'}
+export IDENTITY_PATTERNS IDENTITY_ALLOW
 SR=$(rustup run nightly-2025-06-23 rustc --print sysroot); export LD_LIBRARY_PATH=$SR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export W ZS KEPT=$ZS/kept-rs-files.txt ORPHANS=$ZS/orphans.txt CARGO_INCREMENTAL=0
 mkdir -p $ZS $WORKTREES; rm -rf $ZS/stage $ZS/unzipped $ZS/tok; log=$ZS/rederive.log; : > $log; exec > >(tee -a $log) 2>&1
@@ -126,7 +136,14 @@ echo "   warnings in the derived build: $(grep -c -E '^warning' $ZS/build-derive
 python3 -I $P/strip_misc.py toml $W/Cargo.lock > /dev/null; git -C $W add -A; git -C $W -c user.name=submission -c user.email=submission@localhost commit -q -m "Packaging F: the lockfile as cargo resolved it, header stripped" 2>/dev/null && echo "   lock committed"
 echo "   TREE $(git -C $W rev-parse HEAD^{tree}) files $(git -C $W ls-files | wc -l)"
 echo "   crat word: $(git -C $W grep -n -w -e crat -- . | wc -l); bCRAT_: $(git -C $W grep -n -P '\bCRAT_' -- . | wc -l); __crat_: $(git -C $W grep -n -e '__crat_' -e '__CRAT_' -- . | wc -l); Crat: $(git -C $W grep -n -w -e Crat -- . | wc -l)"
-echo "   identity grep (minus the registry URL in lockfiles, outside benchmarks/): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- . ':!benchmarks' | grep -v -F 'registry+https://github.com/rust-lang/crates.io-index' | wc -l); in benchmarks/ (third-party inputs, kept byte for byte): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) lines in $(git -C $W grep -l -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) files"
+idl=$(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- . ':!benchmarks' | python3 -I -c 'import os, re, sys
+allow = [a for a in os.environ["IDENTITY_ALLOW"].splitlines() if a]; pat = re.compile(os.environ["IDENTITY_PATTERNS"], re.I)
+for line in sys.stdin:
+    path, _, text = line.partition(":")
+    for a in allow: text = text.replace(a, "")
+    if pat.search(text): sys.stdout.write(line)')
+prov=$(git -C $W grep -n -E -e "$PROVENANCE_PATTERNS" -- artifact)
+echo "   identity grep (outside benchmarks/, minus IDENTITY_ALLOW): $(printf '%s' "$idl" | grep -c .); in benchmarks/ (third-party inputs, kept byte for byte): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) lines in $(git -C $W grep -l -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) files; provenance grep over artifact/: $(printf '%s' "$prov" | grep -c .)"
 ours=$(git -C $W grep -o -h -I -E '\b[0-9a-f]{7,40}\b' -- . | sort -u | while read t; do case $t in *[a-f]*) ;; *) continue;; esac; case $t in *[0-9]*) ;; *) continue;; esac; for r in $HASH_REPOS; do git -C $r rev-parse --verify --quiet "$t^{commit}" >/dev/null 2>&1 && { echo $t; break; }; done; done)
 echo "   commit hashes of our repositories in the tree: $(printf '%s' "$ours" | grep -c .)${ours:+ -- $(echo $ours)}"
 echo "   fingerprints: $(git -C $W grep -n -E -e '@2026-|"r[0-9]{3}-|"s23-|s23-force|r385-force|wave5p|era5c-l01p14|-PORT subset tripwire|addendum|user ruling|\bR[0-9]{3,4}-[0-9]\b' -- '*.rs' ':!evaluation' | wc -l); reason attrs: $(git -C $W grep -n -E '^\s*reason\s*=\s*"' -- '*.rs' ':!evaluation' | wc -l); cfg(test): $(git -C $W grep -n -E '#\!?\[cfg\(test\)\]|^\s*#\[test\]' -- '*.rs' ':!evaluation' | wc -l)"
@@ -135,6 +152,8 @@ rm -rf $ZS/tok; mkdir -p $ZS/tok; for f in $(cat $KEPT); do $TOOLS/rslex dump "$
 echo "   list-2 in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -i -w -E -c 'seat|relay|lane|wave|era5|batch|census'); comment markers in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -c -E '\\n\s*(//|/\*)'); README internal words: $(grep -n -i -w -E 'expand|extern|preprocess|bo|wave|era5|census|crat' $W/README.md | wc -l)"
 echo "   artifact/ in the tree: $(git -C $W ls-files -- artifact | wc -l) files; list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- artifact | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- artifact | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- artifact | wc -l)"
 echo "   evaluation/ in the tree: $(git -C $W ls-files -- evaluation | wc -l) files (must be 0); bare CRAT words: $(git -C $W grep -n -w -e CRAT -- evaluation | wc -l); _CRAT suffix: $(git -C $W grep -n -P '_CRAT\b' -- evaluation | wc -l); list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- evaluation | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- evaluation | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- evaluation | wc -l)"
+
+if [ -n "$idl$prov" ]; then echo "the identity or the provenance grep has hits; no zip:"; printf '%s\n' "$idl" "$prov" | grep . | cut -c1-240; exit 1; fi
 
 step "8 zip + from-zip build"
 $P/mkzip.sh | tail -4

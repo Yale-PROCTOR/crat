@@ -19,7 +19,10 @@ python3 >= 3.11 and `unzip`. Two inputs are required, because the evaluation's i
 as `benchmarks/`) and `BENCH_SHA256SUMS` (the SHA-256 of its `SHA256SUMS`; the derivation stops unless it matches,
 every file checks and none but `README.md` is unlisted). Everything else is a parameter with a default under `target/packaging/<tag>`: `REPO`,
 `SCRATCH`, `WORKTREES`, `TOOLS_TARGET`, `CARGO` (the cargo command), `ENVREL` (the environment of record, relative
-to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the authors' and hosts' names). For
+to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the authors' and hosts' names),
+`IDENTITY_ALLOW` (fixed strings the identity grep ignores: the crates.io index, the third parties' own repositories
+the artifact fetches from), `PROVENANCE_PATTERNS` (the internal-provenance grep over `artifact/`: lane names, relay /
+report numbers, ruling ids, addenda, batch names). A hit of either grep stops the derivation before the zip. For
 `smoke.sh`: `INPUTS` (prepared inputs), `REF_TREES` (the emitted trees of record), `DEPS_TARGET`.
 
 ## The derivation, one commit per step on the branch `rederive-<tag>`
