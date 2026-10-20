@@ -29,13 +29,16 @@ RUN curl -fsSL -o /tmp/cloc.tgz https://registry.npmjs.org/cloc/-/cloc-2.0.0-clo
  && echo '2e8d7d57112b0af14d8578d8679423b6e82f1007b29f71c71510f0bc09563b95  /usr/local/bin/cloc' | sha256sum -c -
 
 # The translator's toolchain (rust-toolchain.toml: the nightly and its components) and the Miri toolchain of RQ3,
-# with Miri's sysroot built here so that the runs need no network.
+# with Miri's sysroot built here so that the runs need no network. The sysroot is keyed on its sources' modification
+# times, and an image layer keeps them to the whole second only: they are set to one whole second first, or every run
+# would find the key changed and rebuild the sysroot (and fail).
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo XDG_CACHE_HOME=/opt/cache PATH=/opt/venv/bin:/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
  && rustup toolchain install nightly-2025-06-23 --profile minimal \
       --component rustfmt,clippy,rust-src,rustc-dev,llvm-tools-preview \
  && rustup toolchain install nightly-2026-09-17 --profile minimal --component miri,rust-src \
+ && find "$(rustc +nightly-2026-09-17 --print sysroot)/lib/rustlib/src" -exec touch -h -d 2026-09-17T00:00:00Z {} + \
  && rustup default nightly-2025-06-23 \
  && cargo +nightly-2026-09-17 miri setup
 
