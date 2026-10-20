@@ -72,7 +72,7 @@ HARNESS_APPEND = {
                "    if !g.is_null() { *g = 0; *g.add(1) = 0; *g.add(2) = 0; }\n    3\n}\n"
                "#[no_mangle]\npub unsafe extern \"C\" fn globfree(_g: *mut std::os::raw::c_void) {}\n",
 }
-# Relay 133 item 4: a program the native runtime census does not configure, run under Miri only
+# A program the native runner does not configure, run under Miri only
 # (json.h: the provided tests as a generated Rust driver, drivers/json.h/make_rs.py)
 MIRI_PROGRAMS = {"json.h": dict(kind="cdriver", c_dir=None, drivers={"main": None},
                                 runs=[("main", "main", [], None, [])])}

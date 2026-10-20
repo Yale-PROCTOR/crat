@@ -779,7 +779,7 @@ def main(argv):
                     t.write(f"{input_id}\t{var}\t{r[0]}\t{r[3]:.2f}\t" + ("\t".join(k) if k else "-\t-\t-\t-")
                             + f"\t{eq_c}\t{eq_s}\t{'-' if sub_eq_c is None else sub_eq_c}\n")
                 k = classify(e[2])
-                r481 = False
+                at_fabricated_extent = False
                 if k and (program, input_id) in EXPLAINED_PANICS:
                     input_ub_panics += 1
                     k = None
@@ -804,7 +804,7 @@ def main(argv):
                 if k and at_extent(k):
                     panics += 1
                     fabricated += 1
-                    r481 = True
+                    at_fabricated_extent = True
                 elif k and known_defect(program, k[2], k[3], input_id):
                     panics += 1
                     kid = known_defect(program, k[2], k[3], input_id)
@@ -825,7 +825,7 @@ def main(argv):
                     continue
                 if ran(c) and ran(e) and not (e[0] == c[0] and e[1] == c[1] and e[4] == c[4]):
                     mism += 1
-                    if (program, input_id) not in EXPLAINED and not r481 and not repro \
+                    if (program, input_id) not in EXPLAINED and not at_fabricated_extent and not repro \
                             and not (kc and e[0] == kc[1]):
                         unexplained += 1
                 if ran(s) and ran(e) and not (e[0] == s[0] and e[1] == s[1] and e[4] == s[4]):
