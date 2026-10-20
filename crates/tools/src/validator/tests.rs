@@ -189,6 +189,113 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
 
 #[test]
+fn closure_parameters_and_bodies_have_no_independent_alignment_obligations() {
+    assert_valid(
+        "unsafe fn f(values: &mut [i32]) { #[proctor(0)] todo!(); }",
+        r#"unsafe fn f(values: &mut [i32]) {
+            #[proctor(0)]
+            values.sort_unstable_by(|left, right| {
+                let result = left.cmp(right);
+                let nested = |candidate| { let result = candidate; result };
+                match result { core::cmp::Ordering::Equal => nested(result), _ => result }
+            });
+        }"#,
+    );
+    assert_valid(
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let check = todo!(); #[proctor(1)] if todo!() { #[proctor(2)] todo!() } else { #[proctor(3)] todo!() } }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let check = |other| { let result = other > 0; result }; #[proctor(1)] if (|| { let candidate = value; check(candidate) })() { #[proctor(2)] value } else { #[proctor(3)] 0 } }",
+    );
+    assert_code(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] let invented = || { let local = 1; local }; }",
+        "invalid_generated_binding_name",
+    );
+    assert_code(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(|| { #[proctor(9)] 1 }); }",
+        "unexpected_label",
+    );
+}
+
+#[test]
+fn closure_local_names_do_not_mask_outer_temporary_capture_checks() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] todo!(); #[proctor(1)] todo!(); }";
+    assert_valid(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] consume(|proctor_temp_var_0| { let proctor_temp_var_0 = proctor_temp_var_0; consume!(proctor_temp_var_0); proctor_temp_var_0 }); #[proctor(1)] consume(|| { let proctor_temp_var_0 = 2; proctor_temp_var_0 }); }",
+    );
+    assert_valid(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(0)] consume(|| { let result = proctor_temp_var_0; result }); #[proctor(1)] consume(|| { let proctor_temp_var_0 = 2; proctor_temp_var_0 }); }",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] consume(|| { let result = proctor_temp_var_0; result }); }",
+        "temporary_outside_expansion_group",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] consume(|| { let proctor_temp_var_0 = 1; proctor_temp_var_0 }); #[proctor(1)] consume(proctor_temp_var_0); }",
+        "unresolved_generated_temporary",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(0)] consume(|| { consume!(proctor_temp_var_0); }); #[proctor(1)] consume(0); }",
+        "temporary_in_macro",
+    );
+}
+
+#[test]
+fn closure_opacity_retains_item_attribute_and_unsafe_restrictions() {
+    for (body, code) in [
+        ("fn hidden() {}", "unexpected_nested_item"),
+        ("unsafe { 1 };", "explicit_unsafe_block"),
+        (
+            "#[allow(unused)] let local = 1;",
+            "unexpected_body_attribute",
+        ),
+    ] {
+        assert_code(
+            UNIT_SKELETON,
+            &format!("unsafe fn f() {{ #[proctor(0)] consume(|| {{ {body} }}); }}"),
+            code,
+        );
+    }
+}
+
+#[test]
+fn closure_let_chains_keep_bindings_in_their_condition_scope() {
+    utils::compilation::run_compiler_on_str(
+        "#![feature(let_chains)] pub fn check(value: Option<i32>) -> i32 { (|| { if let Some(proctor_temp_var_0) = value && proctor_temp_var_0 > 0 { proctor_temp_var_0 } else { 0 } })() }",
+        utils::type_check,
+    ).unwrap();
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(|| { if let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { proctor_temp_var_0 } else { 0 } }); }",
+    );
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(|| { while let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { consume(proctor_temp_var_0); break; } }); }",
+    );
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] todo!(); #[proctor(1)] todo!(); }",
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] consume(|| { if let Some(proctor_temp_var_0) = Some(proctor_temp_var_0) && proctor_temp_var_0 > 0 {} }); }",
+        "temporary_outside_expansion_group",
+    );
+    for body in [
+        "if let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { 0 } else { proctor_temp_var_0 }",
+        "while let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { break; } consume(proctor_temp_var_0);",
+        "if let Some(proctor_temp_var_0) = Some(proctor_temp_var_0) && proctor_temp_var_0 > 0 {}",
+    ] {
+        assert_code(
+            UNIT_SKELETON,
+            &format!("unsafe fn f() {{ #[proctor(0)] consume(|| {{ {body} }}); }}"),
+            "unresolved_generated_temporary",
+        );
+    }
+}
+
+#[test]
 fn print_arguments_receive_normal_structural_validation() {
     let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#;
     assert_valid(
@@ -2067,7 +2174,6 @@ fn new_binding_names_and_temporary_declarations_are_strict() {
         "unsafe fn f() { #[proctor(0)] while let Some(helper) = None::<i32> { consume(helper); } }",
         "unsafe fn f() { #[proctor(0)] for helper in [1] { consume(helper); } }",
         "unsafe fn f() { #[proctor(0)] match Some(1) { Some(helper) => { consume(helper); } None => {} } }",
-        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = |helper| helper; }",
     ] {
         assert_code(
             UNIT_SKELETON,
@@ -2075,6 +2181,10 @@ fn new_binding_names_and_temporary_declarations_are_strict() {
             "invalid_generated_binding_name",
         );
     }
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = |helper| helper; }",
+    );
     assert_code(
         UNIT_SKELETON,
         "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; { let proctor_temp_var_0 = 2; consume(proctor_temp_var_0); } }",

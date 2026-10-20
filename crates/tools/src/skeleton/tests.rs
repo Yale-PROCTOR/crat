@@ -4344,6 +4344,63 @@ fn rejects_non_restricted_control_beneath_non_control_payloads() {
 }
 
 #[test]
+fn sorting_closure_is_one_transformable_statement() {
+    let source = r#"
+pub struct ArrayList { pub data: Vec<*mut core::ffi::c_void> }
+pub type Compare = Option<unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32>;
+pub unsafe extern "C" fn arraylist_sort(arraylist: *mut ArrayList, compare_func: Compare) {
+    (&mut *arraylist).data.sort_unstable_by(|left, right| {
+        compare_func.expect("non-null function pointer")(*left, *right).cmp(&0)
+    });
+}
+"#;
+    let records = generate(source);
+    let sort = function(&records, "arraylist_sort");
+    assert_eq!(labels(&sort.annotated_source), [0]);
+    assert_eq!(labels(&sort.baseline.skeleton), [0]);
+    assert_eq!(sort.baseline.transform_labels(), [0]);
+    assert!(sort.baseline.skeleton.contains("todo!();"));
+    assert!(!sort.baseline.skeleton.contains("sort_unstable_by"));
+}
+
+#[test]
+fn closure_bodies_are_opaque_but_outer_controls_and_dependencies_remain() {
+    let source = r#"
+unsafe fn helper(value: i32) -> i32 { value + 1 }
+pub unsafe fn f(values: &[i32], offset: i32) -> i32 {
+    let check = |value: i32| {
+        ;
+        let nested = |other| { let sum = other + offset; helper(sum) };
+        match value { 0 => false, _ => nested(value) > 0 }
+    };
+    if values.iter().any(|value| { let candidate = *value; check(candidate) }) {
+        offset + 1
+    } else {
+        0
+    }
+}
+"#;
+    let records = generate(source);
+    let f = function(&records, "f");
+    assert_eq!(labels(&f.annotated_source), [0, 1, 2, 3]);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2, 3]);
+    assert!(f.baseline.transform_labels().contains(&0));
+    assert!(f.baseline.transform_labels().contains(&1));
+    assert_eq!(f.baseline.statement_dispositions[1].children.len(), 2);
+    assert!(f.dependencies.contains(&record(&records, "helper").id()));
+    assert!(!f.baseline.skeleton.contains("candidate"));
+    assert!(!f.baseline.skeleton.contains("nested"));
+}
+
+#[test]
+fn opaque_closures_do_not_hide_function_local_items() {
+    let error = generate_error(
+        "pub unsafe fn f() { let closure = || { const LOCAL: i32 = 1; LOCAL }; closure(); }",
+    );
+    assert_eq!(error.kind, GenerationErrorKind::FunctionLocalItem);
+}
+
+#[test]
 fn keeps_non_pointer_signature_types_unchanged() {
     let records = generate(
         "struct S { x: i32 } pub unsafe fn f(a: i32, b: (u8, bool), c: [i16; 2], s: S) -> (S, usize) { (s, a as usize + b.0 as usize + c[0] as usize) }",
@@ -9317,7 +9374,8 @@ unsafe fn selectors(
     let _ = (p.is_null(), ping(1));
     let _ = *p + *q;
     let _ = p.offset(q as isize);
-    let _closure = || p;
+    let _closure = || { let captured = p; consume(captured); captured };
+    let _ = (p, || { let captured = p; captured });
     indirect(p);
     *p = 1;
 }
@@ -9414,6 +9472,10 @@ unsafe fn selectors(
                 None => unreachable!("selection always returns pairwise-disjoint maxima"),
                 Some(regions) => {
                     match statement_index {
+                        7 | 8 => assert!(
+                            regions.is_empty(),
+                            "closure-containing payloads remain whole LLM regions"
+                        ),
                         2 | 3 => assert_eq!(
                             regions
                                 .iter()

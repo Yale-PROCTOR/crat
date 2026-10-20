@@ -931,6 +931,12 @@ fn labeled_statements<'a>(
             });
             visit::walk_stmt(self, statement);
         }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !matches!(expression.kind, ExprKind::Closure(..)) {
+                visit::walk_expr(self, expression);
+            }
+        }
     }
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     let mut collector = Collector {
@@ -1705,6 +1711,12 @@ fn plain_statements(item: &Item) -> Vec<&Stmt> {
             self.0.push(statement);
             visit::walk_stmt(self, statement);
         }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !matches!(expression.kind, ExprKind::Closure(..)) {
+                visit::walk_expr(self, expression);
+            }
+        }
     }
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     let mut collector = Collector(vec![]);
@@ -2265,6 +2277,12 @@ pub(crate) fn select_expression_regions<'a>(
         ..ExpressionTree::default()
     };
     tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
+    // Expression rules cannot cover the closure, so its whole payload remains LLM work.
+    if tree.expressions.values().any(|expression| {
+        !tree.opaque.contains(&expression.id) && matches!(expression.kind, ExprKind::Closure(..))
+    }) {
+        return Some((tree, vec![]));
+    }
     if tree.expressions.values().any(|expression| {
         matches!(
             ast_to_hir.get_local_node(expression.id, tcx),

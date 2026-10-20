@@ -1041,6 +1041,7 @@ fn validate_print_arguments_independently(
         error: Option<String>,
         declared: HashMap<String, usize>,
         existing: HashSet<String>,
+        closure_depth: usize,
     }
 
     fn is_temp_name(name: &str) -> bool {
@@ -1091,7 +1092,9 @@ fn validate_print_arguments_independently(
         }
 
         fn visit_pat(&mut self, pattern: &'ast Pat) {
-            if let PatKind::Ident(_, ident, _) = &pattern.kind {
+            if self.closure_depth == 0
+                && let PatKind::Ident(_, ident, _) = &pattern.kind
+            {
                 let name = ident.name.to_string();
                 if !is_temp_name(&name) || self.existing.contains(&name) {
                     self.error.get_or_insert_with(|| {
@@ -1118,7 +1121,8 @@ fn validate_print_arguments_independently(
                     "print argument contains an explicit unsafe block".to_owned()
                 });
             }
-            if let ExprKind::Path(_, path) = &expression.kind
+            if self.closure_depth == 0
+                && let ExprKind::Path(_, path) = &expression.kind
                 && let Some(segment) = path.segments.last()
             {
                 let name = segment.ident.name.to_string();
@@ -1128,11 +1132,14 @@ fn validate_print_arguments_independently(
                     });
                 }
             }
+            let closure = matches!(expression.kind, ExprKind::Closure(..));
+            self.closure_depth += usize::from(closure);
             visit::walk_expr(self, expression);
+            self.closure_depth -= usize::from(closure);
         }
 
         fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
-            if macro_contains_temp(&mac.args.tokens) {
+            if self.closure_depth == 0 && macro_contains_temp(&mac.args.tokens) {
                 self.error.get_or_insert_with(|| {
                     "print argument uses a generated temporary inside macro tokens".to_owned()
                 });
@@ -1144,6 +1151,7 @@ fn validate_print_arguments_independently(
         declared: &'a HashMap<String, usize>,
         existing: &'a HashSet<String>,
         scopes: Vec<HashSet<String>>,
+        closure_scope: Option<usize>,
         error: Option<String>,
     }
 
@@ -1162,7 +1170,10 @@ fn validate_print_arguments_independently(
             let mut bindings = Bindings::default();
             bindings.visit_pat(pattern);
             for name in bindings.0 {
-                if self.declared.contains_key(&name) || self.existing.contains(&name) {
+                if self.closure_scope.is_some()
+                    || self.declared.contains_key(&name)
+                    || self.existing.contains(&name)
+                {
                     self.scopes.last_mut().unwrap().insert(name);
                 }
             }
@@ -1206,12 +1217,34 @@ fn validate_print_arguments_independently(
                 StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
                     self.visit_expr(expression)
                 }
-                StmtKind::MacCall(_) | StmtKind::Empty => {}
+                StmtKind::MacCall(mac) => self.visit_mac_call(&mac.mac),
+                StmtKind::Empty => {}
             }
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
             match &expression.kind {
+                ExprKind::If(condition, then_block, else_expression)
+                    if self.closure_scope.is_some() =>
+                {
+                    self.scopes.push(HashSet::new());
+                    self.visit_expr(condition);
+                    self.visit_block(then_block);
+                    self.scopes.pop();
+                    if let Some(else_expression) = else_expression {
+                        self.visit_expr(else_expression);
+                    }
+                }
+                ExprKind::While(condition, body, _) if self.closure_scope.is_some() => {
+                    self.scopes.push(HashSet::new());
+                    self.visit_expr(condition);
+                    self.visit_block(body);
+                    self.scopes.pop();
+                }
+                ExprKind::Let(pattern, value, ..) if self.closure_scope.is_some() => {
+                    self.visit_expr(value);
+                    self.activate_pattern(pattern);
+                }
                 ExprKind::If(condition, then_block, else_expression) => {
                     if let ExprKind::Let(pattern, value, ..) = &condition.kind {
                         self.visit_expr(value);
@@ -1254,12 +1287,15 @@ fn validate_print_arguments_independently(
                     }
                 }
                 ExprKind::Closure(closure) => {
+                    let previous_closure_scope = self.closure_scope;
+                    self.closure_scope.get_or_insert(self.scopes.len());
                     self.scopes.push(HashSet::new());
                     for parameter in &closure.fn_decl.inputs {
                         self.activate_pattern(&parameter.pat);
                     }
                     self.visit_expr(&closure.body);
                     self.scopes.pop();
+                    self.closure_scope = previous_closure_scope;
                 }
                 ExprKind::Path(None, path) if path.segments.len() == 1 => {
                     let name = path.segments[0].ident.to_string();
@@ -1271,9 +1307,27 @@ fn validate_print_arguments_independently(
                         });
                     }
                 }
-                ExprKind::MacCall(_) => {}
+                ExprKind::MacCall(mac) => self.visit_mac_call(mac),
                 _ => visit::walk_expr(self, expression),
             }
+        }
+
+        fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+            if self.closure_scope.is_none() {
+                return;
+            }
+            crate::validator::collect_temp_symbols(&mac.args.tokens, &mut |name| {
+                let local = self.closure_scope.is_some_and(|start| {
+                    self.scopes[start..]
+                        .iter()
+                        .any(|scope| scope.contains(&name))
+                });
+                if !local && !self.existing.contains(&name) {
+                    self.error.get_or_insert_with(|| {
+                        "print argument uses a generated temporary inside macro tokens".to_owned()
+                    });
+                }
+            });
         }
     }
 
@@ -1294,6 +1348,7 @@ fn validate_print_arguments_independently(
             declared: &defense.declared,
             existing: existing_temporaries,
             scopes: vec![existing_temporaries.clone()],
+            closure_scope: None,
             error: None,
         };
         lexical.visit_expr(argument);

@@ -673,6 +673,9 @@ fn validate_no_nested_control(
 
     impl<'ast> Visitor<'ast> for ControlFinder {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if matches!(expression.kind, ExprKind::Closure(..)) {
+                return;
+            }
             if control_expr(expression, ControlRole::Statement).is_some() {
                 if !self.allow_restricted || !crate::skeleton::is_restricted_conditional(expression)
                 {
@@ -1332,6 +1335,7 @@ struct BodyScanner {
     preserved_labels: HashSet<u32>,
     non_control_payload: bool,
     suppress_unlabeled: usize,
+    closure_depth: usize,
 }
 
 impl BodyScanner {
@@ -1354,6 +1358,7 @@ impl BodyScanner {
             preserved_labels: HashSet::new(),
             non_control_payload: false,
             suppress_unlabeled: 0,
+            closure_depth: 0,
         }
     }
 
@@ -1375,6 +1380,9 @@ impl BodyScanner {
     }
 
     fn collect_pattern(&mut self, pat: &Pat, role: &str, explicit_type: Option<&Ty>) {
+        if self.closure_depth != 0 {
+            return;
+        }
         let mut raw = vec![];
         collect_pattern_bindings(pat, "root", &mut raw);
         let mut grouped: Vec<(String, Vec<RawBinding>)> = vec![];
@@ -1658,14 +1666,11 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 }
             }
             ExprKind::Closure(closure) => {
-                for (index, param) in closure.fn_decl.inputs.iter().enumerate() {
-                    self.collect_pattern(
-                        &param.pat,
-                        &format!("closure parameter {index}"),
-                        Some(&param.ty),
-                    );
-                }
+                self.closure_depth += 1;
+                self.suppress_unlabeled += 1;
                 self.visit_expr(&closure.body);
+                self.suppress_unlabeled -= 1;
+                self.closure_depth -= 1;
             }
             ExprKind::MacCall(mac) => self.visit_mac_call(mac),
             _ => visit::walk_expr(self, expr),
@@ -1676,6 +1681,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
     }
 
     fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+        if self.closure_depth != 0 {
+            return;
+        }
         collect_temp_symbols(&mac.args.tokens, &mut |name| {
             self.macro_temporaries.push(TempReference {
                 name,
@@ -1895,7 +1903,7 @@ fn local_item_kind(item: &Item) -> &'static str {
     }
 }
 
-fn collect_temp_symbols(
+pub(crate) fn collect_temp_symbols(
     tokens: &rustc_ast::tokenstream::TokenStream,
     output: &mut impl FnMut(String),
 ) {
@@ -3106,6 +3114,9 @@ struct LexicalTempScanner<'a> {
     current_label: Option<u32>,
     unresolved: Vec<ScopedTempProblem>,
     outside_group: Vec<ScopedTempProblem>,
+    // Bindings at or beneath this scope belong to an opaque closure body.
+    closure_scope: Option<usize>,
+    macro_temporaries: Vec<TempReference>,
 }
 
 fn expected_binding_names(expected: &ParsedExpected, scan: &BodyScanner) -> HashSet<String> {
@@ -3167,6 +3178,8 @@ fn validate_print_argument_temporaries(
             current_label: Some(label),
             unresolved: vec![],
             outside_group: vec![],
+            closure_scope: None,
+            macro_temporaries: vec![],
         };
         scanner.visit_expr(argument);
         for problem in scanner.unresolved {
@@ -3181,6 +3194,18 @@ fn validate_print_argument_temporaries(
                 ),
             ));
         }
+        for occurrence in scanner.macro_temporaries {
+            errors.push(error(
+                "temporary_in_macro",
+                function_message(
+                    expected,
+                    format!(
+                        "temporary identifier `{}` occurs inside macro tokens at print template label {label}; move that use into ordinary Rust syntax",
+                        occurrence.name,
+                    ),
+                ),
+            ));
+        }
     }
 }
 
@@ -3190,9 +3215,10 @@ impl LexicalTempScanner<'_> {
         collect_pattern_bindings(pat, "root", &mut bindings);
         for binding in bindings {
             if !binding.constructor_like
-                && (self
-                    .reliable_declarations
-                    .contains_key(binding.name.as_str())
+                && (self.closure_scope.is_some()
+                    || self
+                        .reliable_declarations
+                        .contains_key(binding.name.as_str())
                     || self.existing_names.contains(binding.name.as_str()))
             {
                 self.scopes.last_mut().unwrap().insert(binding.name);
@@ -3213,6 +3239,14 @@ impl LexicalTempScanner<'_> {
 
     fn is_active(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    fn is_closure_local(&self, name: &str) -> bool {
+        self.closure_scope.is_some_and(|start| {
+            self.scopes[start..]
+                .iter()
+                .any(|scope| scope.contains(name))
+        })
     }
 }
 
@@ -3240,13 +3274,33 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             }
             StmtKind::Item(_) => {}
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => self.visit_expr(expr),
-            StmtKind::MacCall(_) | StmtKind::Empty => {}
+            StmtKind::MacCall(mac) => self.visit_mac_call(&mac.mac),
+            StmtKind::Empty => {}
         }
         self.current_label = previous_label;
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match &expr.kind {
+            ExprKind::If(condition, then_block, else_expr) if self.closure_scope.is_some() => {
+                self.scopes.push(HashSet::new());
+                self.visit_expr(condition);
+                self.visit_block(then_block);
+                self.scopes.pop();
+                if let Some(else_expr) = else_expr {
+                    self.visit_expr(else_expr);
+                }
+            }
+            ExprKind::While(condition, body, _) if self.closure_scope.is_some() => {
+                self.scopes.push(HashSet::new());
+                self.visit_expr(condition);
+                self.visit_block(body);
+                self.scopes.pop();
+            }
+            ExprKind::Let(pattern, value, ..) if self.closure_scope.is_some() => {
+                self.visit_expr(value);
+                self.activate_pattern(pattern);
+            }
             ExprKind::If(condition, then_block, else_expr) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
                     self.visit_expr(value);
@@ -3289,16 +3343,22 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
                 }
             }
             ExprKind::Closure(closure) => {
+                let previous_closure_scope = self.closure_scope;
+                self.closure_scope.get_or_insert(self.scopes.len());
                 self.scopes.push(HashSet::new());
                 for parameter in &closure.fn_decl.inputs {
                     self.activate_pattern(&parameter.pat);
                 }
                 self.visit_expr(&closure.body);
                 self.scopes.pop();
+                self.closure_scope = previous_closure_scope;
             }
             ExprKind::Path(None, path) if path.segments.len() == 1 => {
                 let name = path.segments[0].ident.to_string();
-                if !is_temp_name(&name) || self.unreliable_names.contains(name.as_str()) {
+                if !is_temp_name(&name)
+                    || self.is_closure_local(&name)
+                    || self.unreliable_names.contains(name.as_str())
+                {
                     return;
                 }
                 let declaration_label = self.reliable_declarations.get(name.as_str()).copied();
@@ -3332,9 +3392,23 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
                     });
                 }
             }
-            ExprKind::MacCall(_) => {}
+            ExprKind::MacCall(mac) => self.visit_mac_call(mac),
             _ => visit::walk_expr(self, expr),
         }
+    }
+
+    fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+        if self.closure_scope.is_none() {
+            return;
+        }
+        collect_temp_symbols(&mac.args.tokens, &mut |name| {
+            if !self.is_closure_local(&name) && !self.existing_names.contains(name.as_str()) {
+                self.macro_temporaries.push(TempReference {
+                    name,
+                    label: self.current_label,
+                });
+            }
+        });
     }
 }
 
@@ -3414,6 +3488,8 @@ fn validate_temporaries(
         current_label: None,
         unresolved: vec![],
         outside_group: vec![],
+        closure_scope: None,
+        macro_temporaries: vec![],
     };
     scanner.scopes.push(HashSet::new());
     for parameter in &result_function.sig.decl.inputs {
@@ -3463,7 +3539,11 @@ fn validate_temporaries(
             ),
         ));
     }
-    for occurrence in &result_scan.macro_temporaries {
+    for occurrence in result_scan
+        .macro_temporaries
+        .iter()
+        .chain(&scanner.macro_temporaries)
+    {
         if expected_names.contains(occurrence.name.as_str()) {
             continue;
         }

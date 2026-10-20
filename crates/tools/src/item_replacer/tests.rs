@@ -1616,6 +1616,98 @@ fn preserved_restricted_conditional_has_only_its_outer_label() {
 }
 
 #[test]
+fn closure_replacement_and_observation_keep_only_outer_statement_alignment() {
+    let source = r#"
+pub unsafe fn f(pointer: *const i32, values: &mut [i32]) -> i32 {
+    values.sort_unstable_by(|left, right| {
+        let shifted = *left + *pointer;
+        shifted.cmp(&(*right + *pointer))
+    });
+    *pointer
+}
+"#;
+    let skeleton = "unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 { #[proctor(0)] todo!(); #[proctor(1)] todo!() }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(7, "f", "f", skeleton, vec![0, 1])],
+        transformation: r#"
+unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 {
+    #[proctor(0)]
+    values.sort_unstable_by(|left, right| {
+        let difference = *left - *right;
+        let compare = |value| { let result = value; result };
+        match difference { 0 => core::cmp::Ordering::Equal, _ => compare(difference).cmp(&0) }
+    });
+    #[proctor(1)]
+    *pointer
+}
+"#
+        .to_owned(),
+        accepted_correspondence: vec![],
+    };
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![crate::ExpectedFunction {
+                id: 7,
+                name: "f".to_owned(),
+                view: request.items[0].view.clone(),
+            }],
+            transformation: request.transformation.clone(),
+        }),
+        crate::ValidationResponse::Valid,
+    );
+    let initial = make_initial_source(source).unwrap();
+    let output = add(source, &initial, &request).unwrap();
+    compile_checked(&output.replacement.source);
+    assert_eq!(
+        output
+            .replacement
+            .statement_pairs
+            .iter()
+            .map(|pair| pair.label)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"pairs",
+        output.observation_source.as_bytes(),
+    );
+    let observations =
+        crate::extract_observations_from_source(&output.observation_source, &metadata).unwrap();
+    assert_eq!(observations.observations.len(), 1);
+    assert_eq!(observations.observations[0].pointer_anchors.len(), 1);
+}
+
+#[test]
+fn print_argument_closures_allow_local_bindings_without_validator() {
+    let source = r#"
+#![feature(let_chains)]
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn f(value: i32) { printf(b"%d\0" as *const u8 as *const i8, value); }
+"#;
+    let skeleton = r#"unsafe fn f(value: i32) { #[proctor(0)] ::std::print!("{}", todo!()); }"#;
+    for expression in [
+        "(|other| { let result = other + 1; result })(value)",
+        "(|| { if let Some(proctor_temp_var_0) = Some(value) && proctor_temp_var_0 > 0 { proctor_temp_var_0 } else { 0 } })()",
+        "(|| { let mut result = 0; while let Some(proctor_temp_var_0) = Some(value) && proctor_temp_var_0 > 0 { result += proctor_temp_var_0; break; } result })()",
+    ] {
+        let request = ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
+            transformation: format!(
+                r#"unsafe fn f(value: i32) {{ #[proctor(0)] ::std::print!("{{}}", {expression}); }}"#
+            ),
+            accepted_correspondence: vec![],
+        };
+        let output = add_source(source, &request).unwrap();
+        compile_checked(&output);
+    }
+}
+
+#[test]
 fn restricted_conditional_does_not_hide_other_label_subtrees() {
     let source = r#"
 pub unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {

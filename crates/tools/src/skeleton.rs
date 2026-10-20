@@ -1212,6 +1212,7 @@ fn render_annotated_item(item: &Item) -> String {
 
 struct BodyValidator<'a> {
     function_path: &'a str,
+    closure_depth: usize,
     error: Option<GenerationError>,
 }
 
@@ -1231,7 +1232,7 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
             });
             return;
         }
-        if matches!(stmt.kind, StmtKind::Empty) {
+        if self.closure_depth == 0 && matches!(stmt.kind, StmtKind::Empty) {
             self.error.get_or_insert_with(|| GenerationError {
                 kind: GenerationErrorKind::EmptyStatement,
                 function_path: self.function_path.to_owned(),
@@ -1246,7 +1247,9 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
         if self.error.is_some() {
             return;
         }
-        if let ExprKind::Match(_, arms, _) = &expr.kind {
+        if self.closure_depth == 0
+            && let ExprKind::Match(_, arms, _) = &expr.kind
+        {
             for arm in arms {
                 if !arm
                     .body
@@ -1262,13 +1265,17 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
                 }
             }
         }
+        let closure = matches!(expr.kind, ExprKind::Closure(..));
+        self.closure_depth += usize::from(closure);
         visit::walk_expr(self, expr);
+        self.closure_depth -= usize::from(closure);
     }
 }
 
 fn validate_function_body(item: &Item, path: &str) -> Result<(), GenerationError> {
     let mut validator = BodyValidator {
         function_path: path,
+        closure_depth: 0,
         error: None,
     };
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
@@ -1292,7 +1299,9 @@ impl MutVisitor for Labeler<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        if self.opaque_expressions.contains(&expr.id) {
+        // A closure body belongs to its enclosing payload, not its statement-label tree.
+        if self.opaque_expressions.contains(&expr.id) || matches!(expr.kind, ExprKind::Closure(..))
+        {
             return;
         }
         mut_visit::walk_expr(self, expr);
@@ -3754,7 +3763,9 @@ impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if self.opaque_expressions.contains(&expression.id) {
+        if self.opaque_expressions.contains(&expression.id)
+            || matches!(expression.kind, ExprKind::Closure(..))
+        {
             return;
         }
         visit::walk_expr(self, expression);
@@ -4477,6 +4488,9 @@ fn contains_control_expression(expr: &Expr) -> bool {
 
     impl<'ast> visit::Visitor<'ast> for Finder {
         fn visit_expr(&mut self, expr: &'ast Expr) {
+            if matches!(expr.kind, ExprKind::Closure(..)) {
+                return;
+            }
             if is_preserved_expression(expr) {
                 self.found = true;
                 return;
@@ -4497,6 +4511,9 @@ fn contains_let_expression(expr: &Expr) -> bool {
 
     impl<'ast> visit::Visitor<'ast> for Finder {
         fn visit_expr(&mut self, expr: &'ast Expr) {
+            if matches!(expr.kind, ExprKind::Closure(..)) {
+                return;
+            }
             if matches!(expr.kind, ExprKind::Let(..)) {
                 self.found = true;
                 return;
@@ -4547,7 +4564,7 @@ fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) ->
 
     impl<'ast, F: FnMut(NodeId)> visit::Visitor<'ast> for Finder<'_, F> {
         fn visit_expr(&mut self, expr: &'ast Expr) {
-            if self.invalid {
+            if self.invalid || matches!(expr.kind, ExprKind::Closure(..)) {
                 return;
             }
             if is_preserved_expression(expr) {
