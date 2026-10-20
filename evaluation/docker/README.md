@@ -100,5 +100,8 @@ results/logs/                one log per program and step, run.log            re
   groups by then. `--miri-cap` changes the cap.
 - **Everything else is expected to be `equal`:**
   - the counts and rates, deterministic given the solver;
-  - the Miri verdicts;
-  - the emitted trees, which match the paper's runs byte for byte modulo the translator's name.
+  - the Miri verdicts.
+- **lodepng's prepared input** differs from the paper's in form, not in meaning. `prepare` resolves the three
+  `#[cfg_attr(target_os = …, link_section = …)]` attributes on its static initializers to Linux's
+  `#[link_section = ".init_array"]`, where the paper's prepared input kept all three, so 33 token lines of the
+  prepared input and of the emitted program differ; no key moves.
