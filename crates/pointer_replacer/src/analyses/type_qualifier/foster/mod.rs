@@ -1,6 +1,6 @@
 //! Foster style flow-insensitive type qualifier inference algorithm
 
-use constraint_system::{BooleanLattice, Var};
+pub use constraint_system::{BooleanLattice, Var};
 use rustc_index::IndexVec;
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
@@ -14,7 +14,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-mod constraint_system;
+pub mod constraint_system;
 pub mod fatness;
 pub mod mutability;
 
@@ -22,12 +22,12 @@ pub type StructFields = encoding::StructFields<Var>;
 pub type FnLocals = encoding::FnLocals<Var>;
 
 pub struct TypeQualifiers<Qualifier> {
-    struct_fields: StructFields,
-    fn_locals: FnLocals,
-    model: IndexVec<Var, Qualifier>,
+    pub struct_fields: StructFields,
+    pub fn_locals: FnLocals,
+    pub model: IndexVec<Var, Qualifier>,
 }
 
-fn count_ptr(mut ty: Ty) -> usize {
+pub fn count_ptr(mut ty: Ty) -> usize {
     let mut cnt = 0;
     loop {
         if let Some(inner_ty) = ty.builtin_deref(true) {
@@ -136,9 +136,9 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
 }
 
 pub struct InferCtxt<'infer, 'tcx, D> {
-    local_decls: &'infer D,
-    locals: &'infer [Var],
-    fn_locals: &'infer FnLocals,
-    struct_fields: &'infer StructFields,
-    tcx: TyCtxt<'tcx>,
+    pub local_decls: &'infer D,
+    pub locals: &'infer [Var],
+    pub fn_locals: &'infer FnLocals,
+    pub struct_fields: &'infer StructFields,
+    pub tcx: TyCtxt<'tcx>,
 }

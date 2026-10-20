@@ -19,7 +19,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-pub(crate) mod eliminable_temporaries;
+pub mod eliminable_temporaries;
 
 pub type OutputParams = FxHashMap<LocalDefId, MixedBitSet<Local>>;
 

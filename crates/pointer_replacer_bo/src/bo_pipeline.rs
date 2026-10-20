@@ -19,6 +19,13 @@ use crate::{
     },
 };
 
+/// The `[pointer]` table of crat's configuration: the settings of the pointer pass.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub c_exposed_fns: rustc_hash::FxHashSet<String>,
+}
+
 /// What a `bo` run reports: the outcome, the identity the frame check reads, the solve's
 /// provenance, and the per-file digests of the emission.
 pub struct BoReceipt {

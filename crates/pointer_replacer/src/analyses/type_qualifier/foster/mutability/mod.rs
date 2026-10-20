@@ -6,7 +6,7 @@ use rustc_middle::mir::{
     BinOp, HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Terminator,
     visit::Visitor,
 };
-use rustc_span::{def_id::LocalDefId, source_map::Spanned};
+use rustc_span::source_map::Spanned;
 use rustc_type_ir::TyKind;
 
 use crate::{
@@ -27,19 +27,6 @@ mod library;
 // mod test;
 
 pub fn mutability_analysis(rust_program: &RustProgram) -> MutabilityResult {
-    mutability_analysis_gated(rust_program, None)
-}
-
-/// era-5c R545-1: a load gate. `lhs = copy (*p)…` emits `lhs ⇒ p` (a value loaded
-/// out of `*p` and used mutably needs `p`'s level mutable -- Rust's rule for
-/// reborrowing `&mut` out of `*p`). The gate is asked per load; `false` drops that
-/// one guard. `None` keeps every guard (the ungated analysis, byte-identical).
-pub type LoadGate<'g, 'tcx> = &'g dyn Fn(LocalDefId, &Place<'tcx>) -> bool;
-
-pub fn mutability_analysis_gated<'tcx>(
-    rust_program: &RustProgram<'tcx>,
-    gate: Option<LoadGate<'_, 'tcx>>,
-) -> MutabilityResult {
     let mut result = MutabilityResult::new_empty(rust_program);
     let mut database = BooleanSystem::new(&result.model);
     for r#fn in &rust_program.functions {
@@ -62,8 +49,6 @@ pub fn mutability_analysis_gated<'tcx>(
         let mut analysis = MutabilityAnalysis {
             ctxt,
             database: &mut database,
-            fn_did: *r#fn,
-            gate,
         };
 
         analysis.visit_body(body);
@@ -145,16 +130,12 @@ impl BooleanLattice for Mutability {}
 pub struct MutabilityAnalysis<'infer, 'tcx, D> {
     ctxt: InferCtxt<'infer, 'tcx, D>,
     database: &'infer mut BooleanSystem<Mutability>,
-    fn_did: LocalDefId,
-    gate: Option<LoadGate<'infer, 'tcx>>,
 }
 
 impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<'infer, 'tcx, D> {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, _location: Location) {
         let lhs = place;
         let rhs = rvalue;
-        // R545-1: whether a load's `lhs ⇒ p` guard is kept (see `LoadGate`).
-        let keep_load = |load: &Place<'tcx>| self.gate.is_none_or(|gate| gate(self.fn_did, load));
 
         let InferCtxt {
             local_decls,
@@ -167,7 +148,6 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
 
         match rhs {
             Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs) => {
-                let keep = keep_load(rhs);
                 let lhs = place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, database);
                 let mut rhs_deref = None;
                 let rhs = place_vars::<UnknownCtxt>(
@@ -178,22 +158,20 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     &mut rhs_deref,
                 );
 
-                // An unencoded projection (currently a union field) can truncate the RHS
-                // qualifier range even when Rust types still agree. Bottom only the representable
-                // destination: silently zipping an empty RHS would leave it incorrectly `Imm`.
-                if lhs.end.index() - lhs.start.index() != rhs.end.index() - rhs.start.index() {
-                    for lhs in lhs {
-                        database.bottom(lhs);
-                    }
-                    return;
-                }
+                // type safety
+                assert_eq!(
+                    lhs.end.index() - lhs.start.index(),
+                    rhs.end.index() - rhs.start.index(),
+                    "{:?}: {} = {:?}",
+                    place,
+                    local_decls.local_decls()[place.local].ty,
+                    rvalue
+                );
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
                     database.guard(lhs, rhs);
-                    if let Some(rhs_deref) = rhs_deref
-                        && keep
-                    {
+                    if let Some(rhs_deref) = rhs_deref {
                         database.guard(lhs, rhs_deref);
                     }
                 }
@@ -204,7 +182,6 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             }
             Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => {
                 // for cast, we process the head ptr only
-                let keep = keep_load(rhs);
                 let lhs = place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, database);
                 let mut rhs_deref = None;
                 let rhs = place_vars::<UnknownCtxt>(
@@ -218,9 +195,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
                     database.guard(lhs, rhs);
-                    if let Some(rhs_deref) = rhs_deref
-                        && keep
-                    {
+                    if let Some(rhs_deref) = rhs_deref {
                         database.guard(lhs, rhs_deref)
                     }
                 }

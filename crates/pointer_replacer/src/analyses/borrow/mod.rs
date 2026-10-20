@@ -158,10 +158,10 @@ impl std::fmt::Debug for ProvenanceData {
 /// This formulation is definitely wrong as we don't create [`Origin`]
 /// for nested pointers. But I guess it could be fine?
 pub struct ProvenanceSet {
-    pub(crate) local_data: IndexVec<Local, Option<Provenance>>,
+    local_data: IndexVec<Local, Option<Provenance>>,
     field_data: FxHashMap<StructFieldSlot, Option<Provenance>>,
-    pub(crate) provenance_data: IndexVec<Provenance, ProvenanceData>,
-    pub(crate) tree_borrow_local: RefCell<UnionFind<Local>>,
+    provenance_data: IndexVec<Provenance, ProvenanceData>,
+    tree_borrow_local: RefCell<UnionFind<Local>>,
 }
 
 impl ProvenanceSet {
@@ -191,7 +191,7 @@ impl ProvenanceSet {
             .map(|_| ProvenanceOwner::Field(field))
     }
 
-    pub(crate) fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
+    fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
         match owner {
             ProvenanceOwner::Local(local) => {
                 let changed = self.local_data[local].is_some();
@@ -391,14 +391,8 @@ impl<C> DebugWithContext<C> for Loan {}
 
 pub struct BorrowData<'tcx> {
     location: Location,
-    pub(crate) borrowed: Place<'tcx>,
-    pub(crate) assigned: Borrower,
-}
-
-impl BorrowData<'_> {
-    pub(crate) fn location(&self) -> Location {
-        self.location
-    }
+    borrowed: Place<'tcx>,
+    assigned: Borrower,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -415,9 +409,9 @@ impl std::fmt::Debug for BorrowData<'_> {
 }
 
 pub struct BorrowSet<'tcx> {
-    pub(crate) loans: IndexVec<Loan, BorrowData<'tcx>>,
+    loans: IndexVec<Loan, BorrowData<'tcx>>,
     location_map: FxHashMap<Location, Vec<Loan>>,
-    pub(crate) local_map: SparseBitMatrix<Local, Loan>,
+    local_map: SparseBitMatrix<Local, Loan>,
 }
 
 pub trait HasBorrowSet<'tcx> {
@@ -572,22 +566,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
                 {
-                    // A C-variadic callee has no parameter local past its fixed
-                    // inputs: `_(i+1)` there is a body local (tisp's `mk_list`,
-                    // RQ3 / analysis-fanout 018), so no loan is bound to it.
-                    let fixed = if cfg!(test)
-                        && std::env::var("CRAT_E5C_W79_FAULT").as_deref() == Ok("no-fixed")
-                    {
-                        usize::MAX
-                    } else {
-                        self.tcx
-                            .fn_sig(callee)
-                            .skip_binder()
-                            .inputs()
-                            .skip_binder()
-                            .len()
-                    };
-                    for (arg_index, arg) in mir_call.args.iter().enumerate().take(fixed) {
+                    for (arg_index, arg) in mir_call.args.iter().enumerate() {
                         let arg = &arg.node;
                         if let Some(arg) = arg.place() {
                             let callee_local = Local::from_usize(arg_index + 1);
@@ -862,258 +841,6 @@ pub fn borrow_inference<'tcx>(
     }
 }
 
-/// One borrow conflict (an invalid loan) attributed to its owners: the slot that
-/// issued the loan (`assigned`) and the slots whose provenance required the loan and
-/// is live at the error point. Keyed by the public `ProvenanceOwner` so callers
-/// outside this module can translate to their own slot space. This is the raw
-/// material for the unified analysis's §8 guarded-exclusion clauses.
-#[derive(Clone, Debug)]
-pub struct ConflictEdge {
-    pub issuer: Option<ProvenanceOwner>,
-    pub requirers: Vec<ProvenanceOwner>,
-    /// BO-only repair-class marker. Ordinary borrow conflicts keep this false; an exact
-    /// ESC-GAP ② selected loan sets it so the unified repair loop can use that class's issuer
-    /// kill switch without changing A-prime selection for any ordinary row.
-    pub(crate) esc_issuer_first: bool,
-}
-
-/// §8 verifier (read-only): run `borrow_inference` with a given ref-candidacy +
-/// mutability and return, per function, the conflict edges (invalid loans attributed
-/// to their issuer/requirer owners). Mirrors the error-extraction of
-/// `demote_pointers_iterative_with_fields` WITHOUT mutating the `ProvenanceSet` — so
-/// it is faithful for a Round-0 (all-candidate) set; a *partial* candidacy that
-/// represents demotions would also need the `tree_borrow_local` union replay the
-/// demotion loop performs (the caller's concern).
-pub fn borrow_conflicts<I, J, K, L>(
-    program: &RustProgram,
-    is_candidate: I,
-    is_mutable: K,
-) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
-where
-    I: Fn(LocalDefId) -> J,
-    J: Fn(Local) -> bool,
-    K: Fn(LocalDefId) -> L,
-    L: Fn(Local) -> bool,
-{
-    let ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
-    let mut out = FxHashMap::default();
-    for f in program.functions.iter().copied() {
-        let inference = borrow_inference(program.tcx, f, &ctxt);
-        let invalid_loans = invalid_loan_set(&inference);
-        if invalid_loans.is_empty() {
-            continue;
-        }
-        let provenance_set = ctxt.provenances.get(&f).unwrap();
-        out.insert(
-            f,
-            extract_conflict_edges(&inference, provenance_set, &invalid_loans),
-        );
-    }
-    out
-}
-
-/// The set of invalid loans (live ∧ invalidated) across all error points.
-fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan> {
-    let mut invalid_loans = DenseBitSet::new_empty(inference.borrow_set.loans.len());
-    for row in inference.errors.rows() {
-        if let Some(loans) = inference.errors.row(row) {
-            invalid_loans.union(loans);
-        }
-    }
-    invalid_loans
-}
-
-/// Attribute each invalid loan to its issuer (`assigned`) and the live provenances
-/// that required it — the `ConflictEdge` shape consumed by the §8 guard encoder.
-/// Shared by `borrow_conflicts` (round-0) and `borrow_conflicts_replaying` (CEGAR).
-fn extract_conflict_edges(
-    inference: &BorrowInferenceResults<'_>,
-    provenance_set: &ProvenanceSet,
-    invalid_loans: &DenseBitSet<Loan>,
-) -> Vec<ConflictEdge> {
-    let BorrowInferenceResults {
-        borrow_set,
-        provenance_liveness,
-        requires,
-        errors,
-        ..
-    } = inference;
-
-    let mut edges = Vec::new();
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        let issuer = match borrow_data.assigned {
-            Borrower::Assign(owner) => Some(owner),
-            Borrower::CallArg(..) => None,
-        };
-        let mut requirers = Vec::new();
-        let mut seen: FxHashSet<Provenance> = FxHashSet::default();
-        for row in errors.rows() {
-            let Some(loans) = errors.row(row) else {
-                continue;
-            };
-            if !loans.contains(loan) {
-                continue;
-            }
-            let Some(live) = provenance_liveness.row(row) else {
-                continue;
-            };
-            for provenance in live.iter() {
-                if requires.contains(provenance, loan) && seen.insert(provenance) {
-                    requirers.push(provenance_set.provenance_data[provenance].owner());
-                }
-            }
-        }
-        edges.push(ConflictEdge {
-            issuer,
-            requirers,
-            esc_issuer_first: false,
-        });
-    }
-    edges
-}
-
-/// §8 BB2-i — the CEGAR validate verifier with **union replay**. Unlike
-/// `borrow_conflicts` (round-0, no demotions), this takes a *partial* candidacy: a
-/// pointer local is a `Ref` candidate iff `is_ref`, induces a borrow demotion+union
-/// iff `is_raw`, and is neither (an `Owning` slot) otherwise. It reproduces the
-/// model-dependent loans that the chosen `Raw` slots create — replaying
-/// `demote_pointers_iterative_with_fields`'s `tree_borrow_local` union via the shared
-/// `collect_invalid_loan_demotions` — then returns the conflict edges that remain.
-///
-/// Algorithm: build the ctxt with candidacy `is_ref ∨ is_raw` (so `Raw` slots still
-/// carry loans whose `borrowed.local` is the union base; `Owning` slots are excluded
-/// and induce no union). For each function, demote the model's `Raw` witnesses with
-/// their unions to a fixpoint (each round demotes ≥1 fresh `Raw` local, so ≤|Raw|
-/// rounds), then extract the residual conflicts over the surviving `Ref` candidates.
-///
-/// Invariant (`assert`ed, release-active since BB3-c): every model-`Raw` local that was NOT a demotion witness
-/// (so it kept its provenance through the fixpoint) is *inert* — it appears in no residual
-/// conflict edge. This is the relaxation of an earlier, too-strong "every `Raw` slot is a
-/// witness" assert. A non-witness `Raw` local can legitimately arise from coherence's
-/// flow-insensitive equate-closure: a DEAD copy `let _r = p` is `equate`d to `p`, so
-/// committing `¬ref(p)` drags `_r` `Raw`, yet `_r` is never live at the conflict and is
-/// never demoted. Such a local cannot be the live issuer/requirer of a residual invalid
-/// loan (else `to_demote` would be non-empty and the loop would not have broken), and
-/// `extract_conflict_edges` draws owners from exactly those live sources — so it is
-/// provably absent from `edges`. The `assert` is a tripwire on that inert-ness; BB3-c made it
-/// release-active so it guards the future BO→codegen path — in the proven-inert valid case it
-/// never fires (a release panic here would mean the inert-ness proof was wrong, i.e. a genuine
-/// soundness bug, not the harmless dead-copy case).
-///
-/// CAVEAT (adversarial review, 2026-06-24): the inert-ness invariant also absorbs the
-/// Owning-issuer case (a loan whose `issuer` is classed `Owning` vanishes under the replay
-/// candidacy, leaving a former requirer non-witness) — that requirer is likewise inert.
-/// What stays DEFERRED to BB3 is the separate *under-report*: an `Owning` slot issues no
-/// loan, so a conflict *caused by* an `Owning` pointer's exclusivity is invisible to the
-/// replay. BO output is unconsumed by codegen (the §8 guardrail) until that lands.
-pub fn borrow_conflicts_replaying<I, J, M, N, K, L>(
-    program: &RustProgram,
-    is_ref: I,
-    is_raw: M,
-    is_mutable: K,
-) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
-where
-    I: Fn(LocalDefId) -> J,
-    J: Fn(Local) -> bool,
-    M: Fn(LocalDefId) -> N,
-    N: Fn(Local) -> bool,
-    K: Fn(LocalDefId) -> L,
-    L: Fn(Local) -> bool,
-{
-    // Pass-1 candidacy keeps `Raw` slots as candidates so their loans (and union
-    // bases) exist; the demotion loop then removes them. `Owning` slots (neither
-    // ref nor raw) are non-candidates from the start and induce no union.
-    let is_candidate = |did: LocalDefId| {
-        let ref_f = is_ref(did);
-        let raw_f = is_raw(did);
-        move |local: Local| ref_f(local) || raw_f(local)
-    };
-    let mut ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
-
-    let mut out = FxHashMap::default();
-    for f in program.functions.iter().copied() {
-        let is_raw_f = is_raw(f);
-
-        // Demote the model's `Raw` witnesses (with their unions) to a fixpoint, then
-        // collect the residual conflict edges from the final inference.
-        let edges = loop {
-            let inference = borrow_inference(program.tcx, f, &ctxt);
-            let invalid_loans = invalid_loan_set(&inference);
-            if invalid_loans.is_empty() {
-                break Vec::new();
-            }
-
-            // Decide which `Raw` witnesses to demote this round (still candidates).
-            let to_demote: Vec<(Local, Local)> = {
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
-                let demotions =
-                    collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-                demotions
-                    .local_witnesses
-                    .into_iter()
-                    .filter(|(local, _base)| {
-                        is_raw_f(*local) && provenance_set.local_data[*local].is_some()
-                    })
-                    .collect()
-            };
-
-            if to_demote.is_empty() {
-                // No more `Raw` demotions possible: the remaining invalid loans are
-                // genuine conflicts over the surviving `Ref` candidates.
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
-                break extract_conflict_edges(&inference, provenance_set, &invalid_loans);
-            }
-
-            drop(inference);
-            let provenance_set = ctxt.provenances.get_mut(&f).unwrap();
-            for (local, base) in to_demote {
-                provenance_set.disable_owner(ProvenanceOwner::Local(local));
-                provenance_set
-                    .tree_borrow_local
-                    .get_mut()
-                    .union(local, base);
-            }
-        };
-
-        // Stray-Raw inert-ness invariant (relaxed from the former "every Raw slot is a
-        // demotion witness", which coherence violates). A model-`Raw` local that was NOT a
-        // witness — so it kept its provenance (`local_data.is_some()`) through the demotion
-        // fixpoint — can legitimately arise from coherence's flow-insensitive equate-closure
-        // (e.g. a DEAD copy `let _r = p`: committing `¬ref(p)` drags `_r` Raw, yet `_r` is
-        // never live at the conflict). Such a local is provably *inert*: it cannot be the
-        // live issuer/requirer of a residual invalid loan (else `to_demote` would have been
-        // non-empty and the loop would not have broken), and `extract_conflict_edges` draws
-        // owners from exactly those live sources — so it appears in NO residual edge. We
-        // assert that inert-ness (a real tripwire) instead of panicking on the valid case.
-        let provenance_set = ctxt.provenances.get(&f).unwrap();
-        assert!(
-            provenance_set
-                .local_data
-                .iter_enumerated()
-                .all(|(local, data)| {
-                    if !(is_raw_f(local) && data.is_some()) {
-                        return true;
-                    }
-                    // inert: named by no residual conflict edge (issuer or requirer)
-                    !edges.iter().any(|e| {
-                        matches!(e.issuer, Some(ProvenanceOwner::Local(l)) if l == local)
-                            || e.requirers
-                                .iter()
-                                .any(|o| matches!(o, ProvenanceOwner::Local(l) if *l == local))
-                    })
-                }),
-            "BB2-i stray-Raw: a non-witness Raw local appears in a residual edge in {f:?} \
-             — the inert-ness invariant (stray Raw ⟹ in no residual edge) is violated"
-        );
-
-        if !edges.is_empty() {
-            out.insert(f, edges);
-        }
-    }
-    out
-}
-
 #[allow(unused)]
 pub fn dump_borrow_inference_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -1249,90 +976,6 @@ pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &G
     }
 }
 
-/// The demotions an invalid-loan set induces, collected WITHOUT mutating the
-/// `ProvenanceSet`. Each `(local, base)` in `local_witnesses` means "demoting
-/// `local` unions it with `base`" — `base` is the invalid loan's `borrowed.local`,
-/// exactly as `demote_pointers_iterative_with_fields` does. `Field` owners are
-/// demoted but carry no union, so they are returned separately. This is the shared,
-/// faithful core consumed by both the production demote loop (which applies every
-/// witness) and the §8 CEGAR validate replay (which gates them on the model's `Raw`
-/// slots) — a single source of truth so the union semantics cannot diverge.
-pub(crate) struct InvalidLoanDemotions {
-    pub local_witnesses: Vec<(Local, Local)>,
-    pub demoted_fields: FxHashSet<StructFieldSlot>,
-}
-
-/// Collect the demotion witnesses induced by `invalid_loans` from one function's
-/// inference results. Mirrors the requirer + issuer demotion paths of
-/// `demote_pointers_iterative_with_fields` but is pure (no mutation), so callers
-/// decide which witnesses to apply.
-pub(crate) fn collect_invalid_loan_demotions(
-    inference: &BorrowInferenceResults<'_>,
-    provenance_set: &ProvenanceSet,
-    invalid_loans: &DenseBitSet<Loan>,
-) -> InvalidLoanDemotions {
-    let BorrowInferenceResults {
-        borrow_set,
-        errors,
-        provenance_liveness,
-        requires,
-        ..
-    } = inference;
-
-    let mut local_witnesses = Vec::new();
-    let mut demoted_fields = FxHashSet::default();
-
-    // Requirer path: every live provenance that requires an invalid loan is demoted
-    // and unioned with that loan's borrowed cell.
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        for row in errors.rows() {
-            let Some(loans) = errors.row(row) else {
-                continue;
-            };
-            if !loans.contains(loan) {
-                continue;
-            }
-            let Some(live_provenances) = provenance_liveness.row(row) else {
-                continue;
-            };
-            for provenance in live_provenances.iter() {
-                if !requires.contains(provenance, loan) {
-                    continue;
-                }
-                match provenance_set.provenance_data[provenance].owner() {
-                    ProvenanceOwner::Local(local) => {
-                        local_witnesses.push((local, borrow_data.borrowed.local));
-                    }
-                    ProvenanceOwner::Field(field) => {
-                        demoted_fields.insert(field);
-                    }
-                }
-            }
-        }
-    }
-
-    // Issuer path: the loan's assigned borrower is demoted and unioned likewise.
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        if let Borrower::Assign(assigned) = borrow_data.assigned {
-            match assigned {
-                ProvenanceOwner::Local(local) => {
-                    local_witnesses.push((local, borrow_data.borrowed.local));
-                }
-                ProvenanceOwner::Field(field) => {
-                    demoted_fields.insert(field);
-                }
-            }
-        }
-    }
-
-    InvalidLoanDemotions {
-        local_witnesses,
-        demoted_fields,
-    }
-}
-
 #[allow(dead_code)]
 pub fn demote_pointers_iterative(
     program: &RustProgram,
@@ -1369,10 +1012,17 @@ pub fn demote_pointers_iterative_with_fields(
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
 
         let inference = borrow_inference(tcx, f, global_borrow_ctxt);
+        let BorrowInferenceResults {
+            borrow_set,
+            errors,
+            provenance_liveness,
+            requires,
+            ..
+        } = inference;
 
-        let mut invalid_loans = DenseBitSet::new_empty(inference.borrow_set.loans.len());
-        for row in inference.errors.rows() {
-            if let Some(loans) = inference.errors.row(row) {
+        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
+        for row in errors.rows() {
+            if let Some(loans) = errors.row(row) {
                 invalid_loans.union(loans);
             }
         }
@@ -1387,22 +1037,58 @@ pub fn demote_pointers_iterative_with_fields(
         let changed = {
             let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
 
-            // Collect the demotion witnesses the invalid loans induce (requirer +
-            // issuer paths), then apply every one: production demotes all of them.
-            // The §8 CEGAR replay reuses `collect_invalid_loan_demotions` but applies
-            // only the model's `Raw` witnesses.
-            let InvalidLoanDemotions {
-                local_witnesses,
-                demoted_fields,
-            } = collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-            for (local, base) in local_witnesses {
-                demoted_locals.insert(local);
-                provenance_set
-                    .tree_borrow_local
-                    .get_mut()
-                    .union(local, base);
+            // Demote every live provenance that depends on the invalid loan, not just
+            // the local where the borrow was originally assigned.
+            // (for inter-procedural borrow inference, e.g., p = id(q))
+            for loan in invalid_loans.iter() {
+                let borrow_data = &borrow_set.loans[loan];
+                for row in errors.rows() {
+                    let Some(loans) = errors.row(row) else {
+                        continue;
+                    };
+                    if !loans.contains(loan) {
+                        continue;
+                    }
+                    let Some(live_provenances) = provenance_liveness.row(row) else {
+                        continue;
+                    };
+                    for provenance in live_provenances.iter() {
+                        if !requires.contains(provenance, loan) {
+                            continue;
+                        }
+                        match provenance_set.provenance_data[provenance].owner() {
+                            ProvenanceOwner::Local(local) => {
+                                demoted_locals.insert(local);
+                                provenance_set
+                                    .tree_borrow_local
+                                    .get_mut()
+                                    .union(local, borrow_data.borrowed.local);
+                            }
+                            ProvenanceOwner::Field(field) => {
+                                demoted_field_slots.insert(field);
+                            }
+                        }
+                    }
+                }
             }
-            demoted_field_slots.extend(demoted_fields);
+
+            for loan in invalid_loans.iter() {
+                let borrow_data = &borrow_set.loans[loan];
+                if let Borrower::Assign(assigned) = borrow_data.assigned {
+                    match assigned {
+                        ProvenanceOwner::Local(local) => {
+                            demoted_locals.insert(local);
+                            provenance_set
+                                .tree_borrow_local
+                                .get_mut()
+                                .union(local, borrow_data.borrowed.local);
+                        }
+                        ProvenanceOwner::Field(field) => {
+                            demoted_field_slots.insert(field);
+                        }
+                    }
+                }
+            }
 
             let mut changed = false;
             for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {

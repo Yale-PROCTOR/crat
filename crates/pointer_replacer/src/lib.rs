@@ -14,43 +14,24 @@ extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
-extern crate rustc_driver;
-extern crate rustc_errors;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
-extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
-extern crate rustc_parse;
-extern crate rustc_session;
 extern crate rustc_span;
-extern crate rustc_target;
 extern crate rustc_type_ir;
 extern crate smallvec;
 extern crate thin_vec;
 
-mod analyses;
-mod bo_pipeline;
-mod bo_rewriter;
-mod coverage_recon;
-mod raw_boundary_census_schema;
-mod rewriter;
-mod utils;
+pub mod analyses;
+pub mod rewriter;
+pub mod utils;
 
-pub use bo_pipeline::{BoReceipt, env_from_file as bo_env_from_file, rewrite_bo};
 pub use rewriter::{
     BytemuckDependency, Config, replace_local_borrows, rewrite_array_local_provenance,
     rewrite_epoch_split, rewrite_struct_arrays, rewrite_struct_param_fields,
 };
 
-#[cfg(test)]
-mod bo_c1;
-#[cfg(test)]
-mod box_census_schema;
-#[cfg(test)]
-mod crown_usage_metric;
-#[cfg(test)]
-mod recon_fixtures;
 #[cfg(test)]
 mod tests;

@@ -116,7 +116,7 @@ struct Args {
     // Pointer
     #[arg(
         long,
-        help = "Enable verbose ownership solver output for the pointer pass"
+        help = "Enable verbose ownership solver output for the pointer-old pass"
     )]
     pointer_verbose: bool,
     #[arg(short, long, help = "Enable verbose output")]
@@ -133,10 +133,10 @@ struct Args {
     c_exposed_fn: Vec<String>,
     #[arg(
         long,
-        help = "File of analysis switches for the bo pass (default: $DIR/config/analysis-env.sh, else the frame env of record under $DIR/crates/pointer_replacer/frames)"
+        help = "File of analysis switches for the pointer pass (default: $DIR/config/analysis-env.sh, else the frame env of record under $DIR/crates/pointer_replacer_bo/frames)"
     )]
     bo_env: Option<PathBuf>,
-    #[arg(long, help = "Write the bo pass's emission receipt to this file")]
+    #[arg(long, help = "Write the pointer pass's emission receipt to this file")]
     bo_receipt: Option<PathBuf>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
@@ -173,7 +173,9 @@ enum Pass {
     Enum,
     Io,
     Pointer,
-    Bo,
+    #[value(name = "pointer-old")]
+    #[serde(rename = "pointer-old")]
+    PointerOld,
     Static,
     Simpl,
 }
@@ -207,7 +209,9 @@ struct Config {
     #[serde(default)]
     unexpand: unexpander::Config,
     #[serde(default)]
-    pointer: pointer_replacer::Config,
+    pointer: pointer_replacer_bo::Config,
+    #[serde(default, rename = "pointer-old")]
+    pointer_old: pointer_replacer::Config,
     #[serde(default)]
     andersen: points_to::andersen::Config,
     #[serde(default)]
@@ -241,7 +245,7 @@ fn main() {
     config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
-    config.pointer.verbose |= args.pointer_verbose;
+    config.pointer_old.verbose |= args.pointer_verbose;
     config.passes.extend(args.pass);
     if args.analysis.is_some() {
         config.analysis = args.analysis;
@@ -376,6 +380,10 @@ fn main() {
         .extend(config.c_exposed_fns.iter().cloned());
     config
         .pointer
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .pointer_old
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
     config
@@ -563,9 +571,9 @@ fn main() {
                     utils::add_dependency(&dir, "num-traits", "0.2.19");
                 }
             }
-            Pass::Pointer => {
+            Pass::PointerOld => {
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
+                    pointer_replacer::rewrite_struct_arrays(&config.pointer_old, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -573,7 +581,7 @@ fn main() {
                 }
 
                 let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
+                    pointer_replacer::rewrite_struct_param_fields(&config.pointer_old, tcx)
                 })
                 .unwrap();
                 if !field_specs.is_empty() {
@@ -593,7 +601,7 @@ fn main() {
                 }
 
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
+                    pointer_replacer::rewrite_epoch_split(&config.pointer_old, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -601,7 +609,7 @@ fn main() {
                 }
 
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
+                    pointer_replacer::rewrite_array_local_provenance(&config.pointer_old, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -609,7 +617,7 @@ fn main() {
                 }
 
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::replace_local_borrows(&config.pointer, tcx)
+                    pointer_replacer::replace_local_borrows(&config.pointer_old, tcx)
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -619,26 +627,26 @@ fn main() {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
             }
-            Pass::Bo => {
+            Pass::Pointer => {
                 let env_file = bo_env.clone().or_else(|| {
                     let dir = PathBuf::from(std::env::var_os("DIR")?);
                     [
                         dir.join("config/analysis-env.sh"),
-                        dir.join("crates/pointer_replacer/frames/l01p14u-s39-mutlend-o-env.sh"),
+                        dir.join("crates/pointer_replacer_bo/frames/l01p14u-s39-mutlend-o-env.sh"),
                     ]
                     .into_iter()
                     .find(|path| path.is_file())
                 });
                 if let Some(path) = &env_file {
-                    let n = pointer_replacer::bo_env_from_file(path).unwrap_or_else(|e| {
+                    let n = pointer_replacer_bo::bo_env_from_file(path).unwrap_or_else(|e| {
                         eprintln!("{e}");
                         std::process::exit(1);
                     });
                     if config.verbose {
-                        println!("bo: {n} variables set from {}", path.display());
+                        println!("pointer: {n} variables set from {}", path.display());
                     }
                 }
-                let receipt = pointer_replacer::rewrite_bo(
+                let receipt = pointer_replacer_bo::rewrite_bo(
                     &file,
                     config.pointer.c_exposed_fns.iter().cloned(),
                 )

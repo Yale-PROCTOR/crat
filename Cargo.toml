@@ -6,6 +6,7 @@ members = [
   "crates/outparam_replacer",
   "crates/passes",
   "crates/pointer_replacer",
+  "crates/pointer_replacer_bo",
   "crates/points_to",
   "crates/static_replacer",
   "crates/union_replacer",
@@ -41,6 +42,7 @@ merger = { path = "crates/merger" }
 outparam_replacer = { path = "crates/outparam_replacer" }
 passes = { path = "crates/passes" }
 pointer_replacer = { path = "crates/pointer_replacer" }
+pointer_replacer_bo = { path = "crates/pointer_replacer_bo" }
 points_to = { path = "crates/points_to" }
 static_replacer = { path = "crates/static_replacer" }
 union_replacer = { path = "crates/union_replacer" }

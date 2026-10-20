@@ -251,6 +251,7 @@ dependencies = [
  "outparam_replacer",
  "passes",
  "pointer_replacer",
+ "pointer_replacer_bo",
  "points_to",
  "serde",
  "serde_json",
@@ -998,6 +999,27 @@ dependencies = [
  "indexmap",
  "itertools 0.14.0",
  "petgraph",
+ "points_to",
+ "regex",
+ "serde",
+ "similar",
+ "tracing",
+ "typed-arena",
+ "utils",
+ "z3",
+]
+
+[[package]]
+name = "pointer_replacer_bo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cadical",
+ "etrace",
+ "indexmap",
+ "itertools 0.14.0",
+ "petgraph",
+ "pointer_replacer",
  "points_to",
  "quote",
  "regex",

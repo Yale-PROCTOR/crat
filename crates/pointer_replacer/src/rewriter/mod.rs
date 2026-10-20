@@ -35,9 +35,9 @@ use crate::{
 
 pub(crate) mod array_local_index_rewriter;
 pub(crate) mod array_local_trace;
-pub(crate) mod collector;
+pub mod collector;
 pub(crate) mod decision;
-pub(crate) mod diagnostics;
+pub mod diagnostics;
 mod epoch_split;
 mod lifetimes;
 mod struct_array_field_pre;
@@ -94,29 +94,6 @@ impl BytemuckDependency {
 
     pub fn needs_derive(self) -> bool {
         matches!(self, Self::Derive)
-    }
-}
-
-pub(crate) fn decision_snapshot_pre_transform_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(other) => {
-            panic!("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM must be 0 or 1, got {other:?}")
-        }
-    }
-}
-
-fn decision_snapshot_pre_transform_enabled() -> bool {
-    let value = std::env::var("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM");
-    match value {
-        Ok(value) => decision_snapshot_pre_transform_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => {
-            decision_snapshot_pre_transform_enabled_from_value(None)
-        }
-        Err(error) => {
-            panic!("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM is not valid Unicode: {error}")
-        }
     }
 }
 
@@ -206,10 +183,6 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         fn_ptr_rewrite,
         diagnostics,
     );
-    if decision_snapshot_pre_transform_enabled() {
-        visitor.emit_diagnostics();
-        return (String::new(), visitor.bytemuck_dependency());
-    }
     visitor.visit_crate(&mut krate);
 
     // add SliceCursor module to the crate if it was used

@@ -1,19 +1,15 @@
 pub mod array_local_provenance;
-pub(crate) mod bo_adapter;
 pub mod borrow;
-pub mod borrow_ownership;
 mod encoding;
 pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;
-mod lattice;
-pub(crate) mod liveness;
-#[cfg(test)]
-pub(crate) use liveness::DefUse;
-mod mir;
+pub mod lattice;
+pub mod liveness;
+pub mod mir;
 pub mod mir_variable_grouping;
 pub mod nullity;
 pub mod offset_sign;
-pub(crate) mod output_params;
+pub mod output_params;
 pub mod ownership;
 pub mod pointer_flow;
 pub mod struct_array_field;
