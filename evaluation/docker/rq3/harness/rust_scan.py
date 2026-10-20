@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small Rust lexer for the conformance checkers (R611-2, wave-6o report 080).
+"""A small Rust lexer.
 
 `tokens(text)` yields (kind, value, offset) with comments removed and string,
 byte-string, raw-string and char literals folded into one `lit` token each, so

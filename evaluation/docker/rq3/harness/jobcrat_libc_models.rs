@@ -1,5 +1,4 @@
-//! Harness-side C-library models for the Miri census (R622-2 STOP 2; wave-6o
-//! report 084). Miri shims part of libc (malloc/free, memcpy, strlen, open /
+//! Harness-side C-library models for the Miri runs. Miri shims part of libc (malloc/free, memcpy, strlen, open /
 //! read / write / close, ...). The functions below are the ones the corpus
 //! calls that it does not model. Each is a specification implementation of
 //! the C function, written against Miri-supported primitives (the `libc`
@@ -886,7 +885,7 @@ pub unsafe extern "C" fn toupper(c: c_int) -> c_int { if (0..128).contains(&c) {
 // harness platform model: macOS ctype (`_DefaultRuneLocale.__runetype`, `__maskrune`) for a
 // translation made on macOS (bzip2). Only `__runetype` (byte offset 60) is read by the tree.
 #[repr(C)]
-pub struct CratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
+pub struct JobcratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
 const fn jobcrat_macos_runetype() -> [u32; 256] {
     let mut t = [0u32; 256];
     let mut c = 0usize;
@@ -916,8 +915,8 @@ const fn jobcrat_macos_runetype() -> [u32; 256] {
     t
 }
 #[no_mangle]
-pub static mut _DefaultRuneLocale: CratRuneLocaleModel =
-    CratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
+pub static mut _DefaultRuneLocale: JobcratRuneLocaleModel =
+    JobcratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
 #[no_mangle]
 pub unsafe extern "C" fn __maskrune(c: c_int, mask: c_ulong) -> c_int {
     if (0..256).contains(&c) { (jobcrat_macos_runetype()[c as usize] as c_ulong & mask) as c_int } else { 0 }
@@ -947,7 +946,7 @@ pub unsafe extern "C" fn __assert_rtn(func: *const c_char, file: *const c_char, 
     std::process::abort()
 }
 
-// ---------------------------------------------------------------- setjmp / longjmp (relay 109, R666-4 STOP 2)
+// ---------------------------------------------------------------- setjmp / longjmp
 /// Miri supports neither. The model makes `setjmp` return 0 (its first return, the only one a run
 /// without a library error takes) and stops the run at the first `longjmp` with a named report,
 /// so the Miri receipt states its coverage as "up to the first longjmp" (libzahl: the first
@@ -963,7 +962,7 @@ pub unsafe extern "C" fn longjmp(_env: *mut c_void, _val: c_int) -> ! {
     std::process::abort()
 }
 
-// relay 128 (frame 13): memmove and the libm functions Miri has no shim for, over Rust's own
+// memmove and the libm functions Miri has no shim for, over Rust's own
 // float methods (Miri evaluates them) and an overlapping copy. Declared harness models.
 #[no_mangle]
 pub unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *mut c_void {
@@ -995,7 +994,7 @@ pub extern "C" fn cos(x: f64) -> f64 { x.cos() }
 #[no_mangle]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 { x % y }
 
-// relay 128 (frame 13): ht's demo reads words with scanf; the same scanner as fscanf, on stdin
+// ht's demo reads words with scanf; the same scanner as fscanf, on stdin
 #[no_mangle]
 pub unsafe extern "C" fn scanf(fmt: *const c_char, mut args: ...) -> c_int {
     let f = stdin;
@@ -1009,7 +1008,7 @@ pub unsafe extern "C" fn scanf(fmt: *const c_char, mut args: ...) -> c_int {
 
 // glibc's versioned stat entry points (`__xstat`, `__lxstat`, `__fxstat`, ver = _STAT_VER), which
 // the translation calls where the C source calls stat / lstat / fstat; Miri shims the unversioned
-// ones (relay 138, wave-6o 099: libtree's input-repair run reached them)
+// ones (libtree's runs reach them)
 #[no_mangle]
 pub unsafe extern "C" fn __xstat(_ver: libc::c_int, path: *const libc::c_char, buf: *mut libc::stat) -> libc::c_int {
     libc::stat(path, buf)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""six_suites.py <runtime-work-dir> [out.tsv] — RQ1's test column (R818-1, USER 2026-10-05; main 173a).
+"""six_suites.py <runtime-work-dir> [out.tsv] — the shipped test suites' verdicts.
 
-The paper's test line is the six programs that SHIP a test suite (the same six as RQ4's Miri experiment, R817-1):
+The paper's test line is the six programs that SHIP a test suite (the same six as the Miri experiment):
 libtree, rgba, quadtree, urlparser, genann, buffer. For each, the suite's OWN verdict on the emitted tree and, where
 it builds, on the C original: the exit status the suite gives (its checks abort or fail the run). The sixteen-program
 runtime harness (`runtime_census.py`) stays an internal instrument; this reads the six suites' rows out of its work
@@ -34,7 +34,7 @@ SUITES = {  # program -> (what the shipped suite is, how it is run, the runs tha
 }
 
 
-NOTES = {  # what the verdict alone does not say (main 134c)
+NOTES = {  # what the verdict alone does not say
     "urlparser": "the C original aborts here: url.h's own 2-byte heap overflow (malloc(strlen(tmp_path)) then "
                  "sprintf(path, \"/%s\", tmp_path)) under this distro's gcc default _FORTIFY_SOURCE=3; unfortified it "
                  "exits 0. The emitted and substrate stdouts differ from C only in the garbage bytes of .query / .port",
@@ -63,7 +63,7 @@ def main(work, out=None):
         eq_c = sum(by[i].get("emitted", {}).get("stdout_eq_c") == "True" for i in runs)
         rows.append((program, suite, how, verdict("emitted"), verdict("c"), f"{eq_c}/{len(runs)}", ",".join(runs)))
     passed = sum(r[3].startswith("pass") for r in rows)
-    print(f"six_suites: {passed}/6 pass on the emitted tree (R818-1; the paper's test line)")
+    print(f"six_suites: {passed}/6 pass on the emitted tree")
     for program, _, _, emitted, c, eq_c, _ in rows:
         print(f"  {program:10} emitted {emitted:40} C {c:40} stdout equals C {eq_c}"
               + (f"\n             note: {NOTES[program]}" if program in NOTES else ""))

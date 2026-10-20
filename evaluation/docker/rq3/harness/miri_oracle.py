@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Pass C, "oracle extents" (wave-6o relay 133, R766-1): a Miri-copy-only harness edit that
-removes the slice-extent waiver's censoring. NOT of record, never in the emitted program.
+"""Pass C, "oracle extents": a Miri-copy-only harness edit that gives every slice whose length the
+translation fabricated (FALLBACK_SLICE_EXTENT) its real extent, so that Miri checks the true bound.
+Never in the emitted program.
 
 1. The registry. The program's calls of malloc / calloc / realloc / free / strdup / strndup /
    posix_memalign (and their function-pointer values) go to harness wrappers that call the real
@@ -215,7 +216,7 @@ def substitute(text, first_site=0):
             elif hint and hint[0] == "slice":
                 pre = f"let __jobcrat_h{kk} = Some(crate::jobcrat_miri_slice(&({hint[1]})[..])); "
             elif hint and hint[0] == "lit":
-                post = f"let __jobcrat_h{kk} = Some((crate::CratMiriPtr::jobcrat_addr(&__jobcrat_b{kk}), {hint[1]}usize)); "
+                post = f"let __jobcrat_h{kk} = Some((crate::JobcratMiriPtr::jobcrat_addr(&__jobcrat_b{kk}), {hint[1]}usize)); "
             else:
                 pre = f"let __jobcrat_h{kk}: Option<(usize, usize)> = None; "
             ext = f"crate::jobcrat_miri_extent(&__jobcrat_b{kk}, {kk}, __jobcrat_h{kk})"
@@ -315,7 +316,7 @@ def register_local_arrays(text):
     spans = _item_spans(mk)
     starts = [a for a, _ in spans]
     edits = []
-    # wave-6o relay 141: also a STRUCT local (`let x: S = ..` or `let x = S { .. }`): a pointer into
+    # also a STRUCT local (`let x: S = ..` or `let x = S { .. }`): a pointer into
     # one of its array fields (libtree's `small_vec_u64_t::buf`, its `p` a self-pointer) resolves
     # to the struct's own extent
     pats = (r"\blet\s+(?:mut\s+)?(\w+)\s*:\s*\[",
@@ -357,7 +358,7 @@ ARGV_REGISTER = ("    for a in args.iter() { crate::jobcrat_miri_oracle::registe
                  "  // harness, pass C: the argv strings' extents\n")
 
 RUNTIME = r'''
-// harness, pass C (wave-6o relay 133, R766-1; NOT of record): the oracle-extent registry
+// harness, pass C (NOT the emitted program): the oracle-extent registry
 #[allow(dead_code, static_mut_refs)]
 pub mod jobcrat_miri_oracle {
     pub static mut REG: Vec<(usize, usize)> = Vec::new();
@@ -386,28 +387,28 @@ pub mod jobcrat_miri_oracle {
         }
     }
 }
-pub trait CratMiriPtr {
+pub trait JobcratMiriPtr {
     fn jobcrat_addr(&self) -> usize;
     fn jobcrat_elem(&self) -> usize;
     fn jobcrat_void(&self) -> *mut libc::c_void;
 }
-impl<T> CratMiriPtr for *const T {
+impl<T> JobcratMiriPtr for *const T {
     fn jobcrat_addr(&self) -> usize { self.addr() }
     fn jobcrat_elem(&self) -> usize { core::mem::size_of::<T>() }
     fn jobcrat_void(&self) -> *mut libc::c_void { *self as *mut libc::c_void }
 }
-impl<T> CratMiriPtr for *mut T {
+impl<T> JobcratMiriPtr for *mut T {
     fn jobcrat_addr(&self) -> usize { self.addr() }
     fn jobcrat_elem(&self) -> usize { core::mem::size_of::<T>() }
     fn jobcrat_void(&self) -> *mut libc::c_void { *self as *mut libc::c_void }
 }
 // a base that is a reference coerced to the raw parameter at the call: its address, no retag
-impl<T> CratMiriPtr for &T {
+impl<T> JobcratMiriPtr for &T {
     fn jobcrat_addr(&self) -> usize { (&raw const **self).addr() }
     fn jobcrat_elem(&self) -> usize { core::mem::size_of::<T>() }
     fn jobcrat_void(&self) -> *mut libc::c_void { (&raw const **self) as *mut libc::c_void }
 }
-impl<T> CratMiriPtr for &mut T {
+impl<T> JobcratMiriPtr for &mut T {
     fn jobcrat_addr(&self) -> usize { (&raw const **self).addr() }
     fn jobcrat_elem(&self) -> usize { core::mem::size_of::<T>() }
     fn jobcrat_void(&self) -> *mut libc::c_void { (&raw const **self) as *mut libc::c_void }
@@ -418,13 +419,13 @@ pub fn jobcrat_miri_lit<const N: usize>(s: &'static [u8; N]) -> &'static [u8; N]
     jobcrat_miri_oracle::register(s.as_ptr().addr(), N);
     s
 }
-pub trait CratMiriSize: Copy { fn jobcrat_usize(self) -> usize; }
-macro_rules! jobcrat_miri_size { ($($t:ty),*) => { $(impl CratMiriSize for $t { fn jobcrat_usize(self) -> usize { self as usize } })* } }
+pub trait JobcratMiriSize: Copy { fn jobcrat_usize(self) -> usize; }
+macro_rules! jobcrat_miri_size { ($($t:ty),*) => { $(impl JobcratMiriSize for $t { fn jobcrat_usize(self) -> usize { self as usize } })* } }
 jobcrat_miri_size!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
 pub fn jobcrat_miri_place<P: ?Sized>(p: *const P) -> (usize, usize) {
     (p.addr(), unsafe { core::mem::size_of_val_raw(p) })
 }
-pub fn jobcrat_miri_extent<P: CratMiriPtr>(p: &P, site: u32, hint: Option<(usize, usize)>) -> usize {
+pub fn jobcrat_miri_extent<P: JobcratMiriPtr>(p: &P, site: u32, hint: Option<(usize, usize)>) -> usize {
     let (a, e) = (p.jobcrat_addr(), p.jobcrat_elem());
     if e == 0 { return crate::FALLBACK_SLICE_EXTENT; }
     if let Some((b, n)) = hint {
@@ -435,19 +436,19 @@ pub fn jobcrat_miri_extent<P: CratMiriPtr>(p: &P, site: u32, hint: Option<(usize
         None => { jobcrat_miri_oracle::unresolved(site); crate::FALLBACK_SLICE_EXTENT }
     }
 }
-pub unsafe fn jobcrat_miri_malloc<N: CratMiriSize>(n: N) -> *mut libc::c_void {
+pub unsafe fn jobcrat_miri_malloc<N: JobcratMiriSize>(n: N) -> *mut libc::c_void {
     let n = n.jobcrat_usize();
     let p = libc::malloc(n);
     if !p.is_null() { jobcrat_miri_oracle::register(p.addr(), n); }
     p
 }
-pub unsafe fn jobcrat_miri_calloc<N: CratMiriSize, M: CratMiriSize>(a: N, b: M) -> *mut libc::c_void {
+pub unsafe fn jobcrat_miri_calloc<N: JobcratMiriSize, M: JobcratMiriSize>(a: N, b: M) -> *mut libc::c_void {
     let (a, b) = (a.jobcrat_usize(), b.jobcrat_usize());
     let p = libc::calloc(a, b);
     if !p.is_null() { jobcrat_miri_oracle::register(p.addr(), a * b); }
     p
 }
-pub unsafe fn jobcrat_miri_realloc<P: CratMiriPtr, N: CratMiriSize>(p: P, n: N) -> *mut libc::c_void {
+pub unsafe fn jobcrat_miri_realloc<P: JobcratMiriPtr, N: JobcratMiriSize>(p: P, n: N) -> *mut libc::c_void {
     let (old, n) = (p.jobcrat_void(), n.jobcrat_usize());
     let q = libc::realloc(old, n);
     if !q.is_null() {
@@ -458,24 +459,24 @@ pub unsafe fn jobcrat_miri_realloc<P: CratMiriPtr, N: CratMiriSize>(p: P, n: N) 
     }
     q
 }
-pub unsafe fn jobcrat_miri_free<P: CratMiriPtr>(p: P) {
+pub unsafe fn jobcrat_miri_free<P: JobcratMiriPtr>(p: P) {
     let p = p.jobcrat_void();
     if !p.is_null() { jobcrat_miri_oracle::unregister(p.addr()); }
     libc::free(p)
 }
-pub unsafe fn jobcrat_miri_strdup<P: CratMiriPtr>(s: P) -> *mut libc::c_char {
+pub unsafe fn jobcrat_miri_strdup<P: JobcratMiriPtr>(s: P) -> *mut libc::c_char {
     extern "C" { fn strdup(_: *const libc::c_char) -> *mut libc::c_char; }
     let q = strdup(s.jobcrat_void() as *const libc::c_char);
     if !q.is_null() { jobcrat_miri_oracle::register(q.addr(), libc::strlen(q) + 1); }
     q
 }
-pub unsafe fn jobcrat_miri_strndup<P: CratMiriPtr, N: CratMiriSize>(s: P, n: N) -> *mut libc::c_char {
+pub unsafe fn jobcrat_miri_strndup<P: JobcratMiriPtr, N: JobcratMiriSize>(s: P, n: N) -> *mut libc::c_char {
     extern "C" { fn strndup(_: *const libc::c_char, _: usize) -> *mut libc::c_char; }
     let q = strndup(s.jobcrat_void() as *const libc::c_char, n.jobcrat_usize());
     if !q.is_null() { jobcrat_miri_oracle::register(q.addr(), libc::strlen(q) + 1); }
     q
 }
-pub unsafe fn jobcrat_miri_posix_memalign<P: CratMiriPtr, A: CratMiriSize, N: CratMiriSize>(pp: P, a: A, n: N) -> libc::c_int {
+pub unsafe fn jobcrat_miri_posix_memalign<P: JobcratMiriPtr, A: JobcratMiriSize, N: JobcratMiriSize>(pp: P, a: A, n: N) -> libc::c_int {
     let pp = pp.jobcrat_void() as *mut *mut libc::c_void;
     let n = n.jobcrat_usize();
     let r = libc::posix_memalign(pp, a.jobcrat_usize(), n);

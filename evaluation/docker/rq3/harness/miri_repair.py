@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""The input-repair pass (wave-6o relay 138, R779-1; called "pass D" in the lane, never in the
-manuscript): a run that stops at a report the INPUT itself has (class (a)) is repaired by one declared
+"""The input-repair pass (with the oracle extents: "pass D"): a run that stops at a report the INPUT itself has (class (a)) is repaired by one declared
 edit, the same in the input and the output copy of the Miri project, and runs on. A harness edit,
 never the emitted program; the analysis is not re-solved.
 
@@ -9,7 +8,7 @@ The edits are rows of `repairs.tsv` (keyed by expression, so that they carry ove
   - kind: reference | uninitialised | input-defect
   - fn: the function the edit is scoped to (its safe twin `__jobcrat_safe_<fn>` too)
   - original / replacement: exact text (whitespace-normalised match), every occurrence in the scope
-Rule 2 (relay 138): in the OUTPUT copy an edit applies only where the output's text at that site is
+Rule 2: in the OUTPUT copy an edit applies only where the output's text at that site is
 byte-equal to the input's; where the tool rewrote it the output is not edited, and the receipt says so.
 
 apply(body, program, variant, repairs, substrate_body) -> (body, receipts)
@@ -48,14 +47,14 @@ def _find(text, fn, original):
 
 
 RUNTIME = r'''
-// harness (wave-6o relay 138; NOT the emitted program): the input-repair pass's helpers
-pub trait CratRepairCstr { unsafe fn jobcrat_cstrlen(&self) -> usize; }
-impl CratRepairCstr for *mut libc::c_char { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(*self) } }
-impl CratRepairCstr for *const libc::c_char { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(*self) } }
-impl CratRepairCstr for &[libc::c_char] { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(self.as_ptr()) } }
-impl CratRepairCstr for &mut [libc::c_char] { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(self.as_ptr()) } }
+// harness (NOT the emitted program): the input-repair pass's helpers
+pub trait JobcratRepairCstr { unsafe fn jobcrat_cstrlen(&self) -> usize; }
+impl JobcratRepairCstr for *mut libc::c_char { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(*self) } }
+impl JobcratRepairCstr for *const libc::c_char { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(*self) } }
+impl JobcratRepairCstr for &[libc::c_char] { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(self.as_ptr()) } }
+impl JobcratRepairCstr for &mut [libc::c_char] { unsafe fn jobcrat_cstrlen(&self) -> usize { libc::strlen(self.as_ptr()) } }
 /// the length of a C string plus its NUL, from the input's raw pointer or the output's slice
-pub unsafe fn jobcrat_repair_cstrlen1<P: CratRepairCstr>(p: P) -> usize { p.jobcrat_cstrlen() + 1 }
+pub unsafe fn jobcrat_repair_cstrlen1<P: JobcratRepairCstr>(p: P) -> usize { p.jobcrat_cstrlen() + 1 }
 /// zero-fill a freshly allocated block (the `uninitialised` repairs, round 2)
 pub unsafe fn jobcrat_repair_zero(p: *mut u8, n: usize) { if !p.is_null() { core::ptr::write_bytes(p, 0, n) } }
 '''
@@ -67,7 +66,7 @@ def apply(body, program, variant, repairs, substrate_body=None):
     for r in rows:
         here = _find(body, r["fn"], r["original"])
         if variant != "emitted" and r.get("scope", "both") == "output":
-            continue   # a hold of the output's form (relay 140 validation): the input is already raw there
+            continue   # a repair of the output's form only: the input is already raw there
         if variant == "emitted" and r.get("scope", "both") == "output":
             for a, b in here:
                 edits.append((a, b, r))

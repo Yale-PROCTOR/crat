@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""relay 161 (R817-1): libtree's SHIPPED suite (tests/NN `make check`, nine) under Miri. The program under test is
+"""libtree's SHIPPED suite (tests/NN `make check`, nine) under Miri. The program under test is
 the Miri project of one pass (input/output x A/C/D), reached through a $BIN wrapper that runs `cargo miri run` in the
 caller's directory (isolation off: the tests read the ELF files they build) and appends each invocation's stderr to
 a per-test log; each test runs exactly as the native census runs it: `ln -sf "$BIN" libtree && make -s -C tests/NN check`.
@@ -24,7 +24,7 @@ flags = "-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-tree-borrows" + (" 
 # `cargo miri` has no `build`: the first `cargo miri run` through the wrapper compiles the project
 rows = []
 for input_id, drv, args, stdin, files in cfg["runs"]:
-    if args[:1] != ["@sh"]: continue          # bin-ls is a harness-made input: not the shipped suite (R817-1)
+    if args[:1] != ["@sh"]: continue          # bin-ls is a harness-made input: not the shipped suite
     rundir = os.path.join(pw, "runs", input_id)
     if os.path.exists(rundir): shutil.rmtree(rundir)
     rc.setup_dir(cfg, rundir)

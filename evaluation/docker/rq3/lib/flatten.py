@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""relay 152 (E4) harness edit, declared: a multi-file c2rust-layout tree (CROWN's output, or the
+"""A declared harness edit: a multi-file c2rust-layout tree (CROWN's output, or the
 c2rust input it was given) is flattened into one crate root as our emitted trees are, so that
 miri_census.py's single-file project builder takes it. Every `pub mod X;` is replaced by
 `pub mod X { <contents of X.rs> }`; nothing else in the program text changes.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The runtime census (R620-2, wave-6o reports 083/084): run the emitted
+"""The native runs: run the emitted
 programs on the benchmark inputs, beside the C original and the untransformed
 substrate, and classify every Rust panic.
 
 usage: runtime_census.py <census-dir> <work-dir> [--programs p,q] [--extent N]
 prints one receipt per program:
   runtime program=<p> inputs=<n> panics=<k> fabricated_extent_panics=<f>
-  other_panics=<o> (fabricated_extent_panics: a bounds panic whose len IS the tree's N, R481, explained) differential_mismatches=<m> N=<extent: --extent, else the tree's own const, '-' if none> c_baseline=<built|absent>
+  other_panics=<o> (fabricated_extent_panics: a bounds panic whose len IS the tree's fabricated extent N, explained) differential_mismatches=<m> N=<extent: --extent, else the tree's own const, '-' if none> c_baseline=<built|absent>
   substrate_mismatches=<s> substrate_differs_from_c=<d> unwrap_none=<e9> overflow=<v> ub_precondition=<u>
   abi_changed_drivers=<a> frame=<analysis_frame> code_frame=<sha>
 and writes <work-dir>/<p>/runs.tsv (one row per input and variant).
@@ -14,7 +14,7 @@ and writes <work-dir>/<p>/runs.tsv (one row per input and variant).
 Three variants per input: `c` (the C original, gcc), `substrate`
 (rs-crown-derived, untransformed) and `emitted` (the census's tree). Both Rust
 variants are built identically: rustc nightly-2025-06-23, every deps_crate
-rlib as an --extern (C2b's path), -C panic=abort (R620-2), overflow checks and
+rlib as an --extern, -C panic=abort, overflow checks and
 debug assertions on, opt-level 1.
 
 Driver kinds.
@@ -130,8 +130,7 @@ def crate_root(d):
 
 
 def tree_extent(d):
-    """The emitted tree's own `FALLBACK_SLICE_EXTENT` (a census build may override it:
-    main 131a, R641-3), or None where the tree declares none."""
+    """The emitted tree's own `FALLBACK_SLICE_EXTENT` (a build may override it), or None where the tree declares none."""
     for f in sorted(glob.glob(os.path.join(d, "**", "*.rs"), recursive=True)):
         m = re.search(r"const FALLBACK_SLICE_EXTENT: usize = (\d+);", open(f, encoding="utf-8", errors="replace").read())
         if m:
@@ -162,7 +161,7 @@ def main0_line(text, module):
 
 
 def shim(text, module, extent=None):
-    """The two textual edits of report 083 §2.1 (plus the extent rewrite for the sweep)."""
+    """The two textual edits (main_0 made reachable, a `fn main` appended) plus the extent rewrite for a sweep."""
     lines = text.split("\n")
     idx, sig = main0_line(text, module)
     lines[idx] = re.sub(r"^(\s*)unsafe fn main_0", r"\1pub(crate) unsafe fn main_0", lines[idx])
@@ -184,7 +183,7 @@ def shim(text, module, extent=None):
     if extent:
         out = re.sub(r"const FALLBACK_SLICE_EXTENT: usize = \d+;", f"const FALLBACK_SLICE_EXTENT: usize = {extent};", out)
     out += f"""
-// runtime-census driver (harness, not the emitted program; report 083 §2.1)
+// the native runner's driver (harness, not the emitted program)
 fn main() {{
     let args: Vec<std::ffi::CString> =
         std::env::args().map(|a| std::ffi::CString::new(a).unwrap()).collect();
@@ -199,7 +198,7 @@ fn main() {{
     return out
 
 
-# Harness-side platform models (R622-2 STOP 2): C-library entry points the
+# Harness-side platform models: C-library entry points the
 # translation references that this platform's libc lacks. They model the C
 # library, never the program.
 PLATFORM_SHIMS = {
@@ -207,7 +206,7 @@ PLATFORM_SHIMS = {
 // harness platform model: macOS ctype (`_DefaultRuneLocale.__runetype`, `__maskrune`) for a
 // translation made on macOS (bzip2). Only `__runetype` (byte offset 60) is read by the tree.
 #[repr(C)]
-pub struct CratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
+pub struct JobcratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
 const fn jobcrat_macos_runetype() -> [u32; 256] {
     let mut t = [0u32; 256];
     let mut c = 0usize;
@@ -237,8 +236,8 @@ const fn jobcrat_macos_runetype() -> [u32; 256] {
     t
 }
 #[no_mangle]
-pub static mut _DefaultRuneLocale: CratRuneLocaleModel =
-    CratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
+pub static mut _DefaultRuneLocale: JobcratRuneLocaleModel =
+    JobcratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
 #[no_mangle]
 pub unsafe extern "C" fn __maskrune(c: std::ffi::c_int, mask: std::ffi::c_ulong) -> std::ffi::c_int {
     if (0..256).contains(&c) { (jobcrat_macos_runetype()[c as usize] as std::ffi::c_ulong & mask) as std::ffi::c_int } else { 0 }
@@ -327,7 +326,7 @@ PROGRAMS = {
                                    for f in sorted(glob.glob(f"{CROWN}/brotli-1.0.9/c/{d}/*.c"))])},
                 setup_abs=[f"{CROWN}/brotli-1.0.9/c/enc/encode.c", f"{CROWN}/brotli-1.0.9/c/common/dictionary.h",
                            f"{CROWN}/brotli-1.0.9/c/dec/decode.c"],
-                # the repo's roundtrip test (q 1/6/9/11) plus q10 compress / stream (R631-10: (a) lives on q10)
+                # the repo's roundtrip test (q 1/6/9/11) plus q10 compress / stream (known defect (a) shows on q10)
                 runs=[r for f in ("encode.c", "dictionary.h", "decode.c") for q in (1, 6, 9, 11) for r in (
                     (f"{f}-q{q}-compress", "brotli", ["-fq", str(q), f, "-o", "out.br"], None, ["out.br"]),
                     (f"{f}-q{q}-decompress", "brotli", ["-fd", "in.br", "-o", "out"], f"@stage:{f}-q{q}-compress/out.br:in.br", ["out"]),
@@ -349,7 +348,7 @@ PROGRAMS = {
                                ("sample-version", "sample", ["--version"], None, []),
                                ("sample-list", "sample", ["--list"], None, [])]),
     # heman: the two tests whose calls keep the C ABI (test_heman / test_pts / test_planet
-    # call functions the emitted tree delivers with fat signatures: report 084 §2.4)
+    # call functions the emitted tree delivers with fat signatures)
     "heman": P(kind="cdriver", c_dir="heman", c_inc=["include", "kazmath", "src", "test"], cflags=["-fopenmp"],
                c_lib=[os.path.relpath(f, f"{CROWN}/heman") for d in ("src", "kazmath")
                       for f in sorted(glob.glob(f"{CROWN}/heman/{d}/*.c"))],
@@ -378,8 +377,8 @@ def c_build(cfg, driver_src, out, log):
     return code == 0
 
 
-# Rust drivers generated from the tree under test at build time (not committed). Empty since
-# R836-1 (libzahl, the only one, left the harness: its test is a client outside the program).
+# Rust drivers generated from the tree under test at build time (not committed). Empty: libzahl's,
+# the only one, was dropped (its test is a client outside the program).
 GENERATED_DRIVERS = set()
 
 
@@ -390,7 +389,7 @@ def prepare_driver(program, tree):
 
 
 def rust_driver(program, drv):
-    """A Rust driver transcribed from the program's own C test (relay 107, R657-1):
+    """A Rust driver transcribed from the program's own C test:
     drivers/<program>/<driver>.driver.rs, appended to the emitted crate, calling the
     emitted API as the tree declares it. None where the program has none."""
     p = os.path.join(DRIVERS, program, f"{drv}.driver.rs")
@@ -477,7 +476,7 @@ FAT = re.compile(r"&\s*(?:'\w+\s+)?(?:mut\s+)?\[|Box<\[|SliceCursor|&str\b")
 
 def fat_exports(root):
     """Exported `extern "C"` functions whose signature no longer matches the C
-    prototype (a fat pointer where C passes one word): report 084 §2.4."""
+    prototype (a fat pointer where C passes one word)."""
     t = open(root, encoding="utf-8", errors="replace").read()
     out = set()
     for m in re.finditer(r'#\[no_mangle\]\s*pub (?:unsafe )?extern "C" fn (\w+)(<[^>]*>)?\s*\((.*?)\)\s*(->\s*[^{]+?)?\s*\{', t, re.S):
@@ -509,7 +508,7 @@ def abi_changed(cfg, spec, tree_root):
 ADDR = re.compile(rb"0x[0-9a-f]{6,16}")
 
 
-# Per-input timing masks (report 084b): an input that prints its own elapsed time.
+# Per-input timing masks: an input that prints its own elapsed time.
 TIMING = {("genann", "test"): re.compile(rb"\b\d+ms\b")}
 
 
@@ -544,36 +543,35 @@ def _first_at(toks, target):
     return lo
 
 
-# Known runtime defects (R628-10, main's landing register: relay 205 item 2). A hit is
+# Known runtime defects of earlier emitted trees. A hit is
 # `known-defect:<id>` and kept apart from new findings, whatever its message says.
 KNOWN = [
     # (a) the dist_cache one-element adapters (quality 10): `from_mut` into
     # BrotliZopfliCreateCommands, `from_ref` into ComputeDistanceCache (which
     # re-slices [1..] and reads again, so it reports length 0 or 1)
     ("a", "brotli", ("BrotliZopfliCreateCommands", "ComputeDistanceCache"), r"length [01]\b|len is [01]\b", "q10"),
-    # (b) batch 50's empty-slice Zopfli root at quality 11
+    # (b) an empty-slice Zopfli root at quality 11
     ("b", "brotli", ("ComputeDistanceCache",), r"length 0\b|len is 0\b", "q11"),
     ("c", "lodepng", ("lodepng_chunk_length", "lodepng_read32bitInt"), r".", None),
     ("d", "bzip2", ("copyFileName",), r"len is 1024 but the index is 1024", None),
-    # R416-5's one-element adapters the runtime hits at 51 (wave-6o 084b §3.3; main relay
-    # 208 item 4): a one-element `from_ref` / `from_mut` into a callee that reads on. The
-    # guard at 52 holds them; until then a hit is known, not new.
-    ("r416-5:Hash14", "brotli", ("Hash14",), r"length 1\b|len is 1\b", None),
-    ("r416-5:DecodeSymbol", "brotli", ("DecodeSymbol",), r"length 1\b|len is 1\b", None),
-    ("r416-5:ReplicateValue", "brotli", ("ReplicateValue",), r"length 1\b|len is 1\b", None),
+    # one-element adapters: a one-element `from_ref` / `from_mut` into a callee that reads on
+    # (later trees hold them raw); a hit is known, not new.
+    ("one-element:Hash14", "brotli", ("Hash14",), r"length 1\b|len is 1\b", None),
+    ("one-element:DecodeSymbol", "brotli", ("DecodeSymbol",), r"length 1\b|len is 1\b", None),
+    ("one-element:ReplicateValue", "brotli", ("ReplicateValue",), r"length 1\b|len is 1\b", None),
     # FindAllMatchesH10's one-element ringbuffer, from BrotliZopfliComputeShortestPath (q10)
-    # and, new at 51, BrotliCreateHqZopfliBackwardReferences (q11); the read is HashBytesH10's
-    ("r416-5:HashBytesH10", "brotli", ("HashBytesH10",), r"length 1\b|len is 1\b", None),
-    ("r416-5:AddMatch", "brotli", ("AddMatch",), r"length 1\b|len is 1\b", None),
-    ("r416-5:mainGtU", "bzip2", ("mainGtU",), r"length 1\b|len is 1\b", None),
-    # landed-tree defect (relay 111 (d); wave-6l relay 067): a wrong-evidence extent, the loop INDEX
+    # and BrotliCreateHqZopfliBackwardReferences (q11); the read is HashBytesH10's
+    ("one-element:HashBytesH10", "brotli", ("HashBytesH10",), r"length 1\b|len is 1\b", None),
+    ("one-element:AddMatch", "brotli", ("AddMatch",), r"length 1\b|len is 1\b", None),
+    ("one-element:mainGtU", "bzip2", ("mainGtU",), r"length 1\b|len is 1\b", None),
+    # a wrong-evidence extent, the loop INDEX
     # `(i) as usize` taken as the slice length at lodepng_convert's call, read at in[i*4 + k] by
-    # getPixelColorRGBA8::in_0#5; present at 51 and 52, run first by the R657 driver
+    # getPixelColorRGBA8::in_0#5; reached by lodepng's transcribed driver
     ("wrong-evidence-extent", "lodepng", ("getPixelColorRGBA8",), r"len is 0\b|length 0\b", None),
 ]
 
 
-# Mismatches against C that are explained, not jobcrat's (R631-10): the input's own UB,
+# Mismatches against C that are explained, not jobcrat's: the input's own UB,
 # and seeded / translation-level rows where the substrate does the same.
 EXPLAINED = {
     ("urlparser", "test"): "input UB: url.h get_part sscanf heap overflow (ASan)",
@@ -582,32 +580,32 @@ EXPLAINED = {
 }
 
 
-# Panics on inputs whose own operation is the UB (§28), kept apart from the landing count
-# (confirmation asked in report 084b): tulip's fuzzer reads input[-1] in ti_dpo at period 1.
+# Panics on inputs whose own operation is the UB, kept apart from the count:
+# tulip's fuzzer reads input[-1] in ti_dpo at period 1.
 EXPLAINED_PANICS = {
     ("tulipindicators", "fuzzer"): "input UB: ti_dpo reads input[period-1-back] = input[-1] at period 1",
 }
 
 
-# Non-panic crashes of the emitted program that are known defects (R674-7 (2)): binn's provided
+# Non-panic crashes of the emitted program that are known defects: binn's provided
 # test passes INVALID_BINN (NULL) to binn_list_add / binn_map_set / binn_object_set, whose
 # emitted formal is a non-Option `&mut binn` handed on as `Some(x)` to a NULL-testing callee;
-# the emitted run dies of SIGSEGV. Known until wave-6o's Option fix lands (53 / 54).
+# the emitted run dies of SIGSEGV (an earlier tree's defect, fixed in later trees).
 KNOWN_CRASHES = {
     ("binn", "test_binn"): ("exported-null-into-ref", -11),
 }
 
 
-# R674-7 (1) as restated (R813-3, main relay 276): a non-bounds panic class the derived substrate
+# The substrate rule: a non-bounds panic class the derived substrate
 # reproduces leaves the panic count as the input's ONLY where the c2rust input (`benchmarks/rs-crown`,
 # what the pipeline is given) reproduces it on that input, or where the substrate equals C on it. The
 # derived substrate alone is our own passes' output, not an oracle. The c2rust reproductions, each by
 # its evidence (the harness does not build rs-crown itself):
 C2RUST_REPRODUCES = {
-    # wave-6o 114: its native builds of rs-crown (flattened) needed the same unaligned-read repair rows
+    # native builds of rs-crown (flattened) needed the same unaligned-read repair rows
     # (BrotliUnalignedRead32 / 64) as the derived substrate's.
     ("brotli", r"(encode\.c|dictionary\.h|decode\.c)-q1-(compress|stream)"):
-        "c2rust: misaligned BrotliUnaligned{Read,Write}64 (wave-6o 114's native rs-crown build)",
+        "c2rust: misaligned BrotliUnaligned{Read,Write}64 (a native rs-crown build)",
 }
 
 
@@ -619,7 +617,7 @@ def c2rust_reproduces(program, input_id):
 
 
 def panic_class(k):
-    """The class of a classified panic, for the substrate-reproduces rule (R674-7 (1)): the kind
+    """The class of a classified panic, for the substrate-reproduces rule: the kind
     and the message with every number and address written `#` (`misaligned pointer dereference:
     address must be a multiple of 0x# but is 0x#`, `unsafe precondition(s) violated: ..`)."""
     return (k[0], re.sub(r"0x[0-9a-f]+|\d+", "#", k[3]).strip())
@@ -733,7 +731,7 @@ def main(argv):
     extent = int(argv[argv.index("--extent") + 1]) if "--extent" in argv else None
     inputs = set(argv[argv.index("--inputs") + 1].split(",")) if "--inputs" in argv else None
     if "--no-ub-checks" in argv:
-        # second configuration (report 084 §2): the debug-assertion precondition
+        # second configuration: the debug-assertion precondition
         # checks (alignment, from_raw_parts) off; bounds and overflow checks stay on
         RUST_FLAGS.extend(["-Zub-checks=no"])
     first = next(iter(glob.glob(os.path.join(census, "*.raw-boundary-subject-outcomes.tsv"))), None)
@@ -755,8 +753,8 @@ def main(argv):
         n_eff = extent or tree_extent(os.path.join(census, "emitted-trees", program))
 
         def at_extent(k):
-            """A bounds panic whose reported length IS the fabricated extent N (relay 111 (a)): the
-            fabricated-extent class by construction, wherever the site lies, explained under R481."""
+            """A bounds panic whose reported length IS the fabricated extent N: the
+            fabricated-extent class by construction, wherever the site lies (the slice-length waiver)."""
             if not k or k[0] != "bounds" or not n_eff:
                 return False
             m = re.search(r"the len is (\d+)|slice of length (\d+)", k[3])
@@ -766,7 +764,7 @@ def main(argv):
             for input_id, res in rows:
                 c, s, e = res["c"], res["substrate"], res["emitted"]
                 ran = lambda r: not (isinstance(r[0], str) and (r[0] in ("build-failed", "absent") or r[0].startswith("abi-changed")))
-                # R813-3: does the substrate equal C on this input? '-' where either did not run (no C baseline).
+                # does the substrate equal C on this input? '-' where either did not run (no C baseline).
                 sub_eq_c = (s[0] == c[0] and s[1] == c[1] and s[4] == c[4]) if ran(c) and ran(s) else None
                 if sub_eq_c is False:
                     sub_differs += 1
@@ -789,8 +787,8 @@ def main(argv):
                 repro = False
                 c2rust = c2rust_reproduces(program, input_id)
                 if k and ks and k[0] != "bounds" and panic_class(k) == panic_class(ks) and (sub_eq_c or c2rust):
-                    # R674-7 (1), restated by R813-3: a panic class the substrate reproduces on the same
-                    # input is the input's (§28) only where the c2rust input reproduces it too (or the
+                    # a panic class the substrate reproduces on the same
+                    # input is the input's only where the c2rust input reproduces it too (or the
                     # substrate equals C there); listed with both sites and the c2rust evidence
                     input_ub_panics += 1
                     reproduced.append(f"{input_id}: {panic_class(k)[1]} (emitted {k[2]} {k[1]}; substrate {ks[2]} {ks[1]}; "
@@ -842,7 +840,7 @@ def main(argv):
         for line in reproduced:
             print(f"  input-ub (c2rust / substrate reproduces): {line}", flush=True)
         for line in substrate_only:
-            print(f"  counted (the derived substrate alone reproduces it, R813-3): {line}", flush=True)
+            print(f"  counted (the derived substrate alone reproduces it): {line}", flush=True)
 
 
 if __name__ == "__main__":

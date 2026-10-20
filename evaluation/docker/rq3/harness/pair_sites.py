@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RQ4's pair line (wave-6o relay 136 item 2, R774-4): of the raw-boundary pair sites (role
+"""The pair sites under the runs: of the raw-boundary pair sites (role
 raw-view / primary, `<program>.raw-boundary-pairs.tsv`), how many the provided inputs EXECUTE, and
 at how many both arguments denote one object.
 
@@ -22,40 +22,40 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from miri_oracle import mask  # noqa: E402
 
 RUNTIME = r'''
-// harness (wave-6o relay 136 item 2; NOT the emitted program): the pair-site recorder
+// harness (NOT the emitted program): the pair-site recorder
 #[allow(dead_code)]
 pub mod jobcrat_pair_rt {
     pub static mut SEEN: Vec<(u32, bool)> = Vec::new();
 }
-pub trait CratPairRange { fn jobcrat_pair_range(&self) -> (usize, usize); }
-impl<T> CratPairRange for *const T {
+pub trait JobcratPairRange { fn jobcrat_pair_range(&self) -> (usize, usize); }
+impl<T> JobcratPairRange for *const T {
     fn jobcrat_pair_range(&self) -> (usize, usize) { (self.addr(), core::mem::size_of::<T>().max(1)) }
 }
-impl<T> CratPairRange for *mut T {
+impl<T> JobcratPairRange for *mut T {
     fn jobcrat_pair_range(&self) -> (usize, usize) { (self.addr(), core::mem::size_of::<T>().max(1)) }
 }
-impl<T: ?Sized> CratPairRange for &T {
+impl<T: ?Sized> JobcratPairRange for &T {
     fn jobcrat_pair_range(&self) -> (usize, usize) {
         let p: *const T = &raw const **self;
         (p.addr(), unsafe { core::mem::size_of_val_raw(p) }.max(1))
     }
 }
-impl<T: ?Sized> CratPairRange for &mut T {
+impl<T: ?Sized> JobcratPairRange for &mut T {
     fn jobcrat_pair_range(&self) -> (usize, usize) {
         let p: *const T = &raw const **self;
         (p.addr(), unsafe { core::mem::size_of_val_raw(p) }.max(1))
     }
 }
-impl<T: CratPairRange> CratPairRange for Option<T> {
+impl<T: JobcratPairRange> JobcratPairRange for Option<T> {
     fn jobcrat_pair_range(&self) -> (usize, usize) { self.as_ref().map_or((0, 0), |p| p.jobcrat_pair_range()) }
 }
-impl<T, const N: usize> CratPairRange for [T; N] {
+impl<T, const N: usize> JobcratPairRange for [T; N] {
     fn jobcrat_pair_range(&self) -> (usize, usize) {
         let p: *const [T; N] = &raw const *self;
         (p.addr(), core::mem::size_of::<[T; N]>().max(1))
     }
 }
-pub fn jobcrat_pair_range<P: CratPairRange + ?Sized>(p: &P) -> (usize, usize) { p.jobcrat_pair_range() }
+pub fn jobcrat_pair_range<P: JobcratPairRange + ?Sized>(p: &P) -> (usize, usize) { p.jobcrat_pair_range() }
 /// `ranges[0]` is the raw-view argument, the rest its peers; (0, 0) = null / unchecked
 #[allow(static_mut_refs)]
 pub fn jobcrat_pair_note(site: u32, ranges: &[(usize, usize)]) {

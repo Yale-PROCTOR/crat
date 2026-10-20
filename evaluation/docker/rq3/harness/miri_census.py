@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Miri census (R621-2 / R623-1, wave-6o report 084): the runtime census's
+"""The Miri runs: the native runner's
 drivers and inputs, run under Miri on the newer nightly (the census's compile
 toolchain is unchanged; only this runner moves).
 
@@ -14,15 +14,15 @@ and writes <work-dir>/<p>/miri-runs.tsv with the first report per input.
 Per (program, driver) a Cargo project is generated: the tree (the same two
 textual edits as the native runner, plus the one feature-gate rename the newer
 nightly needs: `derive_clone_copy` -> `derive_clone_copy_internals`), the
-harness's C-library models mounted as a module (`miri/jobcrat_libc_models.rs`,
-R622-2 STOP 2), `panic = "abort"` for every crate, the pinned deps_crate lock.
+harness's C-library models mounted as a module (`jobcrat_libc_models.rs`),
+`panic = "abort"` for every crate, the pinned deps_crate lock.
 Nothing else is added; the allocator line is never added.
 
-`input_ub` is assigned only by the substrate rule (R674-7 (1)): the substrate's own
+`input_ub` is assigned only by the substrate rule: the substrate's own
 Miri run (`--variant substrate`, run first into the same work dir) reports the same
 class on the same input; any other UB report the classifier cannot place in a
 fabricated-extent construction is `other` until traced. `fabricated_extent_sites`
-counts distinct (fn, line) sites: the §77 class is the same at any N (R693-1).
+counts distinct (fn, line) sites: the fabricated-extent class is the same at any extent N.
 """
 import csv, glob, os, re, shutil, subprocess, sys, time
 
@@ -37,7 +37,7 @@ MIRI_TOOLCHAIN = os.environ.get("MIRI_TOOLCHAIN", "nightly-2026-09-17")  # rustc
 LOCK = os.path.join(rc.SRC, "deps_crate", "Cargo.lock")
 
 
-# Relay 128 §3: harness-side edits that make three programs runnable under Miri, declared and
+# Harness-side edits that make three programs runnable under Miri, declared and
 # recorded per project (`harness-edits.txt`), never in the emitted program:
 #   tulipindicators: the program's `#[no_mangle]` data statics `open` / `close` clash with the
 #     runtime's symbols; their SYMBOL is renamed (`#[export_name]`), the Rust items are unchanged;
@@ -60,13 +60,13 @@ HARNESS_FILE_EDITS = {
     "binn": {"test_binn.rs": [(r'(sizeof\(binn\) = %d\\n\\n\\0" as \*const u8 as \*const libc::c_char,\s*::std::mem::size_of::<binn>\(\)) as libc::c_ulong',
                                r"\1 as libc::c_int")]},
 }
-SIGNAL_STUB = ("\n// harness (relay 128 §3): Miri refuses signal registration; declared stub (no signal is raised)\n"
+SIGNAL_STUB = ("\n// harness: Miri refuses signal registration; declared stub (no signal is raised)\n"
                "#[allow(dead_code)]\nunsafe fn jobcrat_miri_signal<A>(_: std::os::raw::c_int, _: A)\n"
                "    -> Option<unsafe extern \"C\" fn(std::os::raw::c_int)> { None }\n")
 HARNESS_APPEND = {
     "bzip2": SIGNAL_STUB,
     "robotfindskitten": SIGNAL_STUB,
-    "libtree": "\n// harness (relay 128 §3): a declared glob model (GLOB_NOMATCH, empty result)\n"
+    "libtree": "\n// harness: a declared glob model (GLOB_NOMATCH, empty result)\n"
                "#[no_mangle]\npub unsafe extern \"C\" fn glob(_p: *const std::os::raw::c_char, _f: std::os::raw::c_int,\n"
                "    _e: *mut std::os::raw::c_void, g: *mut usize) -> std::os::raw::c_int {\n"
                "    if !g.is_null() { *g = 0; *g.add(1) = 0; *g.add(2) = 0; }\n    3\n}\n"
@@ -79,14 +79,14 @@ MIRI_PROGRAMS = {"json.h": dict(kind="cdriver", c_dir=None, drivers={"main": Non
 # A shell-driven native input whose shell only prepares the run dir: the Rust driver does it
 # (heman's `mkdir -p build && "$BIN"`)
 MIRI_RUN_ARGS = {("heman", "test_sdf"): []}
-# Relay 129 pass B (diagnostic, NOT of record): R443's declaration, added harness-side
-GLOBAL_ALLOCATOR = "\n// harness, pass B (relay 129; NOT of record): R443's declaration\n#[global_allocator]\nstatic JOBCRAT_MIRI_SYSTEM_ALLOCATOR: std::alloc::System = std::alloc::System;\n"
+# pass B (a diagnostic, off unless --global-allocator): the emitted programs' #[global_allocator] declaration, added harness-side
+GLOBAL_ALLOCATOR = "\n// harness, pass B (diagnostic): the global-allocator declaration\n#[global_allocator]\nstatic JOBCRAT_MIRI_SYSTEM_ALLOCATOR: std::alloc::System = std::alloc::System;\n"
 
 
 def project(tree_root, module, var, cfg, proj, program="", pass_b=False, pass_c=False, trace_census=None, repairs=None):
     text = open(tree_root, encoding="utf-8", errors="replace").read()
     if module.endswith(".rs"):
-        # a transcribed Rust driver (report 084, STOP 3), appended to the tree's crate
+        # a transcribed Rust driver, appended to the tree's crate
         body = text + "\n" + open(module).read().replace("@DRIVERS@", rc.DRIVERS)
     else:
         body = rc.shim(text, module)
@@ -116,20 +116,20 @@ def project(tree_root, module, var, cfg, proj, program="", pass_b=False, pass_c=
         edits.append("append: " + HARNESS_APPEND[program].strip().splitlines()[0])
     if pass_b:
         body += GLOBAL_ALLOCATOR
-        edits.append("append: #[global_allocator] System (pass B, not of record)")
+        edits.append("append: #[global_allocator] System (pass B, diagnostic)")
     if repairs is not None:
-        # relay 138 (R779-1): the input-repair pass, the same declared edit in the input and the
+        # the input-repair pass, the same declared edit in the input and the
         # output copy (rule 2: the output only where its text is byte-equal to the input's)
         sub_root = rc.crate_root(os.path.join(rc.SUBSTRATE, program))
         sub_text = open(sub_root, encoding="utf-8", errors="replace").read() if var == "emitted" else None
         body, rec = miri_repair.apply(body, program, var, repairs, sub_text)
         edits += rec
     if pass_c:
-        # relay 133 pass C (NOT of record): the oracle extents (miri_oracle.py)
+        # pass C: the oracle extents (miri_oracle.py)
         body, rec, _, _ = miri_oracle.apply(body)
         edits += rec
     if trace_census:
-        # relay 137 item 1: the function-entry trace of the functions with a delivered declaration
+        # the function-entry trace of the functions with a delivered declaration
         body, own, rec = miri_trace.apply(body, trace_census, program)
         edits.append(rec)
         os.makedirs(proj, exist_ok=True)
@@ -184,7 +184,7 @@ def classify(stderr, code, main_rs):
         fn = owner[0] if owner else "-"
         text = open(main_rs, encoding="utf-8", errors="replace").read().split("\n")[line - 1]
     if "longjmp-reached" in stderr:
-        # the harness's setjmp / longjmp model (relay 109): coverage ends at the first longjmp
+        # the harness's setjmp / longjmp model: coverage ends at the first longjmp
         return "unsupported", "longjmp", fn, line
     if m and m.group(1) == "unsupported operation":
         name = re.search(r"foreign function `([^`]+)`", m.group(2))
@@ -221,7 +221,7 @@ def classify(stderr, code, main_rs):
             return "fabricated-extent", f"unresolved-base site={k.group(1)}: " + detail, fn, line
         return "other", f"oracle-extent-wrong site={k.group(1) if k else '?'}: " + detail, fn, line
     if "FALLBACK_SLICE_EXTENT" in text or "FALLBACK_SLICE_EXTENT" in span:
-        # R693-1 (relay 120): the §77 / R481 class is the retag / access BEYOND the allocation, the
+        # the fabricated-extent class is the retag / access BEYOND the allocation, the
         # same at any N; a report at a fabricated construction whose allocation already covers the
         # requested bytes is not that class and stays `other` (a STOP)
         sz, want = re.search(r"has size (\d+)", span + detail), re.search(r"(?:pointer to|of size|to) (\d+) bytes?", span + detail)
@@ -235,8 +235,8 @@ def classify(stderr, code, main_rs):
 
 
 def beta_callees(path):
-    """main 144's (beta) rows: per program, the callee functions whose thin Ref formal is bridged
-    from a raw pointer with no dominating dereference (the P7 sites, R758-1)."""
+    """The optional --beta table's "(beta) rows": per program, the callee functions whose thin reference formal
+    is bridged from a raw pointer with no dominating dereference."""
     out, on = {}, False
     for line in open(path):
         if line.startswith("(beta) rows"):
@@ -255,21 +255,21 @@ def beta_callees(path):
 
 
 def refine(result, main_rs, beta):
-    """The classes of record (relays 119 / 127 / 129) beyond the classifier's kinds:
-    known-r443   a Rust deallocation of C-heap memory (or the reverse) with no #[global_allocator]
-                 System (R443 ruled, not yet emitted: one line fixes it; main 250 in 54);
-    known-r416-5 a panic on a one-element slice (`len is 1`): R416-5's from_ref bridge (main 250 §4);
-    premise-p7   a reference-validity report whose first site is a call into a P7 (beta) callee."""
+    """Three classes beyond the classifier's kinds:
+    known-allocator    a Rust deallocation of C-heap memory (or the reverse) with no #[global_allocator]
+                       System (the emitted programs declare it; one line fixes such a tree);
+    known-one-element  a panic on a one-element slice (`len is 1`): a from_ref bridge;
+    premise-bridge     a reference-validity report whose first site is a call into a (beta) callee."""
     kind, detail, fn, line = result
     if kind == "allocator":
-        return "known-r443", detail, fn, line
+        return "known-allocator", detail, fn, line
     if detail.startswith("panic:") and re.search(r"len is 1\b|length 1\b", detail):
-        return "known-r416-5", detail, fn, line
+        return "known-one-element", detail, fn, line
     if kind == "other" and beta and line not in ("-", None):
         text = open(main_rs, encoding="utf-8", errors="replace").read().split("\n")[int(line) - 1]
         if re.search(r"dangling|retag|invalid value|reference|not granting", detail) and \
                 any(re.search(rf"\b{re.escape(c)}\s*\(", text) for c in beta):
-            return "premise-p7", detail, fn, line
+            return "premise-bridge", detail, fn, line
     return kind, detail, fn, line
 
 
@@ -326,7 +326,7 @@ def main(argv):
         if only and program not in only:
             continue
         if cfg["kind"] != "main0":
-            # a Rust driver per C driver: <driver>.driver.rs (relay 107), else the program's driver.rs
+            # a Rust driver per C driver: <driver>.driver.rs, else the program's driver.rs
             rs = {d: rc.rust_driver(program, d) or (rs_driver if os.path.exists(rs_driver) else None)
                   for d in cfg["drivers"]}
             if not any(rs.values()):
@@ -374,7 +374,7 @@ def main(argv):
             t.write("input\tfirst_report\tdetail\tfn\tline\twall_s\tunresolved_sites\n")
             for r in rows:
                 t.write("\t".join(str(x) for x in r[:5]) + f"\t{r[5]:.1f}\t{','.join(sorted(r[6], key=int)) or '-'}\n")
-        # R674-7 (1) applied to Miri (relay 119 (a)): a first report whose class the substrate's own Miri run
+        # the substrate rule: a first report whose class the substrate's own Miri run
         # reproduces on the same input is the input's UB (the substrate run: --variant substrate, same work dir)
         sub = os.path.join(pw, f"miri-runs-substrate-{disc}.tsv")
         if var == "emitted" and os.path.exists(sub):
@@ -393,8 +393,8 @@ def main(argv):
         cov = ",".join(sorted({f"prefix-to:{r[3]}" for r in rows if r[1] == "unsupported"})) or ("full" if rows else "-")
         print(f"miri program={program} variant={var} discipline={disc} inputs={len(rows)} pass={count('pass')} "
               f"fabricated_extent={count('fabricated-extent')} fabricated_extent_sites={fab_sites} "
-              f"input_ub={count('input-ub')} allocator={count('allocator')} known_r443={count('known-r443')} "
-              f"known_r416_5={count('known-r416-5')} premise_p7={count('premise-p7')} premise_b2={count('premise-b2')} run={'C' if pass_c else 'B' if pass_b else 'A'} unresolved_sites={len({u for r in rows for u in r[6]})} "
+              f"input_ub={count('input-ub')} allocator={count('allocator')} known_allocator={count('known-allocator')} "
+              f"known_one_element={count('known-one-element')} premise_bridge={count('premise-bridge')} premise_b2={count('premise-b2')} run={'C' if pass_c else 'B' if pass_b else 'A'} unresolved_sites={len({u for r in rows for u in r[6]})} "
               f"unsupported={count('unsupported')} other={count('other') + count('timeout')} wall={t_all:.0f} "
               f"unsupported_names={','.join(f'{k}:{v}' for k, v in names.items()) or '-'} coverage={cov} frame={frame}", flush=True)
 

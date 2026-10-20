@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RQ4's prefix coverage (wave-6o relay 137 item 1): a function-entry trace on the Miri copy, a
+"""Prefix coverage: a function-entry trace on the Miri copy, a
 harness edit (never the emitted program). Every function that holds a delivered declaration (the
 census's realized rows, by owner_fn; its safe twin `__jobcrat_safe_<f>` too) starts with
 `crate::jobcrat_cov_enter(K);`, which prints `jobcrat-cov-enter K` on its first entry. A run that stops
@@ -11,7 +11,7 @@ from miri_oracle import mask  # noqa: E402
 from pair_sites import module_spans  # noqa: E402
 
 RUNTIME = r'''
-// harness (wave-6o relay 137 item 1; NOT the emitted program): the function-entry trace
+// harness (NOT the emitted program): the function-entry trace
 #[allow(static_mut_refs, dead_code)]
 pub fn jobcrat_cov_enter(k: u32) {
     static mut SEEN: Vec<u32> = Vec::new();
