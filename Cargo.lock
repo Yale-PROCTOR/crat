@@ -324,6 +324,7 @@ name = "finders"
 version = "0.1.0"
 dependencies = [
  "etrace",
+ "serde",
  "utils",
 ]
 
@@ -1752,6 +1753,7 @@ version = "0.1.0"
 dependencies = [
  "etrace",
  "lazy_static",
+ "serde",
  "toml",
  "toml_edit",
  "typed-arena",

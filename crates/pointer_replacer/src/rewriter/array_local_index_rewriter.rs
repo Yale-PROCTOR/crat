@@ -621,7 +621,7 @@ pub(crate) fn group_has_rewritable_binding<'tcx>(
     }
 
     group.members.iter().any(|&slot_idx| {
-        let Some(info) = provenance.slot_table.slot_infos.get(slot_idx) else {
+        let Some(info) = provenance.slot_table().slot_infos.get(slot_idx) else {
             return false;
         };
         if info.root == group.base_local || !info.path.is_empty() {
@@ -1000,7 +1000,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             .members
             .iter()
             .filter_map(|&slot_idx| {
-                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                let info = context.provenance.slot_table().slot_infos.get(slot_idx)?;
                 if !info.path.is_empty() || info.root == group.base_local {
                     return None;
                 }
@@ -1027,7 +1027,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         // to use IndexOnly representation (field_base = false).
         let immutable_copy_name = if !group.index_tracked {
             group.members.iter().find_map(|&slot_idx| {
-                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                let info = context.provenance.slot_table().slot_infos.get(slot_idx)?;
                 if !info.path.is_empty() || info.root == group.base_local {
                     return None;
                 }
@@ -1072,7 +1072,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         .members
         .iter()
         .filter_map(|&slot_idx| {
-            let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+            let info = context.provenance.slot_table().slot_infos.get(slot_idx)?;
             if !info.path.is_empty() || info.root == group.base_local {
                 return None;
             }
@@ -1175,7 +1175,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
     );
 
     for &slot_idx in &group.members {
-        let Some(info) = context.provenance.slot_table.slot_infos.get(slot_idx) else {
+        let Some(info) = context.provenance.slot_table().slot_infos.get(slot_idx) else {
             continue;
         };
         if info.root == group.base_local || !info.path.is_empty() {
@@ -1219,7 +1219,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         );
         let nullable = context
             .provenance
-            .provenance
+            .provenance()
             .unique_base(&PfgNode::Slot(slot_idx))
             .is_none()
             && !non_null.is_some_and(|set| set.contains(info.root));
@@ -1656,7 +1656,7 @@ fn choose_binding_representations(
         // unsafe. any other base may still be upgraded to a slice by later
         // stages, turning the same materializations into safe indexing.
         if !base_is_fn_param(tcx, rewrite.base_hir_id)
-            || !super::transform::is_c_exposed_fn(
+            || !crate::utils::rustc::is_c_exposed_fn(
                 tcx,
                 rewrite.base_hir_id.owner.def_id,
                 c_exposed_fns,

@@ -26,6 +26,7 @@ enum Finder {
     Mapper,
     Mir,
     Unsafe,
+    Void,
 }
 
 fn main() {
@@ -56,6 +57,10 @@ fn main() {
                 finders::unsafe_finder::find_unsafe(args.unsafe_show_spans, tcx)
             })
             .unwrap();
+        }
+        Finder::Void => {
+            let findings = run_compiler_on_path(&file, finders::void_finder::find_void).unwrap();
+            println!("{}", serde_json::to_string(&findings).unwrap());
         }
     }
 }
