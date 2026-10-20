@@ -956,7 +956,13 @@ fn extract_with_tcx(
     tcx: TyCtxt<'_>,
 ) -> Result<ObservationDocument, ObservationError> {
     let mut expanded = utils::ast::expanded_ast(tcx);
-    let expanded_ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded, tcx);
+    let expanded_ast_to_hir = catch_unwind(AssertUnwindSafe(|| {
+        utils::ast::make_ast_to_hir(&mut expanded, tcx)
+    }))
+    .map_err(|_| ObservationError {
+        code: "ast_hir_mapping",
+        message: "expanded observation AST does not structurally match HIR".to_owned(),
+    })?;
     let mut expanded_functions = HashMap::new();
     collect_functions(&expanded.items, &mut vec![], &mut expanded_functions);
     let mut surface = catch_unwind(AssertUnwindSafe(|| {
@@ -2259,6 +2265,14 @@ pub(crate) fn select_expression_regions<'a>(
         ..ExpressionTree::default()
     };
     tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
+    if tree.expressions.values().any(|expression| {
+        matches!(
+            ast_to_hir.get_local_node(expression.id, tcx),
+            Some(hir::Node::Pat(_) | hir::Node::PatExpr(_))
+        )
+    }) {
+        return None;
+    }
     let mut selected = vec![];
     for seed in &tree.seeds {
         let (start, ordinal, anchors) = match seed {
@@ -8231,6 +8245,61 @@ unsafe fn target(pointer: &usize, values: Values) -> i32 { #[proctor(0)] values[
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn target_destructuring_assignment_keeps_other_observations() {
+        let source = r#"
+unsafe extern "C" { fn strtol(text: *const i8, end: *mut *mut i8, base: i32) -> i64; }
+fn converted(text: &[i8], _base: i32) -> ((i64, &[i8]), Result<(), ()>) {
+    ((0, text), Ok(()))
+}
+unsafe fn source_copy(text: *const i8, value: *mut i32) -> i32 {
+    #[proctor(0)] let mut end: *mut i8 = std::ptr::null_mut();
+    #[proctor(1)] let mut parsed: i64;
+    #[proctor(2)] parsed = strtol(text, &mut end, 10);
+    #[proctor(3)] *value = parsed as i32;
+    #[proctor(4)] *value
+}
+unsafe fn target(text: &[i8], value: &mut i32) -> i32 {
+    #[proctor(0)] let mut end: &[i8] = &[];
+    #[proctor(1)] let mut parsed: i64;
+    #[proctor(2)] ((parsed, end), _) = converted(text, 10);
+    #[proctor(3)] *value = parsed as i32;
+    #[proctor(4)] *value
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![2, 3, 4]).unwrap();
+        let supported = extract_case(source, "source_copy", "target", vec![3, 4]).unwrap();
+        assert_eq!(document, supported);
+        assert_eq!(document.observations.len(), 2);
+        assert!(document.observations[0].lhs);
+        assert!(!document.observations[1].lhs);
+    }
+
+    #[test]
+    fn source_destructuring_assignment_keeps_other_observations() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] ((pointer,), _) = ((pointer,), ());
+    #[proctor(1)] *pointer
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] ((pointer,), _) = ((pointer,), ());
+    #[proctor(1)] *pointer
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap();
+        let supported = extract_case(source, "source_copy", "target", vec![1]).unwrap();
+        assert_eq!(document, supported);
+        assert_eq!(document.observations.len(), 1);
+        assert_eq!(
+            document.observations[0].source_expression,
+            Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand: Box::new(binding("<id0>")),
+            }
+        );
     }
 
     #[test]

@@ -424,6 +424,105 @@ fn test_expr_assign() {
 }
 
 #[test]
+fn test_expr_destructuring_assign() {
+    run_test(
+        "
+        fn parse(text: &[i8]) -> ((i64, &[i8]), Result<(), ()>) {
+            ((0, text), Ok(()))
+        }
+        fn f(text: &[i8]) {
+            let parsed;
+            let end;
+            ((parsed, end), _) = parse(text);
+        }",
+    )
+}
+
+#[test]
+fn test_expr_destructuring_assign_bindings() {
+    let code = "
+        fn f(mut left: i64, mut right: i32, result: ((i32, i64), bool)) {
+            ((right, left), _) = result;
+        }";
+    compilation::run_compiler_on_str(code, |tcx| {
+        for expanded in [true, false] {
+            let mut krate = if expanded {
+                ast::expanded_ast(tcx)
+            } else {
+                ast::parse_crate(code.to_owned())
+            };
+            let mut mapper = AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut krate, tcx.hir_root_module(), expanded);
+            let item = krate
+                .items
+                .iter()
+                .find(|item| matches!(item.kind, ItemKind::Fn(_)))
+                .unwrap();
+            let ItemKind::Fn(function) = &item.kind else { unreachable!() };
+            let StmtKind::Semi(assignment) = &function.body.as_ref().unwrap().stmts[0].kind else {
+                unreachable!()
+            };
+            let ExprKind::Assign(lhs, rhs, _) = &assignment.kind else { unreachable!() };
+            let ExprKind::Tup(outer) = &lhs.kind else { unreachable!() };
+            let ExprKind::Tup(inner) = &outer[0].kind else { unreachable!() };
+            let mapping = mapper.ast_to_hir;
+            assert!(matches!(
+                mapping.get_expr(assignment.id, tcx).unwrap().kind,
+                hir::ExprKind::Block(..)
+            ));
+            assert!(matches!(
+                mapping.get_pat(lhs.id, tcx).unwrap().kind,
+                hir::PatKind::Tuple(..)
+            ));
+            assert!(matches!(
+                mapping.get_pat(outer[1].id, tcx).unwrap().kind,
+                hir::PatKind::Wild
+            ));
+            assert!(mapping.get_expr(lhs.id, tcx).is_none());
+            let body = tcx.hir_body_owned_by(mapping.global_map[&item.id]);
+            for (expression, parameter) in [(&inner[0], 1), (&inner[1], 0), (rhs, 2)] {
+                let expression = mapping.get_expr(expression.id, tcx).unwrap();
+                let hir::ExprKind::Path(path) = expression.kind else { unreachable!() };
+                let typeck = tcx.typeck(expression.hir_id.owner);
+                assert_eq!(
+                    typeck.qpath_res(&path, expression.hir_id),
+                    hir::def::Res::Local(body.params[parameter].pat.hir_id)
+                );
+                assert_eq!(
+                    typeck.expr_ty(expression),
+                    typeck.node_type(body.params[parameter].pat.hir_id)
+                );
+            }
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_expr_destructuring_assign_patterns() {
+    run_test(
+        "
+        struct Pair { left: i32, right: i32 }
+        struct Tuple(i32, i32);
+        struct Unit;
+        fn f() {
+            let mut left = 0;
+            let mut right = 0;
+            let mut values = [0, 0];
+            let mut pair = Pair { left, right };
+            (right, left, ..) = (1, 2, 3);
+            [values[1], _, values[0], ..] = [1, 2, 3, 4];
+            Pair { left: pair.right, right: pair.left } = Pair { left, right };
+            Pair { left, .. } = pair;
+            Tuple(left, right) = Tuple(1, 2);
+            Unit = Unit;
+            _ = (left, right);
+            (..) = (left, right);
+        }",
+    )
+}
+
+#[test]
 fn test_expr_assign_op() {
     run_test(
         "

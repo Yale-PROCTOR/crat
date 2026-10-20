@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use rustc_ast::{node_id::NodeMap, visit::Visitor, *};
+use rustc_ast::{node_id::NodeMap, ptr::P, visit::Visitor, *};
 use rustc_hash::FxHashMap;
 use rustc_hir::{self as hir, HirId, def::Res};
 use rustc_middle::ty::TyCtxt;
@@ -764,11 +764,23 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 self.map_expr_to_expr(expr, hexpr);
             }
             ExprKind::TryBlock(..) => todo!(),
-            ExprKind::Assign(lhs, rhs, _) => {
-                let hir::ExprKind::Assign(hlhs, hrhs, _) = hexpr.kind else { panic!() };
-                self.map_expr_to_expr(lhs, hlhs);
-                self.map_expr_to_expr(rhs, hrhs);
-            }
+            ExprKind::Assign(lhs, rhs, _) => match hexpr.kind {
+                hir::ExprKind::Assign(hlhs, hrhs, _) => {
+                    self.map_expr_to_expr(lhs, hlhs);
+                    self.map_expr_to_expr(rhs, hrhs);
+                }
+                hir::ExprKind::Block(block, None) => {
+                    let [first, assignments @ ..] = block.stmts else { panic!() };
+                    let hir::StmtKind::Let(local) = first.kind else { panic!() };
+                    assert!(matches!(local.source, hir::LocalSource::AssignDesugar(_)));
+                    assert!(block.expr.is_none());
+                    self.map_expr_to_expr(rhs, local.init.unwrap());
+                    let mut assignments = assignments.iter();
+                    self.map_assign_lhs_to_pat(lhs, local.pat, &mut assignments);
+                    assert!(assignments.next().is_none());
+                }
+                _ => panic!(),
+            },
             ExprKind::AssignOp(op, lhs, rhs) => {
                 let hir::ExprKind::AssignOp(hop, hlhs, hrhs) = hexpr.kind else { panic!() };
                 assert_eq!(op.node, hop.node);
@@ -1121,6 +1133,91 @@ impl<'tcx> AstToHirMapper<'tcx> {
         }
     }
 
+    fn map_assign_lhs_to_pat(
+        &mut self,
+        lhs: &mut Expr,
+        hpat: &hir::Pat<'tcx>,
+        assignments: &mut std::slice::Iter<'_, hir::Stmt<'tcx>>,
+    ) {
+        if matches!(hpat.kind, hir::PatKind::Binding(..)) {
+            let hir::StmtKind::Expr(assignment) = assignments.next().unwrap().kind else {
+                panic!()
+            };
+            let hir::ExprKind::Assign(hlhs, _, _) = assignment.kind else { panic!() };
+            self.map_expr_to_expr(lhs, hlhs);
+            return;
+        }
+        // Destructuring containers and wildcards lower to patterns, not expressions.
+        self.add_local(&mut lhs.id, hpat.hir_id);
+        match &mut lhs.kind {
+            ExprKind::Paren(inner) => self.map_assign_lhs_to_pat(inner, hpat, assignments),
+            ExprKind::Underscore => assert!(matches!(hpat.kind, hir::PatKind::Wild)),
+            ExprKind::Tup(elements) => {
+                let hir::PatKind::Tuple(hpats, rest) = hpat.kind else { panic!() };
+                self.map_assign_sequence(elements, hpats.iter(), rest.as_opt_usize(), assignments);
+            }
+            ExprKind::Array(elements) => {
+                let hir::PatKind::Slice(before, rest, after) = hpat.kind else { panic!() };
+                if let Some(rest) = rest {
+                    self.add_local(&mut elements[before.len()].id, rest.hir_id);
+                }
+                self.map_assign_sequence(
+                    elements,
+                    before.iter().chain(after),
+                    rest.map(|_| before.len()),
+                    assignments,
+                );
+            }
+            ExprKind::Call(callee, arguments) => {
+                let hir::PatKind::TupleStruct(hqpath, hpats, rest) = hpat.kind else { panic!() };
+                let ExprKind::Path(qself, path) = &mut callee.kind else { panic!() };
+                self.add_local(&mut callee.id, hpat.hir_id);
+                self.map_path_to_qpath(qself, path, &hqpath);
+                self.map_assign_sequence(arguments, hpats.iter(), rest.as_opt_usize(), assignments);
+            }
+            ExprKind::Struct(value) => {
+                let hir::PatKind::Struct(hqpath, hfields, _) = hpat.kind else { panic!() };
+                self.map_path_to_qpath(&mut value.qself, &mut value.path, &hqpath);
+                assert_eq!(value.fields.len(), hfields.len());
+                for (field, hfield) in value.fields.iter_mut().zip(hfields) {
+                    self.add_local(&mut field.id, hfield.hir_id);
+                    assert_eq!(field.ident, hfield.ident);
+                    assert_eq!(field.is_shorthand, hfield.is_shorthand);
+                    self.map_assign_lhs_to_pat(&mut field.expr, hfield.pat, assignments);
+                }
+            }
+            ExprKind::Path(..) => {
+                let hir::PatKind::Expr(hexpr) = hpat.kind else { panic!() };
+                self.map_expr_to_pat_expr(lhs, hexpr);
+            }
+            ExprKind::Range(None, None, RangeLimits::HalfOpen) => {
+                let hir::PatKind::Tuple([], rest) = hpat.kind else { panic!() };
+                assert_eq!(rest.as_opt_usize(), Some(0));
+            }
+            _ => panic!(),
+        }
+    }
+
+    fn map_assign_sequence(
+        &mut self,
+        elements: &mut [P<Expr>],
+        mut hpats: impl Iterator<Item = &'tcx hir::Pat<'tcx>>,
+        rest: Option<usize>,
+        assignments: &mut std::slice::Iter<'_, hir::Stmt<'tcx>>,
+    ) {
+        for (index, element) in elements.iter_mut().enumerate() {
+            if rest == Some(index) {
+                assert!(matches!(
+                    element.kind,
+                    ExprKind::Range(None, None, RangeLimits::HalfOpen)
+                ));
+            } else {
+                self.map_assign_lhs_to_pat(element, hpats.next().unwrap(), assignments);
+            }
+        }
+        assert!(hpats.next().is_none());
+    }
+
     fn map_expr_field_to_expr_field(
         &mut self,
         expr_field: &mut ExprField,
@@ -1425,7 +1522,10 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 self.map_anon_const_to_const_block(c, &hc);
             }
             ExprKind::IncludedBytes(_) => todo!(),
-            ExprKind::Path(_, _) => todo!(),
+            ExprKind::Path(qself, path) => {
+                let hir::PatExprKind::Path(hqpath) = hpat_expr.kind else { panic!() };
+                self.map_path_to_qpath(qself, path, &hqpath);
+            }
             ExprKind::Unary(UnOp::Neg, expr) if matches!(expr.kind, ExprKind::Lit(_)) => {
                 let hir::PatExprKind::Lit { negated: true, .. } = hpat_expr.kind else { panic!() };
                 self.add_local(&mut expr.id, hpat_expr.hir_id);
@@ -2079,11 +2179,22 @@ impl<'a> Visitor<'a> for AstToHirChecker<'_> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
+        // A tuple's `..` has no HIR node, just like PatKind::Rest.
+        if matches!(
+            expr.kind,
+            ExprKind::Range(None, None, RangeLimits::HalfOpen)
+        ) && !self.ast_to_hir.local_map.contains_key(&expr.id)
+        {
+            return;
+        }
         let node = self
             .ast_to_hir
             .get_local_node(expr.id, self.tcx)
             .unwrap_or_else(|| panic!("{expr:?}"));
-        assert!(matches!(node, hir::Node::Expr(..) | hir::Node::PatExpr(..)));
+        assert!(matches!(
+            node,
+            hir::Node::Expr(..) | hir::Node::PatExpr(..) | hir::Node::Pat(..)
+        ));
         visit::walk_expr(self, expr);
     }
 
@@ -2175,9 +2286,14 @@ impl<'a> Visitor<'a> for AstToHirChecker<'_> {
     }
 
     fn visit_expr_field(&mut self, field: &'a ExprField) {
-        self.ast_to_hir
-            .get_expr_field(field.id, self.tcx)
+        let node = self
+            .ast_to_hir
+            .get_local_node(field.id, self.tcx)
             .unwrap_or_else(|| panic!("{field:?}"));
+        assert!(matches!(
+            node,
+            hir::Node::ExprField(..) | hir::Node::PatField(..)
+        ));
         visit::walk_expr_field(self, field);
     }
 
