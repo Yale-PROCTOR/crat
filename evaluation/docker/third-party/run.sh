@@ -6,7 +6,7 @@
 #
 # usage: third-party/run.sh [step ...] [--small] [--trials N]
 #   steps (default: all, in this order):
-#     crown    CROWN's image (Zenodo 10.5281/zenodo.7876586) on the twenty: rq3.<p>.crown-s; its output trees and
+#     crown    CROWN's image (Zenodo 10.5281/zenodo.7966511) on the twenty: rq3.<p>.crown-s; its output trees and
 #              evaluation table; the artifact's comparison/ (Laertes's distributed trees) copied out
 #     laertes  the Aliasing Limits image (Zenodo 10.5281/zenodo.7714175), Laertes's 2023 tool, on the twenty, in the
 #              mode of record (--emulate-lifetime-only): rq3.<p>.laertes-s; and in its own mode: laertes-own-mode

@@ -21,7 +21,7 @@ Run it on the host from the source root, before the container's `run.sh … --th
 
 | tool | archive | used as |
 |---|---|---|
-| CROWN (CAV'23) | Zenodo 10.5281/zenodo.7876586, `artifact.zip`, 2,612,422,584 B, md5 `7436500a…` (the record's first version; the later version 7966511 is a different file) | `cav-artifact/crown.tar.gz` → `docker load` → `crown:latest`. Its `/root/crown` holds CROWN's twenty inputs (`benchmark/`) and `comparison/` (Laertes's distributed trees and inputs) |
+| CROWN (CAV'23) | Zenodo 10.5281/zenodo.7966511, `artifact.zip`, 2,695,974,877 B, md5 `1fab8037…`, the record's version. It loads as image `sha256:195933186d8a…`, created 2023-05-24. The record's first version, 7876586, holds an earlier image (04-28): its `comparison/` lacks binn's and libzahl's Laertes trees | `cav-artifact/crown.tar.gz` → `docker load` → `crown:latest`. Its `/root/crown` holds CROWN's twenty inputs (`benchmark/`) and `comparison/` (Laertes's distributed trees and inputs) |
 | Laertes (Aliasing Limits, OOPSLA'23) | Zenodo 10.5281/zenodo.7714175, `aliasing-limits-oopsla23.tar.gz`, 5,227,965,191 B, md5 `f4436443…` | `docker load` → `aliasing-limits-oopsla23:final` (the 2023 tool, toolchain `nightly-2020-10-15`) |
 | &inator | Zenodo 10.5281/zenodo.19650358: `refinator-linux-amd64.tar.gz` (the image), `refinator-src.tar.gz` (the source, for tisp), `benchmarks.tar.gz` | `docker load` → `refinator:latest`; the source built with its own Dockerfile → `tp-inator-src:4f1d6a5` |
 | &inator's carrays, jccc, tisp | the authors' repository at the pinned commit `4fdf3309` (Zenodo's `benchmarks.tar.gz` carries the other six) | every one of the 58 benchmark files is checked against `inator/inputs-sha256.tsv`. `INATOR_BENCHMARKS=<dir>` supplies a local copy instead |
@@ -32,7 +32,7 @@ Run it on the host from the source root, before the container's `run.sh … --th
 
 | file name in `TP_DOWNLOADS` | bytes | md5 |
 |---|---:|---|
-| `crown-artifact.zip` | 2,612,422,584 | `7436500a8342131d252dbe866b09fab3` |
+| `crown-artifact.zip` | 2,695,974,877 | `1fab80379b73e6c2aeda7cf7f3480e43` |
 | `aliasing-limits-oopsla23.tar.gz` | 5,227,965,191 | `f443644380803c1e230d5731f08000ca` |
 | `refinator-linux-amd64.tar.gz` | 635,034,527 | `75be10de6694ea022595a457f93e62a2` |
 | `refinator-src.tar.gz` | 107,046 | `702f2fdea6589d368bbe9e3878380bce` |

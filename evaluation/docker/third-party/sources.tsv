@@ -1,5 +1,5 @@
 name	url	bytes	digest	step
-crown-artifact.zip	https://zenodo.org/records/7876586/files/artifact.zip?download=1	2612422584	md5:7436500a8342131d252dbe866b09fab3	crown laertes
+crown-artifact.zip	https://zenodo.org/records/7966511/files/artifact.zip?download=1	2695974877	md5:1fab80379b73e6c2aeda7cf7f3480e43	crown laertes
 aliasing-limits-oopsla23.tar.gz	https://zenodo.org/records/7714175/files/aliasing-limits-oopsla23.tar.gz?download=1	5227965191	md5:f443644380803c1e230d5731f08000ca	laertes
 refinator-linux-amd64.tar.gz	https://zenodo.org/records/19650358/files/refinator-linux-amd64.tar.gz?download=1	635034527	md5:75be10de6694ea022595a457f93e62a2	inator
 refinator-src.tar.gz	https://zenodo.org/records/19650358/files/refinator-src.tar.gz?download=1	107046	md5:702f2fdea6589d368bbe9e3878380bce	inator
