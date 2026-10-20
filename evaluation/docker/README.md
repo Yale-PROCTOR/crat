@@ -30,7 +30,7 @@ first runs the translation step, which skips every program already translated.
 1. **translate.** Every program of `lists/programs.tsv` is translated one at a time, as the paper's runs did:
    `jobcrat --pass prepare` writes `results/substrate/<p>` (not timed). The step then copies it to
    `results/trees/<p>` and translates that copy in place under GNU time. The environment is
-   `config/analysis-env.sh`, plus `JOBCRAT_ERA5_PROGRAM=<p>` and `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`. CROWN's
+   `config/analysis-env.sh`, plus `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`. CROWN's
    twenty also get `JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`. `run.sh` lists the exact commands.
 2. **rq1:** the counters on the inputs and the emitted trees.
 3. **rq2:** the running times, from the receipts and GNU time's records of step 1.

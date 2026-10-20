@@ -24,8 +24,10 @@ to the head), `IDENTITY_PATTERNS` (the identity grep; the operator adds the auth
 the artifact fetches from), `PROVENANCE_PATTERNS` (the internal-provenance grep over `artifact/`: lane names, relay /
 report numbers, ruling ids, addenda, batch names), `ARTIFACT_REV` (the revision whose `evaluation/docker/` becomes
 `artifact/`; default: the head). The translator is derived from the head, which stays the frozen source the paper
-evaluated; `ARTIFACT_REV` lets the artifact come from the working branch (R1253-5). A hit of either grep stops the
-derivation before the zip. For
+evaluated; `ARTIFACT_REV` lets the artifact come from the working branch (R1253-5). `FORBIDDEN` (fixed strings that
+must appear nowhere in the tree: `retained_alias_observed`, `ERA5_PROGRAM`, `observed:pass-`, R1257-1) and
+`FORBIDDEN_ALLOW` (fixed strings removed from a line first: the program variable's inert readers,
+`std::env::var("JOBCRAT_ERA5_PROGRAM")`). A hit of any of the three greps stops the derivation before the zip. For
 `smoke.sh`: `INPUTS` (prepared inputs), `REF_TREES` (the emitted trees of record), `DEPS_TARGET`.
 
 ## The derivation, one commit per step on the branch `rederive-<tag>`
@@ -35,7 +37,10 @@ derivation before the zip. For
   run (kept: `passes` trimmed to expander / extern_resolver / preprocessor, `pointer_replacer`, `points_to`,
   `utils`, `deps_crate`); `dev-dependencies`. `BENCH`'s `benchmarks/` becomes the zip's `benchmarks/`, byte for
   byte, exempt from the rename and reported separately by the identity grep. **Option 3** (`option3.py`): the legacy rewriter out, keeping
-  `collect_fn_ptrs`, `DiagnosticsMode` and `Config`, and the seven analyses only it used. The driver
+  `collect_fn_ptrs`, `DiagnosticsMode` and `Config`, and the seven analyses only it used. `observed_out.py`
+  (R1257-1): the observed-alias table out -- `decision/retained_alias_observed.rs` and its tests deleted, its two
+  module declarations, its doc mention and its call in `decide_one` removed (`DegradeReason::RetainedAlias` stays:
+  the retained-access rule uses it); every edit applies exactly once or the derivation stops. The driver
   (`driver-template.crat.rs`) with the passes `prepare` (expand, extern, preprocess), `translate` (the analysis
   and emission path of record, `--analysis-env`, `--receipt`, `--c-exposed-fn`) and `check`. The README
   (`README-template.md`). `config/analysis-env.sh` = the exports of `ENVREL`, host-local lines dropped.

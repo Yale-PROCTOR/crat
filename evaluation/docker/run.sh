@@ -4,7 +4,7 @@
 # translate  every program of lists/programs.tsv through prepare and translate, one at a time, as the paper's runs:
 #              jobcrat --pass prepare -o results/substrate benchmarks/<suite>/<p>          (not timed)
 #              cp -a results/substrate/<p> results/trees/<p>
-#              JOBCRAT_ERA5_PROGRAM=<p> JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off
+#              JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off
 #              [JOBCRAT_FALLBACK_SLICE_EXTENT=268435456: CROWN's twenty; unset for &inator's eight]
 #              /usr/bin/time -v -o results/rq2/runs/<p>.time
 #                jobcrat -v --pass translate --inplace --receipt results/rq2/runs/<p>.receipt results/trees/<p>
@@ -64,7 +64,7 @@ translate() {
     cp -a "$SUBSTRATE/$p" "$TREES/$p"
     ext=; [ "$suite" = crown ] && ext=JOBCRAT_FALLBACK_SLICE_EXTENT=268435456
     t0=$(date +%s.%N)
-    env -u JOBCRAT_FALLBACK_SLICE_EXTENT JOBCRAT_ERA5_PROGRAM="$p" JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off $ext \
+    env -u JOBCRAT_FALLBACK_SLICE_EXTENT JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off $ext \
       DIR="$SRC" SYSROOT="$sysroot" LD_LIBRARY_PATH="$sysroot/lib" \
       /usr/bin/time -v -o "$RUNS/$p.time" target/release/jobcrat -v --pass translate --inplace \
       --receipt "$RUNS/$p.receipt" "$TREES/$p" > "$RESULTS/logs/translate-$p.log" 2>&1

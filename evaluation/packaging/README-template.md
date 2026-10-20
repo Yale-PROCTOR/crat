@@ -57,10 +57,9 @@ benchmarks/crown/avl` translates one.
 ## Configuration of record
 
 `config/analysis-env.sh` exports the analysis switches the paper's numbers were
-produced with; the `translate` pass reads it. The evaluation also set, per
-program, `JOBCRAT_ERA5_PROGRAM=<program>` and `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`,
-and, for CROWN's twenty, `JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`;
-`artifact/run.sh` sets them.
+produced with; the `translate` pass reads it. The evaluation also set
+`JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off` and, for CROWN's twenty,
+`JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`; `artifact/run.sh` sets them.
 
 ## Evaluation
 

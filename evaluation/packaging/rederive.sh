@@ -17,6 +17,9 @@
 #                      (upstream c2rust; &inator's authors' repository at its pinned commit; R1249-1)
 #   PROVENANCE_PATTERNS  the internal-provenance grep over artifact/ (grep -E): lane names, relay / report numbers,
 #                      ruling ids, addenda, our batch names (R1251-2); must be empty before the zip
+#   FORBIDDEN          fixed strings (one per line) that must not appear anywhere in the tree (R1257-1: the observed-alias
+#                      table, its program variable and its receipts); FORBIDDEN_ALLOW: fixed strings removed from a line
+#                      first (the variable's four inert readers, which the relay leaves in place)
 #   HASH_REPOS         repositories (space-separated) whose commit hashes must not appear in the tree (default: REPO)
 #   ARTIFACT_REV       the revision whose evaluation/docker/ becomes artifact/ (default: <head>). The translator comes from
 #                      <head>, the frozen source the paper evaluated; the artifact may come from a later revision (R1253-5)
@@ -41,7 +44,11 @@ IDENTITY_ALLOW=${IDENTITY_ALLOW:-'registry+https://github.com/rust-lang/crates.i
 https://github.com/immunant/c2rust.git
 https://codeload.github.com/PLaSSticity/refinator-impl/tar.gz/4fdf3309d2a3763786b0090ae956940d97661855'}
 PROVENANCE_PATTERNS=${PROVENANCE_PATTERNS:-'\b(wave-[0-9][a-z0-9]*|era-5c|analysis-fanout|fan-out|rq3-inator|crat-packaging|slicecursor|ownership-fields|assembler)\b|\b[Rr]elays? [0-9]+|\b[Rr]eports? [0-9]+|\bR[0-9]{3,4}-[0-9]+\b|\b[Aa]ddend(um|a)\b|\b[Bb]atch(es)? [0-9]+|\b60s\b|\bL01'}
-export IDENTITY_PATTERNS IDENTITY_ALLOW
+FORBIDDEN=${FORBIDDEN:-'retained_alias_observed
+ERA5_PROGRAM
+observed:pass-'}
+FORBIDDEN_ALLOW=${FORBIDDEN_ALLOW:-'std::env::var("JOBCRAT_ERA5_PROGRAM")'}
+export IDENTITY_PATTERNS IDENTITY_ALLOW FORBIDDEN FORBIDDEN_ALLOW
 SR=$(rustup run nightly-2025-06-23 rustc --print sysroot); export LD_LIBRARY_PATH=$SR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export W ZS KEPT=$ZS/kept-rs-files.txt ORPHANS=$ZS/orphans.txt CARGO_INCREMENTAL=0
 mkdir -p $ZS $WORKTREES; rm -rf $ZS/stage $ZS/unzipped $ZS/tok; log=$ZS/rederive.log; : > $log; exec > >(tee -a $log) 2>&1
@@ -101,6 +108,7 @@ PY
 [ -d $ZS/bench-keep ] && { mkdir -p $W/benchmarks; mv $ZS/bench-keep/* $W/benchmarks/; echo "   benchmarks/: $(find $W/benchmarks -type f | wc -l) files from BENCH (byte for byte)"; }
 [ -d $ZS/artifact-keep ] && { mv $ZS/artifact-keep $W/artifact; echo "   artifact/: $(find $W/artifact -type f | wc -l) files from evaluation/docker (renamed and checked with the rest)"; }
 python3 -I $P/option3.py
+python3 -I $P/observed_out.py || { echo "observed_out.py did not apply: the head is not the source it was written for"; exit 1; }
 cp $P/driver-template.crat.rs $W/src/bin/crat.rs
 cp $P/README-template.md $W/README.md
 echo "   removed: $(git -C $W diff --cached --name-only --diff-filter=D | wc -l) tracked paths"
@@ -149,6 +157,15 @@ for line in sys.stdin:
     for a in allow: text = text.replace(a, "")
     if pat.search(text): sys.stdout.write(line)')
 prov=$(git -C $W grep -n -E -e "$PROVENANCE_PATTERNS" -- artifact)
+printf '%s\n' "$FORBIDDEN" | grep . > $ZS/forbidden.txt
+forb=$(git -C $W grep -n -I -F -f $ZS/forbidden.txt -- . | python3 -I -c 'import os, sys
+allow = [a for a in os.environ["FORBIDDEN_ALLOW"].splitlines() if a]; forb = [f for f in os.environ["FORBIDDEN"].splitlines() if f]
+for line in sys.stdin:
+    path, _, text = line.partition(":")
+    for a in allow: text = text.replace(a, "")
+    if any(f in text for f in forb): sys.stdout.write(line)')
+printf '%s\n' "$FORBIDDEN_ALLOW" | grep . > $ZS/forbidden-allow.txt
+echo "   forbidden strings ($(paste -s -d, $ZS/forbidden.txt); minus FORBIDDEN_ALLOW): $(printf '%s' "$forb" | grep -c .); lines with an allowed string: $(git -C $W grep -n -I -F -f $ZS/forbidden-allow.txt -- . | wc -l)"
 echo "   identity grep (outside benchmarks/, minus IDENTITY_ALLOW): $(printf '%s' "$idl" | grep -c .); in benchmarks/ (third-party inputs, kept byte for byte): $(git -C $W grep -n -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) lines in $(git -C $W grep -l -i -E -e "$IDENTITY_PATTERNS" -- benchmarks | wc -l) files; provenance grep over artifact/: $(printf '%s' "$prov" | grep -c .)"
 ours=$(git -C $W grep -o -h -I -E '\b[0-9a-f]{7,40}\b' -- . | sort -u | while read t; do case $t in *[a-f]*) ;; *) continue;; esac; case $t in *[0-9]*) ;; *) continue;; esac; for r in $HASH_REPOS; do git -C $r rev-parse --verify --quiet "$t^{commit}" >/dev/null 2>&1 && { echo $t; break; }; done; done)
 echo "   commit hashes of our repositories in the tree: $(printf '%s' "$ours" | grep -c .)${ours:+ -- $(echo $ours)}"
@@ -159,7 +176,7 @@ echo "   list-2 in literals: $(cat $ZS/tok/* | grep -E '^Literal' | grep -i -w -
 echo "   artifact/ in the tree: $(git -C $W ls-files -- artifact | wc -l) files; list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- artifact | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- artifact | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- artifact | wc -l)"
 echo "   evaluation/ in the tree: $(git -C $W ls-files -- evaluation | wc -l) files (must be 0); bare CRAT words: $(git -C $W grep -n -w -e CRAT -- evaluation | wc -l); _CRAT suffix: $(git -C $W grep -n -P '_CRAT\b' -- evaluation | wc -l); list-2 word lines: $(git -C $W grep -n -i -w -E 'seat|relay|lane|wave|era5|batch|census' -- evaluation | wc -l); ruling ids: $(git -C $W grep -n -E '\bR[0-9]{3,4}-[0-9]\b|addendum|user ruling' -- evaluation | wc -l); old pass names: $(git -C $W grep -n -E -e '--pass[^|]*(expand|extern|preprocess|pointer|bo\b)|bo-env|bo-receipt' -- evaluation | wc -l)"
 
-if [ -n "$idl$prov" ]; then echo "the identity or the provenance grep has hits; no zip:"; printf '%s\n' "$idl" "$prov" | grep . | cut -c1-240; exit 1; fi
+if [ -n "$idl$prov$forb" ]; then echo "the identity, the provenance or the forbidden-string grep has hits; no zip:"; printf '%s\n' "$idl" "$prov" "$forb" | grep . | cut -c1-240; exit 1; fi
 
 step "8 zip + from-zip build"
 $P/mkzip.sh | tail -4
