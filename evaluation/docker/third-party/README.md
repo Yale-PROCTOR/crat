@@ -78,4 +78,8 @@ The keys in `times.tsv`:
 - **&inator:** completes on its eight (tisp through the source build).
   - Its `rtypes.txt` numbers its variables differently from run to run.
   - The type of each interface position is the same.
+  - **tisp's time depends on the build.** &inator's own solving time on tisp varies with the source build: its Dockerfile, run unmodified, installs the current stable Rust and resolves crates without a lock. It also varies with Z3's run-to-run assertion order.
+    - The record's run used rustc 1.98.1 with `cc` 1.5.1, `libc` 0.2.189, `llvm-sys` 170.4.0 and `syn` 3.0.6.
+    - A build made later (rustc 1.99.1, newer crates) solved the same 283,289 assertions in 1.6× the record's time, with the same types.
+    - The record's build is kept in our archive. To get a record-like time on tisp, pin those versions in your own copy of &inator's Dockerfile.
 - **c2rust:** every trial's output equals the translation of record.
