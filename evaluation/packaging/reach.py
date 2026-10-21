@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os, re, sys
+sys.dont_write_bytecode = True; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from modscan import decls
 W = os.environ['W'].rstrip('/')
 roots = []
 for c in sorted(os.listdir(f'{W}/crates')):
@@ -17,19 +19,18 @@ def visit(p):
     src = open(p, encoding='utf-8').read()
     d = os.path.dirname(p); stem = os.path.splitext(os.path.basename(p))[0]
     is_root = os.path.basename(p) in ('lib.rs', 'main.rs', 'mod.rs') or '/src/bin/' in p or p.endswith('/examples/fnptr/lib.rs')
-    for m in mod_re.finditer(src):
-        name = m.group(1)
-        before = src[max(0, m.start()-300):m.start()]
+    for name, inline, start in decls(src):
+        before = src[max(0, start-300):start]
         pm = path_re.findall(before.split('\n')[-4:][0] + '\n' + '\n'.join(before.split('\n')[-4:]))
         cands = []
         if pm:
             cands.append(os.path.normpath(os.path.join(d if is_root else os.path.join(d, stem), pm[-1])))
             cands.append(os.path.normpath(os.path.join(d, pm[-1])))
-        base = d if is_root else os.path.join(d, stem)
+        base = os.path.join(d if is_root else os.path.join(d, stem), *inline)
         cands += [f'{base}/{name}.rs', f'{base}/{name}/mod.rs']
         hit = next((c for c in cands if os.path.exists(c)), None)
         if hit: visit(hit)
-        else: unresolved.append((p.replace(W+'/', ''), name, m.start()))
+        else: unresolved.append((p.replace(W+'/', ''), name, start))
 for r in roots:
     if os.path.exists(r): visit(r)
 kept = set(l.strip() for l in open(os.environ['KEPT']))
