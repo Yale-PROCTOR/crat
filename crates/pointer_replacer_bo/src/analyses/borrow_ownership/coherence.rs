@@ -315,8 +315,7 @@ fn add_coherence_impl<'tcx>(
         }
     }
     // W55's fault (`CRAT_E5C_W55_FAULT=equate`) restores the full equate.
-    let deref_reader = super::field_moves::deref_reader()
-        && std::env::var("CRAT_E5C_W55_FAULT").as_deref() != Ok("equate");
+    let deref_reader = std::env::var("CRAT_E5C_W55_FAULT").as_deref() != Ok("equate");
     let copy_relax = super::copy_relax::copy_relax();
     for (block, bbdata) in body.basic_blocks.iter_enumerated() {
         for (statement_index, stmt) in bbdata.statements.iter().enumerate() {

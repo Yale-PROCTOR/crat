@@ -178,10 +178,7 @@ pub(crate) fn solver_identity(
         "ref-own-raw(ref=slots+1,own=1,raw=0)".to_owned(),
     );
     fields.insert("era5c_copy_lend_mut", "on".to_owned());
-    fields.insert(
-        "era5c_deref_reader",
-        super::field_moves::deref_reader().to_string(),
-    );
+    fields.insert("era5c_deref_reader", "true".to_owned());
     fields.insert(
         "era5c_field_own_repair",
         super::field_moves::field_own_repair().to_string(),

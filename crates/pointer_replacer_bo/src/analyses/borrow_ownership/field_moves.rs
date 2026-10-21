@@ -25,21 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_DEREF_READER=on|off` (fail-loud, absent = off): **L01⁹ rule 1b**
-/// (R563-1, era-5c report 055). A deref-only field read -- `t = CopyForDeref((*p).f)`,
-/// which rustc emits only for a place used as a dereference base -- is a Ref reader
-/// of the field: kind-equated on raw, Ref whenever the field is Ref or Owning, and
-/// never on own. Without it the temporary is kind-equated Owning with the field and
-/// then finalized non-owning at exit, which keeps the field from owning (avl's
-/// `insert::_73`-`_76`, quadtree's `node_contains_`/`descent`).
-pub(crate) fn deref_reader() -> bool {
-    match std::env::var("CRAT_ERA5C_DEREF_READER").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_DEREF_READER must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_FIELD_OWN_REPAIR=on|off` (fail-loud, absent = off): **L01⁹, rule
 /// 1b's companion**. A residual borrow conflict that names an OWNING field used to
 /// decline the program (`residual_nonref_field`: Mode A can only demote a Ref).
