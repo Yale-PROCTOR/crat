@@ -95,13 +95,5 @@ pub(crate) fn extend_merge_liveness<'tcx>(
             }
         }
     }
-    if std::env::var_os("CRAT_E5C_MERGE_STATS").is_some() {
-        eprintln!(
-            "E5C_MERGE {:?} demoted={} with_owner={} inserted={inserted}",
-            body.source.def_id(),
-            demoted.len(),
-            owners.len()
-        );
-    }
     inserted
 }

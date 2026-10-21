@@ -1783,10 +1783,7 @@ fn solve_bo_a5_config_with_source_events(
         "the A5 frame runs Baseline or the LendArm selector, never RemovalOnly"
     );
     // era-5c relay 208 (S39 (b)): the copies the relaxation may take, for this solve.
-    let (eligible, counts) = analyze_copy_relax_sites(program, slots, origins.native_flows());
-    if std::env::var_os("CRAT_E5C_CR_STATS").is_some() {
-        eprintln!("E5C_CR_SITES {counts:?}");
-    }
+    let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());
     super::copy_relax::install(eligible);
 
     let baseline_solver = KindSolver::new(slots);
@@ -2248,12 +2245,8 @@ pub(crate) fn analyze_copy_relax_sites(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
-) -> (
-    FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>,
-    std::collections::BTreeMap<&'static str, usize>,
-) {
+) -> FxHashMap<LocalDefId, FxHashSet<MirLocationKey>> {
     let mut eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>> = FxHashMap::default();
-    let mut counts = std::collections::BTreeMap::new();
     for &fn_did in &program.functions {
         let body = program
             .tcx
@@ -2283,15 +2276,12 @@ pub(crate) fn analyze_copy_relax_sites(
             } else {
                 copy_relax_escape(program, slots, fn_did, &body, &closure)
             };
-            *counts
-                .entry(drop.map_or("eligible", |drop| drop.label()))
-                .or_insert(0) += 1;
             if drop.is_none() {
                 eligible.entry(fn_did).or_default().insert(site.location);
             }
         }
     }
-    (eligible, counts)
+    eligible
 }
 
 /// The relaxation's closure: the destination's value flows, plus every local assigned a
