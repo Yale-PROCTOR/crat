@@ -1618,7 +1618,7 @@ fn e5c_inner_w54_funnel() {
 /// the verify loop, so S2 is a ceiling on what the arm can realize.
 #[test]
 fn e5c_w54_the_funnel_reads_the_w52_fixtures() {
-    let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
+    let env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w54_funnel",
         &env,
@@ -1963,7 +1963,7 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
         "a copied operand keeps its hold"
     );
     let rows = || -> std::collections::BTreeMap<String, String> {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
+        let env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w60",
             &env,
