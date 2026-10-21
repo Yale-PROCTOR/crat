@@ -251,9 +251,8 @@ struct Seen {
     kinds: BTreeMap<String, String>,
 }
 
-/// The shape under the frame's arms with the switch `mutable` (`None` = absent) and the extra
-/// environment `extra` (faults).
-fn seen_with(name: &str, mutable: Option<&str>, extra: &[(&str, &str)]) -> Seen {
+/// The shape under the frame's arms and the extra environment `extra` (faults).
+fn seen_with(name: &str, extra: &[(&str, &str)]) -> Seen {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
     command.args([
@@ -267,10 +266,6 @@ fn seen_with(name: &str, mutable: Option<&str>, extra: &[(&str, &str)]) -> Seen 
         command.env(key, value);
     }
     command.env("CRAT_E5C_CM_SHAPE", name);
-    match mutable {
-        Some(value) => command.env("CRAT_ERA5C_COPY_LEND_MUT", value),
-        None => command.env_remove("CRAT_ERA5C_COPY_LEND_MUT"),
-    };
     for (key, value) in extra {
         command.env(key, value);
     }
@@ -299,8 +294,8 @@ fn seen_with(name: &str, mutable: Option<&str>, extra: &[(&str, &str)]) -> Seen 
     seen
 }
 
-fn seen(name: &str, mutable: Option<&str>) -> Seen {
-    seen_with(name, mutable, &[])
+fn seen(name: &str) -> Seen {
+    seen_with(name, &[])
 }
 
 fn row<'a>(seen: &'a Seen, q: &str, p: &str) -> &'a str {
@@ -324,45 +319,30 @@ fn kind<'a>(seen: &'a Seen, key: &str) -> &'a str {
 /// mutably, `p` owns (`Box`) and `q` is a reference (`&mut`).
 #[test]
 fn e5c_cm_1_a_written_copy_is_lent_mutably() {
-    let s = seen("MUT_LEND", Some("on"));
+    let s = seen("MUT_LEND");
     assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
     assert_eq!(kind(&s, "run::p"), "owning", "{s:#?}");
     assert_eq!(kind(&s, "run::q"), "ref", "{s:#?}");
 }
 
-/// (i) at the frame: C2 drops the pair (`q` is written through).
-#[test]
-fn e5c_cm_1_control_at_the_frame_c2_drops_it() {
-    let s = seen("MUT_LEND", Some("off"));
-    assert_eq!(
-        row(&s, "q", "p"),
-        "c2-mutable-or-missing-destination",
-        "{s:#?}"
-    );
-}
-
-/// (ii) `p`, or another copy of it, written while `q` is live: the window check refuses, and the
-/// kinds are the frame's.
+/// (ii) `p`, or another copy of it, written while `q` is live: the window check refuses.
 #[test]
 fn e5c_cm_2_an_access_in_the_window_refuses_the_lend() {
     for name in ["WRITE_IN_WINDOW", "OTHER_COPY_IN_WINDOW"] {
-        let on = seen(name, Some("on"));
+        let on = seen(name);
         assert_eq!(
             row(&on, "q", "p"),
             "c2-mutable-window-access",
             "{name}: {on:#?}"
         );
-        let off = seen(name, Some("off"));
-        assert_eq!(on.kinds, off.kinds, "{name}");
     }
 }
 
-/// (ii″) `p` read while `q` is live: the window check refuses, and the kinds are the frame's.
+/// (ii″) `p` read while `q` is live: the window check refuses.
 #[test]
 fn e5c_cm_2_a_read_of_the_owner_in_the_window_refuses_the_lend() {
-    let on = seen("READ_IN_WINDOW", Some("on"));
+    let on = seen("READ_IN_WINDOW");
     assert_eq!(row(&on, "q", "p"), "c2-mutable-window-access", "{on:#?}");
-    assert_eq!(on.kinds, seen("READ_IN_WINDOW", Some("off")).kinds);
 }
 
 /// Whether the shape's solve took the mutable lend (`p` owning beside `q` a reference).
@@ -375,7 +355,7 @@ fn lent(seen: &Seen) -> bool {
 #[test]
 fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
     for name in ["WRITE_IN_WINDOW", "READ_IN_WINDOW"] {
-        let s = seen_with(name, Some("on"), &[("CRAT_E5C_CM_FAULT", "no-window")]);
+        let s = seen_with(name, &[("CRAT_E5C_CM_FAULT", "no-window")]);
         assert_eq!(row(&s, "q", "p"), "eligible-mut", "{name}: {s:#?}");
         assert!(!lent(&s), "{name}: {s:#?}");
     }
@@ -390,7 +370,6 @@ fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
 fn e5c_cm_f2_without_the_window_or_the_lends_loan_the_copys_own_loan_catches_the_read() {
     let s = seen_with(
         "READ_IN_WINDOW",
-        Some("on"),
         &[
             ("CRAT_E5C_CM_FAULT", "no-window"),
             ("CRAT_E5C_W52_FAULT", "no-loan"),
@@ -408,96 +387,35 @@ fn e5c_cm_f2_without_the_window_or_the_lends_loan_the_copys_own_loan_catches_the
 fn e5c_cm_f2_a_shared_loan_is_caught_here_too() {
     let s = seen_with(
         "READ_IN_WINDOW",
-        Some("on"),
         &[("CRAT_E5C_CM_FAULT", "no-window,shared-loan")],
     );
     assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
     assert!(!lent(&s), "{s:#?}");
 }
 
-/// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend; the kinds
-/// are the frame's.
+/// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend.
 #[test]
 fn e5c_cm_3_a_release_refuses_the_lend() {
-    let on = seen("FREE_DESTINATION", Some("on"));
+    let on = seen("FREE_DESTINATION");
     assert_eq!(row(&on, "q", "p"), "s2-2-free-destination", "{on:#?}");
-    assert_eq!(on.kinds, seen("FREE_DESTINATION", Some("off")).kinds);
-    let on = seen("FREE_IN_WINDOW", Some("on"));
+    let on = seen("FREE_IN_WINDOW");
     assert_eq!(row(&on, "q", "p"), "c2-mutable-window-access", "{on:#?}");
-    assert_eq!(on.kinds, seen("FREE_IN_WINDOW", Some("off")).kinds);
 }
 
 /// (iii′) the window is `q`'s liveness, path by path: `free(p)` after `q`'s last use is outside it.
 #[test]
 fn e5c_cm_3_a_release_after_the_last_use_is_outside_the_window() {
-    let s = seen("FREE_AFTER_LAST_USE", Some("on"));
+    let s = seen("FREE_AFTER_LAST_USE");
     assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
 }
 
-/// (iv) a read-only copy: the shared lend and the kinds, unchanged by the switch. (Another pair
-/// of the fixture, `free`'s temporary, may report its next clause instead of C2: the switch
-/// moves C2 off the front for a mutable destination, never the pair's fate.)
+/// (iv) a read-only copy: the shared lend, never the mutable one.
 #[test]
 fn e5c_cm_4_a_read_only_copy_is_unchanged() {
-    let on = seen("READ_ONLY", Some("on"));
-    let off = seen("READ_ONLY", Some("off"));
+    let on = seen("READ_ONLY");
     assert_eq!(row(&on, "q", "p"), "eligible", "{on:#?}");
-    assert_eq!(row(&off, "q", "p"), "eligible", "{off:#?}");
-    assert_eq!(on.kinds, off.kinds);
     assert!(
         on.rows.iter().all(|r| !r.ends_with("eligible-mut")),
         "{on:#?}"
     );
-}
-
-/// (v) the switch absent is `off`, byte for byte, on every shape.
-#[test]
-fn e5c_cm_5_absent_is_off() {
-    for (name, _) in SHAPES.iter().filter(|(name, _)| *name != "BOTH") {
-        assert_eq!(seen(name, None), seen(name, Some("off")), "{name}");
-    }
-}
-
-/// (v) the identity names the switch only when on; an unknown value fails loud.
-#[test]
-fn e5c_cm_5_identity_names_the_switch_only_when_on() {
-    let exe = std::env::current_exe().expect("current_exe");
-    for (value, expect) in [
-        (None, Some(false)),
-        (Some("off"), Some(false)),
-        (Some("on"), Some(true)),
-        (Some("yes"), None),
-    ] {
-        let mut command = std::process::Command::new(&exe);
-        command.args([
-            "analyses::borrow_ownership::copy_relax_tests::e5c_inner_identity",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-        ]);
-        match value {
-            Some(value) => command.env("CRAT_ERA5C_COPY_LEND_MUT", value),
-            None => command.env_remove("CRAT_ERA5C_COPY_LEND_MUT"),
-        };
-        let output = command.output().expect("child");
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        match expect {
-            Some(named) => {
-                assert!(output.status.success(), "{value:?}: {text}");
-                assert_eq!(
-                    text.contains("era5c_copy_lend_mut=on"),
-                    named,
-                    "{value:?}: {text}"
-                );
-            }
-            None => assert!(
-                !output.status.success() && text.contains("CRAT_ERA5C_COPY_LEND_MUT"),
-                "{value:?}: {text}"
-            ),
-        }
-    }
 }

@@ -7967,7 +7967,6 @@ pub unsafe fn free_source() -> i32 {
                     ("return_escape", false),
                     ("realloc_source", false),
                     ("free_destination", false),
-                    ("mutable_destination", false),
                     ("free_source", true),
                 ] {
                     let function = function_by_name(&program, name);

@@ -1267,7 +1267,6 @@ pub(crate) fn derive<'tcx>(
     // raw pointer derived from the reference (`p as *const T`) or an address
     // comparison through it compiles and changes meaning. Anything else holds.
     let mut lend_aliases = Vec::new();
-    let mutable_lend = crate::analyses::borrow_ownership::field_moves::copy_lend_mut();
     for (alias, init) in lend_bindings {
         let Node::Pat(pattern) = tcx.hir_node(alias) else { return Err(SourceHold::Identity) };
         let rustc_hir::PatKind::Binding(_, _, ident, _) = pattern.kind else {
@@ -1301,7 +1300,7 @@ pub(crate) fn derive<'tcx>(
                     ..
                 }) if target.hir_id == read.hir_id
             );
-            if !deref || addressed || (written && !mutable_lend) {
+            if !deref || addressed {
                 return Err(SourceHold::UnsupportedOwnerUse);
             }
             writes += written as usize;

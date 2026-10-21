@@ -78,19 +78,12 @@ fn e5c_cm_emit_a_sized_owner_lends_mutably_by_reborrow() {
     assert_eq!(reverted, 0, "{context}");
 }
 
-/// (iv)/(v) at emission: the read-only S3 is the shared lend with the switch on, and the written
-/// copy is not delivered with it off (wave-6a's control).
+/// (iv) at emission: the read-only S3 is the shared lend.
 #[test]
 fn e5c_cm_emit_controls() {
     let (function, _, text) = emitted("declaration", "on");
     assert!(
         compact(&function).contains("letmutp:&i32=&(*(buf))[0];"),
-        "{text}\n{function}"
-    );
-    let (function, _, text) = emitted("write-through", "off");
-    let compact = compact(&function);
-    assert!(
-        !compact.contains("::std::boxed::Box") && !compact.contains(":&muti32="),
         "{text}\n{function}"
     );
 }

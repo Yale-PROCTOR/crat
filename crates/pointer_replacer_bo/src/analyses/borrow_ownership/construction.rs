@@ -2496,7 +2496,6 @@ pub(crate) fn analyze_copy_lend_candidates(
     mut_facts: &MutFacts,
     origin_flows: &OriginFlowResults,
 ) -> Vec<CopyLendPairCandidate> {
-    let mutable_lend = super::field_moves::copy_lend_mut();
     let mut answer = Vec::new();
     for &fn_did in &program.functions {
         let body = program
@@ -2533,10 +2532,9 @@ pub(crate) fn analyze_copy_lend_candidates(
             );
             let destination_flow =
                 owner_closure([SlotOwner::Local(sites[0].lhs_local)], &value_flows);
-            // relay 213: under `CRAT_ERA5C_COPY_LEND_MUT`, a destination the facts call mutable
-            // is lent `&mut` when its window is clean; one the facts do not cover stays at C2.
-            let lent_mutably = mutable_lend
-                && mut_facts.is_mutable(fn_did, lhs_local)
+            // A destination the facts call mutable is lent `&mut` when its window is clean; one
+            // the facts do not cover stays at C2.
+            let lent_mutably = mut_facts.is_mutable(fn_did, lhs_local)
                 && !mut_facts.is_defaulted(fn_did, lhs_local);
             let pair = CopyLendPair {
                 mutable: lent_mutably,

@@ -195,7 +195,6 @@ fn frame_arms() -> Vec<(String, String)> {
                 && !key.starts_with("CRAT_ERA5C_RAW_CAUSE"))
             .then(|| (key.to_owned(), value.trim().to_owned()))
         })
-        .chain([("CRAT_ERA5C_COPY_LEND_MUT".to_owned(), "on".to_owned())])
         .collect()
 }
 

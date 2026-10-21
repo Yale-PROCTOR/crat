@@ -15154,37 +15154,6 @@ pub unsafe fn f() {
         .unwrap_or_else(|error| error.raise());
     }
 
-    #[test]
-    fn copy_lend_phase1b_bo_c1_c2_c3_exclusions_reach_driver() {
-        use crate::analyses::borrow_ownership::construction::CopyLendMode;
-        ::utils::compilation::run_compiler_on_str(
-            r#"
-unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
-unsafe fn read_only(p: *const i32) { let _ = unsafe { *p }; }
-pub unsafe fn mutable_destination() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
-    let q = p;
-    unsafe { *q = 1 };
-    unsafe { *q }
-}
-pub unsafe fn ordinary_boundary() -> i32 {
-    let p = unsafe { malloc(4) } as *const i32;
-    let q = p;
-    unsafe { read_only(q) };
-    unsafe { *q }
-}
-"#,
-            |tcx| {
-                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
-                assert_eq!(row.get("status"), Some("ok"));
-                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
-                assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
-                assert_eq!(row.get("copy_lend_replay_selections"), Some("0"));
-            },
-        )
-        .unwrap_or_else(|error| error.raise());
-    }
-
     // Item 15's user/seat-approved case ledger. These fixtures remain PROPOSED, so they are
     // ignored by the ordinary suite and are run one at a time by exact name. Every row enters
     // through `run_bo`: this is intentionally a production-wiring ledger, not another direct
