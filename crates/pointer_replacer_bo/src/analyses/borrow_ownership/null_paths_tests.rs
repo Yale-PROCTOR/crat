@@ -1933,17 +1933,9 @@ fn e5c_inner_w62() {
         let decoded: super::portable_export::PortableExport =
             serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
         let portable = decoded.move_store_obligations();
-        let inputs = super::model_cache::semantic_inputs(&program, mode, attestation).unwrap();
+        let inputs = super::model_cache::semantic_inputs(&program).unwrap();
         let key = super::cache_contract::semantic_key(&inputs).unwrap();
-        super::model_cache::prepare(
-            &program,
-            &slots,
-            &origins,
-            &verified,
-            &captured,
-            mode,
-            attestation,
-        );
+        super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
         let entry = super::model_cache::prepared_move_store_obligations(&key);
         let mut v1 = decoded.clone();
         v1.schema = "era5a-portable-export-v1".into();
@@ -2563,9 +2555,6 @@ fn e5c_inner_w63() {
         // W76 (R677-4): the final review's discharged rows in the in-memory packet
         // and in the prepared (streamed) entry.
         if std::env::var_os("CRAT_E5C_W76").is_some() {
-            let mode = super::a5_overlap::A5Mode::PreciseReplay;
-            let attestation =
-                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
             let discharged = |v: &serde_json::Value| {
                 v["families"]["retirement-final"]["records"][0]["fields"]["discharged"].clone()
             };
@@ -2579,17 +2568,9 @@ fn e5c_inner_w63() {
             };
             let portable: serde_json::Value =
                 serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
-            let inputs = super::model_cache::semantic_inputs(&program, mode, attestation).unwrap();
+            let inputs = super::model_cache::semantic_inputs(&program).unwrap();
             let key = super::cache_contract::semantic_key(&inputs).unwrap();
-            super::model_cache::prepare(
-                &program,
-                &slots,
-                &origins,
-                &verified,
-                &captured,
-                mode,
-                attestation,
-            );
+            super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
             let entry = super::model_cache::prepared_entry(&key).unwrap_or_else(|| {
                 panic!(
                     "the prepared entry: {:?}",
@@ -2614,26 +2595,15 @@ fn e5c_inner_w63() {
         // W72 (R659-1): the arm-(a) receipts from the model, the portable
         // export and the prepared cache entry.
         if std::env::var_os("CRAT_E5C_W72").is_some() {
-            let mode = super::a5_overlap::A5Mode::PreciseReplay;
-            let attestation =
-                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
             let model = super::portable_export::arg_order_rows(&program, &slots, &captured)
                 .expect("rows convert");
             let packet = super::portable_export::collect(&program, &slots, &captured).unwrap();
             let decoded: super::portable_export::PortableExport =
                 serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
             let portable = decoded.arg_order_applied();
-            let inputs = super::model_cache::semantic_inputs(&program, mode, attestation).unwrap();
+            let inputs = super::model_cache::semantic_inputs(&program).unwrap();
             let key = super::cache_contract::semantic_key(&inputs).unwrap();
-            super::model_cache::prepare(
-                &program,
-                &slots,
-                &origins,
-                &verified,
-                &captured,
-                mode,
-                attestation,
-            );
+            super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
             let entry = super::model_cache::prepared_arg_order_applied(&key);
             // R1178-1 (fix (i)): the receipts the loader now takes from memory equal the ones
             // the staged entry's file decodes, rows and refusal alike.

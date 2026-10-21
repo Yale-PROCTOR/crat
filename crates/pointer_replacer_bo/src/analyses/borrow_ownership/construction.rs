@@ -1678,15 +1678,7 @@ pub(crate) fn solve_bo_a5_config_reporting(
     } else {
         super::export::snapshot().expect("active accepted-model capture")
     };
-    super::model_cache::prepare(
-        program,
-        slots,
-        origins,
-        &verified,
-        &captured,
-        mode,
-        attestation,
-    );
+    super::model_cache::prepare(program, slots, origins, &verified, &captured);
     Ok(verified)
 }
 

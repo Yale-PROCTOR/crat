@@ -77,18 +77,9 @@ pub unsafe fn caller()->i32 {
             )
             .expect("actual activated traversal model")
         });
-        let inputs =
-            model_cache::semantic_inputs(&program, A5Mode::PreciseReplay, attestation).unwrap();
+        let inputs = model_cache::semantic_inputs(&program).unwrap();
         let key = semantic_key(&inputs).unwrap();
-        model_cache::prepare(
-            &program,
-            &slots,
-            &origins,
-            &verified,
-            &captured,
-            A5Mode::PreciseReplay,
-            attestation,
-        );
+        model_cache::prepare(&program, &slots, &origins, &verified, &captured);
         let entry = model_cache::prepared_entry(&key).unwrap_or_else(|| {
             panic!(
                 "accepted in-memory traversal envelope: {:?}",
@@ -379,7 +370,6 @@ fn inputs() -> SemanticInputs {
         analysis: "2".repeat(64),
         toolchain: "3".repeat(64),
         dependencies: "4".repeat(64),
-        configuration: "5".repeat(64),
     }
 }
 
@@ -480,8 +470,7 @@ fn e5_i_cache_key_is_portable_and_every_semantic_input_is_keyed() {
             }
             2 => changed.analysis = "6".repeat(64),
             3 => changed.toolchain = "6".repeat(64),
-            4 => changed.dependencies = "6".repeat(64),
-            _ => changed.configuration = "6".repeat(64),
+            _ => changed.dependencies = "6".repeat(64),
         }
         assert_ne!(semantic_key(&changed).unwrap(), key);
     }

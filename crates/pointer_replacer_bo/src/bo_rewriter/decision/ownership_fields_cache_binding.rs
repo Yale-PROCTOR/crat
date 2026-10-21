@@ -68,11 +68,6 @@ pub(crate) fn bind(
             "analysis_digest",
         ),
         (
-            &inputs.configuration,
-            expected.configuration_digest,
-            "configuration_digest",
-        ),
-        (
             &inputs.toolchain,
             expected.toolchain_digest,
             "toolchain_digest",
@@ -308,7 +303,7 @@ mod tests {
                     program: "synthetic-native-cache-binding".into(),
                     files: BTreeMap::from([("synthetic.rs".into(), "11".repeat(32))]),
                     analysis: "01".repeat(32), toolchain: "02".repeat(32),
-                    dependencies: "03".repeat(32), configuration: "04".repeat(32),
+                    dependencies: "03".repeat(32),
                 };
                 let key = cache_contract::semantic_key(&actual).unwrap();
                 let mut model = FxHashMap::default();
@@ -470,7 +465,7 @@ mod tests {
             fixture.pins.as_mut().unwrap().role = ExecutionRole::Analysis;
             assert!(fixture.bind().is_err());
             fixture.pins.as_mut().unwrap().role = ExecutionRole::CacheOnly;
-            fixture.actual.configuration = "fe".repeat(32);
+            fixture.actual.toolchain = "fe".repeat(32);
             assert!(fixture.bind().is_err());
             fixture.actual = fixture.metadata.inputs.clone();
             let subject = *fixture

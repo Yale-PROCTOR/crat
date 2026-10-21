@@ -14,7 +14,6 @@ pub(crate) struct SemanticInputs {
     pub(crate) analysis: String,
     pub(crate) toolchain: String,
     pub(crate) dependencies: String,
-    pub(crate) configuration: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,14 +45,9 @@ pub(crate) fn semantic_key(inputs: &SemanticInputs) -> Result<String, String> {
     if inputs.program.is_empty()
         || inputs.files.is_empty()
         || inputs.files.iter().any(|(p, h)| !logical(p) || !digest(h))
-        || [
-            &inputs.analysis,
-            &inputs.toolchain,
-            &inputs.dependencies,
-            &inputs.configuration,
-        ]
-        .iter()
-        .any(|h| !digest(h))
+        || [&inputs.analysis, &inputs.toolchain, &inputs.dependencies]
+            .iter()
+            .any(|h| !digest(h))
     {
         return Err("missing or noncanonical semantic input".into());
     }

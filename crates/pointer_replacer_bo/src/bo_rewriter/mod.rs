@@ -7662,7 +7662,9 @@ fn decide_table_perturbed_config<'tcx>(
     // they are two tiers of the same question, so they must not disagree about
     // which program this is.
     let fp = model_cache::fingerprint(&program, a5_mode, attestation);
-    let cacheable = matches!(a5_mode, A5Mode::Baseline | A5Mode::PreciseReplay);
+    // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
+    let cacheable = a5_mode == A5Mode::PreciseReplay
+        && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
     let cache_started = std::time::Instant::now();
 
     // Tier 1: the in-process memo. The recon worker has three independent

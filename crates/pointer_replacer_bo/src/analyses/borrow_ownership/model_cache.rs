@@ -337,22 +337,25 @@ pub(crate) fn with_test_config<T>(read: bool, dir: &Path, run: impl FnOnce() -> 
 /// A change to **any** of these must invalidate, so they are hashed together
 /// into one value rather than checked severally — a severally-checked key grows
 /// a forgotten term.
+///
+/// The key does not name the A5 mode: the decide path caches the frame's mode
+/// only (`PreciseReplay` with the frozen-graph attestation), so the mode
+/// arguments are kept for the callers and not read.
 pub(crate) fn fingerprint(
     program: &RustProgram<'_>,
-    a5_mode: A5Mode,
-    attestation: Option<WholeProgramAttestation>,
+    _a5_mode: A5Mode,
+    _attestation: Option<WholeProgramAttestation>,
 ) -> String {
     super::cache_contract::semantic_key(
-        &semantic_inputs(program, a5_mode, attestation)
-            .expect("complete semantic inputs before any cache lookup"),
+        &semantic_inputs(program).expect("complete semantic inputs before any cache lookup"),
     )
     .expect("valid portable semantic input identity")
 }
 
+/// The cache key's inputs: the crate name, its sources by logical path under their
+/// common root, and the three build constants. Nothing from the environment.
 pub(crate) fn semantic_inputs(
     program: &RustProgram<'_>,
-    a5_mode: A5Mode,
-    attestation: Option<WholeProgramAttestation>,
 ) -> Result<super::cache_contract::SemanticInputs, String> {
     let mut real = BTreeMap::<PathBuf, String>::new();
     let mut files = BTreeMap::new();
@@ -375,25 +378,20 @@ pub(crate) fn semantic_inputs(
         }
     }
     if !real.is_empty() {
-        let mut root = if let Some(root) = std::env::var_os("CRAT_ERA5_INPUT_ROOT") {
-            std::fs::canonicalize(root).map_err(|e| e.to_string())?
-        } else {
-            let mut root = real
-                .keys()
-                .next()
-                .unwrap()
-                .parent()
-                .ok_or("source has no parent")?
-                .to_path_buf();
-            for path in real.keys() {
-                while !path.starts_with(&root) {
-                    if !root.pop() {
-                        return Err("no common source root".into());
-                    }
+        let mut root = real
+            .keys()
+            .next()
+            .unwrap()
+            .parent()
+            .ok_or("source has no parent")?
+            .to_path_buf();
+        for path in real.keys() {
+            while !path.starts_with(&root) {
+                if !root.pop() {
+                    return Err("no common source root".into());
                 }
             }
-            root
-        };
+        }
         if root.as_os_str().is_empty() {
             root = PathBuf::from("/");
         }
@@ -406,16 +404,11 @@ pub(crate) fn semantic_inputs(
         }
     }
     Ok(super::cache_contract::SemanticInputs {
-        program: std::env::var("CRAT_ERA5_PROGRAM")
-            .unwrap_or_else(|_| program.tcx.crate_name(LOCAL_CRATE).to_string()),
+        program: program.tcx.crate_name(LOCAL_CRATE).to_string(),
         files,
         analysis: env!("BO_ANALYSIS_FINGERPRINT").to_owned(),
         toolchain: env!("BO_TOOLCHAIN_SHA256").to_owned(),
         dependencies: env!("BO_LOCK_SHA256").to_owned(),
-        configuration: format!(
-            "{:x}",
-            Sha256::digest(solver_identity(a5_mode, attestation).as_bytes())
-        ),
     })
 }
 fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[u8]) -> String {
@@ -517,11 +510,9 @@ pub(crate) fn prepare(
     origins: &super::origin_summary::OriginSummaries,
     verified: &super::construction::VerifiedBo,
     captured: &super::export::BoExport,
-    mode: A5Mode,
-    attestation: Option<WholeProgramAttestation>,
 ) {
     let result = (|| -> Result<Prepared, String> {
-        let inputs = semantic_inputs(program, mode, attestation)?;
+        let inputs = semantic_inputs(program)?;
         let key = super::cache_contract::semantic_key(&inputs)?;
         let directory = dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -878,13 +869,13 @@ pub(crate) fn load(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     slots: &CrateSlots,
-    a5_mode: A5Mode,
-    attestation: Option<WholeProgramAttestation>,
+    _a5_mode: A5Mode,
+    _attestation: Option<WholeProgramAttestation>,
 ) -> Option<CachedModel> {
     if !read_enabled() {
         return None;
     }
-    let expected = semantic_inputs(program, a5_mode, attestation).ok()?;
+    let expected = semantic_inputs(program).ok()?;
     let fp = super::cache_contract::semantic_key(&expected).ok()?;
     let path = entry_path(&dir()?, &fp);
     let entry = super::cache_contract::validate_file(&path).ok()?;

@@ -15,7 +15,6 @@ fn fixture() -> Value {
         analysis: "2".repeat(64),
         toolchain: "3".repeat(64),
         dependencies: "4".repeat(64),
-        configuration: "5".repeat(64),
     };
     let mut families = serde_json::Map::new();
     let mut identities = Vec::new();
