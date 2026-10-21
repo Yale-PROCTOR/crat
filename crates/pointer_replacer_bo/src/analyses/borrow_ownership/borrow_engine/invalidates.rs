@@ -655,14 +655,6 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     PlaceConflictBias::Overlap,
                     self.parameter_overlap,
                 ) {
-                    // era-5c (debug only): the access that invalidates a loan.
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        eprintln!(
-                            "E5C invalidating-access direct at={location:?} place={place:?} kind={kind:?} depth={access_depth:?} loan={loan:?} borrowed={:?} via_overlap_partner={}",
-                            borrow_data.borrowed,
-                            candidate_base != place.local
-                        );
-                    }
                     self.insert_invalidation(
                         point_index,
                         loan,
@@ -768,13 +760,6 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         self.parameter_overlap,
                     ) {
                         let accessor = if copy_lends_only { base } else { place.local };
-                        // era-5c (debug only): the access that invalidates a loan.
-                        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                            eprintln!(
-                                "E5C invalidating-access routed at={location:?} place={place:?} routed={routed:?} kind={kind:?} loan={loan:?} borrowed={:?}",
-                                borrow_data.borrowed
-                            );
-                        }
                         self.insert_invalidation(point_index, loan, accessor, false);
                     }
                 }

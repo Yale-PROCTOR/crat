@@ -1086,19 +1086,6 @@ where
         // call and the destination of that call's result, directly
         // (`x = f(x)`) or through the result temporary (`t = f(x); x = t`).
         let named_locals: rustc_data_structures::fx::FxHashSet<Local> = reseat_destinations(body);
-        let spared: Vec<Local> = locals_collected
-            .iter()
-            .skip(body.arg_count + 1)
-            .filter(|(local, _)| named_locals.contains(local))
-            .map(|(local, _)| *local)
-            .collect();
-        if !spared.is_empty() && std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!(
-                "E5C a1-spared fn={} locals={:?}",
-                infer_cx.tcx.def_path_str(body.source.def_id()),
-                spared.iter().map(|l| l.as_u32()).collect::<Vec<_>>()
-            );
-        }
 
         let mut locals = locals_collected.into_iter().skip(0);
 

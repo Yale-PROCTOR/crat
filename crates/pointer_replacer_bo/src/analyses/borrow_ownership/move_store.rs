@@ -199,7 +199,7 @@ pub(crate) struct MoveStoreObligation {
     pub(crate) cleared: Vec<(Local, SlotKind)>,
 }
 
-/// A loan the arm cleared, for the witnesses and `CRAT_ERA5C_DEBUG`.
+/// A loan the arm cleared, for the witnesses.
 #[derive(Clone, Debug)]
 pub(crate) struct Removed {
     pub(crate) location: Location,
@@ -262,7 +262,6 @@ fn build(
     model: &FxHashMap<SlotRef, SlotKind>,
 ) -> FxHashMap<LocalDefId, FnRule> {
     let tcx = program.tcx;
-    let debug = std::env::var_os("CRAT_ERA5C_DEBUG").is_some();
     let names: FxHashMap<String, LocalDefId> = program
         .functions
         .iter()
@@ -304,24 +303,6 @@ fn build(
         else {
             continue;
         };
-        if debug {
-            eprintln!(
-                "E5C move-store qualify fn={} at={store:?} field={field:?} alias={:?} kept={kept:?} uses={}",
-                candidate.site.function,
-                row.alias,
-                row.uses.len()
-            );
-            for u in &row.uses {
-                eprintln!(
-                    "E5C move-store obligation fn={} store={store:?} use={:?} local={:?} kind={} dominated={}",
-                    candidate.site.function,
-                    u.location,
-                    u.local,
-                    u.kind.as_str(),
-                    u.dominated
-                );
-            }
-        }
         let entry = rule.entry(function).or_insert_with(|| FnRule {
             stores: FxHashMap::default(),
             kept: FxHashSet::default(),
@@ -687,14 +668,6 @@ pub(crate) fn clear_removed(
             kind: rule.kinds.get(&borrowed).copied(),
             was_invalid,
         });
-    }
-    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-        for r in &removed {
-            eprintln!(
-                "E5C move-store removed fn={function:?} at={:?} borrowed={:?} kind={:?} was_invalid={}",
-                r.location, r.borrowed, r.kind, r.was_invalid
-            );
-        }
     }
     RECORD.with(|record| {
         let mut record = record.borrow_mut();

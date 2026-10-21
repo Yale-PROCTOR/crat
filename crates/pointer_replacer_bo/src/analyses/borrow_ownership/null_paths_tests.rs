@@ -338,7 +338,6 @@ fn bst_probe() -> String {
             ("CRAT_R385_TARGETS", BST_TARGETS),
             ("CRAT_R385_GRANULARITY", "assertion"),
             ("CRAT_R385_WORLD", "closed"),
-            ("CRAT_ERA5C_DEBUG", "1"),
             ("DIR", dir.as_str()),
         ],
     )
@@ -801,7 +800,7 @@ fn e5c_inner_bst_shape_full_solve_under_the_arm() {
 fn e5c_w10_bst_shape_fields_own_under_the_arm() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_shape_full_solve_under_the_arm",
-        &[("CRAT_ERA5C_DEBUG", "1")],
+        &[],
     );
     assert!(text.contains("E5C_MODEL"), "{text}");
 }

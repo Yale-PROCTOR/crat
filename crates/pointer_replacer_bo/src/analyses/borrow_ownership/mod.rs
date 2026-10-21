@@ -433,9 +433,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     let nullability = nullability::analyze(crate_ctxt.tcx, &fns, slots);
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
         if !nullability.contains(&slot) {
-            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                eprintln!("E5C may-supply-exclusion slot={slot:?}");
-            }
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
             raw_cause::note_eager(&kind_solver, "may-supply");
             raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "may-supply");

@@ -619,12 +619,6 @@ fn revalidate_replaying_witnessed(
                     };
                     let invalidators = to_slots(witnessed.invalidators);
                     let overlap_invalidators = to_slots(witnessed.overlap_invalidators);
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        eprintln!(
-                            "E5C witnessed-conflict fn={fn_did:?} loan={loan:?} at={loan_location:?} issuer={issuer:?} requirers={:?} invalidators={invalidators:?} via_partner={overlap_invalidators:?} esc={}",
-                            edge.requirers, edge.esc_issuer_first
-                        );
-                    }
                     WitnessedSlotConflict {
                         conflict: SlotConflict {
                             issuer,
@@ -1383,20 +1377,6 @@ fn verify_rounds(
             return (None, stats);
         }
         let raw_targets = reviewed.retirement.raw_targets();
-        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!(
-                "E5C retirement raw_targets={raw_targets:?} demotions={} conflicts={} unresolved={}",
-                reviewed.retirement.demotions.len(),
-                reviewed.retirement.conflicts.len(),
-                reviewed.retirement.unresolved.len()
-            );
-            for row in &reviewed.retirement.demotions {
-                eprintln!("E5C retirement-demotion {row:?}");
-            }
-            for row in &reviewed.retirement.conflicts {
-                eprintln!("E5C retirement-conflict {row:?}");
-            }
-        }
         if !raw_targets.is_empty() {
             if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
                 return (None, stats);
@@ -1548,12 +1528,6 @@ fn verify_rounds(
                 for (did, index, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
                         // era-5c: name the conflict a Mode-A commit came from.
-                        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                            eprintln!(
-                                "E5C mode-a-commit slot={slot:?} issuer={:?} requirers={:?} esc_issuer_first={}",
-                                conflict.issuer, conflict.requirers, conflict.esc_issuer_first
-                            );
-                        }
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
                         if ledger && let Some(track) = solver.last_track() {

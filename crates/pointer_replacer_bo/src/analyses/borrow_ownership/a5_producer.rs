@@ -1151,9 +1151,6 @@ pub(crate) fn produce_a5_plan(
             pair.params().second(),
         ) {
             stats.type_disjoint_pairs += 1;
-            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                eprintln!("E5C type-disjoint {receipt}");
-            }
             type_disjoint.push(receipt);
             continue;
         }

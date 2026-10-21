@@ -545,18 +545,6 @@ impl Context {
             return false;
         }
         let rule = self.discharges.discharge(event, &target);
-        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!(
-                "E5C discharge-check event={}:bb{}[{}] target={} {} at={:?} route_len={} rule={rule:?}",
-                event.source.key.function,
-                event.source.key.block,
-                event.source.key.statement,
-                self.keys.get(&slot).map_or("?", String::as_str),
-                self.discharges.explain(event, &target),
-                event.location,
-                event.route.len(),
-            );
-        }
         let Some(rule) = rule else {
             return false;
         };

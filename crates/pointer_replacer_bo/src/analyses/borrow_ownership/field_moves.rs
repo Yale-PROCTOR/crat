@@ -160,23 +160,9 @@ pub(crate) fn compute<'tcx>(body: &Body<'tcx>) -> FieldMoves {
             match overwritten_on_every_path(body, location, &source) {
                 Ok(()) => {
                     out.moves.insert(location);
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        eprintln!(
-                            "E5C field-move MOVE {:?} at {location:?} ({:?})",
-                            body.source.def_id(),
-                            source
-                        );
-                    }
                 }
                 Err(reason) => {
                     out.refusals.insert(location, reason);
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        eprintln!(
-                            "E5C field-move REFUSED {:?} at {location:?}: {reason} ({:?})",
-                            body.source.def_id(),
-                            source
-                        );
-                    }
                 }
             }
         }

@@ -1356,9 +1356,6 @@ impl KindSolver {
                 &!left.xor(right),
             );
         }
-        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!("E5C field-move-release {lhs:?} <- {rhs:?} (own equality released)");
-        }
     }
 
     /// L01⁹ rule 1b (`CRAT_ERA5C_DEREF_READER`): a deref-only field read. The
@@ -1982,12 +1979,6 @@ impl KindSolver {
                 }
                 Ok(Bool::and(&requirements))
             })();
-            // era-5c: a pending traversal names its reason when asked.
-            if let Err(reason) = &support
-                && std::env::var_os("CRAT_ERA5C_DEBUG").is_some()
-            {
-                eprintln!("E5C traversal-pending {id:?} reason={reason}");
-            }
             let licensed = support.is_ok();
             clauses.push((
                 id,
@@ -3085,12 +3076,6 @@ impl KindSolver {
                     });
                     let core_labels = self.core_labels(selectors, &core);
                     // era-5c: name the core a leaked selector came from.
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        for label in &core_labels {
-                            eprintln!("E5C relax-core {label}");
-                        }
-                        eprintln!("E5C relax-core-end");
-                    }
                     if t2_core.is_empty() {
                         self.record_round_model_failure(RoundModelFailure::HardUnsat {
                             active_t2: assumptions.len(),
@@ -3408,12 +3393,6 @@ impl KindSolver {
                 SatResult::Unsat => {
                     let core = self.solver.get_unsat_core();
                     // era-5c: name the core a leaked selector came from.
-                    if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                        for label in self.core_labels(selectors, &core) {
-                            eprintln!("E5C relax-core {label}");
-                        }
-                        eprintln!("E5C relax-core-end");
-                    }
                     let in_core = |s: &Bool| core.iter().any(|c| c == s);
                     // §S2-1 (NB-F review F2): the drop choice on a MIXED
                     // source/sink core is a deliberate policy — drop sinks
