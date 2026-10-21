@@ -1570,12 +1570,19 @@ pub unsafe fn f() -> i32 {
         }
     }
 
+    /// Under the record, `release::h` is a reference, as in the record's frame
+    /// (`c05_under_the_record_the_ifl3_field_settles_raw`). The typed-release
+    /// premise (R604) says the freed `i32` block `(*h).ptr` cannot be `h`'s `H`
+    /// object, so the free does not retire `h`'s referent, and the kind order
+    /// (Ref > Owning > Raw) selects Ref. The old Raw came from treating the
+    /// public entry's object as unknown, which the premise and the closed-program
+    /// scope (R816) replace.
     #[test]
-    fn c05_unattested_public_entry_keeps_its_unknown_object_protection() {
+    fn c05_unattested_public_entry_is_a_reference_under_the_typed_release_premise() {
         let fixture = super::super::tests::inspect(IFL3);
         fixture.assert_kind(
             "release::h",
-            crate::analyses::borrow_ownership::SlotKind::Raw,
+            crate::analyses::borrow_ownership::SlotKind::Ref,
         );
     }
 

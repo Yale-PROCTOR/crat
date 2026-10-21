@@ -237,8 +237,12 @@ pub unsafe fn f() { let p = malloc(4); *p = 1; free(p); }
     );
 }
 
+/// Under the record's kind order (Ref > Owning > Raw), `a`, a formal whose block
+/// this function frees, settles Owning: it consumes its argument. Owning is not a
+/// reference, so the protection the name states (no reference across its own
+/// free) still holds. Raw was the old default order's tie-break, not the rule.
 #[test]
-fn ol14_source_dead_parameter_stays_protected_at_free() {
+fn ol14_source_dead_parameter_is_owning_not_a_reference_at_free() {
     let fixture = inspect(
         r#"
 unsafe extern "C" { fn free(p: *mut i32); }
@@ -250,7 +254,7 @@ pub unsafe fn releases(a: *mut i32) -> i32 {
 }
 "#,
     );
-    fixture.assert_kind("releases::a", SlotKind::Raw);
+    fixture.assert_kind("releases::a", SlotKind::Owning);
     assert!(!fixture.export.retirement_rounds.is_empty());
     assert!(
         fixture

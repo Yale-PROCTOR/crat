@@ -451,6 +451,14 @@ fn a_w05_the_unwind_successor_carries_the_same_narrowed_clobber() {
 /// address is a projected store and projected stores keep the whole-state
 /// clobber. The anchor A-W01 is the discriminating sibling: this fixture is
 /// A-W01 plus the one global store.
+///
+/// Under the record (the fresh-in-route discharge, (γ)), `keep` is accepted. The
+/// freed operand is identified by `protocol`'s own single definition, the fresh
+/// `get_protocol` result, and a store into `SINK` copies that value without
+/// changing the local. A middle call that freed or moved the block through `SINK`
+/// would make the later `free(protocol)` a double or dangling free, which is UB in
+/// the input and outside the claim (§28). So the old whole-state clobber's
+/// protection is no longer needed here.
 const GLOBAL_CARRIER: &str = r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn free(p: *mut core::ffi::c_void); }
 static mut SINK: *mut u8 = core::ptr::null_mut();
@@ -467,11 +475,10 @@ pub unsafe fn hostname(u: *mut u8, keep: *const u8) -> u8 {
 "#;
 
 #[test]
-fn a_w06_a_pointer_published_to_a_global_is_not_preserved() {
+fn a_w06_a_pointer_published_to_a_global_keeps_its_fresh_identity() {
     assert!(
-        !super::tests::accepts(GLOBAL_CARRIER, &[("hostname", 2, 0)]),
-        "once `protocol` is reachable through a static, the middle call may free or move it and the \
-         unrelated incoming reference must stay protected"
+        super::tests::accepts(GLOBAL_CARRIER, &[("hostname", 2, 0)]),
+        "the freed operand is `protocol`'s fresh single definition; a global copy does not change it"
     );
 }
 
