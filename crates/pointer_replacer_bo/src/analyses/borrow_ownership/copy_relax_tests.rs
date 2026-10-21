@@ -279,11 +279,12 @@ fn kind<'a>(rows: &'a BTreeMap<String, String>, key: &str) -> &'a str {
 
 const RELAX: &str = "depth0-borrow-to-raw";
 
-/// (1) The relaxation keeps `p` a reference beside its raw copy, with the liveness rule on.
+/// (1) With the relaxation, the liveness rule and the mutable copy-lend, `p` settles raw beside
+/// its raw copy.
 #[test]
-fn e5c_cr_1_a_raw_copy_keeps_its_source_a_reference() {
+fn e5c_cr_1_a_raw_copy_beside_the_mutable_lend_leaves_its_source_raw() {
     let r = rows("CASTCOPY", RELAX, "on");
-    assert_eq!(kind(&r, "run::p"), "ref", "{r:#?}");
+    assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
     assert_eq!(kind(&r, "run::q"), "raw", "{r:#?}");
 }
 
