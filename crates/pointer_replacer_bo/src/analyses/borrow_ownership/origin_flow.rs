@@ -1,9 +1,8 @@
 //! BO-native interprocedural origin-flow derivation.
 //!
 //! This module mirrors the frozen production `borrow::lifetime_flow` semantics over BO-owned slot
-//! and summary types. NB5-O's fine-grained rs-crown differential established equality of every
-//! function, ordered slot, subset edge, and unknown-membership entry before the wrapped route was
-//! removed from the active BO path.
+//! and summary types. A fine-grained differential against the production analysis established
+//! equality of every function, ordered slot, subset edge, and unknown-membership entry.
 
 use std::cell::Cell;
 #[cfg(test)]
@@ -835,8 +834,9 @@ impl BodyOriginFlow {
 
     /// Depth-zero caller parameters whose values can flow into `local`.
     ///
-    /// A5 uses this projection to distinguish a direct call-site overlap fact
-    /// from a fact that is conditional on one of the caller's parameter pairs.
+    /// The parameter-overlap analysis uses this projection to distinguish a
+    /// direct call-site overlap fact from a fact that is conditional on one of
+    /// the caller's parameter pairs.
     /// The boolean is false when the ordinary origin analysis has an unknown
     /// source for the local, in which case the producer must also retain a
     /// direct conservative witness.
@@ -2182,7 +2182,7 @@ mod a2_tests {
     const OP: &str = "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; }";
 
     #[test]
-    #[ignore = "PROPOSED version-sensitive A2 acceptance witness: slot-global coherence propagates the mandatory opaque-temp guard"]
+    #[ignore = "PROPOSED version-sensitive acceptance witness for the overwrite-origin construction: slot-global coherence propagates the mandatory opaque-temp guard"]
     fn a2_copy_chain_kills_stale_opaque_definition() {
         let code = format!(
             "{OP} unsafe fn f(p: *mut i32) -> *mut i32 {{ \
@@ -2213,7 +2213,7 @@ mod a2_tests {
     }
 
     #[test]
-    #[ignore = "PROPOSED version-sensitive A2 acceptance witness: restored signature recovery requires version-sensitive coherence/rewriter handling"]
+    #[ignore = "PROPOSED version-sensitive acceptance witness for the overwrite-origin construction: restored signature recovery requires version-sensitive coherence/rewriter handling"]
     fn a2_restore_after_opaque_recovers_signature_origin() {
         let code = format!(
             "{OP} unsafe fn f(out: *mut *mut i32) {{ \

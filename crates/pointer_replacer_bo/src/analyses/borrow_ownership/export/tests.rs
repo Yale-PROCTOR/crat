@@ -1,7 +1,4 @@
-//! M0 RED tests for the BO export surface.
-//!
-//! Numbering follows the M0.5 spec's §7 RED list so progress is trackable
-//! against it. Tests 15b–15d are the R-Q1a witnesses.
+//! Tests for the BO export surface.
 
 use rustc_hash::FxHashMap;
 use rustc_hir::{ItemKind, OwnerNode};
@@ -228,28 +225,25 @@ unsafe fn f(p: *mut i32) -> i32 {
 "#;
 
 // -------------------------------------------------------------------------
-// 1-4: gating and identity
+// Gating and identity
 // -------------------------------------------------------------------------
 
-// RED 1 (the `CRAT_BO_EXPORT` fail-loud parse) is GONE, not weakened: D4 was
-// closed by DESCOPING the env switch, so there is no flag left to reject a bad
-// value. `export_off_records_nothing` is now the gating witness, and it
-// asserts the stronger property: capture is off unless a scope opened it, with
-// no ambient path that can turn it on.
+// There is no `CRAT_BO_EXPORT` env switch to parse: capture is gated by scope
+// alone. The test below is the gating witness and asserts the stronger
+// property: capture is off unless a scope opened it, with no ambient path that
+// can turn it on.
 
-/// RED 4 — capture is inert unless a scope is open.
+/// Capture is inert unless a scope is open.
 ///
-/// **Also the D4 witness.** The first assertion fails if ambient enablement is
+/// The first assertion fails if ambient enablement is
 /// ever reintroduced — an env flag, a global, a lazy install inside
 /// `capturing()` — because this test runs with no scope open. Mutation-tested:
 /// restoring the `if flag_enabled() { install }` branch with the flag forced on
 /// fails it here.
 ///
-/// D18: this doc used to add "and allocates nothing when off". It does not
-/// show that — the body observes `capturing()` and that recording is a no-op,
-/// and asserts nothing about allocation. The zero-allocation property rests on
-/// `record`'s early return, which is an argument, not a measurement. Claim
-/// narrowed to what is actually asserted.
+/// The body observes `capturing()` and that recording is a no-op, and asserts
+/// nothing about allocation. The zero-allocation property rests on `record`'s
+/// early return, which is an argument, not a measurement.
 #[test]
 fn export_off_records_nothing() {
     assert!(!capturing(), "capture must be inactive by default");
@@ -284,12 +278,11 @@ fn export_scope_restores_on_unwind() {
     assert!(!capturing(), "capture leaked after an unwinding scope");
 }
 
-/// RED 3 — capture must not perturb the analysis.
+/// Capture must not perturb the analysis.
 ///
-/// The spec's full gate is corpus-scale (`export-on == export-off` on every
-/// counter); that run queues behind the pairwise sweep. This is the same
-/// property at fixture scale: the accepted model must be byte-identical with
-/// capture on and off.
+/// The full check is corpus-scale (`export-on == export-off` on every
+/// counter). This is the same property at fixture scale: the accepted model
+/// must be byte-identical with capture on and off.
 #[test]
 fn export_on_equals_off_on_the_accepted_model() {
     for code in [MALLOC_FREE, CALL_ARG] {
@@ -303,10 +296,10 @@ fn export_on_equals_off_on_the_accepted_model() {
 }
 
 // -------------------------------------------------------------------------
-// 5-8: E-R2 version sites and move points
+// Version sites and move points
 // -------------------------------------------------------------------------
 
-/// RED 5 — every consume site the emission visits is recorded.
+/// Every consume site the emission visits is recorded.
 #[test]
 fn version_sites_are_recorded() {
     let (model, export) = capture_solve(MALLOC_FREE);
@@ -324,7 +317,7 @@ fn version_sites_are_recorded() {
     );
 }
 
-/// RED 8 — per-`Var` ownership is read from the accepted model.
+/// Per-`Var` ownership is read from the accepted model.
 #[test]
 fn version_owns_is_populated_from_the_accepted_model() {
     let (model, export) = capture_solve(MALLOC_FREE);
@@ -349,10 +342,10 @@ fn move_point_candidates_require_a_populated_model() {
 }
 
 // -------------------------------------------------------------------------
-// 9-13: E-R3 selector provenance
+// Selector provenance
 // -------------------------------------------------------------------------
 
-/// RED 9/10 — a malloc/free fixture records both a source and a sink selector,
+/// A malloc/free fixture records both a source and a sink selector,
 /// each attributed to its call site.
 #[test]
 fn selector_sites_are_recorded_with_provenance() {
@@ -378,13 +371,11 @@ fn selector_sites_are_recorded_with_provenance() {
 }
 
 // -------------------------------------------------------------------------
-// 14-17 + R-Q1a: E-R4 loan identity
+// Loan identity
 // -------------------------------------------------------------------------
 
-/// RED 14 — the COMPLETE final `BorrowSet` is exported, not the invalid subset.
-///
-/// The drafted version of this test asserted equality with the invalid-loan
-/// count and encoded the Gap B error; it must not be restored.
+/// The COMPLETE final `BorrowSet` is exported, not the invalid subset, so
+/// equality with the invalid-loan count would be the wrong property.
 #[test]
 fn loan_identity_covers_the_complete_borrow_set() {
     let (model, export) = capture_solve(CALL_ARG);
@@ -395,11 +386,10 @@ fn loan_identity_covers_the_complete_borrow_set() {
         "no SURVIVING loans exported — a re-route would have nothing to match against"
     );
 
-    // RESTORED CARDINALITY (spec RED 14). Weakening this to a non-emptiness
-    // check is exactly what let defect D1 through: with the recorder appending
-    // across CEGAR rounds, `loans` held N copies of every loan and no
-    // non-emptiness assertion could see it. One record per (fn, loan index) is
-    // the property that pins "the FINAL round's BorrowSet".
+    // Exact cardinality, not non-emptiness: a recorder that appended across
+    // CEGAR rounds would hold N copies of every loan, which no non-emptiness
+    // assertion can see. One record per (fn, loan index) is the property that
+    // pins "the FINAL round's BorrowSet".
     let mut seen = rustc_hash::FxHashSet::default();
     for loan in &export.loans {
         assert!(
@@ -411,7 +401,7 @@ fn loan_identity_covers_the_complete_borrow_set() {
     }
 }
 
-/// RED 15 — the borrower class and borrowed place are carried.
+/// The borrower class and borrowed place are carried.
 #[test]
 fn loan_identity_carries_place_and_borrower() {
     let (_model, export) = capture_solve(CALL_ARG);
@@ -424,7 +414,7 @@ fn loan_identity_carries_place_and_borrower() {
     );
 }
 
-/// RED 15c (**R-Q1a §0.4**) — the kind is keyed on the BASE local, projections
+/// The kind is keyed on the BASE local, projections
 /// ignored. A `CallArg` loan on `(*arg)` reports the kind of `arg`.
 #[test]
 fn loan_kind_keyed_on_base_local() {
@@ -451,7 +441,7 @@ fn loan_kind_keyed_on_base_local() {
     }
 }
 
-/// RED 15d (**R-Q1a §0.4**) — `NoProvenance` is distinct from `Shared`.
+/// `NoProvenance` is distinct from `Shared`.
 ///
 /// Collapsing them would invert the engine's guard, which is
 /// `if let Some(p) = .. && !is_mutable(p)`.
@@ -520,16 +510,15 @@ fn capture_solve_with(
     .unwrap_or_else(|e| e.raise())
 }
 
-/// RED 15b (**R-Q1a**) — the exported kind checked against GROUND TRUTH.
+/// The exported kind checked against GROUND TRUTH.
 ///
-/// The previous version asserted `skips_invalidation() == (kind == Shared)`,
-/// true by the definition of `skips_invalidation` and therefore unable to fail
-/// if the fork-side derivation drifted from the engine. That tautology was
-/// defect **D3**; this is its replacement.
+/// Asserting `skips_invalidation() == (kind == Shared)` would be a tautology:
+/// true by the definition of `skips_invalidation` and unable to fail if the
+/// fork-side derivation drifted from the engine.
 ///
 /// Ground truth is a mutability provider the test supplies. The derivation must
 /// reproduce `is_mutable(fn_did, borrowed.local)` — so this simultaneously
-/// witnesses that the key is the **base local** (R-Q1a §0.4): a derivation that
+/// witnesses that the key is the **base local**: a derivation that
 /// keyed on the projected place would look up a different local and disagree.
 #[test]
 fn loan_kind_matches_ground_truth_provider() {
@@ -608,25 +597,22 @@ fn place_key_counts_derefs_and_fields() {
 }
 
 // -------------------------------------------------------------------------
-// RED 16-17: the E-R4 certificate
+// The accept-point certificate
 // -------------------------------------------------------------------------
 
-/// RED 16 — **D14**: the E-R4 certificate is RECORDED at the accept point.
+/// The certificate is RECORDED at the accept point.
 ///
-/// This is the assertion the previous two versions could not make. As a bare
-/// `Vec`, "recorded, none tolerated" and "never recorded" were the same value,
-/// so `is_empty()` held with the recorder deleted and the whole suite stayed
-/// green — verified by running that mutation. `Option` separates the states and
-/// `is_some()` is exactly the obligation.
+/// As a bare `Vec`, "recorded, none tolerated" and "never recorded" would be the
+/// same value, so `is_empty()` would hold with the recorder deleted. `Option`
+/// separates the states and `is_some()` is exactly the obligation.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** removing the
-/// `record_residuals` call at the accept point leaves the field `None` and
-/// fails this test. Only then the weaker perturbation: recording a fabricated
-/// residual fails the emptiness assertion.
+/// *Mutation-tested.* Removing the `record_residuals` call at the accept point
+/// leaves the field `None` and fails this test; recording a fabricated residual
+/// fails the emptiness assertion.
 ///
-/// The emptiness assertion is retained but is **no longer load-bearing for
-/// D14** — it records an empirical fact (ledger D15: no fixture is known that
-/// tolerates a residual at accept, and the claim that none *can* was retracted).
+/// The emptiness assertion is not load-bearing for recording: it records an
+/// empirical fact (no fixture is known that tolerates a residual at accept, and
+/// there is no argument that none *can*).
 #[test]
 fn certificate_is_recorded_at_the_accept_point() {
     // A multi-round fixture: rounds 1 and 2 each commit, round 3 accepts — so a
@@ -640,20 +626,15 @@ fn certificate_is_recorded_at_the_accept_point() {
         vec![1, 1, 0],
         "rounds 1-2 must commit for this fixture to distinguish rounds"
     );
-    // F3: `verify_to_fixpoint*` dispatches on `CRAT_BO_L2_GUARDED_COMMITS`, and
-    // the L2 accept never calls `record_residuals` — a documented gap (D2
-    // adjacent), so `None` there is CORRECT, not a defect. The first version of
-    // this test asserted `is_some()` unconditionally and therefore FAILED under
-    // the plan-of-record profile while blaming the accept point. Assert the
-    // behaviour each path actually has: this turns an env-sensitivity that used
-    // to be invisible under `Vec` into a tested property of both paths.
+    // Both repairs share the accept at `committed == 0`, which records the
+    // residual certificate.
     let residuals = export.residual_conflicts.as_ref().expect(
         "D14: the accept point ran but recorded no certificate — `record_residuals` \
          is missing from the `committed == 0` accept, or `begin_round()` cleared it \
          afterwards. `None` means NEVER RECORDED, which is not `Some(vec![])`",
     );
     // Empirical, not a theorem: no known fixture tolerates a residual at accept,
-    // but the argument that none can was retracted (ledger D13/D15).
+    // and there is no argument that none can.
     assert!(
         residuals.is_empty(),
         "this fixture accepted while tolerating residuals {residuals:?} — that is \
@@ -661,18 +642,15 @@ fn certificate_is_recorded_at_the_accept_point() {
          and `BoExport::residual_conflicts`' doc should be updated to say the \
          shape is reachable"
     );
-    // D18b: a "well-formedness" loop stood here asserting every residual has an
-    // issuer or a requirer. It was DELETED, not repaired, for two reasons.
-    // First it was unreachable either way — it iterated a collection the assert
-    // above had just required to be empty, and on failure that assert aborted
-    // first. Second, and worse, it was WRONG: an owner-less residual
+    // No "well-formedness" check that every residual has an issuer or a
+    // requirer: it would iterate a collection the assert above has just
+    // required to be empty, and it would be wrong — an owner-less residual
     // (`issuer: None, requirers: []`) is not malformed, it is precisely the
-    // shape D15 is hunting, so on the one day the loop could have run it would
-    // have reported the wrong diagnosis. A missing check is honest; a check
-    // that would misclassify the thing it fires on is not.
+    // shape the emptiness assertion watches for, and such a check would
+    // misdiagnose it.
 }
 
-/// **F4** — a DECLINING run records no certificate.
+/// A DECLINING run records no certificate.
 ///
 /// This is the invariant the `Option` exists to carry and the half the positive
 /// witness cannot reach: `None` must mean "the accept point never ran". The
@@ -685,15 +663,14 @@ fn certificate_is_recorded_at_the_accept_point() {
 /// **Stated limitation, not papered over.** This exercises the *pre-loop*
 /// decline (the first solve returns UNSAT), so it pins the invariant for that
 /// route only. It does **not** exercise the in-loop `residual_nonref_field`
-/// decline, and therefore does NOT catch the specific relocation F4 named —
-/// moving `record_residuals` above that decline. Four candidate fixtures were
+/// decline, and therefore does NOT catch moving `record_residuals` above that
+/// decline. Four candidate fixtures were
 /// probed for an in-loop decline (field own+borrow, aliased double free,
 /// cross-function field escape, address-of-local store); all four accepted.
-/// Recorded as residual rather than claimed as covered.
+/// Recorded as a gap rather than claimed as covered.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** make the decline path
-/// record a certificate — e.g. `record_residuals(vec![])` before the early
-/// return — and this fails.
+/// *Mutation-tested.* Make the decline path record a certificate — e.g.
+/// `record_residuals(vec![])` before the early return — and this fails.
 #[test]
 fn declining_run_records_no_certificate() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
@@ -755,12 +732,12 @@ fn declining_run_records_no_certificate() {
     .unwrap_or_else(|e| e.raise())
 }
 
-/// RED 17 — the exported candidacy agrees with the accepted model.
+/// The exported candidacy agrees with the accepted model.
 #[test]
 fn certificate_candidacy_matches_model() {
     let (model, export) = capture_solve(MALLOC_FREE);
     let model = model.expect("accepted");
-    // F3, as above: `None` is the correct L2 behaviour.
+    // As above, `None` is the correct guarded-repair behaviour.
     let residuals = export
         .residual_conflicts
         .as_ref()
@@ -777,7 +754,7 @@ fn certificate_candidacy_matches_model() {
     }
 }
 
-/// RED 9 — selector provenance is index-aligned with `Selectors` by
+/// Selector provenance is index-aligned with `Selectors` by
 /// construction: each push site writes exactly once, in order.
 #[test]
 fn selector_provenance_index_aligned() {
@@ -796,7 +773,7 @@ fn selector_provenance_index_aligned() {
     }
 }
 
-/// RED 11 — a surviving sink resolves to the `free` call site.
+/// A surviving sink resolves to the `free` call site.
 #[test]
 fn sink_site_names_the_free_call() {
     let (_model, export) = capture_solve(MALLOC_FREE);
@@ -970,7 +947,7 @@ fn e5_r219_dynamic_null_and_distinct_site_receipts() {
                     .mir_drops_elaborated_and_const_checked(function)
                     .borrow();
                 // Derive endpoint identity from original MIR, independently of
-                // both the source-event inventory and the exported T2 keys.
+                // both the source-event inventory and the exported endpoint-retraction keys.
                 let original: BTreeMap<_, _> = body
                     .basic_blocks
                     .iter_enumerated()
@@ -1458,7 +1435,7 @@ pub unsafe fn f(p: *mut u8) -> u8 {
     }).unwrap_or_else(|error| error.raise());
 }
 
-/// B05/B17 closure: retracting realloc ownership assertions must neither erase
+/// Retracting realloc ownership assertions must neither erase
 /// the source retirement nor relax the mandatory laws that reject restoration.
 #[test]
 fn e5_r_t2_opaque_old_realloc_retracts_without_erasing_retirement() {
@@ -1682,10 +1659,11 @@ unsafe fn resize() {
     }
 }
 
-/// T2-W2 (addendum-55 erratum): an exact free endpoint whose incoming value
-/// has no modeled origin cannot retain the endpoint assertion. The mandatory
-/// licensing clause appears beside the typed T2 label, T2 yields first,
-/// restoration fails, and the post-retraction model equals the no-T2 baseline.
+/// An exact free endpoint whose incoming value has no modeled origin cannot
+/// retain the endpoint assertion. The mandatory licensing clause appears beside
+/// the typed endpoint-retraction label, endpoint retraction yields first,
+/// restoration fails, and the post-retraction model equals the baseline without
+/// endpoint assertions.
 #[test]
 fn t2_unknown_origin_free_retracts_with_named_license_core() {
     const CODE: &str = r#"
@@ -1778,7 +1756,7 @@ unsafe fn release() {
     .unwrap_or_else(|error| error.raise());
 }
 
-/// T2-N1: a long move chain receives assertions at its allocation and
+/// A long move chain receives assertions at its allocation and
 /// deallocation endpoints only. Chain middles remain governed exclusively by
 /// existing transfer/coherence constraints.
 #[test]
@@ -1822,7 +1800,7 @@ unsafe fn chain() {
     .unwrap_or_else(|error| error.raise());
 }
 
-/// T2-N2: local functions that merely reuse libc spellings are not boundary
+/// Local functions that merely reuse libc spellings are not boundary
 /// rows and therefore create no endpoint assertions.
 #[test]
 fn t2_local_wrapper_names_do_not_match_foreign_boundaries() {
@@ -1854,9 +1832,9 @@ unsafe fn wrapper() {
     .unwrap_or_else(|error| error.raise());
 }
 
-/// Observation-only W1 causal-chain dump authorized after the first T2
-/// MAX-3 stop. It makes no assertion about the expected repair; the diagnostic
-/// output is the deliverable.
+/// Observation-only causal-chain dump of endpoint retraction on a
+/// malloc-copy-free chain. It makes no assertion about the expected repair; the
+/// diagnostic output is the deliverable.
 #[test]
 fn t2_w1_causal_chain_diagnostic() {
     const CODE: &str = r#"
@@ -1981,7 +1959,7 @@ unsafe fn chain() {
     .unwrap_or_else(|error| error.raise());
 }
 
-/// RED 6/7 — a transfer produces a move-point candidate; a plain
+/// A transfer produces a move-point candidate; a plain
 /// allocate-and-free does not produce one spuriously *for the same local at the
 /// free site alone*. The candidate set is deliberately over-approximate (a
 /// `free` also clears ownership), which is why the API says "candidates".
@@ -2022,23 +2000,23 @@ unsafe fn f() -> i32 {
 }
 
 // -------------------------------------------------------------------------
-// D1 / D2 / D10 / D11 regression witnesses
+// Regression witnesses
 // -------------------------------------------------------------------------
 
 /// A shape that forces the CEGAR loop to commit and re-solve before accepting.
 ///
 /// `x = id(p)` is a live `Ref` requirer invalidated by the write through the
-/// base `b = p` (A′), so the loop commits twice and accepts on round 3. The
+/// base `b = p`, so the loop commits twice and accepts on round 3. The
 /// round count is pinned by `bo_c1.rs:6461` (`commit.rounds == 3`), and this
 /// test pins it again locally so a change in fixture behaviour cannot silently
-/// turn the D1 witness into a single-round no-op.
+/// turn the multi-round witness into a single-round no-op.
 const CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
      unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
 
 /// Solve with capture, returning the round counters as well.
 ///
-/// `verify_to_fixpoint` is a documented-thin wrapper over the counting loop
-/// (`verify_to_fixpoint_is_thin_wrapper`), so this observes the same run
+/// `verify_to_fixpoint` is a thin wrapper over the counting loop, so this
+/// observes the same run
 /// `capture_solve` does, plus the stats needed to pin the round count.
 fn capture_solve_counting(
     code: &str,
@@ -2165,18 +2143,18 @@ fn decomposed_l2_model_actions_and_export_match_legacy() {
     assert_eq!(decomposed, legacy);
 }
 
-/// **D1** — a fixture that drives more than one validation round must still
+/// A fixture that drives more than one validation round must still
 /// export exactly one record per loan.
 ///
-/// The round count is **pinned**, per the delta review: without it, a fixture
+/// The round count is **pinned**: without it, a fixture
 /// that quietly collapsed to one round would make the uniqueness assertion
 /// inert (duplicates can only arise ACROSS rounds), and the test would pass
 /// with the `begin_round()` reset deleted. `model.is_some()` and non-emptiness
 /// are asserted for the same reason — a first-solve decline would otherwise
 /// satisfy an empty-loan-set uniqueness check with zero signal.
 ///
-/// *Mutation-tested (standing rule).* Deleting `export::begin_round()` from
-/// the Mode-A loop fails this test with "loan … appears more than once".
+/// *Mutation-tested.* Deleting `export::begin_round()` from the plain repair
+/// loop fails this test with "loan … appears more than once".
 #[test]
 fn multi_round_export_holds_only_the_final_round() {
     let (model, stats, export) = capture_solve_counting(CASCADE);
@@ -2199,33 +2177,32 @@ fn multi_round_export_holds_only_the_final_round() {
     }
 }
 
-/// **D17** — the `pub(crate)` L2 door carries the load-bearing precondition.
+/// The `pub(crate)` guarded-repair door carries the load-bearing precondition.
 ///
 /// A tracked solver's hard constraints are track-gated, so every solve in this
 /// loop would be vacuously SAT and the accepted model meaningless. The door
 /// refuses one, naming itself in the message.
 ///
-/// **The `expected` string is deliberately door-specific.** The first version
-/// matched "tracked KindSolver must not enter", and passed with the door's
-/// assert DELETED — because `KindSolver::model_kinds_relaxing` carries its own
-/// release-active guard whose message shares that prefix, and the loop hits it
-/// moments later. That is worth stating plainly: the hazard was already guarded
-/// release-active, so this door's `debug_assert!` is a fail-earlier tripwire,
-/// not the thing preventing a meaningless model.
+/// **The `expected` string is deliberately door-specific.** Matching "tracked
+/// KindSolver must not enter" would pass with the door's assert DELETED,
+/// because `KindSolver::model_kinds_relaxing` carries its own release-active
+/// guard whose message shares that prefix, and the loop hits it moments later.
+/// The hazard is therefore already guarded release-active, so this door's
+/// `debug_assert!` is a fail-earlier tripwire, not the thing preventing a
+/// meaningless model.
 ///
-/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:**
-/// removing the `debug_assert!` makes this test fail — the panic that does
-/// occur comes from the solver accessor and no longer matches `expected`.
+/// *Mutation-tested.* Removing the `debug_assert!` makes this test fail — the
+/// panic that does occur comes from the solver accessor and no longer matches
+/// `expected`.
 #[test]
-// F2: `debug_assert!` is compiled out in release, where the panic instead comes
+// `debug_assert!` is compiled out in release, where the panic instead comes
 // from `model_kinds_relaxing`'s own release-active guard with a DIFFERENT
 // message — so this `expected` would not match and the test would fail on
 // `cargo test --release`. Gate it on the profile that has the assert. The
 // hazard itself remains guarded in release by that downstream assert, which is
-// the finding that made this door's tripwire fail-earlier rather than
-// load-bearing.
+// why this door's tripwire is fail-earlier rather than load-bearing.
 #[cfg(debug_assertions)]
-#[should_panic(expected = "must not enter the l2 door")]
+#[should_panic(expected = "must not enter the guarded-repair door")]
 fn l2_door_rejects_a_tracked_solver() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
         let program = collect_program(tcx);
@@ -2256,7 +2233,7 @@ fn l2_door_rejects_a_tracked_solver() {
     .unwrap_or_else(|e| e.raise());
 }
 
-/// **§1.5 / D19** — loan KEYS are stable across re-inference; indices are not.
+/// Loan KEYS are stable across re-inference; indices are not.
 ///
 /// This is the witness the whole content-key change exists for. `BorrowSet`
 /// numbering permutes because `utils/dsa/union_find.rs` hashes with
@@ -2268,19 +2245,17 @@ fn l2_door_rejects_a_tracked_solver() {
 /// loans (more than one loan at one location), or the permutation has nothing
 /// to permute and the test proves nothing.
 ///
-/// *Mutation-tested, Rider 0 order.* The mutation actually run compares
+/// *Mutation-tested.* The mutation compares
 /// `(fn_did, run_local_handle, place.local)` triples instead of `key`s:
 /// **failed 8/8 runs; unmutated passed 8/8.**
 ///
-/// **Correction to an earlier version of this note**, which said the mutation
-/// was "compare `run_local_handle` sets instead of `key` sets". That recipe is
-/// WEAKER than what was run and would NOT fail: handles are exactly
+/// Comparing bare `run_local_handle` sets instead of `key` sets would be a
+/// weaker mutation that does NOT fail: handles are exactly
 /// `0..n_f-1` per function in both runs (`record_loan_identities` walks
 /// `loans.iter_enumerated()` with no filtering), so the bare-handle sets are
-/// equal by construction. The measurement is real; the recipe as written
-/// described a different mutation.
+/// equal by construction.
 ///
-/// **Known gap (not fixed here):** nothing asserts a permutation actually
+/// **Known gap:** nothing asserts a permutation actually
 /// OCCURRED between the two runs, so this witness would silently stop guarding
 /// if `utils/dsa/union_find.rs` ever used a deterministic hasher. The stronger
 /// form is to build `handle -> key` maps for both runs and `assert_ne!` them.
@@ -2322,25 +2297,23 @@ fn loan_keys_are_stable_across_reinference() {
     );
 }
 
-/// **§1.5 (deterministic form)** — an INJECTED push-order permutation leaves
-/// the key set unchanged while the handles move.
+/// Deterministic form of key stability: an INJECTED push-order permutation
+/// leaves the key set unchanged while the handles move.
 ///
-/// This replaces the hash-seed-dependent half of the stability witness. The
-/// previous form ran the analysis twice and relied on `RandomState` actually
-/// permuting `group()` between the two runs — true today (measured 8/8), but
+/// The run-twice form above relies on `RandomState` actually permuting
+/// `group()` between the two runs — true today (measured 8/8), but
 /// contingent: it would silently stop guarding if `utils/dsa/union_find.rs`
 /// ever used a deterministic hasher, and its "sibling loans exist" proxy is
 /// satisfiable by two `CallArg` loans at one terminator, which come from a
-/// deterministic `args.iter().enumerate()` and cannot permute at all (ADV-3).
+/// deterministic `args.iter().enumerate()` and cannot permute at all.
 ///
 /// Here the permutation is INJECTED rather than hoped for: the same loan
 /// records are built twice with explicitly reversed push order. Content keys
 /// must be identical as a SET; handles must actually differ, which is asserted
 /// so the test cannot pass by accident on an empty or singleton set.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** put
-/// `run_local_handle` back into `LoanKey` (or key the set on
-/// `(key, run_local_handle)`) and the two key sets diverge — deterministically,
+/// *Mutation-tested.* Put `run_local_handle` back into `LoanKey` (or key the
+/// set on `(key, run_local_handle)`) and the two key sets diverge — deterministically,
 /// on every run, with no hash-seed reliance.
 #[test]
 fn injected_push_order_permutation_preserves_keys() {
@@ -2408,13 +2381,13 @@ fn injected_push_order_permutation_preserves_keys() {
     );
 }
 
-/// **§1.5** — the run-local handle must not leak into the consumer as identity.
+/// The run-local handle must not leak into the consumer as identity.
 ///
 /// A grep-shaped guard in the same family as the import-denylist test: the
 /// greenfield rewriter module may name the content key, never the handle.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** add a single
-/// `run_local_handle` mention under `bo_rewriter/` and this fails.
+/// *Mutation-tested.* Add a single `run_local_handle` mention under
+/// `bo_rewriter/` and this fails.
 #[test]
 fn run_local_handle_is_not_used_as_identity() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
@@ -2450,17 +2423,16 @@ fn run_local_handle_is_not_used_as_identity() {
     );
 }
 
-/// **ALLOW-LIST (ruling on ADV-1)** — probe barrage: work outside the armed
-/// region records nothing, and the region's boundary is load-bearing.
+/// **ALLOW-LIST** — probe barrage: work outside the armed region records
+/// nothing, and the region's boundary is load-bearing.
 ///
-/// Replaces the two suspension-era witnesses. Those tested a DENY-LIST — "each
-/// probe surface suspends capture" — which shipped incomplete twice (F1 found
-/// four surfaces; ADV-1 then found a fifth and sixth reached through a helper).
-/// The property is positional now: capture is armed only around the accepted
-/// run, so anything outside it records nothing with no list to maintain.
+/// The property is positional, not a DENY-LIST ("each probe surface suspends
+/// capture"), which is hard to keep complete because probe surfaces are also
+/// reached through helpers. Capture is armed only around the accepted run, so
+/// anything outside it records nothing with no list to maintain.
 ///
 /// The barrage runs representatives of the shapes that corrupted the export
-/// under the deny-list: a full RE-EMISSION (the `build_probe_base` shape, which
+/// under a deny-list: a full RE-EMISSION (the `build_probe_base` shape, which
 /// appended a second copy of every selector site), a SECOND full fixpoint (the
 /// CHECK_REAL shape, whose `begin_round()` wiped the certificate), and a
 /// COUNTERFACTUAL oracle probe (the `probe_accepts_with_ref` /
@@ -2534,10 +2506,6 @@ fn probes_outside_the_armed_region_record_nothing() {
             !narrow.loans.is_empty(),
             "accepted run recorded nothing — inert"
         );
-        // F3 pattern: the L2 accept never calls `record_residuals` (the
-        // documented D2-adjacent gap), so `None` there is CORRECT. Asserting
-        // it explicitly turns that env-sensitivity into a tested property of
-        // both paths instead of a failure that blames the accepted run.
         assert!(
             narrow.residual_conflicts.is_some(),
             "accepted run recorded no certificate — inert"
@@ -2568,18 +2536,17 @@ fn probes_outside_the_armed_region_record_nothing() {
 
 /// **ALLOW-LIST TRIPWIRE** — an oracle probe inside the armed region fails loud.
 ///
-/// The `with_capture_suspended` that used to sit in `model_accepts_with_flows`
-/// was replaced by an assertion rather than deleted. Suspension would MASK an
-/// allow-list violation — a probe that somehow ran inside the armed region
+/// `model_accepts_with_flows` asserts rather than suspending capture.
+/// Suspension would MASK an allow-list violation — a probe that somehow ran inside the armed region
 /// would quietly record nothing and look correct; the assertion names the
 /// invariant instead. A backstop that hides the bug it backstops is worse than
 /// no backstop.
 ///
-/// `#[cfg(debug_assertions)]` for the same reason as the L2 door witness: a
-/// `debug_assert!` is compiled out in release, where this would not panic.
+/// `#[cfg(debug_assertions)]` for the same reason as the guarded-repair door
+/// test: a `debug_assert!` is compiled out in release, where this would not panic.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
-/// `debug_assert!` and no panic occurs, so `should_panic` is unsatisfied.
+/// *Mutation-tested.* Remove the `debug_assert!` and no panic occurs, so
+/// `should_panic` is unsatisfied.
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "allow-list violation")]
@@ -2596,12 +2563,11 @@ fn oracle_probe_inside_the_armed_region_trips_the_wire() {
     .unwrap_or_else(|e| e.raise());
 }
 
-/// **GATE (closing addendum)** — the ambient arm records nothing.
+/// The ambient arm records nothing.
 ///
-/// This is what restores timing comparability for the sweep: `run_bo` arms
-/// through `arm_capture`, so an unset flag means the corpus worker pays no
-/// recording cost and its `t_emit_s`/`t_fixpoint_s` stay comparable to rows
-/// banked before the arm existed.
+/// This keeps timings comparable: `run_bo` arms through `arm_capture`, so an
+/// unset flag means the corpus worker pays no recording cost and its
+/// `t_emit_s`/`t_fixpoint_s` stay comparable to runs without capture.
 #[test]
 fn ambient_arm_is_inert() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {

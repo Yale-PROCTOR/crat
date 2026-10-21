@@ -1,9 +1,9 @@
-//! era-5c relay 213 (R988-1, USER): the MUTABLE copy-lend (`CRAT_ERA5C_COPY_LEND_MUT=on`). A copy
-//! `q = p` whose destination is written through is lent `q = &mut *p` when no read, write or
-//! reassignment of `p` (or of another copy of `p`) happens while `q` is live; the lend's loan is
-//! unique, so the replay stays the judge. Each witness runs in a child under the frame of record's
-//! env (`frames/l01p14u-s39-env.sh`) with the switch as named, and reads the classifier's row for
-//! each copy pair and the settled kinds by name.
+//! The MUTABLE copy-lend (`CRAT_ERA5C_COPY_LEND_MUT=on`). A copy `q = p` whose destination is
+//! written through is lent `q = &mut *p` when no read, write or reassignment of `p` (or of another
+//! copy of `p`) happens while `q` is live; the lend's loan is unique, so the replay stays the
+//! judge. Each witness runs in a child under the reference solve configuration's env file
+//! (`FRAME_ENV`) with the switch as named, and reads the classifier's row for each copy pair and
+//! the settled kinds by name.
 
 use std::collections::BTreeMap;
 
@@ -72,7 +72,7 @@ const OTHER_COPY_IN_WINDOW: &str = r#"
 }
 "#;
 
-/// (iii) the destination released (S2-2): no lend, as today.
+/// (iii) the destination released (the free-destination rule): no lend, as for the shared lend.
 const FREE_DESTINATION: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
@@ -101,7 +101,7 @@ const FREE_AFTER_LAST_USE: &str = r#"
 "#;
 
 /// (iii″) `free(p)` while `q` is live: `q` is used after the release, so the input itself is UB
-/// (§28 owes it nothing); the window check still refuses the lend.
+/// (outside the soundness claim); the window check still refuses the lend.
 const FREE_IN_WINDOW: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
@@ -113,7 +113,7 @@ const FREE_IN_WINDOW: &str = r#"
 }
 "#;
 
-/// (iv) a read-only copy (era-5c 133's `copy_read`): the shared lend, unchanged.
+/// (iv) a read-only copy: the shared lend, unchanged.
 const READ_ONLY: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
@@ -146,7 +146,7 @@ fn shape(name: &str) -> String {
     format!("{LIBC}{body}")
 }
 
-/// The frame of record's arms: every `CRAT_` export but the raw-cause sidecar and the launch
+/// The reference configuration's arms: every `CRAT_` export but the raw-cause sidecar and the launch
 /// identity (`CRAT_ERA5_*`), which a fixture solve does not take.
 fn frame_arms() -> Vec<(String, String)> {
     FRAME_ENV
@@ -231,7 +231,7 @@ fn classifier_rows(code: &str) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "runs under the frame's arms in a child of the e5c_cm witnesses"]
+#[ignore = "runs in a child of the e5c_cm witnesses"]
 fn e5c_inner_copy_lend_mut() {
     let code = shape(&std::env::var("CRAT_E5C_CM_SHAPE").expect("CRAT_E5C_CM_SHAPE"));
     for row in classifier_rows(&code) {
@@ -251,7 +251,7 @@ struct Seen {
     kinds: BTreeMap<String, String>,
 }
 
-/// The shape under the frame's arms and the extra environment `extra` (faults).
+/// The shape under the configuration's arms and the extra environment `extra` (faults).
 fn seen_with(name: &str, extra: &[(&str, &str)]) -> Seen {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
@@ -345,7 +345,7 @@ fn e5c_cm_2_a_read_of_the_owner_in_the_window_refuses_the_lend() {
     assert_eq!(row(&on, "q", "p"), "c2-mutable-window-access", "{on:#?}");
 }
 
-/// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend.
+/// (iii) the destination released (the free-destination rule), or `free(p)` inside `q`'s window: no lend.
 #[test]
 fn e5c_cm_3_a_release_refuses_the_lend() {
     let on = seen("FREE_DESTINATION");

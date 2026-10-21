@@ -1,4 +1,4 @@
-//! L2 context-conditioned single-literal commit planning.
+//! Guarded-repair planning: context-conditioned single-literal commits.
 //!
 //! The planner is pure bookkeeping over one solved model. The production
 //! borrow-verification path translates residual conflicts into observations,
@@ -32,7 +32,7 @@ impl MirLocationKey {
     }
 }
 
-/// Model-independent loan identity ruled by §8/A1.
+/// Model-independent loan identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct StableLoanKey {
     pub(crate) fn_key: FnKey,
@@ -66,9 +66,9 @@ impl StableLoanKey {
 pub(crate) struct HazardKey {
     pub(crate) loan: StableLoanKey,
     pub(crate) invalidators: Vec<SlotKey>,
-    /// R617-1: the invalidators met through an A5 overlap partner (`via_overlap_partner`), so a
-    /// hazard is not merged across the two ways of meeting it. Empty outside A5's context, where
-    /// the key, its order and its diagnostic are unchanged.
+    /// The invalidators met through a parameter-overlap partner (`via_overlap_partner`), so a
+    /// hazard is not merged across the two ways of meeting it. Empty outside the overlap context,
+    /// where the key, its order and its diagnostic are unchanged.
     pub(crate) via_overlap_partner: Vec<SlotKey>,
 }
 
@@ -100,7 +100,7 @@ impl HazardKey {
 
 /// A residual borrow-conflict edge translated wholly into BO slots.
 ///
-/// `target` is the unchanged Mode-A A′ representative. `issuer`,
+/// `target` is the plain repair's unchanged live-requirer representative. `issuer`,
 /// `requirers`, and `invalidators` retain the complete mapped edge
 /// attribution; the planner records each participant's kind in `model`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,10 +110,10 @@ pub(crate) struct ConflictObservation {
     pub(crate) issuer: Option<SlotRef>,
     pub(crate) requirers: Vec<SlotRef>,
     pub(crate) invalidators: Vec<SlotRef>,
-    /// R617-1: the subset of `invalidators` met through an A5 overlap partner.
+    /// The subset of `invalidators` met through a parameter-overlap partner.
     pub(crate) overlap_invalidators: Vec<SlotRef>,
-    /// Diagnostic-only per-model ordinal retained during MINI-RED. GREEN-3
-    /// must never use it for recurrence identity.
+    /// Diagnostic-only per-model ordinal. Recurrence identity must never use
+    /// it.
     loan_ordinal: usize,
     stable_loan_key: Option<StableLoanKey>,
     explicit_loan_identity: bool,
@@ -145,7 +145,7 @@ impl ConflictObservation {
         self
     }
 
-    /// R617-1: mark the invalidators met through an A5 overlap partner.
+    /// Mark the invalidators met through a parameter-overlap partner.
     pub(crate) fn with_overlap_invalidators(mut self, overlap_invalidators: Vec<SlotRef>) -> Self {
         self.overlap_invalidators = overlap_invalidators;
         self
@@ -230,12 +230,12 @@ impl SlotKey {
     }
 }
 
-/// Canonical `SlotRef` encoding shared by L2 action and final-kind diagnostics.
+/// Canonical `SlotRef` encoding shared by guarded-repair action and final-kind diagnostics.
 pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
     SlotKey::of(slot).diagnostic()
 }
 
-/// R7 identity for one validation conflict before commit planning. The loan
+/// Diagnostic identity for one validation conflict before commit planning. The loan
 /// index is retained only here; it does not enter clause identity, ordering, or
 /// solver semantics.
 #[cfg(test)]
@@ -287,7 +287,7 @@ pub(crate) struct EdgeAttribution {
     pub(crate) invalidators: Vec<SlotKey>,
 }
 
-/// Canonical R7 diagnostic identity.
+/// Canonical diagnostic identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DiagnosticKey {
     pub(crate) target: SlotKey,
@@ -316,7 +316,7 @@ pub(crate) struct PeerWitness {
     pub(crate) kind: WitnessedKind,
 }
 
-/// One witnessed-context L2 clause.
+/// One witnessed-context guarded-repair clause.
 ///
 /// `negative_refs` contains Ref-witnessed peers plus the fixed target.
 /// `positive_refs` contains Raw-witnessed peers. The target remains negative
@@ -385,8 +385,8 @@ impl CommitActionKind {
 pub(crate) struct CommitAction {
     pub(crate) target: SlotRef,
     /// Canonical edge-local peer set. For escalation this records the
-    /// reappearing context for R7 even though the emitted assertion is
-    /// unconditional.
+    /// reappearing context for the diagnostics even though the emitted
+    /// assertion is unconditional.
     pub(crate) peers: Vec<SlotRef>,
     pub(crate) peer_witnesses: Vec<PeerWitness>,
     pub(crate) owning_peers: Vec<SlotRef>,
@@ -399,10 +399,10 @@ pub(crate) struct CommitAction {
     pub(crate) diagnostic_label: String,
 }
 
-/// R7-only snapshot of one already-asserted L2 clause at a later validation
-/// round. Every literal records its current kind, Boolean value, transition
-/// from the preceding solved model, and whether that slot is itself governed
-/// by an L2 guarded/permanent lifecycle.
+/// Diagnostic-only snapshot of one already-asserted guarded-repair clause at a
+/// later validation round. Every literal records its current kind, Boolean
+/// value, transition from the preceding solved model, and whether that slot is
+/// itself governed by a guarded/permanent lifecycle.
 #[cfg(test)]
 pub(crate) fn clause_state_diagnostic(
     action: &CommitAction,
@@ -617,7 +617,7 @@ pub(crate) enum RoundPlan {
     },
 }
 
-/// Per-fixpoint-invocation L2 state. Every selected slot advances monotonically
+/// Per-fixpoint-invocation guarded-repair state. Every selected slot advances monotonically
 /// through `Unseen → Guarded → Permanent`.
 pub(crate) struct Planner {
     slot_count: usize,
@@ -642,7 +642,7 @@ impl Planner {
 
     pub(crate) fn validation_cap(&self) -> usize {
         self.try_validation_cap()
-            .expect("L2 validation-round cap overflow")
+            .expect("guarded-repair validation-round cap overflow")
     }
 
     fn try_validation_cap(&self) -> Option<usize> {
@@ -785,7 +785,7 @@ impl Planner {
 
                     let guarded = epochs_before
                         .get(&target)
-                        .expect("a Guarded L2 target has a stored epoch");
+                        .expect("a guarded-repair target has a stored epoch");
                     let mut repeated = Vec::new();
                     for mut candidate in observed {
                         let key = candidate
@@ -1008,7 +1008,7 @@ impl Planner {
         let h = self.epochs.values().map(Vec::len).sum::<usize>();
         let psi = phi
             .checked_add(h)
-            .expect("L2 diagnostic potential overflow");
+            .expect("guarded-repair diagnostic potential overflow");
         if actions.is_empty() {
             return RoundPlan::Decline {
                 validation_round,
@@ -1236,7 +1236,7 @@ impl Candidate {
             self.primary_hazard_key().cloned(),
             self.edge_attributions
                 .first()
-                .expect("every L2 candidate retains its spawning edge"),
+                .expect("every guarded-repair candidate retains its spawning edge"),
         )
     }
 
@@ -1318,7 +1318,7 @@ impl Candidate {
             self.clause_key(),
             self.edge_attributions
                 .first()
-                .expect("every L2 candidate retains its spawning edge"),
+                .expect("every guarded-repair candidate retains its spawning edge"),
         )
     }
 
@@ -1342,7 +1342,7 @@ impl Candidate {
         let primary_attribution = self
             .edge_attributions
             .first()
-            .expect("every L2 action retains a canonical spawning edge");
+            .expect("every guarded-repair action retains a canonical spawning edge");
         let diagnostic_key = DiagnosticKey {
             target: SlotKey::of(self.target),
             peers: slot_keys(&self.peers),

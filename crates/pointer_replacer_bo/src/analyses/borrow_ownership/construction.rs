@@ -106,7 +106,7 @@ pub(crate) struct CopyLendEligibility {
     pub(crate) sites: Vec<CopyLendSite>,
 }
 
-/// Exact primary exclusion used by the retained A12 funnel diagnostic. The
+/// Exact primary exclusion used by the retained copy-lend funnel diagnostic. The
 /// production predicate and the diagnostic share this enum-returning
 /// classifier, so measurement cannot silently reinterpret eligibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,11 +122,11 @@ pub(crate) enum CopyLendEligibilityDrop {
     C3OrdinaryCall,
     C3ReallocSource,
     C3OutwardUnknownCall,
-    /// L01¹⁴ (R804-1): the source holds its caller's value and nothing in the
-    /// function releases it, so the lend reading would make an owner of a value the
-    /// function was only handed (R536-4).
+    /// The source holds its caller's value and nothing in the function releases it,
+    /// so the lend reading would make an owner of a value the function was only
+    /// handed.
     GuardCallerDerivedSource,
-    /// era-5c relay 213 (`CRAT_ERA5C_COPY_LEND_MUT=on`): the destination is written through and
+    /// Mutable copy-lend (`CRAT_ERA5C_COPY_LEND_MUT=on`): the destination is written through and
     /// `p`, or another copy of `p`, is used while `q` is live, so `q = &mut *p` would not be
     /// unique.
     C2MutableWindowAccess,
@@ -244,8 +244,9 @@ pub(crate) struct VerifiedBo {
     pub(crate) producer_stats: super::overlap_producer::OverlapProducerStats,
 }
 
-/// Typed diagnostic for every `None` boundary before the production A5 worker
-/// can write its model and T2/ESC ledgers. Production callers retain the
+/// Typed diagnostic for every `None` boundary before the production overlap
+/// worker can write its model and its endpoint-retraction and escape-minimal
+/// ledgers. Production callers retain the
 /// historical `Option` API; measurement callers use the reporting twin below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapPreledgerDeclineReason {
@@ -292,7 +293,7 @@ impl OverlapPreledgerDeclineReason {
 }
 
 /// Name which of `verify_to_fixpoint`'s `None` exits fired, from the stats it
-/// fills on the way out (era-5c report 040).
+/// fills on the way out.
 fn precise_verification_cause(stats: &super::borrow_verify::RoundStats) -> String {
     let cause = if stats.cap_exhausted {
         "cap-exhausted".to_owned()
@@ -475,9 +476,9 @@ fn receipt_field<'a>(receipt: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(&format!("{key}=")))
 }
 
-/// Rebuild only the session-local C9 mark carriers needed by the rewriter from
-/// a cached precise model. No solver is constructed or queried here: the A5
-/// plan is a deterministic MIR/fact projection from the cached baseline model,
+/// Rebuild only the session-local copy-mark carriers needed by the rewriter from
+/// a cached precise model. No solver is constructed or queried here: the
+/// overlap plan is a deterministic MIR/fact projection from the cached baseline model,
 /// and the persisted construction receipt is checked against both the plan and
 /// the consumed final model before its spans are admitted.
 pub(crate) fn cached_precise_rewriter_payload(
@@ -634,9 +635,9 @@ fn canonical_receipt(input: String) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-/// R617-1 STOP 2 (R631-7): the guarded repair's stamp, only when a verification ran guarded, so
-/// every Mode-A receipt is byte-identical. `repair=guarded->mode-a` when any guarded run declined
-/// and its program fell back to Mode-A; the fallbacks are counted and their reasons named.
+/// The guarded repair's stamp, only when a verification ran guarded, so every plain-repair
+/// receipt is byte-identical. `repair=guarded->mode-a` when any guarded run declined and its
+/// program fell back to the plain repair; the fallbacks are counted and their reasons named.
 fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> String {
     let guarded = stats
         .iter()
@@ -676,7 +677,7 @@ fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> 
     canonical_receipt(receipt)
 }
 
-/// R609-3 (b): the type route's count and digest, only when it removed a pair,
+/// The type route's count and digest, only when it removed a pair,
 /// so every receipt without one is byte-identical.
 fn type_disjoint_keys(plan: &OverlapPlan, mut receipt: String) -> String {
     if !plan.type_disjoint.is_empty() {
@@ -770,7 +771,7 @@ fn construct_bo_overlap_reference(
     )
 }
 
-/// One eligible-or-not copy pair of the A12 funnel on the A5 frame (R549-2 (ii)).
+/// One eligible-or-not copy pair of the copy-lend funnel on the overlap solve.
 #[cfg(test)]
 pub(crate) struct FrameFunnelRow {
     pub(crate) fn_did: LocalDefId,
@@ -780,15 +781,15 @@ pub(crate) struct FrameFunnelRow {
     /// `None` = S1 (eligible under C1–C4).
     pub(crate) drop: Option<CopyLendEligibilityDrop>,
     /// S2: the lend reading (destination Ref, source Owning) is satisfiable in the
-    /// frame's hard universe; `None` for an ineligible pair.
+    /// solve's hard universe; `None` for an ineligible pair.
     pub(crate) lend: Option<z3::SatResult>,
     /// The source alone Owning, for attribution; `None` for an ineligible pair.
     pub(crate) source_own: Option<z3::SatResult>,
     pub(crate) shape: &'static str,
 }
 
-/// The A12 funnel S0 → S2 on the A5 frame's reference construction (R549-2 (ii),
-/// R552-5): S0 = every depth-0 local copy pair, S1 = C1–C4 eligible, S2 = the lend
+/// The copy-lend funnel S0 → S2 on the overlap solve's reference construction:
+/// S0 = every depth-0 local copy pair, S1 = C1–C4 eligible, S2 = the lend
 /// reading satisfiable in the hard universe (endpoint selectors free) built under
 /// the caller's arms, `CRAT_ERA5C_COPY_LEND=on` included. Measurement only.
 #[cfg(test)]
@@ -862,7 +863,7 @@ pub(crate) fn copy_lend_frame_funnel(
     })
 }
 
-/// A4 (R560): why a slot is not Owning / not Ref at the frame. On the A5 reference
+/// Wall probe: why a slot is not Owning / not Ref in the overlap solve. On its reference
 /// construction's hard universe (assertion-tracked), each target is asked
 /// `own` and `ref ∧ ¬own`, first alone ("hard") and then with every `holds` slot
 /// kept at its accepted kind ("held": Ref slots keep `ref`, Owning slots keep
@@ -1307,7 +1308,7 @@ fn add_refined_return_kind_links(
     links
 }
 
-/// Accepted A16-REFINE construction: add one-way links only for
+/// Accepted return-refinement construction: add one-way links only for
 /// modeled-origin returns and report their exact site count.
 #[cfg(test)]
 pub(crate) fn construct_bo_into_return_refined(
@@ -1344,7 +1345,7 @@ fn construct_bo_into_a16_refined_with_esc(
     Ok((construction, links))
 }
 
-/// D1-authorized parked-census migration: shared construction, baseline mode, with the harness's
+/// Shared construction for the parked tracking harness: baseline mode, with the harness's
 /// existing Use-family tracking preserved exactly. No eligibility or lend behavior is reachable.
 #[cfg(test)]
 pub(crate) fn construct_tracked_census_baseline(
@@ -1495,7 +1496,7 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
     assert_ne!(
         construction.mode,
         CopyLendMode::RemovalOnly,
-        "A5 focused replay runs Baseline or the LendArm selector, never RemovalOnly"
+        "the parameter-overlap focused replay runs Baseline or the LendArm selector, never RemovalOnly"
     );
     with_construction_replay(construction, || {
         verify_constructed_to_fixpoint(
@@ -1618,7 +1619,7 @@ pub(crate) fn verify_bo_construction_counting_for_test(
     })
 }
 
-/// L2 twin of `verify_bo_construction_counting_for_test`, owned by the same
+/// Guarded-repair twin of `verify_bo_construction_counting_for_test`, owned by the same
 /// production construction boundary.
 #[cfg(test)]
 pub(crate) fn verify_bo_construction_l2_for_test(
@@ -1673,8 +1674,8 @@ pub(crate) fn solve_bo_overlap_config_reporting(
     mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Result<VerifiedBo, OverlapPreledgerDecline> {
-    // A16-REFINE is part of the accepted precise production semantics. The
-    // retained Baseline mode is a diagnostic A5 control, not another
+    // Return refinement is part of the precise production semantics. The
+    // retained Baseline mode is a diagnostic overlap control, not another
     // production configuration.
     let refined = mode == OverlapMode::PreciseReplay;
     // Complete cache capture is owned here only when no caller already owns
@@ -1700,9 +1701,9 @@ pub(crate) fn solve_bo_overlap_config_reporting(
     Ok(verified)
 }
 
-/// Measurement reference: accepted A5/A16 production semantics with Phase-2
-/// escaped-loan selection disabled in both the planning baseline and candidate
-/// construction. This is the byte-equivalence path to c080.
+/// Measurement reference: the overlap and return-refinement production semantics
+/// with escaped-loan selection disabled in both the planning baseline and candidate
+/// construction. This is the byte-equivalence reference path.
 #[cfg(test)]
 pub(crate) fn solve_bo_overlap_reference_reporting(
     program: &RustProgram<'_>,
@@ -1780,15 +1781,15 @@ fn solve_bo_overlap_config_with_source_events(
     refined: bool,
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), OverlapPreledgerDecline> {
-    // R549-2 (i): the A5 frame runs Baseline, or LendArm under
+    // The overlap solve runs Baseline, or LendArm under
     // `CRAT_ERA5C_COPY_LEND=on`; RemovalOnly is a measurement mode with no
-    // environment route and never reaches the frame.
+    // environment route and never reaches this solve.
     assert_ne!(
         CopyLendMode::current(),
         CopyLendMode::RemovalOnly,
         "the overlap solve runs the baseline or the lend-arm copy-lend mode, never removal-only"
     );
-    // era-5c relay 208 (S39 (b)): the copies the relaxation may take, for this solve.
+    // The copies the depth-0 relaxation may take, for this solve.
     let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());
     super::copy_relax::install(eligible);
 
@@ -1937,9 +1938,9 @@ fn solve_bo_overlap_config_with_source_events(
     })?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         if refined {
-            // Refusing A5 promotion must not also disable the independently
-            // accepted A16-REFINE constraint. Product/unattested mode keeps
-            // the A5 guard's fallback while applying the same one-way return
+            // Refusing overlap promotion must not also disable the independently
+            // applied return-refinement constraint. Product/unattested mode keeps
+            // the overlap guard's fallback while applying the same one-way return
             // rule as the attested production path.
             let solver = KindSolver::new(slots);
             let (construction, refined_links) = construct_bo_into_a16_refined_with_esc(
@@ -2181,9 +2182,8 @@ fn solve_bo_overlap_config_with_source_events(
                 mut_facts,
                 &plan.effective_overlaps,
             );
-            // era-5c report 040: the verification loop has seven `None` exits,
-            // each recorded in `RoundStats`, and this site used to discard them
-            // (`detail: None`) -- brotli's L01⁶ decline could not say which one
+            // The verification loop has seven `None` exits, each recorded in
+            // `RoundStats`; without the detail a decline could not say which one
             // fired. Carry the cause in the decline's detail.
             let detail = precise_verification_cause(&stats);
             (
@@ -2343,12 +2343,13 @@ pub(crate) fn analyze_copy_lend_eligibility(
     eligible
 }
 
-/// era-5c relay 208, S39 (b): the copies the depth-0 relaxation may take. A bare copy `q = p`
-/// between locals is eligible only when the destination's value never leaves the function: no
-/// store into a field, an aggregate or an unresolved place, no return, no call argument and no
-/// release over the destination's depth-0 value-flow closure (the copy-lend arm's C3 and S2-2,
-/// on the destination alone). Under Tree Borrows the raw copy carries its source's tag, and the
-/// merge liveness keeps the source's loans live only through the copy's uses in this function.
+/// The copies the depth-0 relaxation may take. A bare copy `q = p` between locals is eligible
+/// only when the destination's value never leaves the function: no store into a field, an
+/// aggregate or an unresolved place, no return, no call argument and no release over the
+/// destination's depth-0 value-flow closure (the copy-lend arm's C3 and its free-destination
+/// rule, on the destination alone). Under Tree Borrows the raw copy carries its source's tag,
+/// and the merge liveness keeps the source's loans live only through the copy's uses in this
+/// function.
 pub(crate) fn analyze_copy_relax_sites(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -2437,7 +2438,7 @@ fn copy_relax_closure<'tcx>(
     }
 }
 
-/// S39 (b): whether a member of the closure leaves the function, wherever it is live: a store
+/// Whether a member of the relaxation's closure leaves the function, wherever it is live: a store
 /// into memory (a field, an aggregate, through a pointer, an unresolved place), a return, or an
 /// argument of any call but a core pointer method.
 fn copy_relax_escape<'tcx>(
@@ -2447,8 +2448,8 @@ fn copy_relax_escape<'tcx>(
     body: &Body<'tcx>,
     closure: &FxHashSet<SlotOwner>,
 ) -> Option<CopyLendEligibilityDrop> {
-    // era-5c relay 210: a copy INTO the return place (`_0 = p`, kazmath's `return pOut`) escapes
-    // by its destination itself.
+    // A copy INTO the return place (`_0 = p`, a `return p` in the source) escapes by its
+    // destination itself.
     if closure.contains(&SlotOwner::Local(RETURN_PLACE)) {
         return Some(CopyLendEligibilityDrop::C3Return);
     }
@@ -2593,7 +2594,7 @@ pub(crate) fn analyze_copy_lend_candidates(
             } else {
                 live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
             };
-            // R804-1: lend only an owner the function makes or releases itself.
+            // Lend only an owner the function makes or releases itself.
             let rhs_local = sites[0].rhs_local;
             let drop = drop.or_else(|| {
                 let released = destination_flows_to_deallocator(
@@ -2616,10 +2617,10 @@ pub(crate) fn analyze_copy_lend_candidates(
     answer
 }
 
-/// relay 213: the window check of a mutable copy-lend (era-5c 163's, shared by measurement and
-/// production). From just after each copy, every location where `q` may still be live is
-/// searched for a use of `p` or of a copy of `p` that is not a copy of `q` (a read, a write, a
-/// reassignment, a release or a pass to a call: any use of the local). Returns the first such
+/// The window check of a mutable copy-lend, shared by measurement and production. From just
+/// after each copy, every location where `q` may still be live is searched for a use of `p`
+/// or of a copy of `p` that is not a copy of `q` (a read, a write, a reassignment, a release
+/// or a pass to a call: any use of the local). Returns the first such
 /// location. The replay's unique loan is the judge; this is its static twin.
 fn copy_lend_window_access(
     body: &Body<'_>,

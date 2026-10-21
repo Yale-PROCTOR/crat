@@ -1,6 +1,5 @@
-//! R310-3 witnesses for (c): a borrowing callee's contract at a call boundary.
-//! Staged RED-first. These are the shapes report 016 measured as holding bst's
-//! remaining `deleteNode` path and both of avl's rotations. Fixtures are never
+//! Witnesses for a borrowing callee's contract at a call boundary: a tree
+//! delete through a min-value helper and a tree rotation. Fixtures are never
 //! executed.
 use super::{
     facts::Facts,
@@ -31,7 +30,7 @@ unsafe extern "C"{fn free(p:*mut core::ffi::c_void);}
 pub struct Node{left:*mut Node,right:*mut Node}
 "#;
 
-/// W-VW-1: the shape that holds bst's last `deleteNode` path. `minValue`
+/// A tree delete through a min-value helper. `minValue`
 /// borrows — it walks a view and hands one back — so the component it was given
 /// is still the caller's afterwards. Modelled as a move, the token lands in `v`
 /// and is dropped while `(*root).child` still names it.
@@ -43,7 +42,7 @@ pub unsafe fn peek(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-VW-2: avl's rotation. The parameter is stored **into its own descendant's**
+/// A tree rotation. The parameter is stored **into its own descendant's**
 /// field and the descendant is returned, with a grandchild read in between.
 const VW2: &str = r#"
 pub unsafe fn rotate(x:*mut Node)->*mut Node{
@@ -55,16 +54,15 @@ pub unsafe fn rotate(x:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-VW-3: a borrowed view stored into a cell. **This certifies today, and the
-/// expectation below is the one I am least sure of.** Both readings are in
-/// report 017; the short version is that `root->child = minValue(root->child)`
+/// A borrowed view stored into a cell. **This certifies today, and the
+/// expectation below is the least certain one.** One reading is that
+/// `root->child = minValue(root->child)`
 /// makes the cell name a node deep inside its own old subtree, and the spine
 /// above it becomes unreachable. That is a *leak*, which the input program
 /// commits too and which crat owes no parity on — not a double free, since
 /// nothing reachable still names the skipped nodes. If that reading holds the
 /// assertion below is wrong and this becomes a positive. Staged as written so
-/// the question is visible rather than settled by whichever way I happened to
-/// write it.
+/// the question stays visible rather than settled by accident.
 const VW3: &str = r#"
 pub unsafe fn stash(root:*mut Node)->*mut Node{
  (*root).child=minValue((*root).child);
@@ -72,7 +70,7 @@ pub unsafe fn stash(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-VW-4 (R336-2): a lent view SUNK. `minValue` only lent the component, so
+/// A lent view SUNK. `minValue` only lent the component, so
 /// the caller still owns it; freeing the view frees a subtree the caller is
 /// still responsible for, and on the emitted side it is a `free` through what
 /// became a borrow into a `Box`. Must refuse.
@@ -84,9 +82,9 @@ pub unsafe fn dropView(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-VW-5 (R336-2): a view THROUGH A WRAPPER. `hop` hands back what `minValue`
+/// A view THROUGH A WRAPPER. `hop` hands back what `minValue`
 /// lent it, so `hop`'s own return is a view; storing it into an owning cell is
-/// W-VW-3 one call further out. Must refuse, and `hop`'s classification is the
+/// the view-into-cell shape one call further out. Must refuse, and `hop`'s classification is the
 /// thing to measure.
 const VW5: &str = r#"
 pub unsafe fn hop(root:*mut Node)->*mut Node{ minValue((*root).child) }
@@ -125,13 +123,13 @@ fn w_vw_5_a_view_through_a_wrapper_is_refused() {
     });
 }
 
-/// W-VW-2n-d (R337-3(ii)): `x` lands at `y.left` with its own `right` cell
+/// `x` lands at `y.left` with its own `right` cell
 /// consumed and never refilled. In C that cell still holds `y` — a cycle, and
 /// UB-free — but the model consumes on read and the emitted owning form moves
 /// the token out, so a later read of `y.left.right` sees `y` in C and nothing in
-/// the emitted program. That divergence is outside §28, so a landed object's
-/// consumed, unrefilled cell must refuse. Measured at depth one first, per the
-/// ruling, before any depth-2 machinery exists.
+/// the emitted program. That divergence is not excused by the UB-free-input
+/// premise, so a landed object's consumed, unrefilled cell must refuse. Checked
+/// at depth one, before any depth-2 machinery exists.
 const VW2ND: &str = r#"
 pub unsafe fn twist(x:*mut Node)->*mut Node{
  let y=(*x).right;
@@ -161,7 +159,7 @@ fn w_vw_1_a_borrowed_view_that_is_dropped_certifies() {
 }
 
 #[test]
-#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
+#[ignore = "a staged licensing witness that does not hold under the current analysis"]
 fn w_vw_2_the_rotation_certifies() {
     with_facts(&format!("{WIDE_PRELUDE}{VW2}"), |facts| {
         certify(facts, "rotate", 1).expect("the parameter is folded under its own descendant");

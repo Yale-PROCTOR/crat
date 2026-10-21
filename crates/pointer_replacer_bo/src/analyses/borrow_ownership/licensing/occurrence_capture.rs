@@ -1,7 +1,7 @@
-//! R237's explicitly invoked bst-only construction diagnostic. Never a model worker.
+//! An explicitly invoked, bst-only construction diagnostic. Never a model worker.
 
 #[test]
-#[ignore = "R237 bst-only zero-solve capture; requires its sealed supervisor"]
+#[ignore = "a bst-only zero-solve capture; requires its supervisor"]
 fn e06_bst_occurrence_capture() {
     use std::{io::Write, path::Path};
 

@@ -1,4 +1,4 @@
-//! OL01–OL12 kind witnesses. The embedded programs are compiler inputs only.
+//! Ownership-licensing kind witnesses. The embedded programs are compiler inputs only.
 //! Occurrence, responsibility and endpoint assertions are added at their due
 //! export/transport phases; lifetime-wide owning kinds do not count live tokens.
 
@@ -90,7 +90,7 @@ pub unsafe fn f() -> *mut node {
 }
 "#;
 
-/// R336-5: bst's `deleteNode` uses BOTH of its structure's pointer fields. With the
+/// bst's `deleteNode` uses BOTH of its structure's pointer fields. With the
 /// per-path token disposition the member plan admits no decision for bst.
 #[test]
 fn r336_5_bst_has_no_member_decision() {
@@ -117,7 +117,7 @@ fn r336_5_bst_has_no_member_decision() {
 }
 
 #[test]
-#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
+#[ignore = "a staged licensing witness that does not hold under the current analysis"]
 fn c08_bst_attested_chain_obligations() {
     let fixture = super::tests::inspect_attested_frame(BST);
     eprintln!(
@@ -144,7 +144,7 @@ fn c08_bst_attested_chain_obligations() {
 }
 
 #[test]
-#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
+#[ignore = "a staged licensing witness that does not hold under the current analysis"]
 fn ol01_bst_return_field_and_free_chain_owns_the_named_carriers() {
     let fixture = inspect(BST);
     assert_kinds(
@@ -164,7 +164,7 @@ fn ol01_bst_return_field_and_free_chain_owns_the_named_carriers() {
 }
 
 #[test]
-#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
+#[ignore = "a staged licensing witness that does not hold under the current analysis"]
 fn ol02_bst_field_readers_keep_references_beside_the_owning_delete_path() {
     let fixture = inspect(BST);
     assert_kinds(
@@ -182,7 +182,7 @@ fn ol02_bst_field_readers_keep_references_beside_the_owning_delete_path() {
 }
 
 #[test]
-#[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
+#[ignore = "a staged licensing witness that does not hold under the current analysis"]
 fn ol03_avl_single_and_double_rotations_transport_source_only_owners() {
     let fixture = inspect(
         r#"
@@ -333,7 +333,7 @@ pub unsafe fn second(p: *mut i32, n: u32) -> *mut i32 {
 
 #[test]
 fn ol06_under_the_lend_the_cell_is_a_reference_and_the_payload_stays_raw() {
-    // Era-5a's explicit closed frame is required for original-cell caller
+    // An explicit closed frame is required for original-cell caller
     // coverage; the unattested negative remains in chain_permission tests.
     let fixture = super::tests::inspect_attested_frame(
         r#"
@@ -420,8 +420,8 @@ pub unsafe fn f() -> i32 {
 
 #[test]
 fn ol07_under_the_record_the_ifl3_payload_and_field_stay_raw() {
-    // Literal IFL3 sequence: aggregate, read, callee free, return saved scalar.
-    // Use the accepted era-5 frame's explicit frozen-graph attestation. The
+    // The literal sequence: aggregate, read, callee free, return saved scalar.
+    // Use an accepted frame's explicit frozen-graph attestation. The
     // unattested public-entry case remains a separate conservative control.
     let fixture = super::tests::inspect_attested_frame(
         r#"
@@ -641,7 +641,7 @@ pub unsafe fn borrowed(p: *mut i32) -> *mut i32 {
     assert_kinds(&fresh, &[("receiver::value", SlotKind::Owning)]);
 }
 
-/// Preflight (R326-1 i): the typed hold carried by every bst and avl fold
+/// Preflight: the typed hold carried by every bst and avl fold
 /// declaration, so the measurement reports reasons rather than a blank.
 #[test]
 #[ignore = "preflight census; run explicitly"]
@@ -721,7 +721,7 @@ pub unsafe fn f(left: bool) -> *mut Avl {
                     effect.field_keys
                 );
             }
-            // R337-2(a): every occurrence the caller gate refuses, classified.
+            // Every occurrence the caller gate refuses, classified.
             for declaration in facts.fold_declarations.as_deref().unwrap_or_default() {
                 let call = &declaration.call;
                 let Ok(refused) = super::fold_caller::unsupported_occurrences(

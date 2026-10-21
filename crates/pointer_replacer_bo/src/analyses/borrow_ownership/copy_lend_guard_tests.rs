@@ -1,5 +1,5 @@
-//! L01¹⁴ (R804-1, era-5c 133): the copy-lend arm lends only an owner the function
-//! makes or releases itself, never its caller's value (R536-4).
+//! The copy-lend arm lends only an owner the function makes or releases itself,
+//! never its caller's value.
 
 use rustc_hir::{ItemKind, OwnerNode};
 
@@ -59,8 +59,8 @@ fn drop_of(rows: &[String], function: &str, source: &str) -> String {
         .to_string()
 }
 
-/// lodepng's sixteen (104a): an entry's formal copied into a local and only read.
-/// bzip2's `copy_read` (104 §1): a local allocation copied and read, then released.
+/// An entry's formal copied into a local and only read.
+/// A local allocation copied and read, then released.
 /// A formal the function releases itself.
 const SHAPES: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types)]
@@ -117,11 +117,11 @@ fn e5c_l14_g3_a_formal_the_function_releases_is_still_lent() {
     );
 }
 
-/// The guarded funnel's S1 over a named program (era-5c 133): every copy-lend
+/// The guarded funnel's candidate listing over a named source file: every copy-lend
 /// candidate with its drop. `CRAT_E5C_SIDE_SOURCE` names the source, the rows go to
 /// `CRAT_E5C_SIDE_ROWS`.
 #[test]
-#[ignore = "the guarded funnel's S1 driver (era-5c 133)"]
+#[ignore = "the guarded funnel's first-stage driver; run on a named source"]
 fn e5c_l14_guarded_funnel_named_source() {
     let path = std::env::var("CRAT_E5C_SIDE_SOURCE").expect("CRAT_E5C_SIDE_SOURCE");
     let out = std::env::var("CRAT_E5C_SIDE_ROWS").expect("CRAT_E5C_SIDE_ROWS");
@@ -131,12 +131,12 @@ fn e5c_l14_guarded_funnel_named_source() {
     eprintln!("E5C_L14_FUNNEL {path} pairs={}", rows.len());
 }
 
-/// era-5c 134: the digest of the system the solve starts from (hard and soft), after
+/// The digest of the system the solve starts from (hard and soft), after
 /// the construction, under the copy-lend mode of the environment. Run once with the
 /// arm off and once on, each in its own process: equal digests mean the arm leaves
 /// the program's constraint system byte-identical.
 #[test]
-#[ignore = "the construction digest driver (era-5c 134)"]
+#[ignore = "the construction digest driver; run on a named source"]
 fn e5c_l14_construction_digest_named_source() {
     use sha2::{Digest, Sha256};
     let path = std::env::var("CRAT_E5C_SIDE_SOURCE").expect("CRAT_E5C_SIDE_SOURCE");

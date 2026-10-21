@@ -1,13 +1,12 @@
-//! era-5c relay 208 (S39): the depth-0 Copy relaxation and the merge liveness. Each witness runs
-//! the full solve of a fixture (the joint pass, borrow verification, retirement, the relax loop) in
-//! a child under the frame of record's arms (`frames/l01p14u-env.sh`) and reads the settled kinds
-//! by name.
+//! The depth-0 Copy relaxation and the merge liveness. Each witness runs the full solve of a
+//! fixture (the joint pass, borrow verification, retirement, the relax loop) in a child under the
+//! switches of the pinned env file and reads the settled kinds by name.
 
 use std::collections::BTreeMap;
 
 const FRAME_ENV: &str = include_str!("../../../frames/l01p14u-env.sh");
 
-/// The frame's arms: every `CRAT_` export of the frame's env file but the raw-cause sidecar and
+/// The pinned switches: every `CRAT_` export of the env file but the raw-cause sidecar and
 /// the launch identity (`CRAT_ERA5_*`), which a fixture solve does not take.
 fn frame_arms() -> Vec<(String, String)> {
     FRAME_ENV
@@ -57,7 +56,7 @@ const WRITE_BETWEEN: &str = r#"
 }
 "#;
 
-/// S39 (b): the raw copy escapes as a return.
+/// The raw copy escapes as a return.
 const ESCAPE_RETURN: &str = r#"
 unsafe fn get(p: *mut i32) -> *mut i32 {
     *p = 1;
@@ -69,7 +68,7 @@ unsafe fn get(p: *mut i32) -> *mut i32 {
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 { let mut x: i32 = 0; let y = get(&mut x); *y = 3; return x; }
 "#;
 
-/// era-5c relay 210: the copy is the return itself (`_0 = p`; heman's kazmath `return pOut`).
+/// The copy is the return itself (`_0 = p`, as in a routine that returns its output parameter).
 const RETURN_DIRECT: &str = r#"
 unsafe fn out(p: *mut i32, q: *mut i32) -> *mut i32 {
     *p = *q + 1;
@@ -83,7 +82,7 @@ unsafe fn out(p: *mut i32, q: *mut i32) -> *mut i32 {
 }
 "#;
 
-/// S39 (b): the raw copy escapes into a call.
+/// The raw copy escapes into a call.
 const ESCAPE_CALL: &str = r#"
 unsafe extern "C" { fn keep(p: *mut i32); }
 unsafe fn give(p: *mut i32) {
@@ -96,7 +95,7 @@ unsafe fn give(p: *mut i32) {
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 { let mut x: i32 = 0; give(&mut x); return x; }
 "#;
 
-/// S39 (b): the raw copy escapes into a field.
+/// The raw copy escapes into a field.
 const ESCAPE_FIELD: &str = r#"
 #[repr(C)] pub struct S { pub f: *mut i32, pub n: i32 }
 unsafe fn put(s: *mut S, p: *mut i32) {
@@ -124,7 +123,7 @@ unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); fn si
 }
 "#;
 
-/// (4) wave-6o 184's shape: a cast (Copy's equality does not apply), the referent written
+/// (4) A cast (Copy's equality does not apply), the referent written
 /// between the view's uses. The merge liveness alone must make `p` raw.
 const CAST: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
@@ -218,7 +217,7 @@ pub(super) fn kinds(code: &str) -> BTreeMap<String, String> {
 }
 
 #[test]
-#[ignore = "runs under the frame's arms in a child of the e5c_cr witnesses"]
+#[ignore = "runs in a child of the e5c_cr witnesses"]
 fn e5c_inner_copy_relax() {
     let code = match std::env::var("CRAT_E5C_CR_SHAPE").as_deref() {
         Ok("CASTCOPY") => CASTCOPY,
@@ -237,7 +236,7 @@ fn e5c_inner_copy_relax() {
     }
 }
 
-/// The shape's kinds under the frame's arms.
+/// The shape's kinds under the pinned switches.
 fn rows(shape: &str) -> BTreeMap<String, String> {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
@@ -292,7 +291,7 @@ fn e5c_cr_2_a_write_between_the_copys_uses_demotes_the_source() {
     assert_ne!(kind(&r, "run::p"), "ref", "{r:#?}");
 }
 
-/// S39 (b): a raw copy that escapes (a return, a call, a field) is not relaxed: its source stays
+/// A raw copy that escapes (a return, a call, a field) is not relaxed: its source stays
 /// equal to it.
 #[test]
 fn e5c_cr_b_an_escaping_copy_is_not_relaxed() {
@@ -318,8 +317,9 @@ fn e5c_cr_3_an_owning_source_stays_equal() {
     assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
 }
 
-/// (4) wave-6o 184's cast shape: at 58 `p` is raw (the cast's source) and `q` a reference over it,
-/// though `x` is written between `q`'s uses. The liveness rule alone makes `q` raw.
+/// (4) The cast shape: without the liveness rule `p` is raw (the cast's source) and `q` a
+/// reference over it, though `x` is written between `q`'s uses. The liveness rule alone makes `q`
+/// raw.
 #[test]
 fn e5c_cr_4_the_cast_view_used_after_a_write_is_not_a_reference() {
     let r = rows("CAST");

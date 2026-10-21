@@ -1,16 +1,16 @@
-//! §8 BB0 — the borrow-verifier seam.
+//! The borrow-verifier seam.
 //!
 //! Runs the production borrow pipeline (`analyses::borrow::borrow_conflicts`) with a
 //! ref-candidacy derived from a BO ref-predicate, and translates the resulting
-//! conflict edges back into BO `SlotRef`s. This is the read-only adapter the later
-//! §8 steps build on: BB1 turns these conflicts into guarded exclusion clauses, BB2
-//! wraps it in the CEGAR validate loop.
+//! conflict edges back into BO `SlotRef`s. This is the read-only adapter the rest of
+//! this module builds on: the exclusion encoding turns these conflicts into guarded
+//! exclusion clauses, and the CEGAR validate loop wraps it.
 //!
-//! BB0 scope: **Local owners only** (`Field` owners are dropped pending the struct
+//! The adapter's scope: **Local owners only** (`Field` owners are dropped pending the struct
 //! field-slot mapping) and **depth-0** correspondence (borrow tracks one provenance
 //! per `Local` = the outermost pointer ↔ BO depth-0 slot). The adapter is faithful
 //! for a Round-0 (all-Ref) candidacy; partial candidacy that encodes demotions also
-//! needs the `tree_borrow_local` union replay the demotion loop performs (BB2).
+//! needs the `tree_borrow_local` union replay the demotion loop performs.
 
 use std::cell::{Cell, RefCell};
 
@@ -39,35 +39,26 @@ use crate::{
 };
 
 thread_local! {
-    /// §NB5-L — test/sweep-scoped `RepairMode` override (see `RepairMode::with_override`). Wins over
-    /// the env selector so ONE process can run both repair modes (the differential harness + the S7
-    /// sweep). `None` ⇒ fall through to env/`DEFAULT`.
+    /// A scoped `RepairMode` override (see `RepairMode::with_override`), so one process can run
+    /// both repairs (the differential harnesses). `None` ⇒ the active repair, `Guarded`.
     static REPAIR_OVERRIDE: Cell<Option<RepairMode>> = const { Cell::new(None) };
 }
 
-/// §NB5-L — the repair strategy the CEGAR loop uses to discharge a residual borrow conflict.
+/// The repair strategy the CEGAR loop uses to discharge a residual borrow conflict.
 ///
-/// - `Plain`: commit one `¬ref(representative)` per residual edge — monotone, permanent (the shipped
-///   loop through NB5-F2).
-/// - `Lemmas` (MVP): emit `⋁¬ref(A′-menu)` per residual edge — an **empty-context, A′-restricted
-///   disjunctive lemma** (`¬ref`-only, invariant 7). It does NOT dominate `Plain`: the hoped upside
-///   (spare a "sparable" requirer) never arises because A′ excludes the only sparable slot (the
-///   write-issuer); the disjunction's freedom to pick a NON-minimal menu member instead becomes a
-///   *downside*. The two modes are **incomparable in general** (the loop is non-confluent — different
-///   commit strategies induce different lemma sets and different optima); on tested fixtures
-///   `Ref(lemmas) ⊆ Ref(mode_a)` and on a high-arity fan-out strictly ⊊ (Lemmas loses ≥1 Ref). So the
-///   disjunction axis is dead; `Plain` is the shipped default and the demotion-choice mechanism.
+/// - `Plain`: commit one `¬ref(representative)` per residual edge — monotone, permanent.
+/// - `Guarded`: the guarded planner's context-conditioned clauses at the same point.
 ///
 /// The active repair is `Guarded`; a thread-local `with_override` selects another for one scope (the
 /// differential harnesses). A uniform strategy toggle, constant within an override scope — no
-/// path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
+/// path-divergence hazard (unlike threaded origins, which are divergent DATA).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RepairMode {
     /// Each residual conflict commits `¬ref` on its representative slot.
     Plain,
-    /// R617-1 (era-5c 082, approved R631-7): the guarded planner's clauses in
-    /// Mode-A's loop, at the point where Mode-A commits. Everything around the
-    /// commits is Mode-A's. A decline falls back to Mode-A for the program
+    /// The guarded planner's clauses in the plain repair's loop, at the point
+    /// where the plain repair commits. Everything around the commits is the
+    /// plain repair's. A decline falls back to the plain repair for the program
     /// (`RoundStats::guarded_fallback`, receipted).
     Guarded,
 }
@@ -79,8 +70,8 @@ impl Default for RepairMode {
 }
 
 impl RepairMode {
-    /// Default until the gate flips it on the S7 differential (NB5-L rider 2). `RoundStats` derives
-    /// `Default`, so this is also the mode a default-constructed stats block reports.
+    /// The default mode. `RoundStats` derives `Default`, so this is also the mode a
+    /// default-constructed stats block reports.
     pub(crate) const DEFAULT: Self = RepairMode::Plain;
 
     /// The active mode: the thread-local override, else `Guarded`.
@@ -99,7 +90,7 @@ impl RepairMode {
         }
     }
 
-    /// §NB5-L guard 2 — run `f` with `mode` forced on this thread, restoring the prior override on
+    /// Run `f` with `mode` forced on this thread, restoring the prior override on
     /// exit INCLUDING on panic (a drop-guard, not a manual reset: a panicking test must not leak its
     /// mode onto the thread for the next test). Test/sweep-only; production resolves via `current()`.
     #[cfg(test)]
@@ -116,14 +107,14 @@ impl RepairMode {
 }
 
 thread_local! {
-    /// §NB5-L2 commit-necessity audit — when `Some`, the CEGAR loop's **Mode-A** commit records every
+    /// Commit-necessity audit — when `Some`, the CEGAR loop's **plain-repair** commit records every
     /// `(committed slot, round)` pair here. `None` (the default) = OFF, zero overhead on the sweep/suite
     /// path. Only the audit driver (`bo_c1::run::run_necessity_audit`) turns it on, via `with_capture`.
-    /// Mode-A ONLY: the audit measures the shipped repair mode; the `Lemmas` branch (dead axis) is not
+    /// Plain repair ONLY: the audit measures the plain repair; the `Lemmas` branch (dead axis) is not
     /// captured. Nesting is unsupported (the audit never nests).
     static AUDIT_CAPTURE: RefCell<Option<Vec<(SlotRef, usize)>>> = const { RefCell::new(None) };
-    /// Diagnosis-only detailed origin for each Mode-A commit. Kept separate
-    /// from the frozen necessity-audit tuple surface.
+    /// Diagnosis-only detailed origin for each plain-repair commit. Kept separate
+    /// from the fixed necessity-audit tuple surface.
     static SELECTOR_CORE_COMMIT_CAPTURE: RefCell<Option<Vec<PlainCommitTrace>>> =
         const { RefCell::new(None) };
 }
@@ -139,7 +130,7 @@ pub(crate) struct PlainCommitTrace {
     pub conflict: SlotConflict,
 }
 
-/// §NB5-L2 — run `f` while CAPTURING Mode-A's `(slot, round)` commit events, returning
+/// Run `f` while CAPTURING the plain repair's `(slot, round)` commit events, returning
 /// `(f's result, the captured events in commit order)`. Panic-safe drop-guard (like
 /// `RepairMode::with_override`): the prior capture state is restored on exit including on unwind, so a
 /// panicking anchor run never leaks a live buffer onto the thread. The event order is the loop's
@@ -182,25 +173,25 @@ pub(crate) fn with_plain_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<Plain
     (output, trace)
 }
 
-/// A borrow conflict edge with its owners translated to BO `SlotRef`s. `Field` owners
-/// are dropped in BB0 (Local-only); `issuer` is `None` for a non-`Assign` borrower.
+/// A borrow conflict edge with its owners translated to BO `SlotRef`s. `issuer` is
+/// `None` for a non-`Assign` borrower.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotConflict {
     pub issuer: Option<SlotRef>,
     pub requirers: Vec<SlotRef>,
-    /// Exact ESC-GAP ② class marker, carried from the selected loan row. False preserves the
-    /// ordinary A-prime repair menu byte-for-byte.
+    /// Exact escape-minimal class marker, carried from the selected loan row. False preserves the
+    /// ordinary live-requirer repair menu byte-for-byte.
     pub(crate) esc_issuer_first: bool,
 }
 
 #[derive(Clone, Debug)]
 struct WitnessedSlotConflict {
     conflict: SlotConflict,
-    /// `None` for an A5 parameter edge (R617-1): no loan behind the conflict.
+    /// `None` for a parameter-overlap edge: no loan behind the conflict.
     loan: Option<usize>,
     stable_loan_key: Option<StableLoanKey>,
     invalidators: Vec<SlotRef>,
-    /// R617-1: the invalidators that met the loan through an A5 overlap partner.
+    /// The invalidators that met the loan through a parameter-overlap partner.
     overlap_invalidators: Vec<SlotRef>,
 }
 
@@ -287,10 +278,10 @@ fn revalidate_with_flows(
                 .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
         }
     };
-    // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+    // Per-local mutability. An immutable provenance's loan is
     // skipped by the invalidation walk, so shared reads of one base stop conflicting.
     let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
-    // §NB3-3a: the forked BO engine.
+    // The forked BO engine.
     let edges =
         super::borrow_engine::borrow_conflicts_with_flows(program, origin_flows, cand, mutab);
 
@@ -305,13 +296,13 @@ fn revalidate_with_flows(
     conflicts
 }
 
-/// §8 BB2-i — the CEGAR validate seam **with union replay**. Like `revalidate` but
+/// The CEGAR validate seam **with union replay**. Like `revalidate` but
 /// takes a *partial* candidacy: a pointer local's depth-0 slot is a `Ref` candidate
 /// iff `is_ref`, induces a demotion+union iff `is_raw`, and is an `Owning`
 /// non-candidate otherwise. Delegates to `borrow::borrow_conflicts_replaying`, which
 /// replays the `tree_borrow_local` union the chosen `Raw` slots induce, so a partial
 /// candidacy surfaces the model-dependent conflicts that `revalidate` (round-0) cannot.
-/// This is the seam BB2-ii's CEGAR loop drives with the solved model's actual kinds.
+/// This is the seam the CEGAR loop drives with the solved model's actual kinds.
 #[cfg(test)]
 pub(crate) fn revalidate_replaying(
     program: &RustProgram,
@@ -426,12 +417,12 @@ fn revalidate_replaying_reviewed(
                 .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
         }
     };
-    // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+    // Per-local mutability. An immutable provenance's loan is
     // skipped by the invalidation walk, so shared reads of one base stop conflicting.
     let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
-    // §NB5-F2 — the model's Raw FIELD slots, bridged to `borrow::StructFieldSlot`, so the fork can
+    // The model's Raw FIELD slots, bridged to `borrow::StructFieldSlot`, so the fork can
     // disable their loans (the field analogue of the Local raw candidacy above). Only the Fork arm
-    // consumes them; production stays frozen at its 4-arg signature.
+    // consumes them; production keeps its 4-arg signature.
     let raw_fields: Vec<borrow::StructFieldSlot> = (0..slots.field_slots.len())
         .map(SlotId::from_usize)
         .filter(|&sid| slots.field_slots.slot(sid).depth == 0 && is_raw(SlotRef::Field(sid)))
@@ -443,7 +434,7 @@ fn revalidate_replaying_reviewed(
             SlotOwner::Local(_) => None,
         })
         .collect();
-    // §NB3-3a: the forked BO engine.
+    // The forked BO engine.
     let replay = || {
         if let Some(parameter_overlaps) = parameter_overlaps {
             let empty = SelectedCopyLendLoans::default();
@@ -492,9 +483,9 @@ fn revalidate_replaying_reviewed(
     }
 }
 
-/// L2-only replay adapter carrying the invalidating access roots captured by
-/// the BO fork. The ordinary replay adapter above remains byte-for-byte on its
-/// existing shape and performs no L2 collection.
+/// Guarded-repair-only replay adapter carrying the invalidating access roots
+/// captured by the BO fork. The ordinary replay adapter above keeps its own
+/// shape and performs no guarded-repair collection.
 fn revalidate_replaying_witnessed(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -540,7 +531,7 @@ fn revalidate_replaying_witnessed(
         })
         .collect();
     let edges = match (selected_copy_lends, parameter_overlaps) {
-        // R617-1: A5's overlap pairs in the witness context, as in Mode-A's replay.
+        // The parameter-overlap pairs in the witness context, as in the plain repair's replay.
         (selected, Some(parameter_overlaps)) => {
             let empty = SelectedCopyLendLoans::default();
             super::borrow_engine::borrow_conflicts_replaying_witnessed_with_flows_and_parameter_overlap_and_escaped(
@@ -658,18 +649,18 @@ fn map_edges_to_slots(
         .collect()
 }
 
-/// §8 BB1 — encode Round-0 borrow conflicts as exclusion guards on the solver. For
+/// Encode round-0 borrow conflicts as exclusion guards on the solver. For
 /// each conflict edge, assert `¬ref(issuer) ∨ ⋁¬ref(requirers)` via
 /// `KindSolver::add_borrow_exclusion`. Hard clauses, applied before the single
-/// `model_kinds_relaxing` solve. BB1 is one shot: it encodes the round-0 (all-Ref)
-/// conflicts only — the CEGAR validate/re-solve loop that closes over the solved
-/// model's actual candidacy is BB2, so BB1 alone is not yet sound on its own.
+/// `model_kinds_relaxing` solve. This is one shot: it encodes the round-0 (all-Ref)
+/// conflicts only — the CEGAR validate/re-solve loop (`verify_to_fixpoint`) closes over
+/// the solved model's actual candidacy, so this encoding alone is not sound on its own.
 ///
-/// Edges with `Field` owners are partially dropped by BB0's Local-only mapping: an
+/// Edges with `Field` owners are partially dropped by the Local-only mapping: an
 /// all-`Field` edge becomes a NO-OP (the deferred field-exclusivity gap), and a mixed
 /// edge keeps only its surviving `Local` literals — a *stronger* (still sound: forces
-/// ≥1 off Ref) but over-constraining guard. Both resolve when the struct field-slot
-/// mapping lands; a precision concern only post-BB2.
+/// ≥1 off Ref) but over-constraining guard. Both resolve with a struct field-slot
+/// mapping; under the CEGAR loop this is a precision concern only.
 #[cfg(test)]
 pub(crate) fn materialize_guards(
     solver: &KindSolver,
@@ -680,24 +671,24 @@ pub(crate) fn materialize_guards(
     }
 }
 
-/// §8 BB2-ii — drive the CEGAR validate/re-solve loop to a fixpoint (Mode A).
+/// Drive the CEGAR validate/re-solve loop to a fixpoint (the plain repair).
 ///
 /// The solver must arrive with ownership constraints + per-fn coherence already
-/// emitted (so `selectors` are its retractable owning assumptions — §NB-F:
+/// emitted (so `selectors` are its retractable owning assumptions:
 /// malloc SOURCES and free/realloc SINKS alike; dropping a sink LEAKS THE
-/// FREE, an unprovable free staying a raw-pointer free). §NB0: the BB3-a
+/// FREE, an unprovable free staying a raw-pointer free). The malloc-source
 /// invariant (`¬ref` on every malloc-source slot — a malloc result owns heap and is
-/// not a borrow; see `sources::collect_malloc_source_slots`) is now emitted EAGERLY
+/// not a borrow; see `sources::collect_malloc_source_slots`) is emitted EAGERLY
 /// by `emit_crate_ownership_constraints`, so no model this loop ever sees can mark a
-/// source `Ref` and the old lazy per-round source commit is gone. Each round: solve →
+/// source `Ref`. Each round: solve →
 /// derive the candidacy from the model's *actual* Raw/Ref/Owning kinds → commit `¬ref`
-/// on **one representative slot per residual borrow conflict** (BB2-ii — §NB4-4a **A′**: a
+/// on **one representative slot per residual borrow conflict** (live-requirer discharge: a
 /// live `Ref` requirer *beyond* the issuer if one exists, else the issuer; see
 /// `representative`; conflicts come from `revalidate_replaying`'s `tree_borrow_local`
 /// union replay) → re-solve. Accept when no committable (currently-`Ref`) slot remains.
 ///
-/// Mode A = *monotone single-slot commitment*, deliberately NOT BB1's disjunctive
-/// `materialize_guards`. Committing one currently-`Ref` slot forces exactly that slot off
+/// The plain repair = *monotone single-slot commitment*, deliberately NOT the round-0
+/// encoding's disjunctive `materialize_guards`. Committing one currently-`Ref` slot forces exactly that slot off
 /// `Ref`, so the *committed* slot is the demotion witness `revalidate_replaying` expects.
 /// (A disjunctive guard instead lets the solver satisfy `¬ref(a) ∨ ¬ref(b)` by demoting a
 /// *non-minimal* slot — the reason this loop commits one slot, not guards an edge.) Note
@@ -708,7 +699,7 @@ pub(crate) fn materialize_guards(
 ///
 /// No separate all-Ref round-0 step is needed: the first solve has no commitments, so
 /// the MaxSMT objective settles every source-free slot to `Ref` and the first iteration
-/// validates that model directly — coinciding with BB1's round-0 only in the
+/// validates that model directly — coinciding with the round-0 encoding only in the
 /// source-free case; with an ownership source the first model legitimately carries
 /// `Owning` slots and we validate *those*.
 ///
@@ -722,8 +713,7 @@ pub(crate) fn materialize_guards(
 ///
 /// SCOPE / SOUNDNESS: an accepted model is accepted **for the current local-only,
 /// depth-0 experimental pass — NOT a proof of global borrow-validity.** Two gaps stay
-/// deferred to BB3, sound only because BO output is unconsumed by codegen (the §8
-/// guardrail): (1) a residual conflict all of whose owners are `Field` (dropped by the
+/// open, sound only because BO output is unconsumed by codegen: (1) a residual conflict all of whose owners are `Field` (dropped by the
 /// Local-only mapping) has no committable slot and is accepted (the deferred struct
 /// field-slot mapping); (2) an `Owning` slot issues no loan, so a conflict *caused by*
 /// an `Owning` pointer is invisible to the replay and an accepted model may hide it.
@@ -748,10 +738,9 @@ pub(crate) fn verify_to_fixpoint_with_flows(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
-    // §NB5-M: thin wrapper over the single counting loop (model only). KEEP THIN — any logic
+    // Thin wrapper over the single counting loop (model only). KEEP THIN — any logic
     // added here but not in `verify_to_fixpoint_counting` diverges the sweep's counters from what
-    // the suite verifies (exactly the mirror-drift the retired bo_c1 mirror guarded; wrapper-
-    // thinness is now the guard — see `verify_to_fixpoint_is_thin_wrapper`).
+    // the suite verifies; wrapper-thinness is the guard against that drift.
     verify_to_fixpoint_counting_with_flows(
         program,
         slots,
@@ -763,25 +752,24 @@ pub(crate) fn verify_to_fixpoint_with_flows(
     .0
 }
 
-/// §NB5-M CEGAR round/commit counters, native to the fork — retires the bo_c1 mirror
-/// (`mirror::verify_to_fixpoint_counting`). `None` (decline) carries the stats of the rounds that
+/// CEGAR round/commit counters, native to the fork. `None` (decline) carries the stats of the rounds that
 /// ran. `verify_to_fixpoint` is the model-only wrapper over this.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RoundStats {
     /// Validate rounds run, INCLUDING the accepting round (accept-first-model ⇒ `rounds == 1`).
     pub rounds: usize,
-    /// §NB0: every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
+    /// Every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
     pub commits_conflict: usize,
     pub commits_per_round: Vec<usize>,
     /// Exact CopyLend loan identities handed to the final replay round. This is a wiring receipt,
     /// not a model-derived recount: suppressing replay registration must drive it to zero.
     pub copy_lend_replay_selections: usize,
-    /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
+    /// Sink selectors the FINAL solve dropped (leaked frees).
     pub dropped_sinks: usize,
-    /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
+    /// Source selectors the FINAL solve dropped (leaked allocs).
     pub dropped_sources: usize,
-    /// §NB5-F: set when the loop declined because a residual borrow conflict named a non-`Ref`
-    /// FIELD slot (the A′ principle extended to field requirers — the field is a live requirer the
+    /// Set when the loop declined because a residual borrow conflict named a non-`Ref`
+    /// FIELD slot (live-requirer discharge extended to field requirers — the field is a live requirer the
     /// Local-only replay candidacy cannot soundly demote, so decline is the sound outcome). Carries
     /// the offending field slot for the sweep's per-program attribution (which field). `None` for an
     /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
@@ -790,28 +778,28 @@ pub(crate) struct RoundStats {
     /// Diagnostic twin of `field_conflict_decline`: the accepted round model's
     /// exact non-Ref kind for that field.
     pub field_conflict_kind: Option<SlotKind>,
-    /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
-    /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so the S7
+    /// The `RepairMode` that produced these stats (the mode-stamp). Self-describing
+    /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so a
     /// differential is never mode-ambiguous. Defaults to `Plain` (= `RepairMode::DEFAULT`).
     pub repair: RepairMode,
-    /// §NB5-L (Codex MEDIUM) — set when the loop declined because the `Lemmas` round cap was exhausted
+    /// Set when the loop declined because the `Lemmas` round cap was exhausted
     /// (the controlled backstop for a hypothetical subset-oscillation blowup, which does not manifest
     /// empirically). A distinct decline KIND: `bo_c1` must tag it before `decline_reason`, which would
     /// otherwise mislabel this relaxed-SAT decline as `sat-in-replay` and hide the cap exhaustion. Never
     /// set under `Plain` (that path panics — its linear bound is proven).
     pub cap_exhausted: bool,
-    /// L2 feature-on controlled decline. The legacy feature-off Mode-A and
-    /// Lemmas paths leave this unset.
+    /// Guarded-repair controlled decline. The plain-repair and Lemmas paths
+    /// leave this unset.
     pub guarded_decline: Option<GuardedDeclineReason>,
     /// Typed source-retirement coverage failure, separate from solver outcome.
     pub source_retirement_decline: Vec<super::retirement::RetirementUnresolved>,
-    /// R617-1 STOP 2 (R631-7): set when a `Guarded` run declined and the program
-    /// fell back to Mode-A. These stats are then the Mode-A run's, stamped
+    /// Set when a `Guarded` run declined and the program fell back to the plain
+    /// repair. These stats are then the plain repair's run, stamped
     /// `repair = Guarded`; the receipt reads `repair=guarded->mode-a`.
     pub guarded_fallback: Option<GuardedFallback>,
 }
 
-/// R617-1 STOP 2: the declined guarded run behind a Mode-A fallback.
+/// The declined guarded run behind a plain-repair fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GuardedFallback {
     /// The guarded run's decline, as its receipt names it.
@@ -857,7 +845,7 @@ pub(super) enum LoopBackend {
     HardCheckRoundOptimize,
 }
 
-/// era-5c R545-1: the mutability facts of one verification round. Foster's load
+/// The mutability facts of one verification round. Foster's load
 /// guard (`lhs = copy (*p)…` ⇒ `p` mutable) is kept unless the LOADED level is
 /// `Raw` in `model`: writes through a Raw level are raw-pointer writes, so the
 /// table they were loaded from is only read and its reborrow is shared. A level
@@ -966,7 +954,7 @@ fn solve_guarded_round_model(
     }
 }
 
-/// R617-1: one round's solve. Mode-A and Lemmas solve as they always have; `Guarded` solves the
+/// One round's solve. The plain repair and Lemmas solve directly; `Guarded` solves the
 /// same system through the typed twin, so a solver decline is recorded in the planner's taxonomy.
 fn solve_round(
     solver: &KindSolver,
@@ -1008,7 +996,7 @@ fn selected_copy_lend_count(selected: &SelectedCopyLendLoans) -> usize {
     selected.values().map(FxHashSet::len).sum()
 }
 
-/// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
+/// The CEGAR validate/re-solve loop (the plain repair) with native counters. See
 /// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
 /// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
 /// the leak counts).
@@ -1070,7 +1058,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     let source_inventory = super::source_events::for_construction(program);
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
-    // §NB-R guard (release-active): a tracked solver's hard constraints are
+    // Release-active guard: a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
     assert!(
@@ -1096,11 +1084,11 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     if repair != RepairMode::Guarded {
         return rounds(repair);
     }
-    // R617-1 STOP 2 (R631-7): a guarded decline falls back to Mode-A for this program. The
-    // guarded run's assertions (its clauses, pins and the field-ownership constraints the loop
-    // asserts first) live in a scope that is popped before the Mode-A run, so that run sees the
-    // solver exactly as a Mode-A-only run would. An accepting guarded run keeps its scope, as a
-    // Mode-A run keeps its commits.
+    // A guarded decline falls back to the plain repair for this program. The guarded run's
+    // assertions (its clauses, pins and the field-ownership constraints the loop asserts first)
+    // live in a scope that is popped before the plain run, so that run sees the solver exactly as
+    // a plain-only run would. An accepting guarded run keeps its scope, as a plain run keeps its
+    // commits.
     solver.push_scope();
     let (model, guarded) = rounds(RepairMode::Guarded);
     if model.is_some() {
@@ -1114,8 +1102,9 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     (model, stats)
 }
 
-/// The validate/re-solve rounds of one repair mode (R617-1: the one loop). `Guarded` differs from
-/// Mode-A only at the commit point, in its witnessed replay, and in its typed solver declines.
+/// The validate/re-solve rounds of one repair mode (one loop for every mode). `Guarded` differs
+/// from the plain repair only at the commit point, in its witnessed replay, and in its typed solver
+/// declines.
 fn verify_rounds(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1129,7 +1118,7 @@ fn verify_rounds(
     backend: LoopBackend,
     repair: RepairMode,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    // R617-1: the guarded planner lives across rounds, and is told of every round -- the
+    // The guarded planner lives across rounds, and is told of every round -- the
     // retirement pins' and the field-own repair's as empty ones -- so its validation counter
     // stays equal to `stats.rounds`. Its own cap (10S + 1) bounds the guarded rounds.
     let mut planner = (repair == RepairMode::Guarded).then(|| {
@@ -1146,15 +1135,15 @@ fn verify_rounds(
         Some(planner) => planner.validation_cap().saturating_add(1),
         None => round_cap(slots),
     };
-    // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
+    // Constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
     super::coherence::constrain_field_ownership(solver, slots, program);
     let hard =
         matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
     let mut stats = RoundStats::default();
-    // §NB5-L guard 1 — resolve the repair strategy ONCE per invocation into a local; NO mid-loop
-    // re-reads, so the whole fixpoint runs one consistent strategy. Guard 3 stamps it into `stats`.
+    // Resolve the repair strategy ONCE per invocation into a local; NO mid-loop re-reads, so the
+    // whole fixpoint runs one consistent strategy. It is stamped into `stats` here.
     stats.repair = repair;
     let Some((mut model, dropped)) = solve_round(
         solver,
@@ -1169,7 +1158,7 @@ fn verify_rounds(
     record_dropped(&mut stats, selectors, &dropped);
     for _ in 0..cap {
         stats.rounds += 1;
-        // D1: each round re-runs the oracle under a DIFFERENT candidacy
+        // Each round re-runs the oracle under a DIFFERENT candidacy
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
         super::export::begin_round();
@@ -1188,16 +1177,16 @@ fn verify_rounds(
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
-        // R545-1: a table's reborrow is unique only when a Ref level below it is
+        // A table's reborrow is unique only when a Ref level below it is
         // written -- the round's facts drop the load guard where the loaded level
-        // is Raw in THIS round's model (era-5c report 045).
+        // is Raw in THIS round's model.
         let round_facts = round_mutability_facts(program, slots, &model);
         let round_mutable = super::mutability_facts::RoundMut {
             base: is_mutable,
             round: &round_facts,
         };
-        // L01⁹ wall 4: this round's qualifying stores issue no loan on a local that is not
-        // `Raw` during the replay (era-5c 060a).
+        // This round's qualifying stores issue no loan on a local that is not
+        // `Raw` during the replay.
         let _move_store = super::move_store::enter_round(
             program,
             slots,
@@ -1206,44 +1195,44 @@ fn verify_rounds(
             &model,
         );
         let is_ref = |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref);
-        // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
+        // Complete by construction: EVERY non-`Ref` slot is a replay candidate
         // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
         // depth-0 slot can be `Owning` (ownership ORs over versions) yet carry a *reference*
         // role in another version (`p = &mut a; …; p = malloc()`; or via reborrow/`offset`);
-        // excluding such a slot as a non-candidate would HIDE its aliasing conflict — the
-        // BB3-b under-report. Including every non-`Ref` slot makes "no hidden `Ref`-vs-`Ref`
+        // excluding such a slot as a non-candidate would HIDE its aliasing conflict — an
+        // under-report. Including every non-`Ref` slot makes "no hidden `Ref`-vs-`Ref`
         // aliasing" hold by construction, with no need to DETECT mixed-role locals (a tar pit:
         // any syntactic/conflict predicate must re-derive the borrow analysis's full
-        // provenance flow — Ref/RawPtr, cast/copy, offset/library methods, … — and kept
-        // missing paths over four adversarial rounds). Treating an `Owning` slot as a raw
+        // provenance flow — Ref/RawPtr, cast/copy, offset/library methods, … — and such
+        // predicates kept missing paths). Treating an `Owning` slot as a raw
         // candidate is strictly MORE conservative (its loans are included, never fewer), so it
         // cannot under-report. RESIDUAL (deferred to flow-sensitivity): a mixed-role local is
         // output `Owning` — an ownership-layer imprecision, NOT a borrow-verifier under-report
         // (the borrow contract = the surviving `Ref` slots do not alias; that holds for the
-        // raw-role completeness THIS argument is about — but NOT under the NB2 mutability
+        // raw-role completeness THIS argument is about — but NOT under the mutability
         // skip, which drops immutable *interprocedural* loans from invalidation: two surviving
         // `Ref`s CAN then alias a written cell via a call-return/param/cast/offset/field alias
-        // the coherence equate-closure does not unify. That is the S2-6 acceptance-level gap,
-        // real today (call-return witness `nb2_cross_alias_write_uncaught_witness`;
-        // production-parity), guarded ONLY by §8 and fixed by write-aware invalidation in
-        // NB3-3b). The §8 guardrail (BO unconsumed) makes both the imprecision above and the
-        // S2-6 gap harmless until codegen.
+        // the coherence equate-closure does not unify. That is the cross-alias write gap at the
+        // acceptance level (shared with production), closed by write-aware invalidation). BO
+        // output being unconsumed by codegen makes both the imprecision above and the
+        // cross-alias write gap harmless until codegen.
         //
-        // §NB5-F2 (Codex HIGH fix): this predicate is used TWO ways in `revalidate_replaying` and
+        // This predicate is used TWO ways in `revalidate_replaying` and
         // the two owner classes need OPPOSITE semantics. LOCAL replay candidacy stays the
-        // conservative non-`Ref` above (an `Owning` local's loans must be INCLUDED — BB3-b). But
+        // conservative non-`Ref` above (an `Owning` local's loans must be INCLUDED, as above). But
         // the field DISABLE list REMOVES loans, so it must be EXACT `Raw`: disabling an `Owning`
         // field's loan would delete a conflict that should decline/demote (an owning + borrow-
         // aliased field → unsound accept). So branch on the owner: fields → exactly `Raw`, locals
-        // → non-`Ref`. (`Raw` fields are the only ones F2 dischargeds; `Owning` fields fall through
+        // → non-`Ref`. (`Raw` fields are the only ones the disable list discharges; `Owning` fields fall through
         // to the `residual_nonref_field` decline backstop.)
         let is_raw = |s: SlotRef| match s {
             SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
             SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
         };
-        // R617-1: the guarded arm reads the witnessed replay -- the same replay with its loans and
-        // invalidators, in the same A5 context and round facts -- and every step before its commit
-        // point reads that replay's plain conflicts. Mode-A and Lemmas keep the reviewed replay.
+        // The guarded arm reads the witnessed replay -- the same replay with its loans and
+        // invalidators, in the same parameter-overlap context and round facts -- and every step
+        // before its commit point reads that replay's plain conflicts. The plain repair and Lemmas
+        // keep the reviewed replay.
         let (reviewed, witnessed) = if repair == RepairMode::Guarded {
             let Revalidated {
                 conflicts,
@@ -1332,7 +1321,7 @@ fn verify_rounds(
             };
             // A missing required proof is an obligation failure, with no
             // invented legacy Loan ID. The existing monotone Ref exclusion
-            // keeps the Mode-A bound and all solver caps unchanged.
+            // keeps the plain repair's bound and all solver caps unchanged.
             conflicts.entry(function).or_default().push(SlotConflict {
                 issuer: Some(target),
                 requirers: Vec::new(),
@@ -1340,17 +1329,18 @@ fn verify_rounds(
             });
         }
         append_retirement_targets(&mut conflicts, &reviewed.retirement);
-        // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
-        // residual is the A′ principle extended to field requirers: the field is a live requirer the
-        // Local-only replay candidacy cannot soundly demote (committing it just regenerates the
-        // conflict), so DECLINE (Option A) is the sound outcome — tagged for the sweep's attribution.
+        // Partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
+        // residual is live-requirer discharge extended to field requirers: the field is a live
+        // requirer the Local-only replay candidacy cannot soundly demote (committing it just
+        // regenerates the conflict), so DECLINE is the sound outcome — tagged for the sweep's
+        // attribution.
         // A non-`Ref` LOCAL residual stays a fail-closed invariant violation: the inert-ness invariant
         // (see `representative`) keeps non-witness `Raw` locals out of residual edges, so a residual
-        // local is always `Ref`; a violation is a real under-report, asserted even in release (BB3-c).
+        // local is always `Ref`; a violation is a real under-report, asserted even in release.
         // (No Local fixture forces this arm — its coverage rests on that invariant, not a synthesized
         // case.) The field early-return runs first, so the assert now effectively guards Locals only.
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
-            // L01⁹: an OWNING field in a residual is demoted (`¬own`, monotone) instead of
+            // An OWNING field in a residual is demoted (`¬own`, monotone) instead of
             // declining the program.
             if model.get(&field) == Some(&SlotKind::Owning) {
                 if !planner_empty_round(planner.as_mut(), &mut stats, &model) {
@@ -1393,24 +1383,16 @@ fn verify_rounds(
         );
         let mut committed = 0;
         match repair {
-            // §NB5-L Mode A (shipped through NB5-F2): one monotone `¬ref(representative)` per residual
-            // edge.
-            //
-            // RETRACTED (§3.3, 2026-07-28): this used to read "Iteration order left on FxHash —
-            // Mode-A's z3 assertion order (hence its corpus numbers) stays byte-comparable to every
-            // prior row (the S5 asymmetry: sort Lemmas ONLY)". The premise was FALSE. `FxHashMap`
-            // iteration is deterministic, but the inner `Vec<ConflictEdge>` follows loan-index order,
-            // and loan numbering is not stable (D19). Mode-A is now sorted for the same reason the
-            // Lemmas arm always was; the asymmetry is gone.
+            // The plain repair: one monotone `¬ref(representative)` per residual edge.
             RepairMode::Plain => {
-                // §3/R4 (D19): the inner `Vec<ConflictEdge>` follows loan-INDEX
-                // order, and loan numbering permutes between runs and between
-                // CEGAR rounds (`utils/dsa/union_find.rs` hashes with
-                // `RandomState`; `borrow/mod.rs` pushes siblings in `group()`
-                // order). So the emitted z3 assertion sequence was not stable.
+                // `FxHashMap` iteration is deterministic, but the inner
+                // `Vec<ConflictEdge>` follows loan-INDEX order, and loan numbering
+                // permutes between runs and between CEGAR rounds
+                // (`utils/dsa/union_find.rs` hashes with `RandomState`; `borrow/mod.rs` pushes siblings in `group()`
+                // order). So an unsorted z3 assertion sequence would not be stable.
                 //
                 // Sorted by `conflict_sort_key` — the SAME key the Lemmas arm
-                // already uses — which is built from slot keys and is therefore
+                // uses — which is built from slot keys and is therefore
                 // numbering-independent. Ties need no further tiebreak: two
                 // conflicts with equal keys have equal issuer and requirers, so
                 // `representative` returns the same slot for both and they emit
@@ -1424,14 +1406,14 @@ fn verify_rounds(
                 });
                 for (_, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
-                        // era-5c: name the conflict a Mode-A commit came from.
+                        // Name the conflict a plain-repair commit came from.
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
                         committed += 1;
                         stats.commits_conflict += 1;
-                        // §NB5-L2 audit capture (gated; `None` = off, zero cost). Record `(slot, round)`
-                        // — `stats.rounds` is this round (incremented at the loop top). Rider 2: the round
-                        // is retained for the audit's stratification + over-pin-by-round diagnostic.
+                        // Commit-necessity audit capture (gated; `None` = off, zero cost). Record
+                        // `(slot, round)` — `stats.rounds` is this round (incremented at the loop top).
+                        // The round is retained for the audit's stratification + over-pin-by-round diagnostic.
                         AUDIT_CAPTURE.with(|c| {
                             if let Some(buf) = c.borrow_mut().as_mut() {
                                 buf.push((slot, stats.rounds));
@@ -1452,10 +1434,10 @@ fn verify_rounds(
                     }
                 }
             }
-            // R617-1: the guarded planner's clauses at Mode-A's commit point. Reader failures and
-            // retirement targets are observations with an empty guard (unconditional `¬ref`,
-            // Mode-A's commits); a witnessed conflict's observation carries its loan and its
-            // invalidators, those met through an A5 overlap partner marked. Everything before
+            // The guarded planner's clauses at the plain repair's commit point. Reader failures and
+            // retirement targets are observations with an empty guard (unconditional `¬ref`, as the
+            // plain repair commits); a witnessed conflict's observation carries its loan and its
+            // invalidators, those met through a parameter-overlap partner marked. Everything before
             // this point -- the pins, the field-own branch, the declines -- and the accept after
             // it are the loop's own.
             RepairMode::Guarded => {
@@ -1506,7 +1488,7 @@ fn verify_rounds(
         }
         stats.commits_per_round.push(committed);
         if committed == 0 {
-            // E-R4 certificate: record the residuals the accepted model
+            // Residual certificate: record the residuals the accepted model
             // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
             // set, so this is non-empty in general. Recording-only.
             super::export::record_residuals(
@@ -1523,9 +1505,9 @@ fn verify_rounds(
             );
             // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
             // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
-            // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
+            // alias (no `Owning` slot's reference role is hidden). A `Ref` field residual is
             // committed like any `Ref` slot and a non-`Ref` field residual already declined above, so
-            // this path no longer silently accepts a dropped-`Field` residual (the old Local-only gap).
+            // this path does not silently accept a dropped-`Field` residual.
             super::licensing::stack_export::accept(solver.ownership_facts());
             return (Some(model), stats);
         }
@@ -1544,23 +1526,23 @@ fn verify_rounds(
             None => return (None, stats),
         };
     }
-    // §NB5-L cap exhaustion — behaviour depends on the repair mode's termination guarantee (Codex
-    // HIGH, 2026-07-18). Mode-A has a PROVEN linear bound (each round commits ≥1 fresh slot to a
+    // Cap exhaustion — behaviour depends on the repair mode's termination guarantee. The plain
+    // repair has a PROVEN linear bound (each round commits ≥1 fresh slot to a
     // PERMANENT `¬ref`, so ≤ |slots| rounds); reaching the cap there is a real bug → panic. Lemmas
     // has NO such bound: its disjunctions are non-monotone, so the Max-Ref optimizer could in
     // principle walk subsets of a k-requirer edge for up to ~2^k rounds (subset oscillation). That
     // worst case does NOT manifest under the pinned z3 seed — empirically a 33-requirer edge still
-    // converges in 3 rounds (`nb5l_high_arity_no_panic`) — but it is not PROVEN impossible, so the
-    // cap must be a CONTROLLED backstop, not a crash: return a sound decline (invariant 6 — decline
-    // is always legal; the §8 guardrail keeps it harmless). This is exactly rider-1's "real
-    // backstop": a rounds explosion becomes a decline the sweep surfaces, never a panic.
+    // converges in 3 rounds — but it is not PROVEN impossible, so the
+    // cap must be a CONTROLLED backstop, not a crash: return a sound decline (a decline
+    // is always legal; BO output being unconsumed keeps it harmless). So a rounds explosion becomes
+    // a decline the sweep surfaces, never a panic.
     match repair {
         RepairMode::Plain => panic!(
             "Mode-A CEGAR did not converge within {cap} rounds — this violates the proven linear \
              bound (each round commits ≥1 fresh permanent ¬ref), so it is a genuine analysis bug."
         ),
-        // R617-1: the planner declines at its own cap (10S + 1) one round before this bound, so
-        // reaching it is a planner defect; decline, which falls back to Mode-A.
+        // The planner declines at its own cap (10S + 1) one round before this bound, so
+        // reaching it is a planner defect; decline, which falls back to the plain repair.
         RepairMode::Guarded => {
             stats.cap_exhausted = true;
             (None, stats)
@@ -1568,7 +1550,7 @@ fn verify_rounds(
     }
 }
 
-/// R617-1: tell the guarded planner of a round whose commits are not its own (the retirement
+/// Tell the guarded planner of a round whose commits are not its own (the retirement
 /// pins, the field-own repair), so its validation counter stays equal to `stats.rounds`. `false`
 /// when the planner declines (its cap). A no-op outside the guarded mode.
 fn planner_empty_round(
@@ -1597,7 +1579,7 @@ fn planner_empty_round(
     }
 }
 
-/// R617-1: one guarded round's observations, as the separate L2 loop built them: reader failures
+/// One guarded round's observations, built as the separate guarded loop builds them: reader failures
 /// and retirement targets with an empty guard, then every witnessed conflict with a committable
 /// representative. The planner orders them canonically.
 fn guarded_observations(
@@ -1654,21 +1636,18 @@ fn guarded_observations(
     observations
 }
 
-/// R617-1: no production route reaches this loop any more. `CRAT_BO_L2_GUARDED_COMMITS=1` is the
-/// alias of `RepairMode::Guarded`, the guarded arm of the one loop above; this separate loop is kept
-/// as the door the existing L2 tests call directly. The rest of this note is its history.
+/// No production route reaches this loop. `CRAT_BO_L2_GUARDED_COMMITS=1` is the alias of
+/// `RepairMode::Guarded`, the guarded arm of the one loop above; this separate loop is kept as the
+/// door the guarded-repair tests call directly.
 ///
-/// D10: `pub(crate)` so a test can route through the L2 loop **directly**
+/// `pub(crate)` so a test can route through the guarded loop **directly**
 /// instead of mutating `CRAT_BO_L2_GUARDED_COMMITS` inside a parallel test
-/// binary. The env switch remains the production entry — resolved once in
-/// `verify_to_fixpoint_counting_with_flows` — and this changes nothing about
-/// it; it only removes the need to perturb process-wide state to reach the same
+/// binary; it removes the need to perturb process-wide state to reach the same
 /// loop.
 ///
-/// # Preconditions this door must carry (D17)
+/// # Preconditions this door must carry
 ///
-/// The env entry asserts **two** things before delegating here, and neither is
-/// what an earlier version of this doc claimed:
+/// Two preconditions:
 ///
 /// - **`solver.tracker().is_none()`.** A tracked solver's hard constraints are
 ///   track-gated, so every solve here would be vacuously SAT and the accepted
@@ -1678,15 +1657,10 @@ fn guarded_observations(
 ///   without passing one. The `debug_assert!` below is a *fail-earlier*
 ///   tripwire — it names the door in the message instead of the accessor — not
 ///   the only thing standing between a tracked solver and a meaningless model.
-///   (The review finding that prompted this called the guard bypassed; that was
-///   checked and is wrong.)
 /// - **`RepairMode::current() == Plain` — INERT here.** This loop stamps
 ///   `repair: RepairMode::Plain` into its own stats and never reads
 ///   `RepairMode::current()`, so violating it changes nothing about what runs.
 ///   Documented for callers, not enforced.
-///
-/// An earlier version of this doc named only the inert one, and called the
-/// other load-bearing.
 #[cfg(test)]
 pub(crate) fn verify_guarded_to_fixpoint_counting(
     program: &RustProgram,
@@ -1728,12 +1702,12 @@ pub(super) fn verify_guarded_to_fixpoint_counting_impl(
     let source_inventory = super::source_events::for_construction(program);
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
-    // D17: re-assert the load-bearing precondition at the door, not only at the
-    // env entry. `debug_assert!` rather than `assert!` so the release-path cost
+    // Re-assert the load-bearing precondition at the door, not only at the
+    // entry. `debug_assert!` rather than `assert!` so the release-path cost
     // and behaviour of the existing single choke point are unchanged.
     debug_assert!(
         !solver.is_diagnostic_tracked(),
-        "diagnostic-tracked KindSolver must not enter the l2 door"
+        "diagnostic-tracked KindSolver must not enter the guarded-repair door"
     );
     let slot_count = slots
         .fn_local_slots
@@ -1774,7 +1748,7 @@ pub(super) fn verify_guarded_to_fixpoint_counting_impl(
 
     loop {
         stats.rounds += 1;
-        // D1: same per-round reset on the L2 path.
+        // Same per-round reset on the guarded path.
         super::export::begin_round();
         let _original_cell_model =
             super::licensing::model_selection::enter(solver.original_cell_selection());
@@ -1811,7 +1785,7 @@ pub(super) fn verify_guarded_to_fixpoint_counting_impl(
         }
         let raw_targets = reviewed.retirement.raw_targets();
         if !raw_targets.is_empty() {
-            // A typed coverage repair is independent of L2's guarded loan clauses.
+            // A typed coverage repair is independent of the guarded loan clauses.
             // Keep its validation-round accounting honest without inventing a loan.
             #[cfg(test)]
             if coverage_planner_fault::active() {
@@ -1989,16 +1963,15 @@ fn record_guarded_decline(stats: &mut RoundStats, reason: GuardedDeclineReason) 
     stats.guarded_decline = Some(reason);
 }
 
-/// §NB5-L2 (commit-necessity audit) — does `model` ACCEPT, i.e. is it a Mode-A fixpoint? True iff one
+/// Commit-necessity audit — does `model` ACCEPT, i.e. is it a plain-repair fixpoint? True iff one
 /// more validate round would commit nothing: no residual conflict names a non-`Ref` FIELD
-/// (`residual_nonref_field` — the field-decline) AND every residual conflict's A′ `representative` is
+/// (`residual_nonref_field` — the field-decline) AND every residual conflict's live-requirer `representative` is
 /// `None` (no committable `Ref` owner, so `committed` would be 0). This is EXACTLY
 /// `verify_to_fixpoint_counting`'s accept condition, factored out so the audit's "one solve + one
 /// validate" classification shares the loop's accept semantics rather than a re-derived twin that could
-/// drift — the `is_ref`/`is_raw` replay closures are byte-identical to the loop's (BB3-b for locals,
-/// exact-`Raw` for fields, §NB5-F2). The anchor asserts `model_accepts(accepted_model)`; the
-/// calibration tests (`nb5l2_probe_necessary_and_injected_overpin`,
-/// `nb5l2_probe_finds_natural_accumulation_overpin`) pin both classification arms.
+/// drift — the `is_ref`/`is_raw` replay closures are byte-identical to the loop's (non-`Ref` for
+/// locals, exact-`Raw` for fields). The anchor asserts `model_accepts(accepted_model)`; calibration
+/// tests pin both classification arms.
 #[cfg(test)]
 pub(crate) fn model_accepts(
     program: &RustProgram,
@@ -2050,13 +2023,12 @@ fn model_accepts_with_flows_impl(
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> bool {
-    // ALLOW-LIST TRIPWIRE (ruling on ADV-1). This is a PROBE — an oracle run
+    // ALLOW-LIST TRIPWIRE. This is a PROBE — an oracle run
     // outside either CEGAR loop, on a model the loop may never have accepted.
     // Under the allow-list it is outside the armed region and records nothing
-    // by construction, so the previous `with_capture_suspended` here is
-    // redundant.
+    // by construction, so suspending capture here would be redundant.
     //
-    // It is replaced by an assertion rather than deleted, and that choice is
+    // An assertion stands here instead of a suspension, and that choice is
     // deliberate: suspension would MASK a violation of the allow-list (a probe
     // that somehow ran inside the armed region would quietly record nothing and
     // look fine), whereas this fails loudly and names the invariant. A backstop
@@ -2093,7 +2065,7 @@ fn model_accepts_with_flows_impl(
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
     // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a
-    // fail-closed STOP — §NB5-L2 Codex F2). A probe model CAN reach a non-`Ref`-local residual (unlike
+    // fail-closed STOP). A probe model CAN reach a non-`Ref`-local residual (unlike
     // the live loop), where `representative` returns `None` and the naive "no committable owner" check
     // would MIS-accept; including `guard_slots_are_ref` rejects it, matching the loop exactly.
     residual_nonref_field(&conflicts, model).is_none()
@@ -2104,9 +2076,9 @@ fn model_accepts_with_flows_impl(
             .all(|c| representative(c, model).is_none())
 }
 
-/// Pick the slot of a residual conflict to commit `¬ref` on (Mode A).
+/// Pick the slot of a residual conflict to commit `¬ref` on (the plain repair).
 ///
-/// §NB4-4a **A′ — live-requirer discharge.** Demoting a slot discharges an edge only if it
+/// **Live-requirer discharge.** Demoting a slot discharges an edge only if it
 /// removes the **conflict**, not the **requirement**. Demoting the *issuer* removes its loan
 /// from the ANALYSIS (the replay disables that provenance and the loan disappears next round),
 /// but a live `Ref` **requirer** of that loan still aliases the written cell — it is not made
@@ -2114,15 +2086,14 @@ fn model_accepts_with_flows_impl(
 /// it must carry the discharge; the issuer stays in the menu only when no such requirer exists
 /// (self-edges, issuer-only edges).
 ///
-/// This RESTRICTS the commit menu — it introduces no new assertion kind, so §3 invariant 7
-/// (lemmas are `¬ref`-only) is untouched. Without it, `x = id(p); …; *b = 2;` (b = p) accepts
+/// This RESTRICTS the commit menu — it introduces no new assertion kind, so the invariant that
+/// lemmas are `¬ref`-only is untouched. Without it, `x = id(p); …; *b = 2;` (b = p) accepts
 /// `p`/`b` = `Raw` while `x` survives `Ref` — a shared reference into a cell written through a
-/// raw alias (the S2-6 family, production-parity, §8-guarded). Fixtures:
-/// `nb4_returned_borrow_vs_base_mutation`, `nb4_callee_write_invalidates_caller_loan`,
-/// `nb4_returned_immutable_borrow_vs_base_write` (A′'s reach is a property of the edge menu, so
-/// it closes the IMMUTABLE shape too — orthogonal to the immutable-loan skip).
+/// raw alias (the cross-alias write family, shared with production, harmless while BO output is
+/// unconsumed). The discharge's reach is a property of the edge menu, so it closes the IMMUTABLE
+/// shape too — orthogonal to the immutable-loan skip.
 ///
-/// Returns `None` only when no owner of the conflict is currently `Ref`. §NB5-F: this cannot
+/// Returns `None` only when no owner of the conflict is currently `Ref`. This cannot
 /// arise on the live path — a non-`Ref` field residual is decline-intercepted (`residual_nonref_field`)
 /// and a non-`Ref` `Local` residual is assert-intercepted (`guard_slots_are_ref`) before this runs, so
 /// every conflict reaching here has a committable `Ref` owner (`Local` OR field). A residual `Local`
@@ -2132,18 +2103,17 @@ fn representative(
     conflict: &SlotConflict,
     model: &FxHashMap<SlotRef, SlotKind>,
 ) -> Option<SlotRef> {
-    // §NB5-L: Mode-A's single pick is the FIRST member of the A′ menu (byte-identical refactor —
-    // `find` returned the first satisfying element in both A′ branches, and `a_prime_menu`'s
-    // order-preserving de-dup never changes the first element).
+    // The plain repair's single pick is the FIRST member of the live-requirer menu
+    // (`a_prime_menu`'s order-preserving de-dup never changes the first element).
     a_prime_menu(conflict, model).into_iter().next()
 }
 
-/// §NB5-L — the A′-restricted commit menu as a **set** (the `Lemmas` disjunction `⋁¬ref(menu)`
-/// ranges over exactly this). Same A′ discipline as `representative` (which is its first element):
+/// The live-requirer-restricted commit menu as a **set** (the `Lemmas` disjunction `⋁¬ref(menu)`
+/// ranges over exactly this). Same discipline as `representative` (which is its first element):
 /// a live `Ref` requirer BEYOND the issuer must carry the discharge, so if any exist the menu is
-/// **exactly those requirers — the issuer is NOT offered** (rider 2: the disjunction's soundness
+/// **exactly those requirers — the issuer is NOT offered** (the disjunction's soundness
 /// invariant; offering the issuer would let the solver discharge by demoting it while a live `Ref`
-/// requirer keeps aliasing the written cell, the S2-6 hole). Otherwise (self-edges, issuer-only
+/// requirer keeps aliasing the written cell, the cross-alias write hole). Otherwise (self-edges, issuer-only
 /// edges) the menu is the `Ref` owners, issuer first. Order-preserving de-dup keeps the emitted
 /// clause (and the reported lemma set) minimal. Empty iff no owner is currently `Ref` — which the
 /// `residual_nonref_field` decline + `guard_slots_are_ref` assert rule out on the live path.
@@ -2180,9 +2150,9 @@ fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -
     menu
 }
 
-/// §NB5-L rider 3 — a stable total-order key for a `SlotRef` (`SlotRef: !Ord`, because `LocalDefId`
+/// A stable total-order key for a `SlotRef` (`SlotRef: !Ord`, because `LocalDefId`
 /// is not; `SlotId` IS orderable). Variant tag orders `Field < Local`; within each, by the
-/// underlying id(s). Used ONLY to canonicalize the `Lemmas` emission order (Mode-A stays on FxHash).
+/// underlying id(s). Used to canonicalize the emission order.
 pub(crate) fn slotref_key(s: &SlotRef) -> (u8, u32, usize) {
     match s {
         SlotRef::Field(sid) => (0, 0, sid.index()),
@@ -2205,14 +2175,14 @@ fn conflict_sort_key(
 }
 
 thread_local! {
-    /// §NB5-L (Codex MEDIUM) — test-only round-cap override so a test can FORCE cap exhaustion
+    /// Test-only round-cap override so a test can FORCE cap exhaustion
     /// (the oscillation blowup does not manifest naturally). `None` ⇒ the real `n + 8` bound.
     static CAP_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Generous round-cap backstop for `verify_to_fixpoint`. The real bound is ≤ |slots|
 /// (each round commits a fresh slot off `Ref`); `n + slack` covers it with margin. Not
-/// the termination guarantee — only a panic tripwire (Mode-A) / decline backstop (Lemmas). A
+/// the termination guarantee — only a panic tripwire (the plain repair) / decline backstop (Lemmas). A
 /// test-only `CAP_OVERRIDE` can lower it to exercise the cap branches.
 fn round_cap(slots: &CrateSlots) -> usize {
     if let Some(c) = CAP_OVERRIDE.with(|c| c.get()) {
@@ -2227,8 +2197,8 @@ fn round_cap(slots: &CrateSlots) -> usize {
     n + 8
 }
 
-/// §NB5-F — the first `SlotRef::Field` in a residual conflict the model left non-`Ref` (a field
-/// that owns/borrow-aliases a written cell). Option A declines on this: it is not a committable
+/// The first `SlotRef::Field` in a residual conflict the model left non-`Ref` (a field
+/// that owns/borrow-aliases a written cell). The loop declines on this: it is not a committable
 /// `Ref`, and the Local-only replay candidacy cannot disable its loan, so forcing it would corrupt
 /// the ownership fact / loop forever. The paired non-`Ref` `Local` case stays a fail-closed
 /// invariant violation (`guard_slots_are_ref`). Returns the offending field for attribution.
@@ -2247,9 +2217,9 @@ fn residual_nonref_field(
 /// `Ref` in the current model. `Raw` slots are replay-demoted (witnessed) and `Owning`
 /// slots are non-candidates, so a residual edge can only name surviving `Ref`
 /// candidates; a violation signals the deferred Owning-issuer / under-report cases.
-/// §NB5-F: `residual_nonref_field` runs first, so any non-`Ref` slot reaching this guard
+/// `residual_nonref_field` runs first, so any non-`Ref` slot reaching this guard
 /// is a `Local` (a genuine violation).
-/// Release-active (BB3-c): a violation = a model with a live residual conflict whose
+/// Release-active: a violation = a model with a live residual conflict whose
 /// owner slot is not `Ref`, so `representative` cannot commit it and the loop would
 /// silently accept an unsound model bound for codegen — it must fail-closed even in
 /// release, not compile out.
@@ -2266,7 +2236,7 @@ fn guard_slots_are_ref(
 }
 
 /// Translate a borrow `ProvenanceOwner` to a BO `SlotRef`. A `Local` owner maps to the
-/// local's depth-0 slot; a `Field` owner (§NB5-F) maps to the global struct-field slot's
+/// local's depth-0 slot; a `Field` owner maps to the global struct-field slot's
 /// depth-0 slot in `field_slots` (already built + solver-encoded). `SlotRef`'s variant
 /// disambiguates the two per-universe `SlotId` spaces, so there is no id collision.
 fn owner_to_slot(
@@ -2298,7 +2268,7 @@ fn owner_to_slot(
 
 #[cfg(test)]
 mod nb5l_a_prime_menu_tests {
-    //! §NB5-L (a′) — the A′-menu-restriction invariant (rider 2), tested directly on the private
+    //! The live-requirer menu-restriction invariant, tested directly on the private
     //! `a_prime_menu` with hand-built `SlotConflict`s + models. Owner-agnostic logic, so `Field`
     //! slots (trivially constructible from a `usize`) exercise it without a compiler run.
     use super::*;
@@ -2312,10 +2282,10 @@ mod nb5l_a_prime_menu_tests {
     }
 
     /// The disjunction's soundness invariant: when a live `Ref` requirer exists BEYOND the issuer,
-    /// the A′ menu is EXACTLY those requirers — the issuer is NOT offered, even though it is `Ref`
-    /// and in the naive issuer∪requirers menu. (Offering it would let the solver discharge by
-    /// demoting the issuer while a live `Ref` requirer keeps aliasing the written cell — the S2-6
-    /// hole the lemma must not permit.)
+    /// the live-requirer menu is EXACTLY those requirers — the issuer is NOT offered, even though
+    /// it is `Ref` and in the naive issuer∪requirers menu. (Offering it would let the solver
+    /// discharge by demoting the issuer while a live `Ref` requirer keeps aliasing the written
+    /// cell — the cross-alias write hole the lemma must not permit.)
     #[test]
     fn a_prime_menu_excludes_issuer_when_live_requirer() {
         let (i, r1, r2) = (field(0), field(1), field(2));
@@ -2335,12 +2305,12 @@ mod nb5l_a_prime_menu_tests {
             vec![r1, r2],
             "menu = exactly the Ref requirers beyond the issuer"
         );
-        // Mode-A's single pick is the menu's first element (the byte-identical refactor).
+        // The plain repair's single pick is the menu's first element.
         assert_eq!(representative(&conflict, &m), Some(r1));
     }
 
     /// Else-branch: no requirer beyond the issuer ⇒ the issuer IS the menu (self / issuer-only
-    /// edges keep the pre-A′ behavior — A′ only RESTRICTS, it never empties a real edge).
+    /// edges keep the unrestricted behavior — the restriction never empties a real edge).
     #[test]
     fn a_prime_menu_offers_issuer_when_no_requirer_beyond() {
         let i = field(0);
@@ -2359,8 +2329,8 @@ mod nb5l_a_prime_menu_tests {
         assert_eq!(representative(&conflict, &m), Some(i));
     }
 
-    /// A non-`Ref` requirer beyond the issuer is not a LIVE requirer, so it does not trip the A′
-    /// "if" branch — the menu falls back to the `Ref` owners (here the issuer).
+    /// A non-`Ref` requirer beyond the issuer is not a LIVE requirer, so it does not trip the
+    /// live-requirer "if" branch — the menu falls back to the `Ref` owners (here the issuer).
     #[test]
     fn a_prime_menu_ignores_non_ref_requirer() {
         let (i, r) = (field(0), field(1));
@@ -2373,7 +2343,7 @@ mod nb5l_a_prime_menu_tests {
         assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
     }
 
-    /// Addenda 61/65: the exact ② class has a different kill switch. Its
+    /// The exact escape-minimal class has a different kill switch. Its
     /// presented source issuer is the sole guard and repair party; the escape
     /// destination is receipt-only and may be Ref or Raw.
     #[test]

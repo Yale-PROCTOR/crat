@@ -46,7 +46,7 @@ struct KindVars {
     own: Bool,
 }
 
-/// §NB-R — opt-in tracked-core diagnostic. When a `KindSolver` is built via
+/// Opt-in tracked-core diagnostic. When a `KindSolver` is built via
 /// `new_tracked`, every HARD constraint is asserted as `track ⇒ constraint`
 /// with a fresh track literal recorded here alongside a human-readable label
 /// (`{context}::{family}(…)`). Solving `check(&[tracks ∪ source selectors])`
@@ -144,15 +144,15 @@ impl CoreTracker {
     /// Mint a fresh track literal for one hard constraint and record its label.
     fn record(&self, label: String) -> Bool {
         if self.granularity == CoreTrackingGranularity::Family {
-            // R385-1: `CORE_LABEL_FAMILIES` predates era-5b's constraint
+            // `CORE_LABEL_FAMILIES` predates the ownership-licensing constraint
             // families (`own-fold-*`, `own-original-cell-*`,
             // `own-guarded-traversal-view-zero`, `own-traversal-license`,
             // `a5-coarse-exclusion`), so a family-tracked probe over a program
             // that emits them died on the panic instead of reporting a core.
-            // Family granularity has no production caller — it is the NB-R
+            // Family granularity has no production caller — it is the tracked-core
             // diagnostic constructor — so an unregistered label gets a family of
             // its own head here and the probe stays usable. Registering them
-            // properly is the seat's call; the panic stays for every other
+            // properly is still open; the panic stays for every other
             // granularity.
             let derived;
             let family = match core_label_family(&label) {
@@ -245,11 +245,11 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     GUARDED_COMMIT_CORE_FAMILY,
     RECURRENCE_ESCALATION_CORE_FAMILY,
     "borrow-exclusion",
-    // §NB4-4c: `¬own(slot)` demotion companion to `borrow-exclusion`. No substring overlap with
+    // `¬own(slot)` demotion companion to `borrow-exclusion`. No substring overlap with
     // the `own-*` families or `borrow-exclusion` (first-containment matching stays unambiguous).
     "own-exclusion",
     "one-hot",
-    // §NB1 per-site safety monotonicity (no substring overlap with the others).
+    // Per-site safety monotonicity (no substring overlap with the others).
     "safe-mono",
     "i1-adjacency",
     "own-copy-for-deref-lend",
@@ -261,7 +261,7 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "own-le",
     "own-eqmin",
     "source-selector",
-    // §NB-F: free/realloc sink selectors (no substring overlap with
+    // Free/realloc sink selectors (no substring overlap with
     // "source-selector" — first-containment matching stays unambiguous).
     "sink-selector",
     // Diagnostic forced assignments. They are not production constraints; they
@@ -269,7 +269,7 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     // core beside the families that refuse them. No substring overlap.
     "s23-force",
     "r385-force",
-    // R390-2: era-5b's own families. Longest first where one contains another,
+    // The ownership-licensing families. Longest first where one contains another,
     // because `family_of` is first-containment; every one of these is reached
     // only after the families above, so none of them shadows an older name.
     "own-guarded-traversal-argument-legacy",
@@ -292,16 +292,14 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "a5-coarse-exclusion",
     "own-original-cell",
     "own-fold-pending",
-    // R551 (spec lane B4): era-5c's own families, registered. Each matched no
+    // The lend, field-move, deref-reader and allocator-contract families. Each matched no
     // family before (it took the family-granularity `unregistered::` fallback),
     // so appending them cannot shadow an older name under first-containment.
     "lend-formal-forbid",
     "field-move-kind",
     "own-guarded-traversal-formal-zero",
     "own-guarded-traversal-receiver-legacy",
-    // L01⁹ rule 1b.
     "deref-reader-kind",
-    // L01¹³ (c), era-5c 108 / 115.
     "allocator-contract-port-retracted",
     "own-contract-sink-drop",
     "own-contract-sink",
@@ -478,7 +476,7 @@ pub(crate) struct SelectorTraceEvent {
     pub active_before: Vec<usize>,
     pub core_selectors: Vec<usize>,
     /// Canonical diagnostic labels for every typed assumption in this core.
-    /// T2 fills this with endpoint and mandatory-track labels; legacy paths
+    /// Endpoint retraction fills this with endpoint and mandatory-track labels; legacy paths
     /// leave it empty.
     pub core_labels: Vec<String>,
     pub outcome: SelectorTraceOutcome,
@@ -549,10 +547,10 @@ pub struct KindSolver {
     lazy_plain_materialization_count: Cell<usize>,
     hard_check_elapsed: Cell<Duration>,
     optimize_materialization_elapsed: Cell<Duration>,
-    /// R379-2: the return-port rows admitted at emission, in slot-key order.
+    /// The return-port rows admitted at emission, in slot-key order.
     /// They are ASSERTED at materialisation, not at emission, because the
     /// refusals they must yield to — the objective, a caller's final-zero —
-    /// enter the system after emission ends. Report 048 measured that.
+    /// enter the system after emission ends.
     return_port_admitted: RefCell<Vec<(String, SlotRef)>>,
     /// One entry per materialisation round: how many of those rows survived.
     return_port_kept: RefCell<Vec<usize>>,
@@ -673,7 +671,7 @@ impl RelaxedSelectors {
 }
 
 impl KindSolver {
-    /// era-5c 134: the whole system the solve sees (hard and soft), as SMT-LIB text.
+    /// The whole system the solve sees (hard and soft), as SMT-LIB text.
     #[cfg(test)]
     pub(crate) fn system_text(&self) -> String {
         self.solver.to_string()
@@ -683,7 +681,7 @@ impl KindSolver {
         Self::build(slots, Some(CoreTracker::new_mandatory()), true)
     }
 
-    /// §NB-R diagnostic constructor: every hard constraint is track-gated.
+    /// Tracked-core diagnostic constructor: every hard constraint is track-gated.
     /// The result must ONLY be driven via assumption solving (see
     /// `CoreTracker`); production solve paths refuse it.
     #[cfg(test)]
@@ -1053,7 +1051,7 @@ impl KindSolver {
         );
     }
 
-    /// A12 phase-1 depth-zero copy disjunction. The destination (`lhs`) and source (`rhs`)
+    /// The copy-lend disjunction for a depth-zero copy. The destination (`lhs`) and source (`rhs`)
     /// either keep the current equal-kind reading, or take the owner-to-shared-reference lend
     /// reading `lhs.ref && rhs.own`. The lend guard is derived from the one-hot kind bits rather
     /// than allocated as a free selector, so it adds no independent model choice.
@@ -1083,7 +1081,7 @@ impl KindSolver {
         }
     }
 
-    /// era-5c relay 208 (S39, `CRAT_COPY_RELAX=depth0-borrow-to-raw`): a bare depth-0 copy
+    /// Under `CRAT_COPY_RELAX=depth0-borrow-to-raw`: a bare depth-0 copy
     /// `lhs := rhs` keeps the equal-kind reading or takes `lhs.raw ∧ rhs.ref` (a raw view of a
     /// reference). Raw → Ref is never allowed and an Owning source stays equal.
     pub(crate) fn copy_relax_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
@@ -1111,7 +1109,7 @@ impl KindSolver {
         }
     }
 
-    /// The derived A12 branch guard, shared by kind coherence and ownership transfer.
+    /// The derived copy-lend branch guard, shared by kind coherence and ownership transfer.
     pub(crate) fn lend_guard(&self, lhs: SlotRef, rhs: SlotRef) -> Bool {
         let lhs_vars = self
             .vars
@@ -1124,7 +1122,7 @@ impl KindSolver {
         Bool::and(&[&lhs_vars.ref_, &rhs_vars.own])
     }
 
-    /// §9.10.2 field-ownership constraint: a struct field slot is one crate-wide slot that
+    /// Field-ownership constraint: a struct field slot is one crate-wide slot that
     /// (flow-insensitively) holds EVERY value stored into the field. It may be `Owning` — the
     /// rewriter would `Box`/free it — ONLY if every stored value is itself owned; if any store
     /// is a borrowed value the field must not be `Owning` (else it would free borrowed memory
@@ -1176,7 +1174,7 @@ impl KindSolver {
         );
     }
 
-    /// §9.10.2 companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
+    /// Companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
     /// Used when a field receives a value that is definitely not an owned heap allocation — an
     /// address-of (`Ref`/`RawPtr`) store, or a store whose RHS cannot be resolved to a slot
     /// (so its ownership is unknown). Such a store means the field can hold non-owned memory,
@@ -1196,8 +1194,8 @@ impl KindSolver {
         );
     }
 
-    /// A14 field ref-worthiness: a field may be Ref only when every non-null stored value is safe
-    /// (Ref or Owning). Null is handled orthogonally by §29; Raw is the only disqualifying kind.
+    /// Field ref-worthiness: a field may be Ref only when every non-null stored value is safe
+    /// (Ref or Owning). Null is handled orthogonally (null is `None`); Raw is the only disqualifying kind.
     pub(crate) fn constrain_field_ref(&self, field: SlotRef, rhs: &[SlotRef]) {
         let field_ref = &self
             .vars
@@ -1233,7 +1231,7 @@ impl KindSolver {
         );
     }
 
-    /// A16-REFINE: a caller may be Ref only if the modeled-origin callee
+    /// Return refinement: a caller may be Ref only if the modeled-origin callee
     /// return is not Raw. This is deliberately one-way: it can demote the
     /// caller, never license Ref from the callee.
     pub(crate) fn constrain_origin_return_ref(&self, caller: SlotRef, callee: SlotRef) {
@@ -1290,14 +1288,14 @@ impl KindSolver {
         }
     }
 
-    /// L01^5 (ii): the field↔field strong-update MOVE. Where `field_moves` proves
+    /// The field↔field strong-update MOVE. Where `field_moves` proves
     /// the loaded place is overwritten on every path before any read of it, the
     /// crate-wide field slot cannot still be observed holding the moved value, so
     /// the kind equality between the loading local and the field slot is RELEASED
     /// — the same shape as `field_reader_or_equate`, with a must-overwrite guard
     /// instead of a reader effect. It asserts no kind: the local's own bit is then
     /// settled by the source token's flow and the store-side AND coupling, and the
-    /// drop policy (R395-2: drops only at C free sites) is untouched.
+    /// drop policy (drops only at C free sites) is untouched.
     pub(crate) fn field_move_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
         let a = &self.vars[&lhs];
         let b = &self.vars[&rhs];
@@ -1314,7 +1312,7 @@ impl KindSolver {
         }
     }
 
-    /// L01⁹ rule 1b (`CRAT_ERA5C_DEREF_READER`): a deref-only field read. The
+    /// A deref-only field read. The
     /// temporary shares the field's surface form (raw iff the field is raw); a
     /// reader of a Ref field is Ref (it never owns borrowed memory); a reader of
     /// an Owning field is Ref or Owning, as its own ownership versions decide --
@@ -1635,7 +1633,7 @@ impl KindSolver {
             .licensing
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("first-permission facts missing"))?;
-        // R1165-1 (era-5c relay 232): the frozen snapshot's plan, field support and transport are
+        // The frozen snapshot's plan, field support and transport are
         // read as they are, once these facts still digest to the ones they were frozen from. The
         // preflight re-derived all three from the facts and compared them, which cost as much as
         // the snapshot (`MatchedTransport::build` again); equal inputs give equal derivations.
@@ -1850,7 +1848,7 @@ impl KindSolver {
                                 && b.ordinal == candidate.receiver_boundary
                         })
                         .ok_or("receiver-boundary-missing")?;
-                    // era-5c (E5C-2): a formal component the actual's window does
+                    // A formal component the actual's window does
                     // not reach (the callee's `node->left` when the caller tracks
                     // `root->right` one level deep) is admissible under the arm
                     // when the licence's own `formal-zero` row covers it — the
@@ -2121,7 +2119,7 @@ impl KindSolver {
                 continue;
             };
             let reader = self.lend_guard(lhs, rhs);
-            // R388-1: a field whose only holds are classified store sources is
+            // A field whose only holds are classified store sources is
             // supported CONDITIONALLY — the condition being the conjunction those
             // sources name. `reader => support` is unchanged; what changes is that
             // `support` can be a formula instead of a pre-solve boolean.
@@ -2163,8 +2161,8 @@ impl KindSolver {
         Ok(())
     }
 
-    /// R388-1: the conjunction a field's classified store sources name. `None`
-    /// when the field carries a hold the classification does not cover — avl's
+    /// The conjunction a field's classified store sources name. `None`
+    /// when the field carries a hold the classification does not cover —
     /// `TerminalRoleC` and `CallerCoverageC` are exactly that — so those fields
     /// keep the pre-solve refusal and their readers stay held.
     fn classified_store_support(
@@ -2187,7 +2185,7 @@ impl KindSolver {
                         && !matches!(store.origin, StoreSourceOrigin::MovedInput { .. })
                 })
             }),
-            // L01⁹ rule 2′: only a moved-input classification covers these.
+            // Only a moved-input classification covers these.
             Pending::TerminalRoleC | Pending::CallerCoverageC => {
                 hold.site.as_ref().is_some_and(|site| {
                     proof.classified.iter().any(|store| {
@@ -2325,7 +2323,7 @@ impl KindSolver {
         Ok(resolved.len())
     }
 
-    /// §NB1 SAFE-MONO clause: `safe(target) ⇒ safe(layer)` — a safe (`¬raw`)
+    /// SAFE-MONO clause: `safe(target) ⇒ safe(layer)` — a safe (`¬raw`)
     /// target cannot sit behind a raw pointer `layer` that was dereferenced to
     /// reach it. `safe(x) ≡ ¬raw(x)` (one-hot), so this is `raw(target) ∨
     /// ¬raw(layer)`, a hard clause over the two slots' `raw` bits. It is
@@ -2350,12 +2348,12 @@ impl KindSolver {
         );
     }
 
-    /// §8 BB1 — assert a borrow-exclusion guard for one conflict edge: at least one
+    /// Assert a borrow-exclusion guard for one conflict edge: at least one
     /// of the involved slots must NOT be a reference. `¬ref(issuer) ∨ ⋁ ¬ref(requirer)`,
     /// a hard clause over the slots' `ref_` one-hot bits. Committing `¬ref` (not `raw`)
     /// is deliberate — a borrow conflict only refutes the *reference* reading; the
     /// slot's ownership bit may still legitimately settle `Owning`. NO-OP when no slot
-    /// is supplied (an all-`Field`-owner edge that BB0's Local-only mapping dropped):
+    /// is supplied (an all-`Field`-owner edge that the Local-only slot mapping dropped):
     /// an empty `Bool::or` is `false` and would force spurious UNSAT, so the
     /// field-exclusivity gap is left unconstrained here rather than crashing the
     /// solve (deferred to the struct field-slot mapping).
@@ -2364,15 +2362,14 @@ impl KindSolver {
     /// every involved slot is independently pinned to `Ref` by hard ownership facts
     /// (`own(d+1)` true forces `¬raw(d)` via I1, and `own(d)` false), which
     /// `model_kinds_relaxing` cannot repair — it only drops malloc source selectors.
-    /// Harmless while BO output is unconsumed; once consumed (post-BB2) the caller
-    /// must treat a `None` model as a real possibility, not assume guards never UNSAT.
+    /// The caller must treat a `None` model as a real possibility, not assume guards never UNSAT.
     ///
     /// Precondition: every supplied `SlotRef` must be registered in this solver — i.e.
     /// derived from the *same* `CrateSlots` the solver was built from. A foreign slot
     /// panics (`unknown slot`). Today's callers share one `CrateSlots`; a debug-assert
-    /// is unnecessary while that discipline holds, but BB2's loop must preserve it.
+    /// is unnecessary while that discipline holds, but the repair loop must preserve it.
     ///
-    /// BB2-ii's Mode-A loop also calls this with a *single* slot
+    /// The plain repair loop also calls this with a *single* slot
     /// (`add_borrow_exclusion(Some(slot), &[])`) to commit a monotone `¬ref(slot)` —
     /// the one-literal degenerate case of the same exclusion clause.
     pub(crate) fn add_borrow_exclusion(&self, issuer: Option<SlotRef>, requirers: &[SlotRef]) {
@@ -2400,17 +2397,16 @@ impl KindSolver {
         );
     }
 
-    /// R377-1: the return-port rule. `add_borrow_exclusion` already denies `ref`
+    /// The return-port rule. `add_borrow_exclusion` already denies `ref`
     /// for every allocation source; this denies `raw` as well, which leaves the
     /// one-hot's `own` — "Owning at the return port". The caller inherits it
     /// through the ordinary `link_own` solidification, so nothing new is
     /// emitted on the caller's side.
     ///
-    /// R379-2: the row is RECORDED here and asserted at materialisation. At
+    /// The row is RECORDED here and asserted at materialisation. At
     /// emission the objective and the final-zero obligations are not in the
     /// system yet, so a check here is satisfiable and the refusal it must yield
-    /// to appears only later — report 048 measured exactly that
-    /// (`emitted=true` for all three of `o03`'s slots).
+    /// to appears only later.
     pub(crate) fn require_own(&self, key: &str, slot: SlotRef) {
         assert!(self.vars.contains_key(&slot), "unknown slot: {slot:?}");
         let mut admitted = self.return_port_admitted.borrow_mut();
@@ -2420,13 +2416,13 @@ impl KindSolver {
         }
     }
 
-    /// R379-2: assert every admitted return-port row, then let the caller's own
+    /// Assert every admitted return-port row, then let the caller's own
     /// `check` decide. On `Unsat` the caller bisects; with none admitted this
     /// asserts nothing and the round is exactly today's.
     fn assert_return_port_rows(&self, rows: &[(String, SlotRef)]) {
         // Scope-local, so asserted the way the assumption bundle is rather than
         // through `assert_hard`: that path bumps the tracked hard-assertion
-        // count, which `relax_selectors_hard_typed`'s T2 no-bypass tripwire
+        // count, which `relax_selectors_hard_typed`'s endpoint-retraction no-bypass tripwire
         // reconciles against mandatory tracks plus typed endpoints — and a
         // popped scope does not un-bump it, so the next round trips.
         for (_, slot) in rows {
@@ -2434,7 +2430,7 @@ impl KindSolver {
         }
     }
 
-    /// R379-2: the admissible subset, found deterministically in slot-key order.
+    /// The admissible subset, found deterministically in slot-key order.
     /// Called ONLY when the round was `Unsat` with every row asserted, so the
     /// common case costs no extra check at all.
     ///
@@ -2473,9 +2469,9 @@ impl KindSolver {
         kept
     }
 
-    /// A5 coarse pricing control: a may-overlapping formal pair cannot both
-    /// settle `Ref`. This is deliberately separate from precise replay and is
-    /// never the proposed landing consumer.
+    /// Parameter-overlap coarse pricing control: a may-overlapping formal pair
+    /// cannot both settle `Ref`. This is deliberately separate from precise
+    /// replay and is only a pricing control.
     pub(crate) fn add_overlap_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
         assert_ne!(
             left, right,
@@ -2499,11 +2495,11 @@ impl KindSolver {
         );
     }
 
-    /// L2 context-conditioned single-literal commit. The planner supplies a
+    /// The guarded repair's context-conditioned single-literal commit. The planner supplies a
     /// witnessed-context clause. Ref-witnessed peers and the target contribute
     /// negative `ref` literals; Raw-witnessed peers contribute positive `ref`
     /// literals. This method binds that representation to the solver's
-    /// hard-assertion and tracked-core path without changing Mode-A's existing
+    /// hard-assertion and tracked-core path without changing the plain repair's existing
     /// `add_borrow_exclusion` emission.
     pub(crate) fn add_guarded_commit(&self, action: &CommitAction) {
         let expected_family = match action.kind {
@@ -2549,7 +2545,7 @@ impl KindSolver {
         );
     }
 
-    /// §NB5-L2 — push a solver scope. Hard clauses asserted after `push_scope` are removed by the
+    /// Push a solver scope. Hard clauses asserted after `push_scope` are removed by the
     /// matching `pop_scope`; the soft objective (added in `build`, before any push) persists. The
     /// commit-necessity audit uses this to reuse ONE emitted base across all leave-one-out probes:
     /// `push_scope` → `add_borrow_exclusion(C\{ci})` → `model_kinds_relaxing` → `pop_scope`. Only the
@@ -2567,7 +2563,7 @@ impl KindSolver {
         self.solver.push();
     }
 
-    /// §NB5-L2 — backtrack one scope (see `push_scope`). Precondition: balanced with `push_scope`.
+    /// Backtrack one scope (see `push_scope`). Precondition: balanced with `push_scope`.
     pub(crate) fn pop_scope(&self) {
         self.solver.pop();
         if let Some(tracker) = self
@@ -2584,10 +2580,10 @@ impl KindSolver {
         }
     }
 
-    /// §NB4-4c — assert `¬own(slot)`: a monotone ownership-exclusion clause, the companion to
+    /// Assert `¬own(slot)`: a monotone ownership-exclusion clause, the companion to
     /// `add_borrow_exclusion` (`¬ref`). Together (`¬ref ∧ ¬own`) they pin an unknown-poisoned slot
     /// to `Raw` by one-hot — the may-overwrite/may-retain case where a bare `¬ref` would leave an
-    /// unsound `Owning` (the 3c-ii rejection of the blunt `¬ref`-only clause). *Forbid-only*: it
+    /// unsound `Owning` (why the blunt `¬ref`-only clause is not enough). *Forbid-only*: it
     /// never asserts a positive kind bit, so it only pushes toward raw — theorems-doc invariant 7
     /// intact, and it is trivially compatible with the `i1-adjacency` coupling clause (`raw(d) ⇒
     /// ¬own(d+1)` says nothing when a slot is forced non-`Owning`). When the slot ALSO carries a
@@ -2596,9 +2592,9 @@ impl KindSolver {
     ///
     /// Precondition (as `add_borrow_exclusion`): `slot` must be registered in this solver.
     ///
-    /// NB4-4c: the may-supply demotion uses `¬ref` only; this `¬own` is the tool for the DEFERRED
+    /// The may-supply demotion uses `¬ref` only; this `¬own` is the tool for the DEFERRED
     /// may-overwrite demotion (needs opaque-overwrite detection, which `summary.unknown` does not
-    /// provide). Kept warm by `nb4_4c_add_owning_exclusion_forbids_owning`, not `allow(dead_code)`.
+    /// provide). Kept compiled by a test, not by `allow(dead_code)`.
     #[cfg(test)]
     pub(crate) fn add_owning_exclusion(&self, slot: SlotRef) {
         let vars = self
@@ -2613,7 +2609,7 @@ impl KindSolver {
         );
     }
 
-    /// §S2-3 DIAGNOSTIC PROBE (compute-only, no production caller). FORCE a slot `Owning` and let the
+    /// DIAGNOSTIC PROBE (compute-only, no production caller). FORCE a slot `Owning` and let the
     /// caller `check()`: SAT ⇒ `own(slot)` is achievable under the hard constraints, so a zero yield in
     /// the optimized model is a SOFT (objective/retention) blocker, not a mechanism gap; UNSAT (best via
     /// `new_tracked`) ⇒ a hard constraint family forbids it and the core names it. Symmetric to
@@ -2632,7 +2628,7 @@ impl KindSolver {
         );
     }
 
-    /// R385-1 companion to `assert_owning`: FORCE a slot `Ref` for the
+    /// Companion to `assert_owning`: FORCE a slot `Ref` for the
     /// forced-assignment core probe. Compute-only, no production caller.
     #[cfg(test)]
     pub(crate) fn assert_ref(&self, slot: SlotRef) {
@@ -2649,7 +2645,7 @@ impl KindSolver {
     }
 
     pub fn check(&self) -> SatResult {
-        // §NB-R guard: a no-assumption check on a tracked solver is vacuously
+        // Tracked-solver guard: a no-assumption check on a tracked solver is vacuously
         // SAT (all hard constraints are track-gated) — refuse, like the other
         // production solve paths.
         assert!(
@@ -2778,7 +2774,7 @@ impl KindSolver {
         // The formulas remain the exact tracked construction, but the fixed
         // set is activated with ordinary hard assertions rather than an
         // assumption vector. On UNSAT only, repeat under assumptions so the
-        // core retains its typed mandatory/T2 identities.
+        // core retains its typed mandatory/endpoint-retraction identities.
         hard.solver.push();
         for literal in &bundle {
             hard.solver.assert(literal);
@@ -2870,7 +2866,7 @@ impl KindSolver {
         self.solver.set_params(&fixed_query_params());
     }
 
-    /// R484-1: the Raw-causal census forces `ref_` and reads the UNSAT core.
+    /// The Raw-cause probe forces `ref_` and reads the UNSAT core.
     /// Raw is the residual kind -- the objective prefers `ref_` -- so "why is
     /// this subject Raw?" is exactly "what forbids `ref_`?".
     #[cfg(test)]
@@ -2911,7 +2907,7 @@ impl KindSolver {
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
-        // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
+        // Tracked-solver guard (release-active): a tracked solver's hard
         // constraints are `track ⇒ c` — without the tracks assumed they are
         // vacuously satisfiable, so this path would return a silently wrong
         // model instead of an error.
@@ -2955,13 +2951,13 @@ impl KindSolver {
         assert_eq!(
             self.hard_assertion_count(),
             expected_hard,
-            "T2 no-bypass tripwire: every Optimize hard assertion must be either a mandatory \
+            "endpoint-retraction no-bypass tripwire: every Optimize hard assertion must be either a mandatory \
              tracked constraint or a typed endpoint assertion"
         );
         assert_eq!(
             hard.assertion_count(),
             expected_hard,
-            "T2 hard-loop mirror omitted or duplicated a tracked assertion"
+            "endpoint-retraction hard-loop mirror omitted or duplicated a tracked assertion"
         );
         self.begin_demand_epoch(selectors);
         let mut assumptions = selectors.all().to_vec();
@@ -3001,7 +2997,7 @@ impl KindSolver {
                             .is_some()
                     });
                     let core_labels = self.core_labels(selectors, &core);
-                    // era-5c: name the core a leaked selector came from.
+                    // Name the core a leaked selector came from.
                     if t2_core.is_empty() {
                         self.record_round_model_failure(RoundModelFailure::HardUnsat {
                             active_endpoint_retraction: assumptions.len(),
@@ -3011,7 +3007,7 @@ impl KindSolver {
                     }
                     assert!(
                         mandatory_core,
-                        "T2-only UNSAT core is an incomplete mandatory-track universe: {:?}",
+                        "endpoint-retraction-only UNSAT core is an incomplete mandatory-track universe: {:?}",
                         self.core_labels(selectors, &core)
                     );
                     t2_core.sort_by(|left, right| {
@@ -3024,7 +3020,7 @@ impl KindSolver {
                     let index = assumptions
                         .iter()
                         .position(|selector| selectors.index_of(selector) == Some(selector_index))
-                        .expect("core T2 assertion is active");
+                        .expect("core endpoint-retraction assertion is active");
                     if let Some(epoch) = trace_epoch {
                         SELECTOR_TRACE_CAPTURE.with(|capture| {
                             let mut capture = capture.borrow_mut();
@@ -3049,10 +3045,10 @@ impl KindSolver {
         dropped.sort_by(|left, right| {
             let left = selectors
                 .index_of(left)
-                .expect("dropped T2 assertion belongs to selector universe");
+                .expect("dropped endpoint-retraction assertion belongs to selector universe");
             let right = selectors
                 .index_of(right)
-                .expect("dropped T2 assertion belongs to selector universe");
+                .expect("dropped endpoint-retraction assertion belongs to selector universe");
             selectors.keys[left]
                 .sort_key()
                 .cmp(&selectors.keys[right].sort_key())
@@ -3116,7 +3112,7 @@ impl KindSolver {
 
     /// Materialize the objective-selected model for one validation round after
     /// hard-only selector decisions have fixed its active set. The fixed
-    /// mandatory and surviving T2 literals are temporary plain-hard assertions;
+    /// mandatory and surviving endpoint-retraction literals are temporary plain-hard assertions;
     /// the Optimize check itself carries no assumptions.
     pub(crate) fn optimized_model_under(
         &self,
@@ -3133,7 +3129,7 @@ impl KindSolver {
                 .get()
                 .saturating_add(1),
         );
-        // R379-2: the return-port rows go in HERE, where the system is complete —
+        // The return-port rows go in HERE, where the system is complete —
         // the objective and the final-zero obligations are in it, so a refusal
         // they carry is visible and the rows yield to it. All at once, so the
         // common case costs no extra check; the bisection below runs only when
@@ -3243,10 +3239,9 @@ impl KindSolver {
     /// selectors (phase 2 proves no leaked selector is individually
     /// restorable) and return the resulting per-slot kinds, or `None` if the
     /// system is UNSAT for non-selector reasons. Subset-minimal is NOT
-    /// minimum-cardinality: the §S2-1 sinks-first policy deliberately retains
+    /// minimum-cardinality: the sinks-first policy deliberately retains
     /// a source even where leaking it alone would have been fewer total
-    /// leaks (a source's Owning conversion outweighs leaked frees —
-    /// `nbs2_mixed_fanout_prefers_source_over_two_sinks` pins the trade).
+    /// leaks (a source's Owning conversion outweighs leaked frees).
     ///
     /// All z3 Bools share the single thread-local context (the analysis is
     /// single-threaded), so `c == s` is `Z3_is_eq_ast` node identity — valid
@@ -3266,7 +3261,7 @@ impl KindSolver {
             .map(|(kinds, _dropped)| kinds)
     }
 
-    /// §NB-F reporting twin of `model_kinds_relaxing`: also returns WHICH
+    /// Reporting twin of `model_kinds_relaxing`: also returns WHICH
     /// selectors were dropped (leaked sources and/or leaked sinks — classify
     /// via `Selectors`). Same semantics; the plain fn delegates here.
     #[cfg(test)]
@@ -3281,7 +3276,7 @@ impl KindSolver {
             let model = self.optimized_model_under(&relaxed)?;
             return Some((model, dropped));
         }
-        // §NB-R guard (release-active): under tracking, this loop's unsat-core
+        // Tracked-solver guard (release-active): under tracking, this loop's unsat-core
         // search would see foreign track literals in cores and its selector
         // matching would silently misbehave. Tracked instances are driven only
         // by the explain path.
@@ -3314,17 +3309,17 @@ impl KindSolver {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
                     let core = self.solver.get_unsat_core();
-                    // era-5c: name the core a leaked selector came from.
+                    // Name the core a leaked selector came from.
                     let in_core = |s: &Bool| core.iter().any(|c| c == s);
-                    // §S2-1 (NB-F review F2): the drop choice on a MIXED
+                    // The drop choice on a MIXED
                     // source/sink core is a deliberate policy — drop sinks
                     // first, retain sources. A leaked sink costs a leak (the
                     // free stays a raw-pointer free); a leaked source costs
-                    // Owning-conversion precision (D7's driver). On a true
+                    // Owning-conversion precision. On a true
                     // either/or tie phase 2 cannot undo the choice, so it must
                     // be made here. Within a class, and on cores with no sink
-                    // at all, the pick stays positional — the pre-S2-1
-                    // behavior exactly.
+                    // at all, the pick stays positional, exactly as
+                    // without this policy.
                     let idx = assumptions
                         .iter()
                         .position(|s| selectors.is_sink(s) && in_core(s))
@@ -3426,9 +3421,9 @@ impl KindSolver {
         }
     }
 
-    /// L2 reporting solve. Unlike the legacy `Option` API, this preserves the
+    /// The guarded repair's reporting solve. Unlike the legacy `Option` API, this preserves the
     /// fail-closed distinction between non-selector UNSAT and Z3 Unknown so the
-    /// feature-on loop can emit the ruled diagnostic without altering the
+    /// feature-on loop can emit its typed diagnostic without altering the
     /// feature-off solver path.
     #[cfg(test)]
     pub(crate) fn model_kinds_relaxing_reporting_guarded(
@@ -3515,7 +3510,7 @@ impl KindSolver {
         }
     }
 
-    /// E-R2 sibling of [`Self::read_kinds`]: evaluate each ownership `Var`'s
+    /// Ownership-version sibling of [`Self::read_kinds`]: evaluate each ownership `Var`'s
     /// Bool against the SAME live model, using the same [`is_true`] helper so
     /// the two readouts cannot disagree.
     fn read_version_owns(&self, model: &Model) {
@@ -3601,7 +3596,7 @@ fn add_universe<F>(
         vars.insert(sref, kind_vars);
     }
 
-    // §NB1: the structural `i1-adjacency` chain clause. It is NOT redundant beside
+    // The structural `i1-adjacency` chain clause. It is NOT redundant beside
     // the per-site SAFE-MONO walk: the walk fires only on READ/borrow sites (write
     // destinations excluded — `safety_mono`), so this clause is what still covers
     // write-only and never-dereferenced same-owner chains.
@@ -3673,7 +3668,7 @@ fn assert_not_both(
     assert_hard(solver, tracker, label, &Bool::or(&[&!a, &!b]));
 }
 
-/// §NB-R — the single hard-assert choke point. Untracked: byte-identical to a
+/// The single hard-assert choke point. Untracked: byte-identical to a
 /// plain `assert` (the label closure is never evaluated). Tracked: assert
 /// `track ⇒ constraint` and record the labeled track literal.
 fn assert_hard(
@@ -3712,7 +3707,7 @@ fn is_true(model: &Model, b: &Bool) -> bool {
 
 pub(crate) struct BoOwnDatabase<'opt> {
     optimize: &'opt Optimize,
-    /// §NB-R: present iff the owning `KindSolver` is tracked; every hard
+    /// Present iff the owning `KindSolver` is tracked; every hard
     /// constraint pushed here is then track-gated with an `own-*` family
     /// label (`push_source_owning` excepted — its selectors are already
     /// their own retractable assumption class).
@@ -3725,7 +3720,7 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// hard source, while the relax loop can drop a selector to leak that source.
     source_selectors: Vec<Bool>,
     source_keys: Vec<super::export::EndpointRetractionKey>,
-    /// §NB-F: one selector per `sink` (free/realloc arg) ownership assertion —
+    /// One selector per `sink` (free/realloc arg) ownership assertion —
     /// the sink twin of `source_selectors`. Dropping one LEAKS THE FREE (the
     /// freed value's owning is no longer forced; nothing asserts ¬own/¬ref).
     sink_selectors: Vec<Bool>,
@@ -3735,7 +3730,6 @@ pub(crate) struct BoOwnDatabase<'opt> {
 impl BoOwnDatabase<'_> {
     pub(crate) fn declare_pending_fold(&mut self, key: (u32, usize)) {
         let candidate = {
-            // R353-2: era-5b's own addition; the pin had no such constraint.
             let facts = self.ownership_facts.borrow();
             if facts.fold_declarations.is_none() {
                 return;
@@ -3782,7 +3776,6 @@ impl BoOwnDatabase<'_> {
 
     pub(crate) fn traversal_view_zero(&mut self, guard: &Bool, var: Var, formal: bool) {
         let operation = if formal {
-            // R353-2: era-5b's own addition; the pin had no such constraint.
             "guarded-traversal-formal-zero"
         } else {
             "guarded-traversal-view-zero"
@@ -3812,7 +3805,6 @@ impl BoOwnDatabase<'_> {
     }
 
     pub(crate) fn pending_traversal_pair(&mut self, guard: &Bool, variables: &[Var]) {
-        // R353-2: era-5b's own addition; the pin had no such constraint.
         let (operation, clause) = match variables {
             [a, b] => (
                 "guarded-traversal-receiver-legacy",
@@ -3953,7 +3945,7 @@ impl BoOwnDatabase<'_> {
         Ok(())
     }
 
-    /// E-R2: hand the export a snapshot of the `Var -> Bool` map so the model
+    /// Hand the export a snapshot of the `Var -> Bool` map so the model
     /// readout can evaluate per-version ownership after emission has ended.
     /// Recording-only; no-op unless a capture scope is active.
     pub(crate) fn snapshot_version_asts(&self) {
@@ -4008,7 +4000,7 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.z3_ast[var]
     }
 
-    /// A12's R1 ownership disjunction for one depth-zero transfer. `lend` is the exact kind-layer
+    /// The copy-lend ownership disjunction for one depth-zero transfer. `lend` is the exact kind-layer
     /// expression returned by [`KindSolver::lend_guard`]. When false, these are the existing Copy
     /// linearity or Move constraints. When true, the destination cannot own and the source owns
     /// both before and after the site.
@@ -4101,7 +4093,7 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.source_keys
     }
 
-    /// §NB-F: selector literals for the emitted `sink` ownerships.
+    /// Selector literals for the emitted `sink` ownerships.
     pub(crate) fn sink_selectors(&self) -> &[Bool] {
         &self.sink_selectors
     }
@@ -4111,7 +4103,7 @@ impl<'opt> BoOwnDatabase<'opt> {
     }
 }
 
-/// §NB-F: the retractable-assumption set emission returns — malloc SOURCE
+/// The retractable-assumption set emission returns — malloc SOURCE
 /// selectors plus free/realloc SINK selectors. Stored combined (`all` is what
 /// `verify_to_fixpoint`/`model_kinds_relaxing` consume) with a typed split so
 /// no caller has to remember an ordering convention.
@@ -4250,7 +4242,6 @@ impl Database for BoOwnDatabase<'_> {
         source_use: Var,
         ensure_move: bool,
     ) {
-        // R353-2: era-5b's own addition; the pin had no such constraint.
         super::ownership_evidence::record(
             if ensure_move {
                 "guarded-reader-move"
@@ -4291,7 +4282,6 @@ impl Database for BoOwnDatabase<'_> {
     fn push_guarded_field_reader_tail(&mut self, reader: &Bool, post: Var, pre: Var, source: bool) {
         super::ownership_evidence::record(
             if source {
-                // R353-2: era-5b's own addition; the pin had no such constraint.
                 "guarded-reader-source-tail"
             } else {
                 "guarded-reader-view-tail"
@@ -4319,7 +4309,6 @@ impl Database for BoOwnDatabase<'_> {
         &mut self,
         boundary: &super::ownership_boundary::Substitution,
     ) -> bool {
-        // R353-2: era-5b's own addition; the pin had no such constraint.
         use super::{
             licensing::{cell_effects, facts::EquationId},
             ownership_boundary::Variables,
@@ -4435,7 +4424,6 @@ impl Database for BoOwnDatabase<'_> {
         reference: &super::ssa::consume::Consume<std::ops::Range<Var>>,
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
-        // R353-2: era-5b's own addition; the pin had no such constraint.
         use super::ownership_occurrence::Availability::Present;
         let Some(point) = super::ownership_evidence::point() else { return false };
         let Some(candidate) =
@@ -4504,7 +4492,6 @@ impl Database for BoOwnDatabase<'_> {
         reference: &super::ssa::consume::Consume<std::ops::Range<Var>>,
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
-        // R353-2: era-5b's own addition; the pin had no such constraint.
         use super::ownership_occurrence::{Availability::Present, PathStep};
         if !super::licensing::facts::active()
             || reference.r#use.end.as_u32() - reference.r#use.start.as_u32() != 2
@@ -4599,7 +4586,7 @@ impl Database for BoOwnDatabase<'_> {
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
     }
 
-    /// era-5c: the phi edge whose incoming component is known null. Recorded
+    /// The phi edge whose incoming component is known null. Recorded
     /// under its own operation and family so a core names it, never as a bare
     /// `less-equal`.
     fn push_null_join_impl(&mut self, x: Var, y: Var) {
@@ -4649,17 +4636,17 @@ impl Database for BoOwnDatabase<'_> {
                 .expect("source selector just pushed"),
         );
         self.source_keys.push(key);
-        // E-R3 capture: index-aligned with `source_selectors` by construction —
+        // Selector-provenance capture: index-aligned with `source_selectors` by construction —
         // this is the only writer and it pushes exactly once. Recording-only.
         super::export::record_selector(super::export::BoundaryRole::Source, var);
     }
 
     fn push_sink_owning(&mut self, var: Var) {
-        // §NB-F: `selector ⇒ owning`, the sink twin of `push_source_owning` —
+        // `selector ⇒ owning`, the sink twin of `push_source_owning` —
         // the relax loop may drop the selector to LEAK THE FREE (decline
         // becomes leak; the freed value's owning is then unconstrained: no
         // ¬own/¬ref is asserted — there is deliberately no sink analogue of
-        // NB0's eager ¬ref(source)). Like source selectors, never track-gated
+        // the eager ¬ref(source) on allocation sources). Like source selectors, never track-gated
         // (selectors are their own assumption class).
         let selector = Bool::fresh_const("sink_sel");
         let not_sel = !&selector;
@@ -4675,7 +4662,7 @@ impl Database for BoOwnDatabase<'_> {
                 .expect("sink selector just pushed"),
         );
         self.sink_keys.push(key);
-        // E-R3 capture: sink twin of the source push above; same alignment
+        // Selector-provenance capture: sink twin of the source push above; same alignment
         // guarantee, same recording-only contract.
         super::export::record_selector(super::export::BoundaryRole::Sink, var);
     }
