@@ -117,33 +117,6 @@ fn e5c_l14_g3_a_formal_the_function_releases_is_still_lent() {
     );
 }
 
-#[test]
-#[ignore = "child of e5c_l14_g4 (the guard's fault)"]
-fn e5c_l14_inner_guard_fault() {
-    let rows = candidates(SHAPES);
-    println!("E5C_L14_G4 {}", drop_of(&rows, "read_formal", "_1"));
-}
-
-/// The fault: without the guard the formal's pair is eligible again.
-#[test]
-fn e5c_l14_g4_the_guards_fault_is_caught() {
-    let exe = std::env::current_exe().expect("current_exe");
-    let output = std::process::Command::new(exe)
-        .args([
-            "analyses::borrow_ownership::copy_lend_guard_tests::e5c_l14_inner_guard_fault",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("CRAT_E5C_L14_FAULT", "copy-lend-guard")
-        .output()
-        .expect("child test");
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("E5C_L14_G4 eligible"), "{text}");
-}
-
 /// The guarded funnel's S1 over a named program (era-5c 133): every copy-lend
 /// candidate with its drop. `CRAT_E5C_SIDE_SOURCE` names the source, the rows go to
 /// `CRAT_E5C_SIDE_ROWS`.

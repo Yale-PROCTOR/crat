@@ -2503,7 +2503,7 @@ pub(crate) fn analyze_copy_lend_candidates(
                     &body,
                     &owner_closure([SlotOwner::Local(rhs_local)], &value_flows),
                 );
-                (copy_lend_guard() && caller_derived.contains(&rhs_local) && !released)
+                (caller_derived.contains(&rhs_local) && !released)
                     .then_some(CopyLendEligibilityDrop::GuardCallerDerivedSource)
             });
             answer.push(CopyLendPairCandidate { pair, sites, drop });
@@ -2610,11 +2610,6 @@ fn copy_lend_window_access(
         }
     }
     None
-}
-
-/// The R804-1 guard; `CRAT_E5C_L14_FAULT=copy-lend-guard` removes it (the fault).
-fn copy_lend_guard() -> bool {
-    std::env::var("CRAT_E5C_L14_FAULT").as_deref() != Ok("copy-lend-guard")
 }
 
 fn collect_copy_sites(
