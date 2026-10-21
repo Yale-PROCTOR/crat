@@ -605,30 +605,6 @@ pub(crate) fn prepare(
             model_map(program.tcx, slots, &verified.model).ok_or("invalid accepted model keys")?;
         let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
             .ok_or("invalid baseline model keys")?;
-        // era-5c R607-1: the raw-cause ledger, a sidecar beside the entry; the
-        // entry's bytes, identity and readback are untouched.
-        if super::raw_cause::enabled() {
-            let path = directory.join(format!("{}.raw-cause-ledger.tsv", inputs.program));
-            match super::raw_cause::take_for(&verified.model) {
-                Some(rows) => {
-                    let mut text = format!("{}\n", super::raw_cause::HEADER);
-                    for row in &rows {
-                        text.push_str(&format!("{}\t{}\n", inputs.program, row.sidecar()));
-                    }
-                    // A failed sidecar never fails the entry.
-                    match std::fs::create_dir_all(&directory)
-                        .and_then(|()| std::fs::write(&path, text))
-                    {
-                        Ok(()) => eprintln!("E5C_LEDGER {} rows={}", path.display(), rows.len()),
-                        Err(error) => eprintln!("E5C_LEDGER {} error: {error}", path.display()),
-                    }
-                }
-                None => eprintln!(
-                    "E5C_LEDGER {} missing: no ledger explains the model",
-                    path.display()
-                ),
-            }
-        }
         // R473-4 design (A): stream the canonical origin bytes to a file,
         // per element, and hand the cache the PATH. The whole-`Value` form that
         // cost 31 GiB on libzahl is never built. The file is removed once the

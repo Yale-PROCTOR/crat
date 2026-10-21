@@ -403,8 +403,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     };
     for slot in malloc_sources {
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
-        raw_cause::note_eager(&kind_solver, "allocation-source");
-        raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "allocation-source");
         comparison::record_guard(
             crate_ctxt.tcx,
             slots,
@@ -434,8 +432,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
         if !nullability.contains(&slot) {
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
-            raw_cause::note_eager(&kind_solver, "may-supply");
-            raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "may-supply");
             comparison::record_guard(
                 crate_ctxt.tcx,
                 slots,
@@ -502,8 +498,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         // O-ORIGIN is independent of endpoint/grant selection. A refused
         // fresh responsibility cannot acquire an invented borrow lifetime.
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
-        raw_cause::note_eager(&kind_solver, "no-ref-carrier");
-        raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
     }
     kind_solver.apply_licensing_grants(&facts)?;
     licensing::readers::block_incomplete_transfers(&facts, kind_solver);
