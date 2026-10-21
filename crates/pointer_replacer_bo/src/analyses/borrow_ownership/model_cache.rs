@@ -896,6 +896,91 @@ mod tests {
         assert_eq!(env!("BO_LOCK_SHA256"), sha("../../Cargo.lock"));
     }
 
+    /// quadtree, whose `insert_(tree, (*tree).root, …)` call carries the argument-order hoist.
+    const S2_QUADTREE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/rs-crown-derived/quadtree/lib.rs"
+    );
+
+    /// Child of T-tmp-1 / T-tmp-2: decide `S2_TMP_SOURCE` with no cache directory and print the
+    /// argument-order hoists the table carries.
+    #[test]
+    #[ignore = "child of s2_t_tmp_1 / s2_t_tmp_2"]
+    fn s2_inner_decide_without_a_cache() {
+        let path = std::env::var_os("S2_TMP_SOURCE").expect("S2_TMP_SOURCE");
+        ::utils::compilation::run_compiler_on_path(Path::new(&path), |tcx| {
+            let (table, _) = crate::bo_rewriter::decide_table_with_emission_config(
+                tcx,
+                None,
+                &Default::default(),
+            )
+            .expect("decision");
+            for (_, caller, _) in &table.arg_order_hoists {
+                eprintln!("S2_HOIST {}", tcx.def_path_str(caller.to_def_id()));
+            }
+            eprintln!("S2_HOISTS {}", table.arg_order_hoists.len());
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    /// The child's stderr, run with `TMPDIR` = `tmp` and no cache directory.
+    fn s2_decide_without_a_cache(tmp: &Path) -> String {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
+        command.args([
+            "analyses::borrow_ownership::model_cache::tests::s2_inner_decide_without_a_cache",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        command.env("TMPDIR", tmp);
+        command.env("S2_TMP_SOURCE", S2_QUADTREE);
+        command.env_remove("CRAT_BO_CACHE_DIR");
+        let output = command.output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "child failed:\n{stderr}");
+        stderr
+    }
+
+    /// T-tmp-1 (S2 D14a): with no cache directory, a solve leaves nothing under `TMPDIR`.
+    #[test]
+    fn s2_t_tmp_1_no_cache_directory_writes_nothing() {
+        if !Path::new(S2_QUADTREE).is_file() {
+            eprintln!("corpus absent; skipping");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("crat-s2-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("fresh TMPDIR");
+        let text = s2_decide_without_a_cache(&tmp);
+        let left: Vec<_> = std::fs::read_dir(&tmp)
+            .expect("TMPDIR")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(text.contains("S2_HOISTS "), "{text}");
+        assert!(left.is_empty(), "left under TMPDIR: {left:?}");
+    }
+
+    /// T-tmp-2 (S2 D14a): with no cache directory the table still carries quadtree's hoist.
+    #[test]
+    fn s2_t_tmp_2_no_cache_directory_keeps_the_hoist() {
+        if !Path::new(S2_QUADTREE).is_file() {
+            eprintln!("corpus absent; skipping");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("crat-s2-tmp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("fresh TMPDIR");
+        let text = s2_decide_without_a_cache(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("S2_HOIST ") && line.ends_with("::quadtree_insert")),
+            "no hoist on quadtree_insert:\n{text}"
+        );
+    }
+
     /// T-cache-1 (S2 D0b): with one cache directory and nothing else, the second run of the
     /// fixture reads the first one's entry.
     #[test]
