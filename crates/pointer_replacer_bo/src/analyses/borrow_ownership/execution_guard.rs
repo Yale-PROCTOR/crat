@@ -1,37 +1,10 @@
-//! Scoped execution policy and query-budget receipts for the era5a pipeline.
-//! Cache-only scopes refuse model construction and queries before they start.
-//! Model-entry counts are distinct from memo/cache materialization counts.
+//! Query-budget receipts for the analysis: the fixed per-query timeout, the
+//! typed Unknown channel, and the count of outer model derivations (distinct
+//! from memo/cache materialization counts).
 
-use std::{
-    cell::{Cell, RefCell},
-    fmt,
-};
+use std::cell::{Cell, RefCell};
 
 pub(crate) const QUERY_TIMEOUT_MS: u32 = 600_000;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ExecutionRole {
-    #[default]
-    Derive,
-    CacheOnly,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RoleParseError {
-    pub(crate) value: String,
-}
-
-/// Strict execution policy, deliberately separate from model semantic identity.
-/// This pure parser does not read or mutate the environment.
-pub(crate) fn parse_role(value: Option<&str>) -> Result<ExecutionRole, RoleParseError> {
-    match value {
-        None | Some("derive") => Ok(ExecutionRole::Derive),
-        Some("cache-only") => Ok(ExecutionRole::CacheOnly),
-        Some(value) => Err(RoleParseError {
-            value: value.to_owned(),
-        }),
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueryStage {
@@ -42,31 +15,6 @@ pub(crate) enum QueryStage {
     OptimizeMaterialization,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Operation {
-    ReadOnly,
-    SolverBuild,
-    ModelEntry,
-    Query(QueryStage),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    pub(crate) role: ExecutionRole,
-    pub(crate) operation: Operation,
-}
-
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "execution role {:?} refuses {:?}",
-            self.role, self.operation
-        )
-    }
-}
-impl std::error::Error for Refusal {}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QueryUnknown {
     pub(crate) stage: QueryStage,
@@ -75,66 +23,12 @@ pub(crate) struct QueryUnknown {
 }
 
 thread_local! {
-    static ROLE: Cell<Option<ExecutionRole>> = const { Cell::new(None) };
     static MODEL_ENTRIES: Cell<usize> = const { Cell::new(0) };
     static LAST_UNKNOWN: RefCell<Option<QueryUnknown>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current_role() -> ExecutionRole {
-    if let Some(role) = ROLE.with(Cell::get) {
-        return role;
-    }
-    let role = match std::env::var("CRAT_ERA5_EXECUTION_ROLE") {
-        Ok(value) => parse_role(Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_role(None),
-        Err(std::env::VarError::NotUnicode(value)) => Err(RoleParseError {
-            value: format!("{value:?}"),
-        }),
-    };
-    match role {
-        Ok(role) => role,
-        Err(error) => std::panic::panic_any(error),
-    }
-}
-
-/// Nested scopes restore their caller's role, including when a refusal unwinds.
-/// No process-global environment or Z3 setting is changed by this carrier.
-pub(crate) fn with_role<T>(role: ExecutionRole, run: impl FnOnce() -> T) -> T {
-    struct Restore(Option<ExecutionRole>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            ROLE.with(|role| role.set(self.0));
-        }
-    }
-    let _restore = Restore(ROLE.with(|current| current.replace(Some(role))));
-    run()
-}
-
-pub(crate) fn check(operation: Operation) -> Result<(), Refusal> {
-    let role = current_role();
-    if role == ExecutionRole::CacheOnly && operation != Operation::ReadOnly {
-        Err(Refusal { role, operation })
-    } else {
-        Ok(())
-    }
-}
-
-/// Compatibility barrier for APIs such as KindSolver::build that return Self.
-/// Normal model entrances should return check/enter_model's typed error instead.
-pub(crate) fn require(operation: Operation) {
-    if let Err(refusal) = check(operation) {
-        std::panic::panic_any(refusal);
-    }
-}
-
-pub(crate) fn guarded<T>(operation: Operation, run: impl FnOnce() -> T) -> Result<T, Refusal> {
-    check(operation)?;
-    Ok(run())
-}
-
 /// One outer model derivation, not each internal baseline/A5 solver instance.
-pub(crate) fn enter_model() -> Result<(), Refusal> {
-    check(Operation::ModelEntry)?;
+pub(crate) fn enter_model() {
     MODEL_ENTRIES.with(|entries| {
         entries.set(
             entries
@@ -143,7 +37,6 @@ pub(crate) fn enter_model() -> Result<(), Refusal> {
                 .expect("model-entry counter overflow"),
         );
     });
-    Ok(())
 }
 
 /// This counter deliberately does not reuse model_cache::derivations(), whose

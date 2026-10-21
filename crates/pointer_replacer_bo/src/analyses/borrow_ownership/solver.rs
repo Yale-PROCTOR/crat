@@ -17,7 +17,7 @@ use super::{
         self, ConstructionId, EndpointKey, EpochId, EventId, FinalSelection, QueryEvent,
         QueryOutcome, QueryPhase,
     },
-    execution_guard::{self, Operation, QueryStage},
+    execution_guard::{self, QueryStage},
     l2::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
         RECURRENCE_ESCALATION_CORE_FAMILY,
@@ -775,7 +775,6 @@ impl KindSolver {
     }
 
     fn build(slots: &CrateSlots, tracker: Option<CoreTracker>, add_objective: bool) -> Self {
-        execution_guard::require(Operation::SolverBuild);
         let solver = Optimize::new();
         solver.set_params(&fixed_query_params());
         let mut vars = FxHashMap::default();
@@ -2641,7 +2640,6 @@ impl KindSolver {
     }
 
     pub fn check(&self) -> SatResult {
-        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         // §NB-R guard: a no-assumption check on a tracked solver is vacuously
         // SAT (all hard constraints are track-gated) — refuse, like the other
         // production solve paths.
@@ -2700,7 +2698,6 @@ impl KindSolver {
     }
 
     pub(crate) fn hard_loop_solver(&self) -> HardLoopSolver {
-        execution_guard::require(Operation::SolverBuild);
         assert!(
             !self.is_diagnostic_tracked(),
             "diagnostic-tracked KindSolver must not enter the production hard loop"
@@ -2718,7 +2715,6 @@ impl KindSolver {
     }
 
     pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
-        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(assumptions);
@@ -2754,7 +2750,6 @@ impl KindSolver {
         hard: &HardLoopSolver,
         assumptions: &[Bool],
     ) -> SatResult {
-        execution_guard::require(Operation::Query(QueryStage::HardCheck));
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         self.hard_check_count
@@ -2784,7 +2779,6 @@ impl KindSolver {
             (initial == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
         hard.solver.pop(1);
         let outcome = if initial == SatResult::Unsat {
-            execution_guard::require(Operation::Query(QueryStage::HardTrackedRecheck));
             self.lazy_tracked_recheck_count
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
             let tracked = hard.solver.check_assumptions(&bundle);
@@ -2839,7 +2833,6 @@ impl KindSolver {
 
     pub(crate) fn optimize(&self) -> &Optimize {
         // The raw backend handle grants query authority to its caller.
-        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         &self.solver
     }
 
@@ -2901,7 +2894,6 @@ impl KindSolver {
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
-        execution_guard::require(Operation::Query(QueryStage::OptimizeCheck));
         // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
         // constraints are `track ⇒ c` — without the tracks assumed they are
         // vacuously satisfiable, so this path would return a silently wrong
@@ -3113,7 +3105,6 @@ impl KindSolver {
         &self,
         relaxed: &RelaxedSelectors,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
-        execution_guard::require(Operation::Query(QueryStage::OptimizeMaterialization));
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
         let started = Instant::now();

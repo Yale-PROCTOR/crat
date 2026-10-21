@@ -792,7 +792,7 @@ pub(crate) fn copy_lend_frame_funnel(
     let _world = super::licensing::stack_entry::enter_world(Some(
         WholeProgramAttestation::FrozenBenchmarkGraph,
     ));
-    super::execution_guard::enter_model().expect("funnel model entry");
+    super::execution_guard::enter_model();
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
     super::source_events::with_inventory(&inventory, || {
         let candidates =
@@ -872,7 +872,7 @@ pub(crate) fn a4_wall_probe(
     let _world = super::licensing::stack_entry::enter_world(Some(
         WholeProgramAttestation::FrozenBenchmarkGraph,
     ));
-    super::execution_guard::enter_model().expect("a4 model entry");
+    super::execution_guard::enter_model();
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
     super::source_events::with_inventory(&inventory, || {
         let solver = KindSolver::new_hard_only(slots);
@@ -1731,9 +1731,7 @@ fn solve_bo_a5_config_inner(
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
     let _call_world = super::licensing::stack_entry::enter_world(attestation);
-    super::execution_guard::enter_model().map_err(|refusal| {
-        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::BaselineConstruction, refusal)
-    })?;
+    super::execution_guard::enter_model();
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
     super::source_events::with_inventory(&inventory, || {
         solve_bo_a5_config_with_source_events(
