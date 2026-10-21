@@ -2190,9 +2190,9 @@ fn e5c_inner_w60() {
     }
 }
 
-/// W60: with 1a′ and 1b on either way, the moved-input arm licenses P's field
-/// (raw without it: RED) and not the guarded A and B; the transfer predicate
-/// admits `linear` and `equal` by move and refuses `equal` by copy (control).
+/// W60: the moved-input rule licenses P's field and not the guarded A and B; the
+/// transfer predicate admits `linear` and `equal` by move and refuses `equal` by
+/// copy (control).
 #[test]
 fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
     use super::licensing::field_support::moved_transfer;
@@ -2201,10 +2201,9 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
         !moved_transfer("equal", false),
         "a copied operand keeps its hold"
     );
-    let rows = |moved: &str| -> std::collections::BTreeMap<String, String> {
+    let rows = || -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         env.push(("CRAT_ERA5C_ORIGIN_SET", "on"));
-        env.push(("CRAT_ERA5C_MOVED_INPUT", moved));
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w60",
             &env,
@@ -2215,15 +2214,13 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
         .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
         .collect()
     };
-    let on = rows("on");
-    let off = rows("off");
+    let on = rows();
     let field = |rows: &std::collections::BTreeMap<String, String>, shape: &str| {
         rows.get(&format!("{shape} Node::field1@d0"))
             .cloned()
             .unwrap_or_default()
     };
     assert_eq!(field(&on, "P"), "owning", "{on:?}");
-    assert_eq!(field(&off, "P"), "raw", "W60 is RED without the arm");
     assert_eq!(
         field(&on, "A"),
         "raw",
@@ -2234,15 +2231,6 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
         "raw",
         "a parameter returned to a freeing caller is not licensed"
     );
-    let lost: Vec<_> = off
-        .iter()
-        .filter(|(k, v)| {
-            v.as_str() != "raw"
-                && on.get(*k) != Some(*v)
-                && on.get(*k).map(String::as_str) == Some("raw")
-        })
-        .collect();
-    assert!(lost.is_empty(), "the arm lost {lost:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2541,10 +2529,7 @@ fn e5c_inner_w61() {
 /// 1b + 1a′ + 2′) plus `extra`.
 fn w61_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.extend_from_slice(&[
-        ("CRAT_ERA5C_ORIGIN_SET", "on"),
-        ("CRAT_ERA5C_MOVED_INPUT", "on"),
-    ]);
+    env.extend_from_slice(&[("CRAT_ERA5C_ORIGIN_SET", "on")]);
     env.extend_from_slice(extra);
     child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w61",
@@ -2740,7 +2725,6 @@ fn e5c_w61_n_the_arm_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         env.extend_from_slice(&[
             ("CRAT_ERA5C_ORIGIN_SET", "on"),
-            ("CRAT_ERA5C_MOVED_INPUT", "on"),
             ("CRAT_ERA5C_MOVE_STORE", arm),
         ]);
         child(
@@ -2929,10 +2913,7 @@ fn e5c_inner_w62() {
 
 fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.extend_from_slice(&[
-        ("CRAT_ERA5C_ORIGIN_SET", "on"),
-        ("CRAT_ERA5C_MOVED_INPUT", "on"),
-    ]);
+    env.extend_from_slice(&[("CRAT_ERA5C_ORIGIN_SET", "on")]);
     env.extend_from_slice(extra);
     child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w62",
@@ -3733,7 +3714,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
-        ("CRAT_ERA5C_MOVED_INPUT", "on"),
         ("CRAT_ERA5C_MOVE_STORE", "on"),
         // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),

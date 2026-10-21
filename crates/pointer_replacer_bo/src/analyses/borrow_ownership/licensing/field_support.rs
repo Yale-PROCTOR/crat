@@ -1480,9 +1480,7 @@ pub(crate) fn audit(
         // L01⁹ rule 2′: a parameter store held for its terminal role or its
         // callers is supported by its own post-store token, when the transfer is
         // linear and the program's callers are all known.
-        if super::super::field_moves::moved_input()
-            && super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete
-        {
+        if super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete {
             let moved: Vec<(Site, Node)> = proof
                 .input_stores
                 .iter()

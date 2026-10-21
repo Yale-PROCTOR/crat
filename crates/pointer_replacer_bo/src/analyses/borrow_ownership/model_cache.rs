@@ -181,10 +181,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_deref_reader", "true".to_owned());
     fields.insert("era5c_field_own_repair", "true".to_owned());
     fields.insert("era5c_null_exit", "false".to_owned());
-    fields.insert(
-        "era5c_moved_input",
-        super::field_moves::moved_input().to_string(),
-    );
+    fields.insert("era5c_moved_input", "true".to_owned());
     fields.insert(
         "era5c_move_store",
         super::field_moves::move_store().to_string(),

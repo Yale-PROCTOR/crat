@@ -97,20 +97,6 @@ pub(crate) fn own_named() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_MOVED_INPUT=on|off` (fail-loud, absent = off): **L01⁹ rule 2′, R568-4
-/// (seat review before any frame)**. A parameter store held by era-5b for its
-/// terminal role (`TerminalRoleC`) or its callers (`CallerCoverageC`) is supported
-/// by the field's own post-store token (`StoreSourceOrigin::MovedInput`) when the
-/// store's transfer is `linear` and the program's caller coverage is `Complete`.
-/// See era-5c report 058 for the argument.
-pub(crate) fn moved_input() -> bool {
-    match std::env::var("CRAT_ERA5C_MOVED_INPUT").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_MOVED_INPUT must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_MOVE_STORE=on|off` (fail-loud, absent = off): **L01⁹ wall 4, R573-5
 /// (built behind the switch; the seat's formal review of the design record gates any
 /// frame)**. A store whose transfer is a move into a field that is `Owning` in the
