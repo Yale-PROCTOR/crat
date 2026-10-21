@@ -493,6 +493,7 @@ fn extract_witnessed_conflict_edges(
 
 /// §8 verifier (round-0). Verbatim from `borrow/mod.rs::borrow_conflicts` @ fc3bd4cf, except the
 /// fork seam (`overwrite_with_engine_facts`) replaces the facts' `invalidates`/`errors` with BO's.
+#[cfg(test)]
 pub fn borrow_conflicts<I, J, K, L>(
     program: &RustProgram,
     is_candidate: I,
@@ -509,6 +510,7 @@ where
     borrow_conflicts_with_flows(program, &flows, is_candidate, is_mutable)
 }
 
+#[cfg(test)]
 pub(crate) fn borrow_conflicts_with_flows<I, J, K, L>(
     program: &RustProgram,
     flows: &OriginFlowResults,
@@ -701,6 +703,7 @@ where
 /// `disable_owner(ProvenanceOwner::Local(local))` call — whose Local branch is exactly
 /// `local_data[local] = None`, and whose return is ignored here — is inlined as that field write
 /// (per the 7-field manifest, no method exposed).
+#[cfg(test)]
 pub fn borrow_conflicts_replaying<I, J, M, N, K, L>(
     program: &RustProgram,
     is_ref: I,
@@ -805,6 +808,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn borrow_conflicts_replaying_with_flows_and_parameter_overlap<I, J, M, N, K, L>(
     program: &RustProgram,
     flows: &OriginFlowResults,

@@ -101,6 +101,7 @@ impl Plan {
 }
 
 /// Equality alone does not authenticate a non-owning callee signature.
+#[cfg(test)]
 pub(crate) fn validate_call_roles(facts: &super::facts::Facts) -> Result<(), String> {
     use super::super::{
         ownership_boundary::{LicensingRole, Role, Window},

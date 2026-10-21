@@ -1,22 +1,22 @@
 //! Accepted stack-entry justification. Capture identities are transient and
 //! never semantic inputs; portable proofs use the explicitly assigned namespace.
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
     rc::{Rc, Weak},
 };
 
 use serde::{Deserialize, Serialize};
 
+use super::{super::export, facts::Facts, stack_entry::KnownStackEntry};
+#[cfg(test)]
 use super::{
     super::{
-        export,
         origin_evidence::OriginEvidence,
         portable_export::{ExportFamily, PortableExport},
     },
-    facts::Facts,
     snapshot::Snapshot,
-    stack_entry::KnownStackEntry,
 };
 
 thread_local! {
@@ -160,6 +160,7 @@ pub(crate) fn collect(capture: &export::BoExport) -> Option<Accepted> {
     Some(accepted.clone())
 }
 
+#[cfg(test)]
 pub(crate) fn validate(
     origin: &OriginEvidence,
     portable: &PortableExport,
@@ -491,6 +492,7 @@ pub(crate) fn validate(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_proof(
     proof: &KnownStackEntry,
     snapshot: &Snapshot,
@@ -613,6 +615,7 @@ fn validate_proof(
     }
     Ok(())
 }
+#[cfg(test)]
 fn one<T>(mut rows: impl Iterator<Item = T>) -> Result<T, String> {
     let row = rows.next().ok_or("missing stack-entry correspondence")?;
     if rows.next().is_some() {

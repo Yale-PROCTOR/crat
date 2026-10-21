@@ -36,6 +36,7 @@ impl Reason {
     /// this site has always done -- and differ only in why the facts were
     /// missing. A receipt reader that cares about the verdict asks this; one that
     /// cares about the population asks the label.
+    #[cfg(test)]
     pub(crate) fn inner_loan_depth(self) -> Option<u8> {
         match self {
             Self::InnerLoanMissing { depth } | Self::InnerLoanEscaped { depth } => Some(depth),

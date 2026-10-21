@@ -14,6 +14,7 @@ pub(crate) struct Requirements {
     pub(crate) guards: Vec<(EquationId, bool)>,
 }
 
+#[cfg(test)]
 pub(crate) fn requirements(facts: &Facts, proof: &Proof) -> Result<Requirements, String> {
     requirements_metadata(
         facts,

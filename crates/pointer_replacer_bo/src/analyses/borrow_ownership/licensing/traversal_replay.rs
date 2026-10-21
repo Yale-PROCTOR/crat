@@ -266,6 +266,7 @@ pub(crate) fn observe(
 /// Match the accepted obligation to both its selected guard/correspondence and
 /// the actual final native Loan record. Standard liveness is a replay output,
 /// not reconstructed from a source-name or numeric interval.
+#[cfg(test)]
 pub(crate) fn validate_export(
     accepted: &super::stack_export::Accepted,
     snapshot: &super::snapshot::Snapshot,

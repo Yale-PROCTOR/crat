@@ -386,6 +386,7 @@ pub(crate) fn prepare(
                     baseline: e5c_baseline,
                     receipt: verified.receipt.clone(),
                     origin: e5c_origin,
+                    #[cfg(test)]
                     move_store: Default::default(),
                     arg_order: Default::default(),
                 };

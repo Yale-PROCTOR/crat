@@ -60,6 +60,7 @@ pub(crate) enum Hold {
     Changed,
 }
 
+#[cfg(test)]
 pub(crate) fn certify(
     facts: &Facts,
     declaration: &Declaration,

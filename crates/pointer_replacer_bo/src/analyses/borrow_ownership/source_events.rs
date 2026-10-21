@@ -169,6 +169,7 @@ pub(crate) fn record_replay() {
 }
 
 impl SourceEvents {
+    #[cfg(test)]
     pub(crate) fn reconcile(
         &self,
         rows: &[(SourceEventKey, Coverage)],
@@ -193,6 +194,7 @@ impl SourceEvents {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum ReconciliationError {
     Missing(SourceEventKey),
     Duplicate(SourceEventKey),

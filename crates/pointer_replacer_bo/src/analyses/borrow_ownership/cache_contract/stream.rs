@@ -156,6 +156,7 @@ pub(crate) struct Metadata {
     pub(crate) baseline: BTreeMap<String, String>,
     pub(crate) receipt: String,
     pub(crate) origin: OriginSource,
+    #[cfg(test)]
     pub(crate) move_store: MoveStoreCapture,
     /// L01¹¹ (R659-1): the `arg-order-applied` family, read the same way.
     pub(crate) arg_order: MoveStoreCapture,
@@ -164,6 +165,7 @@ pub(crate) struct Metadata {
 impl Metadata {
     /// The frame's store-as-move obligations for a consumer that asks
     /// (ownership-fields 069's discharge): refused unless the entry carries them.
+    #[cfg(test)]
     pub(crate) fn move_store_obligations(
         &self,
     ) -> Result<Vec<portable_export::MoveStoreRow>, String> {
@@ -237,6 +239,7 @@ impl Metadata {
 
     /// Hash a writer-owned canonical entry without decoding its portable history.
     /// Exact header/footer comparisons establish the exported section's bounds.
+    #[cfg(test)]
     pub(crate) fn canonical_file_hashes(
         &self,
         path: &std::path::Path,
@@ -411,7 +414,10 @@ impl TryFrom<CompleteEntry> for Metadata {
                 }
             }
         };
+        #[cfg(not(test))]
+        let _ = move_store;
         Ok(Self {
+            #[cfg(test)]
             move_store,
             arg_order,
             schema: entry.schema,
@@ -564,7 +570,10 @@ impl<'de> Visitor<'de> for MetadataVisitor {
             }
         }
         let (move_store, arg_order) = required(exports, "exports")?;
+        #[cfg(not(test))]
+        let _ = move_store;
         Ok(Metadata {
+            #[cfg(test)]
             move_store,
             arg_order,
             schema: required(schema, "schema")?,

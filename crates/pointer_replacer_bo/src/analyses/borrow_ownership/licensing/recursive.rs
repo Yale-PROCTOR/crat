@@ -80,6 +80,7 @@ pub(crate) struct RecursiveCertificate {
 /// A structural, conditional certificate. Every recursive call introduces a
 /// generative invocation scope and retains its exact matcher substitutions.
 /// Origin/OwnedInput obligations remain pending; this is never a grant.
+#[cfg(test)]
 pub(crate) fn certify_invocations(
     facts: &Facts,
     construction: u32,

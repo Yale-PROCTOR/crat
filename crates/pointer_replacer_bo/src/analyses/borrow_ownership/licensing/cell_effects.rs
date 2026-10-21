@@ -174,6 +174,7 @@ pub(crate) fn early(facts: &Facts, point: &Point) -> Option<Early> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn validate_frames(
     facts: &Facts,
     aliases: &std::collections::BTreeMap<super::facts::EquationId, super::facts::EquationId>,
@@ -683,6 +684,7 @@ pub(crate) fn call_arm(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn validate_calls(
     facts: &Facts,
     aliases: &std::collections::BTreeMap<super::facts::EquationId, super::facts::EquationId>,

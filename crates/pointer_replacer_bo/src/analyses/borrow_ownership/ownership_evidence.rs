@@ -169,6 +169,7 @@ impl Equation {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_function(
     equations: &[Equation],
     function: &str,

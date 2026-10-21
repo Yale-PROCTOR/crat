@@ -63,6 +63,7 @@ pub(crate) struct QualifierFacts {
 }
 
 impl QualifierFacts {
+    #[cfg(test)]
     pub(crate) fn canonical_json(&self) -> String {
         let mut rows = self.rows.clone();
         rows.sort_by(|a, b| a.slot.cmp(&b.slot));
@@ -128,6 +129,7 @@ pub(crate) fn collect(
 
 /// Diagnostic constructions without a supplied replay provider must not
 /// manufacture an inferred or forced mutability fact.
+#[cfg(test)]
 pub(crate) fn collect_without_mutability(
     program: &RustProgram<'_>,
     slots: &CrateSlots,

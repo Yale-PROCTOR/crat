@@ -462,6 +462,7 @@ pub(crate) fn valuation_nodes(
     Ok(nodes)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_valuation(
     facts: &Facts,
     candidates: &[Candidate],

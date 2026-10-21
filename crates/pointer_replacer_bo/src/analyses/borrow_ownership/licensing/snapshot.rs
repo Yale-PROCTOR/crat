@@ -294,6 +294,7 @@ impl Metadata {
     }
 
     /// Empty AST containers remain empty; this never freezes or solves Facts.
+    #[cfg(test)]
     pub(crate) fn facts(&self) -> Facts {
         Facts {
             frame_attested: self.frame_attested,
@@ -351,6 +352,7 @@ impl Snapshot {
     }
 
     /// Recompute all transport from recorded metadata, with no AST or solver.
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), String> {
         use std::collections::BTreeSet;
         let mut facts = self.metadata.facts();
@@ -643,6 +645,7 @@ impl Snapshot {
 
 /// Complete-cache joins. Envelopes use local construction namespaces; the flat
 /// origin families use the explicitly offset namespace. No solver is involved.
+#[cfg(test)]
 pub(crate) fn validate_origin(
     origin: &super::super::origin_evidence::OriginEvidence,
     universe: &[String],

@@ -175,6 +175,7 @@ pub(crate) fn validate(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_selection(
     facts: &Facts,
     aliases: &BTreeMap<EquationId, EquationId>,
@@ -188,6 +189,7 @@ pub(crate) fn validate_selection(
 }
 
 /// Selected values need the caller custody validator after this identity check.
+#[cfg(test)]
 pub(crate) fn validate_selection_coverage(
     facts: &Facts,
     aliases: &BTreeMap<EquationId, EquationId>,

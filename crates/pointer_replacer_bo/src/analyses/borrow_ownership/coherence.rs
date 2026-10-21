@@ -927,6 +927,7 @@ fn scan_field_stores(
 /// set, for the source-only field-yield histogram. This caller has no normative
 /// SSA null evidence, so its syntactic candidates are an upper bound, not the
 /// refined production field-and constraint set or a measured Owning verdict.
+#[cfg(test)]
 pub(crate) fn field_ownership_candidates(
     slots: &CrateSlots,
     program: &RustProgram<'_>,

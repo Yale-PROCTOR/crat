@@ -623,6 +623,7 @@ impl OriginEvidence {
     /// functions: an entry that carries them for some and not others is refused
     /// rather than read as era-5a. An era-5a entry carries none of the four and
     /// is validated by exactly the checks it was written under.
+    #[cfg(test)]
     pub(crate) fn declares_ownership_family(&self) -> Result<bool, String> {
         let mut present = 0;
         for function in &self.functions {
@@ -645,6 +646,7 @@ impl OriginEvidence {
     /// is deduplicated, and diagnostic Var numbers remain explicitly labelled.
     /// R471-3 (i): the canonically ordered clone, shared by the two accessors
     /// below so their orderings can never drift apart.
+    #[cfg(test)]
     fn canonicalized(&self) -> Self {
         let mut value = self.clone();
         value.functions.sort_by(|a, b| a.function.cmp(&b.function));
@@ -657,6 +659,7 @@ impl OriginEvidence {
         value
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_json(&self) -> String {
         serde_json::to_string(&self.canonicalized()).expect("origin-evidence DTO serialization")
     }
@@ -1032,6 +1035,7 @@ impl OriginEvidence {
 
     /// The per-function half of `canonicalized`, so the two orderings are one
     /// definition and cannot drift.
+    #[cfg(test)]
     fn canonicalize_function(function: &mut FunctionEvidence) {
         function.signature_slots.sort();
         function.no_borrow_origin.sort();

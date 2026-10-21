@@ -45,6 +45,7 @@ fn one<T>(items: impl IntoIterator<Item = T>, hold: Hold) -> Result<T, Hold> {
     Ok(value)
 }
 
+#[cfg(test)]
 pub(crate) fn certify(
     facts: &Facts,
     declaration: &Declaration,

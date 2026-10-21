@@ -153,6 +153,7 @@ pub(crate) struct PortableExport {
 }
 
 impl PortableExport {
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.schema != SCHEMA || !self.licensing_in_origin_evidence {
             return Err("portable export schema/licensing mismatch".into());
@@ -222,6 +223,7 @@ impl PortableExport {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_json(&self) -> Result<String, String> {
         self.validate()?;
         let mut ordered = self.clone();
@@ -334,9 +336,11 @@ fn realloc_site(site: &ra::ReallocSite) -> Value {
     };
     let callee = match &site.callee {
         ra::ReallocCalleeIdentity::ForeignC(name) => json!({"kind":"foreign-c","name":name}),
+        #[cfg(test)]
         ra::ReallocCalleeIdentity::LocalFunction(name) => {
             json!({"kind":"local-function","name":name})
         }
+        #[cfg(test)]
         ra::ReallocCalleeIdentity::Other => json!({"kind":"other"}),
     };
     let zero = site.zero_size.map(|z| match z {
@@ -594,6 +598,7 @@ impl Resolver<'_, '_> {
         ))
     }
 
+    #[cfg(test)]
     fn review(&self, review: &rt::RetirementReview) -> Result<(Value, Value), String> {
         let mut diagnostics = Vec::new();
         let conflicts=review.conflicts.iter().map(|row|{
@@ -772,6 +777,7 @@ pub(crate) fn decode_arg_order(
 
 impl PortableExport {
     /// The rows, or a refusal: a missing family or `NotRecorded`.
+    #[cfg(test)]
     pub(crate) fn arg_order_applied(&self) -> Result<Vec<ArgOrderRow>, String> {
         let family = self
             .families
@@ -921,6 +927,7 @@ fn move_store_order(a: &MoveStoreRow, b: &MoveStoreRow) -> std::cmp::Ordering {
 
 /// The consumer's accessor (ownership-fields 069's discharge reads these): a
 /// family that is `NotRecorded` or rows that do not decode are refused.
+#[cfg(test)]
 pub(crate) fn decode_move_store(
     availability: &CaptureAvailability,
     records: &[BTreeMap<String, Value>],
@@ -941,6 +948,7 @@ pub(crate) fn decode_move_store(
 
 impl PortableExport {
     /// The rows, or a refusal: a v1 export, a missing family, or `NotRecorded`.
+    #[cfg(test)]
     pub(crate) fn move_store_obligations(&self) -> Result<Vec<MoveStoreRow>, String> {
         if self.schema != SCHEMA {
             return Err(format!(
@@ -958,6 +966,7 @@ impl PortableExport {
 }
 
 impl PortableExport {
+    #[cfg(test)]
     fn add(&mut self, family: ExportFamily, fields: Value, labels: Value) -> Result<(), String> {
         let Value::Object(fields) = fields else {
             return Err("portable row is not an object".into());
@@ -986,6 +995,7 @@ impl PortableExport {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn collect(
     program: &RustProgram<'_>,
     slots: &CrateSlots,

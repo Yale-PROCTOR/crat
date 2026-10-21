@@ -226,6 +226,7 @@ impl Drop for Scope {
 }
 
 /// The last round's cleared loans and obligations (the accepted round's, on an accept).
+#[cfg(test)]
 pub(crate) fn last_round() -> (
     FxHashMap<LocalDefId, Vec<Removed>>,
     Vec<MoveStoreObligation>,

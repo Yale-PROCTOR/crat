@@ -33,6 +33,7 @@ pub(crate) struct MemberPlan {
     pub(crate) routes: Vec<Route>,
 }
 
+#[cfg(test)]
 pub(crate) fn audit(
     facts: &Facts,
     member: &Membership,

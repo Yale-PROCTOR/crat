@@ -54,11 +54,13 @@ impl Drop for OwnedFile {
 pub(crate) struct ExportSpool {
     pub(crate) path: PathBuf,
     _wire: OwnedFile,
+    #[cfg(test)]
     typed: OwnedFile,
     #[cfg(test)]
     pub(super) peak_materialized_nodes: usize,
 }
 impl ExportSpool {
+    #[cfg(test)]
     pub(crate) fn write_portable_typed(&self, writer: &mut impl Write) -> Result<(), String> {
         copy_range(
             &self.typed.file,
@@ -367,6 +369,7 @@ impl StreamCollector {
         Ok(ExportSpool {
             path: wire.path.clone(),
             _wire: wire,
+            #[cfg(test)]
             typed,
             #[cfg(test)]
             peak_materialized_nodes: self.residency.peak,

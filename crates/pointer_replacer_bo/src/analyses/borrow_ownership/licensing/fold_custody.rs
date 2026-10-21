@@ -1,5 +1,7 @@
 //! Same-model values for conditional folded caller obligations.
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use super::{
     facts::{EquationId, Facts},
@@ -69,6 +71,7 @@ pub(crate) fn capture(
     Some(Values { ownership, guards })
 }
 
+#[cfg(test)]
 pub(crate) fn validate(
     snapshot: &super::snapshot::Snapshot,
     accepted: &super::stack_export::Accepted,

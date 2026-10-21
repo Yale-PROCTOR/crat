@@ -337,6 +337,7 @@ fn route<'a>(edges: &'a [&'a Edge], start: Node, terminal: Node) -> Result<Vec<&
     Ok(result)
 }
 
+#[cfg(test)]
 pub(crate) fn certify_linear(
     facts: &Facts,
     construction: u32,

@@ -109,6 +109,7 @@ pub(crate) fn logical_files(
     Ok(out)
 }
 impl CompleteEntry {
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), String> {
         use std::collections::BTreeSet;
         if self.schema != SCHEMA || self.key != semantic_key(&self.inputs)? {
@@ -222,6 +223,7 @@ impl CompleteEntry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_json(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
         let mut value = self.clone();
@@ -230,6 +232,7 @@ impl CompleteEntry {
         serde_json::to_vec(&value).map_err(|e| e.to_string())
     }
 }
+#[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> Result<CompleteEntry, String> {
     let value = super::strict_json::parse(bytes)?;
     let entry: CompleteEntry = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -237,6 +240,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CompleteEntry, String> {
     Ok(entry)
 }
 
+#[cfg(test)]
 pub(crate) fn publish(directory: &Path, entry: &CompleteEntry) -> Result<PathBuf, String> {
     use std::{
         io::Write,

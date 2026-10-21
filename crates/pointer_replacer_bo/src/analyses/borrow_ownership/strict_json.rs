@@ -6,6 +6,7 @@ use serde::{
 };
 use serde_json::{Map, Number, Value};
 
+#[cfg(test)]
 pub(crate) fn parse(bytes: &[u8]) -> Result<Value, String> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = UniqueValue::deserialize(&mut deserializer).map_err(|error| error.to_string())?;
@@ -14,6 +15,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Value, String> {
 }
 
 /// Validates one strict JSON value without retaining its values.
+#[cfg(test)]
 pub(crate) fn validate_reader<R: std::io::Read>(reader: R) -> Result<(), String> {
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
     Discard::deserialize(&mut deserializer).map_err(|error| error.to_string())?;

@@ -26,6 +26,7 @@ pub(crate) enum Hold {
     MissingZero,
     Boundary,
 }
+#[cfg(test)]
 pub(crate) fn certify(
     facts: &Facts,
     member: &Membership,

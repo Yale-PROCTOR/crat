@@ -52,7 +52,9 @@ pub(crate) struct ReallocSiteKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReallocCalleeIdentity {
     ForeignC(String),
+    #[cfg(test)]
     LocalFunction(String),
+    #[cfg(test)]
     Other,
 }
 
@@ -85,6 +87,7 @@ pub(crate) enum ZeroSizeFeasibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SuccessAddress {
     Unknown,
+    #[cfg(test)]
     SameAsOld,
 }
 
@@ -257,6 +260,7 @@ pub(crate) enum ContentsRelation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum ReallocRetirementAvailability {
     Unclassified,
     None,
@@ -283,6 +287,7 @@ pub(crate) fn zero_size_possible(site: &ReallocSite) -> bool {
 
 /// Claim loss and physical retirement are independent facts, particularly for
 /// a dynamic byte count whose zero-size target behavior is not resolved.
+#[cfg(test)]
 pub(crate) fn retirement_availability(
     site: &ReallocSite,
     case: &ReallocCase,

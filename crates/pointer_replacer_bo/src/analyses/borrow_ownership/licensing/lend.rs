@@ -23,6 +23,7 @@ use crate::{
 };
 
 /// R580-1: the waiver every indirect-call site of a lent formal carries.
+#[cfg(test)]
 pub(crate) const WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,7 @@ pub(crate) struct WaiverSite {
 }
 
 impl WaiverSite {
+    #[cfg(test)]
     pub(crate) fn receipt(&self) -> String {
         format!(
             "lend-waiver(tier-2, kind=indirect-call, site={}:bb{}[{}]:arg{})",

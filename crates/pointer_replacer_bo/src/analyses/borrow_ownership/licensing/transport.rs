@@ -1,7 +1,9 @@
 //! Candidate endpoint transport. Connectivity is not an ownership grant or a
 //! proof that the recorded guard and linear responsibility obligations hold.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     super::{
@@ -578,28 +580,33 @@ impl CandidateGraph {
         graph
     }
 
+    #[cfg(test)]
     pub(crate) fn has_edge(&self, from: Node, to: Node, rule: Rule) -> bool {
         self.edges
             .iter()
             .any(|edge| edge.from == from && edge.to == to && edge.rule == rule)
     }
 
+    #[cfg(test)]
     pub(crate) fn forward(&self) -> BTreeSet<Node> {
         self.closure(self.sources.iter().map(|endpoint| endpoint.node), false)
     }
 
+    #[cfg(test)]
     pub(crate) fn backward(&self) -> BTreeSet<Node> {
         self.closure(self.sinks.iter().map(|endpoint| endpoint.node), true)
     }
 
     /// Candidate output demand is separate from free sinks. Reachability does
     /// not certify output roles or discharge any owning/guard obligation.
+    #[cfg(test)]
     pub(crate) fn backward_outputs(&self) -> BTreeSet<Node> {
         self.closure(self.exits.iter().map(|exit| exit.node), true)
     }
 
     /// Unknown predicates admit no route. The original candidate graph and
     /// endpoint identities are retained for retraction/restoration.
+    #[cfg(test)]
     pub(crate) fn forward_selected(
         &self,
         value: impl Fn(EquationId) -> Option<bool>,
@@ -615,6 +622,7 @@ impl CandidateGraph {
         active.forward()
     }
 
+    #[cfg(test)]
     fn closure(&self, roots: impl Iterator<Item = Node>, reverse: bool) -> BTreeSet<Node> {
         let mut adjacency = BTreeMap::<Node, Vec<Node>>::new();
         for edge in &self.edges {

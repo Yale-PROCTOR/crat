@@ -71,6 +71,7 @@ pub(crate) enum Role {
 ///
 /// **Opaque (a callee with no row) = the WORST-CASE row**: every effect assumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum Effect {
     /// The callee never dereferences the argument. It may copy, compare, or inspect the
     /// POINTER VALUE (`is_null`, `addr`), but the pointee is never read or written.
@@ -97,6 +98,7 @@ pub(crate) enum Effect {
 /// Only `Ignore` (`addr` — the arg is discarded) and `Lend` (`is_null` — the POINTER is
 /// inspected, never the pointee) are `NoAccess`. Every other role either reads, writes, frees,
 /// or reborrows the pointee, so all of them keep the `Deep` access.
+#[cfg(test)]
 pub(crate) fn role_effects(role: Role) -> &'static [Effect] {
     match role {
         Role::Ignore => &[Effect::NoAccess],

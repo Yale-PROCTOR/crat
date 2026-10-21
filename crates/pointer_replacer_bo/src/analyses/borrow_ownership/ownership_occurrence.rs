@@ -641,6 +641,7 @@ pub(crate) fn validate(
 
 /// Shape checks on recorded terminals, without claiming an all-locals/returns
 /// roster or final-zero equation coverage. Those are separate validation gates.
+#[cfg(test)]
 pub(crate) fn validate_terminal_shapes(
     function: &str,
     terminals: &[Terminal],

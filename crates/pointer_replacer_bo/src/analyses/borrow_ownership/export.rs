@@ -148,6 +148,7 @@ impl PlaceKey {
 
     /// Derived view, kept so E-R2/E-R4 consumers written against the old shape
     /// do not change. The lossy form is no longer what is STORED.
+    #[cfg(test)]
     pub(crate) fn derefs(&self) -> usize {
         self.proj
             .iter()
@@ -194,6 +195,7 @@ impl LoanKind {
     /// Reproduces the engine's branch at `borrow_engine/invalidates.rs`.
     ///
     /// This is the sole legal way to consume a `LoanKind` as a boolean.
+    #[cfg(test)]
     pub(crate) fn skips_invalidation(self) -> bool {
         matches!(self, LoanKind::Shared)
     }
@@ -580,6 +582,7 @@ impl BoExport {
     /// as do returns and by-value calls. Callers must conjoin the MIR-shape
     /// check that the location is an assignment `other = this` (R-Q1a follow-on
     /// finding #7). This returns the *candidate* sites only.
+    #[cfg(test)]
     pub(crate) fn move_point_candidates(
         &self,
         fn_did: LocalDefId,
@@ -598,6 +601,7 @@ impl BoExport {
     }
 
     /// Surviving loans — the ones a re-route may match against (§5.3).
+    #[cfg(test)]
     pub(crate) fn surviving_loans(&self) -> impl Iterator<Item = &LoanIdentity> {
         self.loans.iter().filter(|l| !l.invalid)
     }
@@ -685,6 +689,7 @@ impl CaptureArm {
 
 /// The ambient arm for the accepted-run region: inert. Nothing is installed,
 /// nothing is restored on drop, and `finish()` yields an empty export.
+#[cfg(test)]
 pub(crate) fn arm_capture() -> CaptureArm {
     CaptureArm {
         prev: None,

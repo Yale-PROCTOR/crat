@@ -127,6 +127,7 @@ impl NullPaths {
     }
 
     /// Whether `place` is known null on the edge `pred -> succ`.
+    #[cfg(test)]
     pub(crate) fn null_on_edge(
         &self,
         pred: BasicBlock,

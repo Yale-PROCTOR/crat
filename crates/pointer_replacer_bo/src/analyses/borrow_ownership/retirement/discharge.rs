@@ -819,6 +819,7 @@ impl Discharges {
     }
 
     /// The type table, for a census that walks without a routed event.
+    #[cfg(test)]
     pub(crate) fn name_of(&self, ty: &CTy) -> String {
         self.types.name(ty)
     }

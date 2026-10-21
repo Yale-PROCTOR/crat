@@ -92,6 +92,7 @@ pub(crate) enum Hold {
     LawCoverage,
 }
 
+#[cfg(test)]
 pub(crate) fn certify(
     facts: &Facts,
     declaration: &Declaration,
@@ -797,6 +798,7 @@ pub(crate) fn cell_plan(
 /// Z3-valued guards to compute them from, and D3 asks `ValueOrigins` — an
 /// instrument computing its own would answer a different question than the gate
 /// it reports on, and would answer it with an empty origin graph.
+#[cfg(test)]
 pub(crate) fn unsupported_occurrences<'a>(
     facts: &'a Facts,
     call: &super::matched::CallKey,

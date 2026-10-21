@@ -43,6 +43,7 @@ pub(crate) enum Error {
     Internal(super::fold_internal::Error),
     FieldScheme(String),
 }
+#[cfg(test)]
 pub(crate) fn certify(
     facts: &Facts,
     call: &CallKey,

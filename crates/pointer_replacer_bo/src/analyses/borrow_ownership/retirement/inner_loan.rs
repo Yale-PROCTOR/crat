@@ -232,8 +232,10 @@ fn mentioned_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
 /// hidden, because it costs recall wherever a holder is rebound before the event.
 #[derive(Clone, Debug)]
 pub(crate) struct ClosureLiveness {
+    #[cfg(test)]
     members: FxHashSet<Local>,
     /// Some member is used at or after this block's entry, on some path.
+    #[cfg(test)]
     live_in: IndexVec<BasicBlock, bool>,
     /// Per block, everything a query needs, so the retirement loop can ask
     /// without carrying a `Body` it does not have in that scope.
@@ -284,13 +286,16 @@ impl ClosureLiveness {
             })
             .collect::<IndexVec<BasicBlock, _>>();
         Self {
+            #[cfg(test)]
             members,
+            #[cfg(test)]
             live_in,
             blocks,
         }
     }
 
     /// Every local this holder's value can be in.
+    #[cfg(test)]
     pub(crate) fn members(&self) -> &FxHashSet<Local> {
         &self.members
     }
@@ -316,6 +321,7 @@ impl ClosureLiveness {
 
     /// Is it demanded on THIS edge only? An event on a cleanup path is discharged
     /// by the cleanup successor's liveness, never by the normal path's.
+    #[cfg(test)]
     pub(crate) fn live_on(&self, block: BasicBlock) -> bool {
         self.live_in[block]
     }
@@ -535,6 +541,7 @@ fn member_locals(
 
 impl InnerLoans {
     /// The locals this holder's value can be in: its copy-graph component.
+    #[cfg(test)]
     pub(crate) fn members(
         &self,
         function: LocalDefId,
@@ -574,6 +581,7 @@ impl InnerLoans {
 
     /// The same question on one edge: an event on a cleanup path is discharged by
     /// the cleanup successor's liveness, never by the normal path's.
+    #[cfg(test)]
     pub(crate) fn disposition_on(
         &self,
         function: LocalDefId,

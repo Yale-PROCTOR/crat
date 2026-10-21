@@ -591,6 +591,7 @@ impl MatchedTransport {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn forward_member_return(
         &self,
         facts: &Facts,
@@ -1224,6 +1225,7 @@ impl MatchedTransport {
     }
 
     /// Provisional guarded routes; caller closure and model selection remain external.
+    #[cfg(test)]
     pub(crate) fn build_with_conditional_folds(
         facts: &Facts,
         folds: &[(EquationId, super::fold_call::Proof)],
@@ -1285,6 +1287,7 @@ impl MatchedTransport {
     }
 
     /// Conditional owned members are authenticated before any new call input.
+    #[cfg(test)]
     pub(crate) fn build_with_subtree_folds(
         facts: &Facts,
         folds: &[(EquationId, super::fold_call::Proof)],
@@ -1371,11 +1374,13 @@ impl MatchedTransport {
     }
 
     /// Deterministic metadata serialization; no predicate AST is included.
+    #[cfg(test)]
     pub(crate) fn encode_json(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(self).map_err(|error| error.to_string())
     }
 
     /// No predicate or solver state is reconstructed by this metadata interface.
+    #[cfg(test)]
     pub(crate) fn decode_json(bytes: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(bytes).map_err(|error| error.to_string())
     }
@@ -1953,6 +1958,7 @@ impl MatchedTransport {
 
     /// Candidate existence with compatible guards; this does not select a model
     /// or assert source/sink activation, ownership, origin or gate completeness.
+    #[cfg(test)]
     pub(crate) fn denials(&self) -> &[Denial] {
         &self.denials
     }
@@ -2036,6 +2042,7 @@ impl MatchedTransport {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn meets_selected(
         &self,
         node: Node,

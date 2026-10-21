@@ -10,6 +10,7 @@ pub(crate) const QUERY_TIMEOUT_MS: u32 = 600_000;
 pub(crate) enum QueryStage {
     HardCheck,
     HardTrackedRecheck,
+    #[cfg(test)]
     Restoration,
     OptimizeCheck,
     OptimizeMaterialization,
@@ -41,15 +42,18 @@ pub(crate) fn enter_model() {
 
 /// This counter deliberately does not reuse model_cache::derivations(), whose
 /// historical contract includes memo insertions after cache loads.
+#[cfg(test)]
 pub(crate) fn model_entries() -> usize {
     MODEL_ENTRIES.with(Cell::get)
 }
 
 /// Actual query Unknown only; an ordinary analysis decline never writes this.
+#[cfg(test)]
 pub(crate) fn last_unknown() -> Option<QueryUnknown> {
     LAST_UNKNOWN.with(|unknown| unknown.borrow().clone())
 }
 
+#[cfg(test)]
 pub(crate) fn clear_unknown() {
     LAST_UNKNOWN.with(|unknown| *unknown.borrow_mut() = None);
 }
