@@ -199,10 +199,7 @@ pub(crate) fn solver_identity(
         super::retirement::discharge::typed_release().to_string(),
     );
     fields.insert("era5c_arg_order", "true".to_owned());
-    fields.insert(
-        "era5c_overlap_type_route",
-        super::field_moves::overlap_type_route().to_string(),
-    );
+    fields.insert("era5c_overlap_type_route", "true".to_owned());
     fields.insert(
         "era5c_ref_peel_zero",
         super::field_moves::ref_peel_zero().to_string(),

@@ -1119,7 +1119,6 @@ pub(crate) fn produce_a5_plan(
     let fixpoint = solve_may_overlap(transfers);
     let mut overlap_pairs = FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
     let mut coarse = BTreeMap::<(SlotKey, SlotKey), (SlotRef, SlotRef)>::new();
-    let type_route = super::field_moves::overlap_type_route();
     let mut type_disjoint = Vec::new();
     let mut planned = Vec::new();
     let mut site_classes = BTreeMap::<
@@ -1161,14 +1160,12 @@ pub(crate) fn produce_a5_plan(
         // R609-3 (b), under R542: formals whose pointees are incompatible object
         // types, neither containing the other by value, cannot overlap. The pair
         // is neither an effective overlap nor a coarse exclusion nor a mark.
-        if type_route
-            && let Some(receipt) = type_disjoint_receipt(
-                tcx,
-                witnesses[0].target,
-                pair.params().first(),
-                pair.params().second(),
-            )
-        {
+        if let Some(receipt) = type_disjoint_receipt(
+            tcx,
+            witnesses[0].target,
+            pair.params().first(),
+            pair.params().second(),
+        ) {
             stats.type_disjoint_pairs += 1;
             if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
                 eprintln!("E5C type-disjoint {receipt}");

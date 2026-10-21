@@ -3493,7 +3493,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),
         // L01¹⁰'s configuration (R609-3): the argument-order premise and the
         // A5 type route are on.
-        ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
         ("CRAT_E5C_W63_SHAPE", shape),
     ]);
     env.extend_from_slice(extra);
@@ -4181,16 +4180,10 @@ fn e5c_w67_e_the_ledger_names_the_objective() {
     );
 }
 
-/// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on and the
-/// type route as given, plus the type route's debug rows.
-fn w68_lines(type_route: &str) -> Vec<String> {
-    w63_lines(
-        "w68-shapes",
-        &[
-            ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", type_route),
-        ],
-    )
+/// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on, plus the
+/// type route's debug rows.
+fn w68_lines() -> Vec<String> {
+    w63_lines("w68-shapes", &[("CRAT_ERA5C_LEND", "on")])
 }
 
 /// W68a: the argument-order premise, on the corpus's own shape: quadtree's
@@ -4206,11 +4199,7 @@ fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
     let shape = format!("file:{W66_QUADTREE}");
     let on = w63_lines(
         &shape,
-        &[
-            ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
-            ("CRAT_E5C_W63_MODEL_ONLY", "1"),
-        ],
+        &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W63_MODEL_ONLY", "1")],
     );
     let key = "src::src::quadtree::quadtree_insert::_1@d0";
     assert_ne!(w63_kind(&on, key), "raw", "{on:?}");
@@ -4226,10 +4215,7 @@ fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
 /// an argument of the receiving call, so only the type route clears it.
 #[test]
 fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
-    let red = w68_lines("off");
-    assert_ne!(w63_kind(&red, "reset_::_2@d0"), "ref", "RED: {red:?}");
-    assert!(!red.iter().any(|l| l.starts_with("a5-receipt ")), "{red:?}");
-    let on = w68_lines("on");
+    let on = w68_lines();
     assert_eq!(w63_kind(&on, "reset_::_2@d0"), "ref", "{on:?}");
     assert!(
         on.iter()
@@ -4242,7 +4228,7 @@ fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
 /// nothing and the conflict stays.
 #[test]
 fn e5c_w68_c_one_type_keeps_its_overlap_partner() {
-    let on = w68_lines("on");
+    let on = w68_lines();
     assert_ne!(w63_kind(&on, "same_::_2@d0"), "ref", "{on:?}");
 }
 
@@ -4594,14 +4580,7 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let on = w63_lines(
-        &shape,
-        &[
-            ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
-            ("CRAT_E5C_W72", "1"),
-        ],
-    );
+    let on = w63_lines(&shape, &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W72", "1")]);
     let summary = on
         .iter()
         .find(|l| l.starts_with("arg-order model="))

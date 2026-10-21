@@ -109,23 +109,6 @@ pub(crate) fn ref_peel_zero() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_OVERLAP_TYPE_ROUTE=on|off` (fail-loud, absent = off): **L01¹⁰,
-/// R609-3 (b), under R542**. Two formals whose pointees are incompatible object
-/// types, neither containing the other by value, are not A5 overlap partners;
-/// receipt `overlap-partner-disjoint:type-rule`.
-pub(crate) fn overlap_type_route() -> bool {
-    match std::env::var("CRAT_ERA5C_OVERLAP_TYPE_ROUTE")
-        .ok()
-        .as_deref()
-    {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => {
-            panic!("CRAT_ERA5C_OVERLAP_TYPE_ROUTE must be `on` or `off`, got {other:?}")
-        }
-    }
-}
-
 /// The locations whose field load is a strong-update MOVE.
 #[derive(Debug, Default)]
 pub(crate) struct FieldMoves {
