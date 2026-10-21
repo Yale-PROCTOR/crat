@@ -28,7 +28,7 @@ use crate::analyses::borrow_ownership::{
     coherence::constrain_field_ownership,
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
-    mutability_facts::{MutFacts, MutFactsMode},
+    mutability_facts::MutFacts,
     origins::compute_origins,
     resolve::{ResolvedSlot, resolve_place},
     slots::{SlotId, SlotOwner},
@@ -586,10 +586,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     emit_checkpoint_phase(started, "ordinary-start", None, 0);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let mutability = match MutFactsMode::current() {
-        MutFactsMode::Off => MutFacts::all_mut(),
-        MutFactsMode::On => MutFacts::from_program(&program),
-    };
+    let mutability = MutFacts::from_program(&program);
     let copy_lend_mode = CopyLendMode::current();
 
     let ordinary = KindSolver::new(&slots);

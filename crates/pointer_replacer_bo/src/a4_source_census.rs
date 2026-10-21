@@ -39,7 +39,7 @@ use crate::analyses::borrow_ownership::{
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
     export::{BoExport, SelectorSite, location_key, with_bo_export},
-    mutability_facts::{MutFacts, MutFactsMode},
+    mutability_facts::MutFacts,
     origins::compute_origins,
     resolve::{ResolvedSlot, resolve_place},
     slots::{SlotId, SlotOwner},
@@ -5087,10 +5087,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let program = collect_program(tcx);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let mutability = match MutFactsMode::current() {
-        MutFactsMode::Off => MutFacts::all_mut(),
-        MutFactsMode::On => MutFacts::from_program(&program),
-    };
+    let mutability = MutFacts::from_program(&program);
     let ordinary = KindSolver::new(&slots);
     let copy_lend_mode = CopyLendMode::current();
     let (

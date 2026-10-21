@@ -6575,7 +6575,7 @@ mod run {
             },
             crate_slots::CrateSlots,
             l2, model_cache,
-            mutability_facts::{MutFacts, MutFactsMode, MutProvider},
+            mutability_facts::{MutFacts, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
             solver::{
@@ -7596,10 +7596,7 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
+        let mut_facts = MutFacts::from_program(&program);
         let copy_lend_mode = CopyLendMode::current();
         row.set("copy_lend_mode", copy_lend_mode.label());
         let solver = KindSolver::new_family_tracked(&slots);
@@ -7791,10 +7788,7 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
+        let mut_facts = MutFacts::from_program(&program);
         let copy_lend_mode = CopyLendMode::current();
         row.set("copy_lend_mode", copy_lend_mode.label());
         let solver = KindSolver::new_tracked(&slots);
@@ -8000,10 +7994,7 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
+        let mut_facts = MutFacts::from_program(&program);
         let copy_lend_mode = CopyLendMode::current();
         row.set("copy_lend_mode", copy_lend_mode.label());
         let candidate_families = program_matrix
@@ -8976,10 +8967,7 @@ mod run {
         // §NB2 + A12 phase-1b: construction consumes the exact mutability facts used by replay,
         // so derive them before the single construction point.
         let t = Instant::now();
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
+        let mut_facts = MutFacts::from_program(&program);
         row.set("t_mut_facts_s", secs(t.elapsed()));
         let copy_lend_mode = CopyLendMode::current();
         row.set("copy_lend_mode", copy_lend_mode.label());
@@ -9024,7 +9012,7 @@ mod run {
         row.set("safe_mono", SafeMonoMode::current().label());
         // §NB2: record the active mutability-facts mode (on = fact-driven immutability from
         // Foster; off = pre-NB2 forced-mut) so the dual-mode sweep is self-labeling.
-        row.set("mut_facts", MutFactsMode::current().label());
+        row.set("mut_facts", "on");
         phase("emit_done", t0);
 
         phase("coherence_done", t0);
@@ -16289,7 +16277,7 @@ mod explain {
         coherence::constrain_field_ownership,
         construction::{CopyLendMode, construct_bo_into},
         crate_slots::CrateSlots,
-        mutability_facts::{MutFacts, MutFactsMode},
+        mutability_facts::MutFacts,
         solver::{CORE_LABEL_FAMILIES, KindSolver},
     };
 
@@ -16352,10 +16340,7 @@ mod explain {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
         let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
+        let mut_facts = MutFacts::from_program(&program);
         let solver = KindSolver::new_tracked(&slots);
         let construction = construct_bo_into(
             &program,
@@ -32722,11 +32707,6 @@ fn boc1_corpus() {
             crate::analyses::borrow_ownership::SafeMonoMode::current(),
             crate::analyses::borrow_ownership::SafeMonoMode::PerSite,
             "L2 RED requires the frozen per-site safety profile"
-        );
-        assert_eq!(
-            crate::analyses::borrow_ownership::mutability_facts::MutFactsMode::current(),
-            crate::analyses::borrow_ownership::mutability_facts::MutFactsMode::On,
-            "L2 RED requires the frozen mutability-facts profile"
         );
         assert_eq!(
             crate::analyses::borrow_ownership::borrow_engine::ForkEngineMode::current(),

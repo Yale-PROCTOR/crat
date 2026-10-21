@@ -21,7 +21,7 @@ use crate::analyses::borrow_ownership::{
     },
     crate_slots::CrateSlots,
     l2::slotref_diagnostic,
-    mutability_facts::{MutFacts, MutFactsMode},
+    mutability_facts::MutFacts,
     origins::compute_origins,
     solver::{CoreTracker, KindSolver, SlotRef},
 };
@@ -232,7 +232,6 @@ struct PairStage {
 fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
     assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
     assert_eq!(RepairMode::current(), RepairMode::ModeA);
-    assert_eq!(MutFactsMode::current(), MutFactsMode::On);
     assert_eq!(SafeMonoMode::current(), SafeMonoMode::PerSite);
     assert!(
         !crate::analyses::borrow_ownership::l2::enabled_from_env(),
@@ -590,7 +589,7 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row.set("repair", RepairMode::current().label());
     row.set("l2", "0");
     row.set("safe_mono", SafeMonoMode::current().label());
-    row.set("mut_facts", MutFactsMode::current().label());
+    row.set("mut_facts", "on");
     row.set("z3_full_version", z3::full_version().to_string());
     row.set("smt_seed", 0);
     row.set("sat_seed", 0);

@@ -269,16 +269,7 @@ pub(crate) fn solver_identity(
     fields.insert("repair_mode", RepairMode::current().label().to_owned());
     fields.insert("safe_mono", SafeMonoMode::current().label().to_owned());
     fields.insert("t2", T2_MARKER.to_owned());
-    // L01¹² (R677-4): RQ5's `mut` row (`CRAT_BO_MUT_FACTS=off`) solves with every
-    // pointer mutable.
-    fields.insert(
-        "mutability",
-        match super::mutability_facts::MutFactsMode::current() {
-            super::mutability_facts::MutFactsMode::On => "foster-from-program-v1",
-            super::mutability_facts::MutFactsMode::Off => "all-mut-v1",
-        }
-        .to_owned(),
-    );
+    fields.insert("mutability", "foster-from-program-v1".to_owned());
     fields.insert("era5c_a5_snapshot", "true".to_owned());
     for key in [
         "CRAT_BO_EXPORT",

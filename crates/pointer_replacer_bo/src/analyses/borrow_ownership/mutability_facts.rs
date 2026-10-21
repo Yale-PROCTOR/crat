@@ -85,36 +85,6 @@ impl MutProvider for &MutFacts {
     }
 }
 
-/// §NB2 switch. `On` (default) consults Foster; `Off` reproduces the pre-NB2 forced-mutable
-/// behavior. Env `CRAT_BO_MUT_FACTS ∈ {off, on}` flips the corpus sweep with no recompile;
-/// fixtures never set it and build `MutFacts` directly, so they are deterministic. Only the
-/// `bo_c1` driver consults `current()` (to choose `all_mut()` vs `from_program`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MutFactsMode {
-    Off,
-    On,
-}
-
-impl MutFactsMode {
-    const DEFAULT: MutFactsMode = MutFactsMode::On;
-
-    pub(crate) fn current() -> MutFactsMode {
-        match std::env::var("CRAT_BO_MUT_FACTS").as_deref() {
-            Ok("off") => MutFactsMode::Off,
-            Ok("on") => MutFactsMode::On,
-            _ => MutFactsMode::DEFAULT,
-        }
-    }
-
-    /// Stable label for reporting (bo_c1 row column).
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            MutFactsMode::Off => "off",
-            MutFactsMode::On => "on",
-        }
-    }
-}
-
 /// Per-`(LocalDefId, Local)` outermost-provenance mutability, built to be BYTE-IDENTICAL to
 /// production's `mutables` input (`mutability_analysis` +
 /// `SourceVarGroups::postprocess_mut_res`: per-local `any(is_mutable)` across pointer depths,

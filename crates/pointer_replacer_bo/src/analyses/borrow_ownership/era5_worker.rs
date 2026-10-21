@@ -338,13 +338,7 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
                 let (result, _) = export::with_bo_export(|| {
                     let slots = CrateSlots::build(&program);
                     let origins = compute_origins(&program);
-                    // L01¹² (R677-4): RQ5's `mut` row sets `CRAT_BO_MUT_FACTS=off`.
-                    let mutability = match super::mutability_facts::MutFactsMode::current() {
-                        super::mutability_facts::MutFactsMode::On => {
-                            MutFacts::from_program(&program)
-                        }
-                        super::mutability_facts::MutFactsMode::Off => MutFacts::all_mut(),
-                    };
+                    let mutability = MutFacts::from_program(&program);
                     let solved = solve_bo_a5_config_reporting(
                         &program,
                         &slots,

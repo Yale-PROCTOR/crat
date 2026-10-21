@@ -36,7 +36,7 @@ use crate::analyses::borrow_ownership::{
     crate_slots::CrateSlots,
     export::{BoExport, VersionSite, location_key, with_bo_export},
     l2::MirLocationKey,
-    mutability_facts::{MutFacts, MutFactsMode},
+    mutability_facts::MutFacts,
     origin_summary::OriginSummaries,
     origins::compute_origins,
     resolve::{ResolvedSlot, resolve_place},
@@ -1040,10 +1040,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
     let ordinary = KindSolver::new(&slots);
-    let mutability = match MutFactsMode::current() {
-        MutFactsMode::Off => MutFacts::all_mut(),
-        MutFactsMode::On => MutFacts::from_program(&program),
-    };
+    let mutability = MutFacts::from_program(&program);
     let (((ordinary_model, _ordinary_stats), commit_trace), ordinary_export) =
         with_bo_export(|| {
             let construction = construct_bo_into(
