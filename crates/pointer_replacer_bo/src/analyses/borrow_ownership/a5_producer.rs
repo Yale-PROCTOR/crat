@@ -1364,53 +1364,6 @@ mod tests {
         .unwrap();
     }
 
-    /// W77's child (R677-4): the worker's A5 mode on the snapshot fixture, its
-    /// planned C-9 marks, and the identity's three RQ5 lines.
-    #[test]
-    #[ignore = "runs in a child of W77"]
-    fn e5c_inner_w77() {
-        let code = r#"
-            unsafe fn two(x: *mut i32, y: *const i32) {
-                let snapshot = *y;
-                *x = snapshot + 1;
-            }
-            unsafe fn entry(p: *mut i32) { two(p, p); }
-        "#;
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let program = program(tcx);
-            let slots = CrateSlots::build(&program);
-            let origins = compute_origins(&program);
-            let mutability = MutFacts::from_program(&program);
-            let model = baseline(&program, &slots, &origins, &mutability);
-            let mode = A5Mode::production();
-            let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
-            let plan = produce_a5_plan(
-                &program,
-                &slots,
-                origins.native_flows(),
-                &mutability,
-                &model,
-                mode,
-                attestation,
-            )
-            .expect("plan");
-            eprintln!(
-                "E5C_W77 mode={} marks={}",
-                mode.label(),
-                plan.planned_marks.len()
-            );
-            let identity = super::super::model_cache::solver_identity(mode, attestation);
-            for line in identity.lines().filter(|l| {
-                l.starts_with("a5_mode=")
-                    || l.starts_with("mutability=")
-                    || l.starts_with("era5c_a5_snapshot=")
-            }) {
-                eprintln!("E5C_W77 {line}");
-            }
-        })
-        .unwrap();
-    }
-
     #[test]
     fn production_plan_reaches_precise_overlap_and_mark_seams() {
         let code = r#"

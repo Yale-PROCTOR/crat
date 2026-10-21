@@ -1345,6 +1345,124 @@ pub(crate) fn load(
 mod tests {
     use super::*;
 
+    /// The record's solver identity (configuration `d9a474da` under its launch digest), without the
+    /// launch digest, which only a job sets.
+    const RECORD_IDENTITY: &str = "\
+CRAT_BO_EXPORT=\n\
+CRAT_BO_L2_TRANSITION_DIAGNOSTICS=\n\
+CRAT_BO_POINT_REQUIRES_TRIPWIRE=\n\
+CRAT_POINTER_DECISION_DIAGNOSTICS=\n\
+a14=positive-opacity-v1\n\
+a16=modeled-origin-one-way-v1\n\
+a2_mode=off\n\
+a5_attestation=frozen_benchmark_graph\n\
+a5_mode=precise_replay\n\
+a5_world=closed_world_frozen_graph\n\
+analysis_frame=era5c-l01p14-v1\n\
+array_fields=uniform-element-raw-holds-v1\n\
+comparison=source-cause-no-comparison-cause-v1\n\
+copy_lend_mode=lend_arm\n\
+coverage_integrity=r253-inventory-complete-l2-result-propagation-v1\n\
+era5_schema=era5b-model-cache-v1\n\
+era5_worker_hosts=lambda7,lambda9\n\
+era5b_interface_own=true\n\
+era5b_pass=joint\n\
+era5b_relax_frame=false\n\
+era5b_repair=false\n\
+era5b_return_port=true\n\
+era5c_a5_snapshot=true\n\
+era5c_allocator_contract=false\n\
+era5c_alpha_returns=true\n\
+era5c_arg_order=true\n\
+era5c_copy_lend=true\n\
+era5c_copy_lend_mut=on\n\
+era5c_copy_relax=depth0-borrow-to-raw+c3-destination-v2\n\
+era5c_dead_join=false\n\
+era5c_deref_reader=true\n\
+era5c_diagnostics=\n\
+era5c_exit_close=false\n\
+era5c_field_move=true\n\
+era5c_field_own_repair=true\n\
+era5c_finalize_soft=false\n\
+era5c_kind_order=ref-own-raw(ref=slots+1,own=1,raw=0)\n\
+era5c_leak_parity=false\n\
+era5c_lend=true\n\
+era5c_lend_formal=false\n\
+era5c_merge_liveness=on\n\
+era5c_move_store=true\n\
+era5c_move_tracking=true\n\
+era5c_moved_input=true\n\
+era5c_mut_model=true\n\
+era5c_null_exit=false\n\
+era5c_origin_set=true\n\
+era5c_overlap_type_route=true\n\
+era5c_own_named=false\n\
+era5c_own_prefer_local=false\n\
+era5c_realloc_nonzero=true\n\
+era5c_realloc_refute=true\n\
+era5c_ref_peel_zero=true\n\
+era5c_ref_weight_named=None\n\
+era5c_reseat_a1=true\n\
+era5c_retire_fresh=true\n\
+era5c_retire_route_use=true\n\
+era5c_test_faults=\n\
+era5c_traversal_ref=false\n\
+era5c_typed_release=true\n\
+era5c_typed_sole=true\n\
+esc_allowlist_sha256=bae5a3f240add2528164748763886e391e1d946457fddca6340e38182f933fd5\n\
+esc_minimal=direct-escape-minimal-v1\n\
+field_inner_facts=explicit-availability-v1\n\
+fork_engine=fork\n\
+l2_guarded_commits=false\n\
+local_coverage_outcomes=r245-ref-inner-demote-realloc-site-hold-v1\n\
+mutability=foster-from-program-v1\n\
+nb4r_routing=on\n\
+ownership_licensing=era5b-in-solve-origin-evidence-v1\n\
+proof_evidence=source-only-v2\n\
+protected_entry=p1-prime-s-v1\n\
+query_timeout_ms=600000\n\
+realloc_outcomes=r243-field-test-fallback-both-v1\n\
+repair_mode=guarded\n\
+retirement_receipts=r253-three-dispositions-v1\n\
+safe_mono=per_site\n\
+t2=endpoint-force-retraction-v1\n\
+";
+
+    /// The record's configuration needs no environment: a child of this binary with every `CRAT_*`
+    /// variable removed prints the solver identity, and every field equals the record's (the
+    /// launch digest aside, which only a job sets).
+    #[test]
+    fn s2_the_record_configuration_needs_no_environment() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut command = std::process::Command::new(exe);
+        command.args([
+            "analyses::borrow_ownership::model_cache::e5c_print_solver_identity",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("CRAT_") {
+                command.env_remove(key);
+            }
+        }
+        let output = command.output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed:\n{stderr}");
+        let printed: std::collections::BTreeSet<&str> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("E5C_IDENTITY "))
+            .collect();
+        let record: std::collections::BTreeSet<&str> = RECORD_IDENTITY.lines().collect();
+        let missing: Vec<_> = record.difference(&printed).collect();
+        let extra: Vec<_> = printed.difference(&record).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "fields not at the record's value:\n  record {missing:#?}\n  printed {extra:#?}"
+        );
+    }
+
     /// Item E / §39 addendum 74: a production cache key names the accepted
     /// solver world explicitly. The analyses-tree hash remains a backstop, but
     /// it is not a substitute for a readable identity: in particular the

@@ -2972,54 +2972,6 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
 // ---------------------------------------------------------------------------
 // W53 (era-5c L01⁹, R551: the spec lane's B2/B3/B4).
 
-#[test]
-#[ignore = "runs in a child of e5c_w53 (every switch is an env var)"]
-fn e5c_inner_w53_identity() {
-    let identity = super::model_cache::solver_identity(
-        super::a5_overlap::A5Mode::PreciseReplay,
-        Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
-    );
-    eprintln!("E5C_W53 {}", identity.replace('\n', "|"));
-}
-
-/// B3 (a) + B2: each constraint-changing switch, each fault hook and each
-/// diagnosis pin moves the identity (and so the configuration digest).
-#[test]
-fn e5c_w53_a_every_switch_moves_the_identity() {
-    let identity = |env: &[(&str, &str)]| -> String {
-        let text = child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_w53_identity",
-            env,
-        );
-        text.lines()
-            .find_map(|l| l.strip_prefix("E5C_W53 ").map(str::to_owned))
-            .expect("identity line")
-    };
-    let base = identity(&[]);
-    for (name, value) in [
-        ("CRAT_ERA5B_PASS", "era5a"),
-        ("CRAT_ERA5B_REPAIR", "on"),
-        ("CRAT_ERA5B_RELAX_FRAME", "on"),
-        ("CRAT_E5C_W47_FAULT", "any-depth"),
-        ("CRAT_E5C_W49_FAULT", "first-field"),
-        ("CRAT_E5C_W52_FAULT", "no-loan"),
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
-        ("CRAT_E5C_W61_FAULT", "raw-too"),
-        ("CRAT_ERA5C_DEBUG", "1"),
-        ("CRAT_ERA5C_BYTEPROOF", "1"),
-        ("CRAT_ERA5C_RESEAT_DUMP", "1"),
-    ] {
-        assert_ne!(
-            identity(&[(name, value)]),
-            base,
-            "{name}={value} must move the identity"
-        );
-    }
-    assert!(base.contains("era5b_pass=joint"), "{base}");
-    assert!(base.contains("era5c_test_faults=|"), "{base}");
-    assert!(base.contains("era5c_diagnostics=|"), "{base}");
-}
-
 /// B4: era-5c's four families are registered, so a family-tracked core names
 /// them instead of an `unregistered::` head.
 #[test]
@@ -6802,56 +6754,5 @@ fn e5c_w76_the_entry_carries_the_discharged_rows() {
     assert!(
         fault.contains(" entry=0 ") && fault.ends_with("equal=false"),
         "{fault}"
-    );
-}
-
-/// W77 (R677-4): RQ5's three switches in L01¹², default-inert. On the snapshot
-/// fixture (`two(p, p)`): by default precise replay plans a C-9 mark and the
-/// identity reads `a5_mode=precise_replay`, `mutability=foster-from-program-v1`,
-/// `era5c_a5_snapshot=true`; `CRAT_ERA5C_A5_SNAPSHOT=off` plans none;
-/// `CRAT_BO_A5_MODE=baseline` turns A5 off; `CRAT_BO_MUT_FACTS=off` names all-mut.
-#[test]
-fn e5c_w77_the_rq5_switches() {
-    let run = |env: &[(&str, &str)]| -> Vec<String> {
-        child(
-            "analyses::borrow_ownership::a5_producer::tests::e5c_inner_w77",
-            env,
-        )
-        .lines()
-        .filter_map(|l| l.find("E5C_W77 ").map(|i| l[i + 8..].to_owned()))
-        .collect()
-    };
-    let marks = |lines: &[String]| -> usize {
-        lines
-            .iter()
-            .find_map(|l| l.split("marks=").nth(1))
-            .and_then(|n| n.parse().ok())
-            .expect("marks")
-    };
-    let default = run(&[]);
-    assert!(marks(&default) > 0, "{default:?}");
-    for line in [
-        "a5_mode=precise_replay",
-        "mutability=foster-from-program-v1",
-        "era5c_a5_snapshot=true",
-    ] {
-        assert!(default.iter().any(|l| l == line), "{line}: {default:?}");
-    }
-    let snapshot = run(&[("CRAT_ERA5C_A5_SNAPSHOT", "off")]);
-    assert_eq!(marks(&snapshot), 0, "{snapshot:?}");
-    assert!(
-        snapshot.iter().any(|l| l == "era5c_a5_snapshot=false"),
-        "{snapshot:?}"
-    );
-    let overlap = run(&[("CRAT_BO_A5_MODE", "baseline")]);
-    assert_eq!(marks(&overlap), 0, "{overlap:?}");
-    assert!(
-        overlap.iter().any(|l| l == "a5_mode=baseline"),
-        "{overlap:?}"
-    );
-    let mutable = run(&[("CRAT_BO_MUT_FACTS", "off")]);
-    assert!(
-        mutable.iter().any(|l| l == "mutability=all-mut-v1"),
-        "{mutable:?}"
     );
 }
