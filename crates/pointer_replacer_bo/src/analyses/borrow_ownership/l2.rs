@@ -98,16 +98,6 @@ impl HazardKey {
     }
 }
 
-/// Feature switch resolved once by `verify_to_fixpoint_counting`.
-pub(crate) fn enabled_from_env() -> bool {
-    match std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
-        Ok(other) => panic!("CRAT_BO_L2_GUARDED_COMMITS must be 0 or 1, got {other:?}"),
-        Err(error) => panic!("CRAT_BO_L2_GUARDED_COMMITS is not valid Unicode: {error}"),
-    }
-}
-
 /// R7 uses the existing decision-diagnostics switch as its sole output gate.
 /// Match that switch's established off values; every other valid string uses
 /// its raw-compatible behavior.

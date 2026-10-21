@@ -249,10 +249,7 @@ pub(crate) fn solver_identity(
     );
     fields.insert("esc_minimal", ESC_MINIMAL_MARKER.to_owned());
     fields.insert("fork_engine", "fork".to_owned());
-    fields.insert(
-        "l2_guarded_commits",
-        super::l2::enabled_from_env().to_string(),
-    );
+    fields.insert("l2_guarded_commits", "false".to_owned());
     fields.insert(
         "nb4r_routing",
         if matches!(

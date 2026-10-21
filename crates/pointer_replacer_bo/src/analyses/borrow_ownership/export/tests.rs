@@ -12,8 +12,8 @@ use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{
-            RepairMode, RoundStats, model_accepts, verify_l2_to_fixpoint_counting,
-            verify_to_fixpoint, verify_to_fixpoint_counting,
+            RoundStats, model_accepts, verify_l2_to_fixpoint_counting, verify_to_fixpoint,
+            verify_to_fixpoint_counting,
         },
         coherence::add_coherence,
         construction::{
@@ -22,7 +22,7 @@ use crate::{
             verify_bo_construction_l2_for_test,
         },
         crate_slots::CrateSlots,
-        emit_crate_ownership_constraints, l2,
+        emit_crate_ownership_constraints,
         mutability_facts::MutFacts,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
@@ -647,14 +647,6 @@ fn certificate_is_recorded_at_the_accept_point() {
     // the plan-of-record profile while blaming the accept point. Assert the
     // behaviour each path actually has: this turns an env-sensitivity that used
     // to be invisible under `Vec` into a tested property of both paths.
-    if l2::enabled_from_env() {
-        assert!(
-            export.residual_conflicts.is_none(),
-            "the L2 accept records no certificate, so it must be None — if this \
-             fires, L2 grew a `record_residuals` call and the gap is closed"
-        );
-        return;
-    }
     let residuals = export.residual_conflicts.as_ref().expect(
         "D14: the accept point ran but recorded no certificate — `record_residuals` \
          is missing from the `committed == 0` accept, or `begin_round()` cleared it \
@@ -769,10 +761,6 @@ fn certificate_candidacy_matches_model() {
     let (model, export) = capture_solve(MALLOC_FREE);
     let model = model.expect("accepted");
     // F3, as above: `None` is the correct L2 behaviour.
-    if l2::enabled_from_env() {
-        assert!(export.residual_conflicts.is_none());
-        return;
-    }
     let residuals = export
         .residual_conflicts
         .as_ref()
@@ -2130,66 +2118,6 @@ fn decomposed_multi_round_model_commits_and_export_match_legacy() {
     assert_eq!(decomposed, legacy);
 }
 
-/// Solve through the **L2 guarded-commit loop**, under export capture (D2).
-///
-/// **D10** — this used to `set_var("CRAT_BO_L2_GUARDED_COMMITS", "1")` inside a
-/// parallel test binary: the same data-race class already fixed for
-/// `CRAT_BO_EXPORT`, one helper over. The safety comment claiming the suite is
-/// single-threaded was wrong — `test_threads = 1` is a *corpus-sweep* setting,
-/// not a property of `cargo test -p pointer_replacer`.
-///
-/// Restructured instead of serialized: route straight into the L2 loop. That
-/// removes the env mutation entirely **and** makes the path taken a fact of
-/// the call rather than of process state, which is what closes D2's
-/// "non-distinguishing" caveat — there is no Mode-A route through this helper.
-/// `RepairMode::ModeA` (the default) satisfies the precondition the env entry
-/// asserts.
-fn capture_solve_l2(
-    code: &str,
-) -> (
-    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
-    RoundStats,
-    BoExport,
-) {
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let origin_flows = analyze_program_origin_flow(&program);
-        assert_eq!(
-            RepairMode::current(),
-            RepairMode::ModeA,
-            "the L2 loop requires Mode-A repair"
-        );
-        let ((model, stats), export) = with_bo_export(|| {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_stats, selectors) = emit_crate_ownership_constraints(
-                &crate_ctxt,
-                &slots,
-                &compute_origins(&program),
-                &solver,
-            )
-            .expect("emission");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            verify_l2_to_fixpoint_counting(
-                &program,
-                &slots,
-                &origin_flows,
-                &solver,
-                &selectors,
-                true,
-                None,
-                None,
-            )
-        });
-        (model, stats, export)
-    })
-    .unwrap_or_else(|e| e.raise())
-}
-
 fn capture_solve_l2_backend(
     code: &str,
     backend: TestValidationBackend,
@@ -2235,40 +2163,6 @@ fn decomposed_l2_model_actions_and_export_match_legacy() {
     let decomposed =
         capture_solve_l2_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
     assert_eq!(decomposed, legacy);
-}
-
-/// **D2** — the witnessed/L2 replay path must capture loans too.
-///
-/// Before the fix this path had no `record_loan_identities` call on either
-/// loop exit, so `loans` was silently empty under exactly the configuration
-/// the plan of record ships.
-///
-/// *Mutation-tested (standing rule).* Deleting either `record_loan_identities`
-/// call in `borrow_conflicts_replaying_witnessed` fails this test, because
-/// `capture_solve_l2` reaches the L2 loop by direct call — the Mode-A capture
-/// sites are not on this path and cannot mask the deletion. That is the
-/// distinguishing power the previous env-based helper lacked.
-#[test]
-fn l2_path_records_loans() {
-    // D18a: an `l2_decline.is_none()` assertion stood here and was counted as
-    // strengthening. It CANNOT FIRE — every `record_l2_decline` call site is
-    // immediately followed by `return (None, stats)`, so it is implied by the
-    // `model.is_some()` below. Removed rather than left as decoration.
-    let (model, _stats, export) = capture_solve_l2(CALL_ARG);
-    assert!(model.is_some(), "L2-on fixture must be accepted");
-    assert!(
-        !export.loans.is_empty(),
-        "D2: the L2 replay path recorded no loans — capture is missing on that path"
-    );
-    // Round-correct: still exactly one record per loan (D1 holds on L2 too).
-    let mut seen = rustc_hash::FxHashSet::default();
-    for loan in &export.loans {
-        assert!(
-            seen.insert(loan.key.clone()),
-            "D1 regression on the L2 path: loan {:?} recorded twice",
-            loan.key
-        );
-    }
 }
 
 /// **D1** — a fixture that drives more than one validation round must still
@@ -2644,17 +2538,10 @@ fn probes_outside_the_armed_region_record_nothing() {
         // documented D2-adjacent gap), so `None` there is CORRECT. Asserting
         // it explicitly turns that env-sensitivity into a tested property of
         // both paths instead of a failure that blames the accepted run.
-        if l2::enabled_from_env() {
-            assert!(
-                narrow.residual_conflicts.is_none(),
-                "the L2 accept records no certificate, so it must be None"
-            );
-        } else {
-            assert!(
-                narrow.residual_conflicts.is_some(),
-                "accepted run recorded no certificate — inert"
-            );
-        }
+        assert!(
+            narrow.residual_conflicts.is_some(),
+            "accepted run recorded no certificate — inert"
+        );
 
         // Reference: the accepted run with no barrage at all.
         let arm2 = arm_scope();

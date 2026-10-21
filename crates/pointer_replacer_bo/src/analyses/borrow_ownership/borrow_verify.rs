@@ -58,13 +58,12 @@ thread_local! {
 ///   `Ref(lemmas) ⊆ Ref(mode_a)` and on a high-arity fan-out strictly ⊊ (Lemmas loses ≥1 Ref). So the
 ///   disjunction axis is dead; `ModeA` is the shipped default and the demotion-choice mechanism.
 ///
-/// Selected by env `CRAT_BO_REPAIR ∈ {mode_a, lemmas, guarded}` (default `ModeA`; the gate did NOT flip it),
-/// or a thread-local `with_override` that WINS over env. A uniform strategy toggle, constant within an
-/// override scope — no path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
+/// The active repair is `Guarded`; a thread-local `with_override` selects another for one scope (the
+/// differential harnesses). A uniform strategy toggle, constant within an override scope — no
+/// path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RepairMode {
     ModeA,
-    Lemmas,
     /// R617-1 (era-5c 082, approved R631-7): the guarded planner's clauses in
     /// Mode-A's loop, at the point where Mode-A commits. Everything around the
     /// commits is Mode-A's. A decline falls back to Mode-A for the program
@@ -83,44 +82,17 @@ impl RepairMode {
     /// `Default`, so this is also the mode a default-constructed stats block reports.
     pub(crate) const DEFAULT: Self = RepairMode::ModeA;
 
-    /// Resolve the active mode: thread-local override first, then env `CRAT_BO_REPAIR`, then `DEFAULT`.
-    /// Fail-loud on a SET-but-invalid env value (a typo must not silently fall back and mask which
-    /// repair ran — the `ForkEngineMode` discipline).
+    /// The active mode: the thread-local override, else `Guarded`.
     pub(crate) fn current() -> Self {
         if let Some(m) = REPAIR_OVERRIDE.with(|c| c.get()) {
             return m;
         }
-        let selected = match std::env::var("CRAT_BO_REPAIR") {
-            Ok(v) => match v.as_str() {
-                "mode_a" | "mode-a" => Some(RepairMode::ModeA),
-                "lemmas" => Some(RepairMode::Lemmas),
-                "guarded" => Some(RepairMode::Guarded),
-                other => panic!(
-                    "CRAT_BO_REPAIR={other:?} is not a valid selector (expected mode_a, lemmas or \
-                     guarded) — refusing to silently fall back"
-                ),
-            },
-            Err(_) => None,
-        };
-        // R617-1: `CRAT_BO_L2_GUARDED_COMMITS=1` is `guarded`'s alias. Its historical form
-        // required Mode-A (`mode_a` or unset), so those select the guarded mode with it;
-        // `lemmas` contradicts it and is refused.
-        if super::l2::enabled_from_env() {
-            assert_ne!(
-                selected,
-                Some(RepairMode::Lemmas),
-                "CRAT_BO_L2_GUARDED_COMMITS=1 (the guarded repair's alias) contradicts \
-                 CRAT_BO_REPAIR=lemmas"
-            );
-            return RepairMode::Guarded;
-        }
-        selected.unwrap_or(Self::DEFAULT)
+        RepairMode::Guarded
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             RepairMode::ModeA => "mode_a",
-            RepairMode::Lemmas => "lemmas",
             RepairMode::Guarded => "guarded",
         }
     }
@@ -1647,32 +1619,6 @@ fn verify_rounds(
                     }
                 }
             }
-            // §NB5-L Lemmas (MVP): one empty-context, A′-restricted disjunctive lemma `⋁¬ref(A′-menu)`
-            // per residual edge. The objective can satisfy it by demoting ANY menu member, which does
-            // NOT beat Mode-A — A′ excludes the only slot whose demotion would help (the issuer), and
-            // the freedom to pick a non-minimal member instead LOSES Ref vs Mode-A's minimal commit on
-            // high-arity edges (≤ / incomparable, not ≥; see the `RepairMode` doc). Rider 3: STABLE-SORT
-            // the edges HERE ONLY (`SlotRef` is not `Ord`, so key explicitly) so the emitted lemma SET
-            // is deterministic BY CONSTRUCTION (Mode-A's assertion order is left untouched).
-            RepairMode::Lemmas => {
-                let mut ordered: Vec<(LocalDefId, &SlotConflict)> = conflicts
-                    .iter()
-                    .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
-                    .collect();
-                ordered.sort_by(|(da, ca), (db, cb)| {
-                    conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb))
-                });
-                for (_did, conflict) in ordered {
-                    let menu = a_prime_menu(conflict, &model);
-                    if !menu.is_empty() {
-                        // `add_borrow_exclusion(None, &menu)` emits the disjunction `⋁¬ref(menu)` with
-                        // NO antecedent (empty context — the context-conditioned form is NB5-L2).
-                        solver.add_borrow_exclusion(None, &menu);
-                        committed += 1;
-                        stats.commits_conflict += 1;
-                    }
-                }
-            }
             // R617-1: the guarded planner's clauses at Mode-A's commit point. Reader failures and
             // retirement targets are observations with an empty guard (unconditional `¬ref`,
             // Mode-A's commits); a witnessed conflict's observation carries its loan and its
@@ -1851,13 +1797,6 @@ fn verify_rounds(
             "Mode-A CEGAR did not converge within {cap} rounds — this violates the proven linear \
              bound (each round commits ≥1 fresh permanent ¬ref), so it is a genuine analysis bug."
         ),
-        RepairMode::Lemmas => {
-            // Non-monotone lemma loop hit the cap (subset oscillation): controlled decline, not panic.
-            // Tag the decline KIND so `bo_c1` reports it as cap-exhaustion, not a mislabeled
-            // `sat-in-replay` (Codex MEDIUM).
-            stats.cap_exhausted = true;
-            (None, stats)
-        }
         // R617-1: the planner declines at its own cap (10S + 1) one round before this bound, so
         // reaching it is a planner defect; decline, which falls back to Mode-A.
         RepairMode::Guarded => {

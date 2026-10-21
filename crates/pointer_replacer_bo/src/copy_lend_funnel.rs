@@ -233,10 +233,6 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
     assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
     assert_eq!(RepairMode::current(), RepairMode::ModeA);
     assert_eq!(SafeMonoMode::current(), SafeMonoMode::PerSite);
-    assert!(
-        !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-        "A12 funnel requires L2 off"
-    );
 
     let program = collect_program(tcx);
     let origins = compute_origins(&program);

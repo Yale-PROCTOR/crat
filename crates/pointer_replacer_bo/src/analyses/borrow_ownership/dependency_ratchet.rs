@@ -146,9 +146,7 @@ mod tests {
         ("src/bo_c1.rs", "s23_owning_blocker_probe"),
         ("src/bo_c1.rs", "r385_forced_assignment_probe"),
         ("src/bo_c1.rs", "nbf_sink_retractable_delete_node"),
-        ("src/bo_c1.rs", "nb5l_cap_exhaustion_declines_not_panics"),
         ("src/bo_c1.rs", "nb5l2_anchor"),
-        ("src/bo_c1.rs", "nb5l2_capture_is_mode_a_only"),
     ];
 
     const LEGACY_PRIMITIVE_PREFIXES: &[&str] = &[

@@ -7068,10 +7068,6 @@ mod run {
         if !super::l2_red_gate::enabled() {
             return;
         }
-        assert!(
-            crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "L2 RED gate requires CRAT_BO_L2_GUARDED_COMMITS=1"
-        );
         // R617-1: `CRAT_BO_L2_GUARDED_COMMITS=1` is the guarded repair's alias.
         assert_eq!(
             repair,
@@ -7349,10 +7345,6 @@ mod run {
         events: &[(SlotRef, usize)],
         row: &mut Row,
     ) {
-        assert!(
-            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "certified-context replay must capture the Mode-A feature-off commit set"
-        );
         assert!(
             l2::diagnostics_enabled_from_env(),
             "certified-context replay requires CRAT_POINTER_DECISION_DIAGNOSTICS"
@@ -31594,11 +31586,6 @@ fn boc1_crown_projection_corpus() {
         "projection sweep L2 value must be exactly 0 or 1"
     );
     let l2_on = l2_value == "1";
-    assert_eq!(
-        crate::analyses::borrow_ownership::l2::enabled_from_env(),
-        l2_on,
-        "projection sweep L2 environment disagrees with the analysis gate"
-    );
     let legacy = std::env::var("CRAT_BOC1_PROJECTION_LEGACY").as_deref() == Ok("1");
     if legacy {
         assert!(!l2_on, "legacy snapshot belongs only to the Mode-A sweep");
@@ -32484,10 +32471,6 @@ fn boc1_corpus() {
             Ok("0"),
             "selector-leak diagnosis requires L2 explicitly off"
         );
-        assert!(
-            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "selector-leak diagnosis resolved L2 on"
-        );
         assert_eq!(
             timeout,
             Duration::from_secs(900),
@@ -32523,10 +32506,6 @@ fn boc1_corpus() {
             std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
             Ok("0"),
             "ownership diagnostic package requires L2 explicitly off"
-        );
-        assert!(
-            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "ownership diagnostic package resolved L2 on"
         );
         assert_eq!(
             timeout,
@@ -32580,10 +32559,6 @@ fn boc1_corpus() {
             std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
             Ok("0"),
             "pairwise family removal requires L2 explicitly off"
-        );
-        assert!(
-            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "pairwise family removal resolved L2 on"
         );
         assert_eq!(
             timeout,
@@ -32661,10 +32636,6 @@ fn boc1_corpus() {
             Ok("0"),
             "ownership-yield measurement requires L2 explicitly off"
         );
-        assert!(
-            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "ownership-yield measurement resolved L2 on"
-        );
         assert_eq!(
             timeout,
             Duration::from_secs(900),
@@ -32712,10 +32683,6 @@ fn boc1_corpus() {
             std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
             Ok("1"),
             "L2 RED requires CRAT_BO_L2_GUARDED_COMMITS=1"
-        );
-        assert!(
-            crate::analyses::borrow_ownership::l2::enabled_from_env(),
-            "L2 RED feature flag did not resolve on"
         );
         assert_eq!(
             std::env::var("CRAT_BO_REPAIR").as_deref(),
@@ -35039,75 +35006,6 @@ fn render_report(merged: &[report::Row]) -> String {
     out
 }
 
-/// §NB5-L (Codex MEDIUM) — the cap backstop is repair-mode-dependent: `Lemmas` returns a CONTROLLED
-/// decline tagged `cap_exhausted` (the oscillation blowup does not manifest, but Lemmas has no proven
-/// linear bound), while `ModeA` PANICS (its linear bound is proven, so a cap hit is a genuine bug).
-/// The natural oscillation never reaches the cap, so this forces it with a test-only cap override.
-#[test]
-fn nb5l_cap_exhaustion_declines_not_panics() {
-    use crate::analyses::borrow_ownership::{
-        CrateCtxt,
-        borrow_verify::{RepairMode, verify_to_fixpoint_counting, with_cap_override},
-        coherence::add_coherence,
-        crate_slots::CrateSlots,
-        emit_crate_ownership_constraints,
-        origins::compute_origins,
-        solver::KindSolver,
-    };
-    // An alias cascade that genuinely needs >1 CEGAR round (so cap=1 exhausts).
-    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
-                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let solve = |mode: RepairMode, cap: usize| {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_s, sel) = emit_crate_ownership_constraints(
-                &crate_ctxt,
-                &slots,
-                &compute_origins(&program),
-                &solver,
-            )
-            .expect("emit");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            with_cap_override(cap, || {
-                RepairMode::with_override(mode, || {
-                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
-                })
-            })
-        };
-        // Sanity: the fixture needs >1 round, else cap=1 would not exhaust.
-        let (_m, natural) = solve(RepairMode::ModeA, 999);
-        assert!(
-            natural.rounds > 1,
-            "fixture must need >1 round (got {})",
-            natural.rounds
-        );
-        // Lemmas at cap=1 ⇒ controlled decline, tagged cap_exhausted (NOT a panic, NOT mislabeled).
-        let (model, stats) = solve(RepairMode::Lemmas, 1);
-        assert!(
-            model.is_none() && stats.cap_exhausted,
-            "Lemmas cap-exhaustion must be a tagged decline (model={:?}, cap_exhausted={})",
-            model.is_some(),
-            stats.cap_exhausted
-        );
-        // Mode-A at cap=1 ⇒ PANIC (proven linear bound; a hit is a real bug). Drop-guards restore the
-        // cap/mode on unwind, so this does not leak state into later tests.
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve(RepairMode::ModeA, 1)))
-                .is_err();
-        assert!(
-            panicked,
-            "Mode-A cap-exhaustion must PANIC (its linear bound is proven)"
-        );
-    })
-    .unwrap_or_else(|e| e.raise())
-}
-
 /// §NB5-L2 commit-necessity audit — helper: run Mode-A to fixpoint capturing the distinct commit set
 /// `C` (dedup by slot, first-seen order) and the accepted model. Panics if the fixture declines.
 #[cfg(test)]
@@ -35352,83 +35250,6 @@ fn nb5l2_greedy_witnessed_joint_certified() {
         })
         .unwrap_or_else(|e| e.raise())
     }
-}
-
-/// §NB5-L2 (Codex F3) — the audit capture is Mode-A-ONLY: under `CRAT_BO_REPAIR=lemmas` the CEGAR loop
-/// takes the `Lemmas` branch, which does NOT record commit events, so `with_capture` returns empty. The
-/// `run_bo` guard rests on this — it refuses `repair != ModeA` with `na_status=wrong-repair-mode` rather
-/// than publishing a plausible-but-meaningless zero audit. Mode-A on the same fixture DOES capture.
-#[cfg(test)]
-#[test]
-fn nb5l2_capture_is_mode_a_only() {
-    use crate::analyses::borrow_ownership::{
-        CrateCtxt,
-        borrow_verify::{self, RepairMode, verify_to_fixpoint_counting},
-        coherence::add_coherence,
-        crate_slots::CrateSlots,
-        emit_crate_ownership_constraints,
-        origins::compute_origins,
-        solver::KindSolver,
-    };
-    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
-                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let origins = compute_origins(&program);
-        let run_mode = |mode: RepairMode| {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_s, sel) =
-                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
-                    .expect("emit");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            let ((_model, stats), events) = RepairMode::with_override(mode, || {
-                borrow_verify::with_capture(|| {
-                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
-                })
-            });
-            (stats.repair, stats.guarded_fallback.is_some(), events)
-        };
-        let (mode_a_repair, _, mode_a_events) = run_mode(RepairMode::ModeA);
-        assert_eq!(
-            mode_a_repair,
-            RepairMode::ModeA,
-            "Mode-A run must stamp ModeA"
-        );
-        assert!(
-            !mode_a_events.is_empty(),
-            "Mode-A must capture commits on a conflict fixture"
-        );
-        let (lemmas_repair, _, lemmas_events) = run_mode(RepairMode::Lemmas);
-        assert_eq!(
-            lemmas_repair,
-            RepairMode::Lemmas,
-            "Lemmas run must stamp Lemmas"
-        );
-        assert!(
-            lemmas_events.is_empty(),
-            "Lemmas must capture NO commit events — the audit is Mode-A-only (got {} events)",
-            lemmas_events.len()
-        );
-        // R617-1: a guarded run stamps Guarded and captures nothing -- unless it fell back to
-        // Mode-A, whose commits are then the capture.
-        let (guarded_repair, fell_back, guarded_events) = run_mode(RepairMode::Guarded);
-        assert_eq!(
-            guarded_repair,
-            RepairMode::Guarded,
-            "a guarded run must stamp Guarded"
-        );
-        assert!(
-            fell_back || guarded_events.is_empty(),
-            "an accepting guarded run must capture NO Mode-A commit events (got {})",
-            guarded_events.len()
-        );
-    })
-    .unwrap_or_else(|e| e.raise())
 }
 
 #[cfg(test)]

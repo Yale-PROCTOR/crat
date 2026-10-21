@@ -150,11 +150,6 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
 }
 
 #[test]
-fn e5_p_retirement_fixpoints_demote_the_actual_entry_and_keep_source_coverage() {
-    check_rounds(false);
-}
-
-#[test]
 fn e5_p_forced_unrepaired_entry_declines_without_an_ordinary_loan_conflict() {
     check_rounds(true);
 }

@@ -4162,10 +4162,7 @@ fn e5c_w74_the_ledger_names_each_commits_clause() {
 /// W69 (R617-1): the W63 child under the guarded repair with the L2 diagnostics on -- its lines,
 /// and the planner's `[bo-l2]` lines prefixed `l2 `.
 fn w69_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
-    let mut env: Vec<(&str, &str)> = vec![
-        ("CRAT_BO_REPAIR", "guarded"),
-        ("CRAT_POINTER_DECISION_DIAGNOSTICS", "raw"),
-    ];
+    let mut env: Vec<(&str, &str)> = vec![("CRAT_POINTER_DECISION_DIAGNOSTICS", "raw")];
     env.extend_from_slice(extra);
     w63_child(shape, &env)
         .lines()
@@ -4413,7 +4410,6 @@ fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
 fn e5c_w69_e_the_field_own_branch_runs_under_the_guarded_repair() {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.push(("CRAT_E5C_SHAPE", "AVL"));
-    env.push(("CRAT_BO_REPAIR", "guarded"));
     let on: Vec<String> = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_shape_decline_reason",
         &env,
@@ -4542,7 +4538,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
 /// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines and the guarded
 /// repair.
 const L01P13_ARMS: &[(&str, &str)] = &[
-    ("CRAT_BO_REPAIR", "guarded"),
     ("CRAT_BO_SAFE_MONO", "per_site"),
     ("CRAT_NB4R_ROUTING", "on"),
     ("CRAT_E5C_W63_MODEL_ONLY", "1"),
