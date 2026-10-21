@@ -154,7 +154,12 @@ def runs_of(tool, p):
         rows = []
         for r in csv.DictReader(open(f), delimiter='\t'):
             rep = r['first_report']
-            cls = 'timeout' if r['make_exit'] == 'timeout' else ('pass' if rep == '-' else rep.split(':', 1)[0])
+            if r['make_exit'] == 'timeout':
+                cls = 'timeout'
+            elif rep == '-':
+                cls = 'pass' if r['make_exit'] == '0' else 'error'   # a failed test with no Miri report
+            else:
+                cls = rep.split(':', 1)[0]
             rows.append((r['input'], cls, rep))
         return rows
     f = os.path.join(work, p, 'miri-runs-emitted-TB.tsv')
@@ -180,6 +185,8 @@ def cell(tool, p, status):
         return '—', 'not run'
     if any(c == 'other' and COMPILE.search(d or '') for _, c, d in rows):
         return '—', 'does not compile'
+    if any(c == 'error' or (c == 'other' and (d or '').startswith('exit ')) for _, c, d in rows):
+        return 'error', 'error'    # Miri exited without a report: the run did not happen (e.g. no sysroot)
     ub = sum(1 for _, c, d in rows if (d or '').startswith('Undefined Behavior') or
              (c not in ('pass', 'timeout', 'other', 'unsupported') and not (d or '').startswith('abnormal')))
     aborts = sum(1 for _, c, d in rows if c == 'unsupported' or (d or '').startswith('abnormal termination'))

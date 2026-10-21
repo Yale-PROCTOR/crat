@@ -141,7 +141,7 @@ def project(tree_root, module, var, cfg, proj, program="", pass_b=False, pass_c=
     if "extern crate c2rust_bitfields" in text:
         deps += 'c2rust-bitfields = "0.3"\n'
     open(os.path.join(proj, "Cargo.toml"), "w").write(
-        f'[package]\nname = "miri-run"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\n{deps}'
+        f'[package]\nname = "miri-run"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n[dependencies]\n{deps}'
         f'[profile.dev]\npanic = "abort"\n[[bin]]\nname = "miri-run"\npath = "src/main.rs"\n')
     shutil.copy(LOCK, os.path.join(proj, "Cargo.lock"))
     return os.path.join(proj, "src", "main.rs")

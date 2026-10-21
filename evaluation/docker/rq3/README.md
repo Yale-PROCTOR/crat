@@ -32,6 +32,7 @@ It writes:
 | `aborts` | the program stopped without UB: an assertion failure, or a call to a function Miri cannot run (`unsupported operation`) |
 | `does not compile` | the tree does not build |
 | `no main` | the test's module has no `main` function |
+| `error` | Miri exited without a report (for libtree: a test failed with no Miri report), so the run did not happen, e.g. no Miri sysroot; `compare.py` then reports the key as differing |
 
 ## `--small`
 
