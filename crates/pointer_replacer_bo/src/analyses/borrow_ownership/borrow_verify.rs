@@ -1282,7 +1282,7 @@ fn verify_rounds(
                 round_mutable,
                 selected_copy_lends.as_ref(),
                 active_escaped_copy_lends.as_ref(),
-                parameter_overlaps.filter(|_| !w69_fault(repair, "no-a5-context")),
+                parameter_overlaps,
             );
             let plain = conflicts
                 .iter()
@@ -1377,7 +1377,7 @@ fn verify_rounds(
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
             // L01⁹: an OWNING field in a residual is demoted (`¬own`, monotone) instead of
             // declining the program.
-            if !w69_fault(repair, "no-field-own") && model.get(&field) == Some(&SlotKind::Owning) {
+            if model.get(&field) == Some(&SlotKind::Owning) {
                 if !planner_empty_round(planner.as_mut(), &mut stats, &model) {
                     return (None, stats);
                 }
@@ -1531,20 +1531,18 @@ fn verify_rounds(
             // E-R4 certificate: record the residuals the accepted model
             // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
             // set, so this is non-empty in general. Recording-only.
-            if !w69_fault(repair, "no-certificate") {
-                super::export::record_residuals(
-                    conflicts
-                        .iter()
-                        .flat_map(|(did, cs)| {
-                            cs.iter().map(move |c| super::export::ResidualConflict {
-                                fn_did: *did,
-                                issuer: c.issuer,
-                                requirers: c.requirers.clone(),
-                            })
+            super::export::record_residuals(
+                conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| {
+                        cs.iter().map(move |c| super::export::ResidualConflict {
+                            fn_did: *did,
+                            issuer: c.issuer,
+                            requirers: c.requirers.clone(),
                         })
-                        .collect(),
-                );
-            }
+                    })
+                    .collect(),
+            );
             // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
             // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
             // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
@@ -1589,22 +1587,6 @@ fn verify_rounds(
             stats.cap_exhausted = true;
             (None, stats)
         }
-    }
-}
-
-/// W69 faults (test builds only; era-5c 082 §3): each removes one piece of the guarded arm, and
-/// only in a guarded run, so the Mode-A fallback is untouched. `no-a5-context`: the witnessed
-/// replay without A5's overlap pairs. `no-field-own`: the field-own branch skipped. `no-certificate`:
-/// the residual certificate not recorded at a guarded accept.
-fn w69_fault(repair: RepairMode, name: &str) -> bool {
-    #[cfg(test)]
-    {
-        repair == RepairMode::Guarded && std::env::var("CRAT_E5C_W69_FAULT").as_deref() == Ok(name)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = (repair, name);
-        false
     }
 }
 

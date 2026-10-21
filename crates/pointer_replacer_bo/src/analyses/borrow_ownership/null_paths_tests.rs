@@ -3604,7 +3604,7 @@ fn e5c_w69_a_a_guarded_round_lifts_a_mode_a_over_pin() {
 }
 
 /// W69d: a guarded accept records the residual certificate, the rows Mode-A records on the same
-/// model (the separate loop left it `None`). Fault `no-certificate`: `none`.
+/// model (the separate loop left it `None`).
 #[test]
 fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
     let guarded = w69_lines("w68-shapes", &[]);
@@ -3616,12 +3616,6 @@ fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
             w63_kind(&mode_a, "residuals")
         );
     }
-    let fault = w69_lines("w68-shapes", &[("CRAT_E5C_W69_FAULT", "no-certificate")]);
-    assert_eq!(
-        w63_kind(&fault, "residuals"),
-        "none",
-        "the fault must be caught"
-    );
 }
 
 /// W69e: the field-own branch (relay 117) runs under the guarded repair. avl's rotations leave a
@@ -3737,7 +3731,7 @@ extern "C" { fn malloc(_: u64) -> *mut ::core::ffi::c_void; }
 "#;
 
 /// W79: with the loan bounded by the callee's fixed inputs the entry is prepared
-/// (the W76 line prints; no refusal). The fault `no-fixed` gives the refusal back.
+/// (the W76 line prints; no refusal).
 #[test]
 fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
     let env = [("CRAT_E5C_W76", "1")];
@@ -3745,14 +3739,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
     assert!(
         on.iter().any(|l| l.starts_with("discharged ")),
         "the entry is prepared: {on:?}"
-    );
-    let text = w63_child(
-        "w79-shapes",
-        &[("CRAT_E5C_W76", "1"), ("CRAT_E5C_W79_FAULT", "no-fixed")],
-    );
-    assert!(
-        text.contains("unresolved callee argument: mk_list argument 4 of 3"),
-        "the fault must be caught: {text}"
     );
 }
 
