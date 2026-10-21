@@ -303,8 +303,6 @@ fn add_coherence_impl<'tcx>(
             );
         }
     }
-    // W55's fault (`CRAT_E5C_W55_FAULT=equate`) restores the full equate.
-    let deref_reader = std::env::var("CRAT_E5C_W55_FAULT").as_deref() != Ok("equate");
     for (block, bbdata) in body.basic_blocks.iter_enumerated() {
         for (statement_index, stmt) in bbdata.statements.iter().enumerate() {
             let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
@@ -372,7 +370,6 @@ fn add_coherence_impl<'tcx>(
                                     // L01^5 (ii): the load moves the field's token.
                                     solver.field_move_or_equate(lhs, rhs);
                                 } else if d == 0
-                                    && deref_reader
                                     && matches!(rvalue, Rvalue::CopyForDeref(_))
                                     && matches!(rhs, SlotRef::Field(_))
                                 {
