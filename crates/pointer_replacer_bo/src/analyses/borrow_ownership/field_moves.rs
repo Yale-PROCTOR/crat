@@ -71,20 +71,6 @@ pub(crate) fn exit_close() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_ORIGIN_SET=on|off` (fail-loud, absent = off): **L01⁹ rule 1a′, R565-3**.
-/// era-5b's store-origin classification (`classify_store_source`) keeps every
-/// origin slot of a stored value -- the parameters it came in as and the fields
-/// it was loaded from anywhere -- as a conjunction (`StoreSourceOrigin::All`),
-/// instead of `Unknown` at the second. avl's `insert` stores a rotation's result
-/// (`x = (*y).left`) into `Node::field1`/`field2` (era-5c 056 §3).
-pub(crate) fn origin_set() -> bool {
-    match std::env::var("CRAT_ERA5C_ORIGIN_SET").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_ORIGIN_SET must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_OWN_NAMED=on|off` (fail-loud, absent = off): **L01⁹, R565-3 STOP 3, a
 /// MEASUREMENT arm**. Arm 3's Owning-over-Raw preference (soft `own`, weight 3:
 /// above Raw's 1, far below Ref's `vars.len() + 1`) on named locals and on

@@ -1598,150 +1598,74 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
         })
     };
     // L01⁹ rule 1a′: collect every origin slot instead of giving up at the second.
-    if super::super::field_moves::origin_set() {
-        let mut keys: BTreeSet<String> = BTreeSet::new();
-        for atom in &atoms {
-            match atom {
-                OriginAtom::Fresh(_) | OriginAtom::Null => {}
-                OriginAtom::Input(port)
-                | OriginAtom::UnresolvedInput { formal: port, .. }
-                | OriginAtom::UnclassifiedInput { formal: port, .. } => match parameter(*port) {
-                    Some(key) => {
-                        keys.insert(key);
-                    }
-                    None => {
-                        if std::env::var("CRAT_R388_DEBUG").is_ok() {
-                            eprintln!(
-                                "R388SET {} {}:{} no entry row for port {port:?}",
-                                site.function, site.block, site.statement
-                            );
-                        }
-                        return StoreSourceOrigin::Unknown;
-                    }
-                },
-                // A load anywhere in the program (vars are program-wide per
-                // construction): the field it was loaded from.
-                OriginAtom::Unknown(port) => {
-                    // The port is the load's definition, or the field place's
-                    // own use window at the load (the token as read out of it).
-                    let loaded: BTreeSet<String> = facts
-                        .field_support_inputs
-                        .loads
-                        .iter()
-                        .filter(|load| {
-                            facts.consumes.iter().any(|consume| {
-                                consume.point.function.as_deref()
-                                    == Some(load.site.function.as_str())
-                                    && consume.point.block == Some(load.site.block)
-                                    && consume.point.statement == Some(load.site.statement)
-                                    && consume.point.construction == port.construction
-                                    && matches!(
-                                        &consume.projected,
-                                        Availability::Present(window)
-                                            if window.def_start == port.var
-                                                || window.use_start == port.var
-                                    )
-                            })
-                        })
-                        .map(|load| load.site.field_key.clone())
-                        .collect();
-                    if loaded.is_empty() {
-                        if std::env::var("CRAT_R388_DEBUG").is_ok() {
-                            eprintln!(
-                                "R388SET {} {}:{} no load for port {port:?}",
-                                site.function, site.block, site.statement
-                            );
-                        }
-                        return StoreSourceOrigin::Unknown;
-                    }
-                    keys.extend(loaded);
-                }
-                _ => return StoreSourceOrigin::Unknown,
-            }
-        }
-        let result = match keys.len() {
-            0 => StoreSourceOrigin::Fresh,
-            _ => StoreSourceOrigin::All(keys.into_iter().collect()),
-        };
-        if std::env::var("CRAT_R388_DEBUG").is_ok() {
-            eprintln!(
-                "R388SET {} {}:{} -> {result:?}",
-                site.function, site.block, site.statement
-            );
-        }
-        return result;
-    }
-    let origin = classify_single_origin(facts, site, &atoms, parameter);
-    if std::env::var("CRAT_R388_DEBUG").is_ok() {
-        eprintln!(
-            "R388SET {} {}:{} -> {origin:?}",
-            site.function, site.block, site.statement
-        );
-    }
-    origin
-}
-
-fn classify_single_origin(
-    facts: &Facts,
-    site: &Site,
-    atoms: &BTreeSet<OriginAtom>,
-    parameter: impl Fn(Node) -> Option<String>,
-) -> StoreSourceOrigin {
-    let mut origin = StoreSourceOrigin::Fresh;
-    for atom in atoms {
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for atom in &atoms {
         match atom {
             OriginAtom::Fresh(_) | OriginAtom::Null => {}
             OriginAtom::Input(port)
             | OriginAtom::UnresolvedInput { formal: port, .. }
-            | OriginAtom::UnclassifiedInput { formal: port, .. } => {
-                match (parameter(*port), &origin) {
-                    // An argument arrives as its pointer COMPONENTS — report 042's
-                    // entry window — so several `Input` atoms naming one parameter
-                    // are one token, not several.
-                    (Some(key), StoreSourceOrigin::Fresh) => {
-                        origin = StoreSourceOrigin::Input(key);
-                    }
-                    (Some(key), StoreSourceOrigin::Input(existing)) if &key == existing => {}
-                    // Two distinct parameters, or a port with no entry row.
-                    _ => return StoreSourceOrigin::Unknown,
+            | OriginAtom::UnclassifiedInput { formal: port, .. } => match parameter(*port) {
+                Some(key) => {
+                    keys.insert(key);
                 }
-            }
-            // A token the origins could not resolve MAY be a field load: fields
-            // are not origin-tracked, so a value read out of one arrives here as
-            // `Unknown`. The loads table says whether it was, and from which
-            // field. Anything else stays `Unknown`.
+                None => {
+                    if std::env::var("CRAT_R388_DEBUG").is_ok() {
+                        eprintln!(
+                            "R388SET {} {}:{} no entry row for port {port:?}",
+                            site.function, site.block, site.statement
+                        );
+                    }
+                    return StoreSourceOrigin::Unknown;
+                }
+            },
+            // A load anywhere in the program (vars are program-wide per
+            // construction): the field it was loaded from.
             OriginAtom::Unknown(port) => {
+                // The port is the load's definition, or the field place's
+                // own use window at the load (the token as read out of it).
                 let loaded: BTreeSet<String> = facts
                     .field_support_inputs
                     .loads
                     .iter()
                     .filter(|load| {
-                        load.site.function == site.function
-                            && facts.consumes.iter().any(|consume| {
-                                consume.point.function.as_deref() == Some(site.function.as_str())
-                                    && consume.point.block == Some(load.site.block)
-                                    && consume.point.statement == Some(load.site.statement)
-                                    && consume.point.construction == port.construction
-                                    && matches!(
-                                        &consume.projected,
-                                        Availability::Present(window)
-                                            if window.def_start == port.var
-                                    )
-                            })
+                        facts.consumes.iter().any(|consume| {
+                            consume.point.function.as_deref() == Some(load.site.function.as_str())
+                                && consume.point.block == Some(load.site.block)
+                                && consume.point.statement == Some(load.site.statement)
+                                && consume.point.construction == port.construction
+                                && matches!(
+                                    &consume.projected,
+                                    Availability::Present(window)
+                                        if window.def_start == port.var
+                                            || window.use_start == port.var
+                                )
+                        })
                     })
                     .map(|load| load.site.field_key.clone())
                     .collect();
-                match (loaded.len(), &origin) {
-                    (1, StoreSourceOrigin::Fresh) => {
-                        origin = StoreSourceOrigin::FieldToken(
-                            loaded.into_iter().next().expect("one field"),
+                if loaded.is_empty() {
+                    if std::env::var("CRAT_R388_DEBUG").is_ok() {
+                        eprintln!(
+                            "R388SET {} {}:{} no load for port {port:?}",
+                            site.function, site.block, site.statement
                         );
                     }
-                    _ => return StoreSourceOrigin::Unknown,
+                    return StoreSourceOrigin::Unknown;
                 }
+                keys.extend(loaded);
             }
             _ => return StoreSourceOrigin::Unknown,
         }
     }
-    origin
+    let result = match keys.len() {
+        0 => StoreSourceOrigin::Fresh,
+        _ => StoreSourceOrigin::All(keys.into_iter().collect()),
+    };
+    if std::env::var("CRAT_R388_DEBUG").is_ok() {
+        eprintln!(
+            "R388SET {} {}:{} -> {result:?}",
+            site.function, site.block, site.statement
+        );
+    }
+    result
 }

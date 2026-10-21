@@ -2076,75 +2076,6 @@ fn e5c_w58_a_fresh_call_result_live_at_exit_is_closed_not_finalized() {
 }
 
 // ---------------------------------------------------------------------------
-// W59 (era-5c L01⁹ rule 1a′, R565-3): store origins classified as a set.
-
-/// Control: the stored value comes from an opaque foreign function -- an origin
-/// the classification cannot name; it stays `Unknown`.
-const W59_OPAQUE: &str = r#"
-#![allow(dead_code, non_snake_case)]
-#[repr(C)] pub struct Node { pub key: i32, pub left: *mut Node }
-extern "C" { fn opaque() -> *mut Node; fn free(p: *mut Node); }
-pub unsafe fn graft(n: *mut Node) { (*n).left = opaque(); }
-pub unsafe fn prune(n: *mut Node) { free((*n).left); }
-"#;
-
-#[test]
-#[ignore = "runs under L01⁸'s arms in a child of e5c_w59"]
-fn e5c_inner_w59() {
-    let name = std::env::var("CRAT_E5C_W59").expect("CRAT_E5C_W59");
-    let code = match name.as_str() {
-        "AVL" => AVL_SHAPE,
-        "OPAQUE" => W59_OPAQUE,
-        other => panic!("{other}"),
-    };
-    let _ = shape_model(code);
-}
-
-/// W59: on avl's insert-and-rotate shape, the recursive stores into `left` /
-/// `right` classify as `All(..)` (the fields, the parameters) with the arm and as
-/// `Unknown` without it; the opaque control stays `Unknown` either way.
-#[test]
-fn e5c_w59_store_origins_classify_as_a_set() {
-    let lines = |shape: &str, arm: &str| -> Vec<String> {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_ORIGIN_SET", arm));
-        env.push(("CRAT_R388_DEBUG", "1"));
-        env.push(("CRAT_E5C_W59", shape));
-        child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_w59",
-            &env,
-        )
-        .lines()
-        .filter(|l| l.starts_with("R388SET "))
-        .map(str::to_owned)
-        .collect()
-    };
-    let on = lines("AVL", "on");
-    let off = lines("AVL", "off");
-    let insert = |rows: &[String]| -> Vec<String> {
-        rows.iter()
-            .filter(|l| l.starts_with("R388SET insert "))
-            .cloned()
-            .collect()
-    };
-    assert!(
-        !insert(&on).is_empty() && insert(&on).iter().all(|l| l.contains("-> All(")),
-        "with the arm insert's stores classify as a set: {on:?}"
-    );
-    assert!(
-        insert(&off).iter().any(|l| l.ends_with("-> Unknown")),
-        "without the arm one is Unknown (RED): {off:?}"
-    );
-    for arm in ["on", "off"] {
-        let control = lines("OPAQUE", arm);
-        assert!(
-            control.iter().all(|l| !l.contains("-> All(")),
-            "an opaque origin is never classified ({arm}): {control:?}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // W60 (era-5c L01⁹ rule 2′, R568-4): a parameter moved into a field supports it.
 
 /// P: `attach` moves its parameter `x` into `y.left`; a walker reads the field.
@@ -2203,7 +2134,6 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
     );
     let rows = || -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_ORIGIN_SET", "on"));
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w60",
             &env,
@@ -2529,7 +2459,6 @@ fn e5c_inner_w61() {
 /// 1b + 1a′ + 2′) plus `extra`.
 fn w61_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.extend_from_slice(&[("CRAT_ERA5C_ORIGIN_SET", "on")]);
     env.extend_from_slice(extra);
     child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w61",
@@ -2716,7 +2645,6 @@ fn e5c_inner_w62() {
 
 fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.extend_from_slice(&[("CRAT_ERA5C_ORIGIN_SET", "on")]);
     env.extend_from_slice(extra);
     child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w62",
@@ -3488,7 +3416,6 @@ fn w63_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
 fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
-        ("CRAT_ERA5C_ORIGIN_SET", "on"),
         // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),
         // L01¹⁰'s configuration (R609-3): the argument-order premise and the

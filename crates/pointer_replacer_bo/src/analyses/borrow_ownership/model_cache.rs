@@ -230,10 +230,7 @@ pub(crate) fn solver_identity(
         "era5c_own_named",
         super::field_moves::own_named().to_string(),
     );
-    fields.insert(
-        "era5c_origin_set",
-        super::field_moves::origin_set().to_string(),
-    );
+    fields.insert("era5c_origin_set", "true".to_owned());
     fields.insert(
         "era5c_exit_close",
         super::field_moves::exit_close().to_string(),
