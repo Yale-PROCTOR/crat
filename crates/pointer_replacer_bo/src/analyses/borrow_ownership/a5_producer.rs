@@ -10,12 +10,14 @@ use rustc_middle::{
     ty::{TyCtxt, TyKind},
 };
 
+#[cfg(test)]
+use super::a5_overlap::A5World;
 use super::{
     SlotKind,
     a5_overlap::{
-        A5Mode, A5SummaryArtifact, A5World, AbiBoundaryFacts, AbiGuardDisposition,
-        AllWitnessesGate, C9MarkKey, CallSiteWitnessKey, CallTransfer, FunctionPairKey, PairClass,
-        PairFacts, SetPairEvidence, WholeProgramAttestation, WitnessMarkability, WitnessMutability,
+        A5Mode, A5SummaryArtifact, AbiBoundaryFacts, AbiGuardDisposition, AllWitnessesGate,
+        C9MarkKey, CallSiteWitnessKey, CallTransfer, FunctionPairKey, PairClass, PairFacts,
+        SetPairEvidence, WholeProgramAttestation, WitnessMarkability, WitnessMutability,
         a5_abi_guard, all_witnesses_gate, classify_pair, join_witness_mutability,
         render_summary_artifact, solve_may_overlap,
     },
@@ -58,7 +60,9 @@ pub(crate) struct A5ProducerStats {
 
 #[derive(Clone, Debug)]
 pub(crate) struct A5Plan {
+    #[cfg(test)]
     pub(crate) mode: A5Mode,
+    #[cfg(test)]
     pub(crate) world: A5World,
     pub(crate) abi_guard: AbiGuardDisposition,
     pub(crate) effective_overlaps: FxHashMap<LocalDefId, ParameterOverlap>,
@@ -83,7 +87,9 @@ impl A5Plan {
     fn baseline_with_guard(guard: AbiGuardDisposition) -> Self {
         let fixpoint = solve_may_overlap(std::iter::empty());
         Self {
+            #[cfg(test)]
             mode: A5Mode::Baseline,
+            #[cfg(test)]
             world: A5World::ClosedWorldFrozenGraph,
             abi_guard: guard.clone(),
             effective_overlaps: FxHashMap::default(),
@@ -173,19 +179,27 @@ struct WitnessRecord {
 #[derive(Clone, Debug)]
 pub(crate) struct A5SiteBranchAudit {
     pub(crate) caller: u32,
+    #[cfg(test)]
     pub(crate) caller_path: String,
     pub(crate) block: u32,
     pub(crate) target: u32,
+    #[cfg(test)]
     pub(crate) target_path: String,
     pub(crate) left_parameter: u32,
     pub(crate) right_parameter: u32,
+    #[cfg(test)]
     pub(crate) left_operand: String,
+    #[cfg(test)]
     pub(crate) right_operand: String,
+    #[cfg(test)]
     pub(crate) left_actual: Option<SlotKey>,
+    #[cfg(test)]
     pub(crate) right_actual: Option<SlotKey>,
     pub(crate) classifier: Option<PairClass>,
+    #[cfg(test)]
     pub(crate) dependencies: usize,
     pub(crate) family: &'static str,
+    #[cfg(test)]
     pub(crate) terminator: String,
 }
 
@@ -247,6 +261,7 @@ pub(crate) fn audit_a5_site_branches(
 
     let mut answer = Vec::new();
     for &caller in &program.functions {
+        #[cfg(test)]
         let caller_path = tcx.def_path_str(caller.to_def_id());
         let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
         let flow = &flows[&caller].body;
@@ -265,6 +280,7 @@ pub(crate) fn audit_a5_site_branches(
                     let left_actual = actual_slot(slots, caller, &body, &args[left].node);
                     let right_actual = actual_slot(slots, caller, &body, &args[right].node);
                     let mut classifier = None;
+                    #[cfg(test)]
                     let mut dependencies = 0usize;
                     let family = if targets.iter().any(|target| {
                         let target_body =
@@ -301,7 +317,10 @@ pub(crate) fn audit_a5_site_branches(
                                 &args[left].node,
                                 &args[right].node,
                             );
-                            dependencies = dependency_rows.len();
+                            #[cfg(test)]
+                            {
+                                dependencies = dependency_rows.len();
+                            }
                             let verdict = classify_pair(&facts);
                             classifier = Some(verdict);
                             match site_seed_disposition(verdict, dependency_rows.is_empty()) {
@@ -323,19 +342,27 @@ pub(crate) fn audit_a5_site_branches(
                     for &target in targets {
                         answer.push(A5SiteBranchAudit {
                             caller: caller.local_def_index.as_u32(),
+                            #[cfg(test)]
                             caller_path: caller_path.clone(),
                             block: block.as_u32(),
                             target: target.local_def_index.as_u32(),
+                            #[cfg(test)]
                             target_path: tcx.def_path_str(target.to_def_id()),
                             left_parameter: left as u32 + 1,
                             right_parameter: right as u32 + 1,
+                            #[cfg(test)]
                             left_operand: format!("{:?}", args[left].node),
+                            #[cfg(test)]
                             right_operand: format!("{:?}", args[right].node),
+                            #[cfg(test)]
                             left_actual: left_actual.map(SlotKey::of),
+                            #[cfg(test)]
                             right_actual: right_actual.map(SlotKey::of),
                             classifier,
+                            #[cfg(test)]
                             dependencies,
                             family,
+                            #[cfg(test)]
                             terminator: format!("{:?}", data.terminator().kind),
                         });
                     }
@@ -563,11 +590,13 @@ pub(crate) struct ClosedWorldCallWorld {
     pub(crate) calls: usize,
     pub(crate) unresolved_calls: usize,
     indirect_function_targets: FxHashSet<LocalDefId>,
+    #[cfg(test)]
     indirect_sites: FxHashSet<(LocalDefId, BasicBlock)>,
     aggregate_guard: AbiGuardDisposition,
 }
 
 impl ClosedWorldCallWorld {
+    #[cfg(test)]
     pub(crate) fn artifact(&self, tcx: TyCtxt<'_>) -> String {
         let mut rows = self
             .resolved
@@ -676,6 +705,7 @@ fn resolve_closed_world_call_world_from_analysis(
         calls,
         unresolved_calls,
         indirect_function_targets,
+        #[cfg(test)]
         indirect_sites,
         aggregate_guard,
     }
@@ -1218,7 +1248,9 @@ pub(crate) fn produce_a5_plan(
         .collect();
     let summary_artifact = render_summary_artifact(&fixpoint, mode, &aggregate_guard);
     Ok(A5Plan {
+        #[cfg(test)]
         mode,
+        #[cfg(test)]
         world: A5World::ClosedWorldFrozenGraph,
         abi_guard: aggregate_guard,
         effective_overlaps,

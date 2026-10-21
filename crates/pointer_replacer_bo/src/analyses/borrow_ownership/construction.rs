@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use super::borrow_verify::verify_l2_to_fixpoint_counting_impl;
 #[cfg(test)]
+use super::borrow_verify::verify_to_fixpoint_counting_with_flows;
+#[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 use super::{
     BoOwnEmissionStats, CrateCtxt, SlotKind,
@@ -27,10 +29,7 @@ use super::{
         apply_coarse_constraints,
     },
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
-    borrow_verify::{
-        LoopBackend, verify_to_fixpoint_counting_with_flows,
-        verify_to_fixpoint_counting_with_flows_impl,
-    },
+    borrow_verify::{LoopBackend, verify_to_fixpoint_counting_with_flows_impl},
     boundary_table::{self, Matcher, Role},
     coherence::{
         CopyLendPair, FieldRefPlan, add_coherence, add_coherence_removal_only,
@@ -85,6 +84,7 @@ impl CopyLendMode {
         f()
     }
 
+    #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
@@ -131,6 +131,7 @@ pub(crate) enum CopyLendEligibilityDrop {
 }
 
 impl CopyLendEligibilityDrop {
+    #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::C2MutableOrMissingDestination => "c2-mutable-or-missing-destination",
@@ -158,17 +159,22 @@ pub(crate) struct CopyLendPairCandidate {
 
 pub(crate) struct BoConstruction {
     pub(crate) source_events: std::sync::Arc<super::source_events::SourceEvents>,
+    #[cfg(test)]
     pub(crate) qualifier_facts: super::qualifier_facts::QualifierFacts,
+    #[cfg(test)]
     pub(crate) array_fields: super::array_fields::ArrayFieldFacts,
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) field_ref_plan: FieldRefPlan,
+    #[cfg(test)]
     pub(crate) a2_killed_memberships: usize,
+    #[cfg(test)]
     pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
     pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     pub(crate) stats: BoOwnEmissionStats,
+    #[cfg(test)]
     pub(crate) eligibility_elapsed: Duration,
     pub(crate) emit_elapsed: Duration,
     pub(crate) coherence_elapsed: Duration,
@@ -178,31 +184,54 @@ pub(crate) struct BoConstruction {
 pub(crate) struct VerifiedBo {
     pub(crate) model: FxHashMap<SlotRef, SlotKind>,
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
+    #[cfg(test)]
     pub(crate) retained_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) retained_c9_plans: Vec<PlannedC9Mark>,
+    #[cfg(test)]
     pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
+    #[cfg(test)]
     pub(crate) mark_artifact: String,
+    #[cfg(test)]
     pub(crate) site_artifact: String,
+    #[cfg(test)]
     pub(crate) nullable_artifact: String,
+    #[cfg(test)]
     pub(crate) field_ref_artifact: String,
     pub(crate) receipt: String,
+    #[cfg(test)]
     pub(crate) round_stats: super::borrow_verify::RoundStats,
+    #[cfg(test)]
     pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
+    #[cfg(test)]
     pub(crate) selector_sources: usize,
+    #[cfg(test)]
     pub(crate) selector_sinks: usize,
+    #[cfg(test)]
     pub(crate) emission_stats: BoOwnEmissionStats,
+    #[cfg(test)]
     pub(crate) construction_emit_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) construction_coherence_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) check_sat_count: usize,
+    #[cfg(test)]
     pub(crate) hard_check_count: usize,
+    #[cfg(test)]
     pub(crate) optimize_materialization_count: usize,
+    #[cfg(test)]
     pub(crate) lazy_plain_hard_check_count: usize,
+    #[cfg(test)]
     pub(crate) lazy_tracked_recheck_count: usize,
+    #[cfg(test)]
     pub(crate) lazy_plain_materialization_count: usize,
+    #[cfg(test)]
     pub(crate) hard_check_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) optimize_materialization_elapsed: Duration,
     pub(crate) a16_refined_links: usize,
+    #[cfg(test)]
     pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
+    #[cfg(test)]
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
 
@@ -223,6 +252,7 @@ pub(crate) enum A5PreledgerDeclineReason {
 }
 
 impl A5PreledgerDeclineReason {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 9] = [
         Self::BaselineConstruction,
         Self::BaselineVerification,
@@ -235,6 +265,7 @@ impl A5PreledgerDeclineReason {
         Self::CoarseVerification,
     ];
 
+    #[cfg(test)]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::BaselineConstruction => "baseline-construction",
@@ -308,10 +339,12 @@ impl A5PreledgerDecline {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reason(&self) -> A5PreledgerDeclineReason {
         self.reason
     }
 
+    #[cfg(test)]
     pub(crate) fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
@@ -1053,12 +1086,14 @@ fn construct_bo_into_with_esc(
     } else {
         super::esc_minimal::EscMinimalSelection::default()
     };
+    #[cfg(test)]
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
         analyze_copy_lend_eligibility(program, slots, mut_facts, origins.native_flows())
     } else {
         CopyLendEligibility::default()
     };
+    #[cfg(test)]
     let eligibility_elapsed = t.elapsed();
     let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
@@ -1111,17 +1146,22 @@ fn construct_bo_into_with_esc(
     ));
     Ok(BoConstruction {
         source_events,
+        #[cfg(test)]
         qualifier_facts,
+        #[cfg(test)]
         array_fields,
         mode,
         nullability,
         field_ref_plan,
+        #[cfg(test)]
         a2_killed_memberships: 0,
+        #[cfg(test)]
         a2_opaque_result_guards: 0,
         selectors,
         eligibility,
         esc_minimal,
         stats,
+        #[cfg(test)]
         eligibility_elapsed,
         emit_elapsed,
         coherence_elapsed,
@@ -1237,6 +1277,7 @@ fn add_refined_return_kind_links(
 
 /// Accepted A16-REFINE construction: add one-way links only for
 /// modeled-origin returns and report their exact site count.
+#[cfg(test)]
 pub(crate) fn construct_bo_into_a16_refined(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1331,6 +1372,7 @@ pub(crate) fn construct_tracked_census_baseline(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn construct_bo_into_a2(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1358,6 +1400,7 @@ pub(crate) fn construct_bo_into_a2(
     Ok(construction)
 }
 
+#[cfg(test)]
 pub(crate) fn verify_bo_construction(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1372,6 +1415,7 @@ pub(crate) fn verify_bo_construction(
 /// Verify a shared construction against an explicitly supplied flow graph. This is reserved for
 /// diagnostic constructions that deliberately substitute the origin summaries while replaying the
 /// production flow facts; the construction mode still owns emission/coherence selection.
+#[cfg(test)]
 pub(crate) fn verify_bo_construction_with_flows(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1625,6 +1669,7 @@ pub(crate) fn solve_bo_a5_config_reporting(
 /// Measurement reference: accepted A5/A16 production semantics with Phase-2
 /// escaped-loan selection disabled in both the planning baseline and candidate
 /// construction. This is the byte-equivalence path to c080.
+#[cfg(test)]
 pub(crate) fn solve_bo_a5_reference_reporting(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1776,39 +1821,62 @@ fn solve_bo_a5_config_with_source_events(
                         &baseline_a14,
                     ),
                 ),
+                #[cfg(test)]
                 mark_artifact: a5_mark_artifact(
                     mode,
                     &plan,
                     &BTreeSet::new(),
                     &selected_model_sha256,
                 ),
+                #[cfg(test)]
                 site_artifact: a5_site_artifact(mode, &plan),
+                #[cfg(test)]
                 nullable_artifact: baseline_nullability.artifact.clone(),
+                #[cfg(test)]
                 field_ref_artifact: baseline_a14.artifact.clone(),
+                #[cfg(test)]
                 summary_artifact: plan.summary_artifact.clone(),
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
+                #[cfg(test)]
                 retained_c9_marks: BTreeSet::new(),
                 retained_c9_plans: Vec::new(),
+                #[cfg(test)]
                 round_stats: baseline_round_stats,
+                #[cfg(test)]
                 esc_minimal: baseline_construction.esc_minimal.clone(),
+                #[cfg(test)]
                 selector_sources: baseline_construction.selectors.sources().len(),
+                #[cfg(test)]
                 selector_sinks: baseline_construction.selectors.sinks().len(),
+                #[cfg(test)]
                 emission_stats: baseline_construction.stats,
+                #[cfg(test)]
                 construction_emit_elapsed: baseline_construction.emit_elapsed,
+                #[cfg(test)]
                 construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+                #[cfg(test)]
                 check_sat_count: baseline_solver.check_sat_count(),
+                #[cfg(test)]
                 hard_check_count: baseline_solver.hard_check_count(),
+                #[cfg(test)]
                 optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                #[cfg(test)]
                 lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
+                #[cfg(test)]
                 lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
+                #[cfg(test)]
                 lazy_plain_materialization_count: baseline_solver
                     .lazy_plain_materialization_count(),
+                #[cfg(test)]
                 hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+                #[cfg(test)]
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
                 a16_refined_links: 0,
+                #[cfg(test)]
                 planned_c9_marks: BTreeSet::new(),
+                #[cfg(test)]
                 producer_stats: plan.stats,
             },
             0,
@@ -1876,41 +1944,64 @@ fn solve_bo_a5_config_with_source_events(
                             &a14,
                         ),
                     ),
+                    #[cfg(test)]
                     mark_artifact: a5_mark_artifact(
                         mode,
                         &plan,
                         &BTreeSet::new(),
                         &selected_model_sha256,
                     ),
+                    #[cfg(test)]
                     site_artifact: a5_site_artifact(mode, &plan),
+                    #[cfg(test)]
                     nullable_artifact: nullability.artifact,
+                    #[cfg(test)]
                     field_ref_artifact: a14.artifact,
+                    #[cfg(test)]
                     summary_artifact: plan.summary_artifact.clone(),
                     baseline_model,
                     model,
+                    #[cfg(test)]
                     retained_c9_marks: BTreeSet::new(),
                     retained_c9_plans: Vec::new(),
+                    #[cfg(test)]
                     round_stats,
+                    #[cfg(test)]
                     esc_minimal: construction.esc_minimal.clone(),
+                    #[cfg(test)]
                     selector_sources: construction.selectors.sources().len(),
+                    #[cfg(test)]
                     selector_sinks: construction.selectors.sinks().len(),
+                    #[cfg(test)]
                     emission_stats: construction.stats,
+                    #[cfg(test)]
                     construction_emit_elapsed: construction.emit_elapsed,
+                    #[cfg(test)]
                     construction_coherence_elapsed: construction.coherence_elapsed,
+                    #[cfg(test)]
                     check_sat_count: solver.check_sat_count(),
+                    #[cfg(test)]
                     hard_check_count: solver.hard_check_count(),
+                    #[cfg(test)]
                     optimize_materialization_count: solver.optimize_materialization_count(),
+                    #[cfg(test)]
                     lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
+                    #[cfg(test)]
                     lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
+                    #[cfg(test)]
                     lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
+                    #[cfg(test)]
                     hard_check_elapsed: solver.hard_check_elapsed(),
+                    #[cfg(test)]
                     optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
                     a16_refined_links: refined_links,
+                    #[cfg(test)]
                     planned_c9_marks: plan
                         .planned_marks
                         .iter()
                         .map(|mark| mark.key.clone())
                         .collect(),
+                    #[cfg(test)]
                     producer_stats: plan.stats,
                 },
                 refined_links,
@@ -1931,43 +2022,66 @@ fn solve_bo_a5_config_with_source_events(
                         &baseline_a14,
                     ),
                 ),
+                #[cfg(test)]
                 mark_artifact: a5_mark_artifact(
                     mode,
                     &plan,
                     &BTreeSet::new(),
                     &selected_model_sha256,
                 ),
+                #[cfg(test)]
                 site_artifact: a5_site_artifact(mode, &plan),
+                #[cfg(test)]
                 nullable_artifact: baseline_nullability.artifact.clone(),
+                #[cfg(test)]
                 field_ref_artifact: baseline_a14.artifact.clone(),
+                #[cfg(test)]
                 summary_artifact: plan.summary_artifact.clone(),
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
+                #[cfg(test)]
                 retained_c9_marks: BTreeSet::new(),
                 retained_c9_plans: Vec::new(),
+                #[cfg(test)]
                 round_stats: baseline_round_stats,
+                #[cfg(test)]
                 esc_minimal: baseline_construction.esc_minimal.clone(),
+                #[cfg(test)]
                 selector_sources: baseline_construction.selectors.sources().len(),
+                #[cfg(test)]
                 selector_sinks: baseline_construction.selectors.sinks().len(),
+                #[cfg(test)]
                 emission_stats: baseline_construction.stats,
+                #[cfg(test)]
                 construction_emit_elapsed: baseline_construction.emit_elapsed,
+                #[cfg(test)]
                 construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+                #[cfg(test)]
                 check_sat_count: baseline_solver.check_sat_count(),
+                #[cfg(test)]
                 hard_check_count: baseline_solver.hard_check_count(),
+                #[cfg(test)]
                 optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                #[cfg(test)]
                 lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
+                #[cfg(test)]
                 lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
+                #[cfg(test)]
                 lazy_plain_materialization_count: baseline_solver
                     .lazy_plain_materialization_count(),
+                #[cfg(test)]
                 hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+                #[cfg(test)]
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
                 a16_refined_links: 0,
+                #[cfg(test)]
                 planned_c9_marks: plan
                     .planned_marks
                     .iter()
                     .map(|mark| mark.key.clone())
                     .collect(),
+                #[cfg(test)]
                 producer_stats: plan.stats,
             },
             0,
@@ -2079,41 +2193,64 @@ fn solve_bo_a5_config_with_source_events(
                     &a14,
                 ),
             ),
+            #[cfg(test)]
             mark_artifact: a5_mark_artifact(
                 mode,
                 &plan,
                 &retained_c9_marks,
                 &selected_model_sha256,
             ),
+            #[cfg(test)]
             site_artifact: a5_site_artifact(mode, &plan),
+            #[cfg(test)]
             nullable_artifact: nullability.artifact,
+            #[cfg(test)]
             field_ref_artifact: a14.artifact,
+            #[cfg(test)]
             summary_artifact: plan.summary_artifact.clone(),
             model,
             baseline_model,
+            #[cfg(test)]
             retained_c9_marks,
             retained_c9_plans,
+            #[cfg(test)]
             round_stats,
+            #[cfg(test)]
             esc_minimal: construction.esc_minimal.clone(),
+            #[cfg(test)]
             selector_sources: construction.selectors.sources().len(),
+            #[cfg(test)]
             selector_sinks: construction.selectors.sinks().len(),
+            #[cfg(test)]
             emission_stats: construction.stats,
+            #[cfg(test)]
             construction_emit_elapsed: construction.emit_elapsed,
+            #[cfg(test)]
             construction_coherence_elapsed: construction.coherence_elapsed,
+            #[cfg(test)]
             check_sat_count: solver.check_sat_count(),
+            #[cfg(test)]
             hard_check_count: solver.hard_check_count(),
+            #[cfg(test)]
             optimize_materialization_count: solver.optimize_materialization_count(),
+            #[cfg(test)]
             lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
+            #[cfg(test)]
             lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
+            #[cfg(test)]
             lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
+            #[cfg(test)]
             hard_check_elapsed: solver.hard_check_elapsed(),
+            #[cfg(test)]
             optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
             a16_refined_links: refined_links,
+            #[cfg(test)]
             planned_c9_marks: plan
                 .planned_marks
                 .iter()
                 .map(|mark| mark.key.clone())
                 .collect(),
+            #[cfg(test)]
             producer_stats: plan.stats,
         },
         refined_links,

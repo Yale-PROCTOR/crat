@@ -16,6 +16,7 @@ pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
 pub(crate) mod cache_contract;
 mod call_graph;
+#[cfg(test)]
 pub(crate) mod code_fingerprint;
 pub mod coherence;
 pub(crate) mod comparison;
@@ -25,6 +26,7 @@ pub(crate) mod demand_evidence;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
+#[cfg(test)]
 pub(crate) mod era5_instruments;
 pub(crate) mod esc_minimal;
 pub(crate) mod execution_guard;

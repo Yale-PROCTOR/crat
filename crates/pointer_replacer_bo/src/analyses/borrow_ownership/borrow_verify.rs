@@ -89,6 +89,7 @@ impl RepairMode {
         RepairMode::Guarded
     }
 
+    #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
             RepairMode::ModeA => "mode_a",
@@ -99,6 +100,7 @@ impl RepairMode {
     /// §NB5-L guard 2 — run `f` with `mode` forced on this thread, restoring the prior override on
     /// exit INCLUDING on panic (a drop-guard, not a manual reset: a panicking test must not leak its
     /// mode onto the thread for the next test). Test/sweep-only; production resolves via `current()`.
+    #[cfg(test)]
     pub(crate) fn with_override<T>(mode: RepairMode, f: impl FnOnce() -> T) -> T {
         struct Restore(Option<RepairMode>);
         impl Drop for Restore {
@@ -126,8 +128,11 @@ thread_local! {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModeACommitTrace {
+    #[cfg(test)]
     pub target: SlotRef,
+    #[cfg(test)]
     pub round: usize,
+    #[cfg(test)]
     pub conflict: SlotConflict,
 }
 
@@ -136,6 +141,7 @@ pub(crate) struct ModeACommitTrace {
 /// `RepairMode::with_override`): the prior capture state is restored on exit including on unwind, so a
 /// panicking anchor run never leaks a live buffer onto the thread. The event order is the loop's
 /// natural commit order; the audit dedups to the distinct commit SET itself.
+#[cfg(test)]
 pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)>) {
     struct Restore(Option<Vec<(SlotRef, usize)>>);
     impl Drop for Restore {
@@ -154,6 +160,7 @@ pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)
 /// Diagnosis-only detailed twin of `with_capture`. It records the originating
 /// conflict edge for the second-order attribution of any tracked
 /// `borrow-exclusion` core member.
+#[cfg(test)]
 pub(crate) fn with_mode_a_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<ModeACommitTrace>) {
     struct Restore(Option<Vec<ModeACommitTrace>>);
     impl Drop for Restore {
@@ -247,6 +254,7 @@ fn append_retirement_targets(
 /// candidate iff its depth-0 slot satisfies `is_ref`, and map the conflict edges back
 /// to `SlotRef`s. `is_mutable` is applied to every pointer local (a clean conflict
 /// needs mutable bases: `invalidates` skips immutable-provenance loans). Read-only.
+#[cfg(test)]
 pub(crate) fn revalidate(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -257,6 +265,7 @@ pub(crate) fn revalidate(
     revalidate_with_flows(program, slots, &origin_flows, is_ref, is_mutable)
 }
 
+#[cfg(test)]
 fn revalidate_with_flows(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -300,6 +309,7 @@ fn revalidate_with_flows(
 /// replays the `tree_borrow_local` union the chosen `Raw` slots induce, so a partial
 /// candidacy surfaces the model-dependent conflicts that `revalidate` (round-0) cannot.
 /// This is the seam BB2-ii's CEGAR loop drives with the solved model's actual kinds.
+#[cfg(test)]
 pub(crate) fn revalidate_replaying(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -321,6 +331,7 @@ pub(crate) fn revalidate_replaying(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn revalidate_replaying_with_parameter_overlap(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -343,6 +354,7 @@ pub(crate) fn revalidate_replaying_with_parameter_overlap(
     )
 }
 
+#[cfg(test)]
 fn revalidate_replaying_with_flows(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -655,6 +667,7 @@ fn map_edges_to_slots(
 /// edge keeps only its surviving `Local` literals — a *stronger* (still sound: forces
 /// ≥1 off Ref) but over-constraining guard. Both resolve when the struct field-slot
 /// mapping lands; a precision concern only post-BB2.
+#[cfg(test)]
 pub(crate) fn materialize_guards(
     solver: &KindSolver,
     conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
@@ -711,6 +724,7 @@ pub(crate) fn materialize_guards(
 /// Local-only mapping) has no committable slot and is accepted (the deferred struct
 /// field-slot mapping); (2) an `Owning` slot issues no loan, so a conflict *caused by*
 /// an `Owning` pointer is invisible to the replay and an accepted model may hide it.
+#[cfg(test)]
 pub(crate) fn verify_to_fixpoint(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -722,6 +736,7 @@ pub(crate) fn verify_to_fixpoint(
     verify_to_fixpoint_with_flows(program, slots, &origin_flows, solver, selectors, is_mutable)
 }
 
+#[cfg(test)]
 pub(crate) fn verify_to_fixpoint_with_flows(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -834,6 +849,7 @@ fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool
 
 #[derive(Clone, Copy)]
 pub(super) enum LoopBackend {
+    #[cfg(test)]
     LegacyOptimize,
     HardCheckRoundOptimize,
 }
@@ -918,6 +934,7 @@ fn solve_round_model(
     hard: Option<&HardLoopSolver>,
 ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
     match backend {
+        #[cfg(test)]
         LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting(selectors),
         LoopBackend::HardCheckRoundOptimize => {
             let hard = hard.expect("R1a validation owns a hard checker");
@@ -936,6 +953,7 @@ fn solve_l2_round_model(
     hard: Option<&HardLoopSolver>,
 ) -> L2SolveResult {
     match backend {
+        #[cfg(test)]
         LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting_l2(selectors),
         LoopBackend::HardCheckRoundOptimize => solver.model_kinds_decomposed_reporting_l2(
             hard.expect("R1a L2 validation owns a hard checker"),
@@ -990,6 +1008,7 @@ fn selected_copy_lend_count(selected: &SelectedCopyLendLoans) -> usize {
 /// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
 /// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
 /// the leak counts).
+#[cfg(test)]
 pub(crate) fn verify_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1008,6 +1027,7 @@ pub(crate) fn verify_to_fixpoint_counting(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn verify_to_fixpoint_counting_with_flows(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1418,8 +1438,11 @@ fn verify_rounds(
                         SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| {
                             if let Some(events) = capture.borrow_mut().as_mut() {
                                 events.push(ModeACommitTrace {
+                                    #[cfg(test)]
                                     target: slot,
+                                    #[cfg(test)]
                                     round: stats.rounds,
+                                    #[cfg(test)]
                                     conflict: conflict.clone(),
                                 });
                             }
@@ -1660,6 +1683,7 @@ fn guarded_observations(
 ///
 /// An earlier version of this doc named only the inert one, and called the
 /// other load-bearing.
+#[cfg(test)]
 pub(crate) fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1683,6 +1707,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     )
 }
 
+#[cfg(test)]
 pub(super) fn verify_l2_to_fixpoint_counting_impl(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1961,6 +1986,7 @@ fn record_l2_decline(stats: &mut RoundStats, reason: L2DeclineReason) {
 /// exact-`Raw` for fields, §NB5-F2). The anchor asserts `model_accepts(accepted_model)`; the
 /// calibration tests (`nb5l2_probe_necessary_and_injected_overpin`,
 /// `nb5l2_probe_finds_natural_accumulation_overpin`) pin both classification arms.
+#[cfg(test)]
 pub(crate) fn model_accepts(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1971,6 +1997,7 @@ pub(crate) fn model_accepts(
     model_accepts_with_flows(program, slots, &origin_flows, model, is_mutable)
 }
 
+#[cfg(test)]
 pub(crate) fn model_accepts_with_flows(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1981,6 +2008,7 @@ pub(crate) fn model_accepts_with_flows(
     model_accepts_with_flows_impl(program, slots, origin_flows, model, is_mutable, None)
 }
 
+#[cfg(test)]
 pub(crate) fn model_accepts_with_flows_and_copy_lends(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -2000,6 +2028,7 @@ pub(crate) fn model_accepts_with_flows_and_copy_lends(
     )
 }
 
+#[cfg(test)]
 fn model_accepts_with_flows_impl(
     program: &RustProgram,
     slots: &CrateSlots,

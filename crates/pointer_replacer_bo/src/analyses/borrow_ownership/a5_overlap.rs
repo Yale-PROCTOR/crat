@@ -118,6 +118,7 @@ impl MayOverlapSummary {
             .insert(witness)
     }
 
+    #[cfg(test)]
     pub(crate) fn union_from(&mut self, other: &Self) -> bool {
         let mut changed = false;
         for witnesses in other.witnesses.values() {
@@ -216,10 +217,12 @@ impl MayOverlapFixpoint {
         &self.summary
     }
 
+    #[cfg(test)]
     pub(crate) fn sccs(&self) -> &[Vec<FnKey>] {
         &self.sccs
     }
 
+    #[cfg(test)]
     pub(crate) fn scc_iterations(&self) -> usize {
         self.scc_iterations
     }
@@ -363,6 +366,7 @@ pub(crate) enum PairClass {
 }
 
 impl PairClass {
+    #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ProvenDisjoint => "proven-disjoint",
@@ -659,6 +663,7 @@ impl C9MarkKey {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn plan_c9_marks(
     witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
 ) -> BTreeSet<C9MarkKey> {
@@ -695,10 +700,12 @@ impl A5Mode {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn proposed_landing() -> Self {
         Self::PreciseReplay
     }
 
+    #[cfg(test)]
     pub(crate) fn is_pricing_control(self) -> bool {
         self == Self::CoarseConstraint
     }
@@ -731,8 +738,10 @@ pub(crate) fn apply_coarse_constraints(
 }
 
 impl A5World {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 1] = [Self::ClosedWorldFrozenGraph];
 
+    #[cfg(test)]
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "closed_world_frozen_graph" => Ok(Self::ClosedWorldFrozenGraph),
@@ -794,6 +803,7 @@ pub(crate) enum AbiGuardDisposition {
 }
 
 impl AbiGuardDisposition {
+    #[cfg(test)]
     pub(crate) fn refused(reasons: impl IntoIterator<Item = AbiGuardReason>) -> Self {
         Self::Refused {
             reasons: reasons.into_iter().collect(),

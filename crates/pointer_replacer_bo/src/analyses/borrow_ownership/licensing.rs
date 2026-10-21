@@ -56,6 +56,7 @@ pub(crate) mod grants;
 pub(crate) mod lend;
 pub(crate) mod matched;
 pub(crate) mod model_selection;
+#[cfg(test)]
 pub(crate) mod read_b;
 pub(crate) mod reader_replay;
 pub(crate) mod readers;
