@@ -111,6 +111,13 @@ pub fn rewrite_bo(
     z3::set_global_param("smt.random_seed", "0");
     z3::set_global_param("sat.random_seed", "0");
 
+    // The cache directory, read and written; no directory, no cache. One environment read at
+    // the pass boundary until the driver passes `--pointer-cache-dir` (S3).
+    model_cache::configure(
+        std::env::var_os("CRAT_BO_CACHE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from),
+    );
     let analysis_fingerprint = model_cache::current_analysis_digest();
 
     let configured_exposure =
