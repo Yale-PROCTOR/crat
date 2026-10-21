@@ -64,34 +64,6 @@ use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
 // Flag gating — resolve once, fail loud, default off
 // ---------------------------------------------------------------------------
 
-/// `CRAT_BO_EXPORT ∈ {0,1}`; unset means `0`. Anything else fails loudly.
-///
-/// Pure parse, so every branch is testable without touching the process
-/// environment — mutating env in a parallel test binary is the D10 race class
-/// this project has already paid for twice.
-pub(crate) fn export_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(other) => panic!("CRAT_BO_EXPORT must be 0 or 1, got {other:?}"),
-    }
-}
-
-fn export_enabled_from_env() -> bool {
-    match std::env::var("CRAT_BO_EXPORT") {
-        Ok(value) => export_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => export_enabled_from_value(None),
-        Err(error) => panic!("CRAT_BO_EXPORT is not valid Unicode: {error}"),
-    }
-}
-
-/// Resolved at most once per process, so no two capture points can disagree.
-static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub(crate) fn flag_enabled() -> bool {
-    *FLAG.get_or_init(export_enabled_from_env)
-}
-
 // ---------------------------------------------------------------------------
 // §1.2 Lifetime-free keys
 // ---------------------------------------------------------------------------
@@ -675,8 +647,8 @@ thread_local! {
 pub(crate) struct CaptureArm {
     prev: Option<BoExport>,
     namespace_scope: Option<super::licensing::stack_export::CaptureScope>,
-    /// `false` when `CRAT_BO_EXPORT` is off: the arm installed nothing and must
-    /// therefore restore nothing, or it would clobber an enclosing scope.
+    /// `false` for the ambient arm: it installed nothing and must therefore
+    /// restore nothing, or it would clobber an enclosing scope.
     armed: bool,
 }
 
@@ -723,21 +695,14 @@ impl CaptureArm {
     }
 }
 
-/// Arm capture for the accepted-run region, **if `CRAT_BO_EXPORT=1`**.
-///
-/// Off by default, in which case this is one `OnceLock` read and the returned
-/// arm is inert: nothing is installed, nothing is restored on drop, and
-/// `finish()` yields an empty export. See the module doc for why the flag
-/// exists now when D4 removed its predecessor.
+/// The ambient arm for the accepted-run region: inert. Nothing is installed,
+/// nothing is restored on drop, and `finish()` yields an empty export.
 pub(crate) fn arm_capture() -> CaptureArm {
-    if !flag_enabled() {
-        return CaptureArm {
-            prev: None,
-            namespace_scope: None,
-            armed: false,
-        };
+    CaptureArm {
+        prev: None,
+        namespace_scope: None,
+        armed: false,
     }
-    arm_scope()
 }
 
 /// Unconditional arm — the explicit-scope primitive behind [`with_bo_export`],

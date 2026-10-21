@@ -2596,39 +2596,14 @@ fn oracle_probe_inside_the_armed_region_trips_the_wire() {
     .unwrap_or_else(|e| e.raise());
 }
 
-/// **GATE (closing addendum)** — `CRAT_BO_EXPORT` is fail-loud on bad values.
-///
-/// Exercised through the pure parse, never by mutating the process
-/// environment: the suite runs tests in parallel, and env mutation is the D10
-/// race class this project has already paid for twice.
-#[test]
-fn export_flag_rejects_invalid_value() {
-    assert!(!export_enabled_from_value(None), "unset must mean off");
-    assert!(!export_enabled_from_value(Some("0")));
-    assert!(export_enabled_from_value(Some("1")));
-    let bad = std::panic::catch_unwind(|| export_enabled_from_value(Some("2")));
-    assert!(bad.is_err(), "CRAT_BO_EXPORT=2 must fail loudly");
-}
-
-/// **GATE (closing addendum)** — with the flag OFF (the default), the ambient
-/// arm records nothing.
+/// **GATE (closing addendum)** — the ambient arm records nothing.
 ///
 /// This is what restores timing comparability for the sweep: `run_bo` arms
 /// through `arm_capture`, so an unset flag means the corpus worker pays no
 /// recording cost and its `t_emit_s`/`t_fixpoint_s` stay comparable to rows
 /// banked before the arm existed.
-///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
-/// `if !flag_enabled()` early return from `arm_capture` and this fails — the
-/// arm installs a buffer, the accepted run records, and the export is
-/// non-empty.
 #[test]
-fn ambient_arm_is_inert_when_the_flag_is_off() {
-    assert!(
-        !flag_enabled(),
-        "this test characterises the DEFAULT; CRAT_BO_EXPORT is set in this \
-         process, so it cannot"
-    );
+fn ambient_arm_is_inert() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
