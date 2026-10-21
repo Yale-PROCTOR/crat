@@ -1286,24 +1286,6 @@ impl KindSolver {
         );
     }
 
-    /// era-5c R545-2: the formal analogue of `forbid_field_own`. A formal whose
-    /// every closed-world actual is the address of a stack place or of an
-    /// interior place (`mod.rs::lend_formals`) holds memory some other object
-    /// owns -- freeing it is UB on a UB-free input -- so it is a LEND and must
-    /// never be `Owning`. Returns whether the slot exists.
-    pub(crate) fn forbid_lend_formal_own(&self, formal: SlotRef) -> bool {
-        let Some(vars) = self.vars.get(&formal) else {
-            return false;
-        };
-        assert_hard(
-            &self.solver,
-            self.tracker.as_ref(),
-            || format!("lend-formal-forbid({formal:?})"),
-            &!&vars.own,
-        );
-        true
-    }
-
     /// A14 field ref-worthiness: a field may be Ref only when every non-null stored value is safe
     /// (Ref or Owning). Null is handled orthogonally by §29; Raw is the only disqualifying kind.
     pub(crate) fn constrain_field_ref(&self, field: SlotRef, rhs: &[SlotRef]) {

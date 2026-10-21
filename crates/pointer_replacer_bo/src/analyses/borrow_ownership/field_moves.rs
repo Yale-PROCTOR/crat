@@ -25,18 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_LEND_FORMAL=on|off` (fail-loud, absent = off): **L01⁸, R545-2**.
-/// A formal whose every closed-world actual is the address of a stack place or
-/// an interior place is a lend and never `Owning` (era-5c report 041's
-/// `init65::_2`: settled Owning with every arm off).
-pub(crate) fn lend_formal() -> bool {
-    match std::env::var("CRAT_ERA5C_LEND_FORMAL").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_LEND_FORMAL must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_COPY_LEND=on|off` (fail-loud, absent = off): **L01⁹, R549-1/2**.
 /// The production selector of A12's copy-lend arm (`CopyLendMode::LendArm`),
 /// deleted after the 08-21 null funnel and restored for the L01⁹ A/B: the lend
