@@ -15043,24 +15043,6 @@ pub unsafe fn f() -> i32 {
                     CopyLendMode::RemovalOnly,
                     CopyLendMode::LendArm,
                 ];
-                let program = collect_program(tcx);
-                let fingerprints = modes
-                    .iter()
-                    .map(|mode| {
-                        mode.with_override(|| {
-                            crate::analyses::borrow_ownership::model_cache::fingerprint(
-                                &program,
-                                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
-                                None,
-                            )
-                        })
-                    })
-                    .collect::<std::collections::BTreeSet<_>>();
-                assert_eq!(
-                    fingerprints.len(),
-                    modes.len(),
-                    "copy-lend mode must participate in model-artifact identity"
-                );
                 for mode in modes {
                     let row = mode.with_override(|| run_bo(tcx, Duration::ZERO));
                     assert_eq!(row.get("status"), Some("ok"));

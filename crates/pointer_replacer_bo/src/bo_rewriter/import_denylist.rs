@@ -393,7 +393,7 @@ fn dependency_ratchet_e2_keeps_cached_model_three_field_schema() {
     .expect("model cache source");
     assert_eq!(
         cached_model_fields(&source),
-        ["model", "baseline_model", "a5_receipt"],
+        ["model", "baseline_model", "overlap_receipt"],
     );
     assert_eq!(
         cached_model_fields(
