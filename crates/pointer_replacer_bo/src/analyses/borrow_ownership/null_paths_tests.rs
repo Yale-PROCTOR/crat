@@ -277,18 +277,8 @@ fn null_join_rows(code: &str) -> usize {
 }
 
 #[test]
-fn e5c_w6_the_default_arm_emits_no_null_join() {
-    assert!(
-        !super::null_paths::move_tracking(),
-        "the suite runs with the arm off"
-    );
-    assert_eq!(null_join_rows(DELETE_SHAPE), 0);
-}
-
-#[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w7"]
 fn e5c_inner_null_join_rows_under_the_arm() {
-    assert!(super::null_paths::move_tracking());
     let rows = null_join_rows(DELETE_SHAPE);
     eprintln!("E5C_NULL_JOIN_ROWS={rows}");
     assert!(
@@ -324,7 +314,7 @@ fn child(test: &str, env: &[(&str, &str)]) -> String {
 fn e5c_w7_the_arm_emits_null_join_rows_at_the_free_and_null_arms() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_null_join_rows_under_the_arm",
-        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
+        &[],
     );
     assert!(text.contains("E5C_NULL_JOIN_ROWS="), "{text}");
 }
@@ -338,7 +328,7 @@ src::bst::newNode::_0@d0=own,src::bst::newNode::_3@d0=own,src::bst::insert::_0@d
 src::bst::insert::_1@d0=own,src::bst::deleteNode::_0@d0=own,src::bst::deleteNode::_1@d0=own,\
 src::bst::minValueNode::_0@d0=ref,src::bst::minValueNode::_1@d0=ref,src::bst::inorder::_1@d0=ref";
 
-fn bst_probe(arm: &str) -> String {
+fn bst_probe() -> String {
     let dir = std::env::var("DIR")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../..").to_owned());
     child(
@@ -348,7 +338,6 @@ fn bst_probe(arm: &str) -> String {
             ("CRAT_R385_TARGETS", BST_TARGETS),
             ("CRAT_R385_GRANULARITY", "assertion"),
             ("CRAT_R385_WORLD", "closed"),
-            ("CRAT_ERA5C_MOVE_TRACKING", arm),
             ("CRAT_ERA5C_DEBUG", "1"),
             ("DIR", dir.as_str()),
         ],
@@ -363,23 +352,9 @@ fn e5c_w8_bst_all_safe_is_sat_under_the_arm() {
         eprintln!("corpus absent; skipping");
         return;
     }
-    let text = bst_probe("on");
+    let text = bst_probe();
     assert!(text.contains("R385 VERDICT=SAT"), "{text}");
     assert!(!text.contains("E5C traversal-pending"), "{text}");
-}
-
-/// The control: the same assignment is UNSAT with the arm off, and the
-/// traversal licence refuses for the unmatched deeper formals (E5C-2's
-/// premise), so the arm-off system is byte-identical to the base.
-#[test]
-fn e5c_w9_bst_all_safe_is_unsat_without_the_arm() {
-    if !std::path::Path::new(BST).is_file() {
-        eprintln!("corpus absent; skipping");
-        return;
-    }
-    let text = bst_probe("off");
-    assert!(text.contains("R385 VERDICT=UNSAT"), "{text}");
-    assert!(text.contains("reason=argument-formal-unmatched"), "{text}");
 }
 
 /// bst's four pointer functions verbatim (the derived substrate's `lib.rs`
@@ -474,7 +449,6 @@ pub unsafe fn deleteNode(root: *mut node, key: i32) -> *mut node {
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w18"]
 fn e5c_inner_bst_leak_shape_full_solve_under_the_arm() {
-    assert!(super::null_paths::move_tracking());
     let rows = shape_model(BST_LEAK_SHAPE);
     let kinds = |needle: &str| -> Vec<String> {
         rows.iter()
@@ -580,7 +554,6 @@ pub unsafe fn dropLeaf(n: *mut Node) {
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w20"]
 fn e5c_inner_avl_with_free_full_solve_under_the_arm() {
-    assert!(super::null_paths::move_tracking());
     let rows = shape_model(AVL_WITH_FREE_SHAPE);
     let raw = rows.iter().filter(|(_, v)| v == "raw").count();
     let refs = rows.iter().filter(|(_, v)| v == "ref").count();
@@ -602,7 +575,7 @@ fn e5c_inner_avl_with_free_full_solve_under_the_arm() {
 fn e5c_w20_avl_with_a_free_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_avl_with_free_full_solve_under_the_arm",
-        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
+        &[],
     );
     assert!(text.contains("E5C_AVLFREE totals"), "{text}");
     eprintln!(
@@ -641,7 +614,6 @@ fn e5c_inner_solve_named_source() {
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w19"]
 fn e5c_inner_avl_shape_full_solve_under_the_arm() {
-    assert!(super::null_paths::move_tracking());
     let rows = shape_model(AVL_SHAPE);
     let kinds = |needle: &str| -> Vec<String> {
         rows.iter()
@@ -666,7 +638,7 @@ fn e5c_inner_avl_shape_full_solve_under_the_arm() {
 fn e5c_w19_the_avl_shape_model_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_avl_shape_full_solve_under_the_arm",
-        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
+        &[],
     );
     assert!(text.contains("E5C_AVL totals"), "{text}");
     eprintln!(
@@ -683,7 +655,7 @@ fn e5c_w19_the_avl_shape_model_is_measured() {
 fn e5c_w18_the_leak_shape_model_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_leak_shape_full_solve_under_the_arm",
-        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
+        &[],
     );
     assert!(text.contains("E5C_LEAK totals"), "{text}");
     eprintln!(
@@ -804,7 +776,6 @@ fn shape_model(code: &str) -> Vec<(String, String)> {
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w10"]
 fn e5c_inner_bst_shape_full_solve_under_the_arm() {
-    assert!(super::null_paths::move_tracking());
     let rows = bst_shape_model();
     let kind = |k: &str| {
         rows.iter()
@@ -830,10 +801,7 @@ fn e5c_inner_bst_shape_full_solve_under_the_arm() {
 fn e5c_w10_bst_shape_fields_own_under_the_arm() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_shape_full_solve_under_the_arm",
-        &[
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_DEBUG", "1"),
-        ],
+        &[("CRAT_ERA5C_DEBUG", "1")],
     );
     assert!(text.contains("E5C_MODEL"), "{text}");
 }
@@ -846,7 +814,6 @@ fn e5c_w10_bst_shape_fields_own_under_the_arm() {
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on in a child of e5c_w11"]
 fn e5c_inner_deferred_argument_read_shape() {
     use rustc_middle::mir::{Location, Rvalue, StatementKind, TerminatorKind};
-    assert!(super::null_paths::move_tracking());
     let deferrals = |code: &str| -> Vec<(u32, usize, Option<usize>)> {
         let mut rows = Vec::new();
         with_body(code, "del", |tcx, body| {
@@ -909,7 +876,7 @@ unsafe fn del(root: *mut N, temp: *mut N) -> *mut N {
 fn e5c_w11_the_argument_move_defers_only_across_pure_reads() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_deferred_argument_read_shape",
-        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
+        &[],
     );
     assert!(text.contains("E5C_DEFERRAL_OK"), "{text}");
 }
@@ -1025,10 +992,7 @@ fn e5c_inner_brotli_shape_full_solve_under_the_contract() {
 fn e5c_w12_to_w15_the_allocator_contract_on_the_brotli_shape() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_full_solve_under_the_contract",
-        &[
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
-        ],
+        &[("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on")],
     );
     assert!(text.contains("E5C_CONTRACT_OK"), "{text}");
 }
@@ -1038,7 +1002,6 @@ fn e5c_w12_to_w15_the_allocator_contract_on_the_brotli_shape() {
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on, contract off, in a child of e5c_w16"]
 fn e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract() {
-    assert!(super::null_paths::move_tracking());
     assert!(!super::allocator_contract::enabled());
     let rows = brotli_shape_model();
     let kind = |k: &str| {
@@ -1068,26 +1031,9 @@ fn e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract() {
 fn e5c_w16_an_indirect_call_result_is_opaque_without_the_contract() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract",
-        &[
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "off"),
-        ],
+        &[("CRAT_ERA5C_ALLOCATOR_CONTRACT", "off")],
     );
     assert!(text.contains("E5C_OPAQUE_OK"), "{text}");
-}
-
-/// The default arm (no era-5c pin) is unchanged: the indirect call's result
-/// still floats — recorded as the baseline gap R412-12 names, not endorsed.
-#[test]
-fn e5c_w17_the_default_arm_still_floats_an_indirect_result() {
-    assert!(!super::null_paths::move_tracking() && !super::allocator_contract::enabled());
-    let rows = brotli_shape_model();
-    let kind = |k: &str| {
-        rows.iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.clone())
-    };
-    assert_eq!(kind("make::_4@d0").as_deref(), Some("owning"), "{rows:?}");
 }
 
 // ---- era-5c report 043 / R536-4: a formal with no allocation site and no free
@@ -1173,7 +1119,7 @@ pub unsafe extern "C" fn rr(t: *const *mut f64) -> f64 {
 pub static TABLE: [Option<unsafe extern "C" fn(*const *mut f64) -> f64>; 1] = [Some(rr)];
 "#;
 
-const W47_ARMS: &[(&str, &str)] = &[("CRAT_ERA5C_MOVE_TRACKING", "on")];
+const W47_ARMS: &[(&str, &str)] = &[];
 
 #[test]
 #[ignore = "runs under L01⁸'s arms in a child of e5c_w47"]

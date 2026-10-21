@@ -1974,13 +1974,12 @@ impl KindSolver {
                     // and the caller's frame keeps its tokens. Unmatched ACTUAL
                     // components and the receiver stay refused.
                     let formal_zero_covers = |var: &u32| {
-                        super::null_paths::move_tracking()
-                            && facts.equations.iter().any(|e| {
-                                e.operation == "guarded-traversal-formal-zero"
-                                    && e.guard.is_some()
-                                    && e.guard == declaration.guard
-                                    && e.variables == [*var]
-                            })
+                        facts.equations.iter().any(|e| {
+                            e.operation == "guarded-traversal-formal-zero"
+                                && e.guard.is_some()
+                                && e.guard == declaration.guard
+                                && e.variables == [*var]
+                        })
                     };
                     if !arg.unmatched_actual_vars.is_empty()
                         || !ret.unmatched_actual_vars.is_empty()

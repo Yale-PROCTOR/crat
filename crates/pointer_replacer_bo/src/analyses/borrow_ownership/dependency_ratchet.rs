@@ -142,7 +142,6 @@ mod tests {
             "emit_crate_ownership_constraints_with_copy_lends",
         ),
         ("src/bo_c1.rs", "verify_to_fixpoint_is_thin_wrapper"),
-        ("src/bo_c1.rs", "nb5m_native_round_stats_contract::stats_of"),
         ("src/bo_c1.rs", "nb5f2_field_conflict_restores::run"),
         ("src/bo_c1.rs", "s23_owning_blocker_probe"),
         ("src/bo_c1.rs", "r385_forced_assignment_probe"),
@@ -150,7 +149,6 @@ mod tests {
         ("src/bo_c1.rs", "nb5l_cap_exhaustion_declines_not_panics"),
         ("src/bo_c1.rs", "nb5l2_anchor"),
         ("src/bo_c1.rs", "nb5l2_capture_is_mode_a_only"),
-        ("src/bo_c1.rs", "l2_feature_off_capture_program"),
     ];
 
     const LEGACY_PRIMITIVE_PREFIXES: &[&str] = &[

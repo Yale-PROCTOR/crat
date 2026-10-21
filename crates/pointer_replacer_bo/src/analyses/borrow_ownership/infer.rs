@@ -157,8 +157,8 @@ where
     realloc_ghosts: FxHashSet<Var>,
     /// era-5c: the function whose body this context infers.
     function: rustc_hir::def_id::DefId,
-    /// era-5c: must-null facts per CFG edge; `Some` only under the arm.
-    null_paths: Option<super::null_paths::NullPaths>,
+    /// era-5c: must-null facts per CFG edge.
+    null_paths: super::null_paths::NullPaths,
     /// era-5c: per (join block, local, incoming version) the window components
     /// known null on EVERY edge that carries that version into the join.
     null_joins: FxHashMap<(BasicBlock, Local, SSAIdx), Vec<bool>>,
@@ -225,8 +225,7 @@ where
             realloc_versions: Vec::new(),
             realloc_ghosts: FxHashSet::default(),
             function: body.source.def_id(),
-            null_paths: super::null_paths::move_tracking()
-                .then(|| super::null_paths::NullPaths::compute(crate_ctxt.tcx, body)),
+            null_paths: super::null_paths::NullPaths::compute(crate_ctxt.tcx, body),
             null_joins: FxHashMap::default(),
             field_moves: super::field_moves::compute(body),
         }
@@ -535,10 +534,7 @@ where
         ty: Ty<'tcx>,
         rhs: SSAIdx,
     ) {
-        let Some(null_paths) = infer_cx.null_paths.as_ref() else {
-            return;
-        };
-        let facts = null_paths.local_facts_on_edge(pred, succ, local);
+        let facts = infer_cx.null_paths.local_facts_on_edge(pred, succ, local);
         let window = infer_cx
             .fn_body_sig
             .get(local)
@@ -1033,46 +1029,42 @@ where
             }
         } else {
             // closure or fn ptr
-            // TODO (default arm: nothing is emitted and the result floats —
-            // the objective then settles it Owning with no evidence).
             //
             // era-5c (R409-1, R412-12): under the frame an indirect call's
             // result is OPAQUE — an unknown call: destination borrowed,
             // arguments lent — and the named allocator contract is the only
             // route to Owning for such a result: a call through `alloc_func`
             // is a receipted source, through `free_func` a sink.
-            if super::null_paths::move_tracking() || super::allocator_contract::enabled() {
-                let class = super::allocator_contract::classify(infer_cx.tcx, body, location);
-                if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                    eprintln!(
-                        "E5C contract-call {:?} at {location:?}: {class:?} callee-ty={:?}",
-                        infer_cx.tcx.def_path_str(body.source.def_id()),
-                        callee.ty(body, infer_cx.tcx)
-                    );
-                }
-                match class {
-                    Some(super::allocator_contract::ContractCall::Alloc) => {
-                        super::allocator_contract::note_producer(body.source.def_id());
-                        with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                            super::export::with_callee(super::allocator_contract::CONTRACT, || {
-                                if let Some(destination) = destination {
-                                    Self::source(infer_cx, destination);
-                                }
-                            })
+            let class = super::allocator_contract::classify(infer_cx.tcx, body, location);
+            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
+                eprintln!(
+                    "E5C contract-call {:?} at {location:?}: {class:?} callee-ty={:?}",
+                    infer_cx.tcx.def_path_str(body.source.def_id()),
+                    callee.ty(body, infer_cx.tcx)
+                );
+            }
+            match class {
+                Some(super::allocator_contract::ContractCall::Alloc) => {
+                    super::allocator_contract::note_producer(body.source.def_id());
+                    with_own_assume_site(OwnAssumeSite::LibcRule, || {
+                        super::export::with_callee(super::allocator_contract::CONTRACT, || {
+                            if let Some(destination) = destination {
+                                Self::source(infer_cx, destination);
+                            }
                         })
-                    }
-                    Some(super::allocator_contract::ContractCall::Free) => {
-                        with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                            super::export::with_callee(super::allocator_contract::CONTRACT, || {
-                                if let Some(Some((arg, is_ref))) = args.get(1) {
-                                    assert!(!is_ref);
-                                    Self::sink(infer_cx, arg.clone());
-                                }
-                            })
-                        })
-                    }
-                    None => infer_cx.unknown_call(destination, &args),
+                    })
                 }
+                Some(super::allocator_contract::ContractCall::Free) => {
+                    with_own_assume_site(OwnAssumeSite::LibcRule, || {
+                        super::export::with_callee(super::allocator_contract::CONTRACT, || {
+                            if let Some(Some((arg, is_ref))) = args.get(1) {
+                                assert!(!is_ref);
+                                Self::sink(infer_cx, arg.clone());
+                            }
+                        })
+                    })
+                }
+                None => infer_cx.unknown_call(destination, &args),
             }
         }
     }

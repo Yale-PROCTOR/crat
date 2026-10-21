@@ -34,22 +34,6 @@ use smallvec::SmallVec;
 
 use super::ptr::Measurable;
 
-/// R404-3 / R405-1: the per-path token disposition arm. Default off, fail-loud
-/// on a typo (as every era-5b pin is), and carried by `solver_identity` so the
-/// two arms can never share a cache key.
-pub(crate) fn move_tracking() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5C_MOVE_TRACKING") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5C_MOVE_TRACKING must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5C_MOVE_TRACKING is not valid Unicode: {error}"),
-    })
-}
-
 /// A projection step of a null place. Only dereferences and fields are
 /// represented; any other projection makes the place untracked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -543,14 +527,11 @@ pub(crate) fn vacuous_components_with<'tcx>(
 /// same block (bst's `(*temp).key` at 18:9, moved past by `_40 = copy
 /// (*root).right` at 18:7) is then dead at the move. The emission side owes
 /// the matching hoist of those reads above the moving argument. `None` when
-/// the arm is off or the shape does not hold.
+/// the shape does not hold.
 pub(crate) fn deferred_argument_read<'tcx>(
     body: &Body<'tcx>,
     location: rustc_middle::mir::Location,
 ) -> Option<rustc_middle::mir::Location> {
-    if !move_tracking() {
-        return None;
-    }
     let data = &body.basic_blocks[location.block];
     let statement = data.statements.get(location.statement_index)?;
     let StatementKind::Assign(assign) = &statement.kind else {

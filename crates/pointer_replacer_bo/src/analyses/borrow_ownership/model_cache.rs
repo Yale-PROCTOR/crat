@@ -146,10 +146,7 @@ pub(crate) fn solver_identity(
     // kept, so two arms cannot compute one semantic key.
     fields.insert("era5b_return_port", "true".to_owned());
     fields.insert("era5b_interface_own", "true".to_owned());
-    fields.insert(
-        "era5c_move_tracking",
-        super::null_paths::move_tracking().to_string(),
-    );
+    fields.insert("era5c_move_tracking", "true".to_owned());
     fields.insert(
         "era5c_allocator_contract",
         super::allocator_contract::enabled().to_string(),
