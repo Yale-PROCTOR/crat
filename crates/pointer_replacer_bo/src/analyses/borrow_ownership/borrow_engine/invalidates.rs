@@ -612,7 +612,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
             expansions += 1;
             assert!(
                 expansions <= cap,
-                "NB4-R routing walk exceeded the per-site cap ({cap}); visited discipline regressed"
+                "the routing walk exceeded the per-site cap ({cap}); its visited set regressed"
             );
             // Compose onto the edge's borrowed place, or fall back to whole-cell on a type mismatch.
             let (routed, routed_depth) =

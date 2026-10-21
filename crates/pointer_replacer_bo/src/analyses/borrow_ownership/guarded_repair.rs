@@ -2625,7 +2625,7 @@ mod tests {
                     label.contains(GUARDED_COMMIT_CORE_FAMILY)
                         && label.contains(&action.diagnostic_label)
                 }),
-            "the real L2 clause must pass through assert_hard under its ruled core family"
+            "the real guarded-repair clause must pass through assert_hard under its ruled core family"
         );
     }
 }

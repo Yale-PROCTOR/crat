@@ -8,7 +8,7 @@ use crate::utils::rustc::RustProgram;
 
 /// v2 (L01⁹, R574-5 (iii)): adds `move-store-obligations`, so the store-as-move
 /// obligations travel with the frame. A v1 export carries no such family.
-pub(crate) const SCHEMA: &str = "era5a-portable-export-v2";
+pub(crate) const SCHEMA: &str = "bo-portable-export-v2";
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -703,7 +703,7 @@ pub(crate) struct ArgOrderRow {
 
 /// Why the family is `NotRecorded`: the arm was off.
 pub(crate) const ARG_ORDER_NOT_RECORDED: &str =
-    "CRAT_ERA5C_ARG_ORDER off: arm (a) admitted no argument read";
+    "argument-order receipts not recorded: no argument read was admitted";
 
 /// The rows a producer recorded, in the portable form; `None` = arm off.
 pub(crate) fn arg_order_rows(
@@ -840,7 +840,7 @@ pub(crate) struct MoveStoreUse {
 
 /// Why the family is `NotRecorded`: the arm was off, so no loan was removed.
 pub(crate) const MOVE_STORE_NOT_RECORDED: &str =
-    "CRAT_ERA5C_MOVE_STORE off: no store-as-move loan was removed";
+    "store-as-move receipts not recorded: no loan was removed";
 
 /// The rows a producer recorded, in the portable form; `None` = arm off.
 pub(crate) fn move_store_rows(
@@ -1102,7 +1102,7 @@ pub(crate) fn collect(
             .get_mut(&F::ResidualConflicts)
             .unwrap()
             .availability = CaptureAvailability::NotRecorded {
-            reason: "producer did not record an L2 residual certificate".into(),
+            reason: "producer did not record a guarded-repair residual certificate".into(),
         };
     }
     match move_store_rows(program, slots, export)? {

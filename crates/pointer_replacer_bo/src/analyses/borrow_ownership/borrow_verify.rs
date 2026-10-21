@@ -1136,7 +1136,7 @@ fn verify_rounds(
             .try_fold(slots.field_slots.len(), |count, universe| {
                 count.checked_add(universe.len())
             })
-            .expect("L2 registered-slot count overflow");
+            .expect("guarded-repair registered-slot count overflow");
         Planner::new(slot_count)
     });
     let cap = match &planner {

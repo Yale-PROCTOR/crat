@@ -2475,16 +2475,19 @@ impl KindSolver {
     /// settle `Ref`. This is deliberately separate from precise replay and is
     /// never the proposed landing consumer.
     pub(crate) fn add_overlap_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
-        assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
+        assert_ne!(
+            left, right,
+            "overlap coarse pair must contain distinct slots"
+        );
         let left_ref = &self
             .vars
             .get(&left)
-            .unwrap_or_else(|| panic!("unknown A5 slot: {left:?}"))
+            .unwrap_or_else(|| panic!("unknown overlap slot: {left:?}"))
             .ref_;
         let right_ref = &self
             .vars
             .get(&right)
-            .unwrap_or_else(|| panic!("unknown A5 slot: {right:?}"))
+            .unwrap_or_else(|| panic!("unknown overlap slot: {right:?}"))
             .ref_;
         assert_hard(
             &self.solver,
@@ -2509,11 +2512,11 @@ impl KindSolver {
         };
         assert_eq!(
             action.core_family, expected_family,
-            "L2 action kind/core-family mismatch"
+            "guarded-repair action kind/core-family mismatch"
         );
         assert!(
             action.clause.negative_refs.contains(&action.target),
-            "L2 clause must contain its negative target literal"
+            "guarded-repair clause must contain its negative target literal"
         );
 
         let mut literals = action
@@ -2524,7 +2527,7 @@ impl KindSolver {
                 let vars = self
                     .vars
                     .get(slot)
-                    .unwrap_or_else(|| panic!("unknown L2 slot: {slot:?}"));
+                    .unwrap_or_else(|| panic!("unknown guarded-repair slot: {slot:?}"));
                 !&vars.ref_
             })
             .collect::<Vec<_>>();
@@ -2532,7 +2535,7 @@ impl KindSolver {
             let vars = self
                 .vars
                 .get(slot)
-                .unwrap_or_else(|| panic!("unknown L2 slot: {slot:?}"));
+                .unwrap_or_else(|| panic!("unknown guarded-repair slot: {slot:?}"));
             vars.ref_.clone()
         }));
         let refs = literals.iter().collect::<Vec<_>>();

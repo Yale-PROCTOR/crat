@@ -1040,7 +1040,7 @@ mod tests {
     fn e5_r_discarded_result_is_not_an_unconditional_old_sink() {
         let site = one_site("pub unsafe fn discarded(p: *mut u8) { realloc(p, 16); }");
         assert!(matches!(site.result, ReallocResult::Unobserved(_)));
-        let cases = classify(&site).expect("R219 unobserved outcomes");
+        let cases = classify(&site).expect("unobserved realloc outcomes");
         assert_eq!(cases.len(), 2);
         assert_eq!(cases[0], nonzero_cases()[0]);
         assert_eq!(cases[1].outcome, ReallocOutcome::Failure);

@@ -223,7 +223,7 @@ pub(crate) fn current_analysis_digest() -> String {
 }
 
 fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
-    d.join("era5b-model-cache-v1")
+    d.join("bo-model-cache-v1")
         .join(format!("{fingerprint}.json"))
 }
 
@@ -323,7 +323,7 @@ pub(crate) fn prepare(
         let entry = match dir() {
             None => None,
             Some(cache) => {
-                let directory = cache.join("era5b-model-cache-v1");
+                let directory = cache.join("bo-model-cache-v1");
                 let portable = super::portable_export::stream::collect_to_path(
                     program, slots, captured, &directory,
                 )?;
@@ -641,7 +641,7 @@ pub(crate) fn store(
     overlap_mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<PathBuf> {
-    let directory = dir()?.join("era5b-model-cache-v1");
+    let directory = dir()?.join("bo-model-cache-v1");
     let fp = fingerprint(program, overlap_mode, attestation);
     let entry = PREPARED.with(|prepared| {
         prepared

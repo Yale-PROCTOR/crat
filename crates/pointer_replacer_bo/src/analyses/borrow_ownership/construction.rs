@@ -487,7 +487,7 @@ pub(crate) fn cached_precise_rewriter_payload(
         OverlapMode::PreciseReplay,
         attestation,
     )
-    .map_err(|error| format!("cached precise A5 plan: {error:#}"))?;
+    .map_err(|error| format!("cached precise overlap plan: {error:#}"))?;
     let (retained_marks, retained_plans) =
         if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
             (BTreeSet::new(), Vec::new())

@@ -78,7 +78,7 @@ pub(crate) struct ProofEvidence {
 impl Default for ProofEvidence {
     fn default() -> Self {
         Self {
-            schema: "era5a-proof-evidence-v2".into(),
+            schema: "bo-proof-evidence-v2".into(),
             claim: Claim::SourceObservationsOnly,
             licensing_in_origin_evidence: true,
             families: FAMILIES.into_iter().map(|f| (f, None)).collect(),
@@ -359,7 +359,7 @@ impl ProofEvidence {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schema != "era5a-proof-evidence-v2"
+        if self.schema != "bo-proof-evidence-v2"
             || !self.licensing_in_origin_evidence
             || self.missing != MISSING.into_iter().collect()
         {

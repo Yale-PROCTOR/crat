@@ -178,7 +178,7 @@ impl CallTransfer {
     ) -> Result<Self, String> {
         if caller_pair.function() != witness.caller() {
             return Err(format!(
-                "A5 transfer dependency belongs to function {}, but call witness belongs to {}",
+                "overlap transfer dependency belongs to function {}, but call witness belongs to {}",
                 caller_pair.function(),
                 witness.caller()
             ));
@@ -721,7 +721,10 @@ pub(crate) fn apply_coarse_constraints(
     }
     let mut canonical = BTreeMap::new();
     for (left, right) in pairs {
-        assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
+        assert_ne!(
+            left, right,
+            "overlap coarse pair must contain distinct slots"
+        );
         let left_key = SlotKey::of(left);
         let right_key = SlotKey::of(right);
         let (key, pair) = if left_key < right_key {

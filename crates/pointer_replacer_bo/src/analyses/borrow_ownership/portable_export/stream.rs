@@ -712,7 +712,7 @@ pub(crate) fn collect_to_path(
             .get_mut(&F::ResidualConflicts)
             .unwrap()
             .availability = CaptureAvailability::NotRecorded {
-            reason: "producer did not record an L2 residual certificate".into(),
+            reason: "producer did not record a guarded-repair residual certificate".into(),
         };
     }
     match move_store_rows(program, slots, export)? {

@@ -66,7 +66,7 @@ where
             return;
         }
         if let Some(continuation) = plan.site.result.continuation() {
-            let cases = realloc::classify(&plan.site).expect("validated R219 cases");
+            let cases = realloc::classify(&plan.site).expect("validated realloc cases");
             let old_argument = args.first().cloned().flatten();
             let old_before = old_argument
                 .as_ref()
@@ -219,7 +219,7 @@ where
                         unreachable!("null old input has no old edge definition")
                     }
                     OldResponsibility::LoseClaimIfPresent => {
-                        unreachable!("R219 unobserved outcomes do not use a direct branch edge")
+                        unreachable!("unobserved realloc outcomes do not use a direct branch edge")
                     }
                 }
             }

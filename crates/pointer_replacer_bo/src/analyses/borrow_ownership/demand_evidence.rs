@@ -7,7 +7,7 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
-pub(crate) const SCHEMA: &str = "era5a-demand-evidence-v1";
+pub(crate) const SCHEMA: &str = "bo-demand-evidence-v1";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LicensingDisposition {

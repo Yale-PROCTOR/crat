@@ -887,7 +887,7 @@ pub(crate) fn current_endpoint_retraction_key(
     var: Var,
 ) -> EndpointRetractionKey {
     let call = current_call_site().unwrap_or_else(|| {
-        panic!("T2 endpoint assertion emitted outside a modeled call-site cursor")
+        panic!("endpoint-retraction assertion emitted outside a modeled call-site cursor")
     });
     EndpointRetractionKey {
         fn_did: call.fn_did,

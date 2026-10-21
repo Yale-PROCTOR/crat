@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-pub(crate) const SCHEMA: &str = "era5b-model-cache-v1";
+pub(crate) const SCHEMA: &str = "bo-model-cache-v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SemanticInputs {
