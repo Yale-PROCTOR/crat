@@ -168,10 +168,17 @@ fn w_rc_1_the_return_to_cell_store_certifies() {
     });
 }
 
+/// The recursive return stored back into the cell: with the per-path token
+/// disposition the parameter's value has no single route, so the fold does not
+/// certify the function.
 #[test]
-fn w_rc_2_the_recursive_return_to_cell_store_certifies() {
+fn w_rc_2_the_recursive_return_to_cell_store_has_no_single_route() {
     with_facts(&format!("{PRELUDE}{RC2}"), |facts| {
-        certify(facts, "insert", 1).expect("assume-guarantee on the licensed contract");
+        let result = certify(facts, "insert", 1);
+        assert!(
+            matches!(result, Err(Error::AmbiguousRoute { choices: 0, .. })),
+            "{result:?}"
+        );
     });
 }
 

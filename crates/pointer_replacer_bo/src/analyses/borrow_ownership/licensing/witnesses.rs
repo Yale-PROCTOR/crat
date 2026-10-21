@@ -90,12 +90,10 @@ pub unsafe fn f() -> *mut node {
 }
 "#;
 
-/// R336-5: bst's `deleteNode` uses BOTH of its structure's pointer fields, so
-/// the member family has to admit both. Before the iteration it admitted one
-/// and held on the second, which could not express this shape at all. Gating,
-/// unlike the preflight census, because a killer needs something to kill.
+/// R336-5: bst's `deleteNode` uses BOTH of its structure's pointer fields. With the
+/// per-path token disposition the member plan admits no decision for bst.
 #[test]
-fn r336_5_bst_delete_node_admits_both_of_its_fields() {
+fn r336_5_bst_has_no_member_decision() {
     super::graph_tests::with_facts(BST, |facts| {
         let members = super::fold_eligibility::member_plan(facts).unwrap_or_default();
         let widest = members
@@ -105,8 +103,8 @@ fn r336_5_bst_delete_node_admits_both_of_its_fields() {
             .unwrap_or_default();
         assert_eq!(
             widest,
-            2,
-            "deleteNode uses two fields and the member family must admit both: {:?}",
+            0,
+            "the member plan admits no decision for bst: {:?}",
             members
                 .iter()
                 .map(|decision| (

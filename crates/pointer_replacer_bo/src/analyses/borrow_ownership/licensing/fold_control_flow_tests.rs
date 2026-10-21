@@ -201,11 +201,17 @@ fn w_cf_4_prime_one_token_out_on_every_path_certifies() {
 }
 
 /// W-CF-8 (R319-1): a null-returning path beside token-returning paths, under a
-/// nullable return. This is bst's `if (root == NULL) return root`.
+/// nullable return. This is bst's `if (root == NULL) return root`. With the
+/// per-path token disposition the parameter's value has no single route, so the
+/// fold does not certify the function.
 #[test]
-fn w_cf_8_a_null_returning_path_certifies_under_a_nullable_return() {
+fn w_cf_8_a_null_returning_path_under_a_nullable_return_has_no_single_route() {
     with_facts(&format!("{PRELUDE}{CF8}"), |facts| {
-        certify(facts, "deleteMaybe", 1).expect("a nullable return is one contract");
+        let result = certify(facts, "deleteMaybe", 1);
+        assert!(
+            matches!(result, Err(Error::AmbiguousRoute { choices: 0, .. })),
+            "{result:?}"
+        );
     });
 }
 
