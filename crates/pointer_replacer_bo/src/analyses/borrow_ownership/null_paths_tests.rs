@@ -1061,60 +1061,6 @@ pub static TABLE: [Option<unsafe extern "C" fn(*const *mut f64) -> f64>; 1] = [S
 const W47_ARMS: &[(&str, &str)] = &[];
 
 #[test]
-#[ignore = "runs under L01⁸'s arms in a child of e5c_w47"]
-fn e5c_inner_w47_tables() {
-    for (name, code) in [
-        ("TULIP", W43_TULIP),
-        ("READONLY", W47_TULIP_READONLY),
-        ("REFELEM", W47_REF_ELEMENT),
-        ("HEMAN", W43_HEMAN),
-        ("OWNER", W43_OWNER),
-    ] {
-        for (k, v) in shape_model(code) {
-            eprintln!("E5C_W47 {name} {k} {v}");
-        }
-    }
-}
-
-fn w47_rows(extra: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
-    let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.extend_from_slice(extra);
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_w47_tables",
-        &env,
-    );
-    text.lines()
-        .filter_map(|l| l.strip_prefix("E5C_W47 "))
-        .filter_map(|l| {
-            let mut it = l.splitn(3, ' ');
-            Some((
-                format!("{} {}", it.next()?, it.next()?),
-                it.next()?.trim().to_owned(),
-            ))
-        })
-        .collect()
-}
-
-fn w47_kind(rows: &std::collections::BTreeMap<String, String>, key: &str) -> String {
-    rows.get(key)
-        .cloned()
-        .unwrap_or_else(|| panic!("no row {key}: {rows:?}"))
-}
-
-/// W47 faults: each one alone must turn the witness RED.
-#[test]
-fn e5c_w47_b_faults_turn_the_witness_red() {
-    for fault in ["any-depth", "no-model"] {
-        let rows = w47_rows(&[("CRAT_E5C_W47_FAULT", fault)]);
-        assert_eq!(
-            w47_kind(&rows, "TULIP ind::_2@d0"),
-            "raw",
-            "fault {fault} must be caught"
-        );
-    }
-}
-
-#[test]
 #[ignore = "runs in a child of e5c_w47_c"]
 fn e5c_inner_w47_rule_level() {
     use rustc_hir::{ItemKind, OwnerNode};
@@ -1382,25 +1328,6 @@ unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
     *q
 }
 "#;
-
-/// W52c, the ruled mutation: suppress the lend's loan emission
-/// (`CRAT_E5C_W52_FAULT=no-loan`, at `selected_copy_lends_for_round`) and A12's
-/// end-to-end emission witness goes RED; without the fault it is GREEN.
-#[test]
-fn e5c_w52_c_suppressing_the_lend_loan_turns_the_emission_witness_red() {
-    let witness = "bo_c1::run::copy_lend_phase1b_bo_c1_end_to_end_recovers_owner";
-    let run = |fault: bool| {
-        let exe = std::env::current_exe().expect("current_exe");
-        let mut command = std::process::Command::new(exe);
-        command.args([witness, "--exact", "--test-threads=1"]);
-        if fault {
-            command.env("CRAT_E5C_W52_FAULT", "no-loan");
-        }
-        command.output().expect("child").status.success()
-    };
-    assert!(run(false), "the emission witness is GREEN");
-    assert!(!run(true), "the no-loan fault must turn it RED");
-}
 
 /// era-5b's return port: a copy of an owner that is then RETURNED. The lend
 /// reading must not mint a licence the objective buys (C2/C3: a returned

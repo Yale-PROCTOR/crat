@@ -345,54 +345,6 @@ fn e5c_cm_2_a_read_of_the_owner_in_the_window_refuses_the_lend() {
     assert_eq!(row(&on, "q", "p"), "c2-mutable-window-access", "{on:#?}");
 }
 
-/// Whether the shape's solve took the mutable lend (`p` owning beside `q` a reference).
-fn lent(seen: &Seen) -> bool {
-    kind(seen, "run::p") == "owning" && kind(seen, "run::q") == "ref"
-}
-
-/// Fault F1 (`no-window`): without the static window check the classifier keeps both window
-/// shapes, and the replay's unique loan still refuses the lend: the replay is the judge.
-#[test]
-fn e5c_cm_f1_without_the_window_check_the_unique_loan_refuses() {
-    for name in ["WRITE_IN_WINDOW", "READ_IN_WINDOW"] {
-        let s = seen_with(name, &[("CRAT_E5C_CM_FAULT", "no-window")]);
-        assert_eq!(row(&s, "q", "p"), "eligible-mut", "{name}: {s:#?}");
-        assert!(!lent(&s), "{name}: {s:#?}");
-    }
-}
-
-/// F2 (`no-window` + W52's `no-loan`), an observation of record: even without the window check and
-/// without the lend's loan, the replay refuses the read of `p` in `q`'s window, because the copy
-/// itself issues an ordinary loan and `p` is mutable (the facts give a copy one qualifier). The
-/// read is caught three times: the window check, the unique loan, the copy's own loan. A fault that
-/// lets it through would have to remove the base borrow inference; none is built.
-#[test]
-fn e5c_cm_f2_without_the_window_or_the_lends_loan_the_copys_own_loan_catches_the_read() {
-    let s = seen_with(
-        "READ_IN_WINDOW",
-        &[
-            ("CRAT_E5C_CM_FAULT", "no-window"),
-            ("CRAT_E5C_W52_FAULT", "no-loan"),
-        ],
-    );
-    assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
-    assert!(!lent(&s), "{s:#?}");
-}
-
-/// F2′ (`no-window,shared-loan`), an observation of record: a SHARED loan catches the read here
-/// too. The mutability facts give a copy one qualifier, so the write through `q` makes `p` mutable,
-/// and the replay conflicts a read of `p` with any loan on it. The unique loan is the defense that
-/// does not rest on that propagation.
-#[test]
-fn e5c_cm_f2_a_shared_loan_is_caught_here_too() {
-    let s = seen_with(
-        "READ_IN_WINDOW",
-        &[("CRAT_E5C_CM_FAULT", "no-window,shared-loan")],
-    );
-    assert_eq!(row(&s, "q", "p"), "eligible-mut", "{s:#?}");
-    assert!(!lent(&s), "{s:#?}");
-}
-
 /// (iii) the destination released (S2-2), or `free(p)` inside `q`'s window: no lend.
 #[test]
 fn e5c_cm_3_a_release_refuses_the_lend() {

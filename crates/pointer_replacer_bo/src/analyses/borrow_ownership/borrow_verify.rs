@@ -889,11 +889,6 @@ pub(crate) fn round_mutability_facts<'tcx>(
 ) -> super::mutability_facts::MutFacts {
     let tcx = program.tcx;
     let keep_load = |fn_did: LocalDefId, load: &rustc_middle::mir::Place<'tcx>| -> bool {
-        // W47 fault F2 (test builds only): the model condition dropped.
-        #[cfg(test)]
-        if std::env::var("CRAT_E5C_W47_FAULT").as_deref() == Ok("no-model") {
-            return true;
-        }
         match loaded_slot(tcx, slots, fn_did, load) {
             Some(slot) => model.get(&slot) != Some(&SlotKind::Raw),
             None => true,
@@ -1024,10 +1019,6 @@ fn selected_copy_lends_for_round(
     escaped: Option<&SelectedCopyLendLoans>,
 ) -> SelectedCopyLendLoans {
     let mut selected = escaped.cloned().unwrap_or_default();
-    // W52 fault (test builds only): the lend's loans never reach the replay.
-    #[cfg(test)]
-    let pair_lends =
-        pair_lends.filter(|_| std::env::var("CRAT_E5C_W52_FAULT").as_deref() != Ok("no-loan"));
     if let Some(pairs) = pair_lends {
         for (fn_did, loans) in selected_copy_lend_sites(program, slots, pairs, model) {
             selected.entry(fn_did).or_default().extend(loans);

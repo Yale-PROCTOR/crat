@@ -134,14 +134,6 @@ impl MutFacts {
             Some(keep_load),
         );
         let groups = SourceVarGroups::new(program);
-        // W47 fault F1 (test builds only): the old any-depth per-local bit.
-        #[cfg(test)]
-        if std::env::var("CRAT_E5C_W47_FAULT").as_deref() == Ok("any-depth") {
-            return MutFacts {
-                mutables: groups.postprocess_mut_res(program, &result),
-                all_mut: false,
-            };
-        }
         let mutables = groups.postprocess_mut_res_outermost(program, &result);
         MutFacts {
             mutables,

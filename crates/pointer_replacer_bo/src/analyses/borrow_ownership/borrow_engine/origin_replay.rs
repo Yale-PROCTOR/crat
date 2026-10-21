@@ -177,12 +177,7 @@ impl<'a> NativeBorrowContext<'a> {
                 );
                 copy_lends.all.insert(loan);
                 // relay 213: a mutable copy-lend's loan is unique.
-                #[cfg(test)]
-                let fault_shared = std::env::var("CRAT_E5C_CM_FAULT")
-                    .is_ok_and(|faults| faults.split(',').any(|f| f == "shared-loan"));
-                #[cfg(not(test))]
-                let fault_shared = false;
-                if selected.unique && !fault_shared {
+                if selected.unique {
                     copy_lends.unique.insert(loan);
                 }
             }
