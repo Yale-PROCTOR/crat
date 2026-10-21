@@ -165,6 +165,7 @@ fn origin_summaries_from_flows(flows: origin_flow::OriginFlowResults) -> OriginS
     OriginSummaries::native(summaries, flows)
 }
 
+#[cfg(test)]
 pub(crate) fn compute_origins_a2(
     program: &RustProgram<'_>,
 ) -> (OriginSummaries, origin_flow::A2Plan) {
@@ -266,6 +267,7 @@ fn signature_slot_to_ref(
 /// — so an opaque-derived slot can pass "sub ∉ unknown" via a bidirectional storage edge whose true
 /// source was filtered out of `unknown`. Genuine `q = p` value flows are unidirectional and survive the
 /// mitigation; storage pairs are discarded. Both counts are reported so the storage inflation is visible.
+#[cfg(test)]
 pub(crate) fn collect_overincluded_modeled_origin_slots(
     origins: &OriginSummaries,
     slots: &CrateSlots,
@@ -287,6 +289,7 @@ pub(crate) fn collect_overincluded_modeled_origin_slots(
 /// True iff `s` has an incoming subset edge `sub → s` from a non-self, non-`unknown` source (a modeled
 /// borrow origin flows into it). `mitigated` additionally requires the edge be unidirectional (no
 /// reverse `s → sub`), discarding the symmetric storage aliases folded into `subset`.
+#[cfg(test)]
 fn carries_modeled_origin(summary: &OriginSummary, s: OriginSlot, mitigated: bool) -> bool {
     for sub in summary.subset.rows() {
         if sub == s || summary.unknown.contains(sub) {
@@ -310,6 +313,7 @@ fn carries_modeled_origin(summary: &OriginSummary, s: OriginSlot, mitigated: boo
 /// symmetric storage aliases. Removing these from the demotion set yields collateral ≥ the TRUE
 /// recoverable, so it is the SOUND upper bound the defer/gate decision needs. A pure opaque result has
 /// NO incoming edge (the opaque call breaks the flow), so it stays demoted — correctly excluded.
+#[cfg(test)]
 fn has_any_incoming_origin(summary: &OriginSummary, s: OriginSlot) -> bool {
     summary
         .subset
@@ -320,6 +324,7 @@ fn has_any_incoming_origin(summary: &OriginSummary, s: OriginSlot) -> bool {
 /// §NB4-4c-Q UPPER-BOUND over-inclusion collector (Codex F1). The self-inclusive maximal set; see
 /// `has_any_incoming_origin`. Reported alongside the mitigated set so the gate can use a sound upper
 /// bound (`mitigated ⊆ upper`).
+#[cfg(test)]
 pub(crate) fn collect_upperbound_overincluded_slots(
     origins: &OriginSummaries,
     slots: &CrateSlots,

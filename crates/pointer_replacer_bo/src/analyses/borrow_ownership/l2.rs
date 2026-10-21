@@ -174,6 +174,7 @@ impl ConflictObservation {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn hazard_key_diagnostic(&self) -> String {
         let loan = self
             .stable_loan_key
@@ -237,6 +238,7 @@ pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
 /// R7 identity for one validation conflict before commit planning. The loan
 /// index is retained only here; it does not enter clause identity, ordering, or
 /// solver semantics.
+#[cfg(test)]
 pub(crate) fn conflict_witness_diagnostic(
     validation_round: usize,
     fn_key: FnKey,
@@ -326,6 +328,7 @@ pub(crate) struct ForbidClause {
 }
 
 impl ForbidClause {
+    #[cfg(test)]
     pub(crate) fn is_satisfied_by(&self, model: &FxHashMap<SlotRef, SlotKind>) -> bool {
         self.negative_refs.iter().any(|slot| {
             *model
@@ -349,6 +352,7 @@ pub(crate) enum Lifecycle {
 }
 
 impl Lifecycle {
+    #[cfg(test)]
     fn diagnostic(self) -> &'static str {
         match self {
             Self::Unseen => "unseen",
@@ -399,6 +403,7 @@ pub(crate) struct CommitAction {
 /// round. Every literal records its current kind, Boolean value, transition
 /// from the preceding solved model, and whether that slot is itself governed
 /// by an L2 guarded/permanent lifecycle.
+#[cfg(test)]
 pub(crate) fn clause_state_diagnostic(
     action: &CommitAction,
     clause_sequence: usize,
@@ -416,6 +421,7 @@ pub(crate) fn clause_state_diagnostic(
     }
 
     impl Role {
+        #[cfg(test)]
         fn diagnostic(self) -> &'static str {
             match self {
                 Self::TargetNegative => "target-neg",
@@ -424,6 +430,7 @@ pub(crate) fn clause_state_diagnostic(
             }
         }
 
+        #[cfg(test)]
         fn literal_value(self, kind: SlotKind) -> bool {
             match self {
                 Self::TargetNegative | Self::PeerNegative => kind != SlotKind::Ref,
@@ -549,7 +556,9 @@ pub(crate) fn clause_state_diagnostic(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SolverOutcome {
     Sat,
+    #[cfg(test)]
     Unsat,
+    #[cfg(test)]
     Unknown,
 }
 
@@ -642,10 +651,12 @@ impl Planner {
             .and_then(|rank_bound| rank_bound.checked_add(1))
     }
 
+    #[cfg(test)]
     pub(crate) fn validation_rounds(&self) -> usize {
         self.validation_rounds
     }
 
+    #[cfg(test)]
     pub(crate) fn lifecycle(&self, slot: SlotRef) -> Lifecycle {
         self.lifecycle
             .get(&slot)
@@ -661,12 +672,14 @@ impl Planner {
         model: &FxHashMap<SlotRef, SlotKind>,
     ) -> RoundPlan {
         match solver_outcome {
+            #[cfg(test)]
             SolverOutcome::Unsat => {
                 return RoundPlan::Decline {
                     validation_round: self.validation_rounds,
                     reason: DeclineReason::Solver(SolverDecline::Unsat),
                 };
             }
+            #[cfg(test)]
             SolverOutcome::Unknown => {
                 return RoundPlan::Decline {
                     validation_round: self.validation_rounds,

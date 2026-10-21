@@ -85,9 +85,13 @@ pub(crate) struct EscCopySiteKey {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EscRuntimeSite {
+    #[cfg(test)]
     pub(crate) key: EscCopySiteKey,
+    #[cfg(test)]
     pub(crate) lhs: SlotRef,
+    #[cfg(test)]
     pub(crate) rhs: SlotRef,
+    #[cfg(test)]
     pub(crate) loan: SelectedCopyLendLoan,
 }
 
@@ -97,6 +101,7 @@ pub(crate) enum EscExclusionReason {
 }
 
 impl EscExclusionReason {
+    #[cfg(test)]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::FieldIssuerOutOfScope => "field-issuer-out-of-scope",
@@ -106,9 +111,13 @@ impl EscExclusionReason {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EscExcludedSite {
+    #[cfg(test)]
     pub(crate) key: EscCopySiteKey,
+    #[cfg(test)]
     pub(crate) lhs: SlotRef,
+    #[cfg(test)]
     pub(crate) rhs: SlotRef,
+    #[cfg(test)]
     pub(crate) reason: EscExclusionReason,
 }
 
@@ -323,9 +332,13 @@ struct Site {
     borrower: BorrowerKind,
     resolved_origin_slot: String,
     destination_place: String,
+    #[cfg(test)]
     escaping: bool,
+    #[cfg(test)]
     resolved_origin: bool,
+    #[cfg(test)]
     live_after_syntactic: bool,
+    #[cfg(test)]
     live_after: bool,
     selected: bool,
 }
@@ -561,6 +574,7 @@ fn collect_sites(
             liveness.seek_before_primary_effect(row.location);
             let live = liveness.get();
             let live_after = live.contains(row.origin.local);
+            #[cfg(test)]
             let live_after_syntactic = live.contains(row.source.local);
             let is_escaping = escaping(&body, row.destination);
             let origin_key = slot_key(program.tcx, slots, row.rhs);
@@ -602,9 +616,13 @@ fn collect_sites(
                 borrower: row.loan_borrower,
                 resolved_origin_slot: origin_key,
                 destination_place,
+                #[cfg(test)]
                 escaping: is_escaping,
+                #[cfg(test)]
                 resolved_origin: row.origin != row.source,
+                #[cfg(test)]
                 live_after_syntactic,
+                #[cfg(test)]
                 live_after,
                 selected,
             });
@@ -651,6 +669,10 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 })
                 .expect("selected row has artifact key")
         });
+        // Outside tests only the `expect` above is wanted: every selected row is an allowlist row.
+        #[cfg(not(test))]
+        let _ = artifact;
+        #[cfg(test)]
         let key = EscCopySiteKey {
             program: artifact.map_or("fixture", |key| key.program).to_owned(),
             function: row.function.clone(),
@@ -660,9 +682,13 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         };
         if matches!(row.rhs, SlotRef::Field(_)) {
             answer.excluded_sites.push(EscExcludedSite {
+                #[cfg(test)]
                 key,
+                #[cfg(test)]
                 lhs: row.lhs,
+                #[cfg(test)]
                 rhs: row.rhs,
+                #[cfg(test)]
                 reason: EscExclusionReason::FieldIssuerOutOfScope,
             });
             continue;
@@ -704,9 +730,13 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             "duplicate ②-minimal presentation identity"
         );
         answer.sites.push(EscRuntimeSite {
+            #[cfg(test)]
             key,
+            #[cfg(test)]
             lhs: row.lhs,
+            #[cfg(test)]
             rhs: row.rhs,
+            #[cfg(test)]
             loan,
         });
     }

@@ -76,10 +76,12 @@ enum CoreTrackingGranularity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoreTrackingPurpose {
     ProductionMandatory,
+    #[cfg(test)]
     Diagnostic,
 }
 
 impl CoreTracker {
+    #[cfg(test)]
     fn new() -> Self {
         CoreTracker {
             entries: RefCell::new(Vec::new()),
@@ -98,6 +100,7 @@ impl CoreTracker {
         }
     }
 
+    #[cfg(test)]
     fn new_family() -> Self {
         CoreTracker {
             entries: RefCell::new(Vec::new()),
@@ -503,6 +506,7 @@ thread_local! {
 /// Run an untracked solve while recording its actual selector drop/re-enable
 /// decisions. The returned model is the exact result of `f`; the side channel
 /// is write-only and cannot influence the choice policy.
+#[cfg(test)]
 pub(crate) fn with_selector_trace<T>(f: impl FnOnce() -> T) -> (T, SelectorTrace) {
     struct Restore(Option<SelectorTrace>);
     impl Drop for Restore {
@@ -670,6 +674,7 @@ impl KindSolver {
     /// §NB-R diagnostic constructor: every hard constraint is track-gated.
     /// The result must ONLY be driven via assumption solving (see
     /// `CoreTracker`); production solve paths refuse it.
+    #[cfg(test)]
     pub(crate) fn new_tracked(slots: &CrateSlots) -> Self {
         Self::build(slots, Some(CoreTracker::new()), true)
     }
@@ -677,6 +682,7 @@ impl KindSolver {
     /// Corpus selector-leak diagnostic constructor: all hard constraints in
     /// one `CORE_LABEL_FAMILIES` family share a single assumption marker.
     /// This preserves family membership while avoiding per-assertion tracking.
+    #[cfg(test)]
     pub(crate) fn new_family_tracked(slots: &CrateSlots) -> Self {
         Self::build(slots, Some(CoreTracker::new_family()), true)
     }
@@ -1428,6 +1434,7 @@ impl KindSolver {
 
     /// Necessary local G-FOLD premises only. Caller alias, all-store and
     /// source-flow closure remain separate; this does not activate transport.
+    #[cfg(test)]
     pub(crate) fn constrain_fold_permission(
         &self,
         facts: &super::licensing::facts::Facts,
@@ -2577,6 +2584,7 @@ impl KindSolver {
     /// NB4-4c: the may-supply demotion uses `¬ref` only; this `¬own` is the tool for the DEFERRED
     /// may-overwrite demotion (needs opaque-overwrite detection, which `summary.unknown` does not
     /// provide). Kept warm by `nb4_4c_add_owning_exclusion_forbids_owning`, not `allow(dead_code)`.
+    #[cfg(test)]
     pub(crate) fn add_owning_exclusion(&self, slot: SlotRef) {
         let vars = self
             .vars
@@ -2595,6 +2603,7 @@ impl KindSolver {
     /// the optimized model is a SOFT (objective/retention) blocker, not a mechanism gap; UNSAT (best via
     /// `new_tracked`) ⇒ a hard constraint family forbids it and the core names it. Symmetric to
     /// `add_owning_exclusion`. Kept warm by `s23_owning_blocker_probe`.
+    #[cfg(test)]
     pub(crate) fn assert_owning(&self, slot: SlotRef) {
         let vars = self
             .vars
@@ -2610,6 +2619,7 @@ impl KindSolver {
 
     /// R385-1 companion to `assert_owning`: FORCE a slot `Ref` for the
     /// forced-assignment core probe. Compute-only, no production caller.
+    #[cfg(test)]
     pub(crate) fn assert_ref(&self, slot: SlotRef) {
         let vars = self
             .vars
@@ -3222,6 +3232,7 @@ impl KindSolver {
     /// phase 2 visits each dropped selector once. Leaking a source classifies
     /// that allocation non-Owning, which is memory-safe; leaking a sink leaves
     /// an unprovable free a raw-pointer free.
+    #[cfg(test)]
     pub(crate) fn model_kinds_relaxing(
         &self,
         selectors: &Selectors,
@@ -4079,6 +4090,7 @@ pub(crate) struct Selectors {
 }
 
 impl Selectors {
+    #[cfg(test)]
     pub(crate) fn new(sources: Vec<Bool>, sinks: Vec<Bool>) -> Self {
         assert!(
             sources.is_empty() && sinks.is_empty(),

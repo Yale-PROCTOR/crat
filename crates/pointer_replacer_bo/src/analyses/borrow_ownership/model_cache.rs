@@ -36,8 +36,10 @@ use crate::utils::rustc::RustProgram;
 
 /// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
 /// changes after this commit do not advance this identity.
+#[cfg(test)]
 pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p14-v1";
 
+#[cfg(test)]
 fn program_identity(
     crate_name: &str,
     files: impl IntoIterator<Item = (String, Vec<u8>)>,
@@ -54,6 +56,7 @@ fn program_identity(
     format!("{:x}", hash.finalize())
 }
 
+#[cfg(test)]
 fn canonical_program_path(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -204,6 +207,7 @@ pub(crate) fn semantic_inputs(
         dependencies: env!("BO_LOCK_SHA256").to_owned(),
     })
 }
+#[cfg(test)]
 fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(solver.as_bytes());
@@ -224,6 +228,7 @@ fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
 }
 
 /// Retained API for explicit refusal of legacy key-only migration into era5a.
+#[cfg(test)]
 pub(crate) fn rekey_entry(
     _old_path: &Path,
     _new_dir: &Path,
@@ -266,6 +271,7 @@ thread_local! {
     static PREPARE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_error() -> Option<String> {
     PREPARE_ERROR.with(|error| error.borrow().clone())
 }
@@ -535,6 +541,7 @@ pub(crate) fn prepared_arg_order_hoists(
 /// for the rewriter's discharge (ownership-fields 069 §4). A loaded entry already
 /// carries them from the streamed read; a staged one is read back once.
 /// Refused unless the entry records them.
+#[cfg(test)]
 pub(crate) fn prepared_move_store_obligations(
     fingerprint: &str,
 ) -> Result<Vec<super::portable_export::MoveStoreRow>, String> {
@@ -558,6 +565,7 @@ pub(crate) fn prepared_move_store_obligations(
 
 /// Explicit materializing compatibility view; model derivation and publication
 /// use the shared streamed entry instead.
+#[cfg(test)]
 pub(crate) fn prepared_entry(fingerprint: &str) -> Option<super::cache_contract::CompleteEntry> {
     let entry = PREPARED.with(|prepared| {
         prepared
@@ -1320,6 +1328,7 @@ pub(crate) fn last_solve() -> Option<SolveProvenance> {
 }
 
 /// Render for a report row: `real` or `cache@<first 12 hex>`.
+#[cfg(test)]
 pub(crate) fn render_provenance() -> String {
     match last_solve() {
         None => "none".to_owned(),
@@ -1330,10 +1339,12 @@ pub(crate) fn render_provenance() -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn render_cache_status() -> &'static str {
     last_solve().map_or("none", |provenance| provenance.cache_status)
 }
 
+#[cfg(test)]
 pub(crate) fn render_model_sha256() -> String {
     last_solve().map_or_else(|| "none".to_owned(), |provenance| provenance.model_sha256)
 }
@@ -1376,6 +1387,7 @@ pub(crate) fn solve_receipt() -> Option<SolveReceipt> {
 /// **This counter is what stops it returning silently.** The sweep asserts
 /// exactly one derivation per program, so adding a fourth consumer that forgets
 /// the memo fails a gate instead of quietly tripling a sweep.
+#[cfg(test)]
 pub(crate) fn derivations() -> usize {
     DERIVATIONS.with(|c| c.get())
 }

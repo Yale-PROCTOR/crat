@@ -5,17 +5,21 @@
 //! function, ordered slot, subset edge, and unknown-membership entry before the wrapped route was
 //! removed from the active BO path.
 
-use std::{cell::Cell, collections::VecDeque};
+use std::cell::Cell;
+#[cfg(test)]
+use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
 };
+#[cfg(test)]
+use rustc_middle::mir::BasicBlock;
 use rustc_middle::{
     mir::{
-        BasicBlock, BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location,
-        Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
+        BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location, Operand,
+        Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
         visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
@@ -112,13 +116,16 @@ struct LocalSlot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct A2State {
     may_originless: DenseBitSet<OriginSlot>,
     modeled_sources: IndexVec<OriginSlot, DenseBitSet<OriginSlot>>,
     unstable_bases: DenseBitSet<OriginSlot>,
 }
 
+#[cfg(test)]
 impl A2State {
+    #[cfg(test)]
     fn all_set(domain_size: usize) -> Self {
         Self {
             may_originless: DenseBitSet::new_filled(domain_size),
@@ -131,12 +138,14 @@ impl A2State {
         }
     }
 
+    #[cfg(test)]
     fn clear_as_modeled_entry(&mut self, slot: OriginSlot) {
         self.may_originless.remove(slot);
         self.modeled_sources[slot].clear();
         self.modeled_sources[slot].insert(slot);
     }
 
+    #[cfg(test)]
     fn join_from(&mut self, other: &Self) -> bool {
         let mut changed = self.may_originless.union(&other.may_originless);
         changed |= self.unstable_bases.union(&other.unstable_bases);
@@ -146,11 +155,13 @@ impl A2State {
         changed
     }
 
+    #[cfg(test)]
     fn set_originless(&mut self, target: OriginSlot) {
         self.may_originless.insert(target);
         self.modeled_sources[target].clear();
     }
 
+    #[cfg(test)]
     fn strong_copy(&mut self, target: OriginSlot, sources: &[OriginSlot]) -> bool {
         if sources.is_empty()
             || sources
@@ -200,6 +211,7 @@ pub(crate) struct OriginFlowResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct A2OpaqueResultGuard {
     pub(crate) function: LocalDefId,
     pub(crate) local: Local,
@@ -208,12 +220,14 @@ pub(crate) struct A2OpaqueResultGuard {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct A2RestoredSelfOrigin {
     pub(crate) function: LocalDefId,
     pub(crate) slot: SignatureSlot,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct A2Plan {
     pub(crate) opaque_result_guards: Vec<A2OpaqueResultGuard>,
     pub(crate) restored_self_origins: Vec<A2RestoredSelfOrigin>,
@@ -274,6 +288,7 @@ pub(crate) fn analyze_program_origin_flow(program: &RustProgram<'_>) -> OriginFl
     results
 }
 
+#[cfg(test)]
 pub(crate) fn analyze_program_origin_flow_a2(
     program: &RustProgram<'_>,
 ) -> (OriginFlowResults, A2Plan) {
@@ -1051,6 +1066,7 @@ impl BodyOriginFlow {
         }
     }
 
+    #[cfg(test)]
     fn signature_slot_for_internal(
         &self,
         body: &Body<'_>,
@@ -1095,12 +1111,14 @@ impl BodyOriginFlow {
     }
 }
 
+#[cfg(test)]
 struct BodyA2Result {
     summary: NativeOriginSummary,
     guards: Vec<(Local, u8, Location)>,
     restored: Vec<SignatureSlot>,
 }
 
+#[cfg(test)]
 fn a2_exact_target<'tcx>(
     flow: &BodyOriginFlow,
     body: &Body<'tcx>,
@@ -1122,6 +1140,7 @@ fn a2_exact_target<'tcx>(
     Some(target)
 }
 
+#[cfg(test)]
 fn a2_operand_sources<'tcx>(
     flow: &BodyOriginFlow,
     body: &Body<'tcx>,
@@ -1135,6 +1154,7 @@ fn a2_operand_sources<'tcx>(
     }
 }
 
+#[cfg(test)]
 fn a2_rvalue_sources<'tcx>(
     flow: &BodyOriginFlow,
     body: &Body<'tcx>,
@@ -1154,6 +1174,7 @@ fn a2_rvalue_sources<'tcx>(
     }
 }
 
+#[cfg(test)]
 fn a2_merge_input(
     inputs: &mut IndexVec<BasicBlock, Option<A2State>>,
     block: BasicBlock,
@@ -1173,6 +1194,7 @@ fn a2_merge_input(
     }
 }
 
+#[cfg(test)]
 fn compute_body_a2<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
