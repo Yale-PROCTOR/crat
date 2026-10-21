@@ -540,7 +540,7 @@ fn e5_i_actual_cache_requires_complete_payload() {
     std::fs::create_dir_all(&directory.0).unwrap();
     ::utils::compilation::run_compiler_on_str("pub unsafe fn read(p:*const i32)->i32{*p}", |tcx| {
         model_cache::reset_for_test();
-        let first = model_cache::with_test_config(false, &directory.0, || {
+        let first = model_cache::with_test_config(&directory.0, || {
             crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
         })
         .expect("fresh accepted model");
@@ -698,7 +698,7 @@ fn e5_i_actual_cache_requires_complete_payload() {
 
         model_cache::reset_for_test();
         let before = execution_guard::model_entries();
-        let loaded = model_cache::with_test_config(true, &directory.0, || {
+        let loaded = model_cache::with_test_config(&directory.0, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
         .expect("cache-only complete readback");
@@ -981,7 +981,7 @@ fn e5_i_actual_cache_transports_between_distinct_source_roots_without_solving() 
     let cache = root.0.join("cache");
     let first = ::utils::compilation::run_compiler_on_path(&left, |tcx| {
         model_cache::reset_for_test();
-        let receipt = model_cache::with_test_config(false, &cache, || {
+        let receipt = model_cache::with_test_config(&cache, || {
             crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
         })
         .expect("sender model");
@@ -997,7 +997,7 @@ fn e5_i_actual_cache_transports_between_distinct_source_roots_without_solving() 
     ::utils::compilation::run_compiler_on_path(&right, |tcx| {
         model_cache::reset_for_test();
         let before = execution_guard::model_entries();
-        let receipt = model_cache::with_test_config(true, &cache, || {
+        let receipt = model_cache::with_test_config(&cache, || {
             crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
         })
         .expect("receiver cache-only readback");

@@ -63,42 +63,51 @@ fn canonical_program_path(path: &Path) -> String {
         .to_string()
 }
 
-/// `CRAT_BO_CACHE=1` enables reads. Writes happen whenever a real solve runs
-/// with a cache directory configured, so a bypassed gate sweep still refreshes
-/// what dev iteration will read next.
+/// The cache directory, read and written; `None` means no cache. The pass sets it
+/// once per run (`rewrite_bo`). It is process-wide because the analysis runs on
+/// rustc's thread, not the caller's.
+static CACHE_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Configure the cache directory for this process (`None`: no cache).
+pub(crate) fn configure(dir: Option<PathBuf>) {
+    *CACHE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
+}
+
+/// Reads are on exactly when a cache directory is configured; a real solve
+/// writes to the same directory.
 pub(crate) fn read_enabled() -> bool {
-    #[cfg(test)]
-    if let Some((read, _)) = TEST_CONFIG.with(|config| config.borrow().clone()) {
-        return read;
-    }
-    matches!(std::env::var("CRAT_BO_CACHE").as_deref(), Ok("1"))
+    dir().is_some()
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Some((_, dir)) = TEST_CONFIG.with(|config| config.borrow().clone()) {
+    if let Some(dir) = TEST_CONFIG.with(|config| config.borrow().clone()) {
         return Some(dir);
     }
-    std::env::var_os("CRAT_BO_CACHE_DIR").map(PathBuf::from)
+    CACHE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 #[cfg(test)]
 thread_local! {
-    static TEST_CONFIG: std::cell::RefCell<Option<(bool, PathBuf)>> = const {
+    static TEST_CONFIG: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
 }
 
 #[cfg(test)]
-pub(crate) fn with_test_config<T>(read: bool, dir: &Path, run: impl FnOnce() -> T) -> T {
-    struct Restore(Option<(bool, PathBuf)>);
+pub(crate) fn with_test_config<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
             TEST_CONFIG.with(|config| *config.borrow_mut() = self.0.take());
         }
     }
-    let previous =
-        TEST_CONFIG.with(|config| config.borrow_mut().replace((read, dir.to_path_buf())));
+    let previous = TEST_CONFIG.with(|config| config.borrow_mut().replace(dir.to_path_buf()));
     let _restore = Restore(previous);
     run()
 }
@@ -777,7 +786,7 @@ mod tests {
     fn s2_fresh_entry(directory: &Path) -> PathBuf {
         ::utils::compilation::run_compiler_on_str(S2_FIXTURE, |tcx| {
             reset_for_test();
-            with_test_config(false, directory, || {
+            with_test_config(directory, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
             .expect("fresh decision");
@@ -897,7 +906,7 @@ mod tests {
         s2_fresh_entry(&directory);
         let second = ::utils::compilation::run_compiler_on_str(S2_FIXTURE, |tcx| {
             reset_for_test();
-            with_test_config(false, &directory, || {
+            with_test_config(&directory, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
             .expect("second decision");
@@ -966,13 +975,14 @@ mod tests {
 
         ::utils::compilation::run_compiler_on_str(source, |tcx| {
             reset_for_test();
-            let first_receipt = with_test_config(false, &directory.0, || {
+            let first_receipt = with_test_config(&directory.0, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
             .expect("fresh precise decision");
             let first_provenance = last_solve().expect("fresh solve provenance");
             assert_eq!(first_provenance.source, "real");
-            assert_eq!(first_provenance.cache_status, "bypass");
+            // One directory is read and written: the first run misses, then writes.
+            assert_eq!(first_provenance.cache_status, "miss");
             assert!(
                 first_provenance
                     .cache_entry
@@ -983,7 +993,7 @@ mod tests {
             let first_model = first_provenance.model_sha256;
 
             reset_for_test();
-            let second_receipt = with_test_config(true, &directory.0, || {
+            let second_receipt = with_test_config(&directory.0, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
             .expect("cached precise decision");
@@ -1138,17 +1148,11 @@ mod tests {
         );
     }
 
-    /// **Reads are off unless asked for.** The cache must never engage by
-    /// accident: a gate sweep that silently read a cache would report
-    /// `solve: real` while doing nothing of the kind.
+    /// **No directory, no cache.** The cache never engages by accident: without a
+    /// configured directory nothing is read (or written).
     #[test]
-    fn reads_are_disabled_by_default() {
-        // SAFETY-of-test note: this asserts the DEFAULT, i.e. the behaviour
-        // when the variable is absent, which is the state every sweep runs in
-        // unless it opts in.
-        if std::env::var("CRAT_BO_CACHE").is_err() {
-            assert!(!read_enabled(), "the cache engaged without being asked");
-        }
+    fn reads_are_disabled_without_a_directory() {
+        assert!(!read_enabled(), "the cache engaged without a directory");
     }
 }
 
