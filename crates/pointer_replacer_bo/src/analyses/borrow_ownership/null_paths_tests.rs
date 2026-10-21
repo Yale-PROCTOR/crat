@@ -3948,25 +3948,6 @@ fn e5c_w67_d_a_phi_with_null_names_its_real_cause() {
     );
 }
 
-/// W67e: the objective class. With temporaries' Ref weight withheld
-/// (`CRAT_ERA5C_REF_WEIGHT_NAMED=on`), `del::_13` can be Ref and can own, and
-/// the optimum still chooses Raw; under the frame's weights it is not Raw.
-#[test]
-fn e5c_w67_e_the_ledger_names_the_objective() {
-    let rows = w67_rows("w67-shapes", &[("CRAT_ERA5C_REF_WEIGHT_NAMED", "on")]);
-    let row = w67_row(&rows, "del::_13@d0");
-    assert_eq!(
-        (row[1].as_str(), row[2].as_str(), row[7].as_str()),
-        ("objective", "none", "none"),
-        "{row:?}"
-    );
-    let frame = w67_rows("w67-shapes", &[]);
-    assert!(
-        !frame.iter().any(|row| row[0] == "del::_13@d0"),
-        "{frame:?}"
-    );
-}
-
 /// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on, plus the
 /// type route's debug rows.
 fn w68_lines() -> Vec<String> {

@@ -25,52 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_REF_WEIGHT_NAMED=on|light|off` (fail-loud, absent = off): **L01⁹, R563-2
-/// (STOP 1), a MEASUREMENT arm**. The objective's Ref soft weight counts only
-/// named slots: struct fields and locals the source names (`var_debug_info`), at
-/// every depth; an anonymous temporary's Ref carries no weight. Era-5c 055: avl's
-/// ten CROWN units are held raw by two call-result temporaries' Refs. The seat
-/// rules on the measured numbers; nothing here changes what is legal.
-pub(crate) fn ref_weight_named() -> bool {
-    ref_weight_temporary().is_some()
-}
-
-/// The Ref weight an anonymous temporary keeps under the arm: `on` = none, `light`
-/// = 2 (above Raw's 1, far below a named slot's `vars.len() + 1`).
-pub(crate) fn ref_weight_temporary() -> Option<u64> {
-    match std::env::var("CRAT_ERA5C_REF_WEIGHT_NAMED").ok().as_deref() {
-        None | Some("off") => None,
-        Some("on") => Some(0),
-        Some("light") => Some(2),
-        Some(other) => {
-            panic!("CRAT_ERA5C_REF_WEIGHT_NAMED must be `on`, `light` or `off`, got {other:?}")
-        }
-    }
-}
-
-/// `CRAT_ERA5C_DEAD_JOIN=on|off` (fail-loud, absent = off): **L01⁹, R563-1** (era-5c
-/// 055, quadtree's `split_node_`/`insert_`). A phi edge that carries a
-/// non-parameter local's never-assigned version 0 adds no ownership equality.
-pub(crate) fn dead_join() -> bool {
-    match std::env::var("CRAT_ERA5C_DEAD_JOIN").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_DEAD_JOIN must be `on` or `off`, got {other:?}"),
-    }
-}
-
-/// `CRAT_ERA5C_OWN_NAMED=on|off` (fail-loud, absent = off): **L01⁹, R565-3 STOP 3, a
-/// MEASUREMENT arm**. Arm 3's Owning-over-Raw preference (soft `own`, weight 3:
-/// above Raw's 1, far below Ref's `vars.len() + 1`) on named locals and on
-/// fields, detached from FINALIZE_SOFT. Objective-only: nothing legal changes.
-pub(crate) fn own_named() -> bool {
-    match std::env::var("CRAT_ERA5C_OWN_NAMED").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_OWN_NAMED must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// The locations whose field load is a strong-update MOVE.
 #[derive(Debug, Default)]
 pub(crate) struct FieldMoves {

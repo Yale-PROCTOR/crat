@@ -226,20 +226,11 @@ pub(crate) fn solver_identity(
         "era5c_realloc_nonzero",
         super::retirement::discharge::realloc_nonzero().to_string(),
     );
-    fields.insert(
-        "era5c_own_named",
-        super::field_moves::own_named().to_string(),
-    );
+    fields.insert("era5c_own_named", "false".to_owned());
     fields.insert("era5c_origin_set", "true".to_owned());
     fields.insert("era5c_exit_close", "false".to_owned());
-    fields.insert(
-        "era5c_dead_join",
-        super::field_moves::dead_join().to_string(),
-    );
-    fields.insert(
-        "era5c_ref_weight_named",
-        format!("{:?}", super::field_moves::ref_weight_temporary()),
-    );
+    fields.insert("era5c_dead_join", "false".to_owned());
+    fields.insert("era5c_ref_weight_named", "None".to_owned());
     // R551 (spec lane B3 (a)): era-5b's three constraint-changing switches were
     // covered only by the launch digest. They are the identity's now.
     fields.insert(

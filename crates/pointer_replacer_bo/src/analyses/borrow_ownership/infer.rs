@@ -570,19 +570,6 @@ where
         bb: BasicBlock,
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
     ) {
-        // L01⁹ (`CRAT_ERA5C_DEAD_JOIN`): a non-parameter local's version 0 is its
-        // never-assigned value; a join edge carrying it carries no value (rustc's
-        // borrow check rejects a use after a join where the local may be
-        // uninitialized), so it adds no ownership equality.
-        let dead_join_arguments = super::field_moves::dead_join().then(|| {
-            infer_cx
-                .tcx
-                .fn_sig(infer_cx.function)
-                .skip_binder()
-                .inputs()
-                .skip_binder()
-                .len()
-        });
         for (local, phi_node) in phi_nodes {
             // This is not necessary if phi nodes have been prune
             phi_node.rhs.sort();
@@ -590,11 +577,6 @@ where
             let lhs = phi_node.lhs;
             for rhs in phi_node.rhs.iter().copied() {
                 if lhs == rhs {
-                    continue;
-                }
-                if dead_join_arguments
-                    .is_some_and(|arguments| rhs.as_u32() == 0 && local.as_usize() > arguments)
-                {
                     continue;
                 }
                 let Some(lhs_sigs) = infer_cx.fn_body_sig[local].get(lhs).cloned() else {

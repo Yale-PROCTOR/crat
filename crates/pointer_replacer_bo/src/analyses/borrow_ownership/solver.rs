@@ -857,19 +857,10 @@ impl KindSolver {
         if add_objective {
             // Prefer Ref where hard constraints allow it, then Owning over Raw.
             let big = vars.len() as u64 + 1;
-            // L01⁹ measurement arm: locals get their Ref weight from
-            // `prefer_ref_for_named`, and only the named ones.
-            let temporary = super::field_moves::ref_weight_temporary();
             // Ref > Owning > Raw: `own` weighs 1 and `raw` nothing. Exactly one kind holds per
             // slot, so a flip gains at most |slots| - 1 < `big`: no reference is ever displaced.
             for (slot, kind_vars) in &vars {
-                match (temporary, slot) {
-                    (Some(0), SlotRef::Local(..)) => {}
-                    (Some(weight), SlotRef::Local(..)) => {
-                        solver.assert_soft(&kind_vars.ref_, weight, None)
-                    }
-                    _ => solver.assert_soft(&kind_vars.ref_, big, None),
-                }
+                solver.assert_soft(&kind_vars.ref_, big, None);
                 solver.assert_soft(&kind_vars.own, 1u64, None);
             }
         }
@@ -1231,32 +1222,6 @@ impl KindSolver {
             || format!("field-and-rev({field:?})"),
             &Bool::or(&clause),
         );
-    }
-
-    /// L01⁹ measurement arm (`CRAT_ERA5C_REF_WEIGHT_NAMED`): the Ref weight of a
-    /// named local's slot, the one `build` withholds from every local.
-    pub(crate) fn prefer_ref_for_named(&self, slot: SlotRef) -> bool {
-        let Some(kind_vars) = self.vars.get(&slot) else {
-            return false;
-        };
-        self.solver
-            .assert_soft(&kind_vars.ref_, self.vars.len() as u64 + 1, None);
-        true
-    }
-
-    /// **L01⁶ arm 3, half two** (R518-2) — seat ownership on the NAMED local.
-    ///
-    /// Weight 3: above L01⁶ (b)'s 2 so a named local outranks an anonymous one,
-    /// and still far below `ref_`'s `vars.len() + 1` so no reference is ever
-    /// displaced. Without this, dropping the finalization blanket lets the
-    /// optimum park the ownership token on a temporary — report 034 §1 measured
-    /// that as `0/13/31 → 28/8/8`.
-    pub(crate) fn prefer_owning_for_named_local(&self, slot: SlotRef) -> bool {
-        let Some(kind_vars) = self.vars.get(&slot) else {
-            return false;
-        };
-        self.solver.assert_soft(&kind_vars.own, 3u64, None);
-        true
     }
 
     /// §9.10.2 companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
