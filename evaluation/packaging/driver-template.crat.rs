@@ -36,11 +36,6 @@ struct Args {
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern types (example: `from::foo to::foo`)")]
     extern_type_hints: Vec<String>,
 
-    #[arg(
-        long,
-        help = "Enable verbose ownership solver output for the translate pass"
-    )]
-    pointer_verbose: bool,
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -49,13 +44,8 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
-    #[arg(
-        long,
-        help = "File of analysis switches for the translate pass (default: $DIR/config/analysis-env.sh when it exists)"
-    )]
-    analysis_env: Option<PathBuf>,
-    #[arg(long, help = "Write the translate pass's emission receipt to this file")]
-    receipt: Option<PathBuf>,
+    #[arg(long, help = "Write the pointer pass's emission receipt to this file")]
+    bo_receipt: Option<PathBuf>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -71,9 +61,10 @@ struct Args {
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
-    Prepare,
-    Translate,
-    Check,
+    Expand,
+    Preprocess,
+    Extern,
+    Pointer,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,7 +74,7 @@ struct Config {
     #[serde(default)]
     r#extern: extern_resolver::Config,
     #[serde(default)]
-    pointer: pointer_replacer::Config,
+    pointer: pointer_replacer_bo::Config,
 
     #[serde(default)]
     c_exposed_fns: Vec<String>,
@@ -111,7 +102,6 @@ fn main() {
     config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
-    config.pointer.verbose |= args.pointer_verbose;
     config.passes.extend(args.pass);
     if args.output.is_some() {
         config.output = args.output;
@@ -174,8 +164,7 @@ fn main() {
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
 
-    let analysis_env = args.analysis_env;
-    let receipt_path = args.receipt;
+    let bo_receipt = args.bo_receipt;
 
     let dir = if let Some(mut output) = config.output {
         output.push(args.input.file_name().unwrap());
@@ -209,45 +198,34 @@ fn main() {
             println!("{pass:?}");
         }
         match pass {
-            Pass::Prepare => {
+            Pass::Expand => {
                 let s = run_compiler_on_path(&file, |tcx| expander::expand(config.expand, tcx))
                     .unwrap();
                 remove_rs_files(&dir, true);
                 std::fs::write(&file, s).unwrap();
+            }
+            Pass::Extern => {
                 let s = run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern(&config.r#extern, tcx)
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
+            }
+            Pass::Preprocess => {
                 let s = run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
                 std::fs::write(&file, s).unwrap();
             }
-            Pass::Check => {
-                run_compiler_on_path(&file, utils::type_check).unwrap();
-            }
-            Pass::Translate => {
-                let env_file = analysis_env.clone().or_else(|| {
-                    std::env::var_os("DIR")
-                        .map(|dir| PathBuf::from(dir).join("config/analysis-env.sh"))
-                        .filter(|path| path.is_file())
+            Pass::Pointer => {
+                let receipt = pointer_replacer_bo::rewrite_bo(
+                    &file,
+                    config.pointer.c_exposed_fns.iter().cloned(),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
                 });
-                if let Some(path) = &env_file {
-                    let n = pointer_replacer::bo_env_from_file(path).unwrap_or_else(|e| {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    });
-                    if config.verbose {
-                        println!("analysis switches: {n} variables set from {}", path.display());
-                    }
-                }
-                let receipt =
-                    pointer_replacer::rewrite_bo(&file, config.pointer.c_exposed_fns.iter().cloned())
-                        .unwrap_or_else(|e| {
-                            eprintln!("{e}");
-                            std::process::exit(1);
-                        });
                 println!("{}", receipt.summary());
-                if let Some(path) = &receipt_path {
+                if let Some(path) = &bo_receipt {
                     std::fs::write(path, receipt.render()).unwrap();
                 }
             }

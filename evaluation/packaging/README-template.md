@@ -32,34 +32,31 @@ translator looks for its build products when it compiles an input program.
 
 The binary is `jobcrat`; the wrapper script `jobcrat` at the top level runs the
 release binary with the rustc sysroot on the library path and `deps_crate`
-located. A translation is two passes, selected with `--pass`:
+located. A translation is four passes, selected with `--pass`:
 
 ```
-./jobcrat --pass prepare,translate -o OUT INPUT
+./jobcrat --pass expand,extern,preprocess,pointer -o OUT INPUT
 ```
 
-`prepare` brings the C2Rust output into the form the analysis reads.
-`translate` runs the ownership and borrowing analysis, the auxiliary analyses,
-and code generation, and replaces the program in place; `--receipt FILE` writes
-the per-file digests of the emission. The analysis switches are read from
-`config/analysis-env.sh` (`--analysis-env FILE` names another file; variables
-already set in the environment win). Functions exposed to C are named with
-`--c-exposed-fn`. `check` type-checks the current state of the program and
-changes nothing.
+`expand`, `extern` and `preprocess` bring the C2Rust output into the form the
+analysis reads: macros expanded, extern declarations resolved to their
+definitions, and duplicated asserts and unreachable code removed. `pointer` runs the ownership and
+borrowing analysis, the auxiliary analyses, and code generation, and replaces
+the program; `--bo-receipt FILE` writes the per-file digests of the emission.
+Functions exposed to C are named with `--c-exposed-fn`.
 
 ## Benchmarks
 
 `benchmarks/crown/` holds the twenty programs of CROWN's benchmark suite as its artifact ships them
 (C2Rust output), `benchmarks/inator/` the eight programs of &inator's suite translated the same way;
-`benchmarks/README.md` and `SHA256SUMS` describe them. `./jobcrat --pass prepare,translate -o OUT
-benchmarks/crown/avl` translates one.
+`benchmarks/README.md` and `SHA256SUMS` describe them. `./jobcrat --pass
+expand,extern,preprocess,pointer -o OUT benchmarks/crown/avl` translates one.
 
 ## Configuration of record
 
-`config/analysis-env.sh` exports the analysis switches the paper's numbers were
-produced with; the `translate` pass reads it. The evaluation also set
-`JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off` and, for CROWN's twenty,
-`JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`; `artifact/run.sh` sets them.
+The analysis has no switches. For CROWN's twenty programs the evaluation set the
+fallback slice extent to 2^28 (`JOBCRAT_FALLBACK_SLICE_EXTENT=268435456`);
+`artifact/run.sh` sets it.
 
 ## Evaluation
 

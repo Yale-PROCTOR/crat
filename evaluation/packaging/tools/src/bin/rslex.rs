@@ -92,8 +92,16 @@ fn main() {
         match mode {
             "dump" => print!("{}", dump(&src)),
             "count" => {
-                let n = tokenize(&src).filter(|t| is_comment(&t.kind)).count();
-                println!("{}\t{}", path, n);
+                let (mut n, mut lines, mut pos) = (0usize, 0usize, 0usize);
+                for t in tokenize(&src) {
+                    let len = t.len as usize;
+                    if is_comment(&t.kind) {
+                        n += 1;
+                        lines += src[pos..pos + len].trim_end_matches('\n').matches('\n').count() + 1;
+                    }
+                    pos += len;
+                }
+                println!("{}\t{}\t{}", path, n, lines);
             }
             "strip" => {
                 let (stripped, n) = strip(&src);
