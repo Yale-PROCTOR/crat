@@ -290,7 +290,7 @@ fn seen_with(name: &str, extra: &[(&str, &str)]) -> Seen {
         .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
         .collect();
     let seen = Seen { rows, kinds };
-    eprintln!("E5C_CM_SEEN {name} mutable={mutable:?} extra={extra:?} {seen:?}");
+    eprintln!("E5C_CM_SEEN {name} extra={extra:?} {seen:?}");
     seen
 }
 
