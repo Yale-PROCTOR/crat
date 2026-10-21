@@ -551,21 +551,12 @@ pub(super) fn assert_non_escaped_liveness_equal(
 /// the landed ones, per round and same input. A FIRE IS A STOP, not a fix — it means the port
 /// added a fact the landed relation did not hold, which the placeholder-omission argument says
 /// is impossible.
-///
-/// Disable with `CRAT_BO_POINT_REQUIRES_TRIPWIRE=off` (its cost is a second loan-liveness
-/// computation per function); any measurement taken with it off must say so.
 pub(super) fn assert_localized_subset(
     landed_loan_liveness: &SparseBitMatrix<PointIndex, Loan>,
     landed_requires: &SparseBitMatrix<Provenance, Loan>,
     ported_loan_liveness: &SparseBitMatrix<PointIndex, Loan>,
     ported_requires: &LocalizedRequires,
 ) {
-    if matches!(
-        std::env::var("CRAT_BO_POINT_REQUIRES_TRIPWIRE").as_deref(),
-        Ok("off") | Ok("0")
-    ) {
-        return;
-    }
     for point in ported_loan_liveness.rows() {
         let Some(ported) = ported_loan_liveness.row(point) else {
             continue;

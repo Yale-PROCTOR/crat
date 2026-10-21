@@ -248,27 +248,16 @@ pub(crate) fn solver_identity(
     fields.insert("esc_minimal", ESC_MINIMAL_MARKER.to_owned());
     fields.insert("fork_engine", "fork".to_owned());
     fields.insert("l2_guarded_commits", "false".to_owned());
-    fields.insert(
-        "nb4r_routing",
-        if matches!(
-            std::env::var("CRAT_NB4R_ROUTING").as_deref(),
-            Ok("off" | "0")
-        ) {
-            "off"
-        } else {
-            "on"
-        }
-        .to_owned(),
-    );
+    fields.insert("nb4r_routing", "on".to_owned());
     fields.insert("repair_mode", RepairMode::current().label().to_owned());
     fields.insert("safe_mono", "per_site".to_owned());
     fields.insert("t2", T2_MARKER.to_owned());
     fields.insert("mutability", "foster-from-program-v1".to_owned());
     fields.insert("era5c_a5_snapshot", "true".to_owned());
+    fields.insert("CRAT_BO_POINT_REQUIRES_TRIPWIRE", String::new());
     for key in [
         "CRAT_BO_EXPORT",
         "CRAT_BO_L2_TRANSITION_DIAGNOSTICS",
-        "CRAT_BO_POINT_REQUIRES_TRIPWIRE",
         "CRAT_POINTER_DECISION_DIAGNOSTICS",
     ] {
         fields.insert(key, std::env::var(key).unwrap_or_default());

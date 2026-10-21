@@ -330,8 +330,7 @@ impl<'a> NativeBorrowContext<'a> {
             );
         // The monotonicity tripwire stays RELEASE-ACTIVE (user decision at landing): the landed
         // flow-insensitive dataflow above is retained solely as its reference, not as a selectable
-        // engine. A fire is a STOP. `CRAT_BO_POINT_REQUIRES_TRIPWIRE=off` skips both the reference
-        // computation and the assert for anyone who needs the cycles back.
+        // engine. A fire is a STOP.
         loan_liveness::assert_localized_subset(
             &landed_loan_liveness,
             &inference.requires,

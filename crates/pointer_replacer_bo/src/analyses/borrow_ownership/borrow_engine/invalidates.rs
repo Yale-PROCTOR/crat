@@ -312,11 +312,6 @@ fn compute_invalidates_inner<'tcx>(
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
 
-    // §NB4-R routing toggle (default ON). `CRAT_NB4R_ROUTING=off|0` disables the cross-alias-write
-    // walk, restoring pre-NB4-R invalidation — the sweep's gross-demotion attribution runs both.
-    let routing_setting = std::env::var("CRAT_NB4R_ROUTING").ok();
-    let routing_enabled = routing_enabled_for(routing_setting.as_deref(), !copy_lends.is_empty());
-
     LoanInvalidatesGenerator {
         facts: &mut invalidates,
         accesses,
@@ -328,36 +323,13 @@ fn compute_invalidates_inner<'tcx>(
         copy_lends,
         parameter_overlap,
         parameter_accesses,
-        issued_loans: if routing_enabled {
-            build_issued_loans(tcx, body, borrow_set)
-        } else {
-            FxHashMap::default()
-        },
-        routing_enabled,
+        issued_loans: build_issued_loans(tcx, body, borrow_set),
         deferring_from: None,
         receiving: None,
     }
     .visit_body(body);
 
     invalidates
-}
-
-fn routing_enabled_for(setting: Option<&str>, has_copy_lends: bool) -> bool {
-    // CopyLend's mandatory free(source)-through-cast rule depends on the issued-loan alias route.
-    // The historical NB4-R ablation may disable that route only when no selected CopyLend exists.
-    has_copy_lends || !matches!(setting, Some("off" | "0"))
-}
-
-#[cfg(test)]
-mod copy_lend_routing_tests {
-    use super::routing_enabled_for;
-
-    #[test]
-    fn copy_lend_keeps_mandatory_alias_routing_under_nb4r_off() {
-        assert!(routing_enabled_for(Some("off"), true));
-        assert!(routing_enabled_for(Some("0"), true));
-        assert!(!routing_enabled_for(Some("off"), false));
-    }
 }
 
 /// §NB4-R — an `offset`-call destination signature `(dest_local, borrowed=(*arg0))`. The fork
@@ -485,10 +457,8 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     parameter_overlap: Option<&'g ParameterOverlap>,
     /// A5-only access stream used to derive conflicts without synthesizing CallArg loans.
     parameter_accesses: Option<&'g mut Vec<ParameterAccess<'tcx>>>,
-    /// §NB4-R routing chain (see `build_issued_loans`). Empty when routing is disabled.
+    /// §NB4-R routing chain (see `build_issued_loans`).
     issued_loans: FxHashMap<Local, Vec<Loan>>,
-    /// §NB4-R toggle (`CRAT_NB4R_ROUTING`); gates the cross-alias-write walk for sweep attribution.
-    routing_enabled: bool,
     /// era-5c (E5C-3): while a call argument's read is attributed to the call
     /// terminator, the statement it was deferred from — its own loans are not
     /// invalidated by their own issuing read.
@@ -716,10 +686,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         // every read view live across it, so routing reads is redundant (and would spuriously demote
         // shared reads of a mutable cell in forced-mut mode). This is the "cross-alias-WRITE routing"
         // divergence class (spec §8).
-        if !self.routing_enabled
-            || kind != AccessKind::Write
-            || place.projection.first() != Some(&PlaceElem::Deref)
-        {
+        if kind != AccessKind::Write || place.projection.first() != Some(&PlaceElem::Deref) {
             return;
         }
         let rest = &place.projection[1..];
