@@ -24,9 +24,8 @@ use super::{
     coherence::{CopyLendPair, SelectedCopyLendLoans, selected_copy_lend_sites},
     crate_slots::CrateSlots,
     l2::{
-        CommitAction, ConflictObservation, DeclineReason as L2DeclineReason, Planner,
-        RoundPlan as L2RoundPlan, SolverDecline as L2SolverDecline,
-        SolverOutcome as L2SolverOutcome, StableLoanKey,
+        ConflictObservation, DeclineReason as L2DeclineReason, Planner, RoundPlan as L2RoundPlan,
+        SolverDecline as L2SolverDecline, SolverOutcome as L2SolverOutcome, StableLoanKey,
     },
     mutability_facts::MutProvider,
     origin_flow::OriginFlowResults,
@@ -1031,52 +1030,6 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
     )
 }
 
-pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
-    program: &RustProgram,
-    slots: &CrateSlots,
-    origin_flows: &OriginFlowResults,
-    solver: &KindSolver,
-    selectors: &Selectors,
-    is_mutable: impl MutProvider + Copy,
-    copy_lends: &FxHashSet<CopyLendPair>,
-) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    verify_to_fixpoint_counting_with_flows_impl(
-        program,
-        slots,
-        origin_flows,
-        solver,
-        selectors,
-        is_mutable,
-        Some(copy_lends),
-        None,
-        None,
-        LoopBackend::HardCheckRoundOptimize,
-    )
-}
-
-pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
-    program: &RustProgram,
-    slots: &CrateSlots,
-    origin_flows: &OriginFlowResults,
-    solver: &KindSolver,
-    selectors: &Selectors,
-    is_mutable: impl MutProvider + Copy,
-    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
-) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    verify_to_fixpoint_counting_with_flows_impl(
-        program,
-        slots,
-        origin_flows,
-        solver,
-        selectors,
-        is_mutable,
-        None,
-        None,
-        Some(parameter_overlaps),
-        LoopBackend::HardCheckRoundOptimize,
-    )
-}
-
 pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -1672,16 +1625,6 @@ fn guarded_observations(
         }
     }
     observations
-}
-
-/// L2 feature-on validate/re-solve loop. This is deliberately separate from
-/// the feature-off branch above: disabled Mode-A retains its original conflict
-/// iteration, assertion order, cap, and `add_borrow_exclusion` calls.
-#[derive(Clone)]
-struct L2ActiveDiagnosticClause {
-    sequence: usize,
-    committed_round: usize,
-    action: CommitAction,
 }
 
 /// R617-1: no production route reaches this loop any more. `CRAT_BO_L2_GUARDED_COMMITS=1` is the
