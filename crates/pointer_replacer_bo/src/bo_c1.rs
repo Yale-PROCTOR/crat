@@ -8241,11 +8241,6 @@ mod run {
         let a16_refined = true;
         let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
-        assert_eq!(
-            WholeProgramAttestation::current(),
-            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-            "A5 batch requires the frozen-graph attestation"
-        );
         row.set("a5_mode", mode.label());
         row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());

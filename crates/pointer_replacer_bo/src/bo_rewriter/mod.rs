@@ -7647,8 +7647,10 @@ fn decide_table_perturbed_config<'tcx>(
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
-    let (a5_mode, attestation) =
-        a5_override.unwrap_or_else(|| (A5Mode::production(), WholeProgramAttestation::current()));
+    let (a5_mode, attestation) = a5_override.unwrap_or((
+        A5Mode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    ));
 
     // Phase 1 input: the BO run, under an explicit capture scope.
     //

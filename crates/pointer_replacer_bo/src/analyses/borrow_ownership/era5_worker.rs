@@ -258,7 +258,7 @@ fn derive(job: &Job, manifest: &BTreeMap<String, String>) -> Result<Completed, F
             structs,
         };
         // L01¹² (R677-4): RQ5's `overlap` row sets `CRAT_BO_A5_MODE=baseline`.
-        let mode = A5Mode::production();
+        let mode = A5Mode::PreciseReplay;
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         if model_cache::current_analysis_digest() != job.semantic.analysis {
             return Err(invalid("analysis tree changed before derivation".into()));

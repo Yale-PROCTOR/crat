@@ -687,20 +687,6 @@ pub(crate) enum A5Mode {
 }
 
 impl A5Mode {
-    /// The mode the solve's worker and the census use: precise replay, unless
-    /// `CRAT_BO_A5_MODE=baseline` (L01¹², R677-4: RQ5's `overlap` row turns A5
-    /// off; fail-loud; carried by the identity's `a5_mode`).
-    pub(crate) fn production() -> Self {
-        match std::env::var("CRAT_BO_A5_MODE").as_deref() {
-            Err(std::env::VarError::NotPresent) | Ok("precise_replay") => Self::PreciseReplay,
-            Ok("baseline") => Self::Baseline,
-            Ok(other) => {
-                panic!("CRAT_BO_A5_MODE must be precise_replay or baseline; got {other:?}")
-            }
-            Err(error) => panic!("CRAT_BO_A5_MODE is not valid Unicode: {error}"),
-        }
-    }
-
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
@@ -772,24 +758,7 @@ pub(crate) enum WholeProgramAttestation {
     FrozenBenchmarkGraph,
 }
 
-impl WholeProgramAttestation {
-    pub(crate) const ENV: &'static str = "CRAT_BO_A5_ATTESTATION";
-
-    pub(crate) fn current() -> Option<Self> {
-        match std::env::var(Self::ENV) {
-            Err(std::env::VarError::NotPresent) => None,
-            Ok(value) => match value.as_str() {
-                "none" => None,
-                "frozen_benchmark_graph" => Some(Self::FrozenBenchmarkGraph),
-                other => panic!(
-                    "{} must be none or frozen_benchmark_graph; got {other:?}",
-                    Self::ENV
-                ),
-            },
-            Err(error) => panic!("{} is not valid Unicode: {error}", Self::ENV),
-        }
-    }
-}
+impl WholeProgramAttestation {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AbiBoundaryFacts {
@@ -1093,7 +1062,6 @@ mod tests {
 
     #[test]
     fn accepted_precise_mode_is_the_single_production_selector() {
-        assert_eq!(A5Mode::production(), A5Mode::PreciseReplay);
         assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
         assert!(A5Mode::CoarseConstraint.is_pricing_control());
     }

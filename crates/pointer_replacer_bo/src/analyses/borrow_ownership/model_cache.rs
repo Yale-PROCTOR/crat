@@ -67,10 +67,8 @@ const ESC_MINIMAL_ALLOWLIST: &[u8] = include_bytes!("esc_minimal_allowlist.tsv")
 #[test]
 #[ignore = "diagnostic: prints the identity field map for a cross-lane diff"]
 fn e5c_print_solver_identity() {
-    // L01¹² (R677-4): the worker's mode (`CRAT_BO_A5_MODE`), so RQ5's `overlap`
-    // row's jobs carry the configuration its worker computes.
     let identity = solver_identity(
-        super::a5_overlap::A5Mode::production(),
+        super::a5_overlap::A5Mode::PreciseReplay,
         Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
     );
     eprintln!(

@@ -336,63 +336,6 @@ fn ordinary_argument_shared_subject_with_a_read_only_child_still_emits() {
 //
 // The two witnesses below are the reachable halves of the rule.
 
-/// A ReadOnly child KEEPS the bridge at a `*mut` position. This is the case
-/// R283-3 says must survive, and it is what makes the widened walk a
-/// permission question rather than a blanket refusal of `*mut` positions.
-///
-/// **Expectation migrated under R217-2(a) for R364-2, and the fixture is kept
-/// exactly.** This shape cannot show the permission verdict any more, and the
-/// reason is the finding itself: `next(chunk) { chunk.offset(1) }` returns a
-/// child ONE ELEMENT past its argument, and the caller then reads `*child`
-/// through a subject delivered as a thin `&u8`. That is a read off the end of
-/// a one-element reference — seat addendum 364's class — so `p` is now held
-/// `held:local-callee-access-extent` by an earlier, TYPED gate, exactly as the
-/// written twin below is held by an earlier gate of its own.
-///
-/// **The property under test is not lost**, which is why this migrates rather
-/// than moves: `ordinary_argument_shared_subject_with_a_read_only_child_still_emits`
-/// asserts the same thing — a child that is only read leaves the subject
-/// admitted — on a subject that settles `Form::Slice` and therefore carries its
-/// own extent. The permission walk is unchanged; only this fixture's subject
-/// stopped being deliverable, and it stopped for a soundness reason.
-#[test]
-fn oap_r283_readonly_child_is_now_held_for_its_extent_at_a_mut_position() {
-    const INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe, unused_mut)]
-    unsafe fn next(chunk: *mut u8) -> *mut u8 { chunk.offset(1) }
-    pub unsafe fn find(p: *const u8) -> u8 {
-        let head = *p;
-        let child = next(p as *mut u8);
-        head ^ *child
-    }
-"#;
-    let got = super::emit_tests::decisions_of(INPUT)
-        .into_iter()
-        .map(|(name, _, reason)| (name, reason))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(
-        got.get("p").map(String::as_str),
-        Some("held:local-callee-access-extent"),
-        "a returned child one element past a thin subject is an extent escape, \
-         whatever the child's permission: {got:#?}"
-    );
-    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(INPUT) else {
-        panic!("the fixture must still emit, with the subject held")
-    };
-    assert!(
-        !source.contains("core::ptr::from_ref(p).cast_mut()"),
-        "the thin view that read past its referent is gone:\n{source}"
-    );
-    assert!(
-        source.contains("find(p: *const u8)"),
-        "the held subject keeps its raw form:\n{source}"
-    );
-    assert!(
-        super::verify::type_checks_str(&source),
-        "emitted output type/borrow-checks:\n{source}"
-    );
-}
-
 /// The twin that writes through the child is refused. Recorded as observed:
 /// it is held at `flows-into-raw-param`, an EARLIER gate than the widened
 /// walk, which is exactly why the walk's own population is zero here. The

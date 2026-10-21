@@ -123,7 +123,7 @@ pub fn rewrite_bo(
         "{:x}",
         Sha256::digest(
             model_cache::solver_identity(
-                A5Mode::production(),
+                A5Mode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .as_bytes()
