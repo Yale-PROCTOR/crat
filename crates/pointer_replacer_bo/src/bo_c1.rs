@@ -7345,11 +7345,6 @@ mod run {
         events: &[(SlotRef, usize)],
         row: &mut Row,
     ) {
-        assert!(
-            l2::diagnostics_enabled_from_env(),
-            "certified-context replay requires CRAT_POINTER_DECISION_DIAGNOSTICS"
-        );
-
         let program_name = std::env::var("CRAT_BOC1_NAME")
             .expect("certified-context worker requires program name");
         let expected = super::l2_red_gate::targets_for(&program_name);

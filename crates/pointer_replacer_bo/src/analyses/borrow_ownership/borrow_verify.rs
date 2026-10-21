@@ -986,22 +986,16 @@ fn solve_round(
     hard: Option<&HardLoopSolver>,
     planner: Option<&Planner>,
     stats: &mut RoundStats,
-    diagnostics_enabled: bool,
 ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
-    let Some(planner) = planner else {
+    if planner.is_none() {
         return solve_round_model(solver, selectors, backend, hard);
-    };
+    }
     let decline = match solve_l2_round_model(solver, selectors, backend, hard) {
         L2SolveResult::Sat { kinds, dropped } => return Some((kinds, dropped)),
         L2SolveResult::Unsat => L2SolverDecline::Unsat,
         L2SolveResult::Unknown => L2SolverDecline::Unknown,
     };
-    record_l2_decline(
-        stats,
-        planner.validation_rounds(),
-        L2DeclineReason::Solver(decline),
-        diagnostics_enabled,
-    );
+    record_l2_decline(stats, L2DeclineReason::Solver(decline));
     None
 }
 
@@ -1169,12 +1163,6 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     }
     solver.pop_scope();
     let fallback = GuardedFallback::of(&guarded);
-    if l2::diagnostics_enabled_from_env() {
-        eprintln!(
-            "[bo-l2] event=guarded_fallback|reason={}|rounds={}|commits={}",
-            fallback.reason, fallback.rounds, fallback.commits
-        );
-    }
     let (model, mut stats) = rounds(RepairMode::ModeA);
     stats.repair = RepairMode::Guarded;
     stats.guarded_fallback = Some(fallback);
@@ -1199,7 +1187,6 @@ fn verify_rounds(
     // R617-1: the guarded planner lives across rounds, and is told of every round -- the
     // retirement pins' and the field-own repair's as empty ones -- so its validation counter
     // stays equal to `stats.rounds`. Its own cap (10S + 1) bounds the guarded rounds.
-    let diagnostics_enabled = repair == RepairMode::Guarded && l2::diagnostics_enabled_from_env();
     let mut planner = (repair == RepairMode::Guarded).then(|| {
         let slot_count = slots
             .fn_local_slots
@@ -1231,7 +1218,6 @@ fn verify_rounds(
         hard.as_ref(),
         planner.as_ref(),
         &mut stats,
-        diagnostics_enabled,
     ) else {
         return (None, stats);
     };
@@ -1378,7 +1364,7 @@ fn verify_rounds(
         }
         let raw_targets = reviewed.retirement.raw_targets();
         if !raw_targets.is_empty() {
-            if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
+            if !planner_empty_round(planner.as_mut(), &mut stats, &model) {
                 return (None, stats);
             }
             for target in &raw_targets {
@@ -1405,7 +1391,6 @@ fn verify_rounds(
                 hard.as_ref(),
                 planner.as_ref(),
                 &mut stats,
-                diagnostics_enabled,
             ) else {
                 return (None, stats);
             };
@@ -1452,7 +1437,7 @@ fn verify_rounds(
             // L01⁹: an OWNING field in a residual is demoted (`¬own`, monotone) instead of
             // declining the program.
             if !w69_fault(repair, "no-field-own") && model.get(&field) == Some(&SlotKind::Owning) {
-                if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
+                if !planner_empty_round(planner.as_mut(), &mut stats, &model) {
                     return (None, stats);
                 }
                 let owning: rustc_hash::FxHashSet<SlotRef> = conflicts
@@ -1475,7 +1460,6 @@ fn verify_rounds(
                     hard.as_ref(),
                     planner.as_ref(),
                     &mut stats,
-                    diagnostics_enabled,
                 ) else {
                     return (None, stats);
                 };
@@ -1600,8 +1584,6 @@ fn verify_rounds(
                     &reviewed.retirement,
                     witnessed,
                     &model,
-                    &stats,
-                    diagnostics_enabled,
                 );
                 match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
                     L2RoundPlan::Accept { validation_round } => {
@@ -1620,7 +1602,6 @@ fn verify_rounds(
                         );
                         for action in &actions {
                             solver.add_l2_commit(action);
-                            emit_l2_action_diagnostic(action, diagnostics_enabled);
                             if ledger && let Some(track) = solver.last_track() {
                                 use super::raw_cause::CommitKind;
                                 let kind = match action.kind {
@@ -1680,12 +1661,7 @@ fn verify_rounds(
                             stats.rounds, validation_round,
                             "guarded planner/fixpoint validation-round counters diverged"
                         );
-                        record_l2_decline(
-                            &mut stats,
-                            validation_round,
-                            reason,
-                            diagnostics_enabled,
-                        );
+                        record_l2_decline(&mut stats, reason);
                         return (None, stats);
                     }
                 }
@@ -1737,7 +1713,6 @@ fn verify_rounds(
             hard.as_ref(),
             planner.as_ref(),
             &mut stats,
-            diagnostics_enabled,
         ) {
             Some((m, dropped)) => {
                 record_dropped(&mut stats, selectors, &dropped);
@@ -1794,7 +1769,6 @@ fn planner_empty_round(
     planner: Option<&mut Planner>,
     stats: &mut RoundStats,
     model: &FxHashMap<SlotRef, SlotKind>,
-    diagnostics_enabled: bool,
 ) -> bool {
     let Some(planner) = planner else {
         return true;
@@ -1807,11 +1781,8 @@ fn planner_empty_round(
             );
             true
         }
-        L2RoundPlan::Decline {
-            validation_round,
-            reason,
-        } => {
-            record_l2_decline(stats, validation_round, reason, diagnostics_enabled);
+        L2RoundPlan::Decline { reason, .. } => {
+            record_l2_decline(stats, reason);
             false
         }
         L2RoundPlan::Continue { .. } => panic!("empty L2 observations produced commit actions"),
@@ -1826,8 +1797,6 @@ fn guarded_observations(
     retirement: &super::retirement::RetirementReview,
     witnessed: &FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>>,
     model: &FxHashMap<SlotRef, SlotKind>,
-    stats: &RoundStats,
-    diagnostics_enabled: bool,
 ) -> Vec<ConflictObservation> {
     let mut observations = Vec::new();
     for failure in reader_failures {
@@ -1871,29 +1840,6 @@ fn guarded_observations(
                 let loan = witnessed.loan.expect("a stable loan key has its loan");
                 observation = observation.with_loan_identity(loan, stable_loan_key);
             }
-            if diagnostics_enabled {
-                eprintln!(
-                    "[bo-l2] {}",
-                    l2::conflict_witness_diagnostic(
-                        stats.rounds,
-                        did.local_def_index.as_u32(),
-                        // An A5 parameter edge has no loan behind it.
-                        witnessed.loan.unwrap_or(usize::MAX),
-                        target,
-                        witnessed.conflict.issuer,
-                        &witnessed.conflict.requirers,
-                        &witnessed.invalidators,
-                    )
-                );
-                // W69c: the hazard key, with the invalidators met through an A5 partner.
-                if witnessed.stable_loan_key.is_some() {
-                    eprintln!(
-                        "[bo-l2] event=guarded_hazard|round={}|hazard={}",
-                        stats.rounds,
-                        observation.hazard_key_diagnostic()
-                    );
-                }
-            }
             observations.push(observation);
         }
     }
@@ -1908,57 +1854,6 @@ struct L2ActiveDiagnosticClause {
     sequence: usize,
     committed_round: usize,
     action: CommitAction,
-}
-
-#[derive(Default)]
-struct L2TransitionDiagnostics {
-    active: Vec<L2ActiveDiagnosticClause>,
-    previous_model: Option<FxHashMap<SlotRef, SlotKind>>,
-}
-
-impl L2TransitionDiagnostics {
-    fn emit_round(
-        &self,
-        validation_round: usize,
-        planner: &Planner,
-        model: &FxHashMap<SlotRef, SlotKind>,
-    ) {
-        eprintln!(
-            "[bo-l2] event=l2_round_state|round={validation_round}|active_clauses={}",
-            self.active.len()
-        );
-        let previous_model = self.previous_model.as_ref().unwrap_or(model);
-        for clause in &self.active {
-            eprintln!(
-                "[bo-l2] {}",
-                l2::clause_state_diagnostic(
-                    &clause.action,
-                    clause.sequence,
-                    clause.committed_round,
-                    validation_round,
-                    previous_model,
-                    model,
-                    |slot| planner.lifecycle(slot),
-                )
-            );
-        }
-    }
-
-    fn record_actions(
-        &mut self,
-        committed_round: usize,
-        actions: &[CommitAction],
-        model: &FxHashMap<SlotRef, SlotKind>,
-    ) {
-        self.previous_model = Some(model.clone());
-        for action in actions {
-            self.active.push(L2ActiveDiagnosticClause {
-                sequence: self.active.len() + 1,
-                committed_round,
-                action: action.clone(),
-            });
-        }
-    }
 }
 
 /// R617-1: no production route reaches this loop any more. `CRAT_BO_L2_GUARDED_COMMITS=1` is the
@@ -2039,9 +1934,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         !solver.is_diagnostic_tracked(),
         "diagnostic-tracked KindSolver must not enter the l2 door"
     );
-    let diagnostics_enabled = l2::diagnostics_enabled_from_env();
-    let mut transition_diagnostics =
-        l2::transition_diagnostics_enabled_from_env().then(L2TransitionDiagnostics::default);
     let slot_count = slots
         .fn_local_slots
         .values()
@@ -2063,32 +1955,21 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     {
         L2SolveResult::Sat { kinds, dropped } => (kinds, dropped),
         L2SolveResult::Unsat => {
-            record_l2_decline(
-                &mut stats,
-                planner.validation_rounds(),
-                L2DeclineReason::Solver(L2SolverDecline::Unsat),
-                diagnostics_enabled,
-            );
+            record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
             return (None, stats);
         }
         L2SolveResult::Unknown => {
             record_l2_decline(
                 &mut stats,
-                planner.validation_rounds(),
                 L2DeclineReason::Solver(L2SolverDecline::Unknown),
-                diagnostics_enabled,
             );
             return (None, stats);
         }
     };
     record_dropped(&mut stats, selectors, &dropped);
-    let mut diagnostic_slots = diagnostics_enabled.then(Vec::new);
 
     loop {
         stats.rounds += 1;
-        if let Some(diagnostics) = &transition_diagnostics {
-            diagnostics.emit_round(stats.rounds, &planner, &model);
-        }
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
         let _original_cell_model =
@@ -2122,7 +2003,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         );
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved;
-            emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
             return (None, stats);
         }
         let raw_targets = reviewed.retirement.raw_targets();
@@ -2140,12 +2020,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                         "L2 coverage/planner validation counters diverged"
                     );
                 }
-                L2RoundPlan::Decline {
-                    validation_round,
-                    reason,
-                } => {
-                    record_l2_decline(&mut stats, validation_round, reason, diagnostics_enabled);
-                    emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                L2RoundPlan::Decline { reason, .. } => {
+                    record_l2_decline(&mut stats, reason);
                     return (None, stats);
                 }
                 L2RoundPlan::Continue { .. } => {
@@ -2166,20 +2042,13 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     continue;
                 }
                 L2SolveResult::Unsat => {
-                    record_l2_decline(
-                        &mut stats,
-                        planner.validation_rounds(),
-                        L2DeclineReason::Solver(L2SolverDecline::Unsat),
-                        diagnostics_enabled,
-                    );
+                    record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
                     return (None, stats);
                 }
                 L2SolveResult::Unknown => {
                     record_l2_decline(
                         &mut stats,
-                        planner.validation_rounds(),
                         L2DeclineReason::Solver(L2SolverDecline::Unknown),
-                        diagnostics_enabled,
                     );
                     return (None, stats);
                 }
@@ -2229,7 +2098,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     {
                         stats.field_conflict_decline = Some(field);
                         stats.field_conflict_kind = model.get(&field).copied();
-                        emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                         return (None, stats);
                     }
                     continue;
@@ -2246,32 +2114,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     observation = observation.with_loan_identity(loan, stable_loan_key);
                 }
                 observations.push(observation);
-                if diagnostics_enabled {
-                    let record = if let Some(stable_loan_key) = witnessed.stable_loan_key {
-                        l2::conflict_witness_diagnostic_stable(
-                            stats.rounds,
-                            did.local_def_index.as_u32(),
-                            witnessed.loan.expect("a stable loan key has its loan"),
-                            stable_loan_key,
-                            target,
-                            witnessed.conflict.issuer,
-                            &witnessed.conflict.requirers,
-                            &witnessed.invalidators,
-                        )
-                    } else {
-                        l2::conflict_witness_diagnostic(
-                            stats.rounds,
-                            did.local_def_index.as_u32(),
-                            // A5 parameter edge (R617-1): no loan behind it.
-                            witnessed.loan.unwrap_or(usize::MAX),
-                            target,
-                            witnessed.conflict.issuer,
-                            &witnessed.conflict.requirers,
-                            &witnessed.invalidators,
-                        )
-                    };
-                    eprintln!("[bo-l2] {}", record);
-                }
             }
         }
 
@@ -2282,7 +2124,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     "L2 planner/fixpoint validation-round counters diverged"
                 );
                 stats.commits_per_round.push(0);
-                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 super::licensing::stack_export::accept(solver.ownership_facts());
                 return (Some(model), stats);
             }
@@ -2304,22 +2145,13 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     stats.rounds, validation_round,
                     "L2 planner/fixpoint validation-round counters diverged"
                 );
-                record_l2_decline(&mut stats, validation_round, reason, diagnostics_enabled);
-                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                record_l2_decline(&mut stats, reason);
                 return (None, stats);
             }
         };
 
         for action in &actions {
-            if let Some(slots) = diagnostic_slots.as_mut() {
-                slots.push(action.target);
-                slots.extend(action.peers.iter().copied());
-            }
             solver.add_l2_commit(action);
-            emit_l2_action_diagnostic(action, diagnostics_enabled);
-        }
-        if let Some(diagnostics) = &mut transition_diagnostics {
-            diagnostics.record_actions(stats.rounds, &actions, &model);
         }
         stats.commits_conflict += actions.len();
         stats.commits_per_round.push(actions.len());
@@ -2330,74 +2162,21 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                 record_dropped(&mut stats, selectors, &dropped);
             }
             L2SolveResult::Unsat => {
-                record_l2_decline(
-                    &mut stats,
-                    planner.validation_rounds(),
-                    L2DeclineReason::Solver(L2SolverDecline::Unsat),
-                    diagnostics_enabled,
-                );
-                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
                 return (None, stats);
             }
             L2SolveResult::Unknown => {
                 record_l2_decline(
                     &mut stats,
-                    planner.validation_rounds(),
                     L2DeclineReason::Solver(L2SolverDecline::Unknown),
-                    diagnostics_enabled,
                 );
-                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 return (None, stats);
             }
         }
     }
 }
 
-fn emit_l2_final_diagnostics(
-    slots: Option<&mut Vec<SlotRef>>,
-    model: &FxHashMap<SlotRef, SlotKind>,
-) {
-    let Some(slots) = slots else {
-        return;
-    };
-    slots.sort_by_key(|slot| l2::SlotKey::of(*slot));
-    slots.dedup();
-    for &slot in slots.iter() {
-        let kind = match model
-            .get(&slot)
-            .copied()
-            .expect("every emitted L2 diagnostic slot must exist in the solved model")
-        {
-            SlotKind::Ref => "ref",
-            SlotKind::Raw => "raw",
-            SlotKind::Owning => "owning",
-        };
-        eprintln!(
-            "[bo-l2] event=l2_final|slot={}|kind={kind}",
-            l2::slotref_diagnostic(slot)
-        );
-    }
-}
-
-fn emit_l2_action_diagnostic(action: &CommitAction, enabled: bool) {
-    if enabled {
-        eprintln!(
-            "[bo-l2] {}|witnessed_peers={}",
-            action.diagnostic_label,
-            l2::witnessed_peers_diagnostic(action)
-        );
-    }
-}
-
-fn record_l2_decline(
-    stats: &mut RoundStats,
-    validation_round: usize,
-    reason: L2DeclineReason,
-    diagnostics_enabled: bool,
-) {
-    if diagnostics_enabled {
-        eprintln!("[bo-l2] {}", reason.diagnostic_label(validation_round));
-    }
+fn record_l2_decline(stats: &mut RoundStats, reason: L2DeclineReason) {
     stats.l2_decline = Some(reason);
 }
 

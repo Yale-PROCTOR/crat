@@ -98,35 +98,6 @@ impl HazardKey {
     }
 }
 
-/// R7 uses the existing decision-diagnostics switch as its sole output gate.
-/// Match that switch's established off values; every other valid string uses
-/// its raw-compatible behavior.
-pub(crate) fn diagnostics_enabled_from_env() -> bool {
-    let value = std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS").ok();
-    !matches!(
-        crate::rewriter::diagnostics::DiagnosticsMode::from_env_value(value.as_deref()),
-        crate::rewriter::diagnostics::DiagnosticsMode::Off
-    )
-}
-
-/// Extra D1 forensics layered on R7. This is resolved only inside the
-/// feature-on L2 loop, so feature-off does not inspect the variable or allocate
-/// transition state.
-pub(crate) fn transition_diagnostics_enabled_from_env() -> bool {
-    const ENV: &str = "CRAT_BO_L2_TRANSITION_DIAGNOSTICS";
-    let enabled = match std::env::var(ENV).as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
-        Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
-        Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
-    };
-    assert!(
-        !enabled || diagnostics_enabled_from_env(),
-        "{ENV}=1 requires CRAT_POINTER_DECISION_DIAGNOSTICS"
-    );
-    enabled
-}
-
 /// A residual borrow-conflict edge translated wholly into BO slots.
 ///
 /// `target` is the unchanged Mode-A A′ representative. `issuer`,
@@ -319,32 +290,6 @@ pub(crate) fn conflict_witness_diagnostic_stable(
     record.push_str("|stable_loan=");
     record.push_str(&stable_loan_key.diagnostic());
     record
-}
-
-/// Explicit, stable per-peer witnessed kinds for the env-gated R7 record.
-///
-/// `diagnostic_label` retains the pinned legacy all-Ref form used by the RED
-/// determinism test and tracked core labels; the emitted R7 line appends this
-/// field so every action records polarity without an implicit convention.
-pub(crate) fn witnessed_peers_diagnostic(action: &CommitAction) -> String {
-    let owning_keys = slot_keys(&action.owning_peers);
-    action
-        .peers
-        .iter()
-        .map(|slot| {
-            let key = SlotKey::of(*slot);
-            if owning_keys.contains(&key) {
-                return format!("{}:owning", key.diagnostic());
-            }
-            let witness = action
-                .peer_witnesses
-                .iter()
-                .find(|witness| witness.slot == *slot)
-                .expect("every non-Owning R7 peer has witnessed polarity");
-            format!("{}:{}", key.diagnostic(), witness.kind.diagnostic())
-        })
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// Canonical identity of the conflict edge that spawned a commit.

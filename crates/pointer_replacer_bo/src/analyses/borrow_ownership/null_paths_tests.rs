@@ -3693,18 +3693,14 @@ fn e5c_w74_the_ledger_names_each_commits_clause() {
     );
 }
 
-/// W69 (R617-1): the W63 child under the guarded repair with the L2 diagnostics on -- its lines,
-/// and the planner's `[bo-l2]` lines prefixed `l2 `.
+/// W69 (R617-1): the W63 child under the guarded repair -- its lines.
 fn w69_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
-    let mut env: Vec<(&str, &str)> = vec![("CRAT_POINTER_DECISION_DIAGNOSTICS", "raw")];
-    env.extend_from_slice(extra);
-    w63_child(shape, &env)
+    w63_child(shape, extra)
         .lines()
         .filter_map(|l| {
             l.find("E5C_W63 ")
                 .map(|i| l[i + 8..].to_owned())
                 .or_else(|| l.find("E5C_MODEL ").map(|i| l[i + 10..].to_owned()))
-                .or_else(|| l.find("[bo-l2] ").map(|i| format!("l2 {}", &l[i + 8..])))
         })
         .collect()
 }
@@ -3713,8 +3709,7 @@ fn w69_model(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
         .filter(|l| {
-            !l.starts_with("l2 ")
-                && !l.starts_with("repair-receipt ")
+            !l.starts_with("repair-receipt ")
                 && !l.starts_with("residuals ")
                 && !l.starts_with("validate ")
                 && !l.starts_with("lendable ")
@@ -3782,8 +3777,7 @@ fn w69_solve(
 const W69_CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
     unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
 
-/// W69b's search (R617-1): shapes under both repairs, one line each; with the diagnostics switch the
-/// planner's `[bo-l2]` lines name any recurrence escalation.
+/// W69b's search (R617-1): shapes under both repairs, one line each.
 #[test]
 #[ignore = "the search for W69b's escalation shape"]
 fn e5c_inner_w69_search() {
@@ -3889,31 +3883,6 @@ fn e5c_w69_a_a_guarded_round_lifts_a_mode_a_over_pin() {
         "RED: the guarded run keeps no more Ref than Mode-A ({guarded} vs {mode_a}); \
          {stats:?} vs {mode_a_stats:?}"
     );
-}
-
-/// W69c: an A5 overlap pair is in the guarded replay's context. `same_`'s two formals share one type
-/// (W68c's effective pair). Before the port the dispatch refused A5 in the L2 loop (a panic); the
-/// guarded run accepts without falling back, and the conflict met through the partner carries the
-/// mark in its hazard key. Fault `no-a5-context`: the mark is gone.
-#[test]
-fn e5c_w69_c_an_a5_pair_is_in_the_guarded_witness_context() {
-    let on = w69_lines("w68-shapes", &[]);
-    assert!(
-        on.contains(&"repair-receipt repair=guarded".to_owned()),
-        "{on:?}"
-    );
-    assert!(
-        on.contains(&"repair-receipt guarded_fallbacks=0".to_owned()),
-        "{on:?}"
-    );
-    let marked = |lines: &[String]| {
-        lines
-            .iter()
-            .any(|l| l.starts_with("l2 event=guarded_hazard") && l.contains("~partner:"))
-    };
-    assert!(marked(&on), "{on:?}");
-    let fault = w69_lines("w68-shapes", &[("CRAT_E5C_W69_FAULT", "no-a5-context")]);
-    assert!(!marked(&fault), "the fault must be caught: {fault:?}");
 }
 
 /// W69d: a guarded accept records the residual certificate, the rows Mode-A records on the same
