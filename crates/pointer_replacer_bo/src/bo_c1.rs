@@ -6569,9 +6569,9 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                A2Mode, BoConstruction, CopyLendMode, construct_bo_into,
-                solve_bo_a5_config_reporting, solve_bo_a5_reference_reporting,
-                verify_bo_construction_counting, verify_bo_construction_with_flows,
+                BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config_reporting,
+                solve_bo_a5_reference_reporting, verify_bo_construction_counting,
+                verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2, model_cache,
@@ -8241,7 +8241,6 @@ mod run {
         let a16_refined = true;
         let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
-        assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
             WholeProgramAttestation::current(),
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
@@ -8250,7 +8249,7 @@ mod run {
         row.set("a5_mode", mode.label());
         row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
-        row.set("a2_mode", A2Mode::Off.label());
+        row.set("a2_mode", "off");
         row.set("soundness_mode", soundness_mode);
         row.set("phase2_baseline_only", baseline_only);
         row.set("z3_full_version", z3::full_version().to_string());

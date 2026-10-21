@@ -56,58 +56,10 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-pub(crate) const A2_MODE_ENV: &str = "CRAT_BO_A2_MODE";
-
 pub(crate) fn plan_a5_c9_marks(
     witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
 ) -> BTreeSet<C9MarkKey> {
     plan_c9_marks(witnesses)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum A2Mode {
-    #[default]
-    Off,
-    DefinitelyOverwritten,
-}
-
-impl A2Mode {
-    pub(crate) fn current() -> Self {
-        #[cfg(test)]
-        if let Some(mode) = A2_MODE_OVERRIDE.with(Cell::get) {
-            return mode;
-        }
-        match std::env::var(A2_MODE_ENV) {
-            Err(std::env::VarError::NotPresent) => Self::Off,
-            Ok(value) => match value.as_str() {
-                "off" => Self::Off,
-                "definitely_overwritten" => Self::DefinitelyOverwritten,
-                other => {
-                    panic!("{A2_MODE_ENV} must be off or definitely_overwritten; got {other:?}")
-                }
-            },
-            Err(error) => panic!("{A2_MODE_ENV} is not valid Unicode: {error}"),
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::DefinitelyOverwritten => "definitely_overwritten",
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_override<T>(self, f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<A2Mode>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                A2_MODE_OVERRIDE.with(|slot| slot.set(self.0));
-            }
-        }
-        let _restore = Restore(A2_MODE_OVERRIDE.with(|slot| slot.replace(Some(self))));
-        f()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,7 +103,6 @@ impl CopyLendMode {
 #[cfg(test)]
 thread_local! {
     static COPY_LEND_MODE_OVERRIDE: Cell<Option<CopyLendMode>> = const { Cell::new(None) };
-    static A2_MODE_OVERRIDE: Cell<Option<A2Mode>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -220,7 +171,6 @@ pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) field_ref_plan: FieldRefPlan,
-    pub(crate) a2_mode: A2Mode,
     pub(crate) a2_killed_memberships: usize,
     pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
@@ -1218,7 +1168,6 @@ fn construct_bo_into_with_esc(
         mode,
         nullability,
         field_ref_plan,
-        a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
         selectors,
@@ -1430,7 +1379,6 @@ pub(crate) fn construct_tracked_census_baseline(
         mode: CopyLendMode::Baseline,
         nullability,
         field_ref_plan: FieldRefPlan::default(),
-        a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
         selectors,
@@ -1472,7 +1420,6 @@ pub(crate) fn construct_bo_into_a2(
         );
         guards += 1;
     }
-    construction.a2_mode = A2Mode::DefinitelyOverwritten;
     construction.a2_killed_memberships = a2.killed_memberships;
     construction.a2_opaque_result_guards = guards;
     Ok(construction)
@@ -2946,12 +2893,5 @@ mod mode_tests {
         let right = canonical_receipt("status=ok\na=1\ndata=true\nz=3\nschema=x\n".to_owned());
         assert_eq!(left, right);
         assert_eq!(left, "schema=x\nstatus=ok\ndata=true\na=1\nz=3\n");
-    }
-
-    #[test]
-    fn dormant_a2_defaults_off() {
-        assert_eq!(A2Mode::default(), A2Mode::Off);
-        assert_eq!(A2Mode::default().label(), "off");
-        assert_eq!(A2Mode::Off.with_override(A2Mode::current), A2Mode::Off);
     }
 }

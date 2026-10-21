@@ -29,7 +29,7 @@ use super::{
     SlotKind,
     a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
     borrow_verify::RepairMode,
-    construction::{A2Mode, CopyLendMode},
+    construction::CopyLendMode,
     crate_slots::CrateSlots,
     slot_key::{field_key, local_key},
     solver::SlotRef,
@@ -125,7 +125,7 @@ pub(crate) fn solver_identity(
     );
     fields.insert("a14", A14_MARKER.to_owned());
     fields.insert("a16", A16_MARKER.to_owned());
-    fields.insert("a2_mode", A2Mode::current().label().to_owned());
+    fields.insert("a2_mode", "off".to_owned());
     fields.insert("a5_mode", a5_mode.label().to_owned());
     fields.insert(
         "a5_attestation",
