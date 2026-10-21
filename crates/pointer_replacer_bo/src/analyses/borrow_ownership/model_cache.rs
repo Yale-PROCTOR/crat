@@ -169,10 +169,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_reseat_a1", "true".to_owned());
     fields.insert("era5c_traversal_ref", "false".to_owned());
     fields.insert("era5c_own_prefer_local", "false".to_owned());
-    fields.insert(
-        "era5c_finalize_soft",
-        super::field_moves::finalize_soft().to_string(),
-    );
+    fields.insert("era5c_finalize_soft", "false".to_owned());
     fields.insert(
         "era5c_mut_model",
         super::field_moves::mut_model().to_string(),

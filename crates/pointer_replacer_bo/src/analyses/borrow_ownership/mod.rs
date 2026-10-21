@@ -581,9 +581,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
         }
     }
-    // L01⁶ arm 3 half two (R518-2): with the finalization blanket gone, prefer
-    // the NAMED locals as owners so the token is not smeared onto temporaries.
-    if field_moves::finalize_soft() || field_moves::own_named() {
+    if field_moves::own_named() {
         // L01⁹ (R565-3 STOP 3, `CRAT_ERA5C_OWN_NAMED`): arm 3's weight-3 Owning
         // preference, detached from FINALIZE_SOFT, on named locals AND fields.
         if field_moves::own_named() {

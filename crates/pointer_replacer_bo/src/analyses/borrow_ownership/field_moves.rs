@@ -281,33 +281,6 @@ pub(crate) fn overlap_type_route() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_FINALIZE_SOFT=on|off` (fail-loud, absent = off): **L01⁶ arm 3**
-/// (R518-2). `temporary-finalization` stops being a blanket hard assumption and
-/// becomes an objective question, under the R101 leak-parity waiver.
-///
-/// Two halves, and the second is what makes the first work. Report 034 §1
-/// measured that dropping the blanket alone *degrades* bst's corpus form
-/// (`0/13/31 → 28/8/8`) — with no finalization the optimum had no reason to
-/// seat the ownership token on the NAMED local rather than on a temporary, so
-/// ownership smeared. R518-2 reads that correctly as an objective gap, not a
-/// reason to keep the blanket. So this arm:
-///
-///   1. drops the hard `own = false` finalization of temporaries, and
-///   2. adds a soft `own` preference on every slot that is a NAMED local
-///      (one with `var_debug_info`), at a weight above L01⁶ (b)'s, so the
-///      optimum seats the token on the name the source gave it.
-///
-/// Soundness lines untouched: fresh ≠ Ref, one owner (`own-linear` stays hard),
-/// frees at C free sites. Every admitted implicit close is the R101 waiver's
-/// `waiver-drop(scope-exit)` site, which the emission side already counts.
-pub(crate) fn finalize_soft() -> bool {
-    match std::env::var("CRAT_ERA5C_FINALIZE_SOFT").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_FINALIZE_SOFT must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// The locations whose field load is a strong-update MOVE.
 #[derive(Debug, Default)]
 pub(crate) struct FieldMoves {

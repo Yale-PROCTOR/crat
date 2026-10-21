@@ -1186,11 +1186,7 @@ where
 
         // finalize temporaries
         //
-        let skip_finalization = super::field_moves::finalize_soft();
         with_own_assume_site(OwnAssumeSite::TemporaryFinalization, || {
-            if skip_finalization {
-                return;
-            }
             for (local, vars) in locals {
                 let Some(vars) = vars else {
                     continue;
