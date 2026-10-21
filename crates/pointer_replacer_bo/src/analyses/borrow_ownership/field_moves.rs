@@ -25,16 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_FIELD_MOVE=on|off` (fail-loud, absent = off): L01⁵ (ii)'s pin.
-/// Separate from `CRAT_ERA5C_MOVE_TRACKING` because L01⁗ is sealed and landing.
-pub(crate) fn field_move() -> bool {
-    match std::env::var("CRAT_ERA5C_FIELD_MOVE").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_FIELD_MOVE must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_LEAK_PARITY=on|off` (fail-loud, absent = off): L01^5 (i)'s pin —
 /// prefer `Owning` for the field slots of a program that has no sink at all.
 pub(crate) fn leak_parity_admission() -> bool {
@@ -476,9 +466,6 @@ fn mentions_place(body: &Body<'_>, location: Location, place: &NullPlace) -> boo
 /// Compute the strong-update field moves of `body`.
 pub(crate) fn compute<'tcx>(body: &Body<'tcx>) -> FieldMoves {
     let mut out = FieldMoves::default();
-    if !field_move() {
-        return out;
-    }
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
             let location = Location {

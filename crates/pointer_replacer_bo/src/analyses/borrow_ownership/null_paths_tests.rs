@@ -668,7 +668,6 @@ fn e5c_w21_bst_main_side_check_at_l01p5() {
             ("CRAT_ERA5B_RETURN_PORT", "on"),
             ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_FIELD_MOVE", "on"),
             ("CRAT_ERA5C_LEAK_PARITY", "on"),
             // Pin the arm explicitly: these two witnesses record the frame
             // WITHOUT A1, and must not drift with the ambient environment.
@@ -702,7 +701,6 @@ fn e5c_w21c_bst_main_side_check_under_a1() {
             ("CRAT_ERA5B_RETURN_PORT", "on"),
             ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_FIELD_MOVE", "on"),
             ("CRAT_ERA5C_LEAK_PARITY", "on"),
             ("CRAT_ERA5C_RESEAT_A1", "on"),
         ],
@@ -713,32 +711,6 @@ fn e5c_w21c_bst_main_side_check_under_a1() {
     );
     assert!(
         text.contains("E5C_SIDE VARIANT totals: raw=0 ref=39 owning=58"),
-        "{text}"
-    );
-}
-
-/// W21's control: the same side check with the **L01⁗** arms only. R510-1(3)
-/// keeps it so the two frames are compared rather than silently swapped.
-#[test]
-fn e5c_w21b_bst_main_side_check_at_l01pppp_control() {
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_main_side_check",
-        &[
-            ("CRAT_ERA5B_INTERFACE_OWN", "on"),
-            ("CRAT_ERA5B_RETURN_PORT", "on"),
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_FIELD_MOVE", "off"),
-            ("CRAT_ERA5C_LEAK_PARITY", "off"),
-            ("CRAT_ERA5C_RESEAT_A1", "off"),
-        ],
-    );
-    assert!(
-        text.contains("E5C_SIDE CORPUS totals: raw=0 ref=13 owning=31"),
-        "{text}"
-    );
-    assert!(
-        text.contains("E5C_SIDE VARIANT totals: raw=59 ref=38 owning=0"),
         "{text}"
     );
 }
@@ -1312,7 +1284,6 @@ fn e5c_w43_lend_formals_are_never_owning() {
             ("CRAT_ERA5B_RETURN_PORT", "on"),
             ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_FIELD_MOVE", "on"),
             ("CRAT_ERA5C_LEAK_PARITY", "on"),
             ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
             ("CRAT_ERA5C_RESEAT_A1", "off"),
@@ -1395,7 +1366,6 @@ const W47_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5B_RETURN_PORT", "on"),
     ("CRAT_ERA5B_PASS", "joint"),
     ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-    ("CRAT_ERA5C_FIELD_MOVE", "on"),
     ("CRAT_ERA5C_LEAK_PARITY", "on"),
     ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
     ("CRAT_ERA5C_RESEAT_A1", "on"),

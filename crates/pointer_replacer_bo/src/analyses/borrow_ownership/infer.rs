@@ -162,8 +162,7 @@ where
     /// era-5c: per (join block, local, incoming version) the window components
     /// known null on EVERY edge that carries that version into the join.
     null_joins: FxHashMap<(BasicBlock, Local, SSAIdx), Vec<bool>>,
-    /// L01^5 (ii): the proven strong-update field moves of this body. Empty
-    /// unless `CRAT_ERA5C_FIELD_MOVE` is on.
+    /// L01^5 (ii): the proven strong-update field moves of this body.
     field_moves: super::field_moves::FieldMoves,
 }
 
@@ -798,8 +797,7 @@ where
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
             // L01^5 (ii): a proven strong-update field load MOVES the token —
             // the destination takes it and the source component goes vacuous —
-            // instead of the split a copy would get. `field_moves` is empty
-            // unless CRAT_ERA5C_FIELD_MOVE is on.
+            // instead of the split a copy would get.
             let ensure_move = ENSURE_MOVE
                 || location.is_some_and(|location| infer_cx.field_moves.is_move(location));
             let mut matched_depth = 0usize;

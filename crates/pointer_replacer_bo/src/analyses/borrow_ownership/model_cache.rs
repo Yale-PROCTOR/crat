@@ -164,10 +164,7 @@ pub(crate) fn solver_identity(
     // only in `CRAT_ERA5C_FIELD_MOVE` or `CRAT_ERA5C_LEAK_PARITY` computed one
     // semantic key -- the R374-1 gap the seat found at `34fd7f68a`. Added here
     // with every L01⁶ arm, before the L01⁶ solve writes a cache.
-    fields.insert(
-        "era5c_field_move",
-        super::field_moves::field_move().to_string(),
-    );
+    fields.insert("era5c_field_move", "true".to_owned());
     fields.insert(
         "era5c_leak_parity",
         super::field_moves::leak_parity_admission().to_string(),
