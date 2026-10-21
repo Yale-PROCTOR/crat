@@ -584,12 +584,6 @@ pub(crate) fn prepare(
 ) {
     let result = (|| -> Result<Prepared, String> {
         let inputs = semantic_inputs(program, mode, attestation)?;
-        #[cfg(test)]
-        if std::env::var("CRAT_ERA5_BYTE_PROOF").as_deref() == Ok("1")
-            && !matches!(inputs.program.as_str(), "bst" | "avl")
-        {
-            return Err("byte proof is restricted to the admitted bst/avl programs".into());
-        }
         let key = super::cache_contract::semantic_key(&inputs)?;
         let directory = dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -665,62 +659,7 @@ pub(crate) fn prepare(
             origin.write_canonical_json(&mut writer)?;
             std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
         }
-        // R473-4: compare the streamed file against the OLD whole-Value bytes,
-        // in the real write path, and report the first divergence. This REBUILDS
-        // the old path, so it must never ride on a profiling switch -- an
-        // acceptance run would then measure the proof instead of the fix.
-        if std::env::var_os("CRAT_ERA5C_BYTEPROOF").is_some() {
-            let old_bytes = serde_json::to_string(
-                &serde_json::from_str::<serde_json::Value>(&origin.canonical_json())
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            let new_bytes = std::fs::read(&origin_path).map_err(|e| e.to_string())?;
-            let at = old_bytes
-                .as_bytes()
-                .iter()
-                .zip(new_bytes.iter())
-                .position(|(a, b)| a != b);
-            eprintln!(
-                "E5C_WRITE_BYTES old={} new={} identical={} first_diff={:?}",
-                old_bytes.len(),
-                new_bytes.len(),
-                old_bytes.as_bytes() == new_bytes.as_slice(),
-                at
-            );
-            if let Some(at) = at {
-                let lo = at.saturating_sub(60);
-                eprintln!(
-                    "E5C_WRITE_DIFF old=...{}...\n                 new=...{}...",
-                    String::from_utf8_lossy(
-                        &old_bytes.as_bytes()[lo..(at + 60).min(old_bytes.len())]
-                    ),
-                    String::from_utf8_lossy(&new_bytes[lo..(at + 60).min(new_bytes.len())])
-                );
-            }
-        }
         let _origin_file = OriginFile(origin_path.clone());
-        // R473-4 byte-identity proof: stage a TWIN entry whose origin bytes come
-        // from the OLD whole-`Value` path, in this same binary at this same code
-        // fingerprint, and compare entry digests. Across a source edit the digest
-        // necessarily moves (SemanticInputs.analysis hashes src/analyses), so the
-        // before/after comparison cannot be the instrument -- this is.
-        let e5c_twin_path = if std::env::var_os("CRAT_ERA5C_BYTEPROOF").is_some() {
-            let old_bytes = serde_json::to_string(
-                &serde_json::from_str::<serde_json::Value>(&origin.canonical_json())
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            let twin = directory.join(format!(
-                ".origin-twin-{}-{}.json",
-                std::process::id(),
-                NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::write(&twin, old_bytes.as_bytes()).map_err(|e| e.to_string())?;
-            Some(twin)
-        } else {
-            None
-        };
         let e5c_origin = super::cache_contract::stream::OriginSource::File(origin_path);
         let metadata = super::cache_contract::stream::Metadata {
             schema: super::cache_contract::SCHEMA.into(),
@@ -735,112 +674,7 @@ pub(crate) fn prepare(
             move_store: Default::default(),
             arg_order: Default::default(),
         };
-        let e5c_twin = e5c_twin_path.map(|twin| {
-            let guard = OriginFile(twin.clone());
-            let mut twin_metadata = metadata.clone();
-            twin_metadata.origin = super::cache_contract::stream::OriginSource::File(twin);
-            (guard, twin_metadata)
-        });
         let entry = super::cache_contract::stage_streamed(&directory, metadata, &portable.path)?;
-        if let Some((_guard, twin_metadata)) = e5c_twin {
-            let twin_entry =
-                super::cache_contract::stage_streamed(&directory, twin_metadata, &portable.path)?;
-            let digest = |e: &super::cache_contract::StreamedEntry| {
-                e.hashes
-                    .as_ref()
-                    .map(|h| h.entry.clone())
-                    .unwrap_or_default()
-            };
-            eprintln!(
-                "E5C_TWIN_DIGEST streamed={} whole_value={} identical={}",
-                digest(&entry),
-                digest(&twin_entry),
-                digest(&entry) == digest(&twin_entry)
-            );
-        }
-        #[cfg(test)]
-        if std::env::var("CRAT_ERA5_BYTE_PROOF").as_deref() == Ok("1") {
-            use std::io::Write;
-            let proof_root = dir()
-                .ok_or("byte proof requires an explicit quarantine cache directory")?
-                .join("byte-proof");
-            std::fs::create_dir_all(&proof_root).map_err(|error| error.to_string())?;
-            let reference_path =
-                proof_root.join(format!("{}.reference.json", entry.metadata.inputs.program));
-            let receipt_path =
-                proof_root.join(format!("{}.proof.json", entry.metadata.inputs.program));
-            let mut reference_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&reference_path)
-                .map_err(|error| error.to_string())?;
-            let mut proof_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&receipt_path)
-                .map_err(|error| error.to_string())?;
-            // The frozen materializer sees the same capture and actual entry.metadata.
-            // No diagnostic labels, history, identities, or bytes are normalized.
-            let reference_exports = super::portable_export::collect(program, slots, captured)?;
-            let reference = super::cache_contract::CompleteEntry {
-                schema: entry.metadata.schema.clone(),
-                key: entry.metadata.key.clone(),
-                inputs: entry.metadata.inputs.clone(),
-                functions: entry.metadata.functions.clone(),
-                universe: entry.metadata.universe.clone(),
-                model: entry.metadata.model.clone(),
-                baseline: entry.metadata.baseline.clone(),
-                receipt: entry.metadata.receipt.clone(),
-                exports: serde_json::from_str(&reference_exports.canonical_json()?)
-                    .map_err(|error| error.to_string())?,
-                origin: {
-                    // R473-4: the byte-proof reference still wants a Value;
-                    // build it from the canonical bytes (test-only path).
-                    let mut bytes = Vec::new();
-                    entry.metadata.write_origin(&mut bytes)?;
-                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?
-                },
-            };
-            let bytes = reference.canonical_json()?;
-            reference_file
-                .write_all(&bytes)
-                .map_err(|error| error.to_string())?;
-            reference_file
-                .sync_all()
-                .map_err(|error| error.to_string())?;
-            drop(reference_file);
-            let identical = super::cache_contract::equal_files(&reference_path, &entry.path)?;
-            let reference_sha256 = super::cache_contract::file_sha256(&reference_path)?;
-            let streamed_sha256 = super::cache_contract::file_sha256(&entry.path)?;
-            let proof = serde_json::json!({
-                "schema": "era5a-same-capture-byte-proof-v1",
-                "program": entry.metadata.inputs.program,
-                "key": entry.metadata.key,
-                "inputs": entry.metadata.inputs,
-                "same_capture": true,
-                "same_actual_metadata": true,
-                "additional_model_entries": 0,
-                "normalization": "none",
-                "reference_path": reference_path,
-                "reference_sha256": reference_sha256,
-                "streamed_sha256": streamed_sha256,
-                "reference_bytes": bytes.len(),
-                "streamed_bytes": std::fs::metadata(&entry.path).map_err(|error| error.to_string())?.len(),
-                "expected_published_entry": directory.join(format!("{}.json", entry.metadata.key)),
-                "full_cache_bytes_identical": identical,
-                "data": identical,
-            });
-            serde_json::to_writer(&mut proof_file, &proof).map_err(|error| error.to_string())?;
-            proof_file
-                .write_all(b"\n")
-                .map_err(|error| error.to_string())?;
-            proof_file.sync_all().map_err(|error| error.to_string())?;
-            if !identical {
-                return Err(
-                    "same-capture complete cache bytes differ from the frozen materializer".into(),
-                );
-            }
-        }
         Ok(Prepared {
             entry: std::sync::Arc::new(entry),
             cached: CachedModel {
