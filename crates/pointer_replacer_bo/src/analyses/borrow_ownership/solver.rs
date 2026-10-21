@@ -2304,10 +2304,7 @@ impl KindSolver {
                     let Some(own) = facts.ownership_asts.get(Var::from_u32(token.var)) else {
                         return Ok(None);
                     };
-                    // W60's fault (`CRAT_E5C_W60_FAULT=no-token`) drops the token term.
-                    if std::env::var("CRAT_E5C_W60_FAULT").as_deref() != Ok("no-token") {
-                        conjuncts.push(own.clone());
-                    }
+                    conjuncts.push(own.clone());
                 }
                 StoreSourceOrigin::Unknown => return Ok(None),
             }
