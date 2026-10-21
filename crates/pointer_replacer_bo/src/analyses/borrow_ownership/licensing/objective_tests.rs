@@ -207,7 +207,7 @@ pub unsafe fn run(empty: bool) -> bool { let p = make(empty); p.is_null() }
 }
 
 #[test]
-fn o08_opaque_and_integer_pointer_results_keep_ordinary_raw_preference() {
+fn o08_an_opaque_result_stays_raw_and_an_integer_cast_result_settles_owning() {
     let fixture = inspect(
         r#"
 unsafe extern "C" { fn opaque() -> *mut i32; }
@@ -216,5 +216,5 @@ pub fn integer(address: usize) -> *mut i32 { address as *mut i32 }
 "#,
     );
     fixture.assert_kind("unknown::_0", SlotKind::Raw);
-    fixture.assert_kind("integer::_0", SlotKind::Raw);
+    fixture.assert_kind("integer::_0", SlotKind::Owning);
 }
