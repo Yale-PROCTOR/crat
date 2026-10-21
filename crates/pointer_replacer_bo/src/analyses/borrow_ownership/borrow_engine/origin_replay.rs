@@ -44,7 +44,6 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) entry_facts:
         Option<std::sync::Arc<crate::analyses::borrow_ownership::protected_entry::EntryAnalysis>>,
     pub(super) copy_lends: super::invalidates::CopyLendLoans,
-    pub(super) escaped_lends: DenseBitSet<Loan>,
     /// Addendum 59: the selected feeder loan keeps its construction-time identity, while the
     /// repair boundary sees the resolved source issuer; the destination remains
     /// receipt metadata and is not a guard/repair party.
@@ -346,7 +345,6 @@ impl<'a> NativeBorrowContext<'a> {
             facts: inference,
             entry_facts: crate::analyses::borrow_ownership::protected_entry::current(),
             copy_lends,
-            escaped_lends,
             escaped_presentations,
             localized_requires,
         }

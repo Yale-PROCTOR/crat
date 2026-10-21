@@ -61,11 +61,9 @@ pub(crate) enum FailureReason {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Failure {
-    pub(crate) candidate: Option<Candidate>,
     /// Matching failures always carry the reader target. A missing target or
     /// frozen construction cannot manufacture a SlotRef for repair.
     pub(crate) target: Option<SlotRef>,
-    pub(crate) field_target: Option<SlotRef>,
     pub(crate) reason: FailureReason,
 }
 
@@ -157,9 +155,7 @@ impl RoundScope {
         result
             .failures
             .extend(failures.into_iter().map(|target| Failure {
-                candidate: None,
                 target,
-                field_target: None,
                 reason: FailureReason::TraversalLoan,
             }));
         for row in round.rows {
@@ -176,9 +172,7 @@ impl RoundScope {
             };
             if let Some(reason) = reason {
                 result.failures.push(Failure {
-                    candidate: candidate.clone(),
                     target: Some(row.expected.target),
-                    field_target: Some(row.expected.field_target),
                     reason,
                 });
             }
@@ -214,12 +208,7 @@ pub(crate) fn begin_round(
                 );
                 let target = facts.slot_refs.get(&key).copied();
                 let field_target = facts.slot_refs.get(&candidate.field_key).copied();
-                let failure = |reason| Failure {
-                    candidate: Some(candidate.clone()),
-                    target,
-                    field_target,
-                    reason,
-                };
+                let failure = |reason| Failure { target, reason };
                 let Some(target) = target else {
                     round.failures.push(failure(FailureReason::MissingTarget));
                     continue;
@@ -324,12 +313,7 @@ pub(crate) fn begin_round(
                     })
                     .copied();
                 let field_target = facts.slot_refs.get(&effect.field_key).copied();
-                let failure = |reason| Failure {
-                    candidate: None,
-                    target,
-                    field_target,
-                    reason,
-                };
+                let failure = |reason| Failure { target, reason };
                 let Some(target @ SlotRef::Local(function, local_id)) = target else {
                     round.failures.push(failure(FailureReason::MissingTarget));
                     continue;
@@ -438,9 +422,7 @@ pub(crate) fn begin_round(
             }
         } else {
             round.failures.push(Failure {
-                candidate: None,
                 target: None,
-                field_target: None,
                 reason: FailureReason::MissingFrozenFacts,
             });
         }

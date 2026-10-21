@@ -86,7 +86,6 @@ pub(crate) struct EscCopySiteKey {
 #[derive(Clone, Debug)]
 pub(crate) struct EscRuntimeSite {
     pub(crate) key: EscCopySiteKey,
-    pub(crate) fn_did: LocalDefId,
     pub(crate) lhs: SlotRef,
     pub(crate) rhs: SlotRef,
     pub(crate) loan: SelectedCopyLendLoan,
@@ -108,7 +107,6 @@ impl EscExclusionReason {
 #[derive(Clone, Debug)]
 pub(crate) struct EscExcludedSite {
     pub(crate) key: EscCopySiteKey,
-    pub(crate) fn_did: LocalDefId,
     pub(crate) lhs: SlotRef,
     pub(crate) rhs: SlotRef,
     pub(crate) reason: EscExclusionReason,
@@ -663,7 +661,6 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         if matches!(row.rhs, SlotRef::Field(_)) {
             answer.excluded_sites.push(EscExcludedSite {
                 key,
-                fn_did: row.fn_did,
                 lhs: row.lhs,
                 rhs: row.rhs,
                 reason: EscExclusionReason::FieldIssuerOutOfScope,
@@ -708,7 +705,6 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         );
         answer.sites.push(EscRuntimeSite {
             key,
-            fn_did: row.fn_did,
             lhs: row.lhs,
             rhs: row.rhs,
             loan,

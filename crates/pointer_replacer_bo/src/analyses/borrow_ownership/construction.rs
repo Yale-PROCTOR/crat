@@ -157,8 +157,6 @@ pub(crate) struct CopyLendPairCandidate {
 }
 
 pub(crate) struct BoConstruction {
-    pub(crate) ownership_facts: std::rc::Rc<super::licensing::facts::Facts>,
-    pub(crate) ownership_transport: super::licensing::transport::CandidateGraph,
     pub(crate) source_events: std::sync::Arc<super::source_events::SourceEvents>,
     pub(crate) qualifier_facts: super::qualifier_facts::QualifierFacts,
     pub(crate) array_fields: super::array_fields::ArrayFieldFacts,
@@ -1112,14 +1110,6 @@ fn construct_bo_into_with_esc(
         selectors.keys(),
     ));
     Ok(BoConstruction {
-        ownership_transport: super::licensing::transport::CandidateGraph::build(
-            &solver
-                .ownership_facts()
-                .expect("ownership emission retains normative facts"),
-        ),
-        ownership_facts: solver
-            .ownership_facts()
-            .expect("ownership emission retains normative facts"),
         source_events,
         qualifier_facts,
         array_fields,
@@ -1323,14 +1313,6 @@ pub(crate) fn construct_tracked_census_baseline(
         selectors.keys(),
     ));
     Ok(BoConstruction {
-        ownership_transport: super::licensing::transport::CandidateGraph::build(
-            &solver
-                .ownership_facts()
-                .expect("ownership emission retains normative facts"),
-        ),
-        ownership_facts: solver
-            .ownership_facts()
-            .expect("ownership emission retains normative facts"),
         source_events,
         qualifier_facts,
         array_fields,

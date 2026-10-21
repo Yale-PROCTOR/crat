@@ -464,7 +464,6 @@ pub(crate) struct InnerLoans {
 
 #[derive(Debug)]
 struct Row {
-    loan: InnerLoan,
     escaped: bool,
     liveness: ClosureLiveness,
 }
@@ -498,11 +497,7 @@ pub(crate) fn analyze(
         let liveness = ClosureLiveness::of_body(&body, members);
         rows.insert(
             (loan.key.function, loan.key.local, loan.key.depth),
-            Row {
-                loan,
-                escaped,
-                liveness,
-            },
+            Row { escaped, liveness },
         );
     }
     InnerLoans { rows }

@@ -155,8 +155,6 @@ where
         std::collections::BTreeMap<super::l2::MirLocationKey, realloc_transition::ReallocInput>,
     realloc_versions: Vec<super::export::ReallocVersionSite>,
     realloc_ghosts: FxHashSet<Var>,
-    /// era-5c: the function whose body this context infers.
-    function: rustc_hir::def_id::DefId,
     /// era-5c: must-null facts per CFG edge.
     null_paths: super::null_paths::NullPaths,
     /// era-5c: per (join block, local, incoming version) the window components
@@ -224,7 +222,6 @@ where
             realloc_inputs: std::collections::BTreeMap::new(),
             realloc_versions: Vec::new(),
             realloc_ghosts: FxHashSet::default(),
-            function: body.source.def_id(),
             null_paths: super::null_paths::NullPaths::compute(crate_ctxt.tcx, body),
             null_joins: FxHashMap::default(),
             field_moves: super::field_moves::compute(body),

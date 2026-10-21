@@ -163,7 +163,6 @@ pub(crate) struct A5ProductionSiteRow {
 struct WitnessRecord {
     key: CallSiteWitnessKey,
     target: LocalDefId,
-    pair: FunctionPairKey,
     class: WitnessMutability,
     markability: WitnessMarkability,
     mark: Option<PlannedC9Mark>,
@@ -1087,7 +1086,6 @@ pub(crate) fn produce_a5_plan(
                         records.entry(pair).or_default().push(WitnessRecord {
                             key,
                             target,
-                            pair,
                             class: mutability.class,
                             markability,
                             mark,

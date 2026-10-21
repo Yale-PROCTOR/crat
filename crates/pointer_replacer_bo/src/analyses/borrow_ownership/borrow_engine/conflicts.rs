@@ -93,7 +93,6 @@ fn overwrite_with_engine_facts<'tcx>(
     crate::analyses::borrow_ownership::move_store::clear_removed(
         f,
         &inference.borrow_set,
-        &inference.loan_liveness,
         &mut inference.invalidates,
     );
     inference.errors = super::errors::compute_errors(
@@ -134,7 +133,6 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
     crate::analyses::borrow_ownership::move_store::clear_removed(
         f,
         &inference.borrow_set,
-        &inference.loan_liveness,
         &mut inference.invalidates,
     );
     inference.errors = super::errors::compute_errors(
@@ -674,7 +672,6 @@ where
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
         let copy_lends = CopyLendLoans::new_empty(inference.borrow_set.loans.len());
-        let escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends, None);
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
@@ -688,7 +685,6 @@ where
             facts: inference,
             entry_facts: None,
             copy_lends,
-            escaped_lends,
             escaped_presentations: FxHashMap::default(),
             localized_requires: None,
         };

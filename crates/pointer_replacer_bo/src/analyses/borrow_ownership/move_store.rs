@@ -205,7 +205,6 @@ pub(crate) struct Removed {
     pub(crate) location: Location,
     pub(crate) borrowed: Local,
     pub(crate) kind: Option<SlotKind>,
-    pub(crate) was_invalid: bool,
 }
 
 #[derive(Default)]
@@ -633,7 +632,6 @@ fn uses_at<'tcx>(
 pub(crate) fn clear_removed(
     function: LocalDefId,
     borrow_set: &BorrowSet<'_>,
-    loan_liveness: &SparseBitMatrix<PointIndex, Loan>,
     invalidates: &mut SparseBitMatrix<PointIndex, Loan>,
 ) {
     let Some(rule) = CURRENT.with(|current| {
@@ -655,10 +653,8 @@ pub(crate) fn clear_removed(
         if !rule.removable(borrowed) {
             continue;
         }
-        let mut was_invalid = false;
         for &row in &rows {
             if invalidates.contains(row, loan) {
-                was_invalid |= loan_liveness.contains(row, loan);
                 invalidates.remove(row, loan);
             }
         }
@@ -666,7 +662,6 @@ pub(crate) fn clear_removed(
             location: data.location(),
             borrowed,
             kind: rule.kinds.get(&borrowed).copied(),
-            was_invalid,
         });
     }
     RECORD.with(|record| {
