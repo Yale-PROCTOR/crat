@@ -167,10 +167,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_field_move", "true".to_owned());
     fields.insert("era5c_leak_parity", "false".to_owned());
     fields.insert("era5c_reseat_a1", "true".to_owned());
-    fields.insert(
-        "era5c_traversal_ref",
-        super::field_moves::traversal_ref().to_string(),
-    );
+    fields.insert("era5c_traversal_ref", "false".to_owned());
     fields.insert(
         "era5c_own_prefer_local",
         super::field_moves::own_prefer_local().to_string(),

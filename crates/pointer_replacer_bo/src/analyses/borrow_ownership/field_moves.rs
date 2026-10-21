@@ -281,20 +281,6 @@ pub(crate) fn overlap_type_route() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_TRAVERSAL_REF=on|off` (fail-loud, absent = off): **L01⁶-A2**.
-/// A field-load re-seat in a loop (`node = (*node).left`) types its result as a
-/// BORROW of the container rather than transferring ownership to it. Era-5c
-/// report 034b §5: `minValueNode`'s own-probe core is internal and carries
-/// `own-linear` + `own-null-join`, so two owners of one allocation is what the
-/// transfer reading would need, and linearity forbids it.
-pub(crate) fn traversal_ref() -> bool {
-    match std::env::var("CRAT_ERA5C_TRAVERSAL_REF").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_TRAVERSAL_REF must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_OWN_PREFER_LOCAL=on|off` (fail-loud, absent = off): **L01⁶ (b)**.
 /// The local-slot Owning preference. A slot the licensing layer has already
 /// refused a reference (`no_ref_carriers`: its origin atoms are all `Fresh`/
