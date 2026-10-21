@@ -25,16 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_LEAK_PARITY=on|off` (fail-loud, absent = off): L01^5 (i)'s pin —
-/// prefer `Owning` for the field slots of a program that has no sink at all.
-pub(crate) fn leak_parity_admission() -> bool {
-    match std::env::var("CRAT_ERA5C_LEAK_PARITY").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_LEAK_PARITY must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_RESEAT_A1=on|off` (fail-loud, absent = off): **L01⁶-A1**.
 /// A call-result re-seat `x = f(x)` transfers the previous version's ownership
 /// to the new version instead of finalizing it `false`, when the callee's

@@ -622,99 +622,6 @@ fn e5c_w20_avl_with_a_free_is_measured() {
     );
 }
 
-/// R459-3(2) / relay 028 -- the USER side check, NON-CITABLE: does bst all-safe
-/// model survive `main_0` / `main` being uncommented? The source is read from disk
-/// (the derived corpus form, and the same form with the commented block restored
-/// verbatim), so this is the corpus program, not a hand-written shape.
-#[test]
-#[ignore = "runs under the arms in a child of e5c_w21"]
-fn e5c_inner_bst_main_side_check() {
-    assert!(super::null_paths::move_tracking());
-    for (name, path) in [
-        (
-            "CORPUS",
-            "/home/p51lee/dev/.crat-scratch/era-5c/bst-main/lib-corpus.rs",
-        ),
-        (
-            "VARIANT",
-            "/home/p51lee/dev/.crat-scratch/era-5c/bst-main/lib-variant.rs",
-        ),
-    ] {
-        let source = std::fs::read_to_string(path).expect("side-check source");
-        let rows = shape_model(&source);
-        let raw = rows.iter().filter(|(_, v)| v == "raw").count();
-        let refs = rows.iter().filter(|(_, v)| v == "ref").count();
-        let own = rows.iter().filter(|(_, v)| v == "owning").count();
-        eprintln!(
-            "E5C_SIDE {name} totals: raw={raw} ref={refs} owning={own} of {}",
-            rows.len()
-        );
-        for (k, v) in &rows {
-            eprintln!("E5C_SIDE {name} {k} {v}");
-        }
-    }
-}
-
-/// W21: the side check at **L01⁵** -- the L01⁗ arms plus L01⁵'s two pins,
-/// which are fail-loud and default to OFF, so a witness that does not set them
-/// measures L01⁗ however far the frame has moved (R510-1(3); era-5c report 033
-/// §1a measured the pin matrix by hand because of exactly this).
-#[test]
-fn e5c_w21_bst_main_side_check_at_l01p5() {
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_main_side_check",
-        &[
-            ("CRAT_ERA5B_INTERFACE_OWN", "on"),
-            ("CRAT_ERA5B_RETURN_PORT", "on"),
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_LEAK_PARITY", "on"),
-            // Pin the arm explicitly: these two witnesses record the frame
-            // WITHOUT A1, and must not drift with the ambient environment.
-            ("CRAT_ERA5C_RESEAT_A1", "off"),
-        ],
-    );
-    assert!(text.contains("E5C_SIDE VARIANT totals"), "{text}");
-    // 033 §1a: the corpus form solves clean and the driver variant collapses,
-    // and L01⁵'s pins move neither. Pinned so a future frame that DOES move one
-    // of them fails here instead of passing quietly.
-    assert!(
-        text.contains("E5C_SIDE CORPUS totals: raw=0 ref=13 owning=31"),
-        "{text}"
-    );
-    assert!(
-        text.contains("E5C_SIDE VARIANT totals: raw=59 ref=38 owning=0"),
-        "{text}"
-    );
-}
-
-/// **W21c** — the same side check with **L01⁷-A1 on**. This is the criterion
-/// R517-12 set and report 039 measured: the corpus form is untouched and the
-/// driver's collapse is repaired outright. A1 spares exactly one local here,
-/// `main_0::_2` (`root`), the destination of `root = insert(root, k)`.
-#[test]
-fn e5c_w21c_bst_main_side_check_under_a1() {
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_main_side_check",
-        &[
-            ("CRAT_ERA5B_INTERFACE_OWN", "on"),
-            ("CRAT_ERA5B_RETURN_PORT", "on"),
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_LEAK_PARITY", "on"),
-            ("CRAT_ERA5C_RESEAT_A1", "on"),
-        ],
-    );
-    assert!(
-        text.contains("E5C_SIDE CORPUS totals: raw=0 ref=13 owning=31"),
-        "{text}"
-    );
-    assert!(
-        text.contains("E5C_SIDE VARIANT totals: raw=0 ref=39 owning=58"),
-        "{text}"
-    );
-}
-
 /// R464-2(1) / 019: one derived corpus source, whatever arms this process pins,
 /// so the memory cost of each arm can be measured with `/usr/bin/time -v`.
 /// `CRAT_E5C_SIDE_SOURCE` names the file.
@@ -1258,74 +1165,6 @@ pub unsafe fn make() -> *mut V { let p = malloc(8); (*p).x = 0.; p }
 pub unsafe fn user() { let q = make(); (*q).y = 1.0; free(q); }
 "#;
 
-#[test]
-#[ignore = "runs under L01⁶'s arms in a child of e5c_w43"]
-fn e5c_inner_w43_lend_formals() {
-    for (name, code) in [
-        ("HEMAN", W43_HEMAN),
-        ("TULIP", W43_TULIP),
-        ("OWNER", W43_OWNER),
-    ] {
-        for (k, v) in shape_model(code) {
-            eprintln!("E5C_W43 {name} {k} {v}");
-        }
-    }
-}
-
-/// W43 (report 043): the lend formals are never Owning under lever (b), and the
-/// controls keep their kinds -- a formal WITH a caller stays `ref`, and a
-/// genuine constructor owner stays `owning`.
-#[test]
-fn e5c_w43_lend_formals_are_never_owning() {
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_w43_lend_formals",
-        &[
-            ("CRAT_ERA5B_INTERFACE_OWN", "on"),
-            ("CRAT_ERA5B_RETURN_PORT", "on"),
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-            ("CRAT_ERA5C_LEAK_PARITY", "on"),
-            ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
-            ("CRAT_ERA5C_RESEAT_A1", "off"),
-        ],
-    );
-    let kind = |name: &str, key: &str| -> String {
-        text.lines()
-            .find_map(|l| {
-                l.strip_prefix(&format!("E5C_W43 {name} {key} "))
-                    .map(|v| v.trim().to_owned())
-            })
-            .unwrap_or_else(|| panic!("no row {name} {key}:\n{text}"))
-    };
-    // the two shapes: never Owning
-    assert_ne!(
-        kind("HEMAN", "mid::_1@d0"),
-        "owning",
-        "heman shape: exported formal, no caller"
-    );
-    assert_ne!(
-        kind("TULIP", "ind::_2@d0"),
-        "owning",
-        "tulip shape: table-only formal"
-    );
-    // controls
-    assert_eq!(
-        kind("HEMAN", "add::_1@d0"),
-        "ref",
-        "control: the same idiom WITH a caller"
-    );
-    assert_eq!(
-        kind("OWNER", "make::_1@d0"),
-        "owning",
-        "control: a constructor's allocation stays Box"
-    );
-    assert_eq!(
-        kind("OWNER", "user::_1@d0"),
-        "owning",
-        "control: the caller receiving it stays Box"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // W47 (era-5c report 047, R545-1): a table's reborrow is unique only when a Ref
 // level below it is written. `CRAT_ERA5C_MUT_MODEL=on` recomputes the replay's
@@ -1366,7 +1205,6 @@ const W47_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5B_RETURN_PORT", "on"),
     ("CRAT_ERA5B_PASS", "joint"),
     ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-    ("CRAT_ERA5C_LEAK_PARITY", "on"),
     ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
     ("CRAT_ERA5C_RESEAT_A1", "on"),
 ];

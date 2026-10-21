@@ -524,13 +524,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         database.sink_selectors().to_vec(),
         database.sink_keys().to_vec(),
     );
-    // L01^5 (i): a program with no sink can never be forced to own (W18). Under
-    // the leak-parity waiver, prefer Box for its field slots. Pin-gated and
-    // objective-only: no hard constraint changes, so nothing legal becomes illegal.
-    if super::borrow_ownership::field_moves::leak_parity_admission() && selectors.sinks().is_empty()
-    {
-        kind_solver.prefer_owning_for_unsinked_fields(slots);
-    }
     let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
         source_sink_emissions: database.source_sink_emissions(),

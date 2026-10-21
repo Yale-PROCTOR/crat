@@ -1240,42 +1240,6 @@ impl KindSolver {
         );
     }
 
-    /// L01^5 (i): the leak-parity source admission, as an OBJECTIVE term.
-    ///
-    /// W18 measured the mechanism: bst with its `free`s deleted has NO relax core
-    /// at all — nothing forbids `Owning`, the optimizer simply prefers `Ref`,
-    /// because `build` weights `ref_` at `big` and `raw` at 1 and gives `own` no
-    /// weight, so `Owning` happens only where a hard constraint (a free site)
-    /// demands it. A program that never frees therefore never owns.
-    ///
-    /// Under the leak-parity waiver (USER RULING 2026-08-31) the emitted program
-    /// MAY drop what the input leaked, receipted per site. So when the program has
-    /// NO sink at all, prefer `Owning` over `Ref` for the FIELD slots — the Box
-    /// market — and leave every hard constraint untouched: this changes what the
-    /// optimizer picks among models that are already legal, never what is legal.
-    pub(crate) fn prefer_owning_for_unsinked_fields(&self, slots: &CrateSlots) {
-        let big = self.vars.len() as u64 + 2;
-        let mut preferred = 0usize;
-        for (slot, kind_vars) in &self.vars {
-            if !matches!(slot, SlotRef::Field(_)) {
-                continue;
-            }
-            self.solver.assert_soft(&kind_vars.own, big, None);
-            preferred += 1;
-        }
-        let _ = slots;
-        // NOTE: no `ownership_evidence` row — the evidence vocabulary is a
-        // validated schema and this is an OBJECTIVE term, not an equation. The
-        // waiver receipt the 2026-08-31 ruling requires is an EMISSION-side
-        // `waiver-drop(scope-exit)` per site; it is owed by the consumer, and
-        // named as owed in report 014.
-        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!(
-                "E5C leak-parity: preferred own on {preferred} field slots (no sink in the program)"
-            );
-        }
-    }
-
     /// L01⁹ measurement arm (`CRAT_ERA5C_REF_WEIGHT_NAMED`): the Ref weight of a
     /// named local's slot, the one `build` withholds from every local.
     pub(crate) fn prefer_ref_for_named(&self, slot: SlotRef) -> bool {
@@ -1294,8 +1258,7 @@ impl KindSolver {
     /// `own` NO weight — so it settles `Raw` for want of a preference. This adds
     /// a soft `own` at weight 2: strictly above `raw`'s 1, and far below
     /// `ref_`'s `vars.len() + 1`, so it can never displace a reference anywhere
-    /// and never makes an illegal model legal. Purely objective, like
-    /// `prefer_owning_for_unsinked_fields`, and unlike that one it carries no
+    /// and never makes an illegal model legal. Purely objective, and it carries no
     /// program-wide sink premise -- the caller supplies exactly the slots whose
     /// reference was already refused.
     ///
