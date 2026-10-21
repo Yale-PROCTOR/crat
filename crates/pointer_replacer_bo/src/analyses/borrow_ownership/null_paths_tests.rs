@@ -3647,9 +3647,18 @@ fn e5c_w66_controls_void_embedded_union_and_the_carve() {
             .collect()
     };
     let on = w66_lines("w66-controls", None);
-    for function in ["void_free", "embedded", "unioned"] {
+    for function in ["void_free", "unioned"] {
         assert!(discharges(&on, function).is_empty(), "{function}: {on:?}");
     }
+    // Under the sole-type containment the embedded referent discharges too.
+    let embedded = discharges(&on, "embedded");
+    assert!(
+        !embedded.is_empty()
+            && embedded
+                .iter()
+                .all(|l| l.ends_with("premise=typed-release@R604-1, containment=sole-type)")),
+        "embedded: {on:?}"
+    );
     for function in ["typed", "carved_use"] {
         let rows = discharges(&on, function);
         assert!(
