@@ -4,7 +4,6 @@ use rustc_hir::{ItemKind, OwnerNode};
 use super::super::{
     construction::{CopyLendMode, construct_bo_into},
     crate_slots::CrateSlots,
-    execution_guard::{self, ExecutionRole},
     export,
     mutability_facts::MutFacts,
     origin_evidence,
@@ -102,8 +101,7 @@ pub unsafe fn run() { let p = make(); free(p); }
                     row.point.construction -= snapshot.offset;
                 }
                 assert_eq!(flat, snapshot.metadata.equations);
-                execution_guard::with_role(ExecutionRole::CacheOnly, || snapshot.validate())
-                    .unwrap();
+                snapshot.validate().unwrap();
             }
             let origin = origin_evidence::collect(&program, &slots, &origins, Some(&captured));
             assert_eq!(origin.licensing.as_ref(), Some(snapshots));

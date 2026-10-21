@@ -52,10 +52,7 @@ pub unsafe fn run() { let p = make(); free(p); }
 fn t14_metadata_rebuild_without_predicate_asts_matches_ordinary_transport() {
     use std::collections::BTreeMap;
 
-    use super::{
-        super::execution_guard::{self, ExecutionRole},
-        transport::CandidateGraph,
-    };
+    use super::transport::CandidateGraph;
 
     with_facts(
         r#"
@@ -76,19 +73,15 @@ pub unsafe fn run() { let p = make(); free(p); }
             let mut metadata = facts.clone();
             metadata.guards.clear();
             metadata.ownership_asts = rustc_index::IndexVec::new();
-            let rebuilt = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-                MatchedTransport::build_metadata(&metadata, &aliases)
-            })
-            .expect("T14 must reconstruct from metadata without predicate ASTs");
+            let rebuilt = MatchedTransport::build_metadata(&metadata, &aliases)
+                .expect("T14 must reconstruct from metadata without predicate ASTs");
             assert_eq!(
                 rebuilt.encode_json().unwrap(),
                 ordinary.encode_json().unwrap()
             );
             assert_eq!(
-                execution_guard::with_role(ExecutionRole::CacheOnly, || {
-                    CandidateGraph::build_metadata(&metadata, &aliases)
-                })
-                .expect("candidate metadata reconstruction"),
+                CandidateGraph::build_metadata(&metadata, &aliases)
+                    .expect("candidate metadata reconstruction"),
                 graph,
             );
             assert!(
@@ -96,18 +89,14 @@ pub unsafe fn run() { let p = make(); free(p); }
                 "metadata reconstruction must not recreate predicate or ownership ASTs"
             );
 
-            if let Ok(incomplete) = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-                CandidateGraph::build_metadata(&metadata, &BTreeMap::new())
-            }) {
+            if let Ok(incomplete) = CandidateGraph::build_metadata(&metadata, &BTreeMap::new()) {
                 assert!(
                     incomplete.sources.is_empty() && incomplete.sinks.is_empty(),
                     "missing endpoint guard metadata must remain held"
                 );
                 assert!(incomplete.forward().is_empty());
             }
-            if let Ok(incomplete) = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-                MatchedTransport::build_metadata(&metadata, &BTreeMap::new())
-            }) {
+            if let Ok(incomplete) = MatchedTransport::build_metadata(&metadata, &BTreeMap::new()) {
                 for sink in &graph.sinks {
                     assert!(incomplete.sources_for(sink.node).is_empty());
                     assert!(
@@ -122,11 +111,7 @@ pub unsafe fn run() { let p = make(); free(p); }
 
 #[test]
 fn t14_frozen_transport_is_normative_and_snapshot_validation_is_ast_free() {
-    use super::{
-        super::execution_guard::{self, ExecutionRole},
-        recursive,
-        snapshot::Snapshot,
-    };
+    use super::{recursive, snapshot::Snapshot};
     with_facts(
         r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
@@ -158,7 +143,8 @@ pub unsafe fn run() { let p = make(1); free(p); }
                     && metadata.ownership_asts.is_empty()
                     && metadata.licensing.is_none()
             );
-            execution_guard::with_role(ExecutionRole::CacheOnly, || snapshot.validate())
+            snapshot
+                .validate()
                 .expect("complete AST-free snapshot validation");
         },
     );

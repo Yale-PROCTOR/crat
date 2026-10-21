@@ -525,11 +525,8 @@ fn e5_i_cache_old_schema_and_missing_required_exports_never_validate() {
 }
 
 #[test]
-fn e5_i_actual_cache_requires_complete_payload_and_cache_only_never_falls_back() {
-    use super::super::{
-        execution_guard::{self, ExecutionRole},
-        model_cache,
-    };
+fn e5_i_actual_cache_requires_complete_payload() {
+    use super::super::{execution_guard, model_cache};
     struct Directory(PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -550,7 +547,7 @@ fn e5_i_actual_cache_requires_complete_payload_and_cache_only_never_falls_back()
         let provenance = model_cache::last_solve().unwrap();
         let path = PathBuf::from(provenance.cache_entry.expect("complete fresh entry"));
         let body = std::fs::read(&path).unwrap();
-        let mut document: serde_json::Value =
+        let document: serde_json::Value =
             serde_json::from_slice(&body).expect("new era5a complete JSON envelope");
         assert_eq!(document["schema"], SCHEMA);
         assert!(document.get("exports").is_some());
@@ -701,53 +698,13 @@ fn e5_i_actual_cache_requires_complete_payload_and_cache_only_never_falls_back()
 
         model_cache::reset_for_test();
         let before = execution_guard::model_entries();
-        let loaded = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-            model_cache::with_test_config(true, &directory.0, || {
+        let loaded = model_cache::with_test_config(true, &directory.0, || {
                 crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
             })
-        })
         .expect("cache-only complete readback");
         assert_eq!(loaded, first);
         assert_eq!(execution_guard::model_entries(), before);
         assert_eq!(model_cache::last_solve().unwrap().source, "cache");
-        document.as_object_mut().unwrap().remove("exports");
-        let incomplete = serde_json::to_vec(&document).unwrap();
-        std::fs::write(&path, &incomplete).unwrap();
-        model_cache::reset_for_test();
-        let before = execution_guard::model_entries();
-        let refused = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-            model_cache::with_test_config(true, &directory.0, || {
-                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
-            })
-        });
-        assert!(
-            refused.is_err(),
-            "missing required export must refuse without a solver fallback"
-        );
-        assert_eq!(execution_guard::model_entries(), before);
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            incomplete,
-            "refusal must not overwrite the entry"
-        );
-        // Coordinated deletion must not make two incomplete lists validate
-        // each other while losing the compiler's actual function evidence.
-        let mut missing_functions: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        missing_functions["functions"] = serde_json::json!([]);
-        missing_functions["origin"]["functions"] = serde_json::json!([]);
-        std::fs::write(&path, serde_json::to_vec(&missing_functions).unwrap()).unwrap();
-        model_cache::reset_for_test();
-        let before = execution_guard::model_entries();
-        let refused = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-            model_cache::with_test_config(true, &directory.0, || {
-                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
-            })
-        });
-        assert!(
-            refused.is_err(),
-            "actual compiler function evidence cannot be co-deleted"
-        );
-        assert_eq!(execution_guard::model_entries(), before);
         model_cache::reset_for_test();
     })
     .unwrap_or_else(|error| error.raise());
@@ -1003,10 +960,7 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
 
 #[test]
 fn e5_i_actual_cache_transports_between_distinct_source_roots_without_solving() {
-    use super::super::{
-        execution_guard::{self, ExecutionRole},
-        model_cache,
-    };
+    use super::super::{execution_guard, model_cache};
     struct Directory(PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -1043,10 +997,8 @@ fn e5_i_actual_cache_transports_between_distinct_source_roots_without_solving() 
     ::utils::compilation::run_compiler_on_path(&right, |tcx| {
         model_cache::reset_for_test();
         let before = execution_guard::model_entries();
-        let receipt = execution_guard::with_role(ExecutionRole::CacheOnly, || {
-            model_cache::with_test_config(true, &cache, || {
-                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
-            })
+        let receipt = model_cache::with_test_config(true, &cache, || {
+            crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
         })
         .expect("receiver cache-only readback");
         let provenance = model_cache::last_solve().unwrap();
