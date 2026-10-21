@@ -179,12 +179,12 @@ impl<'a> NativeBorrowContext<'a> {
                 escaped_lends.insert(loan);
                 let parties = esc_minimal::presentation_for(f, &identity).unwrap_or_else(|| {
                     panic!(
-                        "②-selected feeder loan missing transparent-temp presentation: {identity:?}"
+                        "escape-minimal selected feeder loan missing transparent-temp presentation: {identity:?}"
                     )
                 });
                 assert!(
                     escaped_presentations.insert(loan, parties).is_none(),
-                    "②-selected feeder loan received duplicate presentation"
+                    "escape-minimal selected feeder loan received duplicate presentation"
                 );
             }
         }
@@ -199,18 +199,18 @@ impl<'a> NativeBorrowContext<'a> {
         assert_eq!(
             escaped_lends.iter().count(),
             escaped_copy_lends.len(),
-            "② exemption registration count must equal matched allowlist loans"
+            "escape-minimal exemption registration count must equal matched allowlist loans"
         );
         assert_eq!(
             escaped_presentations.len(),
             escaped_copy_lends.len(),
-            "② presentation registration count must equal matched allowlist loans"
+            "escape-minimal presentation registration count must equal matched allowlist loans"
         );
         let escaped_exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
         assert_eq!(
             escaped_exemptions.len(),
             escaped_copy_lends.len(),
-            "② pruning-exemption registration count must equal the effective selection"
+            "escape-minimal pruning-exemption registration count must equal the effective selection"
         );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
@@ -329,7 +329,7 @@ impl<'a> NativeBorrowContext<'a> {
         assert_eq!(
             escaped_extensions,
             escaped_copy_lends.len(),
-            "② live-to-exit extension count must equal the effective selection"
+            "escape-minimal live-to-exit extension count must equal the effective selection"
         );
         loan_liveness::assert_non_escaped_liveness_equal(
             &ordinary_loan_liveness,

@@ -69,7 +69,11 @@ fn artifact_keys() -> &'static [ArtifactKey] {
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 36, "②-minimal allowlist must contain 36 rows");
+        assert_eq!(
+            keys.len(),
+            36,
+            "escape-minimal allowlist must contain 36 rows"
+        );
         keys
     })
 }
@@ -146,7 +150,7 @@ impl EscMinimalSelection {
         assert_eq!(
             (selected, selected, selected),
             (exemptions, extensions, receipt_rows),
-            "② effective selection must feed every downstream consumer one-to-one"
+            "escape-minimal effective selection must feed every downstream consumer one-to-one"
         );
         (selected, exemptions, extensions, receipt_rows)
     }
@@ -207,7 +211,7 @@ pub(crate) fn demotion_exemption(loan: &SelectedCopyLendLoan) -> (Local, Local) 
     } = loan.borrower
     else {
         panic!(
-            "② feeder borrower must be a local temp, got {:?}",
+            "escape-minimal feeder borrower must be a local temp, got {:?}",
             loan.borrower
         )
     };
@@ -225,7 +229,7 @@ pub(crate) fn demotion_exemptions_for(
         let selection = selection.borrow();
         let selection = selection
             .as_ref()
-            .expect("② pruning exemptions require the effective-selection scope");
+            .expect("escape-minimal pruning exemptions require the effective-selection scope");
         let registered = selection
             .demotion_exemptions
             .get(&fn_did)
@@ -238,11 +242,11 @@ pub(crate) fn demotion_exemptions_for(
         assert_eq!(
             active.len(),
             loans.len(),
-            "② active loan identities must map one-to-one to pruning exemptions"
+            "escape-minimal active loan identities must map one-to-one to pruning exemptions"
         );
         assert!(
             active.is_subset(&registered),
-            "② active pruning exemption escaped the effective selection"
+            "escape-minimal active pruning exemption escaped the effective selection"
         );
         active
     })
@@ -258,9 +262,9 @@ pub(crate) fn active_loans_for_model(
 ) -> SelectedCopyLendLoans {
     EFFECTIVE_SELECTION.with(|selection| {
         let selection = selection.borrow();
-        let selection = selection
-            .as_ref()
-            .expect("② active-loan filtering requires the construction presentation scope");
+        let selection = selection.as_ref().expect(
+            "escape-minimal active-loan filtering requires the construction presentation scope",
+        );
         let mut active = SelectedCopyLendLoans::default();
         let mut visited = 0;
         for (&fn_did, loans) in escaped {
@@ -281,7 +285,7 @@ pub(crate) fn active_loans_for_model(
         assert_eq!(
             visited,
             escaped.values().map(FxHashSet::len).sum::<usize>(),
-            "② active-loan filter must visit every escaped identity exactly once"
+            "escape-minimal active-loan filter must visit every escaped identity exactly once"
         );
         assert!(
             active.values().map(FxHashSet::len).sum::<usize>()
@@ -290,7 +294,7 @@ pub(crate) fn active_loans_for_model(
                     .values()
                     .map(FxHashSet::len)
                     .sum::<usize>(),
-            "② active-loan class exceeded the effective selection"
+            "escape-minimal active-loan class exceeded the effective selection"
         );
         active
     })
@@ -657,7 +661,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         assert_eq!(
             selected.len(),
             expected.len(),
-            "②-minimal exact allowlist did not join one-to-one in this crate"
+            "escape-minimal exact allowlist did not join one-to-one in this crate"
         );
     }
 
@@ -710,7 +714,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 .entry(row.fn_did)
                 .or_default()
                 .insert(loan.clone()),
-            "duplicate ②-minimal selected loan"
+            "duplicate escape-minimal selected loan"
         );
         assert!(
             answer
@@ -718,7 +722,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 .entry(row.fn_did)
                 .or_default()
                 .insert(demotion_exemption(&loan)),
-            "duplicate ②-minimal pruning exemption"
+            "duplicate escape-minimal pruning exemption"
         );
         assert!(
             answer
@@ -732,7 +736,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                     },
                 )
                 .is_none(),
-            "duplicate ②-minimal presentation identity"
+            "duplicate escape-minimal presentation identity"
         );
         answer.sites.push(EscRuntimeSite {
             #[cfg(test)]
@@ -753,12 +757,12 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         assert_eq!(
             answer.sites.len() + answer.excluded_sites.len(),
             expected.len(),
-            "② allowlist keys must partition into selected plus typed-excluded"
+            "escape-minimal allowlist keys must partition into selected plus typed-excluded"
         );
         assert_eq!(
             answer.excluded_sites.len(),
             expected_field_issuers,
-            "② field-issuer exclusions must match the exact joined allowlist rows"
+            "escape-minimal field-issuer exclusions must match the exact joined allowlist rows"
         );
     }
     answer.cross_stage_counts();

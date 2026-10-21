@@ -434,19 +434,21 @@ fn assert_escaped_conflicts_pre_demotion<'a>(
         match edge.issuer {
             Some(ProvenanceOwner::Local(source)) => assert!(
                 is_ref(source),
-                "②-selected loan conflict persisted after its resolved source was demoted"
+                "escape-minimal selected loan conflict persisted after its resolved source was demoted"
             ),
             Some(ProvenanceOwner::Field(_)) => {
                 // Field slots are held out of the ②-minimal wave. Keep this explicit so a future
                 // field-bearing allowlist row cannot silently bypass the Local convergence check.
-                panic!("②-minimal selected source unexpectedly resolved to a field")
+                panic!("escape-minimal selected source unexpectedly resolved to a field")
             }
-            None => panic!("②-selected conflict presentation lost its resolved-source issuer"),
+            None => panic!(
+                "escape-minimal selected conflict presentation lost its resolved-source issuer"
+            ),
         }
     }
     assert!(
         marked <= registered && marked <= 36,
-        "② conflict presentation count exceeded its matched allowlist class"
+        "escape-minimal conflict presentation count exceeded its matched allowlist class"
     );
 }
 
@@ -936,13 +938,15 @@ where
                 export::BorrowerKind::Assign {
                     owner: export::OwnerKey::Local(local),
                 } => Local::from_u32(local),
-                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+                other => {
+                    panic!("escape-minimal feeder borrower must be a local temp, got {other:?}")
+                }
             })
             .collect::<FxHashSet<_>>();
         assert_eq!(
             escaped_borrower_locals.len(),
             escaped_copy_lends.len(),
-            "② exemption identities must map one-to-one to temp borrowers"
+            "escape-minimal exemption identities must map one-to-one to temp borrowers"
         );
 
         let edges = loop {
@@ -1238,13 +1242,15 @@ where
                 export::BorrowerKind::Assign {
                     owner: export::OwnerKey::Local(local),
                 } => Local::from_u32(local),
-                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+                other => {
+                    panic!("escape-minimal feeder borrower must be a local temp, got {other:?}")
+                }
             })
             .collect::<FxHashSet<_>>();
         assert_eq!(
             escaped_borrower_locals.len(),
             escaped_copy_lends.len(),
-            "② exemption identities must map one-to-one to temp borrowers"
+            "escape-minimal exemption identities must map one-to-one to temp borrowers"
         );
 
         let edges = loop {

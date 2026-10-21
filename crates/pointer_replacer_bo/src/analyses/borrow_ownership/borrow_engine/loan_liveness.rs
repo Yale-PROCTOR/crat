@@ -502,7 +502,7 @@ pub(super) fn assert_non_escaped_liveness_equal(
             let after_has = after.row(point).is_some_and(|row| row.contains(loan));
             assert_eq!(
                 before_has, after_has,
-                "②-minimal changed non-selected loan {loan:?} at {point:?}"
+                "escape-minimal changed non-selected loan {loan:?} at {point:?}"
             );
         }
     }

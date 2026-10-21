@@ -2145,12 +2145,12 @@ fn representative(
 fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Vec<SlotRef> {
     let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
     if conflict.esc_issuer_first {
-        let issuer = conflict
-            .issuer
-            .expect("②-selected conflict presentation must carry a resolved-source issuer");
+        let issuer = conflict.issuer.expect(
+            "escape-minimal selected conflict presentation must carry a resolved-source issuer",
+        );
         assert!(
             is_ref(&issuer),
-            "②-selected conflict persisted after its resolved source was demoted"
+            "escape-minimal selected conflict persisted after its resolved source was demoted"
         );
         return vec![issuer];
     }
