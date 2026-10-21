@@ -3204,12 +3204,11 @@ fn w63_kind(lines: &[String], key: &str) -> String {
         .unwrap_or_else(|| panic!("no {key}: {lines:?}"))
 }
 
-/// W63a: with the lend, the context's pass-through formals are not Owning --
-/// every call lends them; without it they take the owner (062's wall, RED).
+/// W63a: the context's pass-through formals are not Owning -- every call lends
+/// them.
 #[test]
 fn e5c_w63_a_a_lendable_formal_is_a_zero_view_at_every_call() {
-    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
-    let off = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "off")]);
+    let on = w63_lines("ctx", &[]);
     // R590-5 L-G (W64b): every lent context formal is Ref, not merely "not
     // Owning" -- 070b's Raw passed the weaker claim.
     for f in [
@@ -3225,11 +3224,6 @@ fn e5c_w63_a_a_lendable_formal_is_a_zero_view_at_every_call() {
             "{on:?}"
         );
         assert_eq!(w63_kind(&on, &key), "ref", "{key} lends: {on:?}");
-        assert_eq!(
-            w63_kind(&off, &key),
-            "owning",
-            "{key} without the lend: {off:?}"
-        );
     }
 }
 
@@ -3238,7 +3232,7 @@ fn e5c_w63_a_a_lendable_formal_is_a_zero_view_at_every_call() {
 /// reaches it.
 #[test]
 fn e5c_w63_b_a_consuming_formal_keeps_the_owner() {
-    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    let on = w63_lines("ctx", &[]);
     assert!(!on.iter().any(|l| l == "lendable lil_free::_1"), "{on:?}");
     assert_eq!(w63_kind(&on, "lil_free::_1@d0"), "owning", "{on:?}");
     assert_eq!(w63_kind(&on, "lil_new::_0@d0"), "owning", "{on:?}");
@@ -3249,7 +3243,7 @@ fn e5c_w63_b_a_consuming_formal_keeps_the_owner() {
 /// indirect call consumes again (RED).
 #[test]
 fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
-    let on = w63_lines("callback", &[("CRAT_ERA5C_LEND", "on")]);
+    let on = w63_lines("callback", &[]);
     assert!(on.iter().any(|l| l == "lendable set_var::_1"), "{on:?}");
     assert_eq!(
         on.iter().filter(|l| l.starts_with("waiver ")).count(),
@@ -3262,13 +3256,7 @@ fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
             && l.ends_with("id=retention-waiver:tier-2@2026-09-21")),
         "{on:?}"
     );
-    let fault = w63_lines(
-        "callback",
-        &[
-            ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_E5C_W63_FAULT", "no-waiver"),
-        ],
-    );
+    let fault = w63_lines("callback", &[("CRAT_E5C_W63_FAULT", "no-waiver")]);
     assert!(
         !fault.iter().any(|l| l == "lendable set_var::_1"),
         "RED: {fault:?}"
@@ -3281,19 +3269,13 @@ fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
 /// plan honest) the validator refuses the uncertified borrowed calls (RED).
 #[test]
 fn e5c_w63_e_the_validator_refuses_an_uncertified_borrowed_call() {
-    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    let on = w63_lines("ctx", &[]);
     assert!(
         on.iter().any(|l| l == "validate ok lend_plan=true"),
         "{on:?}"
     );
     assert!(!on.iter().any(|l| l.starts_with("validate err")), "{on:?}");
-    let fault = w63_lines(
-        "ctx",
-        &[
-            ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_E5C_W63_FAULT", "lend-all"),
-        ],
-    );
+    let fault = w63_lines("ctx", &[("CRAT_E5C_W63_FAULT", "lend-all")]);
     assert!(
         fault
             .iter()
@@ -3358,7 +3340,7 @@ fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
         return;
     }
     let shape = format!("file:{W64_HT}");
-    let on = w63_lines(&shape, &[("CRAT_ERA5C_LEND", "on")]);
+    let on = w63_lines(&shape, &[]);
     for key in ["src::ht::ht_expand::_1@d0", "src::ht::ht_set::_1@d0"] {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
@@ -3366,7 +3348,6 @@ fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
     let fault = w63_lines(
         &shape,
         &[
-            ("CRAT_ERA5C_LEND", "on"),
             ("CRAT_E5C_W64_FAULT", "full-window"),
             // R609-3: the discharge would remove the conflict the fault acts through.
             ("CRAT_E5C_W66_FAULT", "no-discharge"),
@@ -3379,56 +3360,12 @@ fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
     );
 }
 
-/// W64d (R590-5 L-C, a LANDING GATE; restated R631-6): the no-loss control
-/// on the five. With the lend no slot falls to Raw and no Ref becomes Owning;
-/// the gains (raw -> ref, owning -> ref, raw -> owning) are allowed and listed.
-#[test]
-fn e5c_w64_d_no_slot_of_the_five_falls() {
-    let root = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/rs-crown-derived"
-    );
-    for program in ["bst", "avl", "ht", "buffer", "quadtree"] {
-        let path = format!("{root}/{program}/lib.rs");
-        if !std::path::Path::new(&path).is_file() {
-            eprintln!("corpus absent; skipping {program}");
-            continue;
-        }
-        let shape = format!("file:{path}");
-        let model = |lend: &str| -> std::collections::BTreeMap<String, String> {
-            w63_lines(
-                &shape,
-                &[("CRAT_ERA5C_LEND", lend), ("CRAT_E5C_W63_MODEL_ONLY", "1")],
-            )
-            .into_iter()
-            .filter_map(|l| {
-                let (k, v) = l.rsplit_once(' ')?;
-                k.contains("@d").then(|| (k.to_owned(), v.to_owned()))
-            })
-            .collect()
-        };
-        let (off, on) = (model("off"), model("on"));
-        assert_eq!(off.len(), on.len(), "{program}: the slot universe");
-        let moved: Vec<_> = off
-            .iter()
-            .filter(|(k, v)| on.get(*k) != Some(*v))
-            .map(|(k, v)| format!("{k} {v}->{}", on[k]))
-            .collect();
-        eprintln!("E5C_W64D {program} moved={} {moved:?}", moved.len());
-        let lost: Vec<_> = moved
-            .iter()
-            .filter(|m| m.ends_with("->raw") || m.ends_with("ref->owning"))
-            .collect();
-        assert!(lost.is_empty(), "{program}: a slot fell: {lost:?}");
-    }
-}
-
 /// W64e (R590-5 L-B): the validator refuses a `Lent` row with an interior
 /// zero, one missing an interior equality, and one whose certificate is
 /// absent from the snapshot (three faults, each RED).
 #[test]
 fn e5c_w64_e_the_validator_refuses_a_malformed_lent_row() {
-    let on = w63_lines("ctx", &[("CRAT_ERA5C_LEND", "on")]);
+    let on = w63_lines("ctx", &[]);
     assert!(
         on.iter().any(|l| l == "validate ok lend_plan=true"),
         "{on:?}"
@@ -3447,10 +3384,7 @@ fn e5c_w64_e_the_validator_refuses_a_malformed_lent_row() {
             "validate err:lent call has no lend certificate",
         ),
     ] {
-        let lines = w63_lines(
-            "ctx",
-            &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W64_FAULT", fault)],
-        );
+        let lines = w63_lines("ctx", &[("CRAT_E5C_W64_FAULT", fault)]);
         assert!(lines.iter().any(|l| l == message), "{fault}: {lines:?}");
     }
 }
@@ -3465,7 +3399,7 @@ const W66_QUADTREE: &str = concat!(
 );
 
 fn w66_lines(shape: &str, fault: Option<&str>) -> Vec<String> {
-    let mut extra = vec![("CRAT_ERA5C_LEND", "on")];
+    let mut extra = vec![];
     if let Some(fault) = fault {
         extra.push(("CRAT_E5C_W66_FAULT", fault));
     }
@@ -3705,10 +3639,7 @@ fn e5c_free_types_of() {
 /// arms and the lend on. `CRAT_E5C_W67_FAULT=no-ledger` (test builds) silences the
 /// ledger: every W67 witness is RED under it.
 fn w67_rows(shape: &str, extra: &[(&str, &str)]) -> Vec<Vec<String>> {
-    let mut env = vec![
-        ("CRAT_ERA5C_LEND", "on"),
-        ("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on"),
-    ];
+    let mut env = vec![("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on")];
     env.extend_from_slice(extra);
     w63_lines(shape, &env)
         .iter()
@@ -3803,7 +3734,7 @@ fn e5c_w67_d_a_phi_with_null_names_its_real_cause() {
 /// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on, plus the
 /// type route's debug rows.
 fn w68_lines() -> Vec<String> {
-    w63_lines("w68-shapes", &[("CRAT_ERA5C_LEND", "on")])
+    w63_lines("w68-shapes", &[])
 }
 
 /// W68a: the argument-order premise, on the corpus's own shape: quadtree's
@@ -3817,10 +3748,7 @@ fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let on = w63_lines(
-        &shape,
-        &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W63_MODEL_ONLY", "1")],
-    );
+    let on = w63_lines(&shape, &[("CRAT_E5C_W63_MODEL_ONLY", "1")]);
     let key = "src::src::quadtree::quadtree_insert::_1@d0";
     assert_ne!(w63_kind(&on, key), "raw", "{on:?}");
     assert_ne!(
@@ -4096,7 +4024,7 @@ unsafe extern "C" fn fnc_jaileval(mut lil: lil_t, mut x: i32) -> i32 {
 /// W71's lines: the W63 child's receipts (`discharge …`, `retire-conflict …`)
 /// and model.
 fn w71_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
-    let mut env: Vec<(&str, &str)> = vec![("CRAT_ERA5C_LEND", "on")];
+    let mut env: Vec<(&str, &str)> = vec![];
     env.extend_from_slice(extra);
     w63_lines(shape, &env)
 }
@@ -4127,7 +4055,7 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let on = w63_lines(&shape, &[("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W72", "1")]);
+    let on = w63_lines(&shape, &[("CRAT_E5C_W72", "1")]);
     let summary = on
         .iter()
         .find(|l| l.starts_with("arg-order model="))
@@ -4235,7 +4163,6 @@ fn e5c_w74_the_ledger_names_each_commits_clause() {
 /// and the planner's `[bo-l2]` lines prefixed `l2 `.
 fn w69_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = vec![
-        ("CRAT_ERA5C_LEND", "on"),
         ("CRAT_BO_REPAIR", "guarded"),
         ("CRAT_POINTER_DECISION_DIAGNOSTICS", "raw"),
     ];
@@ -4463,7 +4390,7 @@ fn e5c_w69_c_an_a5_pair_is_in_the_guarded_witness_context() {
 #[test]
 fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
     let guarded = w69_lines("w68-shapes", &[]);
-    let mode_a = w63_lines("w68-shapes", &[("CRAT_ERA5C_LEND", "on")]);
+    let mode_a = w63_lines("w68-shapes", &[]);
     assert_ne!(w63_kind(&guarded, "residuals"), "none", "{guarded:?}");
     if w69_model(&guarded) == w69_model(&mode_a) {
         assert_eq!(
@@ -4615,7 +4542,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
 /// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines and the guarded
 /// repair.
 const L01P13_ARMS: &[(&str, &str)] = &[
-    ("CRAT_ERA5C_LEND", "on"),
     ("CRAT_BO_REPAIR", "guarded"),
     ("CRAT_BO_SAFE_MONO", "per_site"),
     ("CRAT_NB4R_ROUTING", "on"),

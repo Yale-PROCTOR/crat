@@ -342,9 +342,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
         facts.reader_inputs = licensing::readers::Inputs::collect(&program, slots);
         facts.reader_plan = licensing::readers::Plan::build(&facts.reader_inputs);
-        if licensing::lend::lend() {
-            facts.lend_plan = licensing::lend::collect(&program);
-        }
+        facts.lend_plan = licensing::lend::collect(&program);
         facts.traversal_native = Some(licensing::traversal_native::collect(
             &program,
             slots,

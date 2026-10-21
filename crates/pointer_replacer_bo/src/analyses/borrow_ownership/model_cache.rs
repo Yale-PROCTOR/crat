@@ -171,7 +171,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_null_exit", "false".to_owned());
     fields.insert("era5c_moved_input", "true".to_owned());
     fields.insert("era5c_move_store", "true".to_owned());
-    fields.insert("era5c_lend", super::licensing::lend::lend().to_string());
+    fields.insert("era5c_lend", "true".to_owned());
     // era-5c relay 208: present only when set, so the frame's identity is unchanged.
     if super::copy_relax::copy_relax() {
         fields.insert(

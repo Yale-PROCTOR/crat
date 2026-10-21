@@ -59,15 +59,6 @@ impl Plan {
     }
 }
 
-/// `CRAT_ERA5C_LEND=on|off` (fail-loud, absent = off).
-pub(crate) fn lend() -> bool {
-    match std::env::var("CRAT_ERA5C_LEND").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_LEND must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// W63's fault hooks (`CRAT_E5C_W63_FAULT`), carried by the identity.
 pub(crate) fn fault(name: &str) -> bool {
     std::env::var("CRAT_E5C_W63_FAULT").ok().as_deref() == Some(name)
