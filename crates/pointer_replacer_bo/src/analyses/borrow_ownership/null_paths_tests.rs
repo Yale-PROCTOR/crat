@@ -1248,60 +1248,11 @@ fn w47_kind(rows: &std::collections::BTreeMap<String, String>, key: &str) -> Str
         .unwrap_or_else(|| panic!("no row {key}: {rows:?}"))
 }
 
-/// W47: the witness and its controls.
-#[test]
-fn e5c_w47_a_tables_reborrow_is_unique_only_under_a_written_ref_level() {
-    let on = w47_rows(&[("CRAT_ERA5C_MUT_MODEL", "on")]);
-    let off = w47_rows(&[("CRAT_ERA5C_MUT_MODEL", "off")]);
-    // the witness: tulip's table keeps `ref` at depth 0
-    assert_eq!(
-        w47_kind(&on, "TULIP ind::_2@d0"),
-        "ref",
-        "W47: the outputs table at depth 0"
-    );
-    assert_eq!(
-        w47_kind(&off, "TULIP ind::_2@d0"),
-        "raw",
-        "W47 is RED without the rule"
-    );
-    // control: the read-only variant is all-ref either way
-    for rows in [&on, &off] {
-        let readonly: Vec<_> = rows
-            .iter()
-            .filter(|(k, _)| k.starts_with("READONLY "))
-            .collect();
-        assert!(
-            !readonly.is_empty() && readonly.iter().all(|(_, v)| *v == "ref"),
-            "{readonly:?}"
-        );
-    }
-    // control: a written Ref element still forbids the all-Ref model -- something is demoted
-    assert!(
-        on.iter()
-            .any(|(k, v)| k.starts_with("REFELEM ") && v == "raw"),
-        "the Ref-element shape must keep a demotion: {on:?}"
-    );
-    // control: W43's shapes are untouched by the rule
-    for key in [
-        "HEMAN mid::_1@d0",
-        "HEMAN add::_1@d0",
-        "OWNER make::_1@d0",
-        "OWNER user::_1@d0",
-    ] {
-        assert_eq!(w47_kind(&on, key), w47_kind(&off, key), "{key}");
-    }
-    assert_eq!(w47_kind(&on, "HEMAN add::_1@d0"), "ref");
-    assert_eq!(w47_kind(&on, "OWNER make::_1@d0"), "owning");
-}
-
 /// W47 faults: each one alone must turn the witness RED.
 #[test]
 fn e5c_w47_b_faults_turn_the_witness_red() {
     for fault in ["any-depth", "no-model"] {
-        let rows = w47_rows(&[
-            ("CRAT_ERA5C_MUT_MODEL", "on"),
-            ("CRAT_E5C_W47_FAULT", fault),
-        ]);
+        let rows = w47_rows(&[("CRAT_E5C_W47_FAULT", fault)]);
         assert_eq!(
             w47_kind(&rows, "TULIP ind::_2@d0"),
             "raw",
@@ -1627,7 +1578,6 @@ fn e5c_inner_w49_models() {
 fn e5c_w49_b_a_lend_formal_is_never_owning() {
     let rows = |lf: &str| {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_LEND_FORMAL", lf));
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w49_models",
@@ -1775,7 +1725,6 @@ fn e5c_inner_w52_frame_path() {
 fn e5c_w52_b_the_lend_arm_on_the_frame_path() {
     let rows = |lend: &str, fault: Option<&str>| {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_COPY_LEND", lend));
         if let Some(fault) = fault {
             env.push(("CRAT_E5C_W52_FAULT", fault));
@@ -1918,7 +1867,6 @@ fn e5c_w52_d_the_lend_arm_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
     for lend_formal in ["off", "on"] {
         let rows = |copy_lend: &str| -> std::collections::BTreeMap<String, String> {
             let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-            env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
             env.push(("CRAT_ERA5C_LEND_FORMAL", lend_formal));
             env.push(("CRAT_ERA5C_COPY_LEND", copy_lend));
             let text = child(
@@ -2047,7 +1995,6 @@ fn e5c_inner_w54_funnel() {
 #[test]
 fn e5c_w54_the_funnel_reads_the_w52_fixtures() {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
     env.push(("CRAT_ERA5C_COPY_LEND", "on"));
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w54_funnel",
@@ -2252,7 +2199,6 @@ fn e5c_inner_w55() {
 
 fn w55_rows(extra: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
     env.extend_from_slice(extra);
     child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w55",
@@ -2369,7 +2315,6 @@ fn e5c_w55_a_deref_only_reads_let_the_field_own() {
 fn e5c_w56_an_owning_field_residual_is_repaired_not_declined() {
     let reason = |repair: &str| -> String {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_DEREF_READER", "on"));
         env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", repair));
         env.push(("CRAT_E5C_SHAPE", "AVL"));
@@ -2401,7 +2346,6 @@ fn e5c_w56_an_owning_field_residual_is_repaired_not_declined() {
 fn e5c_w55_d_the_rule_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
     let rows = |arm: &str| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         // The L01⁹ rules built so far, together (1b, its repair, null-at-exit).
         env.push(("CRAT_ERA5C_DEREF_READER", arm));
         env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", arm));
@@ -2474,7 +2418,6 @@ fn e5c_inner_w57() {
 fn e5c_w57_a_local_null_at_every_exit_is_not_finalized() {
     let rows = |extra: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.extend_from_slice(extra);
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w57",
@@ -2556,7 +2499,6 @@ fn e5c_inner_w58() {
 fn e5c_w58_a_fresh_call_result_live_at_exit_is_closed_not_finalized() {
     let rows = |extra: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.extend_from_slice(extra);
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w58",
@@ -2633,7 +2575,6 @@ fn e5c_inner_w59() {
 fn e5c_w59_store_origins_classify_as_a_set() {
     let lines = |shape: &str, arm: &str| -> Vec<String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_ORIGIN_SET", arm));
         env.push(("CRAT_R388_DEBUG", "1"));
         env.push(("CRAT_E5C_W59", shape));
@@ -2730,7 +2671,6 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
     );
     let rows = |moved: &str| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_ORIGIN_SET", "on"));
         env.push(("CRAT_ERA5C_DEREF_READER", "on"));
         env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"));
@@ -3072,7 +3012,6 @@ fn e5c_inner_w61() {
 fn w61_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
-        ("CRAT_ERA5C_MUT_MODEL", "on"),
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_DEREF_READER", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
@@ -3272,7 +3211,6 @@ fn e5c_w61_n_the_arm_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
     let rows = |arm: &str| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         env.extend_from_slice(&[
-            ("CRAT_ERA5C_MUT_MODEL", "on"),
             ("CRAT_ERA5C_DEREF_READER", "on"),
             ("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"),
             ("CRAT_ERA5C_ORIGIN_SET", "on"),
@@ -3466,7 +3404,6 @@ fn e5c_inner_w62() {
 fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
-        ("CRAT_ERA5C_MUT_MODEL", "on"),
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_DEREF_READER", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
@@ -4271,7 +4208,6 @@ fn w63_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
 fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
-        ("CRAT_ERA5C_MUT_MODEL", "on"),
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_DEREF_READER", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
@@ -5810,7 +5746,6 @@ fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
 fn e5c_w69_e_the_field_own_branch_runs_under_the_guarded_repair() {
     let run = |fault: Option<&str>| -> Vec<String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_MUT_MODEL", "on"));
         env.push(("CRAT_ERA5C_DEREF_READER", "on"));
         env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"));
         env.push(("CRAT_E5C_SHAPE", "AVL"));

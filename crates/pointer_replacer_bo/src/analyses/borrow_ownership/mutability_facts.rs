@@ -70,15 +70,12 @@ impl MutProvider for bool {
 #[derive(Clone, Copy)]
 pub(crate) struct RoundMut<'a, M> {
     pub(crate) base: M,
-    pub(crate) round: Option<&'a MutFacts>,
+    pub(crate) round: &'a MutFacts,
 }
 
 impl<M: MutProvider> MutProvider for RoundMut<'_, M> {
     fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
-        self.base.is_mutable(fn_did, local)
-            && self
-                .round
-                .is_none_or(|round| round.is_mutable(fn_did, local))
+        self.base.is_mutable(fn_did, local) && self.round.is_mutable(fn_did, local)
     }
 }
 

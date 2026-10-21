@@ -1333,11 +1333,10 @@ fn verify_rounds(
         // R545-1: a table's reborrow is unique only when a Ref level below it is
         // written -- the round's facts drop the load guard where the loaded level
         // is Raw in THIS round's model (era-5c report 045).
-        let round_facts =
-            super::field_moves::mut_model().then(|| round_mutability_facts(program, slots, &model));
+        let round_facts = round_mutability_facts(program, slots, &model);
         let round_mutable = super::mutability_facts::RoundMut {
             base: is_mutable,
-            round: round_facts.as_ref(),
+            round: &round_facts,
         };
         // L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): this round's qualifying stores issue
         // no loan on a local that is not `Raw` during the replay (era-5c 060a).

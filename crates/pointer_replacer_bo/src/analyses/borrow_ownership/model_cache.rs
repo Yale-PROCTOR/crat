@@ -170,10 +170,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_traversal_ref", "false".to_owned());
     fields.insert("era5c_own_prefer_local", "false".to_owned());
     fields.insert("era5c_finalize_soft", "false".to_owned());
-    fields.insert(
-        "era5c_mut_model",
-        super::field_moves::mut_model().to_string(),
-    );
+    fields.insert("era5c_mut_model", "true".to_owned());
     fields.insert(
         "era5c_lend_formal",
         super::field_moves::lend_formal().to_string(),

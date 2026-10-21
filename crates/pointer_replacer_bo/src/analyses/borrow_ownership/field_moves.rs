@@ -25,20 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_MUT_MODEL=on|off` (fail-loud, absent = off): **L01⁸, R545-1**.
-/// A table's reborrow is unique only when a Ref level below it is written. The
-/// verification replay recomputes the mutability facts per round with Foster's
-/// load guard dropped where the loaded level is Raw in the round's model (era-5c
-/// report 045: tulip's `outputs@d0` is lost to the per-local bit its written
-/// element sets, through the closing `offset_from(*outputs.offset(0))` re-read).
-pub(crate) fn mut_model() -> bool {
-    match std::env::var("CRAT_ERA5C_MUT_MODEL").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_MUT_MODEL must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_LEND_FORMAL=on|off` (fail-loud, absent = off): **L01⁸, R545-2**.
 /// A formal whose every closed-world actual is the address of a stack place or
 /// an interior place is a lend and never `Owning` (era-5c report 041's
