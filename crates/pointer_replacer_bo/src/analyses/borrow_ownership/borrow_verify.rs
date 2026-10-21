@@ -1305,8 +1305,6 @@ fn verify_rounds(
             for target in &raw_targets {
                 solver.assume(*target, SlotKind::Raw);
             }
-            #[cfg(test)]
-            raw_commit_trace::record(stats.rounds, false, &raw_targets);
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
             let Some((next, dropped)) = solve_round(
@@ -1827,8 +1825,6 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             for target in &raw_targets {
                 solver.assume(*target, SlotKind::Raw);
             }
-            #[cfg(test)]
-            raw_commit_trace::record(stats.rounds, true, &raw_targets);
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
             match solve_l2_round_model(solver, selectors, backend, hard.as_ref()) {
@@ -2214,20 +2210,6 @@ fn round_cap(slots: &CrateSlots) -> usize {
     n + 8
 }
 
-/// §NB5-L (Codex MEDIUM) — run `f` with the round cap forced to `cap` on this thread (test-only;
-/// panic-safe drop-guard, like `RepairMode::with_override`).
-#[cfg(test)]
-pub(crate) fn with_cap_override<T>(cap: usize, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<usize>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CAP_OVERRIDE.with(|c| c.set(self.0));
-        }
-    }
-    let _restore = Restore(CAP_OVERRIDE.with(|c| c.replace(Some(cap))));
-    f()
-}
-
 /// §NB5-F — the first `SlotRef::Field` in a residual conflict the model left non-`Ref` (a field
 /// that owns/borrow-aliases a written cell). Option A declines on this: it is not a committable
 /// `Ref`, and the Local-only replay candidacy cannot disable its loan, so forcing it would corrupt
@@ -2406,45 +2388,5 @@ pub(crate) mod coverage_planner_fault {
         }
         let _reset = Reset(ACTIVE.with(|active| active.replace(true)));
         f()
-    }
-}
-
-/// R258 test-only observation of the actual retirement Raw-delivery branch.
-#[cfg(test)]
-pub(crate) mod raw_commit_trace {
-    use std::cell::RefCell;
-
-    use super::SlotRef;
-    #[derive(Clone, Debug)]
-    pub(crate) struct Commit {
-        pub(crate) round: usize,
-        pub(crate) l2: bool,
-        pub(crate) targets: Vec<SlotRef>,
-    }
-    thread_local! {static CAPTURE:RefCell<Option<Vec<Commit>>>=const{RefCell::new(None)};}
-    pub(super) fn record(round: usize, l2: bool, targets: &[SlotRef]) {
-        CAPTURE.with(|capture| {
-            if let Some(rows) = capture.borrow_mut().as_mut() {
-                rows.push(Commit {
-                    round,
-                    l2,
-                    targets: targets.to_vec(),
-                });
-            }
-        });
-    }
-    pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Commit>) {
-        struct Restore(Option<Vec<Commit>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CAPTURE.with(|capture| {
-                    capture.replace(self.0.take());
-                });
-            }
-        }
-        let _restore = Restore(CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
-        let value = f();
-        let rows = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
-        (value, rows)
     }
 }

@@ -847,8 +847,8 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
             ordinary_probe.values().all(|edges| edges.is_empty()),
             "ordinary repair must not explain this fixture's inner demotion"
         );
-        let ((result, _, _), capture) = super::export::with_bo_export(|| {
-            let ((result, ordinary), raw) = borrow_verify::raw_commit_trace::with_capture(|| {
+        let ((result, _), capture) = super::export::with_bo_export(|| {
+            let (result, ordinary) = {
                 borrow_verify::with_mode_a_commit_trace(|| {
                     if l2 {
                         construction::verify_bo_construction_l2_for_test(
@@ -872,8 +872,8 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
                         )
                     }
                 })
-            });
-            (result, ordinary, raw)
+            };
+            (result, ordinary)
         });
         let _ = result;
         // Under the record no typed inner-loan receipt is recorded for the inner slot.

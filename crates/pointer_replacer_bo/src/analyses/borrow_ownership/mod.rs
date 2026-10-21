@@ -2,7 +2,6 @@
 //!
 //! This module is intentionally self-contained while it is being built out. The
 //! existing `borrow` and `ownership` analyses remain the production baseline.
-#![allow(dead_code)]
 
 use std::ops::Range;
 
@@ -147,14 +146,6 @@ impl<Value> Param<Value> {
         match self {
             Param::Normal(sigs) => sigs,
             Param::Output(..) => panic!("expect normal parameter"),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn expect_output(self) -> Consume<Value> {
-        match self {
-            Param::Output(consume) => consume,
-            Param::Normal(..) => panic!("expect output parameter"),
         }
     }
 

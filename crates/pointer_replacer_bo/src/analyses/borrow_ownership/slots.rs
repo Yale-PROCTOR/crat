@@ -72,7 +72,6 @@ impl SlotUniverse {
         self.slots.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }

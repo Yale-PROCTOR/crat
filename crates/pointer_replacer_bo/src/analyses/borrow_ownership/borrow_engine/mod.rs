@@ -23,10 +23,6 @@
 //! `extract_conflict_edges`) keep production's exact names — the module path is the only
 //! distinguisher, so 3b/NB6 diffs are 1:1.
 
-// TEMPORARY (until task 3 wires the orchestration that calls compute_invalidates/compute_errors):
-// the copied stages are unused in isolation. Remove when `borrow_conflicts` lands.
-#![allow(dead_code)]
-
 // Re-exports so the copied files' verbatim `super::{BorrowSet, Loan}` imports resolve here exactly
 // as they did under production `borrow` — keeps the mirrors byte-identical (no import rewiring).
 pub(crate) use crate::analyses::borrow::{BorrowSet, Loan};
