@@ -28,7 +28,6 @@ use sha2::{Digest, Sha256};
 use super::{
     SafeMonoMode, SlotKind,
     a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
-    borrow_engine::ForkEngineMode,
     borrow_verify::RepairMode,
     construction::{A2Mode, CopyLendMode},
     crate_slots::CrateSlots,
@@ -249,7 +248,7 @@ pub(crate) fn solver_identity(
         format!("{:x}", Sha256::digest(ESC_MINIMAL_ALLOWLIST)),
     );
     fields.insert("esc_minimal", ESC_MINIMAL_MARKER.to_owned());
-    fields.insert("fork_engine", ForkEngineMode::current().label().to_owned());
+    fields.insert("fork_engine", "fork".to_owned());
     fields.insert(
         "l2_guarded_commits",
         super::l2::enabled_from_env().to_string(),

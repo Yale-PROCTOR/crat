@@ -32709,11 +32709,6 @@ fn boc1_corpus() {
             "L2 RED requires the frozen per-site safety profile"
         );
         assert_eq!(
-            crate::analyses::borrow_ownership::borrow_engine::ForkEngineMode::current(),
-            crate::analyses::borrow_ownership::borrow_engine::ForkEngineMode::Fork,
-            "L2 RED requires the frozen fork-engine profile"
-        );
-        assert_eq!(
             std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
             Ok("1"),
             "L2 RED requires CRAT_BO_L2_GUARDED_COMMITS=1"

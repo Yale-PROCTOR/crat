@@ -67,46 +67,6 @@ pub(crate) use loan_liveness::with_escaped_extension_trace;
 pub(crate) use origin_replay::selected_copy_lend_contains;
 pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 
-/// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
-/// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the
-/// default was `Production` so the equivalence differential could compare the two; the equivalence
-/// row is frozen and the engines are model-equal (edge multiset ⇒ demotion set ⇒ model), so the
-/// flip was free. Production is now validator-only — reachable via the switch for differentials +
-/// NB6. Env `CRAT_BO_FORK_ENGINE ∈ {fork|on, production|off}`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ForkEngineMode {
-    Production,
-    Fork,
-}
-
-impl ForkEngineMode {
-    /// Flipped to `Fork` at 3a merge (A1); production stays reachable via `CRAT_BO_FORK_ENGINE`.
-    pub(crate) const DEFAULT: Self = ForkEngineMode::Fork;
-
-    pub(crate) fn current() -> Self {
-        // Reject a SET-but-invalid value (fail-loud on typos — a mistyped selector must NOT silently
-        // fall back to production and mask which engine ran; 3a Codex review [high]). Unset ⇒ DEFAULT.
-        match std::env::var("CRAT_BO_FORK_ENGINE") {
-            Ok(v) => match v.as_str() {
-                "fork" | "on" => ForkEngineMode::Fork,
-                "production" | "off" => ForkEngineMode::Production,
-                other => panic!(
-                    "CRAT_BO_FORK_ENGINE={other:?} is not a valid selector \
-                     (expected fork|on or production|off) — refusing to silently fall back"
-                ),
-            },
-            Err(_) => Self::DEFAULT,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            ForkEngineMode::Production => "production",
-            ForkEngineMode::Fork => "fork",
-        }
-    }
-}
-
 /// §6.4 drop attribution sink. Env-gated (`CRAT_BO_REQUIRER_DROP_OUT`), append-only, flushed by
 /// the caller. Never touched on the default path.
 pub(crate) fn record_requirer_drop(line: String) {

@@ -311,17 +311,9 @@ fn revalidate_with_flows(
     // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
     // skipped by the invalidation walk, so shared reads of one base stop conflicting.
     let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
-    // §NB3-3a: route to the forked BO engine or production (default = production during dev,
-    // flips to Fork at 3a merge — A1). `cand`/`mutab` are `Copy` (all captures are Copy), so both
-    // match arms may reference them; only one runs. Same signatures ⇒ 1:1 dispatch.
-    let edges = match super::borrow_engine::ForkEngineMode::current() {
-        super::borrow_engine::ForkEngineMode::Production => {
-            borrow::borrow_conflicts(program, cand, mutab)
-        }
-        super::borrow_engine::ForkEngineMode::Fork => {
-            super::borrow_engine::borrow_conflicts_with_flows(program, origin_flows, cand, mutab)
-        }
-    };
+    // §NB3-3a: the forked BO engine.
+    let edges =
+        super::borrow_engine::borrow_conflicts_with_flows(program, origin_flows, cand, mutab);
 
     let mut conflicts = map_edges_to_slots(slots, edges);
     let retirement = finish_retirement(retirement_scope);
@@ -469,22 +461,11 @@ fn revalidate_replaying_reviewed(
             SlotOwner::Local(_) => None,
         })
         .collect();
-    // §NB3-3a: route to the forked BO engine or production (default = production during dev,
-    // flips to Fork at 3a merge — A1). All closures are `Copy`, so both arms may reference them.
-    let replay = || match super::borrow_engine::ForkEngineMode::current() {
-        super::borrow_engine::ForkEngineMode::Production => {
-            assert!(
-                selected_copy_lends.is_none_or(|selected| selected.is_empty())
-                    && escaped_copy_lends.is_none_or(|selected| selected.is_empty())
-                    && parameter_overlaps.is_none(),
-                "CopyLend/A5 replay requires the BO fork engine"
-            );
-            borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
-        }
-        super::borrow_engine::ForkEngineMode::Fork => {
-            if let Some(parameter_overlaps) = parameter_overlaps {
-                let empty = SelectedCopyLendLoans::default();
-                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped(
+    // §NB3-3a: the forked BO engine.
+    let replay = || {
+        if let Some(parameter_overlaps) = parameter_overlaps {
+            let empty = SelectedCopyLendLoans::default();
+            super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped(
                     program,
                     origin_flows,
                     cand,
@@ -495,8 +476,8 @@ fn revalidate_replaying_reviewed(
                     escaped_copy_lends.unwrap_or(&empty),
                     parameter_overlaps,
                 )
-            } else {
-                match selected_copy_lends {
+        } else {
+            match selected_copy_lends {
                     Some(selected) => {
                         super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped(
                             program,
@@ -518,7 +499,6 @@ fn revalidate_replaying_reviewed(
                         &raw_fields,
                     ),
                 }
-            }
         }
     };
 
@@ -604,11 +584,6 @@ fn revalidate_replaying_witnessed(
             SlotOwner::Local(_) => None,
         })
         .collect();
-    assert_eq!(
-        super::borrow_engine::ForkEngineMode::current(),
-        super::borrow_engine::ForkEngineMode::Fork,
-        "L2 witnessed invalidator capture requires CRAT_BO_FORK_ENGINE=fork (or the unset fork default)"
-    );
     let edges = match (selected_copy_lends, parameter_overlaps) {
         // R617-1: A5's overlap pairs in the witness context, as in Mode-A's replay.
         (selected, Some(parameter_overlaps)) => {
