@@ -25,18 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_NULL_EXIT=on|off` (fail-loud, absent = off): **L01⁹, R563-1** (era-5c
-/// 055, buffer's wall 1). The exit finalization skips a local that is null on
-/// every path reaching a return (`infer::null_at_exit_locals`): a null pointer
-/// owns nothing. buffer's `test_buffer_slice__range_error::a` is the shape.
-pub(crate) fn null_exit() -> bool {
-    match std::env::var("CRAT_ERA5C_NULL_EXIT").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_NULL_EXIT must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_REF_WEIGHT_NAMED=on|light|off` (fail-loud, absent = off): **L01⁹, R563-2
 /// (STOP 1), a MEASUREMENT arm**. The objective's Ref soft weight counts only
 /// named slots: struct fields and locals the source names (`var_debug_info`), at

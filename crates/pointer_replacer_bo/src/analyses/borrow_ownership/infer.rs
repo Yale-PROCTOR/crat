@@ -1145,11 +1145,6 @@ where
         // call and the destination of that call's result, directly
         // (`x = f(x)`) or through the result temporary (`t = f(x); x = t`).
         let named_locals: rustc_data_structures::fx::FxHashSet<Local> = reseat_destinations(body);
-        let null_exit: FxHashSet<Local> = if super::field_moves::null_exit() {
-            null_at_exit_locals(infer_cx.tcx, body)
-        } else {
-            FxHashSet::default()
-        };
         let exit_close: FxHashSet<Local> = if super::field_moves::exit_close() {
             exit_close_locals(infer_cx.tcx, body)
         } else {
@@ -1193,10 +1188,6 @@ where
                 };
                 // A1: a named local live at exit keeps its ownership bit free.
                 if named_locals.contains(&local) {
-                    continue;
-                }
-                // L01⁹ null-at-exit: a local null on every exit path owns nothing.
-                if null_exit.contains(&local) {
                     continue;
                 }
                 // L01⁹ narrow R101 close: a fresh call result, live at exit.
@@ -1497,127 +1488,6 @@ fn returns_fresh_allocation(
         .iter()
         .any(|l| l.as_usize() >= 1 && l.as_usize() <= body.arg_count)
         && fresh_calls > 0
-}
-
-/// L01⁹ (`CRAT_ERA5C_NULL_EXIT`, R563-1, era-5c 055 buffer wall 1): the non-parameter
-/// locals that are NULL on every path reaching a return. A local qualifies when
-/// a block that tests `local.is_null()` dominates every return, the not-null
-/// successor of that test never reaches a return (it diverges, e.g. into
-/// `__assert_fail`), and the local is not reassigned after the test. A null
-/// pointer owns nothing, so the exit finalization has nothing to assert on it.
-pub(crate) fn null_at_exit_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<Local> {
-    use rustc_middle::mir::{Rvalue, StatementKind, TerminatorKind, UnOp};
-    let mut out = FxHashSet::default();
-    let returns: Vec<BasicBlock> = body
-        .basic_blocks
-        .iter_enumerated()
-        .filter(|(_, data)| matches!(data.terminator().kind, TerminatorKind::Return))
-        .map(|(block, _)| block)
-        .collect();
-    if returns.is_empty() {
-        return out;
-    }
-    let reachable = |from: BasicBlock| -> FxHashSet<BasicBlock> {
-        let mut seen = FxHashSet::default();
-        let mut stack = vec![from];
-        while let Some(block) = stack.pop() {
-            if seen.insert(block) {
-                stack.extend(body.basic_blocks[block].terminator().successors());
-            }
-        }
-        seen
-    };
-    let dominators = body.basic_blocks.dominators();
-    for data in body.basic_blocks.iter() {
-        let TerminatorKind::Call {
-            func,
-            args,
-            destination,
-            target: Some(next),
-            ..
-        } = &data.terminator().kind
-        else {
-            continue;
-        };
-        let Some((callee, _)) = func.const_fn_def() else {
-            continue;
-        };
-        if tcx.item_name(callee).as_str() != "is_null" {
-            continue;
-        }
-        let [arg] = &args[..] else { continue };
-        let Some(place) = arg.node.place() else { continue };
-        if !place.projection.is_empty() {
-            continue;
-        }
-        // The argument is usually a copy made in the calling block (`_t = copy L`).
-        let tested = data
-            .statements
-            .iter()
-            .rev()
-            .find_map(|statement| match &statement.kind {
-                StatementKind::Assign(box (lhs, Rvalue::Use(operand)))
-                    if lhs.local == place.local && lhs.projection.is_empty() =>
-                {
-                    Some(
-                        operand
-                            .place()
-                            .filter(|p| p.projection.is_empty())
-                            .map_or(place.local, |p| p.local),
-                    )
-                }
-                _ => None,
-            })
-            .unwrap_or(place.local);
-        if tested.as_usize() <= body.arg_count {
-            continue;
-        }
-        let switch = &body.basic_blocks[*next];
-        let (mut condition, mut negated) = (destination.local, false);
-        for statement in &switch.statements {
-            if let StatementKind::Assign(box (lhs, Rvalue::UnaryOp(UnOp::Not, operand))) =
-                &statement.kind
-                && operand
-                    .place()
-                    .is_some_and(|p| p.local == condition && p.projection.is_empty())
-            {
-                condition = lhs.local;
-                negated = !negated;
-            }
-        }
-        let TerminatorKind::SwitchInt { discr, targets } = &switch.terminator().kind else {
-            continue;
-        };
-        if discr
-            .place()
-            .is_none_or(|p| p.local != condition || !p.projection.is_empty())
-        {
-            continue;
-        }
-        let Some(zero) = targets.target_for_value(0).into() else { continue };
-        let (not_null, null) = if negated {
-            (targets.otherwise(), zero)
-        } else {
-            (zero, targets.otherwise())
-        };
-        // W57's fault (`CRAT_E5C_W57_FAULT=no-diverge`) skips the divergence check.
-        let diverges = std::env::var("CRAT_E5C_W57_FAULT").as_deref() == Ok("no-diverge")
-            || !reachable(not_null).iter().any(|b| returns.contains(b));
-        if !diverges || !returns.iter().all(|r| dominators.dominates(*next, *r)) {
-            continue;
-        }
-        let reassigned = reachable(null).iter().any(|block| {
-            let data = &body.basic_blocks[*block];
-            data.statements.iter().any(|statement| {
-                matches!(&statement.kind, StatementKind::Assign(box (lhs, _)) if lhs.local == tested)
-            }) || matches!(&data.terminator().kind,
-                TerminatorKind::Call { destination, .. } if destination.local == tested)
-        });
-        if !reassigned {
-            out.insert(tested);
-        }
-    }
-    out
 }
 
 pub(crate) fn reseat_destinations(
