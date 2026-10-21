@@ -855,16 +855,13 @@ impl KindSolver {
         }
 
         if add_objective {
-            // Prefer Ref where hard constraints allow it, then Raw over unnecessary Owning.
+            // Prefer Ref where hard constraints allow it, then Owning over Raw.
             let big = vars.len() as u64 + 1;
             // L01⁹ measurement arm: locals get their Ref weight from
             // `prefer_ref_for_named`, and only the named ones.
             let temporary = super::field_moves::ref_weight_temporary();
-            // era-5c relays 215/216 (R1022-1, R1024-1): Ref > Owning > Raw -- `own` at 1 IN PLACE OF
-            // the raw term (raw no weight), the mirror of the frame's `raw` 1 / `own` none. Exactly
-            // one kind holds per slot, so this orders models as `own` 2 beside `raw` 1 would, and a
-            // flip gains at most |slots| - 1 < `big`: no reference is ever displaced.
-            let own_over_raw = super::field_moves::kind_order_own();
+            // Ref > Owning > Raw: `own` weighs 1 and `raw` nothing. Exactly one kind holds per
+            // slot, so a flip gains at most |slots| - 1 < `big`: no reference is ever displaced.
             for (slot, kind_vars) in &vars {
                 match (temporary, slot) {
                     (Some(0), SlotRef::Local(..)) => {}
@@ -873,11 +870,7 @@ impl KindSolver {
                     }
                     _ => solver.assert_soft(&kind_vars.ref_, big, None),
                 }
-                if own_over_raw {
-                    solver.assert_soft(&kind_vars.own, 1u64, None);
-                } else {
-                    solver.assert_soft(&kind_vars.raw, 1u64, None);
-                }
+                solver.assert_soft(&kind_vars.own, 1u64, None);
             }
         }
 

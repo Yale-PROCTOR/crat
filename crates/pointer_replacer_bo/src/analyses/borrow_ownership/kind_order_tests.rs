@@ -1,7 +1,6 @@
 //! era-5c relays 215/216 (R1022-1, R1024-1, USER): the objective's order Ref > Owning > Raw
-//! (`CRAT_ERA5C_KIND_ORDER=ref-own-raw`: `own` at 1 in place of the raw term). Each witness runs the
-//! full solve of a fixture in a child under the frame of record's env (`frames/l01p14u-s39-env.sh`
-//! + `CRAT_ERA5C_COPY_LEND_MUT=on`, 59m) with the switch as named, and reads the settled kinds by name.
+//! (`own` at 1 in place of the raw term). Each witness runs the full solve of a fixture in a child
+//! under the frame of record's env (`frames/l01p14u-s39-env.sh`) and reads the settled kinds by name.
 
 use std::collections::BTreeMap;
 
@@ -198,67 +197,6 @@ fn frame_arms() -> Vec<(String, String)> {
         .collect()
 }
 
-#[test]
-#[ignore = "runs under the frame's arms in a child of the e5c_ko witnesses"]
-fn e5c_inner_kind_order() {
-    let name = std::env::var("CRAT_E5C_KO_SHAPE").expect("CRAT_E5C_KO_SHAPE");
-    let body = SHAPES
-        .iter()
-        .find(|(shape, _)| *shape == name)
-        .unwrap_or_else(|| panic!("unknown shape {name}"))
-        .1;
-    for (key, kind) in super::copy_relax_tests::kinds(&format!("{LIBC}{body}")) {
-        println!("E5C_KO {key} {kind}");
-    }
-}
-
-/// The shape's settled kinds with the switch as given (`None` = absent).
-fn kinds(shape: &str, order: Option<&str>) -> BTreeMap<String, String> {
-    let exe = std::env::current_exe().expect("current_exe");
-    let mut command = std::process::Command::new(exe);
-    command.args([
-        "analyses::borrow_ownership::kind_order_tests::e5c_inner_kind_order",
-        "--exact",
-        "--ignored",
-        "--nocapture",
-        "--test-threads=1",
-    ]);
-    for (key, value) in frame_arms() {
-        command.env(key, value);
-    }
-    command.env("CRAT_E5C_KO_SHAPE", shape);
-    match order {
-        Some(value) => command.env("CRAT_ERA5C_KIND_ORDER", value),
-        None => command.env_remove("CRAT_ERA5C_KIND_ORDER"),
-    };
-    let output = command.output().expect("child test");
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "child {shape} failed:\n{text}");
-    let rows: BTreeMap<String, String> = text
-        .lines()
-        .filter_map(|l| l.split_once("E5C_KO ").map(|(_, rest)| rest))
-        .filter_map(|l| l.rsplit_once(' '))
-        .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
-        .collect();
-    eprintln!("E5C_KO_ROWS {shape} order={order:?} {rows:?}");
-    rows
-}
-
-/// Every shape under both orders (an observation; run with --ignored --nocapture).
-#[test]
-#[ignore = "an observation: every shape's kinds under ref-raw and ref-own-raw"]
-fn e5c_ko_observe_every_shape() {
-    for (shape, _) in SHAPES {
-        let before = kinds(shape, None);
-        let after = kinds(shape, Some("ref-own-raw"));
-        println!("E5C_KO_OBSERVE {shape}\n  ref-raw     {before:?}\n  ref-own-raw {after:?}");
-    }
-}
-
 /// Every slot's settled kind for a corpus program (`CRAT_E5C_KO_PATH=<lib.rs>`), under the switch as
 /// the environment gives it: `fn::_local@d<depth>` / `Struct::field@d<depth>` and the kind. An
 /// observation for choosing fixtures (run with --ignored --nocapture).
@@ -353,7 +291,7 @@ fn e5c_ko_observe_program() {
 
 /// The shape's whole model (`fn::local@d<depth>` -> kind) with the switch as given (`None` = absent),
 /// from a child running `e5c_ko_observe_program`.
-fn model(shape: &str, order: Option<&str>) -> BTreeMap<String, String> {
+fn model(shape: &str) -> BTreeMap<String, String> {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
     command.args([
@@ -367,10 +305,6 @@ fn model(shape: &str, order: Option<&str>) -> BTreeMap<String, String> {
         command.env(key, value);
     }
     command.env("CRAT_E5C_KO_SHAPE", shape);
-    match order {
-        Some(value) => command.env("CRAT_ERA5C_KIND_ORDER", value),
-        None => command.env_remove("CRAT_ERA5C_KIND_ORDER"),
-    };
     let output = command.output().expect("child test");
     let text = format!(
         "{}\n{}",
@@ -385,53 +319,11 @@ fn model(shape: &str, order: Option<&str>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The slots whose kind differs between two models: `slot -> (before, after)`.
-fn moved(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
-) -> BTreeMap<String, (String, String)> {
-    before
-        .iter()
-        .filter_map(|(slot, kind)| {
-            let other = after.get(slot).cloned().unwrap_or_default();
-            (other != *kind).then(|| (slot.clone(), (kind.clone(), other)))
-        })
-        .collect()
-}
-
-/// (a) Slots whose reference is refused and whose `own` is SAT settle Raw under `ref-raw` and
-/// Owning under `ref-own-raw` (quadtree's test `main`, reduced: the vector's and the strings'
-/// temporaries), and nothing else moves.
-#[test]
-fn e5c_ko_a_a_refused_reference_whose_own_is_free_settles_owning() {
-    let before = model("MAIN_ARGV", None);
-    let after = model("MAIN_ARGV", Some("ref-own-raw"));
-    let moves = moved(&before, &after);
-    assert!(!moves.is_empty(), "nothing moved: {before:#?}");
-    for (slot, (from, to)) in &moves {
-        assert_eq!(
-            (from.as_str(), to.as_str()),
-            ("Raw", "Owning"),
-            "{slot}: {moves:#?}"
-        );
-    }
-}
-
-/// (b) A reference is never displaced: every slot Ref under `ref-raw` is Ref under `ref-own-raw`,
-/// on every shape.
+/// (b) A reference is never displaced: a stack address stays a reference.
 #[test]
 fn e5c_ko_b_a_reference_stays_a_reference() {
-    for (shape, _) in SHAPES {
-        let before = model(shape, None);
-        let after = model(shape, Some("ref-own-raw"));
-        for (slot, kind) in before.iter().filter(|(_, kind)| kind.as_str() == "Ref") {
-            assert_eq!(after.get(slot), Some(kind), "{shape} {slot}");
-        }
-    }
     assert_eq!(
-        model("STACK_REF", Some("ref-own-raw"))
-            .get("run::p@d0")
-            .map(String::as_str),
+        model("STACK_REF").get("run::p@d0").map(String::as_str),
         Some("Ref")
     );
 }
@@ -439,52 +331,10 @@ fn e5c_ko_b_a_reference_stays_a_reference() {
 /// (c) A slot whose `own` is UNSAT stays Raw: a leaked local under Exit.
 #[test]
 fn e5c_ko_c_an_unsat_own_stays_raw() {
-    let after = model("LEAKED", Some("ref-own-raw"));
+    let after = model("LEAKED");
     assert_eq!(
         after.get("run::p@d0").map(String::as_str),
         Some("Raw"),
         "{after:#?}"
     );
-}
-
-/// (d) The identity names the order (its three weights) only when set to `ref-own-raw`; `ref-raw`
-/// and absence are the frame's identity; an unknown value fails loud.
-#[test]
-fn e5c_ko_d_the_identity_names_the_order() {
-    let exe = std::env::current_exe().expect("current_exe");
-    let identity = |value: Option<&str>| {
-        let mut command = std::process::Command::new(&exe);
-        command.args([
-            "analyses::borrow_ownership::copy_relax_tests::e5c_inner_identity",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-        ]);
-        match value {
-            Some(value) => command.env("CRAT_ERA5C_KIND_ORDER", value),
-            None => command.env_remove("CRAT_ERA5C_KIND_ORDER"),
-        };
-        let output = command.output().expect("child");
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        (output.status.success(), text)
-    };
-    let line = "era5c_kind_order=ref-own-raw(ref=slots+1,own=1,raw=0)";
-    let fields = |text: &str| -> Vec<String> {
-        text.lines()
-            .filter(|l| l.contains('=') && !l.starts_with("test ") && !l.starts_with("running"))
-            .map(str::to_owned)
-            .collect()
-    };
-    let (ok, absent) = identity(None);
-    assert!(ok && !absent.contains("era5c_kind_order"), "{absent}");
-    let (ok, frame) = identity(Some("ref-raw"));
-    assert!(ok && fields(&frame) == fields(&absent), "{frame}");
-    let (ok, set) = identity(Some("ref-own-raw"));
-    assert!(ok && set.contains(line), "{set}");
-    let (ok, bogus) = identity(Some("own-ref-raw"));
-    assert!(!ok && bogus.contains("CRAT_ERA5C_KIND_ORDER"), "{bogus}");
 }
