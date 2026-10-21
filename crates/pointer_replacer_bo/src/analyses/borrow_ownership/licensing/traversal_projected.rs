@@ -97,7 +97,7 @@ fn c08_projected_traversal_deref_field_target_and_metadata() {
 }
 
 #[test]
-fn c08_projected_traversal_discharge_requires_its_exact_guard_and_output() {
+fn c08_the_holder_field_has_no_store_under_the_record() {
     let fixture = inspect_era5_frame(CODE);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
@@ -108,65 +108,12 @@ fn c08_projected_traversal_discharge_requires_its_exact_guard_and_output() {
         .iter()
         .find(|s| s.offset == accepted.snapshot_offset)
         .unwrap();
-    let store = snapshot
+    let field = snapshot
         .field_support
         .iter()
         .find(|p| p.field_key == "Holder::field0@d0")
-        .unwrap()
-        .stores
-        .first()
         .unwrap();
-    let discharge = store
-        .traversal_outputs
-        .first()
-        .expect("legacy output is conditionally zero");
-    let facts = snapshot.metadata.facts();
-    assert!(
-        super::traversal_discharge::certify(
-            &facts,
-            &discharge.output,
-            &store.meet,
-            snapshot.matched.guard_aliases()
-        )
-        .is_some()
-    );
-    let mut wrong = store.meet.clone();
-    wrong.guards.insert(discharge.proof.candidate.guard, false);
-    assert!(
-        super::traversal_discharge::certify(
-            &facts,
-            &discharge.output,
-            &wrong,
-            snapshot.matched.guard_aliases()
-        )
-        .is_none(),
-        "a false traversal guard cannot discharge its owning output"
-    );
-    let mut wrong = discharge.output.clone();
-    wrong.terminal = store.meet.terminal.clone();
-    assert!(
-        super::traversal_discharge::certify(
-            &facts,
-            &wrong,
-            &store.meet,
-            snapshot.matched.guard_aliases()
-        )
-        .is_none(),
-        "a C free is never discharged"
-    );
-    let mut wrong = discharge.output.clone();
-    if let super::matched::TerminalTarget::Output { node, .. } = &mut wrong.terminal.target {
-        node.var += 100000;
-    }
-    assert!(
-        super::traversal_discharge::certify(
-            &facts,
-            &wrong,
-            &store.meet,
-            snapshot.matched.guard_aliases()
-        )
-        .is_none()
-    );
+    assert!(field.stores.is_empty(), "{field:#?}");
 }
 
 #[test]

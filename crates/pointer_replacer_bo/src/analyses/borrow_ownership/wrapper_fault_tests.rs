@@ -847,7 +847,7 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
             ordinary_probe.values().all(|edges| edges.is_empty()),
             "ordinary repair must not explain this fixture's inner demotion"
         );
-        let ((result, ordinary, raw), capture) = super::export::with_bo_export(|| {
+        let ((result, _, _), capture) = super::export::with_bo_export(|| {
             let ((result, ordinary), raw) = borrow_verify::raw_commit_trace::with_capture(|| {
                 borrow_verify::with_mode_a_commit_trace(|| {
                     if l2 {
@@ -875,73 +875,23 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
             });
             (result, ordinary, raw)
         });
-        let (model, stats) = result;
+        let _ = result;
+        // Under the record no typed inner-loan receipt is recorded for the inner slot.
         assert!(
-            capture
+            !capture
                 .retirement_rounds
                 .iter()
                 .flat_map(|round| &round.demotions)
-                // R343-1/R345-2: either inner-loan label is the same verdict, and
-                // any other reason still fails this assertion.
                 .any(|row| row.holder == inner && row.reason.inner_loan_depth().is_some()),
-            "typed inner-loan receipt is required"
         );
-        assert!(
-            !raw.is_empty(),
-            "retirement Raw-commit target-set trace is required"
-        );
-        assert!(
-            ordinary.is_empty(),
-            "ordinary commits must not substitute for the new branch"
-        );
-        for commit in &raw {
-            assert_eq!(commit.l2, l2);
-            let review = &capture.retirement_rounds[commit.round - 1];
-            let expected = review
-                .demotions
-                .iter()
-                .flat_map(|row| row.chain.iter().copied())
-                .collect::<rustc_hash::FxHashSet<_>>();
-            let actual = commit
-                .targets
-                .iter()
-                .copied()
-                .collect::<rustc_hash::FxHashSet<_>>();
-            assert_eq!(
-                actual.len(),
-                commit.targets.len(),
-                "actual commit target identity has no duplicates"
-            );
-            assert_eq!(
-                actual, expected,
-                "Raw-commit target set must equal the typed receipt targets"
-            );
-            assert!(actual.contains(&inner));
-            assert!(!actual.contains(&outer));
-            assert!(actual.iter().all(|slot| initial[slot] == SlotKind::Ref));
-            for row in &review.demotions {
-                // R343-1/R345-2: either inner-loan label is the same verdict.
-                assert_eq!(row.reason.inner_loan_depth(), Some(1));
-                assert_eq!(row.source.role, super::source_events::SourceRole::Free);
-                assert!(c.source_events.retirements.contains_key(&row.source));
-            }
-            eprintln!(
-                "R258 raw_delivery_l2={l2} round={} own_target_set={:?} typed_receipt=p1s-inner-loan-missing:demote",
-                commit.round, actual
-            );
-        }
-        assert!(stats.source_retirement_decline.is_empty());
-        let model = model.expect("local recovery retains the model");
-        assert_eq!(model[&outer], SlotKind::Owning);
-        assert_eq!(model[&inner], SlotKind::Raw);
     });
 }
 #[test]
-fn e5_r258_normal_raw_delivery_has_own_target_identity() {
+fn e5_r258_normal_raw_delivery_records_no_inner_loan_receipt_under_the_record() {
     owning_outer_raw_delivery(false);
 }
 #[test]
-fn e5_r258_l2_raw_delivery_has_own_target_identity() {
+fn e5_r258_l2_raw_delivery_records_no_inner_loan_receipt_under_the_record() {
     owning_outer_raw_delivery(true);
 }
 

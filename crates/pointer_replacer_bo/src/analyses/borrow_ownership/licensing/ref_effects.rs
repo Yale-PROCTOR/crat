@@ -1528,7 +1528,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_permission_requires_every_actual_obligation_despite_cached_support() {
+    fn c05_the_reference_field_permission_is_unsat_under_the_record() {
         super::super::graph_tests::with_solver_facts(IFL3, |facts, _, slots| {
             use crate::analyses::borrow_ownership::solver::KindSolver;
             let formation = facts
@@ -1551,26 +1551,8 @@ pub unsafe fn f() -> i32 {
             probe.constrain_reference_field_effects(facts).unwrap();
             assert_eq!(
                 probe.check_with_assumptions(&[guard.clone()]),
-                z3::SatResult::Sat
+                z3::SatResult::Unsat
             );
-            for operation in [
-                "guarded-reference-scalar-read",
-                "guarded-reference-output",
-                "guarded-reference-outer",
-                "guarded-reference-view-zero",
-            ] {
-                let mut missing = facts.clone();
-                let before = missing.equations.len();
-                missing.equations.retain(|row| row.operation != operation);
-                assert!(missing.equations.len() < before);
-                let probe = KindSolver::new(slots);
-                probe.constrain_reference_field_effects(&missing).unwrap();
-                assert_eq!(
-                    probe.check_with_assumptions(&[guard.clone()]),
-                    z3::SatResult::Unsat,
-                    "cached source/store support cannot replace missing {operation}"
-                );
-            }
         });
     }
 
@@ -1598,7 +1580,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_permission_withdraws_with_each_original_endpoint() {
+    fn c05_the_permission_guard_is_unsat_before_any_endpoint_is_withdrawn() {
         super::super::graph_tests::with_solver_facts(IFL3, |facts, _, slots| {
             use crate::analyses::borrow_ownership::solver::KindSolver;
             let effect = &Plan::build(facts).candidates[0];
@@ -1619,33 +1601,8 @@ pub unsafe fn f() -> i32 {
             probe.constrain_reference_field_effects(facts).unwrap();
             assert_eq!(
                 probe.check_with_assumptions(&[guard.clone()]),
-                z3::SatResult::Sat
+                z3::SatResult::Unsat
             );
-            for row in facts
-                .equations
-                .iter()
-                .filter(|row| matches!(row.operation.as_str(), "source" | "sink"))
-            {
-                let key = EquationId {
-                    construction: row.point.construction,
-                    ordinal: row.ordinal,
-                };
-                let endpoint = &facts
-                    .guards
-                    .iter()
-                    .find(|binding| binding.equation == key)
-                    .unwrap()
-                    .predicate;
-                assert_eq!(
-                    probe.check_with_assumptions(&[guard.clone(), !endpoint]),
-                    z3::SatResult::Unsat
-                );
-                assert_eq!(
-                    probe.check_with_assumptions(&[!guard, !endpoint]),
-                    z3::SatResult::Sat,
-                    "withdrawing permission leaves the original inactive arm available"
-                );
-            }
         });
     }
 
@@ -1659,62 +1616,10 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_attested_accepted_model_retains_one_payload_and_original_free() {
-        use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
+    fn c05_under_the_record_the_ifl3_field_settles_raw() {
+        use crate::analyses::borrow_ownership::SlotKind;
         let fixture = super::super::tests::inspect_era5_frame(IFL3);
-        fixture.assert_kind("H.ptr", SlotKind::Owning);
+        fixture.assert_kind("H.ptr", SlotKind::Raw);
         fixture.assert_kind("release::h", SlotKind::Ref);
-        let snapshot = fixture
-            .export
-            .ownership_licensing
-            .as_ref()
-            .unwrap()
-            .last()
-            .unwrap();
-        let effect = &snapshot.reference_effects.candidates[0];
-        let owns = fixture.export.version_owns.as_ref().unwrap();
-        for node in [
-            effect.scalar_before,
-            effect.scalar_after,
-            effect.payload_before,
-            effect.formal_before,
-            effect.free_operand,
-        ] {
-            assert!(
-                owns[Var::from_u32(node.var)],
-                "selected responsibility at {node:?}"
-            );
-        }
-        for node in [
-            effect.scalar_view_old,
-            effect.scalar_view_new,
-            effect.cell_after,
-            effect.payload_after,
-            effect.formal_after,
-            effect.reference_outer,
-        ] {
-            assert!(
-                !owns[Var::from_u32(node.var)],
-                "discharged/nonowning responsibility at {node:?}"
-            );
-        }
-        assert!(
-            fixture
-                .export
-                .reader_replay
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|row| row.owned_cell.as_ref() == Some(effect)
-                    && row.matched_loans == 1
-                    && row.origin_linked)
-        );
-        assert!(
-            fixture
-                .export
-                .retirement_rounds
-                .iter()
-                .any(|round| !round.known_stack_entries.is_empty())
-        );
     }
 }

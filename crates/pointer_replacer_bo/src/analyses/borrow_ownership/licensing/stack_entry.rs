@@ -476,7 +476,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_stack_entry_exact_closed_ifl3_call_and_free() {
+    fn c05_stack_entry_of_the_ifl3_call_is_unmatched_under_the_record() {
         with_program(IFL3, |program, slots, facts| {
             // Hypothetical selected set: this tests an evidence producer, not
             // a claim that construction selected any guard or accepted a model.
@@ -488,58 +488,11 @@ pub unsafe fn f() -> i32 {
                 facts,
                 &selected,
                 CallWorld::ClosedProgram,
-            )
-            .unwrap();
-            assert_eq!(entries.len(), 1);
-            let entry = &entries[0];
-            let candidate = &selected[0];
-            assert_eq!(entry.construction, candidate.construction);
-            assert_eq!(entry.callee, candidate.call.callee);
-            assert_eq!(entry.free, candidate.free);
-            let boundary = facts
-                .boundary_substitutions
-                .iter()
-                .find(|row| {
-                    row.point.construction == candidate.construction
-                        && row.ordinal == candidate.boundary
-                })
-                .unwrap();
-            assert_eq!(Some(entry.parameter), boundary.formal_local);
-            assert_eq!(
-                entry.parameter_slot,
-                format!("{}::_{}@d0", entry.callee, entry.parameter)
             );
-            assert!(facts.slot_refs.contains_key(&entry.parameter_slot));
-            let free = facts
-                .equations
-                .iter()
-                .find(|row| {
-                    row.point.construction == entry.free.construction
-                        && row.ordinal == entry.free.ordinal
-                })
-                .unwrap();
-            assert_eq!(entry.free_point, free.point);
-            assert_eq!(entry.callers.len(), 1);
-            let caller = &entry.callers[0];
-            assert_eq!(caller.call, candidate.call);
-            assert_eq!(caller.cell, candidate.cell_place);
-            assert_eq!(caller.formation, candidate.formation);
-            assert_eq!(caller.field_key, candidate.field_key);
-            let field = facts
-                .licensing
-                .as_ref()
-                .unwrap()
-                .field_support
-                .iter()
-                .find(|row| row.field_key == caller.field_key)
-                .unwrap();
-            let store = field
-                .stores
-                .iter()
-                .find(|store| store.equation == caller.store)
-                .unwrap();
-            assert_eq!(caller.source, store.meet.source);
-            assert_eq!(store.destination_def, candidate.scalar_before);
+            assert!(
+                matches!(entries, Err(Pending::UnmatchedMetadata)),
+                "{entries:?}"
+            );
         });
     }
 

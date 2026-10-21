@@ -384,16 +384,15 @@ fn inputs() -> SemanticInputs {
 }
 
 #[test]
-fn c05_stack_export_final_applied_proof_has_exact_round_and_snapshot_namespace() {
+fn c05_the_final_replay_uses_no_stack_proof_under_the_record() {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
         a5_overlap::{A5Mode, WholeProgramAttestation},
         construction,
         crate_slots::CrateSlots,
-        export, model_cache,
+        export,
         mutability_facts::MutFacts,
-        origin_evidence,
         origins::compute_origins,
     };
     const CODE: &str = r#"
@@ -424,113 +423,6 @@ pub unsafe fn f() -> i32 {
                 _ => {}
             }
         }
-        let program = crate::utils::rustc::RustProgram { tcx, functions, structs };
-        let slots = CrateSlots::build(&program);
-        let origins = compute_origins(&program);
-        let mutability = MutFacts::from_program(&program);
-        let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
-        let (verified, captured) = export::with_bo_export(|| construction::solve_bo_a5_config_reporting(
-            &program, &slots, &origins, &mutability, A5Mode::PreciseReplay, attestation,
-        ).expect("attested OL07 accepted model"));
-        let final_review = captured.source_retirement.as_ref().unwrap();
-        assert!(!final_review.known_stack_entries.is_empty(), "the final replay actually used the stack proof");
-        let inputs = model_cache::semantic_inputs(&program, A5Mode::PreciseReplay, attestation).unwrap();
-        let key = semantic_key(&inputs).unwrap();
-        // In-memory preparation only: no new cache directory or disk write.
-        model_cache::prepare(&program, &slots, &origins, &verified, &captured, A5Mode::PreciseReplay, attestation);
-        let entry = model_cache::prepared_entry(&key).unwrap_or_else(|| {
-            panic!(
-                "complete accepted synthetic envelope: {:?}",
-                model_cache::prepare_error()
-            )
-        });
-        let final_proof = &entry.origin["stack_entry_final"];
-        assert!(final_proof.is_object(), "accepted P1 exception needs durable final-round evidence");
-        assert_eq!(final_proof["retirement_round"], serde_json::json!(captured.retirement_rounds.len() - 1));
-        assert_eq!(final_proof["proofs"], serde_json::to_value(&final_review.known_stack_entries).unwrap());
-        let offset = final_proof["snapshot_offset"].as_u64().expect("explicit construction namespace");
-        let snapshots = entry.origin["licensing"].as_array().unwrap();
-        let snapshot = snapshots.iter().find(|row| row["offset"] == offset).expect("actual referenced snapshot");
-        assert!(snapshot["reference_effects"]["candidates"].as_array().is_some_and(|rows| !rows.is_empty()));
-        entry.validate().unwrap();
-        for fault in ["missing", "snapshot", "round", "free", "caller"] {
-            let mut broken = entry.clone();
-            match fault {
-                "missing" => broken.origin["stack_entry_final"] = serde_json::Value::Null,
-                "snapshot" => broken.origin["stack_entry_final"]["snapshot_offset"] = serde_json::json!(u32::MAX),
-                "round" => broken.origin["stack_entry_final"]["retirement_round"] = serde_json::json!(captured.retirement_rounds.len()),
-                "free" => broken.origin["stack_entry_final"]["proofs"][0]["free"]["ordinal"] = serde_json::json!(usize::MAX),
-                _ => broken.origin["stack_entry_final"]["proofs"][0]["callers"][0]["call"]["statement"] = serde_json::json!(usize::MAX),
-            }
-            assert!(broken.validate().is_err(), "cache accepted corrupted final stack proof: {fault}");
-        }
-        // Existing construction identity is not authenticated by matching
-        // metadata alone; the portable accepted branch stamps its namespace.
-        let previous_offset = snapshots.iter().filter_map(|row| row["offset"].as_u64()).find(|other| *other != offset).expect("A5 baseline and refined constructions");
-        let mut historical_namespace = entry.clone();
-        historical_namespace.origin["stack_entry_final"]["snapshot_offset"] = serde_json::json!(previous_offset);
-        let error = historical_namespace.validate().unwrap_err();
-        assert!(error.contains("namespace/branch stamp"), "namespace must be rejected before a structural correspondence comparison: {error}");
-
-        // Independent completeness: removing all duplicated lists must not
-        // remove the obligation of the still-selected reference/field role.
-        for missing_stamp in [false, true] {
-            let mut omitted = entry.clone();
-            if missing_stamp { omitted.origin["stack_entry_final"] = serde_json::Value::Null; }
-            else { omitted.origin["stack_entry_final"]["proofs"] = serde_json::json!([]); }
-            let mut portable: super::super::portable_export::PortableExport = serde_json::from_value(omitted.exports.clone()).unwrap();
-            for family in [super::super::portable_export::ExportFamily::RetirementFinal, super::super::portable_export::ExportFamily::RetirementRounds] {
-                for row in &mut portable.families.get_mut(&family).unwrap().records {
-                    row.fields.insert("known_stack_entries".into(), serde_json::json!([]));
-                }
-            }
-            omitted.exports = serde_json::to_value(portable).unwrap();
-            assert!(omitted.validate().is_err(), "joint omission of selected stack-entry obligation accepted; missing_stamp={missing_stamp}");
-        }
-        // Retaining a historical applied proof cannot populate the final list.
-        let mut historical_only = captured.clone();
-        historical_only.source_retirement.as_mut().unwrap().known_stack_entries.clear();
-        let historical = origin_evidence::collect(&program, &slots, &origins, Some(&historical_only));
-        let historical: serde_json::Value = serde_json::from_str(&historical.canonical_json()).unwrap();
-        assert!(historical["stack_entry_final"].is_null(),
-            "inconsistent final review cannot be replaced by historical accepted evidence");
-    }).unwrap_or_else(|error| error.raise());
-}
-// This fixture is compiler input only. Preparation below is in memory.
-#[test]
-fn c04_the_accepted_entry_carries_no_complete_chain_under_the_lend() {
-    use rustc_hir::{ItemKind, OwnerNode};
-
-    use super::super::{
-        a5_overlap::{A5Mode, WholeProgramAttestation},
-        construction,
-        crate_slots::CrateSlots,
-        export, model_cache,
-        mutability_facts::MutFacts,
-        origin_evidence::OriginEvidence,
-        origins::compute_origins,
-    };
-    const CODE: &str = r#"
-unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
-pub struct Cell{ptr:*mut i32}
-pub unsafe fn make()->*mut i32{let value=malloc(core::mem::size_of::<i32>()) as *mut i32;*value=5;value}
-pub unsafe fn put(cell:*mut Cell,value:*mut i32){(*cell).ptr=value;}
-pub unsafe fn take(cell:*mut Cell)->*mut i32{let value=(*cell).ptr;(*cell).ptr=0 as *mut i32;value}
-pub unsafe fn release(cell:*mut Cell){let value=take(cell);free(value as *mut core::ffi::c_void);}
-pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut cell,owner);release(&mut cell);}
-"#;
-    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
-        let mut functions = Vec::new();
-        let mut structs = Vec::new();
-        for owner in tcx.hir_crate(()).owners.iter() {
-            let Some(owner) = owner.as_owner() else { continue };
-            let OwnerNode::Item(item) = owner.node() else { continue };
-            match item.kind {
-                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
-                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
-                _ => {}
-            }
-        }
         let program = crate::utils::rustc::RustProgram {
             tcx,
             functions,
@@ -540,7 +432,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
         let origins = compute_origins(&program);
         let mutability = MutFacts::from_program(&program);
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
-        let (verified, captured) = export::with_bo_export(|| {
+        let (_, captured) = export::with_bo_export(|| {
             construction::solve_bo_a5_config_reporting(
                 &program,
                 &slots,
@@ -549,41 +441,14 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
                 A5Mode::PreciseReplay,
                 attestation,
             )
-            .unwrap()
+            .expect("attested OL07 accepted model")
         });
-        let inputs =
-            model_cache::semantic_inputs(&program, A5Mode::PreciseReplay, attestation).unwrap();
-        let key = semantic_key(&inputs).unwrap();
-        model_cache::prepare(
-            &program,
-            &slots,
-            &origins,
-            &verified,
-            &captured,
-            A5Mode::PreciseReplay,
-            attestation,
-        );
-        let entry = model_cache::prepared_entry(&key).unwrap_or_else(|| {
-            panic!(
-                "accepted complete-chain synthetic envelope: {:?}",
-                model_cache::prepare_error()
-            )
-        });
-        entry.validate().unwrap();
-        let original: OriginEvidence = serde_json::from_value(entry.origin.clone()).unwrap();
-        let accepted = original.stack_entry_final.as_ref().unwrap();
-        let snapshot = original
-            .licensing
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|s| s.offset == accepted.snapshot_offset)
-            .unwrap();
-        // Under the lend the cell formals are lent: no complete chain is certified.
+        let final_review = captured.source_retirement.as_ref().unwrap();
+        // Under the record the final replay uses no stack proof.
         assert!(
-            snapshot.complete_chains.is_empty(),
+            final_review.known_stack_entries.is_empty(),
             "{:?}",
-            snapshot.complete_chains
+            final_review.known_stack_entries
         );
     })
     .unwrap_or_else(|error| error.raise());

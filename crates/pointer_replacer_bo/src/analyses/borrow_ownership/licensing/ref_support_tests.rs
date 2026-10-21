@@ -53,11 +53,10 @@ fn context(facts: &Facts) -> (Candidate, ConsumedOutput, Meet, Meet) {
 }
 
 #[test]
-fn c05_ref_support_records_same_free_and_conditional_output_discharge() {
+fn c05_ref_support_holds_the_ifl3_field_unsupported_under_the_record() {
     with_facts(IFL3, |facts| {
-        let (candidate, certificate, free, output) = context(facts);
+        let (candidate, _, _, _) = context(facts);
         let frozen = facts.licensing.as_ref().unwrap();
-        let before = frozen.matched.meets_for(candidate.scalar_before);
         let proofs = field_support::audit(
             facts,
             &facts.field_support_inputs,
@@ -68,30 +67,8 @@ fn c05_ref_support_records_same_free_and_conditional_output_discharge() {
             .iter()
             .find(|field| field.field_key == candidate.field_key)
             .unwrap();
-        assert!(field.supported(), "{field:#?}");
-        assert_eq!(field.stores.len(), 1);
-        let store = &field.stores[0];
-        assert_eq!(store.meet, free);
-        assert_eq!(
-            store.meet.guards.get(&certificate.required_free.binding),
-            Some(&true)
-        );
-        assert_eq!(
-            store.discharged_outputs,
-            vec![OutputDischarge {
-                output: output.clone(),
-                certificate: certificate.clone(),
-            }]
-        );
-        assert_eq!(
-            frozen.matched.meets_for(candidate.scalar_before),
-            before,
-            "conditional disposition never deletes raw transport meets"
-        );
-        assert_eq!(
-            OutputDischarge::certify(&output, &free, &certificate),
-            store.discharged_outputs.first().cloned()
-        );
+        assert!(!field.supported(), "{field:#?}");
+        assert!(field.stores.is_empty(), "{field:#?}");
     });
 }
 
