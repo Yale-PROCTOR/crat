@@ -3247,7 +3247,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
         // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
-        ("CRAT_ERA5C_TYPED_RELEASE", "on"),
         // L01¹⁰'s configuration (R609-3): the argument-order premise and the
         // A5 type route are on.
         ("CRAT_E5C_W63_SHAPE", shape),
@@ -3526,11 +3525,8 @@ const W66_QUADTREE: &str = concat!(
     "/../../benchmarks/rs-crown-derived/quadtree/lib.rs"
 );
 
-fn w66_lines(shape: &str, typed: &str, fault: Option<&str>) -> Vec<String> {
-    let mut extra = vec![
-        ("CRAT_ERA5C_LEND", "on"),
-        ("CRAT_ERA5C_TYPED_RELEASE", typed),
-    ];
+fn w66_lines(shape: &str, fault: Option<&str>) -> Vec<String> {
+    let mut extra = vec![("CRAT_ERA5C_LEND", "on")];
     if let Some(fault) = fault {
         extra.push(("CRAT_E5C_W66_FAULT", fault));
     }
@@ -3546,7 +3542,7 @@ fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
         return;
     }
     let shape = format!("file:{W64_HT}");
-    let on = w66_lines(&shape, "on", None);
+    let on = w66_lines(&shape, None);
     for key in ["src::ht::ht_expand::_1@d0", "src::ht::ht_set::_1@d0"] {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
@@ -3557,7 +3553,7 @@ fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
                 && l.contains("target=src::ht::ht_expand::_1@d0")),
         "{on:?}"
     );
-    let red = w66_lines(&shape, "on", Some("no-discharge"));
+    let red = w66_lines(&shape, Some("no-discharge"));
     assert_eq!(
         w63_kind(&red, "src::ht::ht_expand::_1@d0"),
         "raw",
@@ -3569,11 +3565,11 @@ fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
 /// W66b: lil's context shape; the two formals 072 lost are Ref again.
 #[test]
 fn e5c_w66_b_the_context_formals_return_to_ref_under_the_discharge() {
-    let on = w66_lines("ctx", "on", None);
+    let on = w66_lines("ctx", None);
     for key in ["lil_parse::_1@d0", "lil_pop_env::_1@d0"] {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
-    let red = w66_lines("ctx", "on", Some("no-discharge"));
+    let red = w66_lines("ctx", Some("no-discharge"));
     assert_eq!(w63_kind(&red, "lil_pop_env::_1@d0"), "raw", "RED: {red:?}");
 }
 
@@ -3586,7 +3582,7 @@ fn e5c_w66_c_quadtrees_four_return_to_ref_under_the_discharge() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let on = w66_lines(&shape, "on", None);
+    let on = w66_lines(&shape, None);
     for function in ["insert_", "quadtree_insert", "reset_node_", "split_node_"] {
         let key = format!("src::src::quadtree::{function}::_1@d0");
         assert_eq!(w63_kind(&on, &key), "ref", "{key}: {on:?}");
@@ -3598,7 +3594,7 @@ fn e5c_w66_c_quadtrees_four_return_to_ref_under_the_discharge() {
                 && l.ends_with("premise=typed-release@R604-1)")),
         "{on:?}"
     );
-    let red = w66_lines(&shape, "on", Some("no-discharge"));
+    let red = w66_lines(&shape, Some("no-discharge"));
     assert_eq!(
         w63_kind(&red, "src::src::quadtree::reset_node_::_1@d0"),
         "raw",
@@ -3650,7 +3646,7 @@ fn e5c_w66_controls_void_embedded_union_and_the_carve() {
             .cloned()
             .collect()
     };
-    let on = w66_lines("w66-controls", "on", None);
+    let on = w66_lines("w66-controls", None);
     for function in ["void_free", "embedded", "unioned"] {
         assert!(discharges(&on, function).is_empty(), "{function}: {on:?}");
     }
@@ -3664,12 +3660,6 @@ fn e5c_w66_controls_void_embedded_union_and_the_carve() {
             "{function}: {on:?}"
         );
     }
-    let off = w66_lines("w66-controls", "off", None);
-    assert!(
-        !off.iter()
-            .any(|l| l.contains("retirement-disjoint:effective-type(")),
-        "no effective-type discharge without the premise: {off:?}"
-    );
 }
 
 /// 077's census for a program too large to solve here (brotli): every heap
@@ -4156,14 +4146,9 @@ unsafe extern "C" fn fnc_jaileval(mut lil: lil_t, mut x: i32) -> i32 {
 "#;
 
 /// W71's lines: the W63 child's receipts (`discharge …`, `retire-conflict …`)
-/// and model, under L01¹⁰'s arms with the three switches set to `on` / `off`.
-fn w71_lines(shape: &str, on: &str, extra: &[(&str, &str)]) -> Vec<String> {
-    let mut env: Vec<(&str, &str)> = vec![
-        ("CRAT_ERA5C_LEND", "on"),
-        ("CRAT_ERA5C_RETIRE_FRESH", on),
-        ("CRAT_ERA5C_RETIRE_ROUTE_USE", on),
-        ("CRAT_ERA5C_TYPED_SOLE", on),
-    ];
+/// and model.
+fn w71_lines(shape: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let mut env: Vec<(&str, &str)> = vec![("CRAT_ERA5C_LEND", "on")];
     env.extend_from_slice(extra);
     w63_lines(shape, &env)
 }
@@ -4174,80 +4159,12 @@ fn w71_has(lines: &[String], prefix: &str, target: &str, needle: &str) -> bool {
         .any(|l| l.starts_with(prefix) && l.contains(target) && l.contains(needle))
 }
 
-/// W71 (b, c, d, the controls, g): each discharge on its shape, off vs on; each
-/// fault takes its GREEN away; the controls and the zero-size path stay conflicts.
-#[test]
-fn e5c_w71_the_three_discharges_and_their_controls() {
-    let off = w71_lines("w71-shapes", "off", &[]);
-    let on = w71_lines("w71-shapes", "on", &[]);
-    // A crate-root function's slot key is `<f>::_<n>@d<k>`. A held conflict
-    // frame's formal is not Ref in the accepted model (the final review lists
-    // no conflict: its target is already committed).
-    let conflict = |lines: &[String], f: &str| w63_kind(lines, &format!("{f}::_1@d0")) != "ref";
-    let receipt = |lines: &[String], f: &str, rule: &str| {
-        w71_has(lines, "discharge", &format!("target={f}::_1@d0"), rule)
-    };
-    // RED: at L01¹⁰ every conflict frame is held.
-    for f in [
-        "run_step", "step", "leave", "zclear", "finish", "touch", "push",
-    ] {
-        assert!(conflict(&off, f), "RED {f}: {off:?}");
-    }
-    for f in ["run_step", "step", "leave", "zclear"] {
-        assert!(!conflict(&on, f), "GREEN {f}: {on:?}");
-    }
-    // GREEN.
-    assert!(receipt(&on, "run_step", "fresh-in-route"), "(γ) {on:?}");
-    assert!(
-        receipt(&on, "step", "post-release-use-route"),
-        "(α⁺) {on:?}"
-    );
-    assert!(
-        receipt(&on, "leave", "post-release-use-route"),
-        "(α⁺) one frame up {on:?}"
-    );
-    assert!(
-        receipt(&on, "zclear", "containment=sole-type"),
-        "(β′) {on:?}"
-    );
-    // The controls and STOP 2 (i).
-    for f in ["finish", "touch", "push"] {
-        assert!(conflict(&on, f), "control {f}: {on:?}");
-        assert!(!receipt(&on, f, ""), "control {f}: {on:?}");
-    }
-    // The faults.
-    for (fault, f, rule) in [
-        ("no-fresh", "run_step", "fresh-in-route"),
-        ("no-route-use", "step", "post-release-use-route"),
-        ("no-sole", "zclear", "containment=sole-type"),
-    ] {
-        let lines = w71_lines("w71-shapes", "on", &[("CRAT_E5C_W71_FAULT", fault)]);
-        assert!(
-            !receipt(&lines, f, rule),
-            "fault {fault} must be caught: {lines:?}"
-        );
-    }
-}
-
-/// W71a: lil's shape. Does the review raise the context formals' conflict on
-/// the jail's release, and does (γ) discharge it through the callback's route?
-/// Measured (era-5c 097): on this reduction the review raises none -- the
-/// jail's `env_t` release is (β)'s at L01¹⁰ and the sub-interpreter's own
-/// release is no conflict -- so the context formal is Ref in both arms; lil's
-/// held formals are measured on the solve.
+/// W71a: lil's shape. Measured (era-5c 097): on this reduction the review raises
+/// no conflict on the jail's release, so the context formal is Ref; lil's held
+/// formals are measured on the solve.
 #[test]
 fn e5c_w71_a_the_jail_release_is_fresh() {
-    let off = w71_lines("ctx-jail", "off", &[]);
-    let on = w71_lines("ctx-jail", "on", &[]);
-    let jail = |lines: &[String]| {
-        lines
-            .iter()
-            .filter(|l| l.contains("lil_free") || l.contains("jaileval"))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    eprintln!("W71a off {:?}\nW71a on {:?}", jail(&off), jail(&on));
-    assert_eq!(w63_kind(&off, "fnc_jaileval::_1@d0"), "ref", "{off:?}");
+    let on = w71_lines("ctx-jail", &[]);
     assert_eq!(w63_kind(&on, "fnc_jaileval::_1@d0"), "ref", "{on:?}");
 }
 
@@ -4289,41 +4206,6 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
             && l.contains(".root")),
         "{on:?}"
     );
-}
-
-/// W73 (R666-1): (α) discharges only when every route frame below returns. At
-/// L01¹⁰ `fail`'s later use discharges `die`'s release although `die` exits
-/// after it (RED); with `CRAT_ERA5C_ALPHA_RETURNS` it stays a conflict, while
-/// `recover` (a returning callee) keeps its discharge; the fault gives it back.
-#[test]
-fn e5c_w73_alpha_needs_the_route_to_return() {
-    let run = |alpha: &str, fault: Option<&str>| {
-        let mut extra = vec![("CRAT_ERA5C_ALPHA_RETURNS", alpha)];
-        if let Some(fault) = fault {
-            extra.push(("CRAT_E5C_W71_FAULT", fault));
-        }
-        w71_lines("w71-shapes", "off", &extra)
-    };
-    let alpha = |lines: &[String], f: &str| {
-        w71_has(
-            lines,
-            "discharge",
-            &format!("target={f}::"),
-            "post-free-use(",
-        )
-    };
-    let off = run("off", None);
-    assert!(alpha(&off, "fail"), "RED: {off:?}");
-    assert!(alpha(&off, "recover"), "{off:?}");
-    let on = run("on", None);
-    assert!(!alpha(&on, "fail"), "{on:?}");
-    assert_ne!(w63_kind(&on, "fail::_1@d0"), "ref", "{on:?}");
-    assert!(
-        alpha(&on, "recover"),
-        "the control keeps its discharge: {on:?}"
-    );
-    let fault = run("on", Some("no-alpha-returns"));
-    assert!(alpha(&fault, "fail"), "the fault must be caught: {fault:?}");
 }
 
 /// W74 (R668-4; analysis-fanout 014 STOP 1 (i)): the ledger names each Mode-A
@@ -4708,79 +4590,11 @@ unsafe extern "C" fn grow16(t: *mut tab) {
 }
 "#;
 
-/// W75: with (α)'s route condition (`CRAT_ERA5C_ALPHA_RETURNS`) the exit path
-/// removes `store`'s and `store16`'s (α) discharges (RED). With
-/// `CRAT_ERA5C_REALLOC_REFUTE` the constant size's null branch is refuted --
-/// `store16` and `grow16`'s own frame discharge -- while the computed size is
-/// not; the zero-size premise (`CRAT_ERA5C_REALLOC_NONZERO`) refutes both; the
-/// fault `no-refute` gives the RED back. Without the route condition both
-/// discharge (L01¹⁰'s control).
-#[test]
-fn e5c_w75_alpha_route_refutes_the_realloc_null_path() {
-    let run = |extra: &[(&str, &str)]| {
-        let mut env = vec![("CRAT_ERA5C_ALPHA_RETURNS", "on")];
-        env.extend_from_slice(extra);
-        w71_lines("w75-shapes", "off", &env)
-    };
-    let alpha = |lines: &[String], f: &str| {
-        w71_has(
-            lines,
-            "discharge",
-            &format!("target={f}::_1@d0"),
-            "post-free-use(",
-        )
-    };
-    let red = run(&[]);
-    assert!(
-        !alpha(&red, "store") && !alpha(&red, "store16"),
-        "RED: {red:?}"
-    );
-    let on = run(&[("CRAT_ERA5C_REALLOC_REFUTE", "on")]);
-    assert!(alpha(&on, "store16"), "{on:?}");
-    assert!(
-        alpha(&on, "grow16"),
-        "the releasing frame's own window: {on:?}"
-    );
-    assert!(
-        !alpha(&on, "store"),
-        "a computed size is not refuted: {on:?}"
-    );
-    let premise = run(&[
-        ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
-        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
-    ]);
-    assert!(
-        alpha(&premise, "store") && alpha(&premise, "store16"),
-        "{premise:?}"
-    );
-    let fault = run(&[
-        ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
-        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
-        ("CRAT_E5C_W71_FAULT", "no-refute"),
-    ]);
-    assert!(
-        !alpha(&fault, "store16"),
-        "the fault must be caught: {fault:?}"
-    );
-    let l10 = w71_lines("w75-shapes", "off", &[("CRAT_ERA5C_ALPHA_RETURNS", "off")]);
-    assert!(alpha(&l10, "store") && alpha(&l10, "store16"), "{l10:?}");
-}
-
 /// W78 (R682-3): a discharge only the zero-size `realloc` premise admits is
-/// receipted `premise=realloc-nonzero@R684-1` (R686-4). On W75's shapes with the premise on,
-/// `store`'s (computed size) receipt carries it; `store16`'s and `grow16`'s
-/// (constant size) do not; without the premise no receipt does; the fault
-/// `no-premise` keeps the discharge and drops the marker.
+/// receipted `premise=realloc-nonzero@R684-1` (R686-4). On W75's shapes, `store`'s
+/// (computed size) receipt carries it; `store16`'s and `grow16`'s (constant size) do not.
 #[test]
 fn e5c_w78_the_realloc_premise_is_receipted() {
-    let run = |extra: &[(&str, &str)]| {
-        let mut env = vec![
-            ("CRAT_ERA5C_ALPHA_RETURNS", "on"),
-            ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
-        ];
-        env.extend_from_slice(extra);
-        w71_lines("w75-shapes", "off", &env)
-    };
     let marked = |lines: &[String], f: &str| {
         w71_has(
             lines,
@@ -4791,7 +4605,7 @@ fn e5c_w78_the_realloc_premise_is_receipted() {
     };
     let discharged =
         |lines: &[String], f: &str| w71_has(lines, "discharge", &format!("target={f}::_1@d0"), "");
-    let premise = run(&[("CRAT_ERA5C_REALLOC_NONZERO", "on")]);
+    let premise = w71_lines("w75-shapes", &[]);
     assert!(marked(&premise, "store"), "{premise:?}");
     assert!(
         discharged(&premise, "store16") && !marked(&premise, "store16"),
@@ -4800,19 +4614,6 @@ fn e5c_w78_the_realloc_premise_is_receipted() {
     assert!(
         discharged(&premise, "grow16") && !marked(&premise, "grow16"),
         "{premise:?}"
-    );
-    let strict = run(&[]);
-    assert!(
-        !strict.iter().any(|l| l.contains("premise=realloc-nonzero")),
-        "{strict:?}"
-    );
-    let fault = run(&[
-        ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
-        ("CRAT_E5C_W71_FAULT", "no-premise"),
-    ]);
-    assert!(
-        discharged(&fault, "store") && !marked(&fault, "store"),
-        "the fault must be caught: {fault:?}"
     );
 }
 
@@ -4848,7 +4649,7 @@ extern "C" { fn malloc(_: u64) -> *mut ::core::ffi::c_void; }
 #[test]
 fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
     let env = [("CRAT_E5C_W76", "1")];
-    let on = w71_lines("w79-shapes", "on", &env);
+    let on = w71_lines("w79-shapes", &env);
     assert!(
         on.iter().any(|l| l.starts_with("discharged ")),
         "the entry is prepared: {on:?}"
@@ -4867,12 +4668,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
 /// repair, and the allocator contract on (R691-1).
 const L01P13_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5C_LEND", "on"),
-    ("CRAT_ERA5C_RETIRE_FRESH", "on"),
-    ("CRAT_ERA5C_RETIRE_ROUTE_USE", "on"),
-    ("CRAT_ERA5C_TYPED_SOLE", "on"),
-    ("CRAT_ERA5C_ALPHA_RETURNS", "on"),
-    ("CRAT_ERA5C_REALLOC_REFUTE", "on"),
-    ("CRAT_ERA5C_REALLOC_NONZERO", "on"),
     ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
     ("CRAT_BO_REPAIR", "guarded"),
     ("CRAT_BO_SAFE_MONO", "per_site"),
@@ -5347,7 +5142,7 @@ fn e5c_w76_the_entry_carries_the_discharged_rows() {
     let line = |extra: &[(&str, &str)]| {
         let mut env = vec![("CRAT_E5C_W76", "1")];
         env.extend_from_slice(extra);
-        w71_lines("w71-shapes", "on", &env)
+        w71_lines("w71-shapes", &env)
             .into_iter()
             .find(|l| l.starts_with("discharged "))
             .expect("the W76 line")

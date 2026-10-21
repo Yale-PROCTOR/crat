@@ -36,82 +36,6 @@ use crate::analyses::borrow_ownership::{
     source_events::{SourceObject, SourceRole},
 };
 
-/// `CRAT_ERA5C_TYPED_RELEASE` (on|off, fail-loud): (β), resting on the premise.
-pub(crate) fn typed_release() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5C_TYPED_RELEASE") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5C_TYPED_RELEASE must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5C_TYPED_RELEASE is not valid Unicode: {error}"),
-    })
-}
-
-fn switch(name: &'static str, cell: &'static std::sync::OnceLock<bool>) -> bool {
-    *cell.get_or_init(|| match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("{name} must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("{name} is not valid Unicode: {error}"),
-    })
-}
-
-/// `CRAT_ERA5C_RETIRE_FRESH` (on|off, fail-loud): **L01¹¹ (γ)** (R659-1, the
-/// record `docs/agents/plan/2026-09-29-retirement-fresh-and-interior-release-discharge.md`
-/// §2): the released block is an allocation made inside the route.
-pub(crate) fn retire_fresh() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_RETIRE_FRESH", &ONCE)
-}
-
-/// `CRAT_ERA5C_RETIRE_ROUTE_USE` (on|off, fail-loud): **L01¹¹ (α⁺)** (the record
-/// §3): the referent is used after the release, in a frame of the route.
-pub(crate) fn retire_route_use() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_RETIRE_ROUTE_USE", &ONCE)
-}
-
-/// `CRAT_ERA5C_TYPED_SOLE` (on|off, fail-loud): **L01¹¹ (β′)** (the record §4),
-/// with (β): pointer element types are typed, and the containment refusal fires
-/// only when P contains T or T is P-only.
-pub(crate) fn typed_sole() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_TYPED_SOLE", &ONCE)
-}
-
-/// `CRAT_ERA5C_ALPHA_RETURNS` (on|off, fail-loud): **L01¹¹, R666-1**. (α)
-/// discharges only when every route frame below the conflict frame returns
-/// normally (or uses the referent) on every path after the release: a callee that
-/// releases and then diverges never reaches the conflict frame's later use.
-pub(crate) fn alpha_returns() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_ALPHA_RETURNS", &ONCE)
-}
-
-/// `CRAT_ERA5C_REALLOC_REFUTE` (on|off, fail-loud): **L01¹²** (R677-4, era-5c 100a
-/// STOP 1). In a route's releasing frame, the branch on which a `realloc`'s result
-/// tests null is not a path after the release when the old block was not released
-/// there: its size is a nonzero constant, or `realloc_nonzero()` holds.
-pub(crate) fn realloc_refute() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_REALLOC_REFUTE", &ONCE)
-}
-
-/// `CRAT_ERA5C_REALLOC_NONZERO` (on|off, fail-loud): the premise that a zero-size
-/// `realloc` is outside the target space (091 STOP 2 (ii); C23: undefined, C17:
-/// implementation-defined), so every `realloc`'s null result leaves the old block.
-/// A user decision; off by default.
-pub(crate) fn realloc_nonzero() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    switch("CRAT_ERA5C_REALLOC_NONZERO", &ONCE)
-}
-
 /// W71's faults (test builds only): `no-fresh`, `no-route-use`, `no-sole`.
 fn w71_fault(name: &str) -> bool {
     cfg!(test) && std::env::var("CRAT_E5C_W71_FAULT").ok().as_deref() == Some(name)
@@ -473,7 +397,7 @@ impl Discharges {
         functions: &std::collections::BTreeMap<String, LocalDefId>,
     ) -> Self {
         let mut out = Self::default();
-        out.types.pointers = typed_sole() && !w71_fault("no-sole");
+        out.types.pointers = !w71_fault("no-sole");
         let mut bodies = FxHashSet::default();
         for events in routed.frames.values() {
             for event in events {
@@ -505,7 +429,6 @@ impl Discharges {
                     .borrow();
                 // L01¹² (R677-4): a route-less release's own frame gets the same refutation.
                 let refuted = (event.route.is_empty()
-                    && realloc_refute()
                     && !w71_fault("no-refute")
                     && matches!(event.source.key.role, SourceRole::ReallocOld))
                 .then(|| refuted_realloc_edge(tcx, &body, event.location))
@@ -524,13 +447,11 @@ impl Discharges {
                     out.strict_after.insert(key.clone(), strict);
                 }
                 out.after.insert(key.clone(), after);
-                if retire_fresh() && !w71_fault("no-fresh") {
+                if !w71_fault("no-fresh") {
                     let fresh = out.fresh_release(tcx, event, functions);
                     out.fresh.insert(key.clone(), fresh);
                 }
-                if (retire_route_use() && !w71_fault("no-route-use") || alpha_returns())
-                    && let Some((chain, premised)) = out.route_chain(tcx, event, functions, false)
-                {
+                if let Some((chain, premised)) = out.route_chain(tcx, event, functions, false) {
                     if premised {
                         let strict = out
                             .route_chain(tcx, event, functions, true)
@@ -769,7 +690,6 @@ impl Discharges {
                 .borrow();
             // L01¹² (R677-4): in the releasing frame only, a `realloc`'s refuted null branch.
             let refuted = (chain.is_empty()
-                && realloc_refute()
                 && !w71_fault("no-refute")
                 && matches!(event.source.key.role, SourceRole::ReallocOld))
             .then(|| refuted_realloc_edge(tcx, &body, start))
@@ -870,8 +790,7 @@ impl Discharges {
             && !self.reassigned.contains(&(event.frame, base))
             && after.is_some_and(|set| set.contains(&base))
             // R666-1: every route frame below returns (or uses the referent).
-            && (!alpha_returns()
-                || w71_fault("no-alpha-returns")
+            && (w71_fault("no-alpha-returns")
                 || chain.is_some_and(|chain| {
                     let pointer = pointers(chain, base);
                     below(chain, &pointer, chain.len() - 1)
@@ -882,8 +801,7 @@ impl Discharges {
                 premise: false,
             });
         }
-        if retire_route_use()
-            && !w71_fault("no-route-use")
+        if !w71_fault("no-route-use")
             && let Some(base) = target.base()
             && !self.reassigned.contains(&(event.frame, base))
             && let Some(chain) = chain
@@ -901,9 +819,6 @@ impl Discharges {
             return Some(Rule::FreshInRoute {
                 allocation: allocation.clone(),
             });
-        }
-        if !typed_release() {
-            return None;
         }
         let freed = self.freed.get(key)?.as_ref()?;
         let referent = self.referent(event.frame, target)?;
@@ -959,7 +874,6 @@ impl Discharges {
             {
                 "contains"
             }
-            _ if !typed_release() => "typed-release-off",
             _ => "disjoint",
         };
         format!(
@@ -1016,8 +930,9 @@ impl<'tcx> Visitor<'tcx> for Accesses {
 
 /// L01¹² (R677-4): the edge `(switch block, null branch)` on which the `realloc` at
 /// `at` has returned null with its old block untouched -- the result (through
-/// single-definition copies and pointer casts) tested by `is_null`, and a size that is
-/// a nonzero constant or `realloc_nonzero()`. `None` when any part is not found. The
+/// single-definition copies and pointer casts) tested by `is_null`; a zero-size
+/// `realloc` is outside the target space (the realloc-nonzero premise). `None` when any
+/// part is not found. The
 /// flag: the size is not a nonzero constant, so the edge rests on the premise (R682-3).
 fn refuted_realloc_edge<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -1038,7 +953,7 @@ fn refuted_realloc_edge<'tcx>(
                 .try_eval_target_usize(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
         })
         .is_some_and(|n| n != 0);
-    if !(constant || realloc_nonzero()) || !destination.projection.is_empty() {
+    if !destination.projection.is_empty() {
         return None;
     }
     // The result and its single-definition copies / pointer casts.

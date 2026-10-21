@@ -185,38 +185,17 @@ pub(crate) fn solver_identity(
     if super::copy_relax::merge_liveness() {
         fields.insert("era5c_merge_liveness", "on".to_owned());
     }
-    fields.insert(
-        "era5c_typed_release",
-        super::retirement::discharge::typed_release().to_string(),
-    );
+    fields.insert("era5c_typed_release", "true".to_owned());
     fields.insert("era5c_arg_order", "true".to_owned());
     fields.insert("era5c_overlap_type_route", "true".to_owned());
     fields.insert("era5c_ref_peel_zero", "true".to_owned());
-    fields.insert(
-        "era5c_retire_fresh",
-        super::retirement::discharge::retire_fresh().to_string(),
-    );
-    fields.insert(
-        "era5c_retire_route_use",
-        super::retirement::discharge::retire_route_use().to_string(),
-    );
-    fields.insert(
-        "era5c_typed_sole",
-        super::retirement::discharge::typed_sole().to_string(),
-    );
-    fields.insert(
-        "era5c_alpha_returns",
-        super::retirement::discharge::alpha_returns().to_string(),
-    );
+    fields.insert("era5c_retire_fresh", "true".to_owned());
+    fields.insert("era5c_retire_route_use", "true".to_owned());
+    fields.insert("era5c_typed_sole", "true".to_owned());
+    fields.insert("era5c_alpha_returns", "true".to_owned());
     // L01¹² (R677-4): the realloc refutation on (α)'s route, and its zero-size premise.
-    fields.insert(
-        "era5c_realloc_refute",
-        super::retirement::discharge::realloc_refute().to_string(),
-    );
-    fields.insert(
-        "era5c_realloc_nonzero",
-        super::retirement::discharge::realloc_nonzero().to_string(),
-    );
+    fields.insert("era5c_realloc_refute", "true".to_owned());
+    fields.insert("era5c_realloc_nonzero", "true".to_owned());
     fields.insert("era5c_own_named", "false".to_owned());
     fields.insert("era5c_origin_set", "true".to_owned());
     fields.insert("era5c_exit_close", "false".to_owned());
