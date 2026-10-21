@@ -144,14 +144,8 @@ pub(crate) fn solver_identity(
     fields.insert("era5_worker_hosts", WORKER_HOSTS.join(","));
     // R374-1: an experiment arm must be in the identity before its cache is
     // kept, so two arms cannot compute one semantic key.
-    fields.insert(
-        "era5b_return_port",
-        super::licensing::facts::return_port().to_string(),
-    );
-    fields.insert(
-        "era5b_interface_own",
-        super::licensing::facts::interface_own().to_string(),
-    );
+    fields.insert("era5b_return_port", "true".to_owned());
+    fields.insert("era5b_interface_own", "true".to_owned());
     fields.insert(
         "era5c_move_tracking",
         super::null_paths::move_tracking().to_string(),

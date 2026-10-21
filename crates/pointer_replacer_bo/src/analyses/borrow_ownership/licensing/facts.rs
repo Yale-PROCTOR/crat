@@ -177,41 +177,6 @@ pub(crate) fn repair() -> bool {
     })
 }
 
-/// R388-1: the licences the frame adds. Field support becomes a solver-level
-/// conjunction over the store sources' origins instead of a pre-solve boolean,
-/// so the coupled system (params own <= fields own <= stores supported <= params
-/// own) has the fixpoint the rest of the system already gets. Default off and
-/// carried by `solver_identity`.
-pub(crate) fn interface_own() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5B_INTERFACE_OWN") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5B_INTERFACE_OWN must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5B_INTERFACE_OWN is not valid Unicode: {error}"),
-    })
-}
-
-/// R377-1: the return-port rule. A fresh allocation whose only escape from its
-/// frame is that frame's return is `Owning` at the return port. Default off and
-/// carried by `solver_identity` (R374-1's standing rule), so the two arms cannot
-/// share a cache key.
-pub(crate) fn return_port() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5B_RETURN_PORT") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5B_RETURN_PORT must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5B_RETURN_PORT is not valid Unicode: {error}"),
-    })
-}
-
 /// R372-3 probe (3): relax the folding frame's `argument_count` and
 /// `return_width` while keeping `phis.is_empty()`. The cell plan's walk consults
 /// neither — they are gate conditions — so this measures whether a frame that

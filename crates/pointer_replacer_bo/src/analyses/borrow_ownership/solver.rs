@@ -2244,16 +2244,14 @@ impl KindSolver {
                 continue;
             };
             let reader = self.lend_guard(lhs, rhs);
-            // R388-1: under the arm, a field whose only holds are classified
-            // store sources is supported CONDITIONALLY — the condition being the
-            // conjunction those sources name. `reader => support` is unchanged;
-            // what changes is that `support` can be a formula instead of a
-            // pre-solve boolean.
-            if super::licensing::facts::interface_own()
-                && let Some(proof) = frozen
-                    .field_support
-                    .iter()
-                    .find(|proof| proof.field_key == candidate.field_key && !proof.supported())
+            // R388-1: a field whose only holds are classified store sources is
+            // supported CONDITIONALLY — the condition being the conjunction those
+            // sources name. `reader => support` is unchanged; what changes is that
+            // `support` can be a formula instead of a pre-solve boolean.
+            if let Some(proof) = frozen
+                .field_support
+                .iter()
+                .find(|proof| proof.field_key == candidate.field_key && !proof.supported())
                 && let Some(support) = self.classified_store_support(facts, proof)?
             {
                 clauses.push((

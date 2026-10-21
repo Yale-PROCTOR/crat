@@ -546,9 +546,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // licensing facts, which exist only after `freeze_facts`. Emission order is
     // irrelevant (the bodies share the InterCtxt signature vars), so the loop
     // above is left untouched and this adds rows rather than changing any.
-    if licensing::facts::return_port()
-        && let Some(frozen) = facts.licensing.as_ref()
-    {
+    if let Some(frozen) = facts.licensing.as_ref() {
         let _ = frozen;
         if let Some(tracker) = kind_solver.tracker() {
             tracker.set_context("r377-return-port");
