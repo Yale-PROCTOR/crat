@@ -760,35 +760,6 @@ impl OriginEvidence {
         w: &mut impl std::io::Write,
         s: &super::licensing::snapshot::Snapshot,
     ) -> Result<(), String> {
-        if std::env::var_os("CRAT_ERA5C_FIELDSIZE").is_some() {
-            macro_rules! sz {
-                ($name:literal, $v:expr) => {
-                    eprintln!(
-                        "E5C_FIELD {:<28} bytes={}",
-                        $name,
-                        serde_json::to_string($v).map(|s| s.len()).unwrap_or(0)
-                    );
-                };
-            }
-            sz!("caller_coverage", &s.caller_coverage);
-            sz!("complete_chains", &s.complete_chains);
-            sz!("field_support", &s.field_support);
-            sz!("first_permissions", &s.first_permissions);
-            sz!("grant_holds", &s.grant_holds);
-            sz!("matched", &s.matched);
-            sz!("metadata", &s.metadata);
-            sz!("no_ref_carriers", &s.no_ref_carriers);
-            sz!("objective_grants", &s.objective_grants);
-            sz!("reader_candidates", &s.reader_candidates);
-            sz!("reader_functions", &s.reader_functions);
-            sz!("reader_transfers", &s.reader_transfers);
-            sz!("recursive", &s.recursive);
-            sz!("reference_effects", &s.reference_effects);
-            sz!("traversal_calls", &s.traversal_calls);
-            sz!("traversal_correspondences", &s.traversal_correspondences);
-            sz!("traversal_returns", &s.traversal_returns);
-            sz!("value_origins", &s.value_origins);
-        }
         let raw = |w: &mut dyn std::io::Write, bytes: &[u8]| -> Result<(), String> {
             w.write_all(bytes).map_err(|e| e.to_string())
         };
