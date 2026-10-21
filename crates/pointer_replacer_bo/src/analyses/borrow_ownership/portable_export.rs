@@ -580,9 +580,6 @@ impl Resolver<'_, '_> {
                     .transpose()?;
                 json!({"kind":"missing-owner","owner":owner})
             }
-            R::MissingInnerLoan { slot, depth } => {
-                json!({"kind":"missing-inner-loan","slot":self.slot(*slot)?,"depth":depth})
-            }
             R::MissingSlotKey(slot) => json!({"kind":"missing-slot-key","slot":self.slot(*slot)?}),
             R::MissingEntryFacts
             | R::DifferentEntryFacts

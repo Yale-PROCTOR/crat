@@ -151,10 +151,6 @@ pub(crate) enum UnresolvedReason {
         loan: usize,
         owner: Option<ProvenanceOwner>,
     },
-    MissingInnerLoan {
-        slot: SlotRef,
-        depth: u8,
-    },
     MissingSlotKey(SlotRef),
     MissingContext,
     DuplicateContext,

@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::mir::VarDebugInfoContents;
 
-use super::{RetirementReview, UnresolvedReason};
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
@@ -25,7 +24,7 @@ use crate::{
         slot_key,
         slots::SlotOwner,
         solver::{KindSolver, SlotRef},
-        source_events::{SourceEvents, SourceRole},
+        source_events::SourceRole,
     },
     utils::rustc::RustProgram,
 };
@@ -91,53 +90,6 @@ fn slot_identity(
                 slot.depth,
             )
         }
-    }
-}
-
-fn check_inner_decline(
-    case: Case,
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    source: &SourceEvents,
-    review: &RetirementReview,
-) {
-    assert!(
-        !review.unresolved.is_empty(),
-        "{case:?}: decline requires typed retirement evidence"
-    );
-    for row in &review.unresolved {
-        let UnresolvedReason::MissingInnerLoan { slot, depth } = row.reason else {
-            panic!(
-                "{case:?}: unrelated unresolved reason must not become an expectation migration: {row:?}"
-            );
-        };
-        let (identity, actual_depth) = slot_identity(program, slots, slot);
-        assert_eq!(depth, 1);
-        assert_eq!(
-            actual_depth, depth,
-            "reason depth must match the actual slot"
-        );
-        let SlotRef::Local(function, _) = slot else {
-            panic!("fixture residual is a local inner slot")
-        };
-        assert_eq!(
-            program.tcx.item_name(function.to_def_id()).as_str(),
-            "caller"
-        );
-        let event = row
-            .source
-            .as_ref()
-            .expect("inner residual names its actual source event");
-        assert!(source.retirements.contains_key(event));
-        assert!(matches!(
-            event.role,
-            SourceRole::StorageDead | SourceRole::ReturnStorage | SourceRole::UnwindStorage
-        ));
-        assert!(row.location.is_some() && row.phase.is_some());
-        println!(
-            "receipt.case={case:?} status=declined reason=MissingInnerLoan slot={identity} depth={depth} source={event:?} frame_location={:?} frame_phase={:?} route={:?}",
-            row.location, row.phase, row.route
-        );
     }
 }
 
@@ -246,9 +198,6 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                 if let Some(stats) = &stats { assert!(stats.source_retirement_decline.is_empty()); }
             }
             Case::Outparam => {
-                if model.is_none() {
-                    check_inner_decline(case, &program, &slots, source, review);
-                }
                 let caller = *program.functions.iter().find(|function|
                     tcx.item_name(function.to_def_id()).as_str() == "caller").unwrap();
                 let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();

@@ -325,8 +325,6 @@ pub(crate) enum OwnAssumeSite {
     NonOwnedConstant,
     CastOrDepth,
     OtherInternal,
-    /// era-5c (R409-1): the allocator-contract pairing refusal.
-    AllocatorContractPairing,
 }
 
 impl OwnAssumeSite {
@@ -341,7 +339,6 @@ impl OwnAssumeSite {
             Self::NonOwnedConstant => "non-owned-constant",
             Self::CastOrDepth => "cast-or-depth",
             Self::OtherInternal => "other-internal",
-            Self::AllocatorContractPairing => "allocator-contract-pairing",
         }
     }
 }
@@ -2402,19 +2399,6 @@ impl KindSolver {
             admitted.push((key.to_owned(), slot));
             admitted.sort_by(|left, right| left.0.cmp(&right.0));
         }
-    }
-
-    /// R379-2: the rows kept by each materialisation round, and the set that was
-    /// admitted at emission. The cost receipt the seat reads.
-    pub(crate) fn return_port_receipt(&self) -> (Vec<String>, Vec<usize>) {
-        (
-            self.return_port_admitted
-                .borrow()
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect(),
-            self.return_port_kept.borrow().clone(),
-        )
     }
 
     /// R379-2: assert every admitted return-port row, then let the caller's own

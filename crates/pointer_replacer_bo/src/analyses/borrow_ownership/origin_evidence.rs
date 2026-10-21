@@ -661,14 +661,6 @@ impl OriginEvidence {
         serde_json::to_string(&self.canonicalized()).expect("origin-evidence DTO serialization")
     }
 
-    /// R471-3 (i): the canonical form as a `Value`, WITHOUT the multi-GiB
-    /// intermediate `String`. `to_value` and `from_str` both build serde_json's
-    /// key-sorted `Map`, so the bytes written from it are identical to those
-    /// from `from_str(&canonical_json())` -- the cache contract is unchanged.
-    pub(crate) fn canonical_value(&self) -> serde_json::Value {
-        serde_json::to_value(self.canonicalized()).expect("origin-evidence DTO serialization")
-    }
-
     /// R473-4 (deeper): emit a row vector without ever holding the whole
     /// vector's `Value`. `order` is a permutation (canonical) or `None` (held).
     fn write_rows<T: serde::Serialize>(

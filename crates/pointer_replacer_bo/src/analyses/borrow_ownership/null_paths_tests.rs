@@ -3982,25 +3982,6 @@ pub unsafe fn grow(m: *mut MemoryManager, n: u64) -> u32 {
     return v;
 }
 "#;
-/// Releasers whose released value is not the incoming formal (Codex, era-5c 115):
-/// `keep_and_free` overwrites `p`; `wrap_free` overwrites a wrapper's field
-/// between two transmutes.
-const W81_REASSIGNED: &str = r#"
-pub unsafe fn keep_and_free(m: *mut MemoryManager, mut p: *mut c_void) -> *mut c_void {
-    let saved = p;
-    p = BrotliAllocate(m, 8);
-    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
-    return saved;
-}
-#[repr(transparent)] pub struct W(pub *mut c_void);
-pub unsafe fn wrap_free(m: *mut MemoryManager, p: *mut c_void) -> *mut c_void {
-    let mut w: W = core::mem::transmute(p);
-    w.0 = BrotliAllocate(m, 8);
-    let q: *mut c_void = core::mem::transmute(w);
-    ((*m).free_func).expect("non-null function pointer")((*m).opaque, q);
-    return p;
-}
-"#;
 /// A conditional allocation (`cond`).
 const W82_COND: &str = r#"
 pub unsafe fn cond(m: *mut MemoryManager, n: u64) -> u32 {

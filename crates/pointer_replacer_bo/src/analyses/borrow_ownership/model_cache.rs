@@ -38,8 +38,6 @@ use crate::utils::rustc::RustProgram;
 /// changes after this commit do not advance this identity.
 pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p14-v1";
 
-const CACHE_SCHEMA: &str = "bo-model-cache-v2";
-
 fn program_identity(
     crate_name: &str,
     files: impl IntoIterator<Item = (String, Vec<u8>)>,
@@ -622,13 +620,6 @@ pub(crate) fn model_bytes_sha256(
 ) -> Option<String> {
     let rows = canonical_model_rows(tcx, slots, model)?;
     Some(format!("{:x}", Sha256::digest(rows.join("\n").as_bytes())))
-}
-
-fn attestation_label(attestation: Option<WholeProgramAttestation>) -> &'static str {
-    match attestation {
-        Some(WholeProgramAttestation::FrozenBenchmarkGraph) => "frozen_benchmark_graph",
-        None => "none",
-    }
 }
 
 /// Serialize the accepted model and its minimum precise-replay rehydration

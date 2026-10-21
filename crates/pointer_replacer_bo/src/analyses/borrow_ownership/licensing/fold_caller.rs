@@ -1163,7 +1163,6 @@ pub(crate) enum ReturnPortHold {
     ReturnSiteDeliveryUnknown,
     PortNotFreshOrNull,
     StoredIntoField,
-    HandedToCallee,
 }
 
 pub(crate) fn return_port_owning(

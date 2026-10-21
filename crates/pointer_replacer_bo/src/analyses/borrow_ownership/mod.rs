@@ -141,14 +141,6 @@ const _: () = assert!(
 
 impl<Value> Param<Value> {
     #[inline]
-    pub fn map<U>(self, f: impl Fn(Value) -> U) -> Param<U> {
-        match self {
-            Param::Output(output_param) => Param::Output(output_param.repack(f)),
-            Param::Normal(param) => Param::Normal(f(param)),
-        }
-    }
-
-    #[inline]
     pub fn expect_normal(self) -> Value {
         match self {
             Param::Normal(sigs) => sigs,
@@ -188,7 +180,6 @@ pub(crate) trait AnalysisKind<'analysis, 'db, 'tcx> {
     /// Interprocedural context
     type InterCtxt;
     type DB: Database;
-    fn analyze(crate_ctxt: CrateCtxt<'tcx>) -> anyhow::Result<Self::Results>;
 }
 
 type InterCtxt = FxHashMap<DefId, FnSig<Option<Param<Range<Var>>>>>;
@@ -199,10 +190,6 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for BoOwnershipPro
     type DB = BoOwnDatabase<'db>;
     type InterCtxt = &'analysis InterCtxt;
     type Results = ();
-
-    fn analyze(_crate_ctxt: CrateCtxt<'tcx>) -> anyhow::Result<Self::Results> {
-        unimplemented!("B0 only forks ownership emission; B1 wires a real BO analysis")
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

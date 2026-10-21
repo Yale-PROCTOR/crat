@@ -195,16 +195,6 @@ pub(crate) fn record_access(access: SourceAccess) {
     });
 }
 
-pub(crate) fn current_accesses() -> Vec<SourceAccess> {
-    ACCESSES.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .map(|(rows, _)| rows.clone())
-            .unwrap_or_default()
-    })
-}
-
 pub(crate) struct EntryScope {
     previous: Option<Arc<EntryAnalysis>>,
     accesses: Option<(Vec<SourceAccess>, FxHashSet<SourceAccess>)>,

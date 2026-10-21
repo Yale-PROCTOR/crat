@@ -818,53 +818,9 @@ impl Discharges {
         })
     }
 
-    /// Why a would-be conflict is or is not discharged (the printer's column).
-    pub(crate) fn explain(&self, event: &FrameEvent, target: &Target<'_>) -> String {
-        let key = super::context_key(
-            &event.source.key,
-            event.frame,
-            event.location,
-            event.phase,
-            &event.route,
-        );
-        let freed = self.freed.get(&key).and_then(Option::as_ref);
-        let referent = self.referent(event.frame, target);
-        let name = |t: Option<&CTy>| t.map_or("none".to_owned(), |t| self.types.name(t));
-        let verdict = match (freed, referent.as_ref()) {
-            (None, _) => "no-P",
-            (_, None) => "no-T",
-            (Some(p), Some(t)) if !self.types.typed(p) || !self.types.typed(t) => {
-                "void/char/union/zst"
-            }
-            (Some(p), Some(t)) if self.types.contains(p, t, 0) || self.types.sole(t, p, 0) => {
-                "contains"
-            }
-            _ => "disjoint",
-        };
-        format!(
-            "P={} T={} verdict={verdict}",
-            name(freed),
-            name(referent.as_ref())
-        )
-    }
-
     /// The type table, for a census that walks without a routed event.
     pub(crate) fn name_of(&self, ty: &CTy) -> String {
         self.types.name(ty)
-    }
-
-    /// The freed type recovered for an event, for the printer.
-    pub(crate) fn freed_name(&self, event: &FrameEvent) -> Option<String> {
-        let key = super::context_key(
-            &event.source.key,
-            event.frame,
-            event.location,
-            event.phase,
-            &event.route,
-        );
-        self.freed
-            .get(&key)
-            .map(|p| p.as_ref().map_or("none".into(), |t| self.types.name(t)))
     }
 }
 

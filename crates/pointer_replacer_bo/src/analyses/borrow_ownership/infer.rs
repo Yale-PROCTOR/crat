@@ -231,10 +231,6 @@ where
         }
     }
 
-    pub(crate) fn function(&self) -> rustc_hir::def_id::DefId {
-        self.function
-    }
-
     fn copy_lend_guard(&self, location: Location) -> Option<Bool> {
         self.copy_lend_guards.get(&location).cloned()
     }

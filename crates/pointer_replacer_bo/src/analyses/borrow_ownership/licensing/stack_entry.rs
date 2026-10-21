@@ -83,7 +83,6 @@ pub(crate) struct KnownStackEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pending {
-    Implementation,
     OpenCallWorld,
     CompilerCoverage,
     UncoveredCaller,

@@ -37,14 +37,6 @@ impl FieldMoves {
     pub(crate) fn is_move(&self, location: Location) -> bool {
         self.moves.contains(&location)
     }
-
-    pub(crate) fn refusal(&self, location: Location) -> Option<&'static str> {
-        self.refusals.get(&location).copied()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.moves.len()
-    }
 }
 
 /// A candidate load: `lhs = (*base).field` (a copy out of a field behind a

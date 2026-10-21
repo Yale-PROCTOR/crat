@@ -21,14 +21,12 @@ pub(crate) enum Reason {
     InnerLoanEscaped {
         depth: u8,
     },
-    OwnerMissing,
 }
 impl Reason {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::InnerLoanMissing { .. } => "p1s-inner-loan-missing:demote",
             Self::InnerLoanEscaped { .. } => "p1s-inner-loan-escaped:demote",
-            Self::OwnerMissing => "p1s-owner-missing:demote",
         }
     }
 
@@ -41,7 +39,6 @@ impl Reason {
     pub(crate) fn inner_loan_depth(self) -> Option<u8> {
         match self {
             Self::InnerLoanMissing { depth } | Self::InnerLoanEscaped { depth } => Some(depth),
-            Self::OwnerMissing => None,
         }
     }
 }

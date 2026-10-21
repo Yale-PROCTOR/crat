@@ -268,30 +268,6 @@ pub(crate) fn conflict_witness_diagnostic(
     )
 }
 
-pub(crate) fn conflict_witness_diagnostic_stable(
-    validation_round: usize,
-    fn_key: FnKey,
-    loan: usize,
-    stable_loan_key: StableLoanKey,
-    target: SlotRef,
-    issuer: Option<SlotRef>,
-    requirers: &[SlotRef],
-    invalidators: &[SlotRef],
-) -> String {
-    let mut record = conflict_witness_diagnostic(
-        validation_round,
-        fn_key,
-        loan,
-        target,
-        issuer,
-        requirers,
-        invalidators,
-    );
-    record.push_str("|stable_loan=");
-    record.push_str(&stable_loan_key.diagnostic());
-    record
-}
-
 /// Canonical identity of the conflict edge that spawned a commit.
 ///
 /// The function key is required even for field-only fixtures: the same field

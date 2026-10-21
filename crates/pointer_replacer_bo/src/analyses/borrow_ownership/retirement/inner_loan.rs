@@ -551,18 +551,6 @@ impl InnerLoans {
             .map(|row| row.liveness.members())
     }
 
-    /// The obligation for one holder, if it has one.
-    pub(crate) fn reservations(
-        &self,
-        function: LocalDefId,
-        local: Local,
-        depth: u8,
-    ) -> &[Location] {
-        self.rows
-            .get(&(function, local, depth))
-            .map_or(&[], |row| row.loan.reservations.as_slice())
-    }
-
     /// R343-1: the three-way disposition of sizing 2.2, in one place.
     ///
     /// The order is the whole soundness argument. Escape is asked BEFORE

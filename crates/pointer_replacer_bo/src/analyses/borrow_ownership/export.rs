@@ -52,7 +52,6 @@
 
 use std::cell::RefCell;
 
-use rustc_hash::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::{Local, Location, Place};
@@ -154,17 +153,6 @@ impl PlaceKey {
             .iter()
             .filter(|p| matches!(p, ProjKey::Deref))
             .count()
-    }
-
-    /// Derived view; see [`PlaceKey::derefs`].
-    pub(crate) fn fields(&self) -> Vec<u32> {
-        self.proj
-            .iter()
-            .filter_map(|p| match p {
-                ProjKey::Field(f) => Some(*f),
-                _ => None,
-            })
-            .collect()
     }
 }
 
@@ -1062,9 +1050,7 @@ pub(crate) fn record_residuals(residuals: Vec<ResidualConflict>) {
     record(|export| export.residual_conflicts = Some(residuals));
 }
 
-/// E-R1 is the accepted model itself, which existing entry points already
-/// return. This alias exists so the four E-R names are all nameable.
-pub(crate) type AcceptedModel = FxHashMap<SlotRef, SlotKindAlias>;
+#[cfg(test)]
 pub(crate) use super::domain::SlotKind as SlotKindAlias;
 
 #[cfg(test)]
