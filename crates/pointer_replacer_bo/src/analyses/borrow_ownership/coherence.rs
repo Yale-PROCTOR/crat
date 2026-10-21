@@ -246,13 +246,9 @@ fn add_coherence_impl<'tcx>(
     // through to the pin's unconditional `equate`. The pin asserted one kind
     // equality here; era-5b's guarded form is the seat's prime suspect for the
     // 52 `ref -> raw`, and pass 1 is what tests that.
-    // R371-2: under the repair arm both maps stay empty in the joint pass too,
-    // so the dispatch falls through to the pin's unconditional `equate` — the
-    // general equate is restored, never deleted.
-    let joint = super::licensing::facts::Pass::current() == super::licensing::facts::Pass::Joint
-        && !super::licensing::facts::repair();
-    // L01^5 (ii): the strong-update field moves of this body (empty unless the
-    // pin is on), consulted just before the pin's unconditional `equate`.
+    let joint = super::licensing::facts::Pass::current() == super::licensing::facts::Pass::Joint;
+    // L01^5 (ii): the strong-update field moves of this body, consulted just
+    // before the pin's unconditional `equate`.
     let field_moves = super::field_moves::compute(body);
     let field_readers = solver
         .ownership_facts()

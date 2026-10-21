@@ -236,14 +236,8 @@ pub(crate) fn solver_identity(
         }
         .to_owned(),
     );
-    fields.insert(
-        "era5b_repair",
-        super::licensing::facts::repair().to_string(),
-    );
-    fields.insert(
-        "era5b_relax_frame",
-        super::licensing::facts::relax_frame().to_string(),
-    );
+    fields.insert("era5b_repair", "false".to_owned());
+    fields.insert("era5b_relax_frame", "false".to_owned());
     // The test-build fault hooks are compiled into the worker (a test binary):
     // a set one changes the model, so it names the key.
     fields.insert(

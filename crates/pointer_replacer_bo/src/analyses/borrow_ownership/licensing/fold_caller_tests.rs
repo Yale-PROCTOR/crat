@@ -1116,11 +1116,7 @@ fn r372_declaration_plan_of_a_recorded_entry() {
     let origin: OriginEvidence =
         serde_json::from_value(entry["origin"].clone()).expect("recorded origin evidence");
     let snapshots = origin.licensing.as_deref().unwrap_or_default();
-    let relaxed = super::facts::relax_frame();
-    eprintln!(
-        "PLAN {program} snapshots={} relax_frame={relaxed}",
-        snapshots.len()
-    );
+    eprintln!("PLAN {program} snapshots={}", snapshots.len());
 
     let Some(snapshot) = snapshots.first() else { return };
     let facts = snapshot.metadata.facts();

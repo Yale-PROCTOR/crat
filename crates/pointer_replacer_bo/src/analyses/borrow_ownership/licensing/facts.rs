@@ -158,43 +158,6 @@ pub(crate) enum Pass {
     EraFiveA,
 }
 
-/// R371-2: the joint-pass repair arm. The two families the seat named as the
-/// cause of the 52 `ref -> raw` — era-5b's guarded `equate` replacing the pin's
-/// unconditional one, and the `no_ref_carriers` `¬ref` exclusion — are withdrawn
-/// under `Joint` while every grant constraint stays on. It is an environment arm
-/// so the default path is byte-identical and the repair is a measured arm, not a
-/// silent behaviour change. Fail-loud on a typo, as `Pass` is.
-pub(crate) fn repair() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5B_REPAIR") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5B_REPAIR must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5B_REPAIR is not valid Unicode: {error}"),
-    })
-}
-
-/// R372-3 probe (3): relax the folding frame's `argument_count` and
-/// `return_width` while keeping `phis.is_empty()`. The cell plan's walk consults
-/// neither — they are gate conditions — so this measures whether a frame that
-/// takes arguments and returns a value, but never joins, can carry the cell
-/// story as written. An environment arm, so the default path is unchanged.
-pub(crate) fn relax_frame() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5B_RELAX_FRAME") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5B_RELAX_FRAME must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5B_RELAX_FRAME is not valid Unicode: {error}"),
-    })
-}
-
 /// R353-2: the pass is read once. It is process-wide by construction — an
 /// environment pin — and the inference walk asks per statement, which is not a
 /// place to re-read the environment.

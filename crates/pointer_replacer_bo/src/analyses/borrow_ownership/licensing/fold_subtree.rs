@@ -144,8 +144,7 @@ pub(crate) fn certify_metadata(
         facts.body_rosters.iter().filter(|b| scope(&b.point)),
         Hold::Coverage(line!()),
     )?;
-    let shape =
-        (body.argument_count != 0 || body.return_width != 0) && !super::facts::relax_frame();
+    let shape = body.argument_count != 0 || body.return_width != 0;
     if shape || !body.phis.is_empty() {
         return Err(Hold::BodyShape {
             arguments: body.argument_count,

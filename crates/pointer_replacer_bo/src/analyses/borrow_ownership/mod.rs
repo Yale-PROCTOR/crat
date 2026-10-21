@@ -571,9 +571,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         let slot = facts.slot_refs[&carrier.slot_key];
         // O-ORIGIN is independent of endpoint/grant selection. A refused
         // fresh responsibility cannot acquire an invented borrow lifetime.
-        // R371-2: the repair arm withdraws this exclusion and leaves every
-        // grant constraint below on.
-        if joint && !licensing::facts::repair() {
+        if joint {
             kind_solver.add_borrow_exclusion(Some(slot), &[]);
             raw_cause::note_eager(&kind_solver, "no-ref-carrier");
             raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");

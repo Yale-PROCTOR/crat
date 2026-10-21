@@ -514,7 +514,7 @@ pub(crate) fn cell_plan(
         facts.body_rosters.iter().filter(|b| scope(&b.point)),
         Hold::CoverageAt(line!()),
     )?;
-    let arguments = body.argument_count != 0 && !super::facts::relax_frame();
+    let arguments = body.argument_count != 0;
     if arguments || !body.phis.is_empty() {
         return Err(Hold::BodyShape {
             arguments: body.argument_count,
