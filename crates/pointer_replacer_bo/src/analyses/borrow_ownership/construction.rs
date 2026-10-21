@@ -24,7 +24,7 @@ use super::{
     BoOwnEmissionStats, CrateCtxt, SlotKind,
     a5_overlap::{
         A5Mode, A5World, AbiGuardDisposition, C9MarkKey, WholeProgramAttestation,
-        WitnessMarkability, apply_coarse_constraints, plan_c9_marks,
+        apply_coarse_constraints,
     },
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{
@@ -55,12 +55,6 @@ use crate::{
     },
     utils::rustc::RustProgram,
 };
-
-pub(crate) fn plan_a5_c9_marks(
-    witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
-) -> BTreeSet<C9MarkKey> {
-    plan_c9_marks(witnesses)
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyLendMode {
@@ -335,16 +329,6 @@ struct NullabilityArtifacts {
     fields: usize,
 }
 
-impl NullabilityArtifacts {
-    fn empty() -> Self {
-        Self {
-            artifact: String::from("variant\towner\tslot\tis_null_use\tnull_literal\tnullable\n"),
-            slots: 0,
-            fields: 0,
-        }
-    }
-}
-
 fn nullability_artifacts(construction: &BoConstruction) -> NullabilityArtifacts {
     let mut rows = construction
         .nullability
@@ -380,19 +364,6 @@ struct A14Artifacts {
     opaque_stores: usize,
     unresolved_unresolvable: usize,
     nullable_store_fields: usize,
-}
-
-impl A14Artifacts {
-    fn empty() -> Self {
-        Self {
-            artifact: String::from(
-                "variant\towner\tslot\topaque\tunresolved_unresolvable\tnullable\tsafe\n",
-            ),
-            opaque_stores: 0,
-            unresolved_unresolvable: 0,
-            nullable_store_fields: 0,
-        }
-    }
 }
 
 fn a14_artifacts(construction: &BoConstruction) -> A14Artifacts {
@@ -715,19 +686,6 @@ fn a5_receipt(
             Sha256::digest(a14.artifact.as_bytes()),
         ),
     ))
-}
-
-pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> String {
-    let plan = A5Plan::baseline();
-    a5_receipt(
-        A5Mode::Baseline,
-        &plan,
-        0,
-        0,
-        &model_digest(model),
-        &NullabilityArtifacts::empty(),
-        &A14Artifacts::empty(),
-    )
 }
 
 pub(crate) fn construct_bo_into(
