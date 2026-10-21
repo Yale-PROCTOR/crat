@@ -1,0 +1,17 @@
+[package]
+name = "tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pointer_replacer = { path = "../pointer_replacer" }
+utils = { path = "../utils" }
+serde.workspace = true
+serde_json.workspace = true
+unicode-ident = "1"
+
+[dev-dependencies]
+passes = { path = "../passes" }
+
+[package.metadata.rust-analyzer]
+rustc_private = true

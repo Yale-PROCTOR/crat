@@ -332,6 +332,40 @@ fn test_expr_loop() {
 }
 
 #[test]
+fn test_thir_to_mir_valued_break() {
+    compilation::run_compiler_on_str(
+        "fn f(flag: bool) -> i32 { loop { break if flag { 1 } else { 2 }; } }",
+        |tcx| {
+            let def_id = tcx
+                .hir_free_items()
+                .find_map(|item_id| {
+                    let item = tcx.hir_item(item_id);
+                    matches!(item.kind, hir::ItemKind::Fn { ident, .. } if ident.as_str() == "f")
+                        .then_some(item.owner_id.def_id)
+                })
+                .unwrap();
+            let mapping = map_thir_to_mir(def_id, false, tcx);
+            let (thir, _) = tcx.thir_body(def_id).unwrap();
+            let thir = thir.borrow();
+            let valued_breaks = thir
+                .exprs
+                .iter_enumerated()
+                .filter(|(_, expr)| {
+                    matches!(
+                        expr.kind,
+                        rustc_middle::thir::ExprKind::Break { value: Some(_), .. }
+                    )
+                })
+                .map(|(expr_id, _)| expr_id)
+                .collect::<Vec<_>>();
+            assert_eq!(valued_breaks.len(), 1);
+            assert_eq!(mapping.expr_to_locs[&valued_breaks[0]].len(), 2);
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_expr_match() {
     run_test(
         "
@@ -359,12 +393,131 @@ fn test_expr_closure() {
 }
 
 #[test]
+fn test_expr_async_block() {
+    run_test(
+        "
+        fn f() {
+            let _future = async { 1 };
+        }",
+    )
+}
+
+#[test]
+fn test_expr_await() {
+    run_test(
+        "
+        fn f() {
+            let _future = async { core::future::ready(1).await };
+        }",
+    )
+}
+
+#[test]
 fn test_expr_assign() {
     run_test(
         "
         fn f() {
             let x;
             x = 0;
+        }",
+    )
+}
+
+#[test]
+fn test_expr_destructuring_assign() {
+    run_test(
+        "
+        fn parse(text: &[i8]) -> ((i64, &[i8]), Result<(), ()>) {
+            ((0, text), Ok(()))
+        }
+        fn f(text: &[i8]) {
+            let parsed;
+            let end;
+            ((parsed, end), _) = parse(text);
+        }",
+    )
+}
+
+#[test]
+fn test_expr_destructuring_assign_bindings() {
+    let code = "
+        fn f(mut left: i64, mut right: i32, result: ((i32, i64), bool)) {
+            ((right, left), _) = result;
+        }";
+    compilation::run_compiler_on_str(code, |tcx| {
+        for expanded in [true, false] {
+            let mut krate = if expanded {
+                ast::expanded_ast(tcx)
+            } else {
+                ast::parse_crate(code.to_owned())
+            };
+            let mut mapper = AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut krate, tcx.hir_root_module(), expanded);
+            let item = krate
+                .items
+                .iter()
+                .find(|item| matches!(item.kind, ItemKind::Fn(_)))
+                .unwrap();
+            let ItemKind::Fn(function) = &item.kind else { unreachable!() };
+            let StmtKind::Semi(assignment) = &function.body.as_ref().unwrap().stmts[0].kind else {
+                unreachable!()
+            };
+            let ExprKind::Assign(lhs, rhs, _) = &assignment.kind else { unreachable!() };
+            let ExprKind::Tup(outer) = &lhs.kind else { unreachable!() };
+            let ExprKind::Tup(inner) = &outer[0].kind else { unreachable!() };
+            let mapping = mapper.ast_to_hir;
+            assert!(matches!(
+                mapping.get_expr(assignment.id, tcx).unwrap().kind,
+                hir::ExprKind::Block(..)
+            ));
+            assert!(matches!(
+                mapping.get_pat(lhs.id, tcx).unwrap().kind,
+                hir::PatKind::Tuple(..)
+            ));
+            assert!(matches!(
+                mapping.get_pat(outer[1].id, tcx).unwrap().kind,
+                hir::PatKind::Wild
+            ));
+            assert!(mapping.get_expr(lhs.id, tcx).is_none());
+            let body = tcx.hir_body_owned_by(mapping.global_map[&item.id]);
+            for (expression, parameter) in [(&inner[0], 1), (&inner[1], 0), (rhs, 2)] {
+                let expression = mapping.get_expr(expression.id, tcx).unwrap();
+                let hir::ExprKind::Path(path) = expression.kind else { unreachable!() };
+                let typeck = tcx.typeck(expression.hir_id.owner);
+                assert_eq!(
+                    typeck.qpath_res(&path, expression.hir_id),
+                    hir::def::Res::Local(body.params[parameter].pat.hir_id)
+                );
+                assert_eq!(
+                    typeck.expr_ty(expression),
+                    typeck.node_type(body.params[parameter].pat.hir_id)
+                );
+            }
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_expr_destructuring_assign_patterns() {
+    run_test(
+        "
+        struct Pair { left: i32, right: i32 }
+        struct Tuple(i32, i32);
+        struct Unit;
+        fn f() {
+            let mut left = 0;
+            let mut right = 0;
+            let mut values = [0, 0];
+            let mut pair = Pair { left, right };
+            (right, left, ..) = (1, 2, 3);
+            [values[1], _, values[0], ..] = [1, 2, 3, 4];
+            Pair { left: pair.right, right: pair.left } = Pair { left, right };
+            Pair { left, .. } = pair;
+            Tuple(left, right) = Tuple(1, 2);
+            Unit = Unit;
+            _ = (left, right);
+            (..) = (left, right);
         }",
     )
 }
