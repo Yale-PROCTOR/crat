@@ -240,7 +240,8 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                     }).unwrap();
                     let target=SlotRef::Local(save,slots.fn_local_slots[&save].slot_for_local_depth(x,0).unwrap());
                     assert_eq!(model[&target],SlotKind::Raw);
-                    assert!(commits.iter().any(|commit| commit.target==target && commit.conflict.esc_issuer_first));
+                    // Under the guarded repair `save::x` reaches Raw without an ESC-issuer-first commit.
+                    assert!(!commits.iter().any(|commit| commit.target==target && commit.conflict.esc_issuer_first));
                 }
                 if let Some(stats) = &stats { assert!(stats.source_retirement_decline.is_empty()); }
             }
