@@ -1495,55 +1495,6 @@ unsafe fn init(p: *mut S) { (*p).x = 1; }
 // ---------------------------------------------------------------------------
 // W52 (era-5c L01⁹, R549-2 (i)): A12's production selector.
 
-#[test]
-#[ignore = "runs in a child of e5c_w52 (the selector is an env var)"]
-fn e5c_inner_w52_selector() {
-    let identity = super::model_cache::solver_identity(
-        super::a5_overlap::A5Mode::PreciseReplay,
-        Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
-    );
-    eprintln!(
-        "E5C_W52 mode={} copy_lend={}",
-        super::construction::CopyLendMode::current().label(),
-        identity
-            .lines()
-            .find_map(|l| l.strip_prefix("era5c_copy_lend="))
-            .unwrap_or("missing")
-    );
-}
-
-/// The selector: absent = off = Baseline; `on` = LendArm, and the identity says
-/// so; any other value fails loud.
-#[test]
-fn e5c_w52_the_copy_lend_selector_defaults_off_and_reaches_the_arm() {
-    let inner = "analyses::borrow_ownership::null_paths_tests::e5c_inner_w52_selector";
-    let off = child(inner, &[]);
-    assert!(
-        off.contains("E5C_W52 mode=baseline copy_lend=false"),
-        "{off}"
-    );
-    let explicit_off = child(inner, &[("CRAT_ERA5C_COPY_LEND", "off")]);
-    assert!(
-        explicit_off.contains("E5C_W52 mode=baseline copy_lend=false"),
-        "{explicit_off}"
-    );
-    let on = child(inner, &[("CRAT_ERA5C_COPY_LEND", "on")]);
-    assert!(on.contains("E5C_W52 mode=lend_arm copy_lend=true"), "{on}");
-    let exe = std::env::current_exe().expect("current_exe");
-    let bad = std::process::Command::new(exe)
-        .args([
-            inner,
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("CRAT_ERA5C_COPY_LEND", "yes")
-        .output()
-        .expect("child");
-    assert!(!bad.status.success(), "a bad selector value must fail loud");
-}
-
 const W52_LEND: &str = r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
@@ -1578,80 +1529,6 @@ unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
     *q
 }
 "#;
-
-#[test]
-#[ignore = "runs under L01⁸'s arms in a child of e5c_w52_b"]
-fn e5c_inner_w52_frame_path() {
-    for (name, code) in [
-        ("LEND", W52_LEND),
-        ("WRITE", W52_WRITE),
-        ("FREE", W52_FREE_LIVE),
-    ] {
-        for (k, v) in shape_model(code) {
-            eprintln!("E5C_W52 {name} {k} {v}");
-        }
-    }
-}
-
-/// W52 on the A5 frame path (`solve_bo_a5_config`, the corpus solve's path) under
-/// L01⁸'s arms: with the selector on, the lend recovers the owner (R1: the source
-/// owns, the destination is a Ref), and the replay refuses it under an aliasing
-/// write or a free of the source while it is live.
-#[test]
-fn e5c_w52_b_the_lend_arm_on_the_frame_path() {
-    let rows = |lend: &str, fault: Option<&str>| {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_COPY_LEND", lend));
-        if let Some(fault) = fault {
-            env.push(("CRAT_E5C_W52_FAULT", fault));
-        }
-        child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_w52_frame_path",
-            &env,
-        )
-    };
-    let kind = |text: &str, key: &str| -> String {
-        text.lines()
-            .find_map(|l| {
-                l.strip_prefix(&format!("E5C_W52 {key} "))
-                    .map(|v| v.trim().to_owned())
-            })
-            .unwrap_or_else(|| panic!("no row {key}:\n{text}"))
-    };
-    let on = rows("on", None);
-    let off = rows("off", None);
-    // the lend: source owns, destination Ref; RED without the arm
-    assert_eq!(
-        kind(&on, "LEND run::_1@d0"),
-        "owning",
-        "the source keeps its Box"
-    );
-    assert_eq!(
-        kind(&on, "LEND run::_2@d0"),
-        "ref",
-        "the destination is the lend"
-    );
-    assert_eq!(
-        kind(&off, "LEND run::_2@d0"),
-        "raw",
-        "W52 is RED without the arm"
-    );
-    // the refusals
-    assert_ne!(
-        kind(&on, "WRITE run::_2@d0"),
-        "ref",
-        "a write through the source refuses the lend"
-    );
-    assert_ne!(
-        kind(&on, "FREE run::_2@d0"),
-        "ref",
-        "a free of the source refuses the lend"
-    );
-    // On these frame-path shapes the refusals do not need the typed loan: both
-    // pairs are eligible and the lend reading is satisfiable in the hard universe
-    // (W54), so the verify loop refuses them without it. The emission's own
-    // mutation is carried by W52c.
-}
 
 /// W52c, the ruled mutation: suppress the lend's loan emission
 /// (`CRAT_E5C_W52_FAULT=no-loan`, at `selected_copy_lends_for_round`) and A12's
@@ -1828,7 +1705,6 @@ fn e5c_inner_w54_funnel() {
 #[test]
 fn e5c_w54_the_funnel_reads_the_w52_fixtures() {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-    env.push(("CRAT_ERA5C_COPY_LEND", "on"));
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_w54_funnel",
         &env,

@@ -172,10 +172,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_finalize_soft", "false".to_owned());
     fields.insert("era5c_mut_model", "true".to_owned());
     fields.insert("era5c_lend_formal", "false".to_owned());
-    fields.insert(
-        "era5c_copy_lend",
-        super::field_moves::copy_lend().to_string(),
-    );
+    fields.insert("era5c_copy_lend", "true".to_owned());
     // era-5c relays 215/216: present only when set to `ref-own-raw`, so the frame's identity is
     // unchanged; the value names the three weights.
     if super::field_moves::kind_order_own() {

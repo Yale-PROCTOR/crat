@@ -17,7 +17,6 @@ fn emitted(name: &str, mutable: &str) -> (String, usize, String) {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CRAT_ERA5C_COPY_LEND", "on")
         .env("CRAT_ERA5C_COPY_LEND_MUT", mutable)
         .env("R805_VARIANT", name)
         .output()

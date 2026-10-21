@@ -25,19 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_COPY_LEND=on|off` (fail-loud, absent = off): **L01⁹, R549-1/2**.
-/// The production selector of A12's copy-lend arm (`CopyLendMode::LendArm`),
-/// deleted after the 08-21 null funnel and restored for the L01⁹ A/B: the lend
-/// reading of an eligible copy (`q = p` with `p` owning) is offered to the
-/// solver in BOTH A5 passes. Nothing of the arm's semantics changes here.
-pub(crate) fn copy_lend() -> bool {
-    match std::env::var("CRAT_ERA5C_COPY_LEND").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_COPY_LEND must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_KIND_ORDER=ref-raw|ref-own-raw` (fail-loud, absent = `ref-raw`): **era-5c relay 215
 /// (R1022-1, USER)**, the objective's order of kinds. `ref-raw` is the frame's: `ref_` weighted
 /// `vars.len() + 1`, `raw` 1, `own` nothing, so a slot whose reference is refused settles Raw for want

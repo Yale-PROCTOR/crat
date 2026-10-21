@@ -155,7 +155,6 @@ fn emitted_pinned(name: &str, pin: Option<&str>) -> (String, usize, String, Stri
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CRAT_ERA5C_COPY_LEND", "on")
         .env("R805_VARIANT", name)
         .envs(pin.map(|kind| ("R805_PIN", kind)))
         .output()

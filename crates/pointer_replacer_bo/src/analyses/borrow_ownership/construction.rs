@@ -124,12 +124,7 @@ impl CopyLendMode {
         if let Some(mode) = COPY_LEND_MODE_OVERRIDE.with(Cell::get) {
             return mode;
         }
-        // R549-2 (i): the production selector (`CRAT_ERA5C_COPY_LEND`, default off).
-        if super::field_moves::copy_lend() {
-            Self::LendArm
-        } else {
-            Self::Baseline
-        }
+        Self::LendArm
     }
 
     #[cfg(test)]
@@ -2970,18 +2965,6 @@ mod mode_tests {
         let right = canonical_receipt("status=ok\na=1\ndata=true\nz=3\nschema=x\n".to_owned());
         assert_eq!(left, right);
         assert_eq!(left, "schema=x\nstatus=ok\ndata=true\na=1\nz=3\n");
-    }
-
-    /// R549-2 (i) retires `copy_lend_production_stays_dormant_without_an_environment_switch`:
-    /// the default stays Baseline; the selector's `on` reaching LendArm is pinned in
-    /// `null_paths_tests::e5c_w52_the_copy_lend_selector_defaults_off_and_reaches_the_arm`.
-    #[test]
-    fn copy_lend_defaults_to_baseline_without_the_selector() {
-        assert_eq!(CopyLendMode::default(), CopyLendMode::Baseline);
-        assert_eq!(CopyLendMode::default().label(), "baseline");
-        if std::env::var_os("CRAT_ERA5C_COPY_LEND").is_none() {
-            assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
-        }
     }
 
     #[test]
