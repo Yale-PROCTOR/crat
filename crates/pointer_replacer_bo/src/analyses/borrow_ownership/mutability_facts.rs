@@ -1,39 +1,34 @@
-//! §NB2 — mutability hard facts for the BO borrow replay.
+//! Mutability hard facts for the BO borrow replay.
 //!
 //! Feeds the Foster mutability qualifier into the production borrow verifier's existing
 //! per-local `is_mutable` closure (today forced `true` in every BO seam). When a pointer's
 //! outermost provenance is immutable, `borrow::invalidates` skips its loan
 //! (`invalidates.rs:73` — *loan of immutable provenance does not invalidate*), so two shared
 //! reads of one base stop invalidating each other and both survive `Ref`. That is the entire
-//! NB2 depth-0 Ref recovery mechanism.
+//! depth-0 Ref recovery mechanism.
 //!
-//! This adds NOTHING to the z3 kind solver — no new variable, no kind clause (theorems
-//! invariant 7 untouched). Mutability is consumed entirely outside the solve, as a static
+//! This adds NOTHING to the z3 kind solver — no new variable, no kind clause. Mutability is consumed entirely outside the solve, as a static
 //! per-`(LocalDefId, Local)` boolean. The `&T`/`&mut T` distinction is a *readout* fact, not
 //! a solver kind (the domain has only `Raw`/`Ref`/`Owning`).
 //!
-//! Soundness posture (CORRECTED 2026-07-10 after a SECOND adversarial review DISPROVED the
-//! earlier "the coherence equate-closure is the acceptance-level guard" claim):
+//! Soundness posture (the coherence equate-closure is NOT the acceptance-level guard):
 //! Foster is *precise per-pointer* — it marks a pointer `Imm` iff that pointer is never written
 //! THROUGH, which is NOT the same as its referent cell being immutable. A read-only view whose
 //! cell is written through a *sibling* pointer is therefore `Imm`, and its loan IS skipped by
-//! `invalidates.rs:73`. That makes the immutable-skip **UNSOUND at the acceptance level TODAY**
-//! for interprocedurally-aliased writes:
+//! `invalidates.rs:73`. On its own, that makes the immutable-skip **UNSOUND at the acceptance
+//! level** for interprocedurally-aliased writes:
 //!   1. MISSING map data defaults to `Mut` (`is_mutable` below) — the sole unsound *data*
-//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict. (Leg holds.)
+//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict.
 //!   2. The coherence equate-closure unifies only **DIRECT** copy clusters, so it demotes the
 //!      direct case but does NOT cover call-return / parameter / cast / offset / field aliases.
-//!      The call-return witness (`nb2_cross_alias_write_uncaught_witness`: `let x=id(p); let z=x;
-//!      let q=x; *b=5;`, `b=p`) leaves x/z/q a shared `&T` aliasing the written cell — a
-//!      fact-uniquely-unsound `Ref` at acceptance. Production's own
-//!      `borrow::mutable_references_no_guarantee` ships the same shared `&T` here (production-
-//!      parity: BO is not stricter than what ships to the rewriter).
-//! So the equate-closure is **NOT** an acceptance-level guard; the ONLY guard is the **§8
-//! codegen guardrail** (BO output unconsumed by codegen), and the acceptance-level unsoundness
-//! is REAL NOW (not contingent on future flow-sensitivity). The fix is **write-aware
-//! invalidation** (writes invalidate all overlapping loans regardless of Foster mutability),
-//! landing as NB3 in-fork sub-phase **3b**; the C2 codegen gate remains the backstop. **S2-6**
-//! tracks this.
+//!      A call-return alias (`let x=id(p); let z=x; let q=x; *b=5;`, `b=p`) leaves x/z/q a
+//!      shared `&T` aliasing the written cell — a fact-uniquely-unsound `Ref` at acceptance.
+//!      Production's own `borrow::mutable_references_no_guarantee` ships the same shared `&T`
+//!      here (production parity: BO is not stricter than what ships to the rewriter).
+//! So the equate-closure is **NOT** an acceptance-level guard (and the unsoundness is not
+//! contingent on future flow-sensitivity). The fix is **write-aware invalidation** (writes
+//! invalidate all overlapping loans regardless of Foster mutability), in the forked borrow
+//! engine.
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
@@ -50,7 +45,7 @@ use crate::{
 
 /// A per-local mutability oracle for the production borrow replay's
 /// `is_mutable(LocalDefId, Local)` closure. Implemented by `bool` (uniform — the
-/// forced-mutable control / mode `Off`, so pre-NB2 all-mutable callers pass `true`
+/// forced-mutable control / mode `Off`, so all-mutable callers pass `true`
 /// unchanged) and by `&MutFacts` (fact-driven). The `borrow_verify` seams are generic over
 /// this, so the seam signatures — not their 40+ existing call sites — carry the change.
 pub(crate) trait MutProvider {
@@ -63,7 +58,7 @@ impl MutProvider for bool {
     }
 }
 
-/// era-5c R545-1: the verification round's provider -- the caller's facts AND the
+/// The verification round's provider -- the caller's facts AND the
 /// round's model-conditional facts (`MutFacts::from_program_gated`). The gated
 /// facts drop guards and read only the outermost level, so they are a subset of
 /// the ungated ones; the AND keeps a forced-mutable caller (`bool`) meaningful.
@@ -99,7 +94,8 @@ pub(crate) struct MutFacts {
 
 impl MutFacts {
     /// Forced-mutable: every pointer mutable. The mode-`Off` sweep control and the
-    /// non-vacuity control prong of the NB2 fixtures (reproduces pre-NB2 behavior exactly).
+    /// non-vacuity control prong of the mutability fixtures (reproduces the all-mutable behavior
+    /// exactly).
     pub(crate) fn all_mut() -> MutFacts {
         MutFacts {
             mutables: FxHashMap::default(),
@@ -119,7 +115,7 @@ impl MutFacts {
         }
     }
 
-    /// era-5c R545-1: the same facts with Foster's load guard (`lhs ⇒ p` for
+    /// The same facts with Foster's load guard (`lhs ⇒ p` for
     /// `lhs = copy (*p)…`) kept only where `keep_load` says so, and each local's bit
     /// taken from its OUTERMOST level (the cells its loans borrow). The verification
     /// replay keeps it where the LOADED level is not Raw in the round's model: a Raw

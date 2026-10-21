@@ -1,4 +1,4 @@
-//! R343-1 P1S-INNER-LOAN-REPRESENTATION: a BO-owned loan for a holder at depth >= 1.
+//! Inner-loan representation: a BO-owned loan for a holder at depth >= 1.
 //!
 //! A native loan can never name an inner holder. The native arm consumes three
 //! things -- `loan_liveness.row(point)`, the borrowed object resolved AT
@@ -15,8 +15,8 @@
 //! an inner holder is not.
 //!
 //! Field-owned inner holders get NO obligation here. That is deliberate: the
-//! field object identity is row (b)'s material, it is out of this build by
-//! R342-4, and a holder without an obligation keeps today's demotion.
+//! field object identity is not modelled here, and a holder without an
+//! obligation keeps the existing demotion.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
@@ -53,7 +53,7 @@ pub(crate) struct InnerLoan {
     pub(crate) reservations: Vec<Location>,
 }
 
-/// R343-1(i), sizing 2.6: the locals whose value leaves this frame DIRECTLY.
+/// The locals whose value leaves this frame DIRECTLY.
 ///
 /// MIR copies a value into a temporary before it leaves -- `opaque(argument)` is
 /// `_5 = copy _3; opaque(move _5)` -- so a holder escapes when any member of its
@@ -68,13 +68,13 @@ pub(crate) struct InnerLoan {
 /// creates no copy-graph edge at all: an escaped value has an incomplete closure,
 /// and "no closure member uses this loan after the event" would then be a
 /// statement about the edges we built rather than about the program. A holder
-/// that escapes is therefore `facts missing`, and `facts missing` keeps today's
-/// demotion. Flow-insensitive and in the safe direction, exactly as
+/// that escapes is therefore `facts missing`, and `facts missing` keeps the
+/// existing demotion. Flow-insensitive and in the safe direction, exactly as
 /// `EscapeFacts::of_body` is.
-/// Sizing 2.6 named `EscapeFacts::escapes` -- the local's own storage address
-/// escaping -- as a fifth form. It is NOT one, and the witness found it: an inner
-/// holder is built by taking an address (`inner = &raw mut base`), so `base` is
-/// address-taken in every such frame and is a member of the holder's closure. The
+/// `EscapeFacts::escapes` -- the local's own storage address escaping -- is NOT
+/// a fifth form: an inner holder is built by taking an address
+/// (`inner = &raw mut base`), so `base` is address-taken in every such frame and
+/// is a member of the holder's closure. The
 /// rule would then mark every stack-constructed inner holder escaped and disable
 /// the whole recovery. That relation answers a different question -- can a callee
 /// WRITE this cell -- and the object state already answers it, in
@@ -215,7 +215,7 @@ fn mentioned_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
     }
 }
 
-/// R343-1: is this holder's loan still demanded after a point?
+/// Is this holder's loan still demanded after a point?
 ///
 /// The fact `protected_entry` does not need and this module does. An entry
 /// obligation is live at every event in its frame by construction; an inner
@@ -228,7 +228,7 @@ fn mentioned_locals(value: &Rvalue<'_>, into: &mut FxHashSet<Local>) {
 ///
 /// It is a MAY-live: a reassignment of a member does not kill the closure. That
 /// is the safe direction -- over-approximating liveness over-approximates "still
-/// demanded", which keeps today's demotion -- and it is stated rather than
+/// demanded", which keeps the existing demotion -- and it is stated rather than
 /// hidden, because it costs recall wherever a holder is rebound before the event.
 #[derive(Clone, Debug)]
 pub(crate) struct ClosureLiveness {
@@ -304,7 +304,7 @@ impl ClosureLiveness {
     ///
     /// At a terminator -- which is what a `free` call is -- "after" is the
     /// successors, because the terminator's own operands are the event itself and
-    /// not a later use. R321-1's lesson is taken here: the union over successors
+    /// not a later use. The union over successors
     /// answers "somewhere later", and a caller that needs one edge asks for it.
     pub(crate) fn live_after(&self, location: Location) -> bool {
         let facts = &self.blocks[location.block];
@@ -448,12 +448,12 @@ pub(crate) enum Disposition {
     /// Live and demanded: the caller tests object overlap and, if it overlaps,
     /// raises a conflict naming THIS holder rather than demoting its closure.
     Live,
-    /// Facts missing. Sizing 2.2 row 3: today's demotion, unchanged.
+    /// Facts missing: the existing demotion, unchanged.
     Unrepresented(Missing),
 }
 
 /// Why a holder has no usable fact. Both keep the current verdict; they are kept
-/// apart so the escaped population is counted rather than inferred (sizing 2.6).
+/// apart so the escaped population is counted rather than inferred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Missing {
     /// No obligation: a field-owned holder, a parameter, or a Raw carrier.
@@ -553,7 +553,7 @@ impl InnerLoans {
             .map(|row| row.liveness.members())
     }
 
-    /// R343-1: the three-way disposition of sizing 2.2, in one place.
+    /// The three-way disposition (dead / live / missing), in one place.
     ///
     /// The order is the whole soundness argument. Escape is asked BEFORE
     /// liveness, because an escaped value's closure is incomplete and its

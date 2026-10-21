@@ -1,4 +1,4 @@
-//! R304-7 row (a): which of a caller's cells a callee can reach.
+//! The call-reach rule: which of a caller's cells a callee can reach.
 //!
 //! A callee cannot name a caller's MIR local. It can only write memory it can
 //! reach -- through its arguments, through globals, and through anything

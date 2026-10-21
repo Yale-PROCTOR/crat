@@ -1,4 +1,4 @@
-//! R288 folded-subtree controls. Embedded code is compiler input, never executed.
+//! Folded-subtree controls. Embedded code is compiler input, never executed.
 use super::graph_tests::with_facts;
 
 const TYPES: &str = r#"
@@ -263,9 +263,9 @@ pub unsafe fn duplicate(node:*mut Node)->*mut Node{
         |facts| {
             assert_eq!(
                 super::fold_internal::certify_linear(facts, 0, "duplicate", 1),
-                // Retyped by R317-2. This fixture stores into a `static mut`,
-                // so it is the escape half of the gate, not the deferred
-                // G-FIELD half; both share it until (a) splits them.
+                // This fixture stores into a `static mut`, so it is the escape
+                // half of the gate, not the deferred field half; both share it
+                // until the gate is split.
                 Err(super::fold_internal::Error::PointerDestinationStore)
             )
         },
@@ -283,7 +283,7 @@ pub unsafe fn inspect(node:*mut Node)->*mut Node{let observed=(*node).child;node
             assert!(
                 matches!(
                     super::fold_internal::certify_linear(facts, 0, "inspect", 1),
-                    // Retyped: a retained read sends the value two places, which
+                    // A retained read sends the value two places, which
                     // is an ambiguous route, not a return that leaves a
                     // component unaccounted for.
                     Err(super::fold_internal::Error::AmbiguousRoute { choices: 2, .. })

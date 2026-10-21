@@ -63,7 +63,8 @@ pub(crate) struct Accepted {
     pub(crate) traversal_loans: Vec<super::traversal_replay::Receipt>,
 }
 
-/// Called at the actual Mode-A/L2 accepting branch, after this round's replay.
+/// Called at the actual accepting branch of the plain or guarded repair, after
+/// this round's replay.
 /// No query, inferred last construction, or failed-round fallback is available.
 pub(crate) fn accept(facts: Option<Rc<Facts>>) {
     if !export::capturing() {
@@ -169,7 +170,7 @@ pub(crate) fn validate(
     let final_rows = &portable.families[&ExportFamily::RetirementFinal].records;
     let final_row = final_rows.first().ok_or("missing final retirement row")?;
     let empty = serde_json::json!([]);
-    // L01¹⁰ (R603-2): the retirement discharges, as receipts. The final row's
+    // The retirement discharges, as receipts. The final row's
     // list is the last round's, every receipt names its rule, and an
     // effective-type discharge names the premise it rests on.
     let final_discharged = final_row.fields.get("discharged").unwrap_or(&empty);
@@ -190,7 +191,9 @@ pub(crate) fn validate(
             .get("receipt")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        // L01¹¹ (R659-1): (γ), (α⁺) and (β′)'s sharpened containment.
+        // The rule each receipt may name: post-free use, fresh in route,
+        // post-release use route, or effective type (with its premise and, when
+        // sharpened, its containment).
         let well_formed = receipt.starts_with("retirement-disjoint:post-free-use(")
             || receipt.starts_with("retirement-disjoint:fresh-in-route(")
             || receipt.starts_with("retirement-disjoint:post-release-use-route(")
@@ -249,7 +252,7 @@ pub(crate) fn validate(
     )?;
     super::fold_custody::validate(snapshot, accepted, model)?;
     // Completeness is independent of the exported proof lists. In the current
-    // C05 subset this selected role always uses the exact original-free/entry
+    // supported subset this selected role always uses the exact original-free/entry
     // comparison; producing or retained-return roles are not covered here.
     let guard_values: BTreeMap<_, _> = accepted.original_cell_guards.iter().copied().collect();
     let expected_guards: BTreeSet<_> = snapshot

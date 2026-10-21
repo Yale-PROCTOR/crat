@@ -1,4 +1,4 @@
-//! A5 context at the distinct-local place-conflict seam.
+//! Parameter-overlap context at the distinct-local place-conflict seam.
 
 use std::collections::BTreeSet;
 

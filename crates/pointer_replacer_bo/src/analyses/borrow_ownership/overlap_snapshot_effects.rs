@@ -1,4 +1,4 @@
-//! MIR producer for A5's fail-closed snapshot-equivalence check.
+//! MIR producer for the overlap analysis's fail-closed snapshot-equivalence check.
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{

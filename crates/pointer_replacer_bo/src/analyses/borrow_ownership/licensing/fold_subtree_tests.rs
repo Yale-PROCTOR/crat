@@ -1,4 +1,4 @@
-//! R288 owned-child source identities. These fixtures are never executed.
+//! Owned-child source identities. These fixtures are never executed.
 use super::{
     graph_tests::with_facts,
     matched::{MatchedTransport, TerminalTarget},
@@ -536,7 +536,7 @@ fn oc03_member_transport_rejects_forged_or_duplicate_membership() {
     });
 }
 
-/// R304-9 and R304-10 fixtures. Each differs from `CODE` by exactly one
+/// Store-inventory fixtures. Each differs from `CODE` by exactly one
 /// construct, so a rejection can be attributed to that construct alone.
 ///
 /// `ALIAS_STORE_CODE` writes the member's own child cell through a punned
@@ -663,7 +663,7 @@ fn fold_of(
     )
 }
 
-/// R336-4 positive: bst's `newNode` shape. A pointer-free field written through
+/// Positive: a node constructor's shape. A pointer-free field written through
 /// a base cast from what an allocator returned.
 const SCALAR_FIELD_CODE: &str = r#"
 unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;}
@@ -676,9 +676,9 @@ pub unsafe fn make(key:i32)->*mut Node{
 }
 "#;
 
-/// R336-4 N1: the base is cast from a pointer to a DIFFERENT struct, so the
+/// Negative: the base is cast from a pointer to a DIFFERENT struct, so the
 /// field projection is type-directed on a type the base may not really have.
-/// This is the prefix pun finding A exists for and stays denied.
+/// This is a prefix pun, and it stays denied.
 const N1_CODE: &str = r#"
 unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;}
 pub struct Node{child:*mut Node}
@@ -691,7 +691,7 @@ pub unsafe fn run(){
 }
 "#;
 
-/// R336-4 N2: the written field carries a pointer but is not a REGISTERED raw
+/// Negative: the written field carries a pointer but is not a REGISTERED raw
 /// pointer field, so `field()` does not resolve it and the narrowing is what
 /// must refuse it. A raw-pointer field of a local struct is always registered
 /// and never reaches here, which is why this is a function pointer.
@@ -706,7 +706,7 @@ pub unsafe fn run(){
 }
 "#;
 
-/// R336-4 N3: a pointer-free field written through a base made from an integer.
+/// Negative: a pointer-free field written through a base made from an integer.
 const N3_CODE: &str = r#"
 pub struct Node{key:i32,child:*mut Node}
 pub unsafe fn run(address:usize){
@@ -715,7 +715,7 @@ pub unsafe fn run(address:usize){
 }
 "#;
 
-/// R337-2(b) control: the caller gate admits a READ-ONLY intrinsic, and nothing
+/// Control: the caller gate admits a READ-ONLY intrinsic, and nothing
 /// else from the library. `offset` moves a pointer and must keep holding.
 const OFFSET_CALLER_CODE: &str = r#"
 unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}

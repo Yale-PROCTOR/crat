@@ -1,5 +1,5 @@
-//! Initial F05 store-support audit. Records are conditional support, not kind
-//! grants; OwnedInput, recursive and retained borrowed-return roles stay pending C.
+//! Store-support audit. Records are conditional support, not kind grants;
+//! OwnedInput, recursive and retained borrowed-return roles stay pending.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,7 +58,7 @@ pub(crate) struct Load {
     pub(crate) direct_projection: bool,
 }
 
-/// R304-9: a write the named store inventory cannot resolve, together with the
+/// A write the named store inventory cannot resolve, together with the
 /// pointer fields it may alias. Recording one is a refusal, never a permission:
 /// the inventory fails closed rather than treating the cell as unwritten.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ fn field<'tcx>(
     found.map(|key| (key, supported && direct))
 }
 
-/// R304-9 "known base": the reaching definition of a destination's base local.
+/// The "known base": the reaching definition of a destination's base local.
 /// A constant address is a static, which can never alias a heap struct field.
 /// Anything else a dereference reaches — a cast, an offset, a call result, a
 /// copied pointer, or no definition in this block at all — fails closed. MIR
@@ -168,7 +168,7 @@ fn constant_address_base<'tcx>(
         .unwrap_or(false)
 }
 
-/// R336-4 (ii): is this type transitively free of anything that could carry a
+/// Is this type transitively free of anything that could carry a
 /// pointer? Fails closed: an unknown type, a foreign ADT, a `Box`, a function
 /// pointer, a reference and a raw pointer are all NOT pointer-free, and so is
 /// anything reached through one. The recursion is bounded because a struct that
@@ -194,7 +194,7 @@ fn pointer_free<'tcx>(tcx: TyCtxt<'tcx>, ty: rustc_middle::ty::Ty<'tcx>, depth: 
     }
 }
 
-/// R336-4 (iii): every assignment to this base local, anywhere in the body,
+/// Every assignment to this base local, anywhere in the body,
 /// keeps it a pointer to the struct it is declared to point at. MIR reuses
 /// locals, so this asks about all of them rather than the nearest. A cast is
 /// admitted only from `c_void`, which is what an allocator returns; a cast from
@@ -231,7 +231,7 @@ fn base_stays_in_type<'tcx>(
     })
 }
 
-/// R336-4: a write to a named POINTER-FREE field of the struct the base local
+/// A write to a named POINTER-FREE field of the struct the base local
 /// is declared to point at. A MIR field projection is type-directed, so such a
 /// write cannot reach that struct's pointer fields whatever the base's
 /// provenance — provided the base really is that pointer everywhere, which is
@@ -258,7 +258,7 @@ fn scalar_field_write<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, place: Place<'
         && base_stays_in_type(tcx, body, place.local)
 }
 
-/// R304-9: the may-alias set for a write the inventory could not resolve. A
+/// The may-alias set for a write the inventory could not resolve. A
 /// known local struct pointee narrows it to that struct's registered pointer
 /// fields; anything else (a cast, a punned pointer, a computed address, an
 /// opaque pointee) may alias any of them.
@@ -293,7 +293,7 @@ fn unresolved_effect(
     }
 }
 
-/// R304-10: the struct a call's callee derives an impl for. Derived bodies are
+/// The struct a call's callee derives an impl for. Derived bodies are
 /// admitted to the roster rather than filtered away, so a call into one is
 /// visible here; a derived `Clone` copies the struct's pointer fields.
 fn derived_impl_self_struct<'tcx>(
@@ -396,7 +396,7 @@ impl Inputs {
                         && !constant_address_base(&body, &data.statements[..statement], destination)
                         && field(program.tcx, slots, &body, *destination).is_none()
                     {
-                        // R336-4: a named pointer-free field of the struct the
+                        // A named pointer-free field of the struct the
                         // base is declared to point at denies nothing, but the
                         // row is still recorded and counted rather than dropped.
                         let scalar = scalar_field_write(program.tcx, &body, *destination);
@@ -782,7 +782,7 @@ pub(crate) struct Hold {
     pub(crate) reason: Pending,
 }
 
-/// R388-1: a store's source origin, classified instead of refused. The pre-solve
+/// A store's source origin, classified instead of refused. The pre-solve
 /// boolean asked "is this store's source provably a fresh allocation" and held
 /// everything else; the solver can carry the rest as a condition, so the coupled
 /// system (params own <= fields own <= stores supported <= params own) has a
@@ -797,12 +797,12 @@ pub(crate) enum StoreSourceOrigin {
     Input(String),
     /// The token was loaded from this field. Supported iff that field owns.
     FieldToken(String),
-    /// L01⁹ rule 1a′ (`CRAT_ERA5C_ORIGIN_SET`): the token is one of several
+    /// The origin-set rule: the token is one of several
     /// origins -- parameters it came in as, fields it was loaded from (in any
     /// function, e.g. a rotation's `x = (*y).left` returned through a call).
     /// Supported iff every one of these slots owns.
     All(Vec<String>),
-    /// L01⁹ rule 2′ (`CRAT_ERA5C_MOVED_INPUT`): a parameter's token stored into the
+    /// The moved-input rule: a parameter's token stored into the
     /// field by a LINEAR transfer, in a program whose callers are all known. The
     /// field's post-store token (`token`) is the support: `own-linear` makes the
     /// parameter's pre-store token the exclusive or of it and the parameter's
@@ -829,7 +829,7 @@ pub(crate) struct FieldProof {
     pub(crate) stores: Vec<StoreProof>,
     pub(crate) input_stores: Vec<InputStoreProof>,
     pub(crate) holds: Vec<Hold>,
-    /// R388-1: the `OwnedInputOrOriginC` holds, classified. Additive — absent in
+    /// The `OwnedInputOrOriginC` holds, classified. Additive — absent in
     /// entries recorded before the rule, and the default arm ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) classified: Vec<ClassifiedStore>,
@@ -1453,7 +1453,7 @@ pub(crate) fn audit(
             });
         }
     }
-    // R388-1: classify the source origin of every store the owned path held with
+    // Classify the source origin of every store the owned path held with
     // `OwnedInputOrOriginC`. The classification is recorded; whether it licenses
     // anything is the solver's, under the pin.
     for proof in fields.values_mut() {
@@ -1470,7 +1470,7 @@ pub(crate) fn audit(
             let origin = classify_store_source(facts, origins, &site);
             proof.classified.push(ClassifiedStore { site, origin });
         }
-        // L01⁹ rule 2′: a parameter store held for its terminal role or its
+        // The moved-input rule: a parameter store held for its terminal role or its
         // callers is supported by its own post-store token, when the transfer is
         // linear and the program's callers are all known.
         if super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete {
@@ -1510,14 +1510,14 @@ pub(crate) fn audit(
     fields.into_values().collect()
 }
 
-/// L01⁹ rule 2′: whether a store's transfer hands the whole token to the field --
+/// The moved-input rule: whether a store's transfer hands the whole token to the field --
 /// `linear` (the split is at the store) or `equal` by move (a moved-out temporary,
 /// split at the copy that made it). An `equal` from a copied operand does not.
 pub(crate) fn moved_transfer(operation: &str, by_move: bool) -> bool {
     operation == "linear" || (operation == "equal" && by_move)
 }
 
-/// R388-1: the origin of the value a store puts into a field, from the recorded
+/// The origin of the value a store puts into a field, from the recorded
 /// consume rows and `ValueOrigins`. `Input` and `FieldToken` name the slot the
 /// solver must tie the support to; anything the origins do not resolve is
 /// `Unknown` and never supported.
@@ -1578,7 +1578,7 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
             .flatten()
         })
     };
-    // L01⁹ rule 1a′: collect every origin slot instead of giving up at the second.
+    // The origin-set rule: collect every origin slot instead of giving up at the second.
     let mut keys: BTreeSet<String> = BTreeSet::new();
     for atom in &atoms {
         match atom {

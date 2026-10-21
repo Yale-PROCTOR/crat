@@ -1,9 +1,9 @@
 //! BO-native origin-summary domain: the only interface the rest of BO sees for interprocedural
 //! signature-origin relations.
 //!
-//! NB5-O replaced both the wrapped production derivation and its production-owned slot types. The
-//! active path is derived by `origin_flow`; the wrapped route remains test-only as the frozen
-//! differential oracle.
+//! The active path is derived natively by `origin_flow`, over BO-owned slot types, in place of the
+//! wrapped production derivation and its production-owned slot types; the wrapped route remains
+//! test-only as the frozen differential oracle.
 
 use std::ops::{Deref, DerefMut};
 
@@ -48,20 +48,19 @@ pub struct SignatureSlot {
 /// - `subset`: the **transitively-closed** origin subset relation. An entry `subset.contains(sub,
 ///   sup)` means `sub`'s origin flows into (is contained in) `sup`'s — mirroring the engine's own
 ///   `subset_closure.contains(arg, return)` convention (`borrow/mod.rs:1205`). Built here with a
-///   correct multi-hop closure (NOT the 1-hop production `subset_closure` — D3, diagnostic-only).
+///   correct multi-hop closure (NOT the 1-hop production `subset_closure`, diagnostic-only).
 /// - `unknown`: slots at least one of whose may-definitions has NO trackable borrow origin — an
 ///   opaque-callee RESULT **or** a freshly `malloc`'d OWNED pointer. **This is "no-borrow-origin", NOT
-///   "opaque-poisoned"** (NB4-4c dump correction: the `malloc_only` vs `malloc_opaque` ablation proves
-///   an opaque call adds nothing to this set). **It is a MAY-set, not an exclusive partition** (Codex
-///   re-review 2026-07-17): a slot with a REAL modeled origin can also be here via a stale-but-may-reach
-///   opaque def that a later assignment kills — so membership means "some may-def is origin-less", NOT
-///   "this slot has no origin". Production's conflict path never consumes the analogous `unknown_targets`
-///   (verified), so NB4-4c consuming this for the may-supply `¬ref` demotion is a fork-only win — sound
-///   because `¬ref` is CONSERVATIVE (`Ref → Raw`), not because membership is exclusive. `¬ref` ONLY: an
-///   owned member must keep `Owning` (a uniform `¬own` over-demotes it). The may-set over-inclusion
-///   collaterally demotes modeled-origin slots via coherence — completeness-class, marker-pinned
-///   (`nb4_4c_marker_coherence_collateral_demotes_modeled_origin`), fix deferred (definitely-overwritten
-///   vs may-reach distinction).
+///   "opaque-poisoned"** (an opaque call adds nothing to this set). **It is a MAY-set, not an
+///   exclusive partition**: a slot with a REAL modeled origin can also be here via a
+///   stale-but-may-reach opaque def that a later assignment kills — so membership means "some
+///   may-def is origin-less", NOT "this slot has no origin". Production's conflict path never
+///   consumes the analogous `unknown_targets`, so consuming this for the may-supply `¬ref` demotion
+///   is a fork-only win — sound because `¬ref` is CONSERVATIVE (`Ref → Raw`), not because
+///   membership is exclusive. `¬ref` ONLY: an owned member must keep `Owning` (a uniform `¬own`
+///   over-demotes it). The may-set over-inclusion collaterally demotes modeled-origin slots via
+///   coherence — a completeness loss, not a soundness one; the fix would be a
+///   definitely-overwritten vs may-reach distinction.
 #[derive(Clone, Debug)]
 pub struct OriginSummary {
     pub slots: IndexVec<OriginSlot, SignatureSlot>,
@@ -71,7 +70,7 @@ pub struct OriginSummary {
 
 // NOTE — storage aliases are NOT a separate field: `compute_origins` folds them INTO `subset` by
 // unioning `summary.storage_aliases` into `summary.value_flows` before the transitive closure. This
-// is deliberate and load-bearing (Codex 3c-i re-review): `value_flows` alone is NOT a superset of
+// is deliberate and load-bearing: `value_flows` alone is NOT a superset of
 // `storage_aliases` — `to_summary()` re-projects value-flow targets through an
 // `observable_value_target` filter (lifetime_flow.rs:758) that drops some argument depth-0 targets,
 // whereas `storage_aliases` is retained UNFILTERED (:774), so a symmetric storage direction to a

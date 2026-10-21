@@ -118,7 +118,7 @@ fn valid_event<'tcx>(
                     };
                     targets.known.iter().any(|target| super::source_events::library_drop_effect(
                         program.tcx, body, *target, args.first().map(|argument| &argument.node))
-                        // R308-1: the unknown-retirement event emitted for an
+                        // The unknown-retirement event emitted for an
                         // inherent-method callee outside the scanned set. The
                         // membership test retires this disjunct by itself once
                         // impl bodies are scanned.
@@ -208,8 +208,8 @@ fn substitute(
             ObjectRoot::Stack { .. } => {
                 output.roots.insert(*root);
             }
-            // Row (b): a field root's base names objects of THIS frame, and
-            // wave 1 has no rebasing rule for it. Fail closed rather than let
+            // A field root's base names objects of THIS frame, and
+            // there is no rebasing rule for it. Fail closed rather than let
             // field identity cross a frame unrebased.
             ObjectRoot::Field { .. } => {
                 output.unknown = true;

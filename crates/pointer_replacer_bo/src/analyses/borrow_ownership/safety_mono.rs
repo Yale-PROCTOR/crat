@@ -1,4 +1,4 @@
-//! §NB1 — per-access-site safety monotonicity (SAFE-MONO).
+//! Per-access-site safety monotonicity (SAFE-MONO).
 //!
 //! `safe(x) ≡ ¬raw(x)` (one-hot: safe = Ref ∨ Owning). For every MIR place
 //! access that dereferences pointer layers ℓ₀,…,ℓₖ to reach a modeled target
@@ -35,7 +35,7 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
     }
 }
 
-/// §NB1: emit per-site SAFE-MONO clauses for one function body. Every place
+/// Emit per-site SAFE-MONO clauses for one function body. Every place
 /// accessed in a statement OR terminator that resolves to a modeled target slot
 /// through ≥1 dereferenced pointer layer yields `safe(target) ⇒ safe(layer)`
 /// per layer. Clauses are deduplicated within the body; crate-wide dedup is
@@ -66,7 +66,7 @@ struct SafeMonoWalker<'a, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for SafeMonoWalker<'_, 'tcx> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _location: Location) {
-        // §NB1: SAFE-MONO applies where the place's VALUE is loaded/read or a
+        // SAFE-MONO applies where the place's VALUE is loaded/read or a
         // reference is borrowed from it — the site where a "safe reference behind
         // the layers" is actually formed. A pure OVERWRITE destination
         // (`(*s).f = x`, `*out = malloc()`, call/yield destinations, deinit,
@@ -74,24 +74,22 @@ impl<'tcx> Visitor<'tcx> for SafeMonoWalker<'_, 'tcx> {
         // old value as a reference: writing THROUGH `s` requires `s` valid, but
         // does not read the field/target's old value as a reference at this site.
         // Emitting there spuriously coupled a crate-wide `Owning` field to every
-        // parent pointer's kind and over-demoted (Codex review, 2026-07-10).
+        // parent pointer's kind and over-demoted.
         // Non-uses (storage markers, debuginfo, user-ty ascriptions) never
         // dereference.
         //
         // SOUNDNESS (do NOT weaken this to "heuristic pruning; the replay carries
         // it" — that is a category error): SAFE-MONO is NOT borrow-validity. The
-        // acceptance replay (D5) checks Ref-vs-Ref aliasing and is STRUCTURALLY
+        // acceptance replay checks Ref-vs-Ref aliasing and is STRUCTURALLY
         // BLIND to the ownership/UB hazard here — an `Owning` slot issues no loan
         // (`borrow_verify.rs`), so a raw-path write to an owned cell raises no
         // conflict. SAFE-MONO covers that side: forging a safe reference through
         // an unchecked path, and dropping an `Owning` cell reached through a
         // dangling parent. Skipping WRITE sites therefore ALLOWS an `Owning`
-        // field under a raw parent; that is sound TODAY only because BO output is
-        // unconsumed by codegen (the §8 guardrail). Its discharge at C2 is a
+        // field under a raw parent. Its discharge is a
         // REWRITER OBLIGATION, not the replay: a raw-path store into an `Owning`
         // cell must lower to a non-dropping (`ptr::write`-style) store, never a
         // normal assignment (which would drop the possibly-invalid old value).
-        // Tracked as S2-5 in the stage-2 backlog; C2 gates on it.
         let emits = matches!(
             context,
             PlaceContext::NonMutatingUse(_) | PlaceContext::MutatingUse(MutatingUseContext::Borrow)

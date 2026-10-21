@@ -105,7 +105,7 @@ fn r281_cache_stream_metadata_and_field_order_match_old_validator() {
     assert_eq!(actual.baseline, expected.baseline);
     assert_eq!(actual.receipt, expected.receipt);
     {
-        // R473-4: `origin` is no longer a comparable `Value`; compare the
+        // `origin` is not a comparable `Value` in the stream; compare the
         // canonical bytes, which is the property the contract rests on.
         // `expected` is a CompleteEntry (origin still a Value); `actual` is
         // the streamed Metadata. Compare their canonical bytes.
@@ -196,7 +196,7 @@ fn r281_cache_stream_preserves_scope_sets_and_availability_enum_semantics() {
         json!({"state":"not-recorded","reason":"absent"});
     assert!(!parity(&value));
 
-    // W04: preserve the old decoder's availability/type boundary exactly.
+    // Preserve the old decoder's availability/type boundary exactly.
     for availability in [
         json!({"state":"not-recorded","reason":""}),
         json!({"state":"not-recorded"}),

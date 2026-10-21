@@ -56,19 +56,19 @@ pub(crate) struct Facts {
     pub(crate) unit_locals: Vec<(String, u32)>,
     pub(crate) reader_inputs: super::readers::Inputs,
     pub(crate) reader_plan: super::readers::Plan,
-    /// L01¹⁰ the lend (era-5c 066, R579-2): empty unless `CRAT_ERA5C_LEND=on`.
+    /// The lend plan: empty unless the lend is switched on.
     pub(crate) lend_plan: super::lend::Plan,
     pub(crate) field_support_inputs: super::field_support::Inputs,
     pub(crate) caller_coverage: Option<super::caller_coverage::Coverage>,
     pub(crate) traversal_native: Option<super::traversal_native::Inputs>,
     pub(crate) fold_types: Option<super::fold_types::Inputs>,
     pub(crate) fold_declarations: Option<Vec<super::fold_declaration::Declaration>>,
-    /// R1165-1: the digest of every other field when `licensing` was frozen from them
+    /// The digest of every other field when `licensing` was frozen from them
     /// ([`licensing_inputs_digest`]); the snapshot is read only by facts that still digest to it.
     pub(crate) licensing_inputs: Option<[u8; 32]>,
 }
 
-/// R1165-1 (era-5c relay 232): sha256 over the `Debug` form of everything the licensing snapshot
+/// SHA-256 over the `Debug` form of everything the licensing snapshot
 /// is built from -- every field but the snapshot and this digest. Equal digests mean the snapshot's
 /// derivation (a function of these facts) would come out the same, so a reader compares this
 /// instead of re-deriving the snapshot.

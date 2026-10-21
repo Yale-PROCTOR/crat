@@ -24,9 +24,9 @@ where
         callee: DefId,
         _substs: GenericArgsRef<'tcx>,
     ) {
-        // R701 (the fork's `NULL`): `core::ptr::null()` / `null_mut()` is a null
+        // The fork's `NULL`: `core::ptr::null()` / `null_mut()` is a null
         // constant, as `0 as *mut T` is. The value is None and names no owner
-        // (§29): the value it overwrites must not own, the new one is free. The
+        // (null is `Option::None`): the value it overwrites must not own, the new one is free. The
         // opaque arm below pinned the new value non-owning too, so a field the
         // fork's `NULL` initializes could never own. `source_events` and
         // `nullability` already read this call as null; `origin_evidence` gives
@@ -84,7 +84,7 @@ where
         assert_eq!(args.len(), 1);
         if let Some((mut arg, is_ref)) = args[0].clone() {
             if is_ref {
-                // §NB-F (the NB-R uthash tripwire, fixed): the argument is
+                // The argument is
                 // `&mut place`/`&raw mut place`, so the range's LEADING slot is
                 // the outer reference level and the null-checked pointer sits
                 // one level deeper — peel one slot before lending, the same

@@ -1,9 +1,9 @@
-// FORKED STAGE from production `crates/pointer_replacer/src/analyses/borrow/invalidates.rs` @ fc3bd4cf.
-// Byte-identical to production at 3a (the equivalence baseline) — EXPECTED TO DIVERGE at NB3-3b:
-// write-aware invalidation restores the read/write access distinction the port dropped, so the
-// immutable-loan skip (`continue; // loan of immutable provenance does not invalidate`) fires for
-// READS only, not writes. NO sync tripwire (divergence is the deliverable). NB6's validator uses the
-// UNFORKED production engine (D5).
+// Forked from the legacy borrow analysis's
+// `crates/pointer_replacer/src/analyses/borrow/invalidates.rs`, and deliberately divergent from
+// it: write-aware invalidation restores the read/write access
+// distinction the original dropped, so the immutable-loan skip (`continue; // loan of immutable
+// provenance does not invalidate`) fires for READS only, not writes. There is no sync check against
+// the original. The validator uses the unforked engine.
 use std::collections::BTreeSet;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -30,7 +30,7 @@ use crate::analyses::{
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
-/// L2-only side witness for one invalidation insertion attempt.
+/// Guarded-repair-only side witness for one invalidation insertion attempt.
 ///
 /// The ordinary `Invalidates` matrix remains the sole input to the borrow
 /// fixpoint. This parallel record is populated only by
@@ -41,8 +41,8 @@ pub(crate) struct InvalidationAccess {
     pub(crate) point: PointIndex,
     pub(crate) loan: Loan,
     pub(crate) accessor: Local,
-    /// R617-1 (the guarded port): the access met the loan only through an A5
-    /// overlap partner of the accessor (the loan's base is the partner).
+    /// Guarded repair: the access met the loan only through a parameter-overlap
+    /// partner of the accessor (the loan's base is the partner).
     pub(crate) via_overlap_partner: bool,
 }
 
@@ -52,9 +52,9 @@ struct ParameterAccess<'tcx> {
     kind: AccessKind,
 }
 
-/// The typed CopyLend loans of one function: `all` the selected copy-lends (A12's shared
-/// invalidation), `unique` the subset lent `&mut` (era-5c relay 213), whose loans conflict with
-/// every access to their owner. Derefs to `all`, so a reader that asks only "is this a copy
+/// The typed CopyLend loans of one function: `all` the selected copy-lends (the copy-lend
+/// funnel's shared invalidation), `unique` the subset lent `&mut` (the mutable copy-lend), whose
+/// loans conflict with every access to their owner. Derefs to `all`, so a reader that asks only "is this a copy
 /// lend?" is unchanged.
 pub(crate) struct CopyLendLoans {
     pub(crate) all: DenseBitSet<Loan>,
@@ -99,7 +99,7 @@ pub(crate) fn compute_invalidates_with_copy_lends<'tcx>(
     )
 }
 
-/// R617-1 (the guarded port): the capturing replay with A5's overlap, for the
+/// Guarded repair: the capturing replay with parameter overlap, for the
 /// one witnessed replay -- the invalidation matrix, the captured accesses and
 /// the parameter conflicts, each exactly as the two entry points compute them.
 pub(crate) fn compute_invalidates_capturing_with_copy_lends_and_parameter_overlap<'tcx>(
@@ -228,11 +228,11 @@ fn compute_invalidates_inner<'tcx>(
     invalidates
 }
 
-/// §NB4-R — an `offset`-call destination signature `(dest_local, borrowed=(*arg0))`. The fork
-/// CANNOT tell an `offset` loan from a copy loan by `BorrowData` alone (both build `borrowed=(*arg0)`,
+/// Cross-alias write routing — an `offset`-call destination signature
+/// `(dest_local, borrowed=(*arg0))`. The fork CANNOT tell an `offset` loan from a copy loan by `BorrowData` alone (both build `borrowed=(*arg0)`,
 /// and `BorrowData::location` is private to the `borrow` module), so the offset destinations are
-/// re-derived here by re-walking the MIR. **COUPLING GUARD (spec §4.1 / Amendment 4):** production's
-/// `is_borrowing_method` = `{offset, as_ptr, as_mut_ptr}` (`borrow/mod.rs:783`, FROZEN); only `offset`
+/// re-derived here by re-walking the MIR. **COUPLING GUARD:** the legacy analysis's
+/// `is_borrowing_method` = `{offset, as_ptr, as_mut_ptr}` (`borrow/mod.rs:783`); only `offset`
 /// is address-CHANGING — `as_ptr`/`as_mut_ptr` are address-preserving and STAY as routing edges
 /// (array-cell collapse). This matches ONLY `offset`; if the frozen set ever gains an address-changing
 /// method, extend this filter (`address-changing(is_borrowing_method) ⊆ {offset}`).
@@ -274,12 +274,12 @@ fn build_offset_sigs<'tcx>(
     sigs
 }
 
-/// §NB4-R — the copy/reborrow chain a routed write follows: maps each local to the loans it ISSUES
-/// (`assigned == Assign(Local(l))`). A chain edge is a COPY/REBORROW, whose `borrowed` place is
+/// Cross-alias write routing — the copy/reborrow chain a routed write follows: maps each local
+/// to the loans it ISSUES (`assigned == Assign(Local(l))`). A chain edge is a COPY/REBORROW, whose `borrowed` place is
 /// `source.project_deeper([Deref])` and therefore ENDS in `Deref` (`b=p`→`[Deref]`; `b=h.q`→
 /// `[Field, Deref]`; `b=*pp`→`[Deref, Deref]`; `&mut *p`→`[Deref]`). A DIRECT sub-borrow (`&mut a`→
 /// `[]`; `&mut a.f`→`[Field]`; `&mut (*p).f`→`[Deref, Field]`) does NOT end in `Deref` and is excluded
-/// (spec §11-B: the discriminator is the LAST element, not the first). Address-changing `offset` edges
+/// (the discriminator is the LAST element, not the first). Address-changing `offset` edges
 /// are excluded via `build_offset_sigs`. `CallArg` loans are not edges (the issuer is a callee, not a
 /// copy) but remain invalidation TARGETS in `local_map`. Built once per `compute_invalidates`.
 fn build_issued_loans<'tcx>(
@@ -301,21 +301,22 @@ fn build_issued_loans<'tcx>(
             continue; // degenerate self-alias
         }
         if offset_sigs.contains(&(issuer, bd.borrowed)) {
-            continue; // address-changing offset (would over-demote; §4.1)
+            continue; // address-changing offset (would over-demote)
         }
         m.entry(issuer).or_default().push(loan);
     }
     m
 }
 
-/// §NB4-R — the routed place a cross-alias access composes to (extracted so the type-check/fallback
-/// is testable in isolation, independent of the grouping that masks the end-to-end outcome).
+/// Cross-alias write routing — the routed place a cross-alias access composes to (extracted so
+/// the type-check/fallback is testable in isolation, independent of the grouping that masks the
+/// end-to-end outcome).
 pub(crate) enum RoutedCompose<'tcx> {
     /// `L.borrowed ++ rest` is well-typed (or `rest` is empty) — check it at the access's own depth.
     Composed(Place<'tcx>),
     /// `rest` is NOT applicable to `ty(L.borrowed)` (a type-changing cast) — composing would feed
     /// `places_conflict` an ill-typed place (`unreachable!`) or silently miss (`Disjoint`→UAF). Fall
-    /// back to the whole borrowed cell, forced Deep (sound over-approximation; §4 ruling).
+    /// back to the whole borrowed cell, forced Deep (sound over-approximation).
     WholeCell(Place<'tcx>),
 }
 
@@ -341,7 +342,7 @@ pub(crate) fn route_compose<'tcx>(
 
 struct LoanInvalidatesGenerator<'g, 'tcx> {
     facts: &'g mut Invalidates,
-    /// L2-only write-side capture. `None` on every feature-off path.
+    /// Guarded-repair-only write-side capture. `None` on every feature-off path.
     accesses: Option<&'g mut Vec<InvalidationAccess>>,
     tcx: TyCtxt<'tcx>,
     body: &'g Body<'tcx>,
@@ -349,33 +350,31 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
     copy_lends: &'g CopyLendLoans,
-    /// A5 effective may-overlap among this function's depth-zero parameters.
+    /// Effective may-overlap among this function's depth-zero parameters.
     parameter_overlap: Option<&'g ParameterOverlap>,
-    /// A5-only access stream used to derive conflicts without synthesizing CallArg loans.
+    /// Parameter-overlap-only access stream used to derive conflicts without synthesizing
+    /// CallArg loans.
     parameter_accesses: Option<&'g mut Vec<ParameterAccess<'tcx>>>,
-    /// §NB4-R routing chain (see `build_issued_loans`).
+    /// Cross-alias write routing chain (see `build_issued_loans`).
     issued_loans: FxHashMap<Local, Vec<Loan>>,
-    /// era-5c (E5C-3): while a call argument's read is attributed to the call
+    /// While a call argument's read is attributed to the call
     /// terminator, the statement it was deferred from — its own loans are not
     /// invalidated by their own issuing read.
     deferring_from: Option<Location>,
-    /// L01¹⁰ (R609-3 (a), `CRAT_ERA5C_ARG_ORDER`): while a call's pure-read
+    /// The argument order: while a call's pure-read
     /// operand is consumed, the locals that same call receives -- a read its
     /// argument list makes counts as made before their reborrows.
     receiving: Option<Vec<Local>>,
 }
 
-/// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
+/// The read/write kind of an access, labeled at every access site.
 ///
-/// **Baseline/A12 loan invalidation remains inert by construction**: the immutable-loan skip
-/// fires for both kinds, and a mutable loan conflicts with both. A5 precise replay separately
-/// consumes the label when pairing accesses across effectively-overlapping parameters; that path
-/// is absent when `parameter_overlap=None`. The label was originally threaded so 4b's
-/// write-aware invalidation was a one-line skip change rather than a site refactor.
-///
-/// The site→kind table below is the 3b Task-0 table. Inertness is verified by the suite +
-/// a spot sweep being byte-identical across this commit; if it were NOT inert, that would mean
-/// access kinds already matter somewhere unknown, and it is a STOP.
+/// **Baseline/copy-lend loan invalidation is inert to the label by construction**: the
+/// immutable-loan skip fires for both kinds, and a mutable loan conflicts with both. The precise
+/// parameter-overlap replay separately consumes the label when pairing accesses across
+/// effectively-overlapping parameters; that path is absent when `parameter_overlap=None`. The
+/// label is threaded through every site so write-aware invalidation is a one-line skip change
+/// rather than a site refactor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccessKind {
     Read,
@@ -405,8 +404,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         self.check_access_for_conflict(location, place, AccessDepth::Deep, kind, false);
     }
 
-    /// A12's targeted temporal rule. Only typed CopyLend loans are considered; the ordinary call
-    /// operand remains a Read below, so existing loans retain pre-A12 deallocator behavior (A1).
+    /// The copy-lend's targeted temporal rule. Only typed CopyLend loans are considered; the
+    /// ordinary call operand remains a Read below, so other loans keep their ordinary deallocator
+    /// behavior.
     fn invalidate_copy_lends_at_deallocation(&mut self, location: Location, pointer: Place<'tcx>) {
         let pointee = pointer.project_deeper(&[PlaceElem::Deref], self.tcx);
         self.check_access_for_conflict(
@@ -427,8 +427,8 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         location: Location,
         place: Place<'tcx>,
         access_depth: AccessDepth,
-        // §NB4-4a-ii labeled the kind but left it unconsumed. §NB4-R consumes it: only a WRITE
-        // access ROUTES (below). The DIRECT check still fires for both kinds (production parity).
+        // Only a WRITE access ROUTES (below). The DIRECT check still fires for both kinds (parity
+        // with the legacy analysis).
         kind: AccessKind,
         copy_lends_only: bool,
     ) {
@@ -482,7 +482,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         }
         let point_index = self.location_map.point_from_location(location);
 
-        // DIRECT check: ordinary loans are keyed under the accessed local. A5 effective parameter
+        // DIRECT check: ordinary loans are keyed under the accessed local. Effective parameter
         // overlap additionally opens the paired parameter rows for pointee accesses; otherwise the
         // distinct-base `places_conflict` seam would never receive the pair in the first place.
         let mut candidate_bases = vec![place.local];
@@ -501,9 +501,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 }
                 let borrow_data = &self.borrow_set.loans[loan];
                 if self.deferring_from == Some(borrow_data.location()) {
-                    continue; // era-5c: a deferred read does not invalidate its own loan
+                    continue; // a deferred read does not invalidate its own loan
                 }
-                // R609-3 (a): a read in the argument list of the call that
+                // A read in the argument list of the call that
                 // receives the reborrow is hoisted above it by the emission side,
                 // when only pure reads lie between the reborrow and the call.
                 if kind == AccessKind::Read
@@ -516,7 +516,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         location,
                     )
                 {
-                    // L01¹¹ (R659-1): the receipt the emission's hoist keys on.
+                    // The receipt the emission's hoist keys on.
                     let span = match &self.body.basic_blocks[location.block].terminator().kind {
                         TerminatorKind::Call { fn_span, .. } => *fn_span,
                         _ => self.body.source_info(location).span,
@@ -532,7 +532,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     );
                     continue;
                 }
-                // relay 213: a unique (mutable) copy-lend conflicts with every access to its
+                // A unique (mutable) copy-lend conflicts with every access to its
                 // owner, a read as much as a write.
                 let copy_lend_write = (kind == AccessKind::Write && self.copy_lends.contains(loan))
                     || self.copy_lends.unique.contains(loan);
@@ -561,10 +561,10 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
             }
         }
 
-        // §NB4-R CROSS-ALIAS-WRITE ROUTING. Writing `(*x)[rest]` where `x` is a copy/reborrow of some
+        // CROSS-ALIAS-WRITE ROUTING. Writing `(*x)[rest]` where `x` is a copy/reborrow of some
         // base cell is a WRITE to THAT cell, but `local_map` keys loans by their borrowed base and
         // `places_conflict` bails on differing locals, so `row(x)` is BLIND to loans on the aliased
-        // cell (the S2-6 hole). Walk `x`'s issued-loan chain to each aliased base, COMPOSE the access
+        // cell. Walk `x`'s issued-loan chain to each aliased base, COMPOSE the access
         // onto the loan's own (type-valid) BORROWED place, and re-check `row(base)`. Runs even when
         // `row(x)` was empty above — that is exactly the witness case.
         //
@@ -573,7 +573,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         // route — the cross-alias WRITE that makes the cell hazardous already routes to (and demotes)
         // every read view live across it, so routing reads is redundant (and would spuriously demote
         // shared reads of a mutable cell in forced-mut mode). This is the "cross-alias-WRITE routing"
-        // divergence class (spec §8).
+        // divergence class.
         if kind != AccessKind::Write || place.projection.first() != Some(&PlaceElem::Deref) {
             return;
         }
@@ -592,7 +592,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         // PRE-order bounded walk. Visited keyed on the LOAN (edge), NOT the base Local: distinct edges
         // can share a base local while naming different cells (a writer branch-joined from `h.q`/`h.r`
         // issues loans `(*(h.q))` and `(*(h.r))`, both base `h`); keying on the local would drop one
-        // route and miss the cell aliased on the relevant path (Codex F2). Keying on the loan checks
+        // route and miss the cell aliased on the relevant path. Keying on the loan checks
         // every reachable edge exactly once, so the bound is `≤ loans.len()` and reconvergence still
         // cannot re-expand.
         let cap = self.borrow_set.loans.len();
@@ -619,7 +619,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 match route_compose(self.tcx, self.body, edge_borrowed, rest, deref_ty) {
                     RoutedCompose::Composed(p) => (p, access_depth),
                     // type-changing cast: `L.borrowed ++ rest` would be ill-typed ⇒ whole cell, Deep
-                    // (sound over-approximation; §4 ruling — whole-cell, never a silent Disjoint).
+                    // (sound over-approximation — whole-cell, never a silent Disjoint).
                     RoutedCompose::WholeCell(p) => (p, AccessDepth::Deep),
                 };
             if let Some(borrows_for_base) = self.borrow_set.local_map.row(base) {
@@ -749,7 +749,7 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match &statement.kind {
             StatementKind::Assign(box (lhs, rhs)) => {
-                // era-5c (E5C-3): a call argument's move is placed at the call
+                // A call argument's move is placed at the call
                 // terminator when every statement between the copy and the
                 // call is a pure read — the point the ownership model already
                 // transfers the token at. The emission side hoists those reads
@@ -759,7 +759,7 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 ) {
                     Some(terminator) => {
                         self.deferring_from = Some(location);
-                        // R609-3 (a): a deferred argument read is a read of the
+                        // A deferred argument read is a read of the
                         // receiving call's argument list.
                         if let TerminatorKind::Call { args, .. } =
                             &self.body.basic_blocks[location.block].terminator().kind
@@ -848,15 +848,15 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
             } => {
                 self.consume_operand(location, func, AccessKind::Read);
                 let copy_lend_deallocator = exact_foreign_sink(func, self.body, self.tcx);
-                // R609-3 (a): the locals this call receives, for its other operands' reads.
+                // The locals this call receives, for its other operands' reads.
                 let passed: Vec<Local> = args
                     .iter()
                     .filter_map(|arg| arg.node.place().and_then(|p| p.as_local()))
                     .collect();
                 for arg in args {
-                    // §NB4-4a-ii: labeled `Read` here; 4a-ii's GATING commit refines the arg
-                    // access by the callee's effect class (a `no-access` callee gets a SHALLOW
-                    // access instead of this blanket `Deep` one).
+                    // Labeled `Read` here; refining the argument access by the callee's effect
+                    // class would give a `no-access` callee a SHALLOW access instead of this
+                    // blanket `Deep` one.
                     let own = arg.node.place().and_then(|p| p.as_local());
                     if !passed.is_empty() && own.is_none_or(|local| !passed.contains(&local)) {
                         self.receiving = Some(passed.clone());

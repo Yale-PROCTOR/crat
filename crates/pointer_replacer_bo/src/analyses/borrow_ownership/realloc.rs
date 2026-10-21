@@ -1,7 +1,8 @@
 //! Source-derived realloc outcomes shared by ownership and retirement replay.
 //!
 //! Outcomes are feasible source alternatives, never solver-selected Boolean
-//! branches. Direct result tests and P0-backed uses carry separate evidence.
+//! branches. Direct result tests and uses backed by the UB-free-input premise
+//! carry separate evidence.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -112,7 +113,7 @@ pub(crate) struct ReallocBranch {
     pub(crate) transports: Vec<ResultTransport>,
 }
 
-/// A source operation that excludes a null result on P0-admitted executions.
+/// A source operation that excludes a null result on UB-free executions.
 /// A dereference merely present on one optional path is not such a witness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReallocUseWitness {
@@ -170,9 +171,9 @@ impl ReallocResultTestReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReallocResult {
     DirectBranch(ReallocBranch),
-    /// R219 B: an unconditional dereferencing use excludes failure under P0.
+    /// An unconditional dereferencing use excludes failure on UB-free executions.
     SuccessImplied(ReallocContinuation),
-    /// R219 B: no test/use selects an outcome; both source cases remain.
+    /// No test/use selects an outcome; both source cases remain.
     Unobserved(ReallocContinuation),
     /// Source test is known, while field storage uses the conservative call
     /// boundary representation rather than invented bare-local SSA versions.
@@ -181,7 +182,7 @@ pub(crate) enum ReallocResult {
         continuation: ReallocContinuation,
         field_transports: Vec<FieldResultTransport>,
     },
-    /// R243: unclassified result control keeps both outcomes and a source-site receipt.
+    /// Unclassified result control keeps both outcomes and a source-site receipt.
     FallbackBothOutcomes(ReallocContinuation),
     Discarded,
     UnresolvedTest,
@@ -723,8 +724,8 @@ pub(crate) fn classify(site: &ReallocSite) -> Result<Vec<ReallocCase>, ReallocUn
             {
                 return Err(ReallocUnsupported::UnresolvedResultTest);
             }
-            // P0 admits the witnessed positive-sized access only when this
-            // allocation supplied usable bytes. Nonnull alone does not do so.
+            // The UB-free premise admits the witnessed positive-sized access only
+            // when this allocation supplied usable bytes. Nonnull alone does not do so.
             success_only = true;
         }
         ReallocResult::Unobserved(continuation) => {
@@ -1030,7 +1031,7 @@ mod tests {
         let site = one_site(
             "pub unsafe fn unknown_size(p: *mut u8, n: usize) -> bool { let q = realloc(p, n); q.is_null() }",
         );
-        // R219: the byte contract is present, while a returned null predicate
+        // The byte contract is present, while a returned null predicate
         // still supplies no direct source-outcome control edge.
         assert_eq!(site.size, ReallocSize::ByteCount);
         assert_result_test_fallback(&site);
@@ -1057,7 +1058,8 @@ mod tests {
         let site = one_site(
             "pub unsafe fn unresolved(p: *mut u8) -> bool { let q = realloc(p, 16); q == p }",
         );
-        // R243 supersedes the historical unsupported-result expectation.
+        // An unclassified result test keeps both outcomes (the fallback) rather
+        // than failing as unsupported.
         assert_result_test_fallback(&site);
     }
 

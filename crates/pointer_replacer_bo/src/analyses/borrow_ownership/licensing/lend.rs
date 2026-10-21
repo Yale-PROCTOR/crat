@@ -1,16 +1,16 @@
-//! L01¹⁰, the lend (rule 5): era-5c 066's certificate, R579-2 / R580-1.
+//! The lend: the lendable-formal certificate.
 //!
 //! A raw-pointer formal is LENDABLE when its derivation closure (copies, casts,
 //! field and element addresses, deriving library calls, interior-pointer libc
 //! results) is never freed, never stored as a value (into memory or an
 //! aggregate), never returned, and every call receiving a member is to a
 //! lendable local formal, a libc callee on the no-retain table, a deriving or
-//! read-only library method, or (R580-1) an indirect callee under R481's tier-2
-//! retention waiver, receipted per site. Greatest fixpoint over local callees.
+//! read-only library method, or an indirect callee under the tier-2 retention
+//! waiver, receipted per site. Greatest fixpoint over local callees.
 //!
-//! A lendable formal takes era 5b's existing Borrowed role at every call (the
+//! A lendable formal takes the existing Borrowed role at every call (the
 //! caller's token passes through, the formal is a zero view): the certificate
-//! widens `borrows_parameter`, nothing else. Off by default (`CRAT_ERA5C_LEND`).
+//! widens `borrows_parameter`, nothing else.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +22,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-/// R580-1: the waiver every indirect-call site of a lent formal carries.
+/// The waiver every indirect-call site of a lent formal carries.
 #[cfg(test)]
 pub(crate) const WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
 
@@ -30,7 +30,7 @@ pub(crate) const WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
 pub(crate) struct Plan {
     /// `(function, formal local)` pairs that lend.
     pub(crate) lendable: BTreeSet<(String, u32)>,
-    /// The indirect calls a lendable formal's closure reaches (R580-1).
+    /// The indirect calls a lendable formal's closure reaches.
     pub(crate) waivers: Vec<WaiverSite>,
 }
 

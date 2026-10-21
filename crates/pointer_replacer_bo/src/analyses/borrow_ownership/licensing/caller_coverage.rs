@@ -16,12 +16,12 @@ pub(crate) struct LocalCall {
 pub(crate) struct Coverage {
     pub(crate) configured_functions: BTreeSet<String>,
     pub(crate) compiler_bodies: BTreeSet<String>,
-    /// R304-10: `#[automatically_derived]` impl bodies, admitted to the roster
+    /// `#[automatically_derived]` impl bodies, admitted to the roster
     /// with their role rather than filtered away — a derived `Clone` copies
     /// pointers, so it must stay visible to every consumer that asks.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) derived_impl_bodies: BTreeSet<String>,
-    /// R697-3: const, anonymous-const and static bodies that name no program
+    /// Const, anonymous-const and static bodies that name no program
     /// function (no call to one, no function value, no indirect call), and, for
     /// a static, whose type carries no pointer. They call nothing in the
     /// program and store nothing a slot could own, so they are accounted for by
@@ -162,8 +162,8 @@ pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
     {
         held.insert(Reason::ConfiguredFunctions);
     }
-    // R304-10: a derived impl body is accounted for by its role, never dropped
-    // from the denominator; R697-3: so is an inert const or static body. Every
+    // A derived impl body is accounted for by its role, never dropped
+    // from the denominator; so is an inert const or static body. Every
     // other compiler body still has to be configured.
     if coverage.compiler_bodies.iter().any(|body| {
         !coverage.configured_functions.contains(body)
@@ -236,7 +236,7 @@ pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
     }
 }
 
-/// R697-3: a const-like body that names no program function, or a static that
+/// A const-like body that names no program function, or a static that
 /// does so and whose type carries no pointer (its initializer is a store).
 fn inert_body(tcx: rustc_middle::ty::TyCtxt<'_>, owner: rustc_hir::def_id::LocalDefId) -> bool {
     use rustc_hir::def::DefKind;
@@ -445,7 +445,7 @@ pub unsafe fn f(){let owner=make();let mut c=Cell{ptr:0 as *mut i32};put(&mut c,
             });
         }
     }
-    /// R697-3 (W84's unit half): the fork's `pub const NULL` item, a pointer-free
+    /// The fork's `pub const NULL` item, a pointer-free
     /// static and an array length name no program function, so they hold no
     /// coverage; a pointer-carrying static and a const that calls a program
     /// function still do.

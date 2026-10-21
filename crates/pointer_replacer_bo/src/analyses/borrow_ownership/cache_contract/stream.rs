@@ -19,9 +19,9 @@ use crate::analyses::borrow_ownership::{
     strict_json::{Discard, UniqueValue},
 };
 
-/// R473-4 design (A): where an entry's origin evidence lives.
+/// Where an entry's origin evidence lives.
 ///
-/// The whole-`Value` form cost 31 GiB on libzahl (report 022). Neither variant
+/// The whole-`Value` form cost 31 GiB on one large entry. Neither variant
 /// materializes one: the writer hands over canonical bytes already on disk, and
 /// the reader validates per element and retains only these aggregate facts.
 #[derive(Clone, Debug)]
@@ -61,7 +61,7 @@ impl Default for OriginKeys {
 
 impl Metadata {
     /// The canonical origin bytes, from whichever side holds them. Both forms
-    /// emit exactly what whole-`Value` serialization emitted (report 023 §2).
+    /// emit exactly what whole-`Value` serialization emits.
     pub(crate) fn write_origin(&self, w: &mut impl std::io::Write) -> Result<(), String> {
         match &self.origin {
             OriginSource::File(path) => {
@@ -134,7 +134,7 @@ impl OriginFacts {
     }
 }
 
-/// L01⁹ wall 4: the `move-store-obligations` family as the reader found it.
+/// The `move-store-obligations` family as the reader found it.
 /// It is small (one row per qualifying store), so the streamed reader keeps it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum MoveStoreCapture {
@@ -158,13 +158,13 @@ pub(crate) struct Metadata {
     pub(crate) origin: OriginSource,
     #[cfg(test)]
     pub(crate) move_store: MoveStoreCapture,
-    /// L01¹¹ (R659-1): the `arg-order-applied` family, read the same way.
+    /// The `arg-order-applied` family, read the same way.
     pub(crate) arg_order: MoveStoreCapture,
 }
 
 impl Metadata {
-    /// The frame's store-as-move obligations for a consumer that asks
-    /// (ownership-fields 069's discharge): refused unless the entry carries them.
+    /// The entry's store-as-move obligations for a consumer that asks: refused
+    /// unless the entry carries them.
     #[cfg(test)]
     pub(crate) fn move_store_obligations(
         &self,
@@ -182,7 +182,7 @@ impl Metadata {
         }
     }
 
-    /// L01¹¹: the frame's arm-(a) receipts for the emission's hoist: refused
+    /// The entry's argument-order receipts for the emission's hoist: refused
     /// unless the entry carries them.
     pub(crate) fn arg_order_applied(&self) -> Result<Vec<portable_export::ArgOrderRow>, String> {
         match &self.arg_order {
@@ -218,7 +218,7 @@ impl Metadata {
         {
             return Err("cache requires a complete accepted receipt".into());
         }
-        // R473-4 design (A): the same checks, sited on aggregates gathered per
+        // The same checks, sited on aggregates gathered per
         // element. `File` re-reads the staged bytes as ONE typed value (never a
         // `Value`); `Streamed` already ran the per-element half while reading.
         let facts = self.origin_facts()?;
@@ -428,8 +428,8 @@ impl TryFrom<CompleteEntry> for Metadata {
             model: entry.model,
             baseline: entry.baseline,
             receipt: entry.receipt,
-            // R473-4: a CompleteEntry still carries a Value; convert ONCE here
-            // into the typed form the rest of the contract now uses.
+            // A CompleteEntry still carries a Value; convert ONCE here
+            // into the typed form the rest of the contract uses.
             origin: {
                 let present = OriginKeys {
                     licensing: entry.origin.get("licensing").is_some(),
@@ -479,7 +479,7 @@ fn next<'de, T: DeserializeOwned, A: MapAccess<'de>>(map: &mut A) -> Result<T, A
     serde_json::from_value(value.0).map_err(de::Error::custom)
 }
 
-/// R473-4: deserialize the origin evidence TYPED (never a `Value`) while
+/// Deserialize the origin evidence TYPED (never a `Value`) while
 /// recording which optional keys the bytes carried. Unknown keys are rejected
 /// and duplicates refused here, exactly as the strict `Value` reader did.
 struct OriginWithKeys {

@@ -1,7 +1,6 @@
-//! R310-2/R317-2 witnesses for (b): the return-to-cell store, which is the
-//! shape `root->left = insert(root->left, key)` and the shape that holds
-//! W-CF-5. Staged RED-first: what refuses, and with which named reason, is the
-//! measurement. Fixtures are never executed.
+//! Witnesses for the return-to-cell store, the shape
+//! `root->left = insert(root->left, key)`. What refuses, and with which named
+//! reason, is what these check. Fixtures are never executed.
 use super::{
     facts::Facts,
     fold_internal::{self, Error},
@@ -29,7 +28,7 @@ pub struct Node{left:*mut Node,right:*mut Node}
 pub unsafe fn step(node:*mut Node)->*mut Node{node}
 "#;
 
-/// W-RC-1: the return-to-cell store with no recursion. `step` already has the
+/// The return-to-cell store with no recursion. `step` already has the
 /// licensed contract — one token in, one token out — so the only new thing here
 /// is that the result goes back into the cell it was read from.
 const RC1: &str = r#"
@@ -39,7 +38,7 @@ pub unsafe fn descend(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-RC-2: the same store, self-recursive. This is bst's `insert`. Under
+/// The same store, self-recursive, as in a recursive tree insert. Under
 /// assume-guarantee the callee's contract is the one being proved.
 const RC2: &str = r#"
 pub unsafe fn insert(root:*mut Node,key:i32)->*mut Node{
@@ -49,7 +48,7 @@ pub unsafe fn insert(root:*mut Node,key:i32)->*mut Node{
 }
 "#;
 
-/// W-RC-3: the token read from one cell is stored into another, leaving the
+/// The token read from one cell is stored into another, leaving the
 /// first cell still naming an object nothing is responsible for. Duplicated
 /// responsibility; must be refused however the store is admitted.
 const RC3: &str = r#"
@@ -59,9 +58,8 @@ pub unsafe fn crossed(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// W-RC-5: the null path returns a freshly made object rather than the
-/// parameter. This is bst's `if (node == NULL) return newNode(key);` at width
-/// one — the shape that holds the era-5b target.
+/// The null path returns a freshly made object rather than the
+/// parameter: `if (node == NULL) return newNode(key);` at width one.
 const ALLOC_PRELUDE: &str = r#"
 unsafe extern "C"{
  fn free(p:*mut core::ffi::c_void);
@@ -82,7 +80,7 @@ pub unsafe fn insertFresh(root:*mut Node,key:i32)->*mut Node{
 }
 "#;
 
-/// W-RC-6: mutual recursion. `ping` needs `pong`'s contract and `pong` needs
+/// Mutual recursion. `ping` needs `pong`'s contract and `pong` needs
 /// `ping`'s, so neither is established and the pair is a typed hold. Recorded
 /// as a must-not-move because it is the shape the `visiting` set exists for:
 /// without it this does not refuse, it fails to terminate, which is why its
@@ -100,10 +98,10 @@ pub unsafe fn pong(root:*mut Node,key:i32)->*mut Node{
 }
 "#;
 
-/// W-RC-3r: the live counterpart of W-RC-3. Recursive, so the assumed contract
+/// The live counterpart of the cell-to-cell store above. Recursive, so the assumed contract
 /// is in play, and the token read from `left` is stored into `right` — leaving
 /// `left` naming an object nothing is responsible for and dropping whatever
-/// `right` held. Must be refused. K-RC-2 kills here.
+/// `right` held. Must be refused.
 const RC3R: &str = r#"
 pub unsafe fn crossed(root:*mut Node,key:i32)->*mut Node{
  if root.is_null(){ return root; }
@@ -112,10 +110,10 @@ pub unsafe fn crossed(root:*mut Node,key:i32)->*mut Node{
 }
 "#;
 
-/// W-RC-4: a callee that returns no token at all, its result stored back into
+/// A callee that returns no token at all, its result stored back into
 /// the cell. The cell's own token went in and nothing came out, so the object
 /// is lost. `leak` is not the function under proof, so no contract is assumed
-/// for it — and K-RC-1, which assumes every callee's, dies here.
+/// for it — and a fault that assumes every callee's contract is caught here.
 const RC4: &str = r#"
 pub unsafe fn leak(node:*mut Node)->*mut Node{ 0 as *mut Node }
 pub unsafe fn dropIn(root:*mut Node)->*mut Node{
@@ -124,9 +122,9 @@ pub unsafe fn dropIn(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// Census only, never a gate: does the member fold chain already reach the
+/// A probe only, never a gate: does the member fold chain already reach the
 /// return-to-cell shape, and with which hold? The internal certificate and the
-/// member chain are different surfaces, and (b)'s design turns on whether the
+/// member chain are different surfaces, and the return-to-cell design turns on whether the
 /// link across the call has to be built or only joined.
 #[test]
 #[ignore]

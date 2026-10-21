@@ -36,7 +36,7 @@ pub(crate) enum Hold {
     Declaration,
     Call,
     FieldScheme,
-    /// R369-2: the folding frame's own shape — see `fold_caller::Hold::BodyShape`.
+    /// The folding frame's own shape — see `fold_caller::Hold::BodyShape`.
     /// The membership certificate additionally needs the frame to return
     /// nothing.
     BodyShape {
@@ -44,10 +44,10 @@ pub(crate) enum Hold {
         returns: usize,
         phis: usize,
     },
-    /// R363-1: membership is written for one descendant; this is how many the
+    /// Membership is written for one descendant; this is how many the
     /// admitted field set produced. `FieldScheme` stays the premise refusal.
     Descendants(usize),
-    /// R363-1: the line that refused, across the 14 explicit coverage sites of
+    /// The line that refused, across the 14 explicit coverage sites of
     /// the membership certificate. Recorded through `fold_caller::Hold::Member`.
     Coverage(u32),
     UnsupportedEffect,
@@ -119,7 +119,7 @@ pub(crate) fn certify_metadata(
     if &packed.field_scheme != field || packed.carrier_input != descendant.input {
         return Err(Hold::Call);
     }
-    // R304-9: membership's closed store inventory is only closed if every write
+    // Membership's closed store inventory is only closed if every write
     // that could reach this field resolved to a named store. It does not rely on
     // the scheme gate in `fold_call` having run.
     if facts

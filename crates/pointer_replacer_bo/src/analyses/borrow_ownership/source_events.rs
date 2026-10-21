@@ -274,8 +274,8 @@ fn transfer_call<'tcx>(
 }
 
 /// `core::ptr::null()` / `null_mut()`: the compiler-resolved non-local null
-/// constructor. The Yale-PROCTOR fork translates C's `NULL` to this call where
-/// the older translation wrote `0 as *mut T` (R701).
+/// constructor. The newer C-to-Rust translation emits this call for C's `NULL`
+/// where the older translation wrote `0 as *mut T`.
 pub(crate) fn null_constructor(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
     matches!(tcx.item_name(did).as_str(), "null" | "null_mut")
         && tcx.crate_name(did.krate).as_str() == "core"
@@ -472,9 +472,9 @@ thread_local! {
     static LEAF_PROBE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// R309-1: an unscanned impl callee is LEAF when its own body retires nothing
+/// An unscanned impl callee is LEAF when its own body retires nothing
 /// that propagates and calls nothing. Storage roles are the callee's own stack
-/// and are excluded under §28; the admitted roles are exactly the propagation
+/// and are excluded under the UB-free-input premise; the admitted roles are exactly the propagation
 /// filter used to build `reachable` below.
 fn is_leaf_callee(program: &RustProgram<'_>, callee: rustc_span::def_id::LocalDefId) -> bool {
     if LEAF_PROBE.with(Cell::get) {
@@ -721,14 +721,14 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                                 },
                             );
                         }
-                        // R308-1: an inherent-method callee outside the scanned
+                        // An inherent-method callee outside the scanned
                         // function set has unknown retirement effects. Recording a
                         // route would demand coverage nothing can ever supply and
-                        // decline the program (R245-1); the unknown-retirement
+                        // decline the program; the unknown-retirement
                         // event states the same uncertainty in the vocabulary the
                         // conflict machinery already propagates to every caller.
                         CallKind::Impl(callee) if !program.functions.contains(&callee) => {
-                            // R309-1 row (0'): a leaf callee retires nothing and
+                            // A leaf callee retires nothing and
                             // calls nothing, so it gets neither event nor route.
                             let leaf = *leaf_callees
                                 .entry(callee)
@@ -1171,7 +1171,7 @@ mod tests {
             .filter(|event| event.key.role == SourceRole::ReallocOld)
             .collect();
         assert_eq!(unresolved.len(), 1);
-        // R243: an unclassified result test retains both outcomes, with only
+        // An unclassified result test retains both outcomes, with only
         // success retiring the old generation and failure losing its claim.
         assert_eq!(
             events.reallocations[0]

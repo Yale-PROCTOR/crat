@@ -1,4 +1,5 @@
-//! Compiler type observations for G-FOLD. These are not ownership or effect proofs.
+//! Compiler type observations for the fold vocabulary. These are not ownership or effect
+//! proofs.
 
 use std::collections::BTreeSet;
 
@@ -61,13 +62,13 @@ pub(crate) struct Inputs {
     pub(crate) structures: Vec<Structure>,
 }
 
-/// R339-5 D4: an operation the fold vocabulary need not represent, because it
+/// An operation the fold vocabulary need not represent, because it
 /// moves no token — an integer branch predicate such as `key < (*node).key`.
 ///
 /// The rule is read off what the occurrence records, never off its debug
 /// description: the destination is a place the type table says is not a
 /// pointer, and no operand resolves to a slot. A pointer operand is recorded
-/// `Present`, so `p < q` over pointers still refuses, which is K-D4.
+/// `Present`, so `p < q` over pointers still refuses.
 pub(crate) fn moves_no_token(
     inputs: &Inputs,
     function: &str,

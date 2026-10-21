@@ -196,7 +196,7 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
             .iter()
             .flat_map(|round| &round.demotions)
             .collect::<Vec<_>>();
-        // R343-1: a consumer may now have NO local repair at all, because the
+        // A consumer may have NO local repair at all, because the
         // disposition can prove the inner holder's loan dead at the event -- BOX_N5
         // is exactly that: `*p` is never read or written, so nothing protects the
         // freed object and the inner cell keeps its Ref. The invariant that must
@@ -246,7 +246,7 @@ fn check_decline(label: &str, source: &str, name: &str, storage_only: bool) {
             );
         }
         for row in rows {
-            // R343-1/R345-2: either inner-loan reason is the same verdict; any
+            // Either inner-loan reason is the same verdict; any
             // other reason is still refused.
             let Some(depth) = row.reason.inner_loan_depth() else {
                 panic!("{label}: unrelated local outcome requires attribution: {row:?}");

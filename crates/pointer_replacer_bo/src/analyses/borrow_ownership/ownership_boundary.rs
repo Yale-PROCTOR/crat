@@ -255,8 +255,7 @@ pub(crate) enum LicensingRole {
     Borrowed,
     OriginalCell,
     TraversalBorrow,
-    /// L01¹⁰ the lend (era-5c 066 / the record 2026-09-27-lend-interior-window,
-    /// R590-5): component 0 of the formal window is lent (the caller's frame, a
+    /// The lend: component 0 of the formal window is lent (the caller's frame, a
     /// zero view in the callee); every interior component takes the ordinary
     /// call equalities. Never a reader's call, which stays `Borrowed`.
     Lent,
@@ -735,7 +734,7 @@ pub(crate) fn validate_links(
                 .ok_or("proxy registration refers to a missing consume")?;
             let window =
                 observed_window(&registration.window).ok_or("proxy has no consume window")?;
-            // R357-2: the resolving lookup admits a narrowing cast's leading
+            // The resolving lookup admits a narrowing cast's leading
             // window, so the check that validates it uses the same rule —
             // otherwise the two disagree about the same registration.
             let corresponds = consume.projected == Present(window.clone())
@@ -786,7 +785,7 @@ pub(crate) fn validate_links(
         }
         if row.licensing_role == LicensingRole::Lent {
             // The container (component 0) is framed and zero; an interior
-            // component is never zeroed (R590-5 L-B).
+            // component is never zeroed.
             let (
                 Present(Window::UseDef {
                     use_start: a0,
@@ -841,7 +840,7 @@ pub(crate) fn validate_links(
                             None,
                         ) || has(
                             &row.point,
-                            // era-5c (R409-1): a contract producer's guarded port.
+                            // A contract producer's guarded port.
                             "guarded-contract-port",
                             &[*def_var, *formal],
                             None,
@@ -880,7 +879,7 @@ pub(crate) fn validate_links(
                             && has(&row.point, "assume", &[*formal_use], Some(false))
                             && has(&row.point, "assume", &[*formal_def], Some(false))
                     } else {
-                        // L01¹³ (c)(iii): a contract releaser's guarded sink formal.
+                        // A contract releaser's guarded sink formal.
                         (has(&row.point, "equal", &[*formal_use, *actual_use], None)
                             || has(
                                 &row.point,

@@ -29,7 +29,8 @@ mod infer;
 pub(crate) mod overlap_producer;
 pub(crate) mod overlap_snapshot_effects;
 pub(crate) mod param_overlap;
-// era-5c report 040: the A1 spare-set, for the MIR-walk market count.
+// The call-result reseat destinations (`x = f(x)`) the exit finalization spares, for a
+// MIR-walk count.
 pub(crate) use infer::reseat_destinations;
 #[cfg(test)]
 mod copy_lend_guard_tests;
@@ -114,14 +115,13 @@ pub type Precision = u8;
 /// raised in `CrateCtxt::new`) MUST move in lockstep — the two consts alone are a
 /// no-op against the `max_ptr_chased` cap. The `field ⟹ parent` suppression in
 /// `GlobalAssumptionApplier::apply` is REQUIRED at precision ≥ 2 to avoid
-/// over-claiming borrowed struct pointers whose fields are malloc'd. See task doc
-/// §9.11 (and §9.8 for the over-claim this avoids).
+/// over-claiming borrowed struct pointers whose fields are malloc'd.
 const BO_PRECISION: Precision = 2;
 
-/// §NB1 (C4-ii, plumbing only) — STRONG ownership monotonicity: re-enable the
+/// STRONG ownership monotonicity (plumbing only): re-enable the
 /// production `dominate`-style `own(deeper) ⇒ own(shallower)` push that
 /// `infer::new_vars` deliberately dropped (the relaxation site). OFF by default;
-/// the wiring exists so the C4-ii ablation can flip it without a code change.
+/// the wiring exists so an ablation can flip it without a code change.
 /// No behavior when false.
 pub(crate) const STRONG_MONO: bool = false;
 
@@ -189,13 +189,13 @@ pub(crate) struct BoOwnEmissionStats {
     pub source_sink_emissions: usize,
 }
 
-/// B3b: crate-level interprocedural emission. Builds the full `InterCtxt` (a
+/// Crate-level interprocedural emission. Builds the full `InterCtxt` (a
 /// signature for every crate function) into one shared `BoOwnDatabase`, then
 /// emits every function body's constraints into that shared `KindSolver`. The
 /// shared signature vars are the interprocedural linkage — z3 resolves
 /// cross-function (and recursive) ownership flow when the joint system is solved
-/// via `model_kinds_relaxing`. Stats and the retractable selectors (§NB-F:
-/// malloc SOURCES and free/realloc SINKS, typed-split in `Selectors`)
+/// via `model_kinds_relaxing`. Stats and the retractable selectors
+/// (malloc SOURCES and free/realloc SINKS, typed-split in `Selectors`)
 /// aggregate across all functions.
 pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
@@ -237,7 +237,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     });
     let _source_scope = source_events::enter_inventory(&inventory);
     let mut var_gen = Gen::new();
-    // §NB-R: hand the KindSolver's tracker (if any) to the database so the
+    // Hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
     let mut database = BoOwnDatabase::new(kind_solver.optimize(), kind_solver.tracker());
     let facts_scope = database.activate_facts();
@@ -358,14 +358,14 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         tracker.set_context("nb0-eager-source");
     }
 
-    // §NB0 (hoisted BB3-a): `¬ref(slot)` for every malloc-source slot, emitted
+    // `¬ref(slot)` for every malloc-source slot, emitted
     // EAGERLY as a candidacy-independent domain invariant — a heap allocation is
     // owned memory, never a borrow, so no model (however early) may classify it
     // `Ref`. `Owning` and `Raw` both satisfy the clause: an unleaked source still
     // settles `Owning`, a leaked one `Raw`. Routed through `add_borrow_exclusion`
     // (NOT the BoOwnDatabase source/sink path), so `source_sink_emissions` and
-    // the selector set are untouched. Replaces `verify_to_fixpoint`'s lazy
-    // per-round BB3-a commit.
+    // the selector set are untouched. Emitted here rather than as a lazy per-round
+    // commit in `verify_to_fixpoint`.
     let fns: Vec<_> = crate_ctxt.fns().iter().map(|d| d.expect_local()).collect();
     let malloc_sources = match copy_lends {
         Some(copy_lends) => sources::collect_malloc_source_slots_with_copy_lends(
@@ -386,20 +386,19 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         );
     }
 
-    // §NB4-4c: MAY-SUPPLY demotion over the NO-BORROW-ORIGIN set. A monotone `¬ref` on every
+    // MAY-SUPPLY demotion over the NO-BORROW-ORIGIN set. A monotone `¬ref` on every
     // no-borrow-origin slot — base signature slots (args/returns) AND struct fields, per
     // `collect_no_borrow_origin_slots` (NO depth-0 arg tier — deferred). Emitted EAGERLY here
-    // (candidacy-independent), mirroring the malloc-source `¬ref` loop above (the 3c-ii lesson).
-    // `origins` is THREADED in (F3 split-brain fix): CHECK_REAL, explain_unsat, and every test see the
-    // identical clause set.
+    // (candidacy-independent), mirroring the malloc-source `¬ref` loop above. `origins` is
+    // THREADED in so CHECK_REAL, explain_unsat, and every test see the identical clause set.
     //
     // `¬ref`-ONLY, not `¬ref ∧ ¬own`: `summary.unknown` is "NO-BORROW-ORIGIN", not "opaque-poisoned"
-    // (the malloc_only vs malloc_opaque ablation — `opaque(out)` adds nothing to the set), so it also
+    // (`opaque(out)` adds nothing to the set), so it also
     // holds owned-heap `*out = malloc()` / `return malloc()` transfers. `¬ref` is SELF-DISCRIMINATING:
     // an owned slot keeps `Owning` via its source selector; an opaque RESULT loses `Ref` → `Raw`. A
     // uniform `¬own` over-demoted the owned transfers (9 tests). The may-overwrite `¬own` is
     // un-targetable from this set (the overwrite is not in `summary.unknown`) and DEFERS to the
-    // effect-row/opaque-interaction bucket; see the task doc.
+    // effect-row/opaque-interaction work.
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("nb4-4c-may-supply-demotion");
     }
@@ -416,7 +415,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
     }
 
-    // E-R2: snapshot the Var -> Bool map before the database is dropped.
+    // Snapshot the Var -> Bool map before the database is dropped.
     database.emit_reference_effect_obligations()?;
     database.snapshot_version_asts();
 
@@ -438,12 +437,12 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("licensing-origin-admissibility");
     }
-    // R351-3 pass 1: the facts are still carried — the construction downstream
-    // is built from them — but not one of era-5b's constraints is emitted and
+    // The licensing facts are still carried — the construction downstream
+    // is built from them — but not one of the licensing constraints is emitted and
     // nothing is recorded into the entry. The gate sits at each emission site
     // rather than before them, because the facts themselves are structure, not
     // constraint.
-    // R377-1: the return-port rule. It is emitted here rather than beside the
+    // The return-port rule. It is emitted here rather than beside the
     // `¬ref` at the `AllocationSource` loop because its premise is read from the
     // licensing facts, which exist only after `freeze_facts`. Emission order is
     // irrelevant (the bodies share the InterCtxt signature vars), so the loop
@@ -470,7 +469,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         .no_ref_carriers
     {
         let slot = facts.slot_refs[&carrier.slot_key];
-        // O-ORIGIN is independent of endpoint/grant selection. A refused
+        // A no-ref carrier's exclusion is independent of endpoint/grant selection. A refused
         // fresh responsibility cannot acquire an invented borrow lifetime.
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
     }
@@ -554,15 +553,15 @@ fn emit_fn_body_into<'tcx>(
         ) as usize,
     );
 
-    // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
+    // Solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
     link_versions_to_slots(slots, fn_did, body, &summary, database, kind_solver);
     Ok(())
 }
 
-/// B2 solidification linking: tie each local pointer slot's `own` bit to the
+/// Solidification linking: tie each local pointer slot's `own` bit to the
 /// disjunction of that slot's per-version ownership Bools — the faithful
-/// OR-latch from `ownership::solidify`. Only depth 0 is emitted by B1's
-/// precision-1 driver, so only depth 0 is linked; inner depths are carried by
+/// OR-latch from `ownership::solidify`. Only depth 0 is emitted by the
+/// precision-1 body driver (`B1_PRECISION`), so only depth 0 is linked; inner depths are carried by
 /// `coherence`.
 fn link_versions_to_slots<'tcx>(
     slots: &CrateSlots,
@@ -590,7 +589,7 @@ fn link_versions_to_slots<'tcx>(
             for (local, consume) in summary.location_results(location) {
                 let use_var = consume.r#use.clone().next();
                 let def_var = consume.def.clone().next();
-                // E-R2 capture: this loop already visits exactly the tuples the
+                // Capture: this loop already visits exactly the tuples the
                 // export needs, and the `Location` association is discarded
                 // immediately below when the vars are ORed into `depth0_owns`.
                 // Recording-only; a no-op unless a capture scope is active.
@@ -637,8 +636,8 @@ fn link_versions_to_slots<'tcx>(
     }
 }
 
-/// B3b/B4: build a signature (ret + args) for *every* crate function into the
-/// shared database, keyed by `DefId`. B4 retired the `output_params` input:
+/// Build a signature (ret + args) for *every* crate function into the
+/// shared database, keyed by `DefId`. The `output_params` input is not used:
 /// every pointer ARG is uniformly two-slot `Consume(use+def)` so the solver
 /// decides escape natively (relaxed monotonicity), rather than a precomputed
 /// output-param flag. The RETURN stays `Param::Normal` (single slot). These
@@ -685,7 +684,7 @@ fn initial_crate_inter_ctxt<'tcx>(
                     database,
                     crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
                 );
-                // B4: no owning seed — escape is solved natively. A read-only
+                // No owning seed — escape is solved natively. A read-only
                 // param settles to Ref via the soft objective; `*out = malloc`
                 // settles to Ref-over-Owning. Hard-seeding here would force every
                 // param Owning (regressing read-only/borrowed caller storage).
@@ -724,7 +723,7 @@ impl<'tcx> CrateCtxt<'tcx> {
         // ownership var is created for the caller-side out-param escape. `new`
         // already applies one `increase_precision` (→ depth 1), so bump the
         // remainder; the `INIT_PRECISION`/`B1_PRECISION` consts alone are a no-op
-        // against this cap (see `BO_PRECISION` docs, §9.11).
+        // against this cap (see the `BO_PRECISION` docs).
         let mut struct_ctxt = struct_ctxt::StructCtxt::new(program.tcx, &structs);
         for _ in 1..BO_PRECISION {
             struct_ctxt.increase_precision(program.tcx);
@@ -745,7 +744,7 @@ impl<'tcx> CrateCtxt<'tcx> {
 #[cfg(test)]
 pub(crate) mod wrapper_fault_tests;
 
-/// L01⁷ lever (b), report 043: the locals whose value derives from a FORMAL --
+/// The locals whose value derives from a FORMAL --
 /// the formals themselves, then anything assigned from them by `Use`/`Cast`
 /// (including loads THROUGH a caller pointer, `x = copy (*p).f`), and the
 /// result of a non-local call (`ptr::offset` and friends) taking one. These hold

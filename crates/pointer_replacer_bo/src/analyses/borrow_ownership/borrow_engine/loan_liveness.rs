@@ -134,25 +134,25 @@ impl<'tcx> Analysis<'tcx> for LoanLiveAt<'_> {
 }
 
 // ===========================================================================================
-// §HLZ-PORT (A2) — point-keyed `requires` + fused reachability loan-liveness.
+// Point-keyed `requires` + fused reachability loan-liveness.
 //
-// PORTED from Hanliang Zhang's `hlz/flow-sensitive-borrow-inference @ 8d3878a2`
-// (`analyses/borrow/loan_liveness.rs` there), adapted to the fork in three ways, each
+// PORTED from an upstream flow-sensitive borrow-inference variant of
+// `analyses/borrow/loan_liveness.rs`, adapted to the fork in three ways, each
 // deliberate:
 //
 //   1. It lives HERE, in the fork, and writes a `LocalizedRequires` carried on the fork's own
 //      `NativeInference` — production `analyses/borrow/` is not edited, so
-//      `borrow::borrow_conflicts` (the D5-independent NB6 validator) keeps its behaviour by
+//      `borrow::borrow_conflicts` (the independent validator) keeps its behaviour by
 //      construction.
-//   2. `provenance_live_at` has NO `PlaceHolder`-is-always-live rule. His version pairs with a
-//      `provenance_liveness` repair we do not port; adopting the rule alone would be a
+//   2. `provenance_live_at` has NO `PlaceHolder`-is-always-live rule. The upstream version pairs
+//      with a `provenance_liveness` repair not ported here; adopting the rule alone would be a
 //      TIGHTENING (more live provenances ⇒ more requires ⇒ more errors) on exactly the
 //      parameter-shaped code that dominates the corpus. Omitting it is what makes the ported
 //      facts a provable pointwise SUBSET of the landed ones (the tripwire below).
 //   3. Edge locations are `EdgeLocation`, a fork-local type, because production has no
-//      `ConstraintLocation`. Under A2 only loan-derived reborrow edges are `Point`; the
+//      `ConstraintLocation`. Here only loan-derived reborrow edges are `Point`; the
 //      closure-derived depth-0 value flows are `All`, since a transitive-closure edge has no
-//      single location and locating them means touching `origin_flow` (that is A1).
+//      single location and locating them means touching `origin_flow` (a separate step).
 // ===========================================================================================
 
 /// Where a subset constraint applies. `All` is the escape hatch for a constraint with no
@@ -274,8 +274,7 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
     // `by_edge || live(node)`, so it is a property of HOW the node was reached; keying `visited`
     // on the node alone let whichever push happened to pop first decide, and silently discarded a
     // later edge-step arrival that would have licensed a record the sideways arrival did not.
-    // That made the output pop-order-shaped rather than semantic (recorded as a residual at the
-    // 2026-08-25 close, §8.2 item 1; repaired here on reopening). Re-expanding a node once per
+    // That made the output pop-order-shaped rather than semantic. Re-expanding a node once per
     // reach-kind is wasted work, not wrong work: every write below is into an idempotent set.
     let mut visited: FxHashSet<(LocalizedNode, bool)> = FxHashSet::default();
     // `bool` = reached by a CFG edge step. Such a node's ENTRY liveness is already established by
@@ -300,10 +299,10 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
         // Loans are issued after their reservation location. Starting at successor points
         // prevents a borrow from conflicting with the access that creates it.
         //
-        // §HLZ-PORT EDGE GATE (see the note at the bottom of this file): the liveness test is
+        // EDGE GATE (see the note at the bottom of this file): the liveness test is
         // taken at the SOURCE point, not the target, because our `provenance_liveness` holds
         // EXIT liveness. `live_on_exit(q, pt)` is exactly "q is live on the edge out of pt",
-        // which is what his entry-liveness test at the target expresses.
+        // which is what the upstream entry-liveness test at the target expresses.
         for provenance in initial.iter() {
             if !provenance_live_at(provenance_liveness, provenance, reserve_point) {
                 continue;
@@ -343,7 +342,7 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
                 continue;
             }
 
-            // §HLZ-PORT EDGE GATE — same reason as the seed above: gate the CFG step on the
+            // EDGE GATE — same reason as the seed above: gate the CFG step on the
             // SOURCE point's (exit) liveness.
             if provenance_live_at(provenance_liveness, node.provenance, node.point) {
                 for successor in successor_points(body, location_map, node.point) {
@@ -509,33 +508,32 @@ pub(super) fn assert_non_escaped_liveness_equal(
 }
 
 // ===========================================================================================
-// §HLZ-PORT EDGE GATE — why the liveness test sits at the source, not the target
+// EDGE GATE — why the liveness test sits at the source, not the target
 //
-// hlz's traversal gates the CFG step on the TARGET point's liveness, and pairs that with a
+// The upstream traversal gates the CFG step on the TARGET point's liveness, and pairs that with a
 // `provenance_liveness` repair in the same commit: `seek_before_primary_effect` ->
 // `seek_after_primary_effect`, doc comment "live on exit" -> "live on entry"
-// (`borrow/provenance_liveness.rs:14`, `:41` pre-hlz; `:14`, `:50-52` on 8d3878a2). The repair
+// (`borrow/provenance_liveness.rs`). The repair
 // is not decoration — `MaybeLiveLocals` is a BACKWARD analysis, so "before the primary effect"
-// in analysis order is AFTER it in program order, i.e. pre-hlz sampling yields liveness on
+// in analysis order is AFTER it in program order, i.e. the unrepaired sampling yields liveness on
 // EXIT. Gating on the target's liveness while holding an exit-liveness matrix shortens every
 // loan's window by one point at the tail.
 //
-// We cannot take his repair directly: our production `analyses/borrow/` is byte-frozen for this
+// The repair cannot be taken directly: production `analyses/borrow/` is byte-frozen for this
 // port, and a faithful fork of `compute_provenance_liveness` is impossible without editing it —
 // the field branch needs `ProvenanceSet::field_data` and `direct_raw_pointer_field_slots_in_ty`,
 // BOTH PRIVATE (`borrow/mod.rs:162`, `:288`).
 //
 // So the same predicate is expressed on the matrix we already have. For liveness,
 //     exit(pt) = ⋃ { entry(s) : s ∈ succ(pt) },
-// so testing `live_on_exit(q, pt)` before stepping to `pt'` is his `live_on_entry(q, pt')` test
+// so testing `live_on_exit(q, pt)` before stepping to `pt'` is the upstream `live_on_entry(q, pt')` test
 // — exactly equal where `pt` has one successor, and a UNION (hence more permissive, the
 // conservative direction) at a branch. That union is also precisely what the landed dataflow
 // did: its `required(pt)` was built from this same exit matrix and applied to every successor.
 //
-// EXCLUDED, deliberately: hlz's second `provenance_liveness` change — placeholder provenances
+// EXCLUDED, deliberately: the upstream second `provenance_liveness` change — placeholder provenances
 // live at every point (`provenance_liveness.rs:24-30`, `:46-48`). It is a genuine tightening on
-// parameter-shaped code and is a separate decision with its own measurement (seat, §39
-// addendum 15).
+// parameter-shaped code and is a separate decision with its own measurement.
 //
 // The record gate at the node is left as it is: a node arrives either by an edge step (whose
 // gate is above) or by an unconditional same-point subset hop, and for the latter the exit
@@ -543,11 +541,11 @@ pub(super) fn assert_non_escaped_liveness_equal(
 // (`conflicts.rs:226-230`, `borrow/mod.rs:1273-1277`).
 // ===========================================================================================
 
-/// §HLZ-PORT monotonicity tripwire — RELEASE-ACTIVE by design.
+/// Monotonicity tripwire — RELEASE-ACTIVE by design.
 ///
 /// The suite runs `--release`, where `debug_assert!` compiles out, and this project's precedent
-/// for a soundness-relevant invariant is a release-active `assert!` (§8 BB3-c). It asserts the
-/// claim §2.7 of the port-exploration record argues: the ported facts are a pointwise SUBSET of
+/// for a soundness-relevant invariant is a release-active `assert!`. It asserts the
+/// port's claim: the ported facts are a pointwise SUBSET of
 /// the landed ones, per round and same input. A FIRE IS A STOP, not a fix — it means the port
 /// added a fact the landed relation did not hold, which the placeholder-omission argument says
 /// is impossible.

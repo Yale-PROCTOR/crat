@@ -1,10 +1,10 @@
-//! L01⁵ (ii) — the field↔field strong-update move.
+//! The field↔field strong-update move.
 //!
-//! bst needed none of this: its deletion never permutes two live fields. avl's
-//! rotations do — `x = (*y).left; T2 = (*x).right; (*x).right = y; (*y).left = T2;`
-//! permutes three field slots between two nodes — and W19/W20 measure what that
-//! costs: 25 raw / 8 ref / 0 owning with a `free` and without one, while the same
-//! shape with no rotation (W18) is 0 raw. The relax core names the mechanism:
+//! A tree deletion that never permutes two live fields needs none of this. An
+//! AVL rotation does — `x = (*y).left; t = (*x).right; (*x).right = y; (*y).left = t;`
+//! permutes three field slots between two nodes — and on a rotation fixture that
+//! costs 25 raw / 8 ref / 0 owning with a `free` and without one, while the same
+//! shape with no rotation is 0 raw. The relax core names the mechanism:
 //! `coherence::kind-equate(Local(rightRotate, BO_S(2)), Field(BO_S(0)), own)` —
 //! a field load kind-equates the local with the CRATE-WIDE field slot, so the
 //! field can never hand its token to the local and the whole web settles raw.
@@ -12,10 +12,10 @@
 //! The fact this module computes is the guard that releases that equality, and
 //! only where releasing it is sound: the load is a MOVE when the loaded place is
 //! overwritten on EVERY path out of the load before any later read of it — so no
-//! reader can observe the field still holding the moved value. It is E5C-1's
-//! must-null discharge keyed on an overwrite instead of a NULL, and it asserts
+//! reader can observe the field still holding the moved value. It is the
+//! must-null join discharge keyed on an overwrite instead of a NULL, and it asserts
 //! nothing about ownership: it only stops forcing local and field to share a kind.
-//! The soundness lines of R395-2 are untouched — drops stay at C free sites.
+//! Drops stay at C free sites.
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{

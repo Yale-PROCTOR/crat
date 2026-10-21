@@ -1,15 +1,14 @@
-//! L01¹⁰ (R602-1 / R603-2; the record
-//! `docs/agents/plan/2026-09-28-retirement-effective-type-discharge.md`): two
-//! discharges of a retirement conflict raised by a `Free` / `ReallocOld` whose
+//! Two discharges of a retirement conflict raised by a `Free` / `ReallocOld` whose
 //! object the overlap analysis cannot place.
 //!
 //! (α) the post-free use, unconditional: every path from the event reaches, in
 //! the conflict's own frame, a load or store through the reference (or a
 //! single-definition copy of it) before the frame returns. An overlapping free
-//! would make that access a use-after-free of the input, which §28 excludes.
+//! would make that access a use-after-free of the input, which the UB-free-input
+//! premise excludes.
 //!
-//! (β) the effective type, behind `CRAT_ERA5C_TYPED_RELEASE` (the premise
-//! `TypedReleaseDiscipline`, R603-1, the user's): the freed allocation's type P
+//! (β) the effective type, under the stated premise
+//! `TypedReleaseDiscipline`: the freed allocation's type P
 //! (recovered from the freed operand backwards through pointer casts and
 //! single-definition copies, and along the event's route from a routed
 //! callee's parameter to the caller's actual) and the referent's type T are
@@ -59,7 +58,7 @@ fn signedness_twin(name: &str) -> &str {
     }
 }
 
-/// R609-3 (the A5 type route, under R542): two pointees that are object types
+/// The parameter-overlap type route, under the effective-type premise: two pointees that are object types
 /// (not `void`, character, a union, zero-sized or opaque) and of which neither
 /// contains the other by value, under the same structural compatibility as (β)
 /// (tag and members, never a definition identity), cannot overlap. Their names
@@ -311,7 +310,7 @@ pub(crate) struct Discharges {
     /// (α⁺): the route's frames, bottom (the releasing function) to top (the
     /// conflict frame).
     chains: std::collections::BTreeMap<EventKey, Vec<RouteFrame>>,
-    /// L01¹² (R682-3): `after` / `chains` without the zero-size premise's
+    /// `after` / `chains` without the zero-size premise's
     /// refuted edge, for the events where that edge was applied.
     strict_after: std::collections::BTreeMap<EventKey, FxHashSet<Local>>,
     strict_chains: std::collections::BTreeMap<EventKey, Option<Vec<RouteFrame>>>,
@@ -335,7 +334,7 @@ struct RouteFrame {
 }
 
 /// One discharged conflict, for the receipt. `premise`: only the zero-size
-/// `realloc` premise admits it (L01¹², R682-3).
+/// `realloc` premise admits it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Rule {
     PostFreeUse {
@@ -415,7 +414,7 @@ impl Discharges {
                 let body = tcx
                     .mir_drops_elaborated_and_const_checked(event.frame)
                     .borrow();
-                // L01¹² (R677-4): a route-less release's own frame gets the same refutation.
+                // A route-less release's own frame gets the same refutation.
                 let refuted = (event.route.is_empty()
                     && matches!(event.source.key.role, SourceRole::ReallocOld))
                 .then(|| refuted_realloc_edge(tcx, &body, event.location))
@@ -427,7 +426,7 @@ impl Discharges {
                     &out.reassigned,
                     refuted.map(|(edge, _)| edge),
                 );
-                // R682-3: what holds without the premise, for the receipt.
+                // What holds without the premise, for the receipt.
                 if refuted.is_some_and(|(_, premise)| premise) {
                     let strict =
                         accessed_after(&body, event.location, event.frame, &out.reassigned, None);
@@ -658,7 +657,7 @@ impl Discharges {
     ) -> Option<(Vec<RouteFrame>, bool)> {
         let releasing = *functions.get(&event.source.key.function)?;
         let mut chain = Vec::new();
-        // R682-3: whether the zero-size premise's edge was applied (`strict`: never).
+        // Whether the zero-size premise's edge was applied (`strict`: never).
         let mut premised = false;
         // The bottom frame, from the release itself.
         let (mut function, mut start) = (
@@ -673,7 +672,7 @@ impl Discharges {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
-            // L01¹² (R677-4): in the releasing frame only, a `realloc`'s refuted null branch.
+            // In the releasing frame only, a `realloc`'s refuted null branch.
             let refuted = (chain.is_empty()
                 && matches!(event.source.key.role, SourceRole::ReallocOld))
             .then(|| refuted_realloc_edge(tcx, &body, start))
@@ -742,7 +741,7 @@ impl Discharges {
         let after = self.after.get(&key);
         let chain = self.chains.get(&key).map(Vec::as_slice);
         let rule = self.discharge_on(event, target, &key, after, chain);
-        // L01¹² (R682-3): a discharge only the zero-size `realloc` premise admits
+        // A discharge only the zero-size `realloc` premise admits
         // (a computed size's refuted null branch) says so in its receipt.
         if rule.is_none()
             || !(self.strict_after.contains_key(&key) || self.strict_chains.contains_key(&key))
@@ -769,7 +768,7 @@ impl Discharges {
         if let Some(base) = target.base()
             && !self.reassigned.contains(&(event.frame, base))
             && after.is_some_and(|set| set.contains(&base))
-            // R666-1: every route frame below returns (or uses the referent).
+            // Every route frame below returns (or uses the referent).
             && chain.is_some_and(|chain| {
                 let pointer = pointers(chain, base);
                 below(chain, &pointer, chain.len() - 1)
@@ -818,7 +817,7 @@ impl Discharges {
         })
     }
 
-    /// The type table, for a census that walks without a routed event.
+    /// The type table, for a whole-program scan that walks without a routed event.
     #[cfg(test)]
     pub(crate) fn name_of(&self, ty: &CTy) -> String {
         self.types.name(ty)
@@ -850,12 +849,12 @@ impl<'tcx> Visitor<'tcx> for Accesses {
     }
 }
 
-/// L01¹² (R677-4): the edge `(switch block, null branch)` on which the `realloc` at
+/// The edge `(switch block, null branch)` on which the `realloc` at
 /// `at` has returned null with its old block untouched -- the result (through
 /// single-definition copies and pointer casts) tested by `is_null`; a zero-size
 /// `realloc` is outside the target space (the realloc-nonzero premise). `None` when any
 /// part is not found. The
-/// flag: the size is not a nonzero constant, so the edge rests on the premise (R682-3).
+/// flag: the size is not a nonzero constant, so the edge rests on the premise.
 fn refuted_realloc_edge<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,

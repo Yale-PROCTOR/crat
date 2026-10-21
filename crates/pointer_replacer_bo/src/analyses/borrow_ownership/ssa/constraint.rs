@@ -274,8 +274,9 @@ pub trait Database {
         Infer::store_linear(store, x, y, z);
     }
 
-    /// A12's symbolic Copy/Move branch. Only BO's shared Optimize backend receives a lend guard;
-    /// the unit/no-op databases retain their existing unguarded paths and must never call this.
+    /// The copy-lend funnel's symbolic Copy/Move branch. Only BO's shared Optimize backend receives
+    /// a lend guard; the unit/no-op databases retain their existing unguarded paths and must never
+    /// call this.
     fn push_guarded_copy(
         &mut self,
         _lend: &z3::ast::Bool,
@@ -351,7 +352,7 @@ pub trait Database {
         Infer::store_less_equal(store, x, y);
     }
 
-    /// era-5c (R404-3): a phi edge on which the incoming component is known
+    /// A phi edge on which the incoming component is known
     /// null. The join may drop the vacuous token (`lhs <= rhs`) but never
     /// create one. Backends that label constraints override the `_impl` to name
     /// the row; the stored constraint is the `less-equal` it is.
@@ -379,11 +380,11 @@ pub trait Database {
         self.push_assume_impl(var, true);
     }
 
-    /// §NB-F: force a consumed (`sink`: free/realloc arg) value's ownership to
+    /// Force a consumed (`sink`: free/realloc arg) value's ownership to
     /// `true`. Default: a hard `assume(var = true)`, faithful to production.
     /// Retractable backends override this to gate the owning behind a selector
     /// so the relax loop can LEAK THE FREE instead of declining the crate (an
-    /// unprovable free stays a raw-pointer free; option (a) of the NB-R gate).
+    /// unprovable free stays a raw-pointer free).
     fn push_sink_owning(&mut self, var: Var) {
         self.push_assume_impl(var, true);
     }

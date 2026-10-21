@@ -331,7 +331,7 @@ pub(crate) fn consume_at(point: &Point, window: &Window) -> Availability<usize> 
     if matches.len() == 1 {
         return Availability::Present(matches[0]);
     }
-    // R357-2: a native pointer cast transfers the root only, and the
+    // A native pointer cast transfers the root only, and the
     // certificate's own component loop already says so (`width.min(1)`). The
     // registration's window is then the leading components of the source's,
     // sharing both starts — not a different window. One such source resolves;

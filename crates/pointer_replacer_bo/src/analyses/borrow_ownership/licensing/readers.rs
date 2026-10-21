@@ -34,10 +34,10 @@ pub(crate) struct Body {
 }
 
 impl Body {
-    /// R337-2(b): THE read-only-intrinsic test. Every gate that needs to know
+    /// THE read-only-intrinsic test. Every gate that needs to know
     /// whether a call at a site only reads asks this one question, so the gates
     /// cannot drift apart again — `check_effects` refusing an `is_null` that
-    /// `fold_internal` admits is exactly what held OL01-OL03.
+    /// `fold_internal` admits is exactly what held the tree fold witnesses.
     pub(crate) fn readonly_intrinsic(&self, block: u32, statement: usize) -> bool {
         self.readonly_intrinsics.contains(&(block, statement))
     }
@@ -85,7 +85,7 @@ impl Plan {
         })
     }
 
-    /// R335-4: a borrowing parameter with a VIEW return LENDS. The function is a
+    /// A borrowing parameter with a VIEW return LENDS. The function is a
     /// reader — it performs no store and no free anywhere, which is what reader
     /// eligibility already establishes — and what it hands back is a proper
     /// descendant of this parameter, not the parameter itself. The caller keeps
@@ -126,7 +126,7 @@ pub(crate) fn validate_call_roles(facts: &super::facts::Facts) -> Result<(), Str
             return Err("borrowed call has no target parameter".into());
         };
         // A reader's call is `Borrowed`; a lend is `Lent` and its certificate is
-        // the recorded lend plan (R590-5 L-B: absent from the snapshot = refused).
+        // the recorded lend plan (absent from the snapshot = refused).
         if lent && !facts.lend_plan.lends(callee, index) {
             return Err("lent call has no lend certificate".into());
         }

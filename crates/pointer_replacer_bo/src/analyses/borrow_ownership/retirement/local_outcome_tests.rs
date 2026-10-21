@@ -1,4 +1,4 @@
-//! R245: coverage stays local; foreign-only storage and inner-holder contrast.
+//! Coverage stays local; foreign-only storage and inner-holder contrast.
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::mir::VarDebugInfoContents;
 
@@ -111,7 +111,7 @@ fn e5_r245_full_draw_foreign_address_carriers_keep_model() {
 }
 #[test]
 fn e5_r245_inner_holder_and_copy_chain_demote_raw_without_decline() {
-    // R343-1: the inner value is RETURNED, so it leaves the frame and the holder
+    // The inner value is RETURNED, so it leaves the frame and the holder
     // is `Unrepresented(Escaped)` -- which keeps the copy-chain demotion this
     // witness is about. Without the return the holder is merely live, the
     // disposition raises a targeted conflict instead, and there is no chain to
@@ -332,7 +332,7 @@ fn e5_r253_l2_coverage_propagates_planner_decline_before_commit() {
     use crate::analyses::borrow_ownership::{
         borrow_verify::coverage_planner_fault, guarded_repair::DeclineReason,
     };
-    // R343-1: the inner value is RETURNED, so it leaves the frame and the holder
+    // The inner value is RETURNED, so it leaves the frame and the holder
     // is `Unrepresented(Escaped)` -- which keeps the copy-chain demotion this
     // witness is about. Without the return the holder is merely live, the
     // disposition raises a targeted conflict instead, and there is no chain to

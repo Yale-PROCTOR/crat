@@ -1,4 +1,4 @@
-//! R243: exact source result transport through a finite straight-line field chain.
+//! Exact source result transport through a finite straight-line field chain.
 //! This recognizes a null test; it does not manufacture conditional field SSA.
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,4 +1,4 @@
-//! §8 BB3-a — malloc-source slot identification (`Ref ⇒ loan`).
+//! Malloc-source slot identification (`Ref ⇒ loan`).
 //!
 //! A pointer that receives a heap allocation (`malloc`/`calloc`/`realloc`/`strdup`) OWNS
 //! that memory — it is not a borrow, so it must never be classified `Ref` (a reference to
@@ -6,8 +6,8 @@
 //! function's MIR for allocator `Call`s with a **bare-local** destination, then propagating
 //! through kind-preserving rvalues (cast / copy / move) so the canonical C2Rust shape
 //! `let p = malloc(n) as *mut T` (`_tmp = malloc()`, `_p = _tmp as *mut T`) flags BOTH the
-//! call destination AND the cast target. §NB0: `emit_crate_ownership_constraints` asserts
-//! `¬ref` on every source slot EAGERLY at emission time (the hoisted BB3-a invariant), so
+//! call destination AND the cast target. `emit_crate_ownership_constraints` asserts
+//! `¬ref` on every source slot EAGERLY at emission time (a hoisted invariant), so
 //! no model at any stage can mark a source `Ref`.
 //!
 //! Allocator recognition mirrors the ownership boundary EXACTLY: a callee is a source only
@@ -27,10 +27,10 @@
 //! - Struct-field stores and interprocedural (callee-returned) allocations into caller
 //!   slots are not covered (depth>0 / cross-fn gaps).
 //!
-//! §NB0: allocator recognition now reads the unified `boundary_table` (the ForeignC
+//! Allocator recognition reads the unified `boundary_table` (the ForeignC
 //! `Source` rows) instead of a module-local list. The table's contents still mirror
 //! `infer/boundary/libc.rs` (production `ownership/` must stay byte-unchanged, so it
-//! cannot be the shared source), and the `nb0_consistency_libc_dispatch` test enforces
+//! cannot be the shared source), and a consistency test enforces
 //! that mirroring. NOTE `call_graph.rs` intentionally omits `strdup` (it ranks
 //! alloc/dealloc *monotonicity* only) — the lists need not be identical.
 
@@ -45,7 +45,7 @@ use super::{boundary_table, coherence::CopyLendPair, crate_slots::CrateSlots, so
 /// Whether `func` resolves to an extern allocator declaration — gated on `Node::ForeignItem`
 /// exactly like the ownership boundary (`infer.rs`), so a crate-local fn merely *named*
 /// `malloc` (a wrapper / user fn) is NOT treated as a source. The name set is the
-/// boundary table's ForeignC `Source` rows (§NB0).
+/// boundary table's ForeignC `Source` rows.
 fn is_allocator_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
     let Some((def_id, _)) = func.const_fn_def() else {
         return false;
@@ -64,7 +64,7 @@ fn is_allocator_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 /// destinations, plus everything reachable from them through kind-preserving rvalues
 /// (cast / copy / move). See the module docs for the (sound) scope limits.
 ///
-/// §NB0: takes `(tcx, functions)` instead of `&RustProgram` so the emission path
+/// Takes `(tcx, functions)` instead of `&RustProgram` so the emission path
 /// (which holds a `CrateCtxt`, not a `RustProgram`) can compute the set for the
 /// hoisted eager `¬ref(source)` constraints.
 pub(crate) fn collect_malloc_source_slots(

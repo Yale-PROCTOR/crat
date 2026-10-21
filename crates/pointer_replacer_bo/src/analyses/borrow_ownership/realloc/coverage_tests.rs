@@ -1,4 +1,4 @@
-//! R243: real field-carried tests and a receipted, non-declining fallback.
+//! Real field-carried tests and a receipted, non-declining fallback.
 use rustc_hir::{ItemKind, OwnerNode};
 
 use super::*;

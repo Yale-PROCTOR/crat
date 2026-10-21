@@ -460,7 +460,7 @@ pub(crate) fn validate_returns(
                     scope(&row.point)
                         && row.point.phase == "phi"
                         && row.point.block == Some(phi.block)
-                        // era-5c: a null-join is the phi relation on an edge
+                        // A null-join is the phi relation on an edge
                         // whose incoming component is known null.
                         && matches!(row.operation.as_str(), "equal" | "null-join")
                         && row.variables == [left, right]

@@ -1,9 +1,10 @@
-//! Row (0) ROUTE-INHERENT-METHOD: an unresolved inherent-method callee must not
-//! decline the program (R245-1). Witnesses Z-W01..Z-W07, killers Z-K01..Z-K04.
+//! The inherent-method route: an unresolved inherent-method callee must not
+//! decline the program.
 
-/// Z-W01 getter: a free function retires, an unrelated frame calls an inherent
-/// getter. The Ref selection is OUTSIDE any hold set (R307-2), so this is a clean
-/// RED (no model at all) before the row and GREEN after it.
+/// Getter: a free function retires, an unrelated frame calls an inherent
+/// getter. The Ref selection is OUTSIDE any hold set, so without the
+/// inherent-method route the program yields no model at all, and with it the
+/// program is accepted.
 const GETTER: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct S { flags: u32 }
@@ -13,7 +14,7 @@ pub unsafe fn keeper(p: *const u8) -> u8 { *p }
 pub unsafe fn releaser(q: *mut u8) { free(q as *mut core::ffi::c_void); }
 "#;
 
-/// Z-W02 setter: same shape through a `&mut self` inherent setter.
+/// Setter: same shape through a `&mut self` inherent setter.
 const SETTER: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct S { flags: u32 }
@@ -23,9 +24,10 @@ pub unsafe fn keeper(p: *const u8) -> u8 { *p }
 pub unsafe fn releaser(q: *mut u8) { free(q as *mut core::ffi::c_void); }
 "#;
 
-/// Z-W06 control: the same program with the inherent method replaced by a free
-/// function. It has no unresolved route, so it must be ACCEPTED both before and
-/// after the row -- this is what makes Z-W01's RED attributable to the impl call.
+/// Control: the same program with the inherent method replaced by a free
+/// function. It has no unresolved route, so it must be ACCEPTED with or without
+/// the inherent-method route -- this is what attributes the getter's failure to
+/// the impl call.
 const FREE_FUNCTION_CONTROL: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct S { flags: u32 }
@@ -59,10 +61,10 @@ fn z_w02_inherent_setter_callee_must_not_decline_the_program() {
     );
 }
 
-/// Z-W03: the Ref is live ACROSS the unresolved call in the immediate caller.
+/// The Ref is live ACROSS the unresolved call in the immediate caller.
 /// The unknown-retirement event's object is the TOP set, so it overlaps this Ref
-/// and the analysis must demote it. Read with Z-W01, a `false` here cannot be
-/// "the program declined": Z-W01 shows this class of program now yields a model.
+/// and the analysis must demote it. A `false` here cannot be "the program
+/// declined": the getter case shows this class of program yields a model.
 const ACROSS_IMMEDIATE: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct S { flags: u32, held: *mut u8 }
@@ -75,7 +77,7 @@ pub unsafe fn caller(s: *mut S) -> u32 {
 pub unsafe fn keeper(p: *const u8) -> u8 { *p }
 "#;
 
-/// Z-W07 (R308-2): the grand-caller. `g` holds a Ref into an object it passes to
+/// The grand-caller. `g` holds a Ref into an object it passes to
 /// `f`, and `f` makes the unresolved inherent call. Nothing in `g` is an
 /// unresolved call, so an immediate-frame hold could never reach it: only the
 /// event's propagation through the g -> f route can demote this Ref.
@@ -92,10 +94,9 @@ pub unsafe fn g(s: *mut S) -> u32 {
 pub unsafe fn keeper(p: *const u8) -> u8 { *p }
 "#;
 
-/// Z-P01 (report-only, re-authored per R309-1 item 2): the first draft selected
-/// `s` while `f(s)` passed that very pointer, so `s` was in use AT the call the
-/// event sits on and demotion was the required outcome -- the draft could not
-/// have reported anything. Here the selected Ref `s` is dead before the call and
+/// Report-only. Selecting a pointer that the call itself passes would put it in
+/// use AT the call the event sits on, making demotion the required outcome and
+/// leaving nothing to report. Here the selected Ref `s` is dead before the call and
 /// a DIFFERENT pointer `t` is passed, so nothing about `s` is in use at or after
 /// the event. Report whether it survives; no behaviour is asserted.
 const BEFORE_ONLY: &str = r#"
@@ -111,11 +112,12 @@ pub unsafe fn g(s: *mut S, t: *mut S) -> u32 {
 pub unsafe fn keeper(p: *const u8) -> u8 { *p }
 "#;
 
-/// Z-W05: the exact corpus shape. brotli's 38 `CallKind::Impl` sites are calls to
+/// The exact corpus shape. brotli's 38 `CallKind::Impl` sites are calls to
 /// `c2rust_bitfields` accessors whose bodies borrow a bitfield and hand it to a
 /// RustLib target -- here `u32::from` -- so the callee body itself contains no
-/// local call and no retirement. Under row (0) the program must be ACCEPTED; the
-/// receiver's own demotion is what row (0') LEAF-CALLEE-EXEMPTION addresses.
+/// local call and no retirement. Under the inherent-method route the program must
+/// be ACCEPTED; the receiver's own demotion is what the leaf-callee exemption
+/// addresses.
 const BROTLI_ACCESSOR_SHAPE: &str = r#"
 #[repr(C)] pub struct Bits { raw: [u8; 4] }
 #[repr(C)] pub struct State { bits: Bits, data: *mut u8 }
@@ -179,13 +181,12 @@ fn z_w05_the_exact_brotli_accessor_shape_is_accepted() {
     );
 }
 
-/// Z-W04: the receipt, at review level, on the production path.
+/// The receipt, at review level, on the production path.
 ///
-/// R308-2 named `Demotion.source` as the join. It is not this class's channel:
-/// `local_outcome::Reason` carries only `InnerLoanMissing` and `OwnerMissing`
-/// (the P1'-S demotion channel), while an `UnknownObjects` overlap is recorded as
-/// a `RetirementConflict` -- which is exactly what the R286 evidence files show
-/// for this row category. The receipt therefore joins
+/// `Demotion.source` is not this class's channel: `local_outcome::Reason`
+/// carries only `InnerLoanMissing` and `OwnerMissing` (the protected-entry
+/// demotion channel), while an `UnknownObjects` overlap is recorded as a
+/// `RetirementConflict`. The receipt therefore joins
 /// `RetirementConflict.source -> Coverage::UnresolvedCalleeEffects`, and carries
 /// the conflict's own `target_key` as the affected slot.
 #[test]
@@ -293,12 +294,12 @@ fn z_w04_receipt_joins_conflicts_to_unresolved_callee_coverage() {
     .unwrap_or_else(|error| error.raise())
 }
 
-// ---------------------------------------------------------------- row (0') ----
-// R309-1 LEAF-CALLEE-EXEMPTION. A leaf callee retires nothing that propagates
-// and calls nothing, so it gets neither event nor route. Z-W05 measured the RED:
-// under row (0) alone the accessor receiver does NOT survive.
+// ---------------------------------------------------- leaf-callee exemption ----
+// A leaf callee retires nothing that propagates and calls nothing, so it gets
+// neither event nor route. Under the inherent-method route alone the accessor
+// receiver does NOT survive.
 
-/// Z-W09 non-leaf by an explicit `free` in the callee body.
+/// Non-leaf by an explicit `free` in the callee body.
 const NON_LEAF_FREE: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct S { p: *mut u8 }
@@ -310,7 +311,7 @@ pub unsafe fn probe(s: *mut S) -> *mut u8 {
 pub unsafe fn keeper(q: *const u8) -> u8 { *q }
 "#;
 
-/// Z-W10 non-leaf by a Drop terminator in the callee body.
+/// Non-leaf by a Drop terminator in the callee body.
 const NON_LEAF_DROP: &str = r#"
 #[repr(C)] pub struct S { p: *mut u8 }
 impl S { pub unsafe fn take(&mut self) { let _b = Box::from_raw(self.p); } }

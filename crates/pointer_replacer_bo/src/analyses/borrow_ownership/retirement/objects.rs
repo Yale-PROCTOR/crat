@@ -39,7 +39,7 @@ pub(crate) enum ObjectRoot {
         function: LocalDefId,
         local: Local,
     },
-    /// Row (b): the object pointed to by field `field` of a single known base.
+    /// The object pointed to by field `field` of a single known base.
     /// `FieldBase` has no field variant, so the path is bounded to one step.
     Field {
         base: super::field_objects::FieldBase,
@@ -161,7 +161,7 @@ fn clobber(state: &mut State) {
     }
 }
 
-/// R304-7 row (a): the clobber a non-allocator local call actually needs.
+/// The clobber a non-allocator local call actually needs.
 ///
 /// Every depth >= 1 cell describes memory behind a pointer, which a callee may
 /// write, and is clobbered exactly as before. A depth-0 cell holds the pointer
@@ -173,10 +173,10 @@ fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
     for (local, row) in state.iter_mut().enumerate() {
         let reachable = escapes.escapes(Local::from_usize(local));
         for (depth, objects) in row.iter_mut().enumerate() {
-            // Row (b): a callee may write the field cell a `Field` root was
+            // A callee may write the field cell a `Field` root was
             // loaded from, so field identity does not survive a call even in a
-            // cell the callee cannot name. Wave 1 has no callee/base
-            // reachability relation and therefore kills every field root.
+            // cell the callee cannot name. There is no callee/base
+            // reachability relation, so every field root is killed.
             if depth > 0 || reachable || field_objects::names_field(objects) {
                 objects.unknown = true;
             }
@@ -343,7 +343,7 @@ fn call_effect<'tcx>(
     }
     // Return identity is not an effect summary. The clobber keeps its exact
     // position -- after any admitted actual-value snapshot, before the
-    // destination write -- and row (a) narrows only its SCOPE, to the cells a
+    // destination write -- and `clobber_callee_reachable` narrows only its SCOPE, to the cells a
     // callee can reach. Every other clobber site in this file is unchanged.
     if local_candidate {
         clobber_callee_reachable(state, escapes);

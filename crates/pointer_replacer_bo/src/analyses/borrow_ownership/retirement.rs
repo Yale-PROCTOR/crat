@@ -74,7 +74,7 @@ pub(crate) struct RetirementConflict {
     pub(crate) overlap: OverlapReason,
 }
 
-/// L01¹⁰ (R603-2): a conflict the overlap analysis raised and a discharge
+/// A conflict the overlap analysis raised and a discharge
 /// removed; its receipt is counted per program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RetirementDischarge {
@@ -97,7 +97,7 @@ impl RetirementDischarge {
             self.source.function, self.source.block, self.source.statement, self.source.role
         );
         let route = self.route_names.join(" ");
-        // L01¹² (R682-3, R684-1, R686-4): a discharge only the zero-size `realloc` premise admits.
+        // A discharge only the zero-size `realloc` premise admits names that premise.
         let premise = |premise: bool| {
             if premise {
                 ", premise=realloc-nonzero@R684-1"
@@ -111,8 +111,8 @@ impl RetirementDischarge {
                 self.target_key,
                 premise(*p)
             ),
-            // R604-1: every effective-type discharge rests on TypedReleaseDiscipline.
-            // L01¹¹ (β′, R659-1): one the sharpened test alone admits says so.
+            // Every effective-type discharge rests on TypedReleaseDiscipline;
+            // one the sharpened test alone admits says so.
             discharge::Rule::EffectiveType {
                 freed,
                 referent,
@@ -122,12 +122,12 @@ impl RetirementDischarge {
                 self.target_key,
                 if *sole { ", containment=sole-type" } else { "" }
             ),
-            // L01¹¹ (γ, R659-1): the released block was allocated inside the route.
+            // The released block was allocated inside the route.
             discharge::Rule::FreshInRoute { allocation } => format!(
                 "retirement-disjoint:fresh-in-route(allocation={allocation}, event={event}, route=[{route}], target={})",
                 self.target_key
             ),
-            // L01¹¹ (α⁺, R659-1): the referent is used after the release inside the route.
+            // The referent is used after the release inside the route.
             discharge::Rule::PostReleaseUseRoute {
                 frame,
                 local,
@@ -193,7 +193,7 @@ pub(crate) struct ContextCoverage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetirementReview {
     pub(crate) conflicts: Vec<RetirementConflict>,
-    /// L01¹⁰ (R603-2): conflicts a discharge removed, with their receipts.
+    /// Conflicts a discharge removed, with their receipts.
     pub(crate) discharged: Vec<RetirementDischarge>,
     pub(crate) demotions: Vec<local_outcome::Demotion>,
     pub(crate) unresolved: Vec<RetirementUnresolved>,
@@ -328,7 +328,7 @@ struct Context {
     copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
     exact_kinds: bool,
     unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
-    /// R343-1: the BO-owned loans for those of them that have one.
+    /// The BO-owned loans for those of them that have one.
     inner_loans: inner_loan::InnerLoans,
     entry_consistent: bool,
     latest: FxHashMap<LocalDefId, RetirementReview>,
@@ -449,7 +449,7 @@ pub(crate) fn begin(
                     .locals
                     .insert((function, ProvenanceOwner::Local(local)), reference);
             }
-            // R251: only Ref carriers hold loans; Owning is handled by the ledger.
+            // Only Ref carriers hold loans; Owning is handled by the ledger.
             let safe = is_ref(reference);
             if safe {
                 context
@@ -495,7 +495,7 @@ pub(crate) fn begin(
                 reference,
             );
         }
-        // R251: only Ref carriers hold loans; Owning is handled by the ledger.
+        // Only Ref carriers hold loans; Owning is handled by the ledger.
         let safe = is_ref(reference);
         if safe {
             context.safe_holders.push((reference, None, slot.depth));
@@ -525,7 +525,7 @@ impl Context {
         }
     }
 
-    /// L01¹⁰ (R603-2): a would-be conflict of a heap release the overlap
+    /// A would-be conflict of a heap release the overlap
     /// analysis could not place, offered to the two discharges first. Returns
     /// whether it was discharged (and receipted).
     fn try_discharge(
@@ -693,9 +693,9 @@ impl Context {
             // Native loan owners carry only the outer provenance: `Context::owner`
             // resolves through maps populated at depth 0 alone and
             // `ProvenanceOwner` carries no depth, so a live native loan can never
-            // name an inner holder. R343-1 supplies the missing loan as a BO-owned
-            // obligation and this is where it is consumed, in the three-way
-            // disposition of the sizing's 2.2:
+            // name an inner holder. The missing loan is supplied as a BO-owned
+            // obligation and this is where it is consumed, in a three-way
+            // disposition:
             //   * dead    -- the loan is provably not demanded here: nothing;
             //   * live    -- a conflict naming THIS holder, not a demotion of its
             //                whole copy closure;
@@ -1236,7 +1236,7 @@ mod tests {
                 let body = tcx
                     .mir_drops_elaborated_and_const_checked(function)
                     .borrow();
-                // R343-1: body locals are selectable too, because an inner-loan
+                // Body locals are selectable too, because an inner-loan
                 // holder IS a body local -- parameters are `protected_entry`'s and
                 // never carry an obligation. The guard still catches a typo'd
                 // index, which is what it was for.

@@ -329,7 +329,7 @@ fn gf08_custody_rejects_joint_false_guard_with_kept_native_endpoints() {
     );
 }
 
-/// OC09 (R309-1): the accepting model's custody denominator covers the MEMBER
+/// The accepting model's custody denominator covers the MEMBER
 /// requirements. For a used-child declaration the identity family holds and
 /// contributes nothing, so this valuation is the member's alone.
 #[test]
@@ -392,12 +392,12 @@ fn oc09_custody_covers_the_member_requirements_in_the_accepting_model() {
     assert_eq!(accepted.stamp()["fold_values"], encoded["fold_values"]);
 }
 
-/// R348-1(iii) preflight: what the member family actually does on the bst
+/// Preflight: what the member family actually does on the bst
 /// fixture, before a witness asserts anything about it.
 #[test]
 #[ignore = "diagnostic for the member-selected witness"]
 fn r348_member_selection_preflight() {
-    eprintln!(); // R325-1
+    eprintln!();
     let fixture = inspect_attested_frame(super::witnesses::BST);
     eprintln!(
         "MEMBERSEL accepted={} error={:?}",
@@ -459,7 +459,7 @@ fn r348_member_selection_preflight() {
     }
 }
 
-/// R351-4: the fixture control for `deleteNode`'s uncovered store.
+/// The fixture control for `deleteNode`'s uncovered store.
 ///
 /// The corpus refuses at `_27 = move _28 as *mut libc::c_void` (bb11 s7), a
 /// depth-0 store the certificate covers as neither transfer nor proxy. The
@@ -469,7 +469,7 @@ fn r348_member_selection_preflight() {
 #[test]
 #[ignore = "diagnostic for the deleteNode store control"]
 fn r351_fixture_delete_node_store_control() {
-    eprintln!(); // R325-1
+    eprintln!();
     let fixture = inspect_attested_frame(super::witnesses::BST);
     eprintln!(
         "FIXTURE accepted={} error={:?}",
@@ -495,7 +495,7 @@ fn r351_fixture_delete_node_store_control() {
         }
         break;
     }
-    // R356-4(d): the equations recorded AT the store, which is what `covered`
+    // The equations recorded AT the store, which is what `covered`
     // looks for. The corpus records four `assume(false)` rows there and no
     // transfer at all.
     if let Some(snapshot) = fixture

@@ -1,4 +1,5 @@
-//! R245-1 actual preledger wrappers: scoped faults, unarmed success controls.
+//! Fault tests through the actual preledger wrappers: scoped faults, unarmed
+//! success controls.
 use std::{cell::RefCell, sync::Arc};
 
 use rustc_hir::{ItemKind, OwnerNode};
@@ -705,8 +706,8 @@ pub unsafe fn f(p:*mut u8)->*mut u8{realloc(p,16)}
 
 #[test]
 fn e5_r253_each_held_carrier_has_an_effective_raw_restriction() {
-    // Primitive enforcement control; the full A5 path is checked independently
-    // by the coverage-handler and actual multiple-site construction witnesses.
+    // Primitive enforcement control; the full parameter-overlap path is checked
+    // independently by the coverage-handler and multiple-site construction tests.
     const CODE: &str = r#"
 unsafe extern "C"{fn realloc(p:*mut u8,n:usize)->*mut u8;fn free(p:*mut u8);}
 pub unsafe fn f(a:*mut u8,b:*mut u8){
@@ -771,7 +772,7 @@ fn owning_outer_raw_delivery(l2: bool) {
     use rustc_middle::mir::VarDebugInfoContents;
 
     use super::{borrow_verify, construction};
-    // R343-1: the inner cell's value is passed to a foreign call before the free,
+    // The inner cell's value is passed to a foreign call before the free,
     // so it leaves the frame and the holder is `Unrepresented(Escaped)` -- which is
     // what keeps the demotion this witness is about. Without it the inner cell is
     // never touched at all, the disposition proves its loan dead, and there is no

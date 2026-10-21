@@ -1,4 +1,4 @@
-//! Row (b) FIELD-OBJECT-IDENTITY: witnesses, controls and the pairing law.
+//! FIELD-OBJECT IDENTITY: witnesses, controls and the pairing law.
 //! Fixtures are compiled for analysis and never executed.
 
 use rustc_hash::FxHashSet;
@@ -49,7 +49,7 @@ fn local_cell(facts: &ObjectFacts, function: LocalDefId, at: Location, local: Lo
     )
 }
 
-/// The exact root a wave-1 load from field `field` of parameter `parameter` mints.
+/// The exact root a load from field `field` of parameter `parameter` mints.
 fn input_field(function: LocalDefId, parameter: Local, field: u32) -> ObjectSet {
     ObjectSet {
         roots: FxHashSet::from_iter([ObjectRoot::Field {
@@ -129,9 +129,9 @@ fn local_call(
     calls[0]
 }
 
-// ---------------------------------------------------------------- B-W01
+// ---------------------------------------------------------------- field realloc
 
-/// B-W01, the `buffer_resize` shape: `realloc((*p).f, ..)` with `obj(p)` a
+/// The field-realloc shape: `realloc((*p).f, ..)` with `obj(p)` a
 /// known `Input`. The retired set must be the exact field root, not Unknown.
 const REALLOC_FIELD: &str = r#"
 unsafe extern "C" { fn realloc(p: *mut core::ffi::c_void, n: usize) -> *mut core::ffi::c_void; }
@@ -172,9 +172,9 @@ fn b_w01_a_reallocated_field_load_is_the_exact_field_root() {
     });
 }
 
-// ---------------------------------------------------------------- B-W02
+// ---------------------------------------------------------------- two loads
 
-/// B-W02: two loads of the same field of the same object, with nothing between
+/// Two loads of the same field of the same object, with nothing between
 /// them that may write the cell. The roots are identical, and the retirement of
 /// one conflicts with the other rather than being disjoint from it.
 const TWO_LOADS: &str = r#"
@@ -220,9 +220,9 @@ fn b_w02_two_unwritten_loads_are_the_same_object_and_conflict() {
     });
 }
 
-// ---------------------------------------------------------------- B-W03
+// ---------------------------------------------------------------- store between loads
 
-/// B-W03: a store to the field between the two loads. The first load's identity
+/// A store to the field between the two loads. The first load's identity
 /// must die -- it named the object that WAS in the cell.
 const STORE_BETWEEN: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); fn malloc(n: usize) -> *mut u8; }
@@ -267,11 +267,12 @@ fn b_w03_a_field_store_kills_the_earlier_load() {
     });
 }
 
-// ---------------------------------------------------------------- B-W04
+// ---------------------------------------------------------------- call between load and use
 
-/// B-W04, the row-(a) interaction: a non-allocator local call between the load
-/// and its use. `first` never escapes and sits at depth 0, so row (a) preserves
-/// its pointer VALUE; row (b) must still kill its field IDENTITY, because the
+/// The call-reach interaction: a non-allocator local call between the load
+/// and its use. `first` never escapes and sits at depth 0, so the call-reach rule
+/// preserves its pointer VALUE; field-object identity must still kill its field
+/// IDENTITY, because the
 /// callee may write the cell it was loaded from.
 const CALL_BETWEEN: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
@@ -313,9 +314,9 @@ fn b_w04_a_local_call_kills_field_identity_it_could_write() {
     });
 }
 
-// ---------------------------------------------------------------- B-W05
+// ---------------------------------------------------------------- may base
 
-/// B-W05: a MAY base is never named. Two known bases is the discriminating
+/// A MAY base is never named. Two known bases is the discriminating
 /// shape -- an Unknown base is refused by the `unknown` test alone.
 const MAY_BASE: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); fn opaque() -> *mut Node; }
@@ -369,9 +370,9 @@ fn b_w05_a_may_base_mints_no_field_root() {
     });
 }
 
-// ---------------------------------------------------------------- B-W06
+// ---------------------------------------------------------------- self-free pair
 
-/// B-W06 must-not-move, the exact `buffer_free` shape. `free((*p).f)` then
+/// Must-not-move, the free-a-field-then-its-container shape. `free((*p).f)` then
 /// `free(p)`: the pair still conflicts and both slots stay Raw. This is the
 /// pairing law's load-bearing case -- `Field { base: o, f }` against `o` itself
 /// is NOT disjoint, because a field of `o` may point back into `o`.
@@ -417,9 +418,9 @@ fn b_w06_buffer_free_self_free_pair_still_conflicts() {
     });
 }
 
-// ---------------------------------------------------------------- B-W07
+// ---------------------------------------------------------------- the bound
 
-/// B-W07: the bound. Anything that is not "one or more derefs, then one field,
+/// The bound. Anything that is not "one or more derefs, then one field,
 /// then nothing" mints nothing, and no extra depth is ever named.
 #[test]
 fn b_w07_only_a_single_field_step_is_within_the_bound() {
@@ -504,10 +505,10 @@ fn b_w07_a_nested_field_load_stays_unknown_in_production() {
     });
 }
 
-// ---------------------------------------------------------------- B-W08
+// ---------------------------------------------------------------- routed field event
 
-/// B-W08: a field-rooted event crossing a route step fails closed. The base
-/// names the callee's own parameter object and wave 1 has no rebasing rule, so
+/// A field-rooted event crossing a route step fails closed. The base
+/// names the callee's own parameter object and there is no rebasing rule, so
 /// the routed event must carry `unknown` and say why.
 const ROUTED_FIELD_FREE: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
@@ -574,9 +575,9 @@ fn b_w08_a_field_root_fails_closed_across_a_route_step() {
     });
 }
 
-// ---------------------------------------------------------------- B-C01
+// ---------------------------------------------------------------- no disjoint field pair
 
-/// B-C01, obligation 2 of the row: in wave 1 no pair involving a field root may
+/// The no-disjointness obligation: no pair involving a field root may
 /// yield the disjointness verdict, except the pre-existing `heap_only` skip for
 /// `Stack` roots, which is unchanged.
 #[test]
@@ -640,15 +641,15 @@ fn b_c01_no_field_pair_is_disjoint_outside_the_stack_skip() {
     });
 }
 
-// ---------------------------------------------------------------- B-C02
+// ---------------------------------------------------------------- no removed conflict
 
-/// B-C02, the mechanized form of obligation 2: a minted field root must never
-/// REMOVE a conflict that Unknown would have reported. This is the property
-/// that makes wave 1 sound without depending on the kill obligation, and it is
-/// also the measurement of wave 1's precision: if a field root never removes a
-/// conflict, wave 1 cannot promote anything through `overlap`, and the yield it
-/// carries is exact identity in the receipts rather than verdict movement. The
-/// day a later wave makes any pair below disjoint, this control fails and the
+/// The mechanized form of the no-disjointness obligation: a minted field root must
+/// never REMOVE a conflict that Unknown would have reported. This is the property
+/// that makes field roots sound without depending on the kill obligation, and it is
+/// also the measure of their precision: if a field root never removes a
+/// conflict, field roots cannot promote anything through `overlap`, and the yield they
+/// carry is exact identity in the receipts rather than verdict movement. The
+/// day an extension makes any pair below disjoint, this control fails and the
 /// kill obligation becomes load-bearing -- which is exactly when it should be
 /// re-examined.
 #[test]

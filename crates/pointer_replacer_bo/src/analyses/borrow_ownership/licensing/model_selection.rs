@@ -14,7 +14,7 @@ pub(crate) struct Selection {
     values: BTreeMap<EquationId, bool>,
     traversal_owns: BTreeMap<super::transport::Node, bool>,
     fold_values: Option<super::fold_custody::Values>,
-    /// L01⁹ wall 4: the move-store candidates' destination post-store own values.
+    /// The move-store candidates' destination post-store own values.
     move_store_owns: BTreeMap<u32, bool>,
 }
 impl Selection {
@@ -100,7 +100,7 @@ impl Selection {
         Rc::ptr_eq(facts, &self.facts).then(|| self.values.clone())
     }
 
-    /// L01⁹ wall 4: whether a store's destination post-store token owns in this model.
+    /// Whether a store's destination post-store token owns in this model.
     pub(crate) fn move_store_own(&self, facts: &Rc<Facts>, var: u32) -> Option<bool> {
         Rc::ptr_eq(facts, &self.facts)
             .then(|| self.move_store_owns.get(&var).copied())

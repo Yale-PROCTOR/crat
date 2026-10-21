@@ -407,8 +407,8 @@ pub(crate) fn stage_streamed(
         .write(true)
         .open(&path)
         .map_err(|e| e.to_string())?;
-    // R471-3 (i): MOVE the metadata in. Cloning it duplicated the multi-GiB
-    // origin `Value`, which was half of libzahl's 37.4 GiB peak.
+    // MOVE the metadata in. Cloning it duplicated the multi-GiB
+    // origin `Value`, which was half of a large program's peak memory.
     let mut staged = StreamedEntry {
         path,
         metadata,

@@ -1,4 +1,4 @@
-//! Rustc-facing producer for A5 parameter-overlap plans.
+//! Rustc-facing producer for parameter-overlap plans.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,7 +57,7 @@ pub(crate) struct OverlapProducerStats {
     pub(crate) effective_pairs: usize,
     pub(crate) planned_marks: usize,
     pub(crate) missing_mutability_defaults: usize,
-    /// R609-3 (b): pairs the type route removed (`CRAT_ERA5C_OVERLAP_TYPE_ROUTE`).
+    /// Pairs the type route removed.
     pub(crate) type_disjoint_pairs: usize,
 }
 
@@ -78,7 +78,7 @@ pub(crate) struct OverlapPlan {
     pub(crate) site_ledger: Vec<OverlapSiteRow>,
     pub(crate) summary_artifact: OverlapSummaryArtifact,
     pub(crate) stats: OverlapProducerStats,
-    /// R609-3 (b): `overlap-partner-disjoint:type-rule(…)`, one per removed pair.
+    /// `overlap-partner-disjoint:type-rule(…)`, one per removed pair.
     pub(crate) type_disjoint: Vec<String>,
 }
 
@@ -598,9 +598,9 @@ fn merge_abi_guard(current: &mut AbiGuardDisposition, next: AbiGuardDisposition)
     }
 }
 
-/// The O2 frozen-call-world product shared by production A5 and read-only
-/// measurement consumers. Construction is a pure extraction of A5's former
-/// inline call-target block; it does not seed unknown callers.
+/// The frozen closed-world call product shared by the production overlap
+/// analysis and read-only measurement consumers. Construction resolves call
+/// targets only; it does not seed unknown callers.
 #[derive(Clone, Debug)]
 pub(crate) struct ClosedWorldCallWorld {
     pub(crate) resolved: FxHashMap<(LocalDefId, BasicBlock), Vec<LocalDefId>>,
@@ -1189,7 +1189,7 @@ pub(crate) fn produce_overlap_plan(
                 .push(witness.class);
         }
         stats.raw_pairs += 1;
-        // R609-3 (b), under R542: formals whose pointees are incompatible object
+        // Under the C effective-type premise: formals whose pointees are incompatible object
         // types, neither containing the other by value, cannot overlap. The pair
         // is neither an effective overlap nor a coarse exclusion nor a mark.
         if let Some(receipt) = type_disjoint_receipt(

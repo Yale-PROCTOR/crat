@@ -1,4 +1,4 @@
-//! Compiler-backed RED contracts over existing T2 queries and construction.
+//! Compiler-backed contracts over the existing endpoint-retraction queries and construction.
 
 use std::collections::BTreeSet;
 

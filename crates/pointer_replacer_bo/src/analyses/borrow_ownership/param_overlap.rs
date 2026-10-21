@@ -1,4 +1,4 @@
-//! Pure domain for A5 parameter may-overlap summaries.
+//! Pure domain for parameter may-overlap summaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -682,8 +682,8 @@ pub(crate) fn plan_copy_marks(
     witnesses.into_iter().map(|(mark, _)| mark).collect()
 }
 
-/// The only A5 call-world policy authorized for loop 2. Keeping the complete
-/// option set here makes the absence of an O1 build/config arm testable.
+/// The only parameter-overlap call-world policy. Keeping the complete option
+/// set here makes the absence of any other call-world build/config arm testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapWorld {
     ClosedWorldFrozenGraph,

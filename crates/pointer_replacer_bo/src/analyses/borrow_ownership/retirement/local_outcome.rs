@@ -1,4 +1,4 @@
-//! R245 local coverage outcomes, with actual kind and copy-carrier identities.
+//! Local coverage outcomes, with actual kind and copy-carrier identities.
 use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -14,10 +14,10 @@ pub(crate) enum Reason {
     InnerLoanMissing {
         depth: u8,
     },
-    /// R343-1/R345-2: the holder's value leaves the frame, so its copy closure is
+    /// The holder's value leaves the frame, so its copy closure is
     /// incomplete and its liveness is not a statement about the program. The
     /// VERDICT is the same demotion as `InnerLoanMissing`; the label is separate
-    /// so the escaped population is counted rather than inferred (sizing 2.6).
+    /// so the escaped population is counted rather than inferred.
     InnerLoanEscaped {
         depth: u8,
     },

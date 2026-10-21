@@ -1,21 +1,21 @@
-//! R304-7 row (b): bounded field-object identity.
+//! Bounded field-object identity.
 //!
 //! `ObjectRoot::Field { base, field }` denotes *the object pointed to by the
 //! pointer stored in field `field` of the object `base`*. `FieldBase` has no
-//! field variant, so the field path is exactly one step: the wave-1 bound is
+//! field variant, so the field path is exactly one step: that bound is
 //! enforced by the type rather than by a length check, and interning is not
 //! needed to keep `ObjectRoot` `Copy`. A deeper path, an aggregate element, or
 //! any base that is not a single known root simply mints nothing and the load
-//! stays Unknown, exactly as before this row.
+//! stays Unknown, exactly as without field roots.
 //!
 //! The root names the object that was in that cell AT THE LOAD, so every write
 //! that may reach the cell must kill it. Two writers exist:
 //!
 //!   * a store to a projected place, which already raises `unknown` on the
 //!     whole state (`objects::write`), covering every field store; and
-//!   * a callee-scoped clobber, where wave 1 has no reachability relation
+//!   * a callee-scoped clobber, where there is no reachability relation
 //!     between a callee and a base object and therefore kills every field root
-//!     (`names_field` below). Row (a)'s own preservation is unaffected: the
+//!     (`names_field` below). The call clobber's own preservation is unaffected: the
 //!     cell keeps its pointer VALUE, it just stops being exact evidence.
 
 use rustc_middle::mir::{Local, Location};

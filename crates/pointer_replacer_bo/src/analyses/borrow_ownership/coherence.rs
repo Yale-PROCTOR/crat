@@ -25,15 +25,15 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
     }
 }
 
-/// A12's pair-global depth-zero eligibility result. Construction is deliberately separate from
-/// coherence: the final producer combines Foster mutability, closed origin flow, and MIR liveness;
-/// this type is only the narrow solver/coherence handoff.
+/// The copy-lend funnel's pair-global depth-zero eligibility result. Construction is deliberately
+/// separate from coherence: the final producer combines Foster mutability, closed origin flow, and
+/// MIR liveness; this type is only the narrow solver/coherence handoff.
 ///
-/// era-5c relay 213 (`CRAT_ERA5C_COPY_LEND_MUT`): `mutable` marks a pair lent `&mut` (its
+/// Under `CRAT_ERA5C_COPY_LEND_MUT`, `mutable` marks a pair lent `&mut` (its
 /// destination is written through and its window is clean). It is an attribute of the pair, not
 /// part of its identity: equality and hashing read `(lhs, rhs)` only, so every lookup keyed by
 /// `CopyLendPair::new` finds a mutable pair, and `Debug` names it only when set (a read-only pair
-/// prints as before).
+/// prints without it).
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLendPair {
     pub(crate) lhs: SlotRef,
@@ -121,7 +121,7 @@ pub(crate) fn copy_lend_guards_for_body(
 /// sufficient: grouped provenance can synthesize companion loans at the same statement, and those
 /// retain the existing-loan invalidation semantics.
 ///
-/// era-5c relay 213: `unique` marks the loan of a mutable copy-lend (`q = &mut *p`): the replay
+/// `unique` marks the loan of a mutable copy-lend (`q = &mut *p`): the replay
 /// counts every access to `p` while it is live as a conflict, a read as much as a write. Like
 /// `CopyLendPair::mutable` it is an attribute, not identity: equality and hashing read
 /// `(location, borrowed, borrower)`, so an identity rebuilt from a BorrowSet loan finds it, and
@@ -242,7 +242,7 @@ fn add_coherence_impl<'tcx>(
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
     remove_copy_equates: bool,
 ) {
-    // L01^5 (ii): the strong-update field moves of this body, consulted just
+    // The strong-update field moves of this body, consulted just
     // before the pin's unconditional `equate`.
     let field_moves = super::field_moves::compute(body);
     let field_readers = solver
@@ -312,7 +312,7 @@ fn add_coherence_impl<'tcx>(
             match rvalue {
                 Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
                 | Rvalue::CopyForDeref(rhs) => {
-                    // era-5c relay 208 (S39): a bare copy between two locals.
+                    // A bare copy between two locals.
                     let relax_site = matches!(rvalue, Rvalue::Use(_))
                         && lhs.projection.is_empty()
                         && rhs.projection.is_empty()
@@ -326,7 +326,7 @@ fn add_coherence_impl<'tcx>(
                                 resolve_place(slots, fn_did, body, *lhs, d, None),
                                 resolve_place(slots, fn_did, body, *rhs, d, None),
                             ) {
-                                // §9.10.2: a field STORE's depth-0 ownership is set crate-wide by
+                                // A field STORE's depth-0 ownership is set crate-wide by
                                 // `constrain_field_ownership` (`field.own <=> AND stored owns`), so
                                 // skip the per-store equate here — equating multiple stores to one
                                 // global field slot is what transitively dragged a borrowed value
@@ -367,13 +367,13 @@ fn add_coherence_impl<'tcx>(
                                         statement_index,
                                     })
                                 {
-                                    // L01^5 (ii): the load moves the field's token.
+                                    // The load moves the field's token.
                                     solver.field_move_or_equate(lhs, rhs);
                                 } else if d == 0
                                     && matches!(rvalue, Rvalue::CopyForDeref(_))
                                     && matches!(rhs, SlotRef::Field(_))
                                 {
-                                    // L01⁹ rule 1b: a deref-only field read.
+                                    // A deref-only field read.
                                     solver.deref_reader_or_equate(lhs, rhs);
                                 } else if d == 0
                                     && relax_site
@@ -424,7 +424,7 @@ fn add_coherence_impl<'tcx>(
                         }
 
                         for d in 0..MAX_SLOT_DEPTH {
-                            // §9.10.2: an aggregate is a field INITIALIZER; its depth-0
+                            // An aggregate is a field INITIALIZER; its depth-0
                             // ownership is set crate-wide by `constrain_field_ownership`.
                             if d == 0 {
                                 continue;
@@ -446,7 +446,7 @@ fn add_coherence_impl<'tcx>(
         }
     }
 
-    // §NB1: per-site SAFE-MONO is emitted alongside coherence (every consumer
+    // Per-site SAFE-MONO is emitted alongside coherence (every consumer
     // adds coherence per body, so this is the single chokepoint), beside the
     // structural `i1-adjacency` in `solver::add_universe`.
     super::safety_mono::add_safety_mono(solver, slots, fn_did, body);
@@ -490,7 +490,7 @@ pub(crate) fn add_coherence_tagging_uses<'tcx>(
     add_coherence_impl(solver, slots, fn_did, body, true, None, false);
 }
 
-/// §9.10.2 crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot
+/// The crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot
 /// that (flow-insensitively) holds EVERY value stored into that field across the crate. The
 /// per-store depth-0 `equate` is SKIPPED in `add_coherence` for field stores/aggregates (it is
 /// what transitively dragged a borrowed value to `Owning` when an owned source was stored into
@@ -765,7 +765,7 @@ fn certified_null_stores(
     result
 }
 
-/// §S2-3 — the field-store ownership scan, shared by `constrain_field_ownership` (which emits the
+/// The field-store ownership scan, shared by `constrain_field_ownership` (which emits the
 /// `field.own <=> AND(stored owns)` constraints from it) and the sweep's field-yield histogram (which
 /// counts Owning candidates from it). Returns per-field owned-store RHS places and the set of fields
 /// blocked by a non-owned store. Production may discharge exact SSA-proved
@@ -923,7 +923,7 @@ fn scan_field_stores(
     (owned_stores, blocked)
 }
 
-/// §S2-3 — Owning-candidate fields (≥1 owned store and no blocking non-owned store) and the blocked
+/// Owning-candidate fields (≥1 owned store and no blocking non-owned store) and the blocked
 /// set, for the source-only field-yield histogram. This caller has no normative
 /// SSA null evidence, so its syntactic candidates are an upper bound, not the
 /// refined production field-and constraint set or a measured Owning verdict.

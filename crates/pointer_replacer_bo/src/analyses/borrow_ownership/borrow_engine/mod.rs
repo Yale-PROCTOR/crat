@@ -1,27 +1,28 @@
-//! §NB3-3a — the BO-owned borrow theory engine ("fork the theory, keep the judge").
+//! The BO-owned borrow theory engine ("fork the theory, keep the judge").
 //!
-//! A scoped fork (user ruling 2026-07-10, option (a)) of production `borrow`'s per-function
+//! A scoped fork of production `borrow`'s per-function
 //! constraint-graph → fact-pipeline → conflict-edge extraction, self-contained under
-//! `borrow_ownership/` so NB3-3b (write-aware invalidation) and NB3-3c (signature origins) can
-//! extend it WITHOUT touching the byte-frozen production `borrow/`. NB6's final validator remains
-//! the UNFORKED production `borrow::borrow_conflicts[_replaying]` path — that independence is D5.
+//! `borrow_ownership/` so write-aware invalidation and signature origins can
+//! extend it WITHOUT touching the byte-frozen production `borrow/`. The final validator remains
+//! the UNFORKED production `borrow::borrow_conflicts[_replaying]` path, independent of this fork.
 //!
-//! **Thin fork (task 0).** Production `borrow::borrow_inference` (pub) already exposes every
+//! **Thin fork.** Production `borrow::borrow_inference` (pub) already exposes every
 //! pre-invalidation fact as a pub field, so this engine REUSES it and forks only the loan
 //! set + invalidation walk. The fact types (`Invalidates`/`Errors`/`LoanLiveness`) are
 //! `SparseBitMatrix<PointIndex, Loan>` aliases — reused by value, no struct copies.
 //!
-//! **Two-class copy discipline (D-1).**
+//! **Two-class copy discipline.**
 //! - `places_conflict.rs` — MIRRORED LEAF: byte-identical to production, never diverges; guarded by
 //!   the `fork_sync::fork_sync_places_conflict` tripwire (its drift can hide from the differential).
 //! - `errors.rs` — mirrored, comment-sync only (drift is caught behaviorally by the differential).
-//! - `invalidates.rs` — FORKED STAGE: byte-identical at 3a, DIVERGES at 3b; header only, no tripwire.
+//! - `invalidates.rs` — FORKED STAGE: DIVERGES from production (write-aware invalidation); header
+//!   only, no tripwire.
 //!
-//! **3a is equivalence-first (rule 4):** this engine must produce `ConflictEdge`s byte-identical to
-//! production on the full fixture suite AND a corpus sweep before any semantics diverge. The
+//! **Equivalence first:** this engine had to produce `ConflictEdge`s byte-identical to
+//! production on the full fixture suite AND a corpus sweep before any semantics diverged. The
 //! orchestration (`borrow_conflicts`/`borrow_conflicts_replaying`) + glue (`invalid_loan_set`/
 //! `extract_conflict_edges`) keep production's exact names — the module path is the only
-//! distinguisher, so 3b/NB6 diffs are 1:1.
+//! distinguisher, so diffs against production are 1:1.
 
 // Re-exports so the copied files' verbatim `super::{BorrowSet, Loan}` imports resolve here exactly
 // as they did under production `borrow` — keeps the mirrors byte-identical (no import rewiring).
@@ -52,8 +53,8 @@ pub(crate) use conflicts::{
 pub(crate) use conflicts::{
     borrow_conflicts_replaying_with_flows_and_parameter_overlap, borrow_conflicts_with_flows,
 };
-// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
-// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
+// The place-based routing's compose/type-check decision, re-exported so its fallback is unit-testable
+// in isolation (grouping-independent).
 #[cfg(test)]
 pub(crate) use conflicts::{demotion_witness_census, loan_liveness_census};
 #[cfg(test)]
@@ -67,7 +68,7 @@ pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict
 
 #[cfg(test)]
 mod fork_sync {
-    /// Fork-sync tripwire (D-1 mirrored-leaf discipline): `places_conflict.rs` is copied verbatim
+    /// Fork-sync tripwire (the mirrored-leaf discipline): `places_conflict.rs` is copied verbatim
     /// from production and must NEVER diverge — its drift can HIDE from the equivalence differential
     /// (a subtly-changed place-conflict could agree on every current fixture yet differ elsewhere).
     /// Asserts the mirror is byte-identical to the production source below its header boundary.

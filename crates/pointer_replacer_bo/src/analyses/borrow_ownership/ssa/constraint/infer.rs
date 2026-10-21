@@ -44,7 +44,7 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         phi_nodes: impl Iterator<Item = (Local, &'a mut PhiNode)>,
     );
 
-    /// era-5c: one incoming version of a phi node, with the CFG edge it arrives
+    /// One incoming version of a phi node, with the CFG edge it arrives
     /// on, so the join can consult the edge's path facts. Default: nothing.
     fn phi_edge(
         _infer_cx: &mut Self::Ctxt,
@@ -382,7 +382,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 block: bb,
                 statement_index: index,
             };
-            // E-R3 capture: park `(fn_did, location)` so a selector pushed
+            // Selector-attribution capture: park `(fn_did, location)` so a selector pushed
             // deeper in the boundary dispatch can attribute itself to this call
             // site. No-op unless a capture scope is active.
             match self.body.source.def_id().as_local() {

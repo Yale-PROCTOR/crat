@@ -1,6 +1,6 @@
-//! era-5c relays 215/216 (R1022-1, R1024-1, USER): the objective's order Ref > Owning > Raw
-//! (`own` at 1 in place of the raw term). Each witness runs the full solve of a fixture in a child
-//! under the frame of record's env (`frames/l01p14u-s39-env.sh`) and reads the settled kinds by name.
+//! The objective's order Ref > Owning > Raw (`own` at 1 in place of the raw term). Each witness
+//! runs the full solve of a fixture in a child under the pinned env file's switches and reads the
+//! settled kinds by name.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +14,7 @@ extern "C" {
 }
 "#;
 
-/// An allocation never released (a leak; R534's leak-parity waiver lets a Box drop it).
+/// An allocation never released (a leak; the leak-parity waiver lets a Box drop it).
 const LEAKED: &str = r#"
 #[no_mangle] pub unsafe extern "C" fn run() -> i32 {
     let p: *mut i32 = malloc(4) as *mut i32;
@@ -116,7 +116,7 @@ const FIELD_STORE_UNRELEASED: &str = r#"
 }
 "#;
 
-/// ht_create's shape: the field's allocation stored straight from the call (a temporary).
+/// A constructor's shape: the field's allocation stored straight from the call (a temporary).
 const FIELD_STORE_DIRECT: &str = r#"
 #[repr(C)] pub struct T { pub e: *mut i32 }
 #[no_mangle] pub unsafe extern "C" fn make() -> *mut T {
@@ -130,7 +130,7 @@ const FIELD_STORE_DIRECT: &str = r#"
 }
 "#;
 
-/// (a) quadtree's test `main_0` reduced: a pointer formal of an internal function whose only caller
+/// (a) The translated `main` wrapper reduced: a pointer formal of an internal function whose only caller
 /// passes a `Vec`'s `as_mut_ptr()` (a raw origin: its reference is refused) and which nothing
 /// releases or constrains further: its `own` is SAT, so it settles Raw under `ref-raw` and Owning
 /// under `ref-own-raw`.
@@ -290,7 +290,7 @@ fn e5c_ko_observe_program() {
 }
 
 /// The shape's whole model (`fn::local@d<depth>` -> kind) with the switch as given (`None` = absent),
-/// from a child running `e5c_ko_observe_program`.
+/// from a child running the observation test above.
 fn model(shape: &str) -> BTreeMap<String, String> {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);

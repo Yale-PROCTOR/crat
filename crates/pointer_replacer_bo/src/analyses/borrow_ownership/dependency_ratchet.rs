@@ -1,10 +1,10 @@
-//! §0.2 dependency ratchet (NB3-3c-i) — enforces the self-containment ledger as a test invariant.
+//! Dependency ratchet — enforces the self-containment ledger as a test invariant.
 //!
-//! The BO end state (execution-plan §0.2, user-ratified 2026-07-11) is **zero dependencies on
-//! `analyses/borrow/` and `analyses/ownership/`** except the NB6 validator seam and test-only
+//! The BO end state is **zero dependencies on
+//! `analyses/borrow/` and `analyses/ownership/`** except the validator seam and test-only
 //! baselines. This test freezes an **allowlist** of every `analyses::borrow::<seg>` /
 //! `analyses::ownership::<seg>` reference the NON-TEST `borrow_ownership/` code is currently
-//! permitted to make, each tagged with its §0.2 retirement milestone. It asserts the actual
+//! permitted to make, each tagged with what retires it. It asserts the actual
 //! reference surface **equals** the allowlist:
 //!   - a NEW reference (surface ⊋ allowlist) fails → a fresh production dependency needs an
 //!     explicit, reviewed allowlist entry with its milestone;
@@ -16,7 +16,7 @@
 //! false-match class present in this tree: `borrow_ownership::` substring hits (word-boundary
 //! guard), doc/line/block comments (stripped), `std::borrow` re-exports (`Borrow`/`BorrowMut`/`Cow`/
 //! `ToOwned` excluded), multi-line `use borrow::{ … }` groups (whole-file scan), and `#[cfg(test)]`
-//! modules (stripped — test-only baselines are a sanctioned §0.2 exception).
+//! modules (stripped — test-only baselines are a sanctioned exception).
 
 #[cfg(test)]
 mod tests {
@@ -25,10 +25,10 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    /// Every permitted `analyses::borrow::<seg>` reference in non-test BO code, with its §0.2
-    /// ledger retirement milestone. MAY ONLY SHRINK.
+    /// Every permitted `analyses::borrow::<seg>` reference in non-test BO code, with what
+    /// retires it. MAY ONLY SHRINK.
     const BORROW_ALLOW: &[&str] = &[
-        // → S2-4(b) BO-side reconstruction / NB5 lemma loop (the 3a replaying fact source +
+        // → BO-side reconstruction (the replaying fact source +
         //   orchestration; the fork consumes production's pre-invalidation facts):
         "borrow_inference",
         "BorrowInferenceResults",
@@ -42,7 +42,7 @@ mod tests {
         "ProvenanceSet",
         "ProvenanceOwner",
         "ConflictEdge",
-        // → NB5-F2 (field candidacy: the fork disables a Raw field's loan via the manifest-widened
+        // → field candidacy (the fork disables a Raw field's loan via the manifest-widened
         //   `disable_owner(ProvenanceOwner::Field(field))`; `StructFieldSlot` is the field key):
         "StructFieldSlot",
         // `self` is the `use borrow::{self, …}` the module's `borrow::…` paths resolve through:
@@ -50,7 +50,7 @@ mod tests {
     ];
 
     /// Every permitted `analyses::ownership::<seg>` reference in non-test BO code. **NONE** — BO has
-    /// been self-contained from ownership since inception (§0.2 ledger: "ownership: NONE ✓ done").
+    /// been self-contained from ownership since inception.
     /// The two `ownership::` strings in the tree are doc-comment intra-links (`mod.rs:337`,
     /// `infer.rs:227`), stripped by the scanner. Any real reference here must fail.
     const OWNERSHIP_ALLOW: &[&str] = &[];
@@ -61,7 +61,7 @@ mod tests {
     /// The ratchet does not scan itself (its allowlist entries are string literals anyway).
     const SELF_FILE: &str = "dependency_ratchet.rs";
 
-    /// Phase-1b construction ratchet. These are the only whole files allowed to invoke the legacy
+    /// Construction ratchet. These are the only whole files allowed to invoke the legacy
     /// BO construction primitives directly. `construction.rs` is the planned single production
     /// owner; the other two are dedicated lower-level semantic fixture files. This is deliberately
     /// an enumerated list: adding another exempt file requires a visible reviewed diff.
@@ -76,13 +76,13 @@ mod tests {
     /// production and measurement callers in that file are intentionally absent and therefore RED
     /// until they migrate to `construction.rs`.
     const LEGACY_DIRECT_CALLER_ALLOW: &[(&str, &str)] = &[
-        // G's primitive constraint witness isolates scalar reverse-AND from
+        // The primitive constraint witness isolates scalar reverse-AND from
         // ownership emission; the separate constructor witness uses the shared door.
         (
             "src/analyses/borrow_ownership/array_fields/tests.rs",
             "e5_x_array_raw_summary_adds_no_reverse_ownership_demand",
         ),
-        // R617-1's W69 (the guarded repair's witnesses): Mode-A and the guarded repair on one
+        // The guarded repair's witnesses: the plain and the guarded repair on one
         // legacy construction under `RepairMode::with_override`, reading `RoundStats`, as
         // `bo_c1`'s repair probes below do.
         (
@@ -691,7 +691,7 @@ mod tests {
         );
     }
 
-    /// Phase-1b RED-first construction ratchet. Before production wiring this deliberately names
+    /// Construction ratchet. This deliberately names
     /// every production/measurement consumer that still assembles the legacy three-stage pipeline
     /// directly. Migrating those callers through `construction.rs` makes this test GREEN; adding a
     /// fresh direct consumer makes it RED again without silently broadening the allowlist.
@@ -792,7 +792,7 @@ mod tests {
     }
 
     /// A grouped glob `borrow::{self, *}` must record `*` — not silently capture only the sibling
-    /// `self` (Codex re-review). The `*` imports the whole surface.
+    /// `self`. The `*` imports the whole surface.
     #[test]
     fn scanner_catches_grouped_glob() {
         let cleaned = strip_cfg_test(strip_comments_and_strings(
@@ -807,7 +807,7 @@ mod tests {
     }
 
     /// A module alias `use borrow as prod;` imports the whole surface under a new name — record `*`
-    /// (the alias would otherwise hide every `prod::X` use from segment tracking) (Codex re-review).
+    /// (the alias would otherwise hide every `prod::X` use from segment tracking).
     #[test]
     fn scanner_catches_module_alias() {
         let cleaned = strip_cfg_test(strip_comments_and_strings(
@@ -822,7 +822,7 @@ mod tests {
     }
 
     /// A raw string with an interior `"` must not desync the scanner and blank the following code —
-    /// the dependency AFTER it must survive scanning (Codex re-review).
+    /// the dependency AFTER it must survive scanning.
     #[test]
     fn scanner_raw_string_does_not_swallow_following_dep() {
         let src = "const S: &str = r#\"one quote: \"\"#; fn f() { let _ = borrow::REAL_DEP; }";
@@ -836,7 +836,7 @@ mod tests {
     }
 
     /// A self-aliased group `borrow::{self as prod}` aliases the WHOLE module — must record `*`, not
-    /// just capture the sibling `self` (Codex 3rd review).
+    /// just capture the sibling `self`.
     #[test]
     fn scanner_catches_grouped_self_alias() {
         let cleaned = strip_cfg_test(strip_comments_and_strings(
@@ -851,7 +851,7 @@ mod tests {
     }
 
     /// Rust block comments NEST — `/* /* */ #[cfg(test)] */` must be fully stripped so the interior
-    /// cfg token cannot make strip_cfg_test remove a real dependency after it (Codex 3rd review).
+    /// cfg token cannot make strip_cfg_test remove a real dependency after it.
     #[test]
     fn scanner_nested_block_comment() {
         let src =

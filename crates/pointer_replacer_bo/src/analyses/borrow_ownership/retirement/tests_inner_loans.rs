@@ -1,4 +1,4 @@
-//! R343-1 P1S-INNER-LOAN-REPRESENTATION witnesses.
+//! Witnesses for the inner-loan representation.
 
 use super::{
     inner_loan::{self, ValueEscapes},
@@ -104,8 +104,8 @@ fn c_w00_every_obligation_names_where_its_value_is_defined() {
 
 #[test]
 fn c_w00_a_field_owned_inner_holder_gets_no_obligation() {
-    // R342-4 keeps the field object out of this build, so a field-owned holder
-    // has no obligation and therefore keeps today's demotion (C-W05).
+    // The field object is not modelled, so a field-owned holder has no
+    // obligation and therefore keeps the existing demotion.
     with_program(HOLDERS, |program| {
         let slots = CrateSlots::build(program);
         assert!(
@@ -366,9 +366,9 @@ fn c_w09_a_holder_that_never_leaves_the_frame_is_decided_by_its_liveness() {
 }
 
 /// End to end: the inner cell of a freed allocation is never read or written, so
-/// nothing protects the retired object and the holder keeps its Ref. Before the
-/// disposition this slot was demoted by the blanket rule, with its whole copy
-/// closure dragged Raw behind it.
+/// nothing protects the retired object and the holder keeps its Ref. Without the
+/// disposition the blanket rule would demote this slot, dragging its whole copy
+/// closure Raw behind it.
 const END_TO_END: &str = r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;

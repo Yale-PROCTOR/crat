@@ -145,12 +145,12 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
-    /// Report 048: the streamed form of `serde_json::to_writer(&to_value(self))`,
+    /// The streamed form of `serde_json::to_writer(&to_value(self))`,
     /// byte for byte -- keys in `Value`'s sorted order, the two
     /// `skip_serializing_if` options omitted when `None`, every sequence element
-    /// and every `occurrences` entry through its own `Value`. brotli's metadata is
-    /// 267 MB of JSON; the whole-`Value` form of it is what a cache write must not
-    /// build.
+    /// and every `occurrences` entry through its own `Value`. A large program's
+    /// metadata runs to hundreds of MB of JSON; the whole-`Value` form of it is
+    /// what a cache write must not build.
     pub(crate) fn write_canonical(&self, w: &mut dyn std::io::Write) -> Result<(), String> {
         use super::matched::write_value_seq as seq;
         let raw = |w: &mut dyn std::io::Write, bytes: &[u8]| -> Result<(), String> {
@@ -256,7 +256,7 @@ pub(crate) struct Snapshot {
     pub(crate) reader_transfers: Vec<super::readers::TransferProof>,
     pub(crate) field_support: Vec<super::field_support::FieldProof>,
     pub(crate) reference_effects: super::ref_effects::Plan,
-    /// L01¹⁰ the lend (era-5c 066): recorded, since it is computed from MIR and
+    /// The lend plan: recorded, since it is computed from MIR and
     /// not from the recorded occurrences; absent with the arm off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lend_plan: Option<super::lend::Plan>,

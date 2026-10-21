@@ -1,4 +1,4 @@
-//! Row (a) CALL-CLOBBER-SCOPE: a callee can only write what it can reach.
+//! CALL-CLOBBER SCOPE (the call-reach rule): a callee can only write what it can reach.
 
 use rustc_hash::FxHashSet;
 use rustc_middle::mir::{
@@ -65,11 +65,11 @@ fn cell(
     )
 }
 
-/// A-W01, the `url_get_hostname` anchor. `protocol` is a closed-Fresh return; a
+/// The anchor, a hostname-extraction shape. `protocol` is a closed-Fresh return; a
 /// non-allocator local call sits between it and its `free`. `keep` is an
-/// unrelated incoming reference. Before row (a) the middle call clobbers every
-/// cell, so the freed operand reads Unknown and overlaps `keep`; after it, the
-/// freed operand keeps its exact Fresh root and `keep` survives.
+/// unrelated incoming reference. Without the call-reach rule the middle call
+/// clobbers every cell, so the freed operand reads Unknown and overlaps `keep`;
+/// with it, the freed operand keeps its exact Fresh root and `keep` survives.
 const ANCHOR: &str = r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn free(p: *mut core::ffi::c_void); }
 unsafe fn get_protocol(u: *mut u8) -> *mut u8 { malloc(8) }
@@ -83,7 +83,7 @@ pub unsafe fn hostname(u: *mut u8, keep: *const u8) -> u8 {
 }
 "#;
 
-/// A-W02: the same shape, except `protocol`'s own address escapes before the
+/// The same shape, except `protocol`'s own address escapes before the
 /// middle call. The callee could reach that cell, so Unknown must be preserved
 /// and `keep` must NOT survive.
 const ANCHOR_ADDRESS_TAKEN: &str = r#"
@@ -101,7 +101,7 @@ pub unsafe fn hostname(u: *mut u8, keep: *const u8) -> u8 {
 }
 "#;
 
-/// A-W08 must-not-move: the `buffer_free` self-free pair stays Raw.
+/// Must-not-move: the self-free pair (a field, then its container) stays Raw.
 const SELF_FREE_PAIR: &str = r#"
 unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
 #[repr(C)] pub struct Buffer { alloc: *mut u8 }
@@ -136,7 +136,7 @@ fn a_w08_buffer_free_self_free_pair_stays_raw() {
     );
 }
 
-/// A-W03 (required by R318-4): a pointer stored BEHIND an argument is memory,
+/// A pointer stored BEHIND an argument is memory,
 /// not a caller local, so an opaque local call must still clobber it. The
 /// selection is at depth 1 -- the cell reached by dereferencing the argument.
 const DEPTH_ONE_BEHIND_ARGUMENT: &str = r#"
@@ -150,8 +150,8 @@ pub unsafe fn deep(pp: *mut *mut u8) -> *mut u8 {
 }
 "#;
 
-/// A-W03 is REPORT-ONLY, not an assertion, and that is a finding rather than a
-/// concession. A-K01 (preserve depth >= 1 cells too) leaves this fixture green,
+/// The probe below is REPORT-ONLY, not an assertion, and that is a finding rather
+/// than a concession. A fault that preserves depth >= 1 cells too leaves this fixture green,
 /// so an assertion here would witness nothing. The representation is why:
 ///   * a projected store (`*pp = ...`) is not `place.as_local()`, so `write`
 ///     falls to the whole-state `clobber` -- a depth >= 1 cell is therefore
@@ -160,9 +160,9 @@ pub unsafe fn deep(pp: *mut *mut u8) -> *mut u8 {
 ///     `(Input, Input)` pairs to `PossibleInputAlias`, so preserving such a cell
 ///     instead of clobbering it does not change any overlap verdict.
 /// So no fixture in this representation can make the depth >= 1 clobber
-/// observable through `accepts`. The probe records the measurement; the
-/// discriminating witness R318-4 asks for needs either a different observation
-/// channel or row (b)'s Field roots, which do refine depth >= 1.
+/// observable through `accepts`. The probe records the measurement; a
+/// discriminating witness needs either a different observation channel or
+/// field-object identity's Field roots, which do refine depth >= 1.
 #[test]
 fn a_w03_probe_depth_one_cell_behind_an_argument() {
     let accepted = super::tests::accepts(DEPTH_ONE_BEHIND_ARGUMENT, &[("deep", 1, 1)]);
@@ -171,11 +171,11 @@ fn a_w03_probe_depth_one_cell_behind_an_argument() {
     );
 }
 
-/// A-W03 asserting arm (R318-4, R320-2). The `accepts` channel cannot see the
+/// The depth-1 case's asserting arm. The `accepts` channel cannot see the
 /// depth >= 1 clobber -- that is the measured finding the probe above records --
 /// but the object state can. Here the opaque callee *holds the argument*, so it
 /// really can write the cell behind it; preserving that cell would be unsound,
-/// not merely imprecise. A-K01 (preserve depth >= 1 cells) flips this exact
+/// not merely imprecise. A fault that preserves depth >= 1 cells flips this exact
 /// assertion, which is what makes the depth >= 1 clobber witnessed rather than
 /// declared-redundant.
 #[test]
@@ -247,9 +247,9 @@ fn a_w03_depth_one_cell_behind_a_passed_argument_is_clobbered() {
     });
 }
 
-/// A-W04: the same anchor as A-W01, with the middle call made UNKNOWN -- once
-/// foreign, once indirect through a function pointer. Neither callee is visible
-/// to the analysis, and the seat predicted both keep the whole-state clobber.
+/// The same anchor, with the middle call made UNKNOWN -- once foreign, once
+/// indirect through a function pointer. Neither callee is visible to the
+/// analysis, and one might expect both to keep the whole-state clobber.
 /// They do not, and they should not: reachability, not knowledge of the callee,
 /// is what bounds the clobber. No callee of any kind can name a caller's MIR
 /// local unless that local's own address escaped, so the narrowing applies to
@@ -334,7 +334,7 @@ fn a_w04_an_unknown_callee_still_clobbers_an_escaped_local() {
     );
 }
 
-/// A-W05: the unwind edge. `call_effect` runs once per successor, and the
+/// The unwind edge. `call_effect` runs once per successor, and the
 /// clobber does not depend on `normal`; a callee that unwinds has still run,
 /// wholly or in part, so the unwind successor needs exactly the same narrowed
 /// clobber as the normal one. `Guard` keeps a real cleanup edge alive across
@@ -446,18 +446,18 @@ fn a_w05_the_unwind_successor_carries_the_same_narrowed_clobber() {
     });
 }
 
-/// A-W06: a pointer stored into a global is reachable from every callee. The
+/// A pointer stored into a global is reachable from every callee. The
 /// narrowing preserves nothing about it, because a store through a static's
 /// address is a projected store and projected stores keep the whole-state
-/// clobber. The anchor A-W01 is the discriminating sibling: this fixture is
-/// A-W01 plus the one global store.
+/// clobber. The anchor is the discriminating sibling: this fixture is the
+/// anchor plus the one global store.
 ///
-/// Under the record (the fresh-in-route discharge, (γ)), `keep` is accepted. The
+/// Under the fresh-in-route discharge, `keep` is accepted. The
 /// freed operand is identified by `protocol`'s own single definition, the fresh
 /// `get_protocol` result, and a store into `SINK` copies that value without
 /// changing the local. A middle call that freed or moved the block through `SINK`
 /// would make the later `free(protocol)` a double or dangling free, which is UB in
-/// the input and outside the claim (§28). So the old whole-state clobber's
+/// the input and outside the soundness claim. So the old whole-state clobber's
 /// protection is no longer needed here.
 const GLOBAL_CARRIER: &str = r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn free(p: *mut core::ffi::c_void); }
@@ -482,7 +482,7 @@ fn a_w06_a_pointer_published_to_a_global_keeps_its_fresh_identity() {
     );
 }
 
-/// A-W07: an aggregate field address takes the whole local's address. The
+/// An aggregate field address takes the whole local's address. The
 /// escape set is asserted directly, because a struct field's pointer VALUE is
 /// not a cell of the object state -- only the local's own address is at stake,
 /// and `&local.field` hands a callee exactly that. The third arm is the

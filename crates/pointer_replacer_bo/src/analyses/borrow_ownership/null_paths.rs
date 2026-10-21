@@ -1,11 +1,11 @@
-//! era-5c (R404-3): path-sensitive null facts for the ownership solver.
+//! Path-sensitive null facts for the ownership solver.
 //!
 //! The ownership model equates every incoming version of a local at a phi
 //! node, so a token retained on one path and moved out on another refuses the
-//! whole function (bst's `deleteNode`: on the `left == NULL` arm the `left`
+//! whole function (a tree-node deletion: on the `left == NULL` arm the `left`
 //! field's token survives the free while the `right == NULL` arm moves `left`
-//! out and returns it; `insert`: the `node == NULL` arm keeps the parameter's
-//! token to the exit while `return node` moves it). A pointer that is NULL on a
+//! out and returns it; a tree insertion: the `node == NULL` arm keeps the
+//! parameter's token to the exit while `return node` moves it). A pointer that is NULL on a
 //! path guards no object, so its token is vacuous there: dropping it at the
 //! join is sound with no waiver — the emitted `Option<Box<_>>` is `None` on
 //! that path and dropping `None` frees nothing.
@@ -518,15 +518,15 @@ pub(crate) fn vacuous_components_with<'tcx>(
     vacuous
 }
 
-/// E5C-3 (R406-7 §4): the deferred argument move. For `_t = copy/move P` at
+/// The deferred argument move. For `_t = copy/move P` at
 /// `location`, where `_t` is a call-argument temporary of the block's own call
 /// terminator and every statement between the copy and the terminator is a
 /// pure read (a copy into a fresh local, a storage marker, a non-writing
 /// rvalue — never a store, a borrow, a call or an intrinsic), the READ of `P`
 /// is attributed to the terminator: that is where the ownership model
 /// transfers the token, and a loan live only until a later pure read of the
-/// same block (bst's `(*temp).key` at 18:9, moved past by `_40 = copy
-/// (*root).right` at 18:7) is then dead at the move. The emission side owes
+/// same block (e.g. a read of `(*temp).key` after the argument copy
+/// `_40 = copy (*root).right`) is then dead at the move. The emission side owes
 /// the matching hoist of those reads above the moving argument. `None` when
 /// the shape does not hold.
 pub(crate) fn deferred_argument_read<'tcx>(
@@ -590,7 +590,7 @@ pub(crate) fn deferred_argument_read<'tcx>(
     })
 }
 
-/// R609-3 (a): `reservation` is a statement of `call`'s block and every
+/// `reservation` is a statement of `call`'s block and every
 /// statement after it, up to the call, is a pure read (a fresh local written by a
 /// non-writing rvalue, or a storage marker) -- so a read of the call's argument
 /// list can be hoisted above the reservation without reading a stale value.

@@ -26,7 +26,7 @@ pub(crate) enum OriginAtom {
         formal: Node,
         actual: Node,
     },
-    /// R367-2: the callee returned this formal port and the call's substitution
+    /// The callee returned this formal port and the call's substitution
     /// named no actual for it — the deeper components of an argument whose root
     /// alone was matched. Keeping the port is the difference between "the
     /// analysis could not classify this" and "this is the caller's own token,
@@ -190,7 +190,7 @@ impl ValueOrigins {
                 .entry((point.construction, name.clone()))
                 .or_default();
             function.nodes.extend([edge.from, edge.to]);
-            // Origin alternatives are independent of T2 endpoint retraction.
+            // Origin alternatives are independent of endpoint retraction.
             // Including both possible copy roles is conservative; a possible
             // borrowed view below prevents a no-borrow classification.
             function.edges.insert((edge.from, edge.to));
@@ -339,7 +339,7 @@ impl ValueOrigins {
                     // substitution. Its true caller-local frame arrives through
                     // the graph; a held candidate creates no returned Borrow atom.
                     for (index, pair) in row.matched.iter().enumerate() {
-                        // L01¹⁰: a Lent row's container pair is framed, not a port.
+                        // A Lent row's container pair is framed, not a port.
                         if row.lends_pair(index) {
                             continue;
                         }

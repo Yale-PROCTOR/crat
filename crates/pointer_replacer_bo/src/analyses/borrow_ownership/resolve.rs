@@ -19,7 +19,7 @@ pub enum ResolvedSlot {
 
 /// Push the pointer slot at `(range, depth)` — the pointer being dereferenced
 /// at this step — into `layers`, if it is a modeled slot and a caller asked for
-/// the traversed path (`§NB1` SAFE-MONO walk). A no-op when `layers` is `None`.
+/// the traversed path (the SAFE-MONO walk). A no-op when `layers` is `None`.
 fn push_layer(
     layers: &mut Option<&mut Vec<ResolvedSlot>>,
     is_field: bool,
@@ -45,7 +45,7 @@ fn push_layer(
 /// `None` means the place is not a fully modeled pointer slot and callers must
 /// conservatively treat it as raw.
 ///
-/// §NB1: when `layers` is `Some`, every pointer slot *dereferenced* on the way
+/// When `layers` is `Some`, every pointer slot *dereferenced* on the way
 /// to the target is appended to it (shallowest first, across struct-field
 /// boundaries) — the SAFE-MONO walk's traversed layers. The target slot itself
 /// is NOT a layer. Layers are only meaningful when the call returns `Some`

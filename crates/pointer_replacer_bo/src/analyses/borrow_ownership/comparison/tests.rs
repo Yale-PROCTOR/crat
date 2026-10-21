@@ -90,7 +90,7 @@ fn snapshot(code: &str, requested_locals: &[&str]) -> (Snapshot, usize) {
         let model = model.expect("comparison-control model");
         assert!(stats.source_retirement_decline.is_empty());
         // These fixtures have no allocation/free endpoint. A BinaryOp must not
-        // silently introduce a new T2 ownership assertion.
+        // silently introduce a new endpoint-retraction ownership assertion.
         assert!(construction.selectors.keys().is_empty());
         let mut selected = Vec::new();
         let mut locals = BTreeMap::new();

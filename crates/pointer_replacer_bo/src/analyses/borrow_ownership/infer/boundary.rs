@@ -185,15 +185,15 @@ where 'tcx: 'infercx
             if let Some(param) = param.clone()
                 && let Some((arg, is_ref)) = arg.clone()
             {
-                // B4: every arg is `Param::Output` (uniform two-slot Consume);
+                // Every arg is `Param::Output` (uniform two-slot Consume);
                 // `Param::Normal` is only the RETURN (handled above). The old
                 // `Param::Normal` arm — `push_linear` plus a c_void range-narrowing
                 // "working around type cast" — became unreachable when
-                // `output_params` was retired, so it is deleted. (If real-corpus
+                // `output_params` was retired, so it is deleted. (If real
                 // c_void local-call args ever need that narrowing for correct
-                // classification, it must be re-added to this Output arm; the
-                // `c_void_local_call_arg_emits` test guards that the path at least
-                // stays panic-free and satisfiable.)
+                // classification, it must be re-added to this Output arm; a test
+                // keeps a c_void local-call argument at least panic-free and
+                // satisfiable.)
                 let crate::analyses::borrow_ownership::Param::Output(output_param) = param else {
                     unreachable!("B4: call args are always Param::Output");
                 };
@@ -201,7 +201,7 @@ where 'tcx: 'infercx
                     crate::analyses::borrow_ownership::licensing::facts::read(|facts| {
                         let callee = infer_cx.tcx.def_path_str(callee);
                         let reader = facts.reader_plan.borrows_parameter(&callee, index);
-                        // L01¹⁰ (era-5c 071, R590-5): a lendable formal is lent --
+                        // A lendable formal is lent --
                         // component 0 only; a reader's call keeps the whole window.
                         let lent = !reader && !is_ref && facts.lend_plan.lends(&callee, index);
                         (reader, lent)
@@ -259,7 +259,7 @@ where 'tcx: 'infercx
                 let ty = if is_ref {
                     let skipped = output_param.next().unwrap();
                     ownership_boundary::peel(&mut argument_record, &skipped);
-                    // L01¹¹ (R645-2, era-5c 086): the peeled outer component is the
+                    // The peeled outer component is the
                     // formal pointer itself, a view of the actual's place; nothing
                     // else constrains it, so without this law Owning could appear
                     // at the formal from no source.
@@ -298,7 +298,7 @@ where 'tcx: 'infercx
                         }
                         if let Some((container_use, container_def)) = container {
                             // The container pair is lent; an interior pair takes the
-                            // ordinary equalities (R590-5; the record §2).
+                            // ordinary equalities.
                             if (param.r#use, param.def) == (container_use, container_def) {
                                 return;
                             }
@@ -398,7 +398,7 @@ where 'tcx: 'infercx
                         )
                     }
 
-                    // B4: every arg is `Param::Output`, so this is always the
+                    // Every arg is `Param::Output`, so this is always the
                     // output path. The old `!is_output` branch (one global-assumption
                     // apply to the input, for non-output params) is unreachable after
                     // output_params retirement. These global assumptions are
@@ -512,11 +512,11 @@ where 'tcx: 'infercx
                     .map(Window::single),
             );
             if let Some((param, arg)) = param.zip(arg) {
-                // B4: every arg is `Param::Output`, so `into_output()` is always
+                // Every arg is `Param::Output`, so `into_output()` is always
                 // `Some` — write the actual back to the def signature var. The old
                 // `else` finalize (`push_assume(arg, false)`) asserted escape=false
-                // for non-output params; it was the load-bearing edit retired in
-                // B4a (escape is now solved natively), and is unreachable here.
+                // for non-output params; it was retired when escape became solved
+                // natively, and is unreachable here.
                 let Some(param) = param.into_output() else {
                     unreachable!("B4: exit args are always Param::Output");
                 };
@@ -626,7 +626,7 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
                     // (`push_eq_min` asserts `input ⟹ dom`) that over-claims a
                     // borrowed `*mut S` as `Owning` when a field is malloc'd
                     // (`(*owner).data = malloc`) — a field-ownership transfer, NOT
-                    // evidence the parent owns (task doc §9.8/§9.9). A field starts
+                    // evidence the parent owns. A field starts
                     // fresh and only picks up `dom` from its OWN pointer derefs; this
                     // is a no-op for by-value structs (already `None`), and the
                     // caller-side escape's depth-1 var is on the pointer-chain path

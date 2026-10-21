@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 /// The legacy crate's files the analysis runs on, relative to its `src/`: the
 /// modules BO's non-test analysis code names, closed over those modules' own
-/// non-test `crate::` / `super::` references (era-5c S2 D1). Every file of a
+/// non-test `crate::` / `super::` references. Every file of a
 /// covered module is hashed, its tests included. A new legacy reference from
 /// `src/analyses/**` needs its module here.
 pub(crate) const LEGACY_FILES: &[&str] = &[

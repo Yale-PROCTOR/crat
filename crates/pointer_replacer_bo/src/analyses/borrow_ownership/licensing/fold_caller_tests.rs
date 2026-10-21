@@ -397,7 +397,7 @@ fn gf08_caller_reset_after_payload_free_stays_outside_initial_order() {
     });
 }
 
-/// R348-1(i): the occurrence behind `Caller.UnsupportedEffect`, read back out
+/// The occurrence behind `Caller.UnsupportedEffect`, read back out
 /// of a recorded entry.
 ///
 /// `fold_caller::Hold` has ten variants and none carries a payload, so an
@@ -410,7 +410,7 @@ fn gf08_caller_reset_after_payload_free_stays_outside_initial_order() {
 /// `CRAT_ERA5B_ENTRY` at a joint cache entry and run it directly:
 ///
 /// ```text
-/// CRAT_ERA5B_ENTRY=<cache>/era5b-model-cache-v1/<key>.json \
+/// CRAT_ERA5B_ENTRY=<cache>/bo-model-cache-v1/<key>.json \
 ///   pointer_replacer-<hash> --ignored --exact \
 ///   analyses::borrow_ownership::licensing::fold_caller_tests::r348_caller_gate_occurrences_of_a_recorded_entry \
 ///   --nocapture --test-threads=1
@@ -423,7 +423,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
         fold_eligibility::Hold as Eligibility,
     };
 
-    // R325-1: the first line of a `--nocapture` run shares the test-name line.
+    // The first line of a `--nocapture` run shares the test-name line.
     eprintln!();
     let path = std::env::var("CRAT_ERA5B_ENTRY").expect("CRAT_ERA5B_ENTRY names a cache entry");
     let bytes = std::fs::read(&path).expect("readable cache entry");
@@ -459,7 +459,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
                 Err(Eligibility::Declaration) => "Declaration".to_owned(),
             };
             // One line per declaration even when the gate is not the reason,
-            // so a reader can see which refusals this census cannot explain.
+            // so a reader can see which refusals this diagnostic cannot explain.
             if !reported.insert((call.caller.clone(), call.block, call.statement)) {
                 continue;
             }
@@ -471,7 +471,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
                 continue;
             };
             if refused.is_empty() {
-                // R365-3: the gate refuses nothing, so the hold is past it. Print
+                // The gate refuses nothing, so the hold is past it. Print
                 // the payload endpoint's origin atoms and this call's argument
                 // substitutions — the two sides of the owner-return premise.
                 let payload = payload_atoms(&facts, &aliases, decision);
@@ -509,7 +509,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
                     }
                     _ => "other",
                 };
-                // R363-1: the two halves of D3, printed for the class it
+                // The two halves of the fresh-producer rule, printed for the class it
                 // governs, so a producer that stays refused says which half.
                 let d3 = if class == "producing-local-call" {
                     use super::super::origin_evidence::OriginAvailability;
@@ -632,7 +632,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
     }
 }
 
-/// R350-3(2): the certificate re-derived over a recorded entry, so a refusal
+/// The certificate re-derived over a recorded entry, so a refusal
 /// that carried no payload when the entry was written can be read with one now.
 ///
 /// `fold_custody::validate` already re-derives the plan from
@@ -645,7 +645,7 @@ fn r348_caller_gate_occurrences_of_a_recorded_entry() {
 fn r350_internal_certificate_gap_of_a_recorded_entry() {
     use super::super::origin_evidence::OriginEvidence;
 
-    eprintln!(); // R325-1
+    eprintln!(); // keep the first output line off the test-name line
     let path = std::env::var("CRAT_ERA5B_ENTRY").expect("CRAT_ERA5B_ENTRY names a cache entry");
     let bytes = std::fs::read(&path).expect("readable cache entry");
     let entry: serde_json::Value = serde_json::from_slice(&bytes).expect("entry json");
@@ -691,7 +691,7 @@ fn r350_internal_certificate_gap_of_a_recorded_entry() {
     }
 }
 
-/// R363-1 D3/K-D3. The admitted branch and both halves of its conjunction.
+/// The fresh-producer rule: the admitted branch and both halves of its conjunction.
 /// A producer handed no pointer, whose return is fresh on every path by its own
 /// certificate, moves no token out of this caller. A callee handed a pointer
 /// does, and so does one whose return is not fresh — neither is admitted by the
@@ -769,7 +769,7 @@ pub unsafe fn run(){{
     );
 }
 
-/// R365-3: the payload endpoint's origin atoms for one recorded declaration,
+/// The payload endpoint's origin atoms for one recorded declaration,
 /// plus this call's argument substitutions. Reproduces `endpoint_routes`' own
 /// lookup up to the point where it asks `ValueOrigins`, so the two read the same
 /// node.
@@ -913,7 +913,7 @@ callee-entry-ports={entries:?}",
     )
 }
 
-/// R365-3 and its K-witnesses. The caller certificate admits an `Input` in the
+/// The owner-return premise and its negative cases. The caller certificate admits an `Input` in the
 /// payload origin only when THIS call recorded a transfer of that argument into
 /// the callee: one token in, the same token out. Every other shape is a second
 /// owner or a different token, and each clause of the premise has its own case.
@@ -1003,14 +1003,14 @@ fn r365_the_owner_return_admits_only_the_argument_this_call_consumed() {
         fold_caller::returned_token(&transferred, &call, &OriginAtom::Input(port)),
         "the caller's token moved into this call and the return carries it back"
     );
-    // R367-2: the unmatched component of that same argument, kept typed instead
+    // The unmatched component of that same argument, kept typed instead
     // of collapsed to `Unknown`, is the same token.
     assert!(
         fold_caller::returned_token(&transferred, &call, &unresolved),
         "an unmatched component of the consumed argument is still its token"
     );
 
-    // K-R365-a: a lend. The caller kept its token; admitting the return would
+    // Negative case: a lend. The caller kept its token; admitting the return would
     // let it hold the same token twice.
     for lending in [LicensingRole::Borrowed, LicensingRole::TraversalBorrow] {
         let lent = facts(row(lending, Availability::Present(3), consumed()));
@@ -1036,7 +1036,7 @@ fn r365_the_owner_return_admits_only_the_argument_this_call_consumed() {
         "an unidentified actual does not witness the caller's token"
     );
 
-    // K-R365-b: an `Input` port this call did not consume is a different token.
+    // Negative case: an `Input` port this call did not consume is a different token.
     let other = facts(row(
         LicensingRole::Legacy,
         Availability::Present(3),
@@ -1051,7 +1051,7 @@ fn r365_the_owner_return_admits_only_the_argument_this_call_consumed() {
         !fold_caller::returned_token(&other, &call, &OriginAtom::Input(port)),
         "a port this call did not consume is another token"
     );
-    // R367-2: the same K case for the unresolved atom. A component of another
+    // The same negative case for the unresolved atom. A component of another
     // argument is another token, however it reached the origin set.
     assert!(
         !fold_caller::returned_token(&other, &call, &unresolved),
@@ -1093,7 +1093,7 @@ fn r365_the_owner_return_admits_only_the_argument_this_call_consumed() {
     }
 }
 
-/// R372-3: the whole declaration plan re-derived over a recorded entry, under
+/// The whole declaration plan re-derived over a recorded entry, under
 /// whatever environment arm is pinned. The certificate runs without Z3 —
 /// `fold_custody::validate` already re-derives it that way in production — so a
 /// probe that only changes which declarations the certificate admits costs no
@@ -1103,7 +1103,7 @@ fn r365_the_owner_return_admits_only_the_argument_this_call_consumed() {
 fn r372_declaration_plan_of_a_recorded_entry() {
     use super::{super::origin_evidence::OriginEvidence, fold_eligibility};
 
-    // R325-1: the first line of a `--nocapture` run shares the test-name line.
+    // The first line of a `--nocapture` run shares the test-name line.
     eprintln!();
     let path = std::env::var("CRAT_ERA5B_ENTRY").expect("CRAT_ERA5B_ENTRY names a cache entry");
     let entry: serde_json::Value =
@@ -1159,11 +1159,10 @@ fn r372_declaration_plan_of_a_recorded_entry() {
     }
 }
 
-/// R377-1: the return-port rule. W1 admits; every killer refuses, each for its
-/// own reason. The three STOP-1 killers (K8–K10) and K3 all refuse through the
-/// same coarse clause — a frame with any in-frame free is refused — which is
-/// sound and is why K3 is listed as refused here although R377-1 §2 ruled its
-/// shape admissible: see report 047's STOP.
+/// The return-port rule. W1 admits; every killer refuses, each for its
+/// own reason. K8–K10 and K3 all refuse through the same coarse clause — a
+/// frame with any in-frame free is refused — which is sound, and is why K3 is
+/// listed as refused here although its shape is admissible in principle.
 #[test]
 fn r377_the_return_port_rule_admits_only_a_token_that_escapes_by_the_return() {
     const PRELUDE: &str = r#"
@@ -1184,13 +1183,12 @@ pub unsafe fn keep(p:*mut Node){ROOT=p;}
         recv.recv().expect("the rule ran")
     };
 
-    // K11 (R378-2): a producer whose ownership some OTHER rule refuses. The
+    // K11: a producer whose ownership some OTHER rule refuses. The
     // premise is about escape and cannot see the refusal — `buffer_new`'s token
     // does escape only by the return, so the rule ADMITS it. What protects the
     // model is the yield at emission: `require_own` tries the row in a scope and
     // drops it when the system is unsatisfiable with it, which here is the
-    // CALLER's unchanged live-local final-zero on `read_length::buffer`. The
-    // sentinels for that are `o03` and `o07` staying green with the pin on.
+    // CALLER's unchanged live-local final-zero on `read_length::buffer`.
     assert!(
         admitted(
             r#"pub struct Buffer{data:*mut Node,len:usize}
@@ -1234,8 +1232,8 @@ pub unsafe fn read_length()->usize{let b=buffer_new();(*b).len}"#,
             "pub unsafe fn make(h:*mut Node)->*mut Node{let p=malloc(core::mem::size_of::<Node>()) as *mut Node;(*h).child=p;p}",
             "make",
         ),
-        // K3: frees on an error path (R377-1 ruled the shape admissible; the
-        // built rule refuses it — report 047's STOP).
+        // K3: frees on an error path (a shape admissible in principle; the
+        // built rule's coarse in-frame-free clause refuses it).
         (
             "K3 error-path free",
             "pub unsafe fn make(c:bool)->*mut Node{let p=malloc(core::mem::size_of::<Node>()) as *mut Node;if c{free(p as *mut core::ffi::c_void);return 0 as *mut Node;}p}",
@@ -1282,7 +1280,7 @@ pub unsafe fn read_length()->usize{let b=buffer_new();(*b).len}"#,
     }
 }
 
-/// R382-1: the return-port rule read over a recorded entry — what it admits,
+/// The return-port rule read over a recorded entry — what it admits,
 /// what it holds and why. No solve: the premise is a function of recorded
 /// evidence, so a probe that asks "which producers did the rule reach" costs
 /// nothing. What it cannot show is the YIELD, which happens at materialisation;

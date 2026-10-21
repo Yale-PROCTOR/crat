@@ -147,7 +147,7 @@ impl CandidateGraph {
                     _ => {}
                 }
             }
-            // era-5c: a phi null-join (`left <= right`) still lets the token
+            // A phi null-join (`left <= right`) still lets the token
             // flow right-to-left; the may-flow graph keeps the edge.
             if (equation.operation == "equal"
                 || (equation.operation == "null-join" && equation.point.phase == "phi"))

@@ -4,9 +4,9 @@
 // on the fixture suite ⇒ it CANNOT hide from the equivalence differential (tripwires are for leaves
 // whose drift can hide, e.g. places_conflict; differentials for the rest). Production names are kept
 // verbatim (`borrow_conflicts`/`borrow_conflicts_replaying`/`invalid_loan_set`/
-// `extract_conflict_edges`) so 3b/NB6 diffs are 1:1 — the module path is the only distinguisher.
+// `extract_conflict_edges`) so diffs against production are 1:1 — the module path is the only distinguisher.
 //
-// NB5-O adds the BO-owned origin-replay seam: production `borrow_inference` still supplies the
+// The BO-owned origin-replay seam: production `borrow_inference` still supplies the
 // frozen base facts, then `NativeBorrowContext` replaces subset/requires/loan-liveness from retained
 // BO-native body flows before this module replaces invalidates/errors with the BO engine's.
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -35,19 +35,19 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-/// BO-local L2 edge attribution. The ordinary conflict edge remains unchanged;
+/// BO-local edge attribution for the guarded repair. The ordinary conflict edge remains unchanged;
 /// `invalidators` are access roots captured from the exact error rows that made
 /// this loan invalid.
 #[derive(Clone, Debug)]
 pub(crate) struct WitnessedConflictEdge {
     pub(crate) edge: ConflictEdge,
-    /// The invalid loan and its location. `None` for an A5 parameter edge (R617-1):
+    /// The invalid loan and its location. `None` for a parameter-overlap edge:
     /// two Ref formals that may overlap, with no loan behind the conflict.
     pub(crate) loan: Option<usize>,
     pub(crate) loan_location:
         Option<crate::analyses::borrow_ownership::guarded_repair::MirLocationKey>,
     pub(crate) invalidators: Vec<Local>,
-    /// R617-1: the invalidators that met the loan only through an A5 overlap
+    /// The invalidators that met the loan only through a parameter-overlap
     /// partner (a subset of `invalidators`), part of the hazard key.
     pub(crate) overlap_invalidators: Vec<Local>,
 }
@@ -104,7 +104,7 @@ fn overwrite_with_engine_facts<'tcx>(
     parameter_conflicts
 }
 
-/// L2-only fork seam. The invalidation and error matrices are computed exactly
+/// Fork seam used only by the guarded repair. The invalidation and error matrices are computed exactly
 /// as above; the returned side witnesses are write-only metadata filtered to
 /// rows that survived `loan_liveness ∩ invalidates`.
 fn overwrite_with_engine_facts_capturing<'tcx>(
@@ -222,7 +222,7 @@ fn record_retirement_review(
     );
 }
 
-/// E-R4 capture: record loan-level identity for the COMPLETE final `BorrowSet`.
+/// Loan-identity capture: record loan-level identity for the COMPLETE final `BorrowSet`.
 ///
 /// Deliberately NOT folded into `extract_conflict_edges`: that function is a
 /// verbatim mirror of `borrow/mod.rs` and must stay so, and
@@ -236,7 +236,7 @@ fn record_retirement_review(
 ///
 /// The kind derivation is textually the engine's own expression (`invalidates.rs`,
 /// both `is_mutable` sites) applied to the loan record, keyed on the BASE local
-/// with projections ignored (R-Q1a §0.4).
+/// with projections ignored.
 fn record_loan_identities(
     fn_did: LocalDefId,
     inference: &BorrowInferenceResults<'_>,
@@ -251,7 +251,7 @@ fn record_loan_identities(
     for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
         let mutable = provenance_set.local_data[data.borrowed.local]
             .map(|p| provenance_set.provenance_data[p].is_mutable());
-        // D5 payloads restored: both are key components now (§1.1 correction 2).
+        // Both payloads are key components.
         let borrower = match data.assigned {
             Borrower::Assign(owner) => export::BorrowerKind::Assign {
                 owner: export::OwnerKey::from_owner(owner),
@@ -315,8 +315,8 @@ fn extract_conflict_edges(
                 continue;
             };
             for provenance in live.iter() {
-                // §HLZ-PORT: `row` is the error POINT and is already in scope — the same shape
-                // the colleague's own edit has. `Off` keeps the whole-body predicate verbatim.
+                // Point-keyed requires: `row` is the error POINT and is already in scope.
+                // `Off` keeps the whole-body predicate verbatim.
                 let required = match &inference.localized_requires {
                     Some(localized) => localized.contains(row, provenance, loan),
                     None => requires.contains(provenance, loan),
@@ -344,11 +344,11 @@ fn extract_conflict_edges(
     edges
 }
 
-/// §HLZ-PORT — the demotion-witness half of the SAME predicate.
+/// The demotion-witness half of the SAME point-keyed predicate.
 ///
 /// Production `collect_invalid_loan_demotions` (`borrow/mod.rs:1246`) and
 /// `extract_conflict_edges` above test `requires` over the same `(error row, live provenance)`
-/// pairs. Between them sits the release-active BB2-i stray-Raw assertion: a non-witness Raw local
+/// pairs. Between them sits the release-active stray-Raw assertion: a non-witness Raw local
 /// must appear in no residual edge. Point-keying ONE of the two would let a local be dropped from
 /// the witness set while surviving as a requirer (or the reverse) and fire it. So the fork carries
 /// its own copy, and under `Off` it delegates to production verbatim rather than duplicating it.
@@ -418,7 +418,7 @@ fn local_witnesses_for_loan(
     local_witnesses
 }
 
-/// Addendum 61 convergence tripwire. A marked row may exist only while its presented source is
+/// Convergence tripwire. A marked row may exist only while its presented source is
 /// still `Ref`; after issuer-first repair demotes that source, the active-loan filter must remove
 /// the selected loan before the next replay. This check precedes the generic stray-Raw invariant
 /// so persistence is reported as the class-specific STOP rather than looking like an ordinary
@@ -437,7 +437,7 @@ fn assert_escaped_conflicts_pre_demotion<'a>(
                 "escape-minimal selected loan conflict persisted after its resolved source was demoted"
             ),
             Some(ProvenanceOwner::Field(_)) => {
-                // Field slots are held out of the ②-minimal wave. Keep this explicit so a future
+                // Field slots are held out of escape-minimal selection. Keep this explicit so a future
                 // field-bearing allowlist row cannot silently bypass the Local convergence check.
                 panic!("escape-minimal selected source unexpectedly resolved to a field")
             }
@@ -453,7 +453,7 @@ fn assert_escaped_conflicts_pre_demotion<'a>(
 }
 
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
-/// aggregation. Event unioning happens only on the L2 feature-on path.
+/// aggregation. Event unioning happens only on the guarded-repair feature-on path.
 fn extract_witnessed_conflict_edges(
     inference: &NativeInference<'_>,
     provenance_set: &ProvenanceSet,
@@ -496,7 +496,7 @@ fn extract_witnessed_conflict_edges(
         .collect()
 }
 
-/// §8 verifier (round-0). Verbatim from `borrow/mod.rs::borrow_conflicts` @ fc3bd4cf, except the
+/// Round-0 verifier. Verbatim from `borrow/mod.rs::borrow_conflicts` @ fc3bd4cf, except the
 /// fork seam (`overwrite_with_engine_facts`) replaces the facts' `invalidates`/`errors` with BO's.
 #[cfg(test)]
 pub fn borrow_conflicts<I, J, K, L>(
@@ -562,10 +562,10 @@ where
     out
 }
 
-/// §HLZ-PORT witness instrument (test-only). Per function, one row per loan:
+/// Loan-liveness witness instrument (test-only). Per function, one row per loan:
 /// `(loan index, is the borrower a `CallArg`, number of points at which the loan is live)`.
 ///
-/// Exists because the port's `CallArg` claim (§2.4(a) of the port-exploration record) is about
+/// Exists because the point-keyed port's `CallArg` claim is about
 /// `loan_liveness`, which no public entry point exposes — the conflict-edge surface reports the
 /// ABSENCE of an edge in both modes and so cannot distinguish "never live" from "live but inert".
 /// Reads the facts BEFORE `overwrite_with_engine_facts`, so it observes the loan-liveness stage
@@ -612,12 +612,12 @@ where
     out
 }
 
-/// §HLZ-PORT witness instrument (test-only) — the DEMOTION side, observed on its own.
+/// Witness instrument (test-only) — the DEMOTION side, observed on its own.
 ///
-/// The adversarial review's point (2026-08-25, §39 addendum 15): asserting that conflict edges
+/// Asserting that conflict edges
 /// and demotion witnesses agree only proves they are mutually consistent, and the same
 /// incomplete predicate applied to both can delete a required invalidation on both sides while
-/// keeping BB2-i silent. So the two are witnessed SEPARATELY — this returns the demotion
+/// keeping the stray-Raw assertion silent. So the two are witnessed SEPARATELY — this returns the demotion
 /// witnesses directly, with no reference to the edge set.
 #[cfg(test)]
 pub(crate) fn demotion_witness_census<I, J, K, L>(
@@ -685,7 +685,7 @@ where
             continue;
         }
         let provenance_set = ctxt.provenances.get(&f).unwrap();
-        // §HLZ-PORT: this test-only path runs production `borrow_inference` directly and never
+        // This test-only path runs production `borrow_inference` directly and never
         // goes through `NativeBorrowContext::infer`, so it has no localized relation by
         // construction — `None` keeps it on the whole-body predicate, which is what it compares.
         let inference = NativeInference {
@@ -703,7 +703,7 @@ where
     out
 }
 
-/// §8 BB2-i replaying verifier. Verbatim from `borrow/mod.rs::borrow_conflicts_replaying` @
+/// Replaying verifier. Verbatim from `borrow/mod.rs::borrow_conflicts_replaying` @
 /// fc3bd4cf, except: (1) the fork seam replaces `invalidates`/`errors`; (2) the private
 /// `disable_owner(ProvenanceOwner::Local(local))` call — whose Local branch is exactly
 /// `local_data[local] = None`, and whose return is ignored here — is inlined as that field write
@@ -911,14 +911,14 @@ where
     };
     let mut ctxt = NativeBorrowContext::new(program, flows, is_candidate, is_mutable);
 
-    // §NB5-F2 — field candidacy: a struct-field slot the model settled `Raw` is a raw pointer, not a
+    // Field candidacy: a struct-field slot the model settled `Raw` is a raw pointer, not a
     // borrow, so its loan must be disabled — the field analogue of a Raw local's `local_data=None`
     // demotion below. A field slot is `Raw` CRATE-WIDE, so disable it in EVERY function's provenance
     // set (the crate-wide hammer). `disable_owner` is a no-op where a function has no provenance for
     // that field, so passing the whole raw-field list is safe. Cleared field loans stop regenerating
-    // the field conflicts that Option A (NB5-F) had to decline, so those programs now accept with the
+    // the field conflicts that would otherwise force a decline, so those programs accept with the
     // field `Raw`. Genuinely un-dischargeable field residuals (never disabled here) still hit the
-    // `residual_nonref_field` decline backstop in the caller — B narrows the decline set, not deletes it.
+    // `residual_nonref_field` decline backstop in the caller — this narrows the decline set, not deletes it.
     for provenance_set in ctxt.borrow.provenances.values_mut() {
         for &field in raw_fields {
             provenance_set.disable_owner(ProvenanceOwner::Field(field));
@@ -972,7 +972,7 @@ where
                 .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
-                // E-R4: a conflict-free function is exactly the case where every
+                // A conflict-free function is exactly the case where every
                 // loan SURVIVED, so this branch must record rather than exit
                 // silently. Capturing only where edges are extracted would export
                 // the invalid subset and nothing else.
@@ -1006,7 +1006,7 @@ where
 
             if to_demote.is_empty() {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                // E-R4: record from the FINAL inference — the loop above may
+                // Record from the FINAL inference — the loop above may
                 // replay demotions, so earlier iterations are not the accepted
                 // borrow set.
                 record_loan_identities(
@@ -1035,7 +1035,7 @@ where
             }
         };
 
-        // BB2-i stray-Raw inert-ness invariant (verbatim; release-active tripwire).
+        // Stray-Raw inert-ness invariant (verbatim; release-active tripwire).
         let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
         assert_escaped_conflicts_pre_demotion(edges.iter(), &is_ref_f, escaped_copy_lends.len());
         assert!(
@@ -1067,7 +1067,7 @@ where
     out
 }
 
-/// L2 witnessed replay. This is a feature-on sibling of
+/// Witnessed replay for the guarded repair. This is a feature-on sibling of
 /// `borrow_conflicts_replaying`: the plain function and all of its consumers
 /// retain their original output shape and perform no capture allocation.
 pub(crate) fn borrow_conflicts_replaying_witnessed<I, J, M, N, K, L>(
@@ -1153,8 +1153,8 @@ where
     )
 }
 
-/// R617-1 (the guarded port): the one witnessed replay with A5's overlap pairs.
-/// Its edges are Mode-A's -- the invalid loans' edges, then the Ref-Ref
+/// The one witnessed replay with the parameter-overlap pairs.
+/// Its edges are the plain repair's -- the invalid loans' edges, then the Ref-Ref
 /// parameter edges -- each carrying its witness (loan identity and invalidating
 /// accesses; a parameter edge has no loan).
 pub(crate) fn borrow_conflicts_replaying_witnessed_with_flows_and_parameter_overlap_and_escaped<
@@ -1265,7 +1265,7 @@ where
                 parameter_overlaps.and_then(|overlaps| overlaps.get(&f)),
             );
             record_retirement_review(f, &inference, ctxt.borrow.provenances.get(&f).unwrap());
-            // R617-1: the Ref-Ref parameter edges, as Mode-A's replay builds them.
+            // The Ref-Ref parameter edges, as the plain repair's replay builds them.
             let parameter_edges = parameter_conflicts
                 .into_iter()
                 .filter(|(left, right)| is_ref_f(*left) && is_ref_f(*right))
@@ -1283,10 +1283,10 @@ where
                 .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
-                // D2: the witnessed/L2 replay is structurally identical to the
-                // Mode-A one and had no capture at all, so `loans` was silently
-                // empty under CRAT_BO_L2_GUARDED_COMMITS=1 — the plan-of-record
-                // configuration. Same Gap-B reasoning applies here: a
+                // The witnessed replay is structurally identical to the
+                // plain one and had no capture at all, so `loans` was silently
+                // empty under CRAT_BO_L2_GUARDED_COMMITS=1. The same reasoning
+                // as the plain path applies here: a
                 // conflict-free function is where every loan SURVIVED.
                 record_loan_identities(
                     f,
@@ -1318,8 +1318,8 @@ where
 
             if to_demote.is_empty() {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                // D2: record from the FINAL inference of this call, exactly as
-                // the Mode-A path does.
+                // Record from the FINAL inference of this call, exactly as
+                // the plain repair path does.
                 record_loan_identities(
                     f,
                     &inference,
@@ -1581,9 +1581,9 @@ unsafe fn f(p: *mut i32) -> i32 {
                 ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
             )]);
 
-            // Conflict equality is deliberately excluded. W1 owns that
-            // territory and requires A5 to add parameter-overlap conflicts;
-            // H3 compares the complete old-loan observation only.
+            // Conflict equality is deliberately excluded: the overlap pairs
+            // add parameter-overlap conflicts by design, so this compares the
+            // complete old-loan observation only.
             let (_, baseline_export) = with_bo_export(|| {
                 borrow_conflicts_replaying_with_flows_and_copy_lends(
                     &program,

@@ -54,10 +54,11 @@ pub(crate) enum OriginAvailability<T> {
     Missing(OriginMissing),
 }
 
-/// R342-1: the joint envelope is a strict superset of era-5a's. Era-5a wrote
+/// The joint envelope is a strict superset of the older format's, which wrote
 /// the positions that now carry an availability as a bare `OriginMissing`,
-/// before the tag existed, and those bytes decode as `Missing`. Only the
-/// tagged form is ever written, so no era-5b entry depends on this arm.
+/// before the tag existed; those bytes decode as `Missing`. Only the tagged
+/// form is ever written, so no entry carrying the ownership family depends on
+/// this arm.
 impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for OriginAvailability<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
@@ -142,7 +143,7 @@ pub(crate) struct SourceOccurrence {
     pub(crate) syntax: super::ownership_access::Syntax,
 }
 
-/// A supplied E-R2 emission occurrence. Var numbers are run-local diagnostics,
+/// A supplied ownership-version emission occurrence. Var numbers are run-local diagnostics,
 /// never stable identity, generation identity, equations, or conservation evidence.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,8 +185,8 @@ pub(crate) struct OwnershipCorrespondence {
     pub(crate) conservation: OriginMissing,
 }
 
-/// An era-5a entry does not carry the era-5b ownership positions at all. Their
-/// absence is the same typed fact era-5b records when it has nothing to record,
+/// An older-format entry does not carry the ownership positions at all. Their
+/// absence is the same typed fact the ownership family records when it has nothing to record,
 /// so the two entries validate through one path.
 fn consumes_absent() -> OriginAvailability<Vec<super::ownership_occurrence::Consumption>> {
     OriginAvailability::Missing(OriginMissing::OwnershipConsumesNotRecorded)
@@ -428,7 +429,7 @@ pub(crate) fn occurrences<'tcx>(
                         call.args.iter().map(|arg| &arg.node),
                         program.tcx,
                     );
-                    // R701: the null constructor's result is a null literal's (the
+                    // The null constructor's result is a null literal's (the
                     // fork's `NULL`), as `0 as *mut T` is in `assignment`.
                     if matches!(call.func, CallKind::RustLib(did)
                         if super::source_events::null_constructor(program.tcx, did))
@@ -444,7 +445,7 @@ pub(crate) fn occurrences<'tcx>(
     rows
 }
 
-/// Transport only the supplied origin derivation and completed E-R2 capture.
+/// Transport only the supplied origin derivation and completed ownership-version capture.
 /// Source occurrence enumeration performs no origin, ownership or alias inference.
 pub(crate) fn collect(
     program: &RustProgram<'_>,
@@ -619,11 +620,12 @@ pub(crate) fn collect(
 }
 
 impl OriginEvidence {
-    /// Whether this entry declares the era-5b ownership family — it does so by
+    /// Whether this entry declares the ownership family — it does so by
     /// carrying any of its evidence. The equations are all-or-nothing across
     /// functions: an entry that carries them for some and not others is refused
-    /// rather than read as era-5a. An era-5a entry carries none of the four and
-    /// is validated by exactly the checks it was written under.
+    /// rather than read as an older-format entry. An older-format entry carries
+    /// none of the four and is validated by exactly the checks it was written
+    /// under.
     #[cfg(test)]
     pub(crate) fn declares_ownership_family(&self) -> Result<bool, String> {
         let mut present = 0;
@@ -645,7 +647,7 @@ impl OriginEvidence {
 
     /// Canonical order is independent of input container order. No occurrence
     /// is deduplicated, and diagnostic Var numbers remain explicitly labelled.
-    /// R471-3 (i): the canonically ordered clone, shared by the two accessors
+    /// The canonically ordered clone, shared by the two accessors
     /// below so their orderings can never drift apart.
     #[cfg(test)]
     fn canonicalized(&self) -> Self {
@@ -665,7 +667,7 @@ impl OriginEvidence {
         serde_json::to_string(&self.canonicalized()).expect("origin-evidence DTO serialization")
     }
 
-    /// R473-4 (deeper): emit a row vector without ever holding the whole
+    /// Emit a row vector without ever holding the whole
     /// vector's `Value`. `order` is a permutation (canonical) or `None` (held).
     fn write_rows<T: serde::Serialize>(
         w: &mut impl std::io::Write,
@@ -745,12 +747,12 @@ impl OriginEvidence {
         }
     }
 
-    /// R473-4 (deeper, licensing): one licensing `Snapshot`, streamed field by
-    /// field in sorted key order with every vector emitted row by row.
+    /// One licensing `Snapshot`, streamed field by field in sorted key order
+    /// with every vector emitted row by row.
     ///
-    /// This is where libzahl's memory actually was: 108 functions cost 0.03 GiB,
-    /// while TWO snapshots cost 15.6 GiB as whole `Value`s (report 023 measures
-    /// it). `fold_callers`/`fold_members` carry `skip_serializing_if`, so an
+    /// This is where the memory goes on a large program: 108 functions cost
+    /// 0.03 GiB, while TWO snapshots cost 15.6 GiB as whole `Value`s.
+    /// `fold_callers`/`fold_members` carry `skip_serializing_if`, so an
     /// absent one is omitted exactly as the derived serializer omits it.
     fn write_snapshot(
         w: &mut impl std::io::Write,
@@ -894,7 +896,7 @@ impl OriginEvidence {
         s(w, b"}")
     }
 
-    /// R473-4 design (A): the per-function half of `validate_meta`'s origin
+    /// The per-function half of `validate_meta`'s origin
     /// checks, so the streaming validator and the whole-value one are ONE
     /// definition. No check is dropped here; they are re-sited.
     pub(crate) fn check_function(
@@ -929,7 +931,7 @@ impl OriginEvidence {
         }
     }
 
-    /// R473-4 design (A): write the canonical form **per element**, so the
+    /// Write the canonical form **per element**, so the
     /// multi-GiB whole-`Value` never exists.
     ///
     /// Byte-identity argument: serializing a `serde_json::Value` emits object
@@ -973,7 +975,7 @@ impl OriginEvidence {
             if n > 0 {
                 w.write_all(b",").map_err(err)?;
             }
-            // R473-4 (deeper): stream the function field by field and row by
+            // Stream the function field by field and row by
             // row. No clone of the function, no `Value` of the whole function --
             // memory is bounded by the largest single ROW.
             Self::write_function(&mut *w, &self.functions[index], canonical)?;

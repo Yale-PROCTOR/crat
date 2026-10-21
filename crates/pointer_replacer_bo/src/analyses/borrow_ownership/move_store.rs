@@ -1,15 +1,14 @@
-//! L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): the model's half of the store-as-move
-//! protocol. Design record `agents/plan/2026-09-25-avl-rotation-move-protocol.md`
-//! §3, as era-5c 060a filed it.
+//! The model's half of the store-as-move protocol, the
+//! shape a tree rotation takes when it moves a child pointer between fields.
 //!
-//! A store `(*C).f = move _t` **qualifies** in a round when (3.1) the field is
-//! `Owning` in the round's model, its transfer is a move (2′'s `moved_transfer`),
+//! A store `(*C).f = move _t` **qualifies** in a round when the field is
+//! `Owning` in the round's model, its transfer is a move (`moved_transfer`),
 //! and the store's destination post-store token owns in the round's model. A
 //! qualifying store issues **no loan on a local that is not `Raw`** in the round's
-//! model (3.2): its operand-pointee loan and its group loans on `Owning` / `Ref`
+//! model: its operand-pointee loan and its group loans on `Owning` / `Ref`
 //! members are cleared from the invalidation matrix. A loan on a `Raw` member stays.
 //! The model exports every use of the operand's copy closure after the store as a
-//! [`MoveStoreObligation`] (3.3). A store whose row cannot be built does not qualify.
+//! [`MoveStoreObligation`]. A store whose row cannot be built does not qualify.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -39,8 +38,8 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-/// A field store whose transfer is a move (3.1 (ii)), with its destination's
-/// post-store token. Construction 0 only, as 2′'s `MovedInput` requires.
+/// A field store whose transfer is a move, with its destination's
+/// post-store token. Construction 0 only, as `MovedInput` requires.
 #[derive(Clone, Debug)]
 pub(crate) struct Candidate {
     pub(crate) site: Site,
@@ -189,11 +188,11 @@ pub(crate) struct MoveStoreObligation {
     pub(crate) field: StructFieldSlot,
     pub(crate) alias: Vec<Local>,
     pub(crate) uses: Vec<ObligationUse>,
-    /// Non-`Ref` pointers derived from the alias set: their loans stay (3.2).
+    /// Non-`Ref` pointers derived from the alias set: their loans stay.
     pub(crate) kept: Vec<Local>,
     /// Their uses after S (`loan=kept`); none is an obligation.
     pub(crate) kept_uses: Vec<ObligationUse>,
-    /// R577-5: the members whose loans this store cleared, with their round
+    /// The members whose loans this store cleared, with their round
     /// kinds, as the replay's last pass removed them (`clear_removed`), so the
     /// rewriter can check each one's emitted form.
     pub(crate) cleared: Vec<(Local, SlotKind)>,
@@ -321,9 +320,9 @@ fn build(
     rule
 }
 
-/// 3.3's row: the operand's copy closure (plus the `Ref` pointers derived from a
+/// The obligation row: the operand's copy closure (plus the `Ref` pointers derived from a
 /// member), and every use of a member on a path from the store before that member
-/// is redefined; with it, the non-`Ref` derived pointers whose loans stay (3.2).
+/// is redefined; with it, the non-`Ref` derived pointers whose loans stay.
 /// `None` when the store is not `C.f = move/copy _t`.
 fn obligation<'tcx>(
     program: &RustProgram<'tcx>,
@@ -369,7 +368,7 @@ fn obligation<'tcx>(
     }
     // Pointers derived from a member by anything but a plain copy (a field address
     // `&raw mut (*a).g`, a pointer-returning call on a member) may point into A's
-    // object. A `Ref` one is exported (3.3); any other keeps its loan (3.2), whatever
+    // object. A `Ref` one is exported as an obligation; any other keeps its loan, whatever
     // its kind: the rewriter cannot deliver an `Owning` field address as a `Box`.
     let kind_of = |f: LocalDefId, local: Local| {
         slots
@@ -481,7 +480,7 @@ fn obligation<'tcx>(
         (members, uses)
     };
     let (members, uses) = walk(&alias);
-    // ownership-fields 069 (4.2a): the kept members' uses after S, marked
+    // The kept members' uses after S, marked
     // `loan=kept`, for the rewriter's consistency guard.
     let (kept_members, kept_uses) = walk(&kept);
     Some((
@@ -667,7 +666,7 @@ pub(crate) fn clear_removed(
     }
     RECORD.with(|record| {
         let mut record = record.borrow_mut();
-        // R577-5: each of this function's rows carries the members its store
+        // Each of this function's rows carries the members its store
         // cleared in this (latest) replay pass.
         let mut changed = false;
         for row in record

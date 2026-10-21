@@ -1,4 +1,4 @@
-//! R281 full-byte frozen-oracle and temporary resident-graph witnesses.
+//! Full-byte frozen-oracle and temporary resident-graph witnesses.
 use rustc_hir::{ItemKind, OwnerNode};
 
 use crate::analyses::borrow_ownership::{

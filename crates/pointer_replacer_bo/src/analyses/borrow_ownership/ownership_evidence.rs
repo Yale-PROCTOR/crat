@@ -155,7 +155,7 @@ impl Equation {
             {
                 return Err("invalid ownership endpoint correspondence");
             }
-            // Realloc's old claim and R219 continuations emit at the call;
+            // Realloc's old claim and unbranched continuations emit at the call;
             // a direct-branch fresh result emits on the success successor.
             let placed = (self.point.phase == "terminator"
                 && self.point.block == Some(endpoint.block)

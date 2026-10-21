@@ -55,19 +55,19 @@ pub(crate) struct CallerProof {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Hold {
     /// Retained for decoding entries recorded before the line existed; no site
-    /// emits it. R363-1 emission carries the refusing line in `CoverageAt`.
+    /// emits it. Emission carries the refusing line in `CoverageAt`.
     Coverage,
-    /// R363-1: the line that refused, across the 30 explicit coverage sites of
+    /// The line that refused, across the 30 explicit coverage sites of
     /// the caller and member-caller certificates.
     CoverageAt(u32),
     UnsupportedEffect,
-    /// R339-5 D2/K-D2: two fold sites the caller can reach on one path. Sites
+    /// Two fold sites the caller can reach on one path. Sites
     /// on mutually exclusive paths are admitted; these are not.
     MultipleFoldSitesOnPath,
-    /// R363-1: the membership certificate's own refusal, carried instead of
+    /// The membership certificate's own refusal, carried instead of
     /// collapsed. `UnsupportedEffect` keeps its own variant.
     Member(super::fold_subtree::Hold),
-    /// R369-2: the folding frame's own shape. The cell plan walks one linear
+    /// The folding frame's own shape. The cell plan walks one linear
     /// chain of blocks and names every SSA version in it, which assumes a frame
     /// that takes nothing, returns nothing and joins nowhere — a top-level
     /// `run()`. A recursive tree function is none of those, and this says which
@@ -78,9 +78,9 @@ pub(crate) enum Hold {
         phis: usize,
     },
     /// Retained for decoding entries recorded before the line existed; no site
-    /// emits it. R363-1 emission carries the refusing line in `OriginAt`.
+    /// emits it. Emission carries the refusing line in `OriginAt`.
     Origin,
-    /// R363-1: the line that refused, across the 23 explicit origin sites of the
+    /// The line that refused, across the 23 explicit origin sites of the
     /// caller, member-caller and member-law certificates.
     OriginAt(u32),
     CellIdentity,
@@ -131,8 +131,8 @@ pub(crate) fn certify_metadata(
         .iter()
         .filter(|c| c.target == call.callee)
         .collect();
-    // R339-5 D2-a, the same rule the member path already asks: one call to this
-    // callee on THIS path, not one in the whole body. `insert` calls itself from
+    // The same rule the member path already asks: one call to this callee on
+    // THIS path, not one in the whole body. A recursive insert calls itself from
     // two mutually exclusive arms, and a body-wide uniqueness test reads that as
     // an unsupported effect. Both gates go through `mutually_exclusive`, so they
     // cannot disagree about the same pair of sites.
@@ -348,16 +348,16 @@ pub(crate) fn endpoint_routes(
     }
     let origins =
         ValueOrigins::build_metadata(facts, aliases).map_err(|_| Hold::OriginAt(line!()))?;
-    // R365-3: the owner-return shape. A callee handed the caller's token for
+    // The owner-return shape. A callee handed the caller's token for
     // argument `a` and handing it back has not created a second owner — one
     // token in, the same token out, which is what `root = insert(root, key)`
     // is and what a `Box<Node>` insert compiles to.
     //
     // The premise is the transfer INTO the callee recorded at THIS call. A
     // callee that returns an argument it was only lent still refuses, because
-    // the caller kept its token and would then hold it twice (K-R365-a); an
+    // the caller kept its token and would then hold it twice; an
     // `Input` port that is not a consumed argument of this call is a different
-    // token and still refuses (K-R365-b). `Borrowed` and `TraversalBorrow` are
+    // token and still refuses. `Borrowed` and `TraversalBorrow` are
     // exactly the lending roles, and an argument whose caller place the
     // substitution could not identify is not evidence that the caller's token
     // is what moved.
@@ -791,11 +791,12 @@ pub(crate) fn cell_plan(
 }
 
 /// Reject unmodelled effects before endpoint routing can lose their provenance.
-/// R337-2: every occurrence this gate refuses, not just the first. The gate
+/// Every occurrence this gate refuses, not just the first. The gate
 /// itself returns at the first one, which made "held by one thing" mean "held by
 /// the first thing"; the instrument needs the whole list to classify it.
-/// R363-1: the aliases are a parameter because a re-derived snapshot has no
-/// Z3-valued guards to compute them from, and D3 asks `ValueOrigins` — an
+/// The aliases are a parameter because a re-derived snapshot has no
+/// Z3-valued guards to compute them from, and the fresh-return rule asks
+/// `ValueOrigins` — an
 /// instrument computing its own would answer a different question than the gate
 /// it reports on, and would answer it with an empty origin graph.
 #[cfg(test)]
@@ -824,7 +825,7 @@ pub(crate) fn check_effects(
     Ok(())
 }
 
-/// R365-3: whether `atom` is the caller's own token coming back out of `call` —
+/// Whether `atom` is the caller's own token coming back out of `call` —
 /// the owner-return shape, one token in and the same token out, which is what
 /// `root = insert(root, key)` is and what a `Box<Node>` insert compiles to.
 ///
@@ -904,7 +905,7 @@ pub(crate) fn reaches(blocks: &[super::coverage::Block], from: u32, to: u32) -> 
     false
 }
 
-/// R339-5 D2-a: two sites lie on mutually exclusive paths when neither block
+/// Two sites lie on mutually exclusive paths when neither block
 /// reaches the other. A path is a sequence, so it can contain both only by
 /// reaching one from the other — which makes this exact rather than
 /// conservative.
@@ -947,7 +948,7 @@ fn effects<'a>(
         .pointer
         .is_some())
     };
-    // R339-5 D2-a: this caller's other declared fold sites, with the CFG the
+    // This caller's other declared fold sites, with the CFG the
     // exclusivity test reads.
     let fold_sites: std::collections::BTreeSet<(u32, usize)> = facts
         .fold_declarations
@@ -963,7 +964,7 @@ fn effects<'a>(
         .find(|roster| roster.point.function.as_deref() == Some(call.caller.as_str()))
         .map(|roster| roster.blocks.as_slice())
         .unwrap_or_default();
-    // R339-5 D3: the node this site defines, from the compiler's own consume
+    // The node this site defines, from the compiler's own consume
     // rows. One row or none — a destination two rows claim is not a value this
     // gate can name.
     let defined = |o: &super::super::origin_evidence::SourceOccurrence| -> Option<Node> {
@@ -987,12 +988,12 @@ fn effects<'a>(
         }
         found
     };
-    // Built once and only if a D3 candidate is reached: every other arm decides
+    // Built once and only if a fresh-return candidate is reached: every other arm decides
     // on facts already in hand.
     let mut origins: Option<super::value_origins::ValueOrigins> = None;
     // Effect rejection precedes using any selected endpoint/cell story.
     for o in &reader.occurrences {
-        // D4: an integer branch predicate is not a token operation at all, and
+        // An integer branch predicate is not a token operation at all, and
         // refusing it would refuse every branching body for computing its own
         // condition. One predicate decides it, on recorded facts.
         if super::fold_types::moves_no_token(types, &call.caller, o) {
@@ -1008,7 +1009,7 @@ fn effects<'a>(
                         && o.site.block == call.block
                         && o.site.statement == call.statement;
                     let other_site = (o.site.block, o.site.statement);
-                    // R339-5 D1: a callee that lends or borrows every pointer
+                    // A callee that lends or borrows every pointer
                     // argument it is given moves no token out of this caller —
                     // it frames the argument and hands back a view, and the
                     // caller keeps its token across the call, which is what
@@ -1018,7 +1019,7 @@ fn effects<'a>(
                     // and this gate derives no view set of its own.
                     //
                     // A callee that neither lends nor borrows a pointer argument
-                    // is a producer or a consumer and still refuses (K-D1), and
+                    // is a producer or a consumer and still refuses, and
                     // so does an argument whose slot is not represented.
                     let lends_every_pointer_argument = || {
                         let mut pointers = 0;
@@ -1041,7 +1042,7 @@ fn effects<'a>(
                     if !own && !fold_sites.contains(&other_site) && lends_every_pointer_argument() {
                         continue;
                     }
-                    // R339-5 D3: a callee given no pointer at all, whose return
+                    // A callee given no pointer at all, whose return
                     // is fresh on every path, moves no token out of this caller
                     // — it creates one. `ValueOrigins` carries the callee's own
                     // origins across the boundary substitution, so this asks the
@@ -1051,7 +1052,7 @@ fn effects<'a>(
                     // cannot disagree about the same value.
                     //
                     // Taking no pointer argument is necessary and not
-                    // sufficient (K-D3): a callee handed an owning pointer could
+                    // sufficient: a callee handed an owning pointer could
                     // free it and still return a fresh cell, which the freshness
                     // half alone would admit. A callee that returns one of its
                     // inputs, a borrow, a null alone, or anything unclassified
@@ -1080,9 +1081,9 @@ fn effects<'a>(
                         }
                     }
                     if !own && fold_sites.contains(&other_site) {
-                        // D2-a: admitted when the two cannot share a path, and
+                        // Admitted when the two cannot share a path, and
                         // named when they can — the caller is then folding
-                        // twice over one execution, which is D2-b's hold.
+                        // twice over one execution, which is a hold.
                         if !mutually_exclusive(blocks, call.block, o.site.block) {
                             return Err(Hold::MultipleFoldSitesOnPath);
                         }
@@ -1092,7 +1093,7 @@ fn effects<'a>(
                     }
                 }
                 SourceCallee::RustLibrary(name) => {
-                    // R337-2(b): a read-only intrinsic reads and returns; it
+                    // A read-only intrinsic reads and returns; it
                     // moves no token, which is why the internal certificate
                     // already admits it. Same predicate, so the two cannot
                     // disagree about the same call again.
@@ -1133,7 +1134,7 @@ fn effects<'a>(
     Ok(())
 }
 
-/// R377-1: the slot keys admitted by the return-port rule — a fresh allocation
+/// The slot keys admitted by the return-port rule — a fresh allocation
 /// whose ONLY escape from its frame is that frame's return.
 ///
 /// The subject is the allocation's own slot, which is what carries the
@@ -1142,21 +1143,21 @@ fn effects<'a>(
 ///
 /// 1. every exit-return port of the frame is `Fresh | Null` with at least one
 ///    `Fresh` — every path returns a fresh token or nothing (null is
-///    `Option::None` and carries no token, the 2026-08-23 ruling);
+///    `Option::None` and carries no token);
 /// 2. this allocation reaches one of those ports;
 /// 3. its token is never stored into a field — a `Value` store of it is a second
 ///    escape, and a `Null` store is not;
 /// 4. its token is never handed to a callee — an outgoing call argument is a
 ///    second escape unless that callee's own no-retention evidence covers it,
-///    which this rule does not yet consume (R377-1 §3).
+///    which this rule does not yet consume.
 ///
-/// A frame containing ANY in-frame free is refused. R377-1 ruled the error-path
-/// free admissible, but admitting it needs per-return-statement delivery — which
+/// A frame containing ANY in-frame free is refused. An error-path free is
+/// admissible in principle, but admitting it needs per-return-statement delivery — which
 /// return site delivers the token and which delivers null — and the recorded
 /// `ReturnSelection` carries SSA versions that do not join to the port nodes.
-/// Refusing is the sound reading until that evidence exists; see report 047.
-/// R378-2 STOP 1: why a producer that is otherwise the shape was not admitted.
-/// `ReturnSiteDeliveryUnknown` is the ruled-admissible error-path free that the
+/// Refusing is the sound reading until that evidence exists.
+/// The hold says why a producer that is otherwise the shape was not admitted.
+/// `ReturnSiteDeliveryUnknown` is the admissible error-path free that the
 /// record cannot yet decide — which return site delivers the token and which
 /// delivers null — so refusing is the sound reading, and the hold says so
 /// instead of the producer silently missing from the set.

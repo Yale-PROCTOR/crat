@@ -548,7 +548,7 @@ pub(crate) fn plan(
             }
         }
         // Backward demand selects the successor that can reach this exact
-        // terminal. May-reach fan-out alone never licenses both copy partners.
+        // terminal. May-reach branching alone never licenses both copy partners.
         let mut reaches = BTreeSet::from([terminal]);
         loop {
             let before = reaches.len();

@@ -1,4 +1,5 @@
-//! J07 exact seat-129 Read-B inventory. No model, worker, filesystem or solver API.
+//! The exact inventory of CROWN's ownership units, one record per unit. No model, worker,
+//! filesystem or solver API.
 //! Authority TSV SHA256: 60869d0e423f4e0fd65a74ca55df025e3fbd4968cc76ecaa0f1490f0e924cdca.
 //! Coverage alone never means measured-kind, analysis, or delivery acceptance.
 use std::collections::BTreeMap;

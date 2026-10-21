@@ -1,5 +1,4 @@
-//! R294 raw RED draft v2. Compile fixtures for analysis; never execute their bodies.
-//! Complete-file replacement draft; v1 is preserved as failed authoring evidence.
+//! Return-origin witnesses. Compile fixtures for analysis; never execute their bodies.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
@@ -76,7 +75,7 @@ pub unsafe fn caller(entry: *const u8, choose: bool) -> u8 {
 "##;
 
 mod extended {
-    //! R296 raw whole-item draft: compiler analysis only; fixture bodies never run.
+    //! Whole-item fixtures: compiler analysis only; fixture bodies never run.
     //! Reuse the established Send+Sync compiler callback carrier, not a new one.
 
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -902,11 +901,9 @@ fn check_destination(code: &str, expected: ExpectedObject) {
             actual, expected,
             "normal-return transfer at exact caller/callee/site"
         );
-        // premise-moved:row-a (R318-1). This control asserted that the local-call
-        // clobber reached `_1`'s own depth-0 cell -- true only while the clobber
-        // was whole-state, which was G0-B's era-5a' disposition. Row (a) narrows
-        // it to the cells a callee can reach, so the control now asserts the
-        // NARROWED verdict: `_1`'s own cell is clobbered exactly when its address
+        // A local-call clobber reaches `_1`'s own depth-0 cell unconditionally only
+        // when the clobber is whole-state. The call-reach rule narrows it to the
+        // cells a callee can reach, so the control asserts the NARROWED verdict: `_1`'s own cell is clobbered exactly when its address
         // escapes. It still discriminates in both directions -- a clobber that
         // reached everything would fail here for a non-escaping `_1`, and one
         // that reached nothing would fail for an escaping one.

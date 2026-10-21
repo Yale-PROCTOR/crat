@@ -1,25 +1,24 @@
 //! BO-native signature-origin inference.
 //!
-//! NB5-O replaced the wrapped production `lifetime_flow` route with BO-owned slot types and
-//! `origin_flow`. `OriginSummary` remains the only interface the rest of BO sees. The wrapped
-//! derivation and its production→BO conversion remain compiled only in tests as the differential
-//! oracle; production `analyses/borrow/` stays frozen for the rewriter.
+//! Origins are derived natively over BO-owned slot types and `origin_flow`, in place of the
+//! wrapped legacy `lifetime_flow` route. `OriginSummary` remains the only interface the rest of BO
+//! sees. The wrapped derivation and its legacy→BO conversion remain compiled only in tests as the
+//! differential oracle; the legacy `analyses/borrow/` stays frozen for the rewriter.
 //!
 //! What this adds over the reused summaries: (1) a **transitively-correct** subset closure (the
-//! production `subset_closure` is 1-hop — D3, diagnostic-only, never reused); (2) `unknown` carried
+//! legacy `subset_closure` is 1-hop, diagnostic-only, never reused); (2) `unknown` carried
 //! for candidacy demotion. Origin inference is kind-independent and runs ONCE per program;
 //! `origin_flow::ORIGIN_DERIVATION_COUNT` backs the runs-once invariant.
 //!
-//! §NB3-3c-ii OUTCOME (2026-07-12): compute-only is where origins STAY on the BO path.
-//! - **Depth-0 subset is NOT injected — proven redundant.** `nb3c_origins_subset_redundant_vs_depth0`
-//!   shows every depth-0 origins subset edge (minus `unknown`) is already consumed by the fork via
-//!   production's `depth0_value_flows` seam (fixtures + corpus: all `already`; closure/storage/
-//!   genuinely-new = 0). So there is nothing to inject at depth-0 (deeper origins are the NB5-O harvest).
-//! - **`unknown` candidacy demotion moves to NB4.** A blunt emission-time `¬ref` clause on
-//!   opaque-poisoned slots was prototyped and REJECTED by adversarial review: `¬ref` still permits an
-//!   unsound `Owning` on may-overwrite slots, and it misses direct-arg/field retention. The sound
-//!   treatment is effect-dependent (may-overwrite vs may-supply vs pure-read) = NB4. The clause impl +
-//!   retain-shape/negative-control witnesses are saved as an NB4 seed patch.
+//! Origins stay compute-only on the BO path:
+//! - **The depth-0 subset is NOT injected — it is redundant.** Every depth-0 origins subset edge
+//!   (minus `unknown`) is already consumed by the borrow fork via the legacy `depth0_value_flows`
+//!   seam (closure/storage/genuinely-new edges = 0), so there is nothing to inject at depth 0.
+//! - **`unknown` candidacy demotion is not an emission-time clause.** A blunt emission-time `¬ref`
+//!   clause on opaque-poisoned slots is unsound: `¬ref` still permits an unsound `Owning` on
+//!   may-overwrite slots, and it misses direct-arg/field retention. The sound treatment is
+//!   effect-dependent (may-overwrite vs may-supply vs pure-read); see the no-borrow-origin
+//!   demotion set below.
 
 use rustc_index::{
     Idx, IndexVec,
@@ -105,8 +104,8 @@ pub(crate) fn compute_origins_wrapped(program: &RustProgram<'_>) -> OriginSummar
             // through an `observable_value_target` filter (lifetime_flow.rs:758) that DROPS some
             // argument depth-0 targets, while `storage_aliases` is retained UNFILTERED (:774). So the
             // summary's `value_flows` is NOT a superset of `storage_aliases` — a symmetric storage
-            // direction to a non-observable arg slot lives only in `storage_aliases` (Codex 3c-i
-            // re-review; witness `&raw mut p`: value has arg1@0→return@1, storage the return@1→arg1@0).
+            // direction to a non-observable arg slot lives only in `storage_aliases` (e.g.
+            // `&raw mut p`: value has arg1@0→return@1, storage the return@1→arg1@0).
             // Unioning `storage_aliases` back in BEFORE closing restores the complete relation in one
             // matrix (no separate storage field). The union is not pre-closed across value↔storage
             // chains, so `transitive_closure` below does real work (and is guarded directly).
@@ -140,7 +139,7 @@ pub(crate) fn compute_origins_wrapped(program: &RustProgram<'_>) -> OriginSummar
         .collect()
 }
 
-/// NB5-O native derivation over BO-owned MIR-flow and signature-slot types.
+/// Native derivation over BO-owned MIR-flow and signature-slot types.
 pub(crate) fn compute_origins_native(program: &RustProgram<'_>) -> OriginSummaries {
     let flows = origin_flow::analyze_program_origin_flow(program);
     origin_summaries_from_flows(flows)
@@ -173,38 +172,36 @@ pub(crate) fn compute_origins_a2(
     (origin_summaries_from_flows(flows), plan)
 }
 
-/// Whole-program signature-origin summaries. NB5-O's zero-delta rs-crown differential retired the
-/// wrapped production derivation from the BO path; it remains available only as a test oracle.
+/// Whole-program signature-origin summaries, from the native derivation. The wrapped legacy
+/// derivation, which it reproduces, is not on the BO path; it remains available only as a test
+/// oracle.
 pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
     compute_origins_native(program)
 }
 
-/// §NB4-4c NO-BORROW-ORIGIN DEMOTION SET: the origins' `unknown` SIGNATURE/FIELD slots, mapped to
+/// NO-BORROW-ORIGIN DEMOTION SET: the origins' `unknown` SIGNATURE/FIELD slots, mapped to
 /// their kind-solver `SlotRef`s. `emit_crate_ownership_constraints` applies a monotone `¬ref` to each
 /// (the may-supply demotion).
 ///
-/// **The set is "NO-BORROW-ORIGIN", NOT "opaque-poisoned"** (dump-corrected 2026-07-16). A slot lands
+/// **The set is "NO-BORROW-ORIGIN", NOT "opaque-poisoned"**. A slot lands
 /// in `summary.unknown` when its value has no trackable *borrow* origin — either an opaque-callee
 /// RESULT (opaque return / opaque-supplied field), OR a freshly-`malloc`'d OWNED pointer
-/// (`*out = malloc()`, `return malloc()`). The `malloc_only` vs `malloc_opaque` ablation proves
-/// `opaque(out)` adds NOTHING to this set, so a member cannot be read as "an opaque callee may
-/// overwrite it."
+/// (`*out = malloc()`, `return malloc()`). An `opaque(out)` call adds NOTHING to this set, so a
+/// member cannot be read as "an opaque callee may overwrite it."
 ///
 /// `¬ref`-only is sound precisely because it is SELF-DISCRIMINATING and makes no may-overwrite claim:
 /// - an OWNED slot keeps `Owning` — its malloc source selector still settles it, and `¬ref` forbids
 ///   only the *reference* reading; the slot is `Owning` before AND after (no over-demotion — this is
 ///   what a uniform `¬own` got wrong: it forced owned `*out=malloc()` transfers to `Raw`).
-/// - an opaque RESULT (no owning origin, previously `Ref`) drops to `Raw` — the may-supply FFI-S2-6
-///   fix (a shared `&T` over unknown callee memory the callee may retain + write).
+/// - an opaque RESULT (no owning origin, otherwise `Ref`) drops to `Raw` — the may-supply
+///   demotion (a shared `&T` over unknown callee memory the callee may retain + write).
 ///
-/// Covers base signature slots (args/returns) AND struct fields (the field skip is dropped).
+/// Covers base signature slots (args/returns) AND struct fields (field slots are not skipped).
 ///
-/// DEFERRED — one bucket, gate = effect-row + opaque-interaction detection (see task doc): (a) the
-/// may-OVERWRITE demotion of an owned slot an opaque callee may overwrite — UN-targetable here (the
-/// overwrite is not in `summary.unknown`); marker = the reverted `out@1`-Owning-today assertion.
-/// (b) depth-0 arg retention — marker `nb4_4c_marker_depth0_arg_retention_open`; the tier-2 seed-size
-/// dump (harness `CRAT_BOC1_SEED_SIZE`) sizes it. Both need opaque-callee-interaction detection that
-/// this no-borrow-origin set does not provide.
+/// Not covered here: (a) the may-OVERWRITE demotion of an owned slot an opaque callee may
+/// overwrite — UN-targetable here (the overwrite is not in `summary.unknown`); (b) depth-0 arg
+/// retention. Both need opaque-callee-interaction detection that this no-borrow-origin set does
+/// not provide.
 pub(crate) fn collect_no_borrow_origin_slots(
     origins: &OriginSummaries,
     slots: &CrateSlots,
@@ -220,10 +217,10 @@ pub(crate) fn collect_no_borrow_origin_slots(
     out
 }
 
-/// Map a signature slot to its kind-solver `SlotRef` (shared by the demotion set and the NB4-4c-Q
+/// Map a signature slot to its kind-solver `SlotRef` (shared by the demotion set and the
 /// over-inclusion measurement, so both agree on the mapping).
 ///
-/// §NB4-4c: field slots are NOT skipped — a no-borrow-origin struct-field slot maps to its crate-wide
+/// Field slots are NOT skipped — a no-borrow-origin struct-field slot maps to its crate-wide
 /// kind `SlotRef::Field`. The signature carries the `borrow`-side `StructFieldSlot`; the kind universe
 /// keys on the `borrow_ownership::slots` one — identically shaped, SAME `(struct_did, all-fields
 /// `field_index`)` semantics (`borrow/mod.rs:136` `field.index()` vs `crate_slots.rs:39-46`
@@ -250,7 +247,7 @@ fn signature_slot_to_ref(
         .map(|id| SlotRef::Local(f, id))
 }
 
-/// §NB4-4c-Q (MEASUREMENT-ONLY — item-4 sizing, 2026-07-17): the OVER-INCLUSION subset of the
+/// MEASUREMENT-ONLY: the OVER-INCLUSION subset of the
 /// no-borrow-origin demotion set — `unknown` SIGNATURE/FIELD slots that ALSO carry a modeled borrow
 /// origin. These are the slots the may-supply `¬ref` demotes despite them having a real origin; the
 /// coherence-collateral Ref-loss they cause is what the `CRAT_BOC1_COLLATERAL` sweep measures (n_ref
@@ -259,7 +256,7 @@ fn signature_slot_to_ref(
 /// **NEVER SHIP a demotion that excludes these.** A branch-join `q = if c { op(p) } else { p }` fires
 /// this predicate identically to a definitely-overwritten `q = op(p); q = p` (flow-insensitivity), yet
 /// the branch-join demotion is LEGITIMATE — un-demoting it reinstates an unsound `Ref`. The shippable
-/// fix is item-4's definitely-overwritten-vs-may-reach distinction, not this set. This collector exists
+/// fix is a definitely-overwritten-vs-may-reach distinction, not this set. This collector exists
 /// solely to SIZE the collateral (an UPPER BOUND on what the precise fix would recover).
 ///
 /// `mitigated`: discard incoming edges whose REVERSE is also in `subset`. `subset` folds the SYMMETRIC
@@ -306,7 +303,7 @@ fn carries_modeled_origin(summary: &OriginSummary, s: OriginSlot, mitigated: boo
     false
 }
 
-/// §NB4-4c-Q UPPER BOUND (Codex F1, 2026-07-17): the MAXIMAL over-inclusion — `unknown` SIGNATURE slots
+/// UPPER BOUND: the MAXIMAL over-inclusion — `unknown` SIGNATURE slots
 /// with ANY incoming subset edge, SELF-INCLUSIVE and UNMITIGATED. Unlike the mitigated set, this catches
 /// (a) restored input-root self-origins — `*out = old` after `*out = op()`, whose recovered origin
 /// survives projection only as a self-loop `s → s` (the intermediate `old` is dropped) — and (b)
@@ -321,7 +318,7 @@ fn has_any_incoming_origin(summary: &OriginSummary, s: OriginSlot) -> bool {
         .any(|sub| summary.subset.contains(sub, s))
 }
 
-/// §NB4-4c-Q UPPER-BOUND over-inclusion collector (Codex F1). The self-inclusive maximal set; see
+/// UPPER-BOUND over-inclusion collector. The self-inclusive maximal set; see
 /// `has_any_incoming_origin`. Reported alongside the mitigated set so the gate can use a sound upper
 /// bound (`mitigated ⊆ upper`).
 #[cfg(test)]
@@ -344,7 +341,7 @@ pub(crate) fn collect_upperbound_overincluded_slots(
 
 /// Correct multi-hop transitive closure of `value_flows` (edge `source → target` means
 /// `source`'s origin flows into `target`'s). `answer.contains(sub, sup)` ⇔ `sub` reaches `sup`.
-/// This is the transitively-correct closure the production `subset_closure` (1-hop, D3) is not —
+/// This is the transitively-correct closure the legacy `subset_closure` (1-hop) is not —
 /// note line: successors are taken from the POPPED node, never the root.
 fn transitive_closure(
     value_flows: &SparseBitMatrix<OriginSlot, OriginSlot>,
@@ -509,7 +506,7 @@ mod tests {
         .unwrap()
     }
 
-    /// NB5-O RED: the BO-native derivation must reproduce the wrapped oracle at the finest
+    /// The BO-native derivation must reproduce the wrapped oracle at the finest
     /// summary granularity: every function, ordered slot, subset edge, and unknown membership.
     #[test]
     fn nb5o_native_matches_wrapped_fixture_summaries() {
@@ -537,7 +534,7 @@ mod tests {
         edges.iter().any(|(a, b)| a == sub && b == sup)
     }
 
-    /// RED: a callee that returns its arg ⇒ the return origin ⊇ the arg origin.
+    /// A callee that returns its arg ⇒ the return origin ⊇ the arg origin.
     #[test]
     fn nb3_id_flow_through() {
         let facts = origin_facts("unsafe fn id(p: *mut i32) -> *mut i32 { p }");
@@ -549,7 +546,7 @@ mod tests {
         );
     }
 
-    /// RED: mutual recursion — the SCC fixpoint must converge with each fn's return ⊇ its arg.
+    /// Mutual recursion — the SCC fixpoint must converge with each fn's return ⊇ its arg.
     #[test]
     fn nb3_mutual_recursion_fixpoint() {
         // Terminating mutual recursion (base case) — a non-terminating a→b→a never returns, so its
@@ -570,7 +567,7 @@ mod tests {
         );
     }
 
-    /// RED: an opaque (extern) callee poisons the flowed-through origins.
+    /// An opaque (extern) callee poisons the flowed-through origins.
     #[test]
     fn nb3_unknown_callee_poisons() {
         let facts = origin_facts(
@@ -595,7 +592,7 @@ mod tests {
         );
     }
 
-    /// RED: `*dst = src` — src's origin flows into arg0's storage (output-param shape).
+    /// `*dst = src` — src's origin flows into arg0's storage (output-param shape).
     #[test]
     fn nb3_arg_into_arg0_storage_flow() {
         let facts = origin_facts("unsafe fn f(dst: *mut *mut i32, src: *mut i32) { *dst = src; }");
@@ -610,11 +607,10 @@ mod tests {
         );
     }
 
-    /// SYMMETRIC storage alias folds into `subset` (corrected 2026-07-11 after the 3c-i adversarial
-    /// review). `lifetime_flow`'s `closed()` unions the symmetric `storage_aliases` into `value_flows`
+    /// SYMMETRIC storage alias folds into `subset`. `lifetime_flow`'s `closed()` unions the symmetric `storage_aliases` into `value_flows`
     /// (lifetime_flow.rs:678-680) BEFORE the summary, so both directions of a `*mut *mut` forwarding
     /// alias (`arg1@1 ↔ return@1`) land in `subset` — there is no separate `storage` field and no
-    /// lost direction (the earlier "carry storage separately" concern was moot). Asserting BOTH
+    /// lost direction. Asserting BOTH
     /// directions in `subset` is exactly what pins that the symmetric relation survives the fold.
     #[test]
     fn nb3_storage_alias_symmetric() {
@@ -632,10 +628,10 @@ mod tests {
         );
     }
 
-    /// 3-NODE-CHAIN closure (req 2026-07-11): a→b→c ⇒ a→c — the exact test whose absence let the
-    /// D3 1-hop bug survive in production `subset_closure`. `*a=*b; *b=*c` gives value-flows
-    /// arg3@1→arg2@1→arg1@1; a correct multi-hop closure MUST yield arg3@1→arg1@1 (a 1-hop closure
-    /// would miss it). Pins the "successors from the POPPED node, not the seed" fix forever.
+    /// 3-NODE-CHAIN closure: a→b→c ⇒ a→c — the property the legacy 1-hop `subset_closure`
+    /// violates. `*a=*b; *b=*c` gives value-flows arg3@1→arg2@1→arg1@1; a correct multi-hop
+    /// closure MUST yield arg3@1→arg1@1 (a 1-hop closure would miss it). Pins "successors from the
+    /// POPPED node, not the seed".
     #[test]
     fn nb3_transitive_closure_three_node_chain() {
         let facts = origin_facts(
@@ -651,12 +647,12 @@ mod tests {
         );
     }
 
-    /// DIRECT guard for the multi-hop `transitive_closure` (Codex 3c-i re-review). The end-to-end
+    /// DIRECT guard for the multi-hop `transitive_closure`. The end-to-end
     /// three-node fixture above is vacuous for THIS function: `lifetime_flow`'s summary is already
     /// transitively closed, so a 1-hop or no-op closure still passes it. This feeds a synthetic,
     /// NOT-pre-closed matrix (only A→B and B→C) and asserts the transitive A→C — which a 1-hop closure
     /// (successors taken from the seed, not the popped node) would miss. This is the real guard for the
-    /// closure the NB5-O BO-native (un-closed) input will depend on.
+    /// closure the BO-native (un-closed) input depends on.
     #[test]
     fn transitive_closure_multi_hop_from_synthetic() {
         let mut m: SparseBitMatrix<OriginSlot, OriginSlot> = SparseBitMatrix::new(3);
@@ -676,7 +672,7 @@ mod tests {
         );
     }
 
-    /// Argument depth-0 storage symmetry regression (Codex 3c-i re-review). A storage alias whose
+    /// Argument depth-0 storage symmetry regression. A storage alias whose
     /// target is a NON-observable argument depth-0 slot survives ONLY in `storage_aliases` —
     /// `to_summary()` drops it from `value_flows` via the `observable_value_target` filter. `&raw mut
     /// p` aliases the returned `*mut *mut` pointee storage with `p`'s address, so `subset` must carry
@@ -694,27 +690,27 @@ mod tests {
         );
     }
 
-    // ---- §NB3-3c-ii REDUNDANCY WITNESS (guard-claim discipline) ----
+    // ---- REDUNDANCY WITNESS ----
     //
-    // The rescope claim (2026-07-12): injecting origins' depth-0 subset into the fork adds nothing —
-    // the fork ALREADY consumes `lifetime_flow`'s interprocedural flows through production's own
+    // The claim: injecting origins' depth-0 subset into the fork adds nothing —
+    // the fork ALREADY consumes `lifetime_flow`'s interprocedural flows through the legacy analysis's own
     // `depth0_value_flows` seam (fork replay → `borrow_inference` → `ProvenanceConstraintGraph::new`).
     // This witness proves it PER EDGE-CLASS: every depth-0 origins subset edge (minus `unknown`
     // endpoints) is one of — (already) already in `depth0_value_flows`; (closure) derivable by the
     // fork's own transitive closure of those edges (`compute_subset_closure`/`requires`); or a
     // genuinely-new (storage / composite) edge the fork CANNOT re-derive. The GATE asserts the last
     // two soundness-relevant buckets (`storage`, `genuinely_new`) are EMPTY. If either is non-empty,
-    // injection would add a real constraint ⇒ the redundancy claim is false ⇒ STOP.
+    // injection would add a real constraint ⇒ the redundancy claim is false.
     //
     // Only DEPTH-0 endpoints are in scope: `depth0_value_flows` never carries deeper pointer levels,
-    // and 3c-ii injection would be depth-0 (the depth-0/Local-grained provenance universe). Deeper
-    // origins are the NB5-O harvest, out of scope here.
+    // and injection would be depth-0 (the depth-0/Local-grained provenance universe). Deeper
+    // origins are out of scope here.
 
     use rustc_hash::FxHashSet;
 
     use crate::analyses::{borrow::ProvenanceOwner, borrow_ownership::slots::StructFieldSlot};
 
-    // Owner key preserving FULL field identity (F4, Codex 2026-07-12): `StructFieldSlot` carries
+    // Owner key preserving FULL field identity: `StructFieldSlot` carries
     // `struct_did` + `field_index`, so keying fields by `field_index` alone collided field-0 across
     // DIFFERENT structs and could mask a genuinely-new cross-struct edge as already/reflexive. The
     // enum keeps the whole `StructFieldSlot` — exactly what `provenance_owner` (and thus
@@ -736,7 +732,7 @@ mod tests {
     }
 
     // A depth-0 `SignatureSlot` → the SAME key `depth0_value_flows` uses via `provenance_owner`.
-    // None for depth>0 (out of scope — deeper origins are the NB5-O harvest).
+    // None for depth>0 (deeper origins are out of scope).
     fn slot_key(slot: SignatureSlot) -> Option<OKey> {
         if slot.depth != 0 {
             return None;
@@ -763,7 +759,7 @@ mod tests {
     }
 
     // `v` reachable from `u` over the directed edge set `b` (multi-hop) — the fork's own subset
-    // closure. BFS; successors taken from the POPPED node (the D3-correct closure).
+    // closure. BFS; successors taken from the POPPED node (the correct multi-hop closure).
     fn reachable(b: &FxHashSet<(OKey, OKey)>, u: OKey, v: OKey) -> bool {
         let mut seen: FxHashSet<OKey> = FxHashSet::default();
         let mut stack = vec![u];
@@ -851,7 +847,7 @@ mod tests {
     }
 
     /// GATE: origins' depth-0 subset (minus `unknown`) carries only edges the fork already has or
-    /// re-derives by closure — no `storage`/`genuinely_new`. STOP if either bucket is non-empty.
+    /// re-derives by closure — no `storage`/`genuinely_new`. Fails if either bucket is non-empty.
     #[test]
     fn nb3c_origins_subset_redundant_vs_depth0() {
         const FIXTURES: &[(&str, &str)] = &[
@@ -876,7 +872,7 @@ mod tests {
                  unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; \
                  let r0 = *z; *b = 5; r0 + *z }",
             ),
-            // Two structs with a same-INDEX pointer field (F4 non-vacuity, Codex): exercises field
+            // Two structs with a same-INDEX pointer field (non-vacuity): exercises field
             // slots so the `OKey::Field(StructFieldSlot)` full-identity key is actually stressed — a
             // `field_index`-only key would conflate `A.f0` with `B.f0`.
             (

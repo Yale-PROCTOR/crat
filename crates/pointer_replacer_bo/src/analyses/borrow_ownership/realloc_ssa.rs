@@ -198,7 +198,7 @@ fn plan_body_exact<'tcx>(
             {
                 return Err(error(ReallocSsaUnsupported::StaleSite));
             }
-            // R219 continuations have no conditional CFG edge to rename. The
+            // Unbranched realloc continuations have no conditional CFG edge to rename. The
             // ordinary ownership boundary carries a success qualifier plus
             // explicit source-case/loss receipts, including projected places.
             Ok(ReallocSsaPlan {
@@ -471,7 +471,7 @@ fn plan_body_exact<'tcx>(
     Ok(continuation_plans)
 }
 
-/// R245/R246 recovery validates source identity before converting a coverage limit.
+/// Recovery validates source identity before converting a coverage limit.
 pub(crate) fn plan_body<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     body: &Body<'tcx>,

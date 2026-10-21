@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{crate_slots::CrateSlots, export::BoExport};
 use crate::utils::rustc::RustProgram;
 
-/// v2 (L01⁹, R574-5 (iii)): adds `move-store-obligations`, so the store-as-move
-/// obligations travel with the frame. A v1 export carries no such family.
+/// v2 adds `move-store-obligations`, so the store-as-move obligations travel
+/// with the export. A v1 export carries no such family.
 pub(crate) const SCHEMA: &str = "bo-portable-export-v2";
 
 #[derive(
@@ -35,11 +35,10 @@ pub(crate) enum ExportFamily {
     ArrayFields,
     DemandEvidence,
     ProofEvidence,
-    /// L01⁹ wall 4: one row per qualifying store (design record §3.3);
-    /// `NotRecorded` when `CRAT_ERA5C_MOVE_STORE` is off.
+    /// One row per qualifying store-as-move.
     MoveStoreObligations,
-    /// L01¹¹ (R659-1): one row per arm-(a) application (the call and the lent
-    /// pointer); `NotRecorded` when `CRAT_ERA5C_ARG_ORDER` is off.
+    /// One row per argument-order application (the call and the lent
+    /// pointer).
     ArgOrderApplied,
 }
 
@@ -72,7 +71,7 @@ pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 22] = [
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub(crate) enum CaptureAvailability {
     Captured,
-    /// In particular, the existing L2 residual certificate is not recorded.
+    /// In particular, the existing guarded-repair residual certificate is not recorded.
     NotRecorded {
         reason: String,
     },
@@ -637,8 +636,8 @@ impl Resolver<'_, '_> {
             })
             .collect::<Vec<_>>();
         let mut value = json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal,"known_stack_entries":review.known_stack_entries});
-        // L01¹⁰ (R603-2): additive, and absent when nothing was discharged, so
-        // an entry without a discharge is byte-identical to the frame before.
+        // Additive, and absent when nothing was discharged, so an entry
+        // without a discharge is byte-identical to one written without this key.
         if !review.discharged.is_empty() {
             let discharged=review.discharged.iter().map(|row|{
                 let target=self.slot(row.target)?;
@@ -687,7 +686,7 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
     ))
 }
 
-/// L01¹¹ (R659-1; wave-5d 133 STOP 2): the typed row of the `arg-order-applied`
+/// The typed row of the `arg-order-applied`
 /// family. `call` is the receiving call's MIR location, `span` its `fn_span`,
 /// `lent` the pointer whose reborrow the call receives (the subject the
 /// emission's hoist matches), `owner` the receiving temporary.
@@ -788,7 +787,7 @@ impl PortableExport {
     }
 }
 
-/// L01⁹ wall 4: the typed row of the `move-store-obligations` family. The
+/// The typed row of the `move-store-obligations` family. The
 /// writer serializes it and every reader decodes it, so the two cannot drift.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -802,7 +801,7 @@ pub(crate) struct MoveStoreRow {
     pub(crate) uses: Vec<MoveStoreUse>,
     pub(crate) kept: Vec<u32>,
     pub(crate) kept_uses: Vec<MoveStoreUse>,
-    /// R577-5: the members whose loans the store cleared, with their round kinds.
+    /// The members whose loans the store cleared, with their round kinds.
     pub(crate) cleared: Vec<MoveStoreCleared>,
 }
 
@@ -925,7 +924,7 @@ fn move_store_order(a: &MoveStoreRow, b: &MoveStoreRow) -> std::cmp::Ordering {
     ))
 }
 
-/// The consumer's accessor (ownership-fields 069's discharge reads these): a
+/// The consumer's accessor (the rewriter's discharge reads these): a
 /// family that is `NotRecorded` or rows that do not decode are refused.
 #[cfg(test)]
 pub(crate) fn decode_move_store(

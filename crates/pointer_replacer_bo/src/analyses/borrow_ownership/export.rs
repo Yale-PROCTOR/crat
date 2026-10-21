@@ -1,7 +1,6 @@
-//! BO → rewriter export surface (E-R1..E-R4).
+//! BO → rewriter export surface.
 //!
-//! Specification: `docs/agents/plan/2026-07-28-m05-export-surface-spec.md`.
-//! Ruling basis: Q11 (loan-level identity) and R-Q1a (kind derived fork-side).
+//! Loan identity is loan-level, and a loan's kind is derived fork-side.
 //!
 //! # Contract
 //!
@@ -12,9 +11,9 @@
 //!
 //! # Why a scoped thread-local rather than threaded parameters
 //!
-//! The M0.5 spec proposed threading a flag and a cursor through
+//! The alternative is threading a flag and a cursor through
 //! `emit_crate_ownership_constraints`, `InferCtxt`, and `extract_conflict_edges`.
-//! Recon against current source found three problems with that:
+//! That has three problems:
 //!
 //! 1. `BoOwnDatabase<'opt>` borrows the `Optimize` owned by `KindSolver`, so
 //!    returning it would forbid moving the solver — which several existing call
@@ -29,26 +28,11 @@
 //! changes, it is `None` (and therefore free) on the production path, and its
 //! scope is established by the caller before any capture point runs.
 //!
-//! # The env switch (`CRAT_BO_EXPORT`), and why it exists now
+//! # The ambient arm
 //!
-//! D4 descoped an earlier `CRAT_BO_EXPORT` because it gated onto **nothing** —
-//! it turned on a recorder no one read. That objection is spent: the switch now
-//! gates [`arm_capture`], the production arm in `bo_c1::run::run_bo`, which is
-//! a real consumer of the decision.
-//!
-//! Semantics: resolve-once per process, fail loud on anything other than `0`
-//! or `1`, **default OFF**.
-//!
-//! - **Off (default):** `arm_capture` is inert, so the corpus worker pays no
-//!   recording cost and its `t_emit_s`/`t_fixpoint_s` stay comparable to rows
-//!   banked before the arm existed.
-//! - **On:** the accepted-run region records, which makes the corpus-scale
-//!   export-identity check reproducible directly — no temporary ambient patch
-//!   of the kind the first such measurement needed.
-//!
-//! [`with_bo_export`] is **not** gated. It is the explicit-scope API used by
-//! tests and by any future in-process consumer that has already decided it
-//! wants a recording; the flag governs the *ambient* arm, not the explicit one.
+//! [`arm_capture`] is inert: it installs nothing, so a run that arms through it
+//! pays no recording cost. [`with_bo_export`] is the explicit-scope API for a
+//! caller that wants a recording.
 
 use std::cell::RefCell;
 
@@ -64,12 +48,12 @@ use super::{guarded_repair::MirLocationKey, solver::SlotRef, ssa::constraint::Va
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// §1.2 Lifetime-free keys
+// Lifetime-free keys
 // ---------------------------------------------------------------------------
 
 /// One MIR projection element, lifetime-free and **total**.
 ///
-/// D19/§1.2: the previous `PlaceKey` kept only `Deref` (as a *count*) and
+/// A previous `PlaceKey` kept only `Deref` (as a *count*) and
 /// `Field`, discarding `Index`, `ConstantIndex`, `Subslice`, `Downcast` and
 /// `OpaqueCast`. That made `arr[i]` and `arr[j]` the SAME key, and — because
 /// derefs were counted rather than sequenced — made `(*p).f` and `*(p.f)`
@@ -105,7 +89,7 @@ pub(crate) enum ProjKey {
 /// Lifetime-free, **order-preserving** projection of a MIR [`Place`].
 ///
 /// `Place<'tcx>` cannot escape the analysis, so it is projected here — the same
-/// pattern L2 established with [`MirLocationKey`].
+/// pattern as [`MirLocationKey`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct PlaceKey {
     pub local: Local,
@@ -146,7 +130,8 @@ impl PlaceKey {
         }
     }
 
-    /// Derived view, kept so E-R2/E-R4 consumers written against the old shape
+    /// Derived view, kept so ownership-version and loan-identity consumers written
+    /// against the old shape
     /// do not change. The lossy form is no longer what is STORED.
     #[cfg(test)]
     pub(crate) fn derefs(&self) -> usize {
@@ -162,11 +147,11 @@ pub(crate) fn location_key(location: Location) -> MirLocationKey {
 }
 
 // ---------------------------------------------------------------------------
-// §5.1 E-R4 — loan identity and the R-Q1a kind
+// Loan identity and the loan kind
 // ---------------------------------------------------------------------------
 
 /// The engine's effective per-loan kind, derived by exactly the expression the
-/// invalidation path uses (R-Q1a §0.3).
+/// invalidation path uses.
 ///
 /// **Three-valued on purpose.** The engine's guard is
 /// `if let Some(p) = local_data[..] && !is_mutable(p) { continue }`, so a loan
@@ -183,7 +168,7 @@ pub(crate) enum LoanKind {
     NoProvenance,
 }
 
-/// How the loan entered BO replay. Orthogonal to mutability [`LoanKind`]: A12 uses this typed
+/// How the loan entered BO replay. Orthogonal to mutability [`LoanKind`]: the copy-lend funnel uses this typed
 /// class to apply shared CopyLend invalidation without changing older syntactic loan semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoanClass {
@@ -212,9 +197,8 @@ impl LoanKind {
 
 /// Owner of an `Assign` borrow, mirrored lifetime-free with a total order.
 ///
-/// D5 payload, restored: the spec always required it, M0 dropped it. As a
-/// display field that was a precision loss; as a **key** component it is a
-/// correctness question, which is why D5 became blocking for §1.
+/// As a display field this payload would be only a matter of precision; as a
+/// **key** component it is a correctness question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum OwnerKey {
     Local(u32),
@@ -235,9 +219,9 @@ impl OwnerKey {
 }
 
 /// Which loan this is. Orthogonal to [`LoanKind`]: it feeds the access-dependent
-/// self-loan skip, not the kind derivation (R-Q1a §0.5).
+/// self-loan skip, not the kind derivation.
 ///
-/// Both payloads are the D5 restoration. `arg_index` alone happened to separate
+/// Both payloads are key components. `arg_index` alone happened to separate
 /// two `CallArg` loans at one terminator, but only because a terminator has one
 /// callee — an accident of the current shape, not a property of the key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -246,16 +230,16 @@ pub(crate) enum BorrowerKind {
     CallArg { callee: u32, arg_index: usize },
 }
 
-/// The **stable content identity** of one loan (§1.3).
+/// The **stable content identity** of one loan.
 ///
-/// D19: `BorrowSet` loan *numbering* permutes between runs and between CEGAR
+/// `BorrowSet` loan *numbering* permutes between runs and between CEGAR
 /// rounds, because `utils/dsa/union_find.rs` uses a `RandomState`-hashed
 /// `HashSet` and `borrow/mod.rs` pushes sibling loans in `group()` iteration
 /// order. An index into that numbering is therefore not an identity, which is
-/// exactly what E-R4 was created to provide (ruling Q11).
+/// exactly what this key provides.
 ///
 /// **`kind` is deliberately NOT a component.** It is a pure function of
-/// `fn_did` and the borrowed base local (R-Q1a §0.4), so it adds zero
+/// `fn_did` and the borrowed base local, so it adds zero
 /// discriminating power — and a *derived* component in an identity key is a
 /// drift hazard: if the derivation ever moved, one loan would silently become
 /// two identities. Keys are built from inputs, not from analysis outputs.
@@ -293,19 +277,19 @@ impl PartialOrd for LoanKey {
     }
 }
 
-/// Ruling Q11: borrowed place, kind, program point — all three present, now
+/// Borrowed place, kind, program point — all three present, now
 /// carried by a content key rather than by a run-local index.
 ///
 /// `PartialEq` is **hand-written to exclude `run_local_handle`**, and that is a
 /// contract requirement rather than a convenience. The handle is documented as
 /// "never compare across runs"; deriving equality made the compiler compare it
 /// across runs anyway, so two exports with identical CONTENT compared unequal
-/// whenever D19 permuted the numbering. A field that is not identity must not
+/// whenever the loan numbering permuted. A field that is not identity must not
 /// participate in identity.
 #[derive(Clone, Debug, Eq)]
 pub(crate) struct LoanIdentity {
     pub key: LoanKey,
-    /// Run-local handle. **NOT an identity** (D19): `BorrowSet` numbering
+    /// Run-local handle. **NOT an identity**: `BorrowSet` numbering
     /// permutes between runs AND between CEGAR rounds. Valid only for
     /// correlating against other facts from the SAME inference — never
     /// serialize it, never compare it across runs, never use it as a map key.
@@ -337,7 +321,7 @@ pub(crate) struct ResidualConflict {
 }
 
 // ---------------------------------------------------------------------------
-// §3 E-R2 — per-version ownership and move points
+// Per-version ownership and move points
 // ---------------------------------------------------------------------------
 
 /// One consume site: a `(local, location)` pair the ownership emission visited.
@@ -364,7 +348,7 @@ pub(crate) struct ReallocVersionSite {
     pub(crate) def_var: Var,
 }
 
-/// Outcome-qualified responsibility for an unbranched R219 continuation.
+/// Outcome-qualified responsibility for an unbranched `realloc` continuation.
 /// The ordinary SSA result bit is a potential-owning qualifier; failure has
 /// no result claim even when that qualifier permits an owner on success.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,7 +361,7 @@ pub(crate) struct ReallocCaseReceipt {
 }
 
 // ---------------------------------------------------------------------------
-// §4 E-R3 — selector provenance
+// Selector provenance
 // ---------------------------------------------------------------------------
 
 #[derive(
@@ -388,7 +372,7 @@ pub(crate) enum BoundaryRole {
     Sink,
 }
 
-/// Stable runtime identity of one T2 endpoint assertion. Artifact writers
+/// Stable runtime identity of one endpoint-retraction assertion. Artifact writers
 /// render `fn_did` through `TyCtxt::def_path_str`; the in-process key keeps the
 /// typed MIR/function identities used by construction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -479,8 +463,7 @@ pub(crate) struct CallSite {
 /// Everything the export records during one analysis run.
 ///
 /// `PartialEq` is derived so a witness can compare the WHOLE record rather than
-/// a hand-picked subset of fields (F5: the previous D16 witness compared 3 of 6
-/// and called it "byte-identical").
+/// a hand-picked subset of fields.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BoExport {
     /// Recording epochs, not dynamic allocation generations or proof completion.
@@ -512,24 +495,23 @@ pub(crate) struct BoExport {
     pub realloc_version_sites: Vec<ReallocVersionSite>,
     pub realloc_cases: Vec<ReallocCaseReceipt>,
     pub realloc_coverage_holds: Vec<super::realloc_ssa::coverage_hold::Receipt>,
-    /// E-R2 consume sites, in emission order.
+    /// Consume sites, in emission order.
     pub version_sites: Vec<VersionSite>,
-    /// E-R2 per-`Var` ownership, evaluated from the accepted model.
+    /// Per-`Var` ownership, evaluated from the accepted model.
     pub version_owns: Option<IndexVec<Var, bool>>,
-    /// L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): the final round's store-as-move
-    /// obligations (design record §3.3). In-process only: not in the portable
-    /// export or the cache entry until the seat rules on the schema.
+    /// The final round's store-as-move obligations. In-process only: not in
+    /// the portable export or the cache entry while the schema is unsettled.
     pub(crate) move_store_obligations: Option<Vec<super::move_store::MoveStoreObligation>>,
-    /// L01¹¹ (R659-1; wave-5d 133 STOP 2): the final round's arm-(a) applications, one per
-    /// (call, lent pointer); `None` when `CRAT_ERA5C_ARG_ORDER` is off. The rewriter's hoist
+    /// The final round's argument-order applications, one per
+    /// (call, lent pointer); `None` when the argument-order arm is off. The rewriter's hoist
     /// (`arg_order_hoists`) keys them by the call's span, caller and lent local.
     pub(crate) arg_order_applied: Option<Vec<ArgOrderApplied>>,
-    /// E-R3 selector provenance, index-aligned with `Selectors`.
+    /// Selector provenance, index-aligned with `Selectors`.
     pub source_sites: Vec<SelectorSite>,
     pub sink_sites: Vec<SelectorSite>,
-    /// E-R4 loan identity for the complete final `BorrowSet`.
+    /// Loan identity for the complete final `BorrowSet`.
     pub loans: Vec<LoanIdentity>,
-    /// E-R4 certificate: the residual conflicts the accepted model TOLERATES.
+    /// The residual-conflict certificate: the residual conflicts the accepted model TOLERATES.
     ///
     /// **Empty on every fixture measured so far, but NOT provably empty — an
     /// earlier version of this doc claimed it was, and that claim is
@@ -556,21 +538,17 @@ pub(crate) struct BoExport {
     /// set intact.
     ///
     /// What is NOT established is whether such an edge can survive to an
-    /// *accepting* round; no fixture exhibits one (ledger D15). So: empty in
+    /// *accepting* round; no fixture exhibits one. So: empty in
     /// practice, unproven in general, and a consumer must not assume either
     /// way.
     ///
-    /// **`Option`, not `Vec` — D14.** `None` means the accept point never ran,
+    /// **`Option`, not `Vec`.** `None` means the accept point never ran,
     /// so nothing was recorded; `Some(vec![])` means it ran and tolerated no
     /// residual. As a bare `Vec` those two states were indistinguishable, and
     /// that is exactly why no test could detect deletion of the recorder: the
     /// default value and the recorded value were the same value. A consumer
-    /// must not read `None` as "no residuals".
-    ///
-    /// **`None` on the L2 path** (see the ledger's D2 adjacent gap):
-    /// `record_residuals`' sole call site is inside the Mode-A accept, so under
-    /// `CRAT_BO_L2_GUARDED_COMMITS=1` the certificate is never recorded — which
-    /// this type now says out loud instead of presenting as an empty set.
+    /// must not read `None` as "no residuals". Both repairs share the accept
+    /// point, so either records the certificate.
     pub residual_conflicts: Option<Vec<ResidualConflict>>,
 }
 
@@ -580,8 +558,7 @@ impl BoExport {
     /// **Ownership disappearance alone is not sufficient** and this method does
     /// not claim it is: a `free` sink also forces the def version non-owning,
     /// as do returns and by-value calls. Callers must conjoin the MIR-shape
-    /// check that the location is an assignment `other = this` (R-Q1a follow-on
-    /// finding #7). This returns the *candidate* sites only.
+    /// check that the location is an assignment `other = this`. This returns the *candidate* sites only.
     #[cfg(test)]
     pub(crate) fn move_point_candidates(
         &self,
@@ -600,7 +577,7 @@ impl BoExport {
             .collect()
     }
 
-    /// Surviving loans — the ones a re-route may match against (§5.3).
+    /// Surviving loans — the ones a re-route may match against.
     #[cfg(test)]
     pub(crate) fn surviving_loans(&self) -> impl Iterator<Item = &LoanIdentity> {
         self.loans.iter().filter(|l| !l.invalid)
@@ -622,10 +599,9 @@ thread_local! {
 ///
 /// # Why an allow-list
 ///
-/// M0 spent two cycles trying to make a deny-list work: suspend capture at
-/// every probe surface that must not record. Both cycles shipped an
-/// enumeration that turned out to be incomplete (F1 found four surfaces; ADV-1
-/// then found a fifth and sixth reached through a helper). Enumeration is the
+/// A deny-list — suspend capture at every probe surface that must not record —
+/// was tried twice, and both times the enumeration turned out to be incomplete
+/// (surfaces reached through a helper were missed). Enumeration is the
 /// wrong correctness input — it fails open, silently, and each new probe
 /// surface is a new chance to miss one.
 ///
@@ -660,14 +636,14 @@ impl CaptureArm {
     /// Take the recording and end the scope, in CANONICAL order.
     ///
     /// `loans` is sorted by [`LoanKey`] before it leaves the scope. Without
-    /// this the vector carries `BorrowSet` index order, which D19 permutes
+    /// this the vector carries `BorrowSet` index order, which permutes
     /// between runs and between CEGAR rounds — so two analyses of the same
     /// program produced exports with identical CONTENT in different ORDER, and
     /// `BoExport`'s derived `PartialEq` compares `Vec`s order-sensitively.
     ///
-    /// That was not hypothetical: it made the probe-barrage witness flake
-    /// (838/1 then 839/0 on consecutive runs), differing only in two loans
-    /// swapping position. Canonicalising here is what makes E-R4 reproducible
+    /// That was not hypothetical: it made a whole-export comparison flake,
+    /// differing only in two loans swapping position. Canonicalising here is
+    /// what makes loan identity reproducible
     /// for the consumer the content key was introduced for — an unordered
     /// identity set is not much use if the container it ships in is unordered
     /// too.
@@ -741,7 +717,7 @@ pub(crate) fn snapshot() -> Option<BoExport> {
 /// Whether capture is active.
 ///
 /// Active if and only if a scope is open — [`with_bo_export`] or
-/// [`arm_capture`]. There is no env-driven enablement (D4, descoped), and off
+/// [`arm_capture`]. There is no env-driven enablement, and off
 /// any scope this is one thread-local read of an `Option` with every capture
 /// point short-circuiting on it. Inside `run_bo`'s armed region it is true.
 pub(crate) fn capturing() -> bool {
@@ -802,7 +778,7 @@ pub(crate) fn record_ownership_facts(facts: &std::rc::Rc<super::licensing::facts
 }
 
 // ---------------------------------------------------------------------------
-// E-R3 call cursor
+// Selector call cursor
 // ---------------------------------------------------------------------------
 //
 // The data a `SelectorSite` needs is split across two frames that never meet:
@@ -879,7 +855,7 @@ pub(crate) fn current_call_site() -> Option<CallSite> {
     })
 }
 
-/// Join the always-scoped call cursor into the key used by T2 construction.
+/// Join the always-scoped call cursor into the key used by endpoint-retraction construction.
 /// Unlike `record_selector`, this is normative construction input and
 /// therefore remains available when export capture is off.
 pub(crate) fn current_endpoint_retraction_key(
@@ -907,7 +883,7 @@ pub(crate) fn current_endpoint_retraction_key(
     }
 }
 
-/// Record one retractable selector at its push site (E-R3).
+/// Record one retractable selector at its push site.
 pub(crate) fn record_selector(role: BoundaryRole, var: Var) {
     record(|export| {
         let site = SelectorSite {
@@ -922,7 +898,7 @@ pub(crate) fn record_selector(role: BoundaryRole, var: Var) {
     });
 }
 
-/// Record one consume site during ownership emission (E-R2).
+/// Record one consume site during ownership emission.
 pub(crate) fn record_version_site(
     fn_did: LocalDefId,
     local: Local,
@@ -960,7 +936,7 @@ pub(crate) fn record_version_asts(asts: &IndexVec<Var, Bool>) {
     VERSION_ASTS.with(|c| *c.borrow_mut() = Some(asts.clone()));
 }
 
-/// Evaluate the stashed ASTs against a live model (E-R2).
+/// Evaluate the stashed ASTs against a live model.
 ///
 /// `eval` runs only when a capture is active AND the ASTs were stashed, so the
 /// model evaluation costs nothing on the production path.
@@ -976,12 +952,12 @@ pub(crate) fn record_version_owns_from(
     }
 }
 
-/// Record one loan's identity (E-R4).
+/// Record one loan's identity.
 pub(crate) fn record_loan(identity: LoanIdentity) {
     record(|export| export.loans.push(identity));
 }
 
-/// Start a fresh validation round (D1).
+/// Start a fresh validation round.
 ///
 /// The borrow oracle runs once per CEGAR round, each time under a DIFFERENT
 /// candidacy predicate. Without this reset `loans` would accumulate the union
@@ -1009,7 +985,7 @@ pub(crate) fn begin_round() {
     });
 }
 
-/// One arm-(a) application (R609-3 (a)): at `location` (the receiving call) in
+/// One argument-order application: at `location` (the receiving call) in
 /// `function`, a read of the argument list was not an invalidation of the loan
 /// on `*lent`, whose reborrow `owner` the call receives. The emission owes the
 /// hoist of that read above the reborrow.
@@ -1022,7 +998,7 @@ pub(crate) struct ArgOrderApplied {
     pub(crate) owner: Local,
 }
 
-/// L01¹¹: record an arm-(a) application in the current round, once.
+/// Record an argument-order application in the current round, once.
 pub(crate) fn record_arg_order_applied(row: ArgOrderApplied) {
     record(|export| {
         if let Some(rows) = export.arg_order_applied.as_mut()
@@ -1033,7 +1009,7 @@ pub(crate) fn record_arg_order_applied(row: ArgOrderApplied) {
     });
 }
 
-/// L01⁹ wall 4: this round's store-as-move obligations (the final round's remain).
+/// This round's store-as-move obligations (the final round's remain).
 pub(crate) fn record_move_store_obligations(rows: &[super::move_store::MoveStoreObligation]) {
     if !capturing() {
         return;
@@ -1050,7 +1026,7 @@ pub(crate) fn record_move_store_obligations(rows: &[super::move_store::MoveStore
 // accepted run, inert everywhere else — and there is deliberately no API for
 // making an exception.
 
-/// Record the residual conflicts present at acceptance (E-R4 certificate).
+/// Record the residual conflicts present at acceptance (the residual-conflict certificate).
 ///
 /// Called at the `committed == 0` accept point, where the residual set is the
 /// one the accepted model tolerates.

@@ -22,8 +22,8 @@ pub(crate) struct CallKey {
 }
 
 /// Exact static application chains remain distinct through enclosing calls.
-/// A recursive fold is explicitly not an exact allocation identity; T12/G-ID
-/// must certify its per-invocation binder before it can support a grant.
+/// A recursive fold is explicitly not an exact allocation identity; its
+/// per-invocation binder must be certified before it can support a grant.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SourceLineage {
     Exact(Vec<CallKey>),
@@ -199,7 +199,7 @@ pub(crate) mod ordered_pairs {
     }
 }
 
-/// era-5c R541-3 / report 048: write a sequence as `[e0,e1,…]` with each element
+/// Write a sequence as `[e0,e1,…]` with each element
 /// passed through a `serde_json::Value` on its own. Byte-identical to the element
 /// run of `to_writer(&to_value(whole))` (a `Value` only sorts OBJECT keys, and
 /// every element is sorted the same way alone), with memory bounded by the
@@ -409,10 +409,10 @@ pub(crate) struct MatchedTransport {
 }
 
 impl MatchedTransport {
-    /// Report 048: the streamed form of `serde_json::to_writer(&to_value(self))`,
+    /// The streamed form of `serde_json::to_writer(&to_value(self))`,
     /// byte for byte. The object's keys in `Value`'s sorted order, each
     /// `ordered_pairs` field as its pairs, each pair through its own `Value`.
-    /// lil's cache write died building this whole `Value` (report 042).
+    /// Building this whole `Value` exhausts memory on a large program's cache write.
     pub(crate) fn write_canonical(&self, w: &mut dyn std::io::Write) -> Result<(), String> {
         let raw = |w: &mut dyn std::io::Write, bytes: &[u8]| -> Result<(), String> {
             w.write_all(bytes).map_err(|e| e.to_string())
@@ -1731,7 +1731,7 @@ impl MatchedTransport {
                             Guards::new()
                         };
                     for (matched, pair) in row.matched.iter().enumerate() {
-                        // L01¹⁰: a Lent row's container pair is framed, not a port.
+                        // A Lent row's container pair is framed, not a port.
                         if row.lends_pair(matched) {
                             continue;
                         }

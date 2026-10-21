@@ -88,7 +88,7 @@ pub(crate) fn certify_metadata(
     admit_internal(&internal_result)?;
     let internal = internal_result.map_err(Error::Internal)?;
     let candidate = join_native(facts, call, argument, owning_fields, &internal.used_fields)?;
-    // R304-9/R304-10: a write or copy the named store inventory could not
+    // A write or copy the named store inventory could not
     // resolve denies the field scheme it may alias. The inventory fails closed,
     // so the fold holds rather than treating the cell as unwritten.
     for descendant in &candidate.descendants {

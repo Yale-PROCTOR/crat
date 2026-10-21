@@ -100,7 +100,7 @@ where
                             .expect("old operand identity"),
                         || {
                             // Both source alternatives close the old claim: a
-                            // success retirement, or R219's failure loss law. This
+                            // success retirement, or the failure loss law. This
                             // is never a declaration that failure frees the block.
                             <Analysis as InferMode>::sink(self, argument);
                         },

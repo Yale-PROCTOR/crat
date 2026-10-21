@@ -1,4 +1,4 @@
-//! O02 alternatives from real zero-query compiler construction facts.
+//! Value-origin alternatives from real zero-query compiler construction facts.
 
 use super::{
     super::{
@@ -298,7 +298,7 @@ pub unsafe fn run(fresh: bool, p: *mut i32) -> *mut i32 { mixed(fresh, p) }
             assert!(omitted.boundary_substitutions.len() < before);
             let origins = ValueOrigins::build(&omitted);
             assert!(!origins.fresh_without_borrow(node));
-            // R367-2: the atom the callee's unresolvable `Input` becomes is now
+            // The atom the callee's unresolvable `Input` becomes is
             // typed — `UnresolvedInput` keeps the formal port instead of losing
             // it. The claim this control makes is unchanged and is the first
             // assertion: the value is still not provably fresh. What the type

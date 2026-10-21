@@ -1,20 +1,20 @@
-//! §NB0 — the unified BO boundary table.
+//! The unified BO boundary table.
 //!
 //! ONE registry mapping every callee name the BO analyses know anything about
-//! to its roles, unifying knowledge that previously lived in three legacy
-//! lists (plus a fourth found during NB0 recon):
+//! to its roles, unifying knowledge that previously lived in four legacy
+//! lists:
 //!   1. `sources.rs::ALLOCATOR_NAMES` (BO malloc-source slot walk),
 //!   2. production `borrow/mod.rs::is_borrowing_method` (3 names),
 //!   3. production `borrow/lifetime_flow.rs` whitelists (pointer arithmetic,
 //!      slice views/indexing/splits, C-string search, null constructors),
 //!   4. `call_graph.rs`'s Alloc/Dealloc monotonicity ranking lists.
-//! Production `borrow/` keeps its own copies untouched (NB plan prime
-//! directive); the subset tests below pin its lists as literals.
+//! Production `borrow/` keeps its own copies untouched; the subset tests
+//! below pin its lists as literals.
 //!
-//! Data-only in NB0: BO's `infer/boundary/{libc,library}.rs` hooks keep their
+//! Data-only: BO's `infer/boundary/{libc,library}.rs` hooks keep their
 //! dispatch arms (behavior), and consistency tests enforce that every
-//! dispatched name appears here with the matching role. Rewiring dispatch
-//! through the table is NB3/NB4's job, when roles become behavior.
+//! dispatched name appears here with the matching role. Dispatch is rewired
+//! through the table only when roles become behavior.
 //!
 //! Matching disciplines deliberately DIFFER per row (`Matcher`): a naive
 //! name-union would silently change semantics — e.g. `sources.rs` insists on
@@ -23,7 +23,7 @@
 //! bare name across every callee kind. Type guards (slice-shaped args/dests)
 //! are recorded in each row's comment, not enforced here.
 
-/// Semantic role of a callee, per the NB0 taxonomy (source / sink /
+/// Semantic role of a callee, per the table's taxonomy (source / sink /
 /// loan-creating / provenance-preserving flow / unknown), refined by the
 /// concrete role kinds the legacy lists actually encode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,12 +40,12 @@ pub(crate) enum Role {
     /// Flows arg0's provenance to the return value (pointer arithmetic,
     /// slice views/indexing, C-string search).
     ///
-    /// ⚠ NB3/NB4 consumers: several rows carrying this role are TYPE-GUARDED
+    /// ⚠ Consumers: several rows carrying this role are TYPE-GUARDED
     /// in production (slice views require a slice-like-ref destination;
     /// slice indexing and `memchr` require a slice-like-ref arg0 — see each
     /// row's comment). Consuming the role WITHOUT re-implementing the guard
     /// over-matches production semantics. The guards live only in the row comments
-    /// because NB0 is data-only; they MUST become code when roles become
+    /// because the table is data-only; they MUST become code when roles become
     /// behavior.
     ProvenanceFlow,
     /// Recognized only to SUPPRESS unknown-target poisoning; adds no flow
@@ -60,11 +60,12 @@ pub(crate) enum Role {
     Ignore,
 }
 
-/// §NB4-4a-ii — the **pointee-effect axis**: what a callee may do to the POINTEE of a
+/// The **pointee-effect axis**: what a callee may do to the POINTEE of a
 /// pointer argument. Orthogonal to `Role` (which describes provenance/ownership
-/// plumbing, not pointee access). **Pinned here once; 4c consumes it unmodified.**
+/// plumbing, not pointee access). **Pinned here once; consumers use it unmodified.**
 ///
-/// `NoAccess` is the BOTTOM of the lattice and is the only class 4a-ii consumes: an
+/// `NoAccess` is the BOTTOM of the lattice and is the only class the call-site
+/// access refinement consumes: an
 /// argument whose callee provably never touches the pointee gets a SHALLOW access (the
 /// pointer VALUE) instead of the blanket `Deep` access to `(*arg)` that the Call arm emits
 /// today — which is what manufactures conflicts a callee cannot possibly cause.
@@ -75,25 +76,25 @@ pub(crate) enum Role {
 pub(crate) enum Effect {
     /// The callee never dereferences the argument. It may copy, compare, or inspect the
     /// POINTER VALUE (`is_null`, `addr`), but the pointee is never read or written.
-    /// **The class 4a-ii gates on.**
+    /// **The class the call-site access refinement gates on.**
     NoAccess,
     /// The pointee may be READ, never written.
     PureRead,
     /// The pointee may be WRITTEN in place.
     MayWrite,
     /// The pointee may be REPLACED with foreign memory (an out-param the callee overwrites)
-    /// — the class that makes a blunt `¬ref` unsound (it needs `¬owning` too). Consumed at 4c.
+    /// — the class that makes a blunt `¬ref` unsound (it needs `¬owning` too).
     MayOverwrite,
     /// The callee may SUPPLY caller-visible provenance (its return, or an out-param, carries
-    /// memory the callee owns or borrows). Consumed at 4c.
+    /// memory the callee owns or borrows).
     MaySupply,
     /// The callee may RETAIN the pointer beyond the call (store it into foreign state).
-    /// Nothing consumes retention until 4c; it is pinned now so the schema is not re-litigated.
+    /// Nothing consumes retention yet; it is pinned so the schema stays fixed.
     MayRetain,
 }
 
-/// §NB4-4a-ii — the ONE `Role` → `Effect` mapping (rider 5: stated once, here). 4c consumes
-/// it unmodified. Anything NOT mapped to `NoAccess` is treated as touching the pointee.
+/// The ONE `Role` → `Effect` mapping, stated once, here; consumers use it unmodified.
+/// Anything NOT mapped to `NoAccess` is treated as touching the pointee.
 ///
 /// Only `Ignore` (`addr` — the arg is discarded) and `Lend` (`is_null` — the POINTER is
 /// inspected, never the pointee) are `NoAccess`. Every other role either reads, writes, frees,
@@ -163,8 +164,8 @@ const fn entry(name: &'static str, matcher: Matcher, roles: &'static [Role]) -> 
 }
 
 /// The unified table. Contents are EXACTLY the union of the four legacy
-/// lists plus BO's own boundary hooks — NB0's non-goal forbids new names
-/// (expansion changes fragment F and is its own decision).
+/// lists plus BO's own boundary hooks — no new names (expansion changes the
+/// modeled fragment and is its own decision).
 pub(crate) const TABLE: &[Entry] = &[
     // --- extern "C" callees (ForeignC): BO libc hooks + sources.rs +
     // --- call_graph.rs monotonicity ranking.
@@ -177,18 +178,18 @@ pub(crate) const TABLE: &[Entry] = &[
     // NOT unify.
     entry("strdup", Matcher::ForeignC, &[Role::Source]),
     // libc.rs call_realloc: source(destination) + sink(arg0); sources.rs; call_graph Alloc. Sink
-    // owning selector-retractable since NB-F.
+    // owning is selector-retractable.
     entry("realloc", Matcher::ForeignC, &[Role::Source, Role::Sink]),
-    // libc.rs call_free: sink(arg0); call_graph Dealloc. Sink owning selector-retractable since
-    // NB-F (leak-the-free).
+    // libc.rs call_free: sink(arg0); call_graph Dealloc. Sink owning is selector-retractable
+    // (the solver may leak the free).
     entry("free", Matcher::ForeignC, &[Role::Sink]),
     // libc.rs call_memset: transfer(dest, arg)
     entry("memset", Matcher::ForeignC, &[Role::FlowTransfer]),
     // --- BO library hooks (RustPtrPath: def_path starts at TypeNs("ptr")).
     // library.rs call_offset: lend(arg) + borrow(dest); release-active assert!(!is_ref)
     entry("offset", Matcher::RustPtrPath, &[Role::LoanCreating]),
-    // library.rs call_is_null: lend(arg); §NB-F an is_ref arg has its leading outer-reference slot
-    // peeled before the lend (the former uthash tripwire assert!(!is_ref) is gone)
+    // library.rs call_is_null: lend(arg); an is_ref arg has its leading outer-reference slot
+    // peeled before the lend (no `assert!(!is_ref)` here)
     entry("is_null", Matcher::RustPtrPath, &[Role::Lend]),
     // library.rs call_addr: arg ignored
     entry("addr", Matcher::RustPtrPath, &[Role::Ignore]),
@@ -342,8 +343,7 @@ pub(crate) fn lookup(name: &str, matcher: Matcher) -> Option<&'static Entry> {
 // ---------------------------------------------------------------------------
 // PRECONDITION for every test below: the pinned production name lists are
 // literals copied from `analyses/borrow/` (file:line noted per test), valid
-// while the production `borrow/` + `ownership/` freeze (NB plan prime
-// directive, docs/agents/tasks/2026-07-03-bo-native-borrow-plan.md §0) holds.
+// while the production `borrow/` + `ownership/` stay frozen.
 // If that freeze is ever lifted, RE-AUDIT the pins against the live code
 // before trusting either a failure or a pass of these tests.
 // ---------------------------------------------------------------------------
@@ -372,7 +372,7 @@ mod tests {
         assert!(!TABLE.is_empty(), "the table must not be a stub");
     }
 
-    /// Legacy list 1 — `sources.rs::ALLOCATOR_NAMES` (pre-NB0 const, formerly
+    /// Legacy list 1 — `sources.rs::ALLOCATOR_NAMES` (the const before this table, formerly
     /// sources.rs:46): every allocator is a ForeignC Source row, and
     /// `sources_foreign()` reproduces the set exactly.
     #[test]
@@ -474,7 +474,7 @@ mod tests {
         }
     }
 
-    /// Legacy list 4 (NB0 recon extension; zero new names) —
+    /// Legacy list 4 (zero new names) —
     /// `call_graph.rs:90-104` monotonicity ranking: Alloc = malloc, calloc,
     /// realloc; Dealloc = free; both ForeignC. NOTE: `strdup` is
     /// INTENTIONALLY absent from call_graph's Alloc list (it ranks

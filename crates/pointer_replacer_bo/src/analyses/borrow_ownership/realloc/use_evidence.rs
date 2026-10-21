@@ -1,4 +1,5 @@
-//! Bounded source use evidence for R219. This is not ownership or field SSA.
+//! Bounded source use evidence for realloc result outcomes. This is not
+//! ownership or field SSA.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -299,7 +300,8 @@ fn walk<'tcx>(
                     state.aliases.insert(destination);
                 } else if matches!(&call.func, CallKind::LibC(name) if name.as_str() == "free") {
                     // free(NULL) is valid. Retirement never proves a usable
-                    // result; a subsequent use after free cannot supply P0.
+                    // result; a subsequent use after free cannot witness a usable
+                    // result.
                     if !derived.is_empty() {
                         state.retired = true;
                     }

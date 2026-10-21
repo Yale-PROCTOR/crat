@@ -45,9 +45,9 @@ pub(crate) struct Proof {
     pub(crate) packed_return: Option<PackedReturn>,
     pub(crate) terminal_inventory: Vec<usize>,
 }
-/// R329-2: which gate refused, so `Unsupported` reads as a gate rather than a
-/// wall. `SingleDescendantOnly` is the width limit R317-2 deferred, named so it
-/// can be counted at the first measurement.
+/// Which gate refused, so `Unsupported` reads as a gate rather than a
+/// wall. `SingleDescendantOnly` is the deferred width limit, named so it
+/// can be counted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Site {
     RouteCycle,
@@ -65,28 +65,27 @@ pub(crate) enum Site {
     UnsupportedExpression,
     NonPointerDestinationWithSource,
     SourceOperandMissing,
-    /// R337-3(ii): a cell of a landed or returned object whose token was
+    /// A cell of a landed or returned object whose token was
     /// consumed and never put back. In C the cell still holds what was read out
     /// of it; the model consumes on read and the emitted owning form moves the
     /// token, so a later read sees a value there and nothing here. That
-    /// divergence is outside §28, so it refuses. A null store counts as a
+    /// divergence is not excused by the UB-free-input premise, so it refuses. A null store counts as a
     /// refill.
     ConsumedCellNotRefilled,
-    /// R336-2: a view freed. The callee only LENT the component, so the caller
+    /// A view freed. The callee only LENT the component, so the caller
     /// still owns it and still reaches it; freeing the view frees a subtree the
     /// caller is responsible for, and on the emitted side it is a `free`
     /// through what became a borrow into a `Box`.
     SinkOnView,
-    /// R335-4: a view stored into an owning cell. The callee only LENT the
+    /// A view stored into an owning cell. The callee only LENT the
     /// component, so the caller still owns it; writing the view back makes the
     /// cell name a node inside its own old generation, and the emitted
     /// overwrite drops that generation while the cell still points into it.
     ViewStoredIntoOwningCell,
-    /// R319-3's owed split: a store into a pointer field of the certified
-    /// structure, reached through the certified root. This is the
-    /// DEFERRED-G-FIELD-IN-CERTIFICATE case — W-CF-5's second destination and
-    /// (b)'s `root->left = insert(root->left, key)` — and it is a deferral, not
-    /// an escape. Named so the two are counted apart at the first measurement.
+    /// A store into a pointer field of the certified structure, reached
+    /// through the certified root. This is the deferred field-in-certificate
+    /// case — e.g. `root->left = insert(root->left, key)` — and it is a
+    /// deferral, not an escape. Named so the two are counted apart.
     FieldStoreDeferred,
 }
 
@@ -108,7 +107,7 @@ pub(crate) enum TransferGap {
     LandingDestinationAbsent,
     /// A depth-0 store the certificate cannot account for as a transfer or a
     /// registered proxy. Carries the store, because a fix needs to know which
-    /// one — R325-1's structured receipt, as `AmbiguousRoute` carries its ends.
+    /// one, as `AmbiguousRoute` carries its ends.
     StoreNotCovered { block: u32, statement: usize },
     /// The store is covered, but one of its two consume records is absent.
     ConsumeRecordAbsent,
@@ -125,7 +124,7 @@ pub(crate) enum TransferGap {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Error {
     Unsupported(Site),
-    /// R332-2: the line that refused. `Coverage` reaches here from 36 explicit
+    /// The line that refused. `Coverage` reaches here from 36 explicit
     /// sites and from every `one()` call, so naming them by hand would have
     /// missed the helper entirely; `#[track_caller]` attributes those to their
     /// caller instead.
@@ -136,28 +135,28 @@ pub(crate) enum Error {
     /// The single positive route forks or dead-ends: the value reaches more than
     /// one place, or none. Distinct from UnaccountedToken, which is a return
     /// that does not account for every input component. Carries the choice count
-    /// so the refusal says which, per R325-1's structured receipt.
+    /// so the refusal says which.
     AmbiguousRoute {
         choices: usize,
         from: Node,
         to: Node,
     },
-    /// Retained so an entry written before R350-3 still decodes its own
+    /// Retained so an entry written before `MissingTransferGap` still decodes its own
     /// recorded reason. Nothing emits it any more.
     MissingTransfer,
-    /// R350-3(2): twelve distinct conditions returned `MissingTransfer` with no
+    /// Twelve distinct conditions returned `MissingTransfer` with no
     /// way to tell them apart from a recorded entry. The gap says which.
     MissingTransferGap(TransferGap),
     BoundaryCoverage,
     FrameCoverage,
-    /// R317-1: each path certifies, but their boundary summaries are not one
+    /// Each path certifies, but their boundary summaries are not one
     /// contract.
     BoundaryDisagreement,
-    /// R317-2: the per-path core keeps one sink per path.
+    /// The per-path core keeps one sink per path.
     MultipleSinks,
-    /// R315-2: more CFG paths than the budget admits.
+    /// More CFG paths than the budget admits.
     PathBudget,
-    /// R310-1: a loop whose body performs a consuming token operation. Only a
+    /// A loop whose body performs a consuming token operation. Only a
     /// loop that leaves every token untouched is admitted, and then it is not
     /// traversed, because it cannot change what the paths carry.
     LoopWithTokenOperation,
@@ -390,10 +389,10 @@ fn takes_no_owning_argument(
     })
 }
 
-/// R317-2's must-answer for W-CF-6: which pointer fields of the certified
+/// Which pointer fields of the certified
 /// parameter this path proves null. A null pointer carries no token, so a
 /// component proven null before the parent's free owes neither a take nor a
-/// pre-free zero — which is what `deleteNode`'s one-child arm rests on.
+/// pre-free zero — which is what a tree delete's one-child arm rests on.
 ///
 /// Every link is recorded evidence, none of it inferred. The block's `switch`
 /// says what it branched on and names its arms; the arm this path takes is the
@@ -453,7 +452,7 @@ fn path_null_fields(
             continue;
         };
         let Some(place) = operand(value) else { continue };
-        // `None` is the root itself — bst's `if (node == NULL)` — and
+        // `None` is the root itself — `if (node == NULL)` — and
         // `Some(index)` one of its pointer fields.
         let component = match place.projection.as_slice() {
             [] => None,
@@ -476,7 +475,7 @@ fn path_null_fields(
     Ok(proven)
 }
 
-/// R315-2: every CFG path from entry to a return. A back edge is admitted only
+/// Every CFG path from entry to a return. A back edge is admitted only
 /// when the loop it closes performs no consuming token operation, and is then
 /// not traversed; any other loop is a typed hold.
 fn enumerate_paths(
@@ -521,7 +520,7 @@ fn enumerate_paths(
     Ok(complete)
 }
 
-/// R319-4/R320-3: the `phase == "phi"` equations this path admits. Neither the
+/// The `phase == "phi"` equations this path admits. Neither the
 /// equation nor the phi edge names the predecessor, so it is recovered through
 /// the version table: an input variable belongs to exactly one `(local, ssa)`,
 /// and `(to, local, input_ssa)` selects the edge that carries `from`. Fails
@@ -597,7 +596,7 @@ pub(crate) fn certify_linear_metadata(
 /// established further up. A callee already in it gets no contract, which is
 /// what makes mutual recursion terminate rather than descend; the function
 /// under proof is the exception, since assuming its own contract is the whole
-/// of R310-2.
+/// of the assume-guarantee step.
 fn certify_visiting(
     facts: &Facts,
     construction: u32,
@@ -632,7 +631,7 @@ fn certify_visiting(
         )?);
     }
     let [first, rest @ ..] = proofs.as_slice() else { return Err(Error::Coverage(line!())) };
-    // R321-3: which object the returned token names is not a component of the
+    // Which object the returned token names is not a component of the
     // boundary. Only whether a token comes back, and how many.
     if rest.iter().any(|proof| {
         proof.parameter != first.parameter
@@ -790,9 +789,8 @@ fn certify_path(
         return Err(Error::Coverage(line!()));
     }
     // The path's own rows, not the function's. Without this a selection such as
-    // `taking` sees the other path's take as well and `one()` reports Coverage,
-    // which is what W-CF-1 was refusing on. A point with no block belongs to
-    // every path; a phi equation belongs only to the path that admitted it.
+    // `taking` sees the other path's take as well and `one()` reports Coverage.
+    // A point with no block belongs to every path; a phi equation belongs only to the path that admitted it.
     let on_path = |p: &super::super::ownership_evidence::Point| {
         scope(p) && p.block.is_none_or(|block| order.contains_key(&block))
     };
@@ -845,8 +843,8 @@ fn certify_path(
         return Err(Error::Coverage(line!()));
     }
     // Independent source coverage catches escaping stores absent from the graph.
-    // R319-3's split: a store into a pointer field of the certified structure,
-    // written through the certified root itself, is the deferred G-FIELD case
+    // A store into a pointer field of the certified structure,
+    // written through the certified root itself, is the deferred field case
     // and says so; every other pointer destination is an escape.
     for occurrence in &body.occurrences {
         if !order.contains_key(&occurrence.site.block) {
@@ -857,8 +855,8 @@ fn certify_path(
             continue;
         }
         // Keyed on the structure being written, not on which local reaches it:
-        // W-CF-5 stores through the taken descendant and `insert` stores through
-        // the parameter, and both are the same deferred case. Whether the base
+        // a store through the taken descendant and one through the parameter (a
+        // recursive insert) are the same deferred case. Whether the base
         // is a token this certificate accounts for is the admission question,
         // not the classification one — and both arms refuse either way, so the
         // split can only move a refusal's name, never its verdict.
@@ -883,7 +881,7 @@ fn certify_path(
     }
     let graph =
         CandidateGraph::build_metadata(facts, aliases).map_err(|_| Error::Coverage(line!()))?;
-    // R310-2, assume-guarantee: a call to the function under proof carries the
+    // Assume-guarantee: a call to the function under proof carries the
     // contract being proved, so the token that goes in is the token that comes
     // back and the callee's body is never traversed. Only the root component is
     // paired: the argument's own window is one slot wide, the callee's deeper
@@ -891,7 +889,7 @@ fn certify_path(
     // else is not admitted here — its contract is not the one being assumed.
     let mut assumed = Vec::new();
     // A callee whose contract this certificate may assume: the function under
-    // proof, by R310-2; or any other function that has a certificate of its
+    // proof, by assume-guarantee; or any other function that has a certificate of its
     // own, established here rather than taken on trust. `visiting` stops a
     // cycle from descending, and the depth bound stops a long chain from
     // costing more than it is worth — both fail closed, since a callee with no
@@ -909,7 +907,7 @@ fn certify_path(
         deeper.insert(function.to_string());
         certify_visiting(facts, construction, callee, formal, aliases, &deeper).is_ok()
     };
-    // R335-4: does this callee LEND the argument rather than take it? Then the
+    // Does this callee LEND the argument rather than take it? Then the
     // caller keeps its token across the call — a frame on the argument, exactly
     // the shape a read-only intrinsic's lend takes — and what comes back is a
     // view, which owns nothing.
@@ -1001,8 +999,7 @@ fn certify_path(
             // A phi edge is how a value crosses a merge block. `equations` is
             // already restricted to this path's admitted phis, so admitting the
             // rule here is automatically path-selective. Without it a route
-            // through any merge dead-ends, which is the `choices: 0` the three
-            // witnesses were reporting.
+            // through any merge dead-ends (`choices: 0`).
             Evidence::Transfer(id) | Evidence::Frame { equation: id, .. } | Evidence::Phi(id) => {
                 id.construction == construction
                     && equations.iter().any(|e| e.ordinal == id.ordinal)
@@ -1049,7 +1046,7 @@ fn certify_path(
     if sinks.len() > 1 {
         return Err(Error::MultipleSinks);
     }
-    // R336-2: and a view may not be sunk either. Without this the shape refuses
+    // And a view may not be sunk either. Without this the shape refuses
     // only because the route happens to dead-end, which is not the reason.
     if sinks.iter().any(|sink| views.contains(&sink.node)) {
         return Err(Error::Unsupported(Site::SinkOnView));
@@ -1088,14 +1085,14 @@ fn certify_path(
                 if null_fields.contains_key(&Some(*index)))
         })
         .collect();
-    // R310-2: a path that proved the parameter null carries no token in any of
+    // A path that proved the parameter null carries no token in any of
     // its components, so the token it returns cannot be one of them. It has to
     // come from somewhere that took nothing from us — a call on this path with
     // no owning argument at all cannot be handing one of our components back —
-    // and the route is re-rooted there rather than waived. This is bst's
+    // and the route is re-rooted there rather than waived, as in
     // `if (node == NULL) return newNode(key);`.
-    // Available, not required: `deleteMaybe` proves its root null and returns
-    // that same null root, which routes from the input as usual. The fresh
+    // Available, not required: a body that proves its root null and returns
+    // that same null root routes from the input as usual. The fresh
     // source is the alternative start for a path that returns something else.
     let fresh_source = null_fields.get(&None).and_then(|_| {
         let mut receivers = boundaries.iter().filter(|b| {
@@ -1144,7 +1141,7 @@ fn certify_path(
         let sink_eq = one(equations
             .iter()
             .filter(|e| e.ordinal == sink.equation.ordinal))?;
-        // R317-2's width lift. Each live descendant lands in exactly one
+        // The width lift. Each live descendant lands in exactly one
         // component of the returned value: the carrier lands in the root, and a
         // descendant reattached into the carrier's field lands in that field's
         // component. A component no descendant claims is one the carrier
@@ -1314,7 +1311,7 @@ fn certify_path(
                             && &destination.path == component)
                 })
             })
-            // R337-3(ii): a null store is a refill, and it carries no transfer,
+            // A null store is a refill, and it carries no transfer,
             // so the occurrence is what says so.
             || body.occurrences.iter().any(|occurrence| {
                 order.contains_key(&occurrence.site.block)
@@ -1380,7 +1377,7 @@ fn certify_path(
             }
             root_landed |= component == 0;
         }
-        // R337-3(ii): the object is returned rather than freed, so every cell of
+        // The object is returned rather than freed, so every cell of
         // it outlives this body. A cell whose token was read out and never put
         // back still holds that token in the input and holds nothing in the
         // emitted program, which a later read would see differently.
@@ -1528,12 +1525,12 @@ fn certify_path(
             // derives the set from MIR as core/std `is_null` with a
             // non-pointer destination, and `InferMode::lend` is what the
             // inference emits for it, so the pointer crosses the call as the
-            // identity edge transport now carries. This is the call in bst's
+            // identity edge transport now carries, as in
             // `if (root == NULL) return root`.
             if body.readonly_intrinsic(occurrence.site.block, occurrence.site.statement) {
                 continue;
             }
-            // R310-2: the self-call whose contract this certificate assumes.
+            // The self-call whose contract this certificate assumes.
             // Tied to the same evidence that built the assumed edge — the
             // `CallArgument` row for this function at this very site — so the
             // occurrence cannot be admitted unless the route could cross it.
@@ -1574,7 +1571,7 @@ fn certify_path(
         let pointer = place_type(&occurrence.syntax.destination)?
             .pointer
             .is_some();
-        // R330-3: a non-pointer-producing expression is not a token operation
+        // A non-pointer-producing expression is not a token operation
         // when no operand of it is a pointer. `Unrepresented` carries only a
         // description — the branch predicate arrives as `Ne(move _5, const 0)` —
         // so the operand check reads the recorded consumes at this point rather

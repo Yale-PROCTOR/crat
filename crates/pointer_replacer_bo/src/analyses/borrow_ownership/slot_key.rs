@@ -14,11 +14,9 @@
 //!
 //! # One definition
 //!
-//! **RELOCATED 2026-08-06 from `bo_c1`**, unchanged, so the analysis-model
-//! cache's loader and the harness's snapshot writer share **one** canonicalizer
-//! rather than a copy each. The round trip is witnessed by
-//! `ownership_yield_model_kind_snapshot_is_byte_stable_and_round_trips`, which
-//! passes unchanged across the move — that is the relocation's own check.
+//! The analysis-model cache's loader and the harness's snapshot writer share
+//! **one** canonicalizer rather than a copy each; the harness's model-kind
+//! snapshot is byte-stable and round-trips through it.
 
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;

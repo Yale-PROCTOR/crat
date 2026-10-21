@@ -538,9 +538,8 @@ fn write_review_fields(
         },
         residency,
     )?;
-    // L01¹² (R677-4; era-5c 099 STOP 1 (ii)): the discharged rows, as the in-memory
-    // writer writes them (absent when nothing was discharged). The streamed entry
-    // carried none before.
+    // The discharged rows, as the in-memory writer writes them (absent when
+    // nothing was discharged).
     if !review.discharged.is_empty() {
         raw(w, b",\"discharged\":")?;
         values(
@@ -731,7 +730,7 @@ pub(crate) fn collect_to_path(
             };
         }
     }
-    // L01¹¹ (R659-1): the arm-(a) receipts, as the in-memory writer writes them.
+    // The argument-order receipts, as the in-memory writer writes them.
     match super::arg_order_rows(program, slots, export)? {
         Some(rows) => {
             for row in rows {

@@ -830,7 +830,7 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
     decoded.validate().unwrap();
     assert_eq!(decoded, entry);
 
-    // R281 W01/W06/W09/W10: exercise the new bounded transport against this
+    // Exercise the bounded streamed transport against this
     // independently constructed frozen CompleteEntry and its exact encodings.
     let exports_path = directory.0.join("exports.json");
     std::fs::write(&exports_path, serde_json::to_vec(&entry.exports).unwrap()).unwrap();
@@ -872,7 +872,7 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
     let different =
         stage_streamed(&directory.0, collision_metadata.clone(), &exports_path).unwrap();
     assert!(publish_streamed(&stream_root, &different).is_err());
-    // W09: a start barrier exercises concurrent contenders, but does not
+    // A start barrier exercises concurrent contenders, but does not
     // claim to force both through the internal pre-link check simultaneously.
     let identical = stage_streamed(&directory.0, metadata.clone(), &exports_path).unwrap();
     let same_root = directory.0.join("concurrent-same");

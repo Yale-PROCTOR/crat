@@ -25,7 +25,7 @@ pub(crate) struct Decision {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MemberDecision {
     pub(crate) declaration: Declaration,
-    /// R336-5: the admitted set, not one field. A member that uses two of its
+    /// The admitted set, not one field. A member that uses two of its
     /// structure's pointer fields needs both, and which ones is what the rest
     /// of the chain has to carry.
     pub(crate) fields: BTreeSet<String>,
@@ -61,7 +61,7 @@ pub(crate) fn member_plan_metadata(
         ) else {
             continue;
         };
-        // R336-5: admit the refused field and ask again. A re-run that refuses
+        // Admit the refused field and ask again. A re-run that refuses
         // ANOTHER registered pointer field of the same structure is the same
         // member needing a wider set, so admit that too; anything else — a
         // field of a different structure, or any other refusal — is the answer.

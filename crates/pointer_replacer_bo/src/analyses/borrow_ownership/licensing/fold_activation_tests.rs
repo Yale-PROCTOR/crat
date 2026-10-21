@@ -287,7 +287,7 @@ pub unsafe fn run(){
 }
 "#;
 
-/// R310-1(owed): the member arm activates only inside a closed frame. The open
+/// The member arm activates only inside a closed frame. The open
 /// frame is the witnessed half; the unsupported-callee half is a shape control
 /// whose refusal is produced upstream, where no certificate qualifies at all.
 #[test]

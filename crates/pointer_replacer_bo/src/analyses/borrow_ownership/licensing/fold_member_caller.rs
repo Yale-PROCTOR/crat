@@ -81,8 +81,8 @@ pub(crate) fn certify_metadata(
         .iter()
         .filter(|c| c.target == call.callee)
         .collect();
-    // R339-5 D2-a, in the member path too: the requirement is one call to this
-    // callee on THIS path, not one in the whole body. `deleteNode` calls itself
+    // In the member path too, the requirement is one call to this callee on
+    // THIS path, not one in the whole body. A recursive tree delete calls itself
     // from three mutually exclusive arms, and a body-wide uniqueness test reads
     // that as an unsupported effect.
     let blocks = facts

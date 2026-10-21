@@ -1,6 +1,6 @@
-//! Retirement-only closed return evidence. R294 RED stub: no certificate is issued.
+//! Retirement-only closed return evidence.
 //!
-//! The existing NB5-O may-relations are candidate/evidence links, never CLOSED
+//! The existing origin-flow may-relations are candidate/evidence links, never CLOSED
 //! certificates. This module changes neither that analysis nor object factories.
 
 use rustc_hash::FxHashMap;
@@ -515,7 +515,7 @@ mod producer {
         origin_flows: &OriginFlowResults,
     ) -> CertificateMap {
         let mut certificates = FxHashMap::default();
-        // Finite callee postorder; no recursive expansion and no NB5-O rerun.
+        // Finite callee postorder; no recursive expansion and no origin-flow rerun.
         // Even apparently singleton/empty recursive MAY summaries remain closed
         // to this producer. Its certificate is not a termination proof.
         let order = CallGraphPostOrder::new(program);

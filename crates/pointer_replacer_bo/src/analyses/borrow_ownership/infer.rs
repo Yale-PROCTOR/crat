@@ -157,12 +157,12 @@ where
     >,
     realloc_versions: Vec<super::export::ReallocVersionSite>,
     realloc_ghosts: FxHashSet<Var>,
-    /// era-5c: must-null facts per CFG edge.
+    /// Must-null facts per CFG edge.
     null_paths: super::null_paths::NullPaths,
-    /// era-5c: per (join block, local, incoming version) the window components
+    /// Per (join block, local, incoming version) the window components
     /// known null on EVERY edge that carries that version into the join.
     null_joins: FxHashMap<(BasicBlock, Local, SSAIdx), Vec<bool>>,
-    /// L01^5 (ii): the proven strong-update field moves of this body.
+    /// The proven strong-update field moves of this body.
     field_moves: super::field_moves::FieldMoves,
 }
 
@@ -265,11 +265,11 @@ where
                 }
                 if let Some(ty_mut) = ty.builtin_deref(true) {
                     let var = vars.next().unwrap();
-                    // §NB1 (C4-ii, plumbing only) — STRONG ownership monotonicity.
+                    // STRONG ownership monotonicity (plumbing only).
                     // BO deliberately dropped the production `dominate`'s
-                    // `own(deeper) ⇒ own(shallower)` push (the relaxation site
-                    // D2/`STRONG_MONO`). Re-enabled here behind the const so the
-                    // C4-ii ablation can flip it; OFF by default (dead code, no
+                    // `own(deeper) ⇒ own(shallower)` push (the `STRONG_MONO`
+                    // relaxation). Re-enabled here behind the const so an
+                    // ablation can flip it; OFF by default (dead code, no
                     // behavior). Shape copied verbatim from
                     // `analyses::ownership::infer::new_vars::dominate`.
                     if super::STRONG_MONO
@@ -592,7 +592,7 @@ where
                         .as_ref()
                         .is_some_and(|vacuous| vacuous.get(index).copied().unwrap_or(false))
                     {
-                        // era-5c: the incoming pointer is null on every edge
+                        // The incoming pointer is null on every edge
                         // that carries this version here — its token guards
                         // nothing and may be dropped at the join.
                         infer_cx.database.push_null_join::<
@@ -768,7 +768,7 @@ where
             .as_ref()
             .map(|_| (lhs_result.clone(), rhs_result.clone()));
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
-            // L01^5 (ii): a proven strong-update field load MOVES the token —
+            // A proven strong-update field load MOVES the token —
             // the destination takes it and the source component goes vacuous —
             // instead of the split a copy would get.
             let ensure_move = ENSURE_MOVE
@@ -920,7 +920,7 @@ where
         Self::assume(infer_cx, result.r#use, false);
         if let Some(sig) = result.def.clone().next() {
             // Retractable owning: hard by default, selector-gated for BO so the
-            // on-UNSAT relax loop can leak a conflicting allocation (B3a).
+            // on-UNSAT relax loop can leak a conflicting allocation.
             infer_cx.database.push_source_owning(sig)
         }
     }
@@ -928,12 +928,11 @@ where
     fn sink(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
         infer_cx.database.record_source_sink();
         if let Some(sig) = result.r#use.clone().next() {
-            // §NB-F retractable owning (option (a) of the NB-R gate): hard by
-            // default, selector-gated for BO — the sink twin of `source` above.
-            // The relax loop may drop the selector to LEAK THE FREE (an
-            // unprovable free stays a raw-pointer free) instead of declining;
-            // NB-R showed the hard sink was the forced-owning pole of every
-            // Family-A corpus UNSAT.
+            // Retractable owning sink: hard by default, selector-gated for BO —
+            // the sink twin of `source` above. The relax loop may drop the
+            // selector to LEAK THE FREE (an unprovable free stays a raw-pointer
+            // free) instead of declining; a hard sink is the forced-owning pole
+            // of the unsatisfiable systems it would otherwise cause.
             infer_cx.database.push_sink_owning(sig)
         }
         Self::assume(infer_cx, result.def, false);
@@ -998,7 +997,7 @@ where
                     // extern
                     rustc_hir::Node::ForeignItem(foreign_item) => {
                         with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                            // E-R3 capture: the callee-name half of the call
+                            // Selector-provenance capture: the callee-name half of the call
                             // cursor, joined with the location half at the
                             // selector push site.
                             crate::analyses::borrow_ownership::export::with_callee(
@@ -1025,7 +1024,7 @@ where
         } else {
             // closure or fn ptr
             //
-            // era-5c (R409-1, R412-12): an indirect call's result is OPAQUE — an
+            // An indirect call's result is OPAQUE — an
             // unknown call: destination borrowed, arguments lent.
             infer_cx.unknown_call(destination, &args)
         }
@@ -1059,27 +1058,25 @@ where
             locals_collected.push((local, sigs));
         }
 
-        // L01⁷-A1 (R525-5). The loop below is commented "finalize temporaries",
-        // but it walks EVERY non-parameter local -- named ones included. Report
-        // 037 §3 measured `main_0::root` sitting in that set directly, which is
-        // why bst's driver collapses: the blanket asserts `own = false` on the
-        // very local the source named as the owner.
+        // The loop below is commented "finalize temporaries", but it walks
+        // EVERY non-parameter local -- named ones included. On a driver that
+        // re-seats a tree root (`root = insert(root, k)`), the blanket asserts
+        // `own = false` on the very local the source named as the owner, and
+        // the root's ownership collapses.
         //
-        // A1 spares exactly those. Uniqueness is preserved by construction and
-        // the argument is direct: every ANONYMOUS temporary stays pinned to
+        // Such named locals are spared. Uniqueness is preserved by construction
+        // and the argument is direct: every ANONYMOUS temporary stays pinned to
         // non-owning, so within each `own-equal` class at most the named local
         // can hold the token -- which is the conclusion the blanket exists to
-        // support. On bst that is 5 named locals spared out of 159.
+        // support.
         //
-        // R526-3 narrows this from "every named local" to the CALL-RESULT
-        // RE-SEAT destination only. The wide form took the analyses suite from
-        // 1,112/6 to 1,005/113 -- the fold/custody/gate certificates rely on the
-        // final zero of a live local as an inference device, and
-        // `ol19_return_transfers_but_live_local_finalization_is_not_relaxed` is
-        // a purpose-named counter-witness that is NOT re-pinned. So the spare
-        // set is exactly `x = f(x)`: a named local that is both an argument of a
-        // call and the destination of that call's result, directly
-        // (`x = f(x)`) or through the result temporary (`t = f(x); x = t`).
+        // The spare set is the CALL-RESULT RE-SEAT destination only, not every
+        // named local: the fold/custody/gate certificates rely on the final
+        // zero of a live local as an inference device, and a live local whose
+        // value a return transfers is still finalized. So the spare set is
+        // exactly `x = f(x)`: a named local that is both an argument of a call
+        // and the destination of that call's result, directly (`x = f(x)`) or
+        // through the result temporary (`t = f(x); x = t`).
         let named_locals: rustc_data_structures::fx::FxHashSet<Local> = reseat_destinations(body);
 
         let mut locals = locals_collected.into_iter().skip(0);
@@ -1104,7 +1101,7 @@ where
                 let Some(vars) = vars else {
                     continue;
                 };
-                // A1: a named local live at exit keeps its ownership bit free.
+                // A spared call-result destination keeps its ownership bit free.
                 if named_locals.contains(&local) {
                     continue;
                 }
@@ -1271,10 +1268,9 @@ pub(crate) fn reseat_destinations(
         else {
             continue;
         };
-        // R526-3's callee condition, its necessary half: the callee is a
-        // function OF THIS PROGRAM. Report 040 measured the syntactic form
-        // matching ~2,300 calls corpus-wide, all but a handful of them
-        // `wrapping_*` arithmetic and `ptr::offset` cursor advances
+        // The callee condition, its necessary half: the callee is a function
+        // OF THIS PROGRAM. The syntactic form alone matches mostly `wrapping_*`
+        // arithmetic and `ptr::offset` cursor advances
         // (`output = output.offset(1)` is a call in MIR). A cursor's
         // `own = false` finalization is protective -- a cursor must never
         // become the owner of the interior of an allocation -- so those
@@ -1299,7 +1295,7 @@ pub(crate) fn reseat_destinations(
         }
         let result = destination.local;
         // The argument is normally a COPY of the re-seated local --
-        // bst's `root = insert(root, k)` is `_4 = copy _2;
+        // a tree insert's `root = insert(root, k)` is `_4 = copy _2;
         // _3 = insert(_4, _5); _2 = move _3` -- so resolve each argument
         // back through `Use(Copy|Move)` chains to the locals it reads.
         let mut argument_sources = argument_locals.clone();

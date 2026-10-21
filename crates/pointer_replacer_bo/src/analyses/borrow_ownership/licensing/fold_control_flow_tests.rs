@@ -1,6 +1,6 @@
-//! R310-1/R315-1 witnesses for (a), realized per-path (R315-2). These target the
-//! internal certificate directly, which is the surface (a) changes. Fixtures are
-//! never executed.
+//! Witnesses for control-flow admission in the internal fold certificate,
+//! realized per path. These target the internal certificate directly, which is
+//! the surface that admission changes. Fixtures are never executed.
 use super::{
     facts::Facts,
     fold_internal::{self, Error},
@@ -26,7 +26,7 @@ unsafe extern "C"{fn free(p:*mut core::ffi::c_void);}
 pub struct Node{left:*mut Node,right:*mut Node}
 "#;
 
-/// W-CF-1: two exit paths, each linear, agreeing on the boundary summary.
+/// Two exit paths, each linear, agreeing on the boundary summary.
 const CF1: &str = r#"
 pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
  if pick != 0 {
@@ -40,7 +40,7 @@ pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
 }
 "#;
 
-/// W-CF-2: the minValueNode view walk. The loop body performs no consuming
+/// A minimum-node view walk. The loop body performs no consuming
 /// token operation, so the parameter is borrowed throughout.
 const CF2: &str = r#"
 pub unsafe fn minValue(mut node:*mut Node)->*mut Node {
@@ -51,7 +51,7 @@ pub unsafe fn minValue(mut node:*mut Node)->*mut Node {
 }
 "#;
 
-/// W-CF-3: a use after a conditional consume. One path frees and then reads.
+/// A use after a conditional consume. One path frees and then reads.
 const CF3: &str = r#"
 pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
  if pick != 0 {
@@ -61,7 +61,7 @@ pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
 }
 "#;
 
-/// W-CF-4': consumed on one path, the parameter returned on the other. Each path
+/// Consumed on one path, the parameter returned on the other. Each path
 /// is linear and each returns exactly one owning token.
 const CF4: &str = r#"
 pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
@@ -74,7 +74,7 @@ pub unsafe fn detach(node:*mut Node,pick:i32)->*mut Node {
 }
 "#;
 
-/// W-CF-5: width. Straight-line and phi-free over a two-pointer-field struct,
+/// Width. Straight-line and phi-free over a two-pointer-field struct,
 /// both descendants taken, the second reattached to the first, parent freed.
 const CF5: &str = r#"
 pub unsafe fn detach(node:*mut Node)->*mut Node {
@@ -86,8 +86,9 @@ pub unsafe fn detach(node:*mut Node)->*mut Node {
 }
 "#;
 
-/// W-CF-2n: admitting a back edge is not free. This loop body frees, so the
-/// loop cannot be summarised by not traversing it. K-CF-3 kills here.
+/// Admitting a back edge is not free. This loop body frees, so the loop cannot
+/// be summarised by not traversing it; it is refused as a loop with a token
+/// operation.
 const CF2N: &str = r#"
 pub unsafe fn drainAll(mut node:*mut Node)->*mut Node {
  while !(*node).child.is_null() {
@@ -99,7 +100,7 @@ pub unsafe fn drainAll(mut node:*mut Node)->*mut Node {
 }
 "#;
 
-/// W-CF-8: a null-returning path beside token-returning paths.
+/// A null-returning path beside token-returning paths.
 const CF8: &str = r#"
 pub unsafe fn deleteMaybe(node:*mut Node,pick:i32)->*mut Node {
  if node.is_null() { return node; }
@@ -112,10 +113,10 @@ pub unsafe fn deleteMaybe(node:*mut Node,pick:i32)->*mut Node {
 }
 "#;
 
-/// W-CF-9: a lend on one arm only. The merge's phi for the parameter has one
-/// input per arm, so admitting the other arm's input would give the pre-lend
-/// version two ways forward — the lend and a phi it does not sit on. K-CF-4
-/// kills here.
+/// A lend on one arm only. The merge's phi for the parameter has one input per
+/// arm, so admitting the other arm's input would give the pre-lend version two
+/// ways forward — the lend and a phi it does not sit on. The fixture is the
+/// counterexample to admitting that input.
 const CF9: &str = r#"
 pub unsafe fn probe(node:*mut Node,flag:i32)->*mut Node {
  if flag != 0 { let _seen=node.is_null(); }
@@ -123,7 +124,7 @@ pub unsafe fn probe(node:*mut Node,flag:i32)->*mut Node {
 }
 "#;
 
-/// W-CF-5a: width without a second destination. Two pointer fields, the parent
+/// Width without a second destination. Two pointer fields, the parent
 /// returned with both descendants untouched — no take, no free.
 const CF5A: &str = r#"
 pub unsafe fn passthrough(node:*mut Node)->*mut Node {
@@ -131,7 +132,7 @@ pub unsafe fn passthrough(node:*mut Node)->*mut Node {
 }
 "#;
 
-/// W-CF-6: the one-child deleteNode shape. It closes only with the path fact
+/// The one-child tree-delete shape. It closes only with the path fact
 /// that the untaken descendant is null on the taken path.
 const CF6: &str = r#"
 pub unsafe fn deleteOne(root:*mut Node)->*mut Node {
@@ -144,7 +145,7 @@ pub unsafe fn deleteOne(root:*mut Node)->*mut Node {
 }
 "#;
 
-/// W-CF-7: the parent is freed with an untaken descendant whose nullness is
+/// The parent is freed with an untaken descendant whose nullness is
 /// unknown on that path. ParentFreeWithLiveDescendant stays load-bearing.
 const CF7: &str = r#"
 pub unsafe fn deleteOne(root:*mut Node,pick:i32)->*mut Node {
@@ -187,11 +188,11 @@ fn w_cf_3_a_use_after_a_conditional_consume_is_refused() {
     });
 }
 
-/// W-CF-4' (R319-1): this is deleteNode's own boundary and must CERTIFY. On both
-/// paths the parameter's token leaves the caller and one owning token returns;
-/// which object it is is invisible to the caller, whose cell was zeroed by the
+/// This is a tree delete's own boundary and must CERTIFY. On both paths the
+/// parameter's token leaves the caller and one owning token returns; which
+/// object it is is invisible to the caller, whose cell was zeroed by the
 /// consuming old-zero law and whose views into the subtree are dead on every
-/// path. Refusing it would refuse bst at (b).
+/// path. Refusing it would refuse the tree delete it models.
 #[test]
 fn w_cf_4_prime_one_token_out_on_every_path_certifies() {
     with_facts(&format!("{PRELUDE}{CF4}"), |facts| {
@@ -200,8 +201,8 @@ fn w_cf_4_prime_one_token_out_on_every_path_certifies() {
     });
 }
 
-/// W-CF-8 (R319-1): a null-returning path beside token-returning paths, under a
-/// nullable return. This is bst's `if (root == NULL) return root`. With the
+/// A null-returning path beside token-returning paths, under a nullable
+/// return: a tree delete's `if (root == NULL) return root`. With the
 /// per-path token disposition the parameter's value has no single route, so the
 /// fold does not certify the function.
 #[test]
@@ -241,9 +242,9 @@ fn w_cf_5a_two_untouched_descendants_certify() {
     });
 }
 
-/// Deferred per R317-2: the second taken token needs a destination, and every
+/// Deferred: the second taken token needs a destination, and every
 /// destination is refused by the shared pointer-destination gate. Held as a RED
-/// against the G-FIELD half of that gate.
+/// against the field half of that gate.
 #[test]
 fn w_cf_5_two_taken_descendants_certify() {
     with_facts(&format!("{WIDE_PRELUDE}{CF5}"), |facts| {

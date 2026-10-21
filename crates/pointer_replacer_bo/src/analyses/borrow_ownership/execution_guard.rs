@@ -28,7 +28,7 @@ thread_local! {
     static LAST_UNKNOWN: RefCell<Option<QueryUnknown>> = const { RefCell::new(None) };
 }
 
-/// One outer model derivation, not each internal baseline/A5 solver instance.
+/// One outer model derivation, not each internal baseline/overlap solver instance.
 pub(crate) fn enter_model() {
     MODEL_ENTRIES.with(|entries| {
         entries.set(

@@ -1,5 +1,4 @@
-//! era-5c relay 208 (the paper session's S39, the user's proposal): two switches, both off in
-//! the frame.
+//! Two switches, both off in the reference configuration.
 //!
 //! - `CRAT_COPY_RELAX=off|depth0-borrow-to-raw`: a bare copy `x := y` between two locals
 //!   keeps `x_0 ≡ y_0` or takes `y_0 = Ref ∧ x_0 = Raw` (a raw view of a reference). Raw → Ref
@@ -29,7 +28,7 @@ use crate::analyses::{
     liveness::MaybeLiveLocals,
 };
 
-/// The copies the relaxation may take (S39 (b)), installed by the solve before any coherence is
+/// The copies the relaxation may take, installed by the solve before any coherence is
 /// added (`construction::analyze_copy_relax_sites`). Nothing installed: nothing is relaxed.
 static ELIGIBLE: Mutex<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> = Mutex::new(None);
 

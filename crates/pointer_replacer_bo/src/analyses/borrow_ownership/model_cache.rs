@@ -1,8 +1,8 @@
-//! Complete era5a model cache and unchanged three-field consumer view.
+//! Complete model cache and unchanged three-field consumer view.
 //!
-//! New entries contain portable semantic inputs, the complete model and A5
+//! New entries contain portable semantic inputs, the complete model and overlap
 //! planning baseline, the accepted receipt, and every required captured export.
-//! Accepted legacy namespaces are never rewritten or relabelled into era5a.
+//! Accepted legacy namespaces are never rewritten or relabelled into the current format.
 //! Publication validates a staged body and atomically links it without overwrite.
 //!
 //! The existing consumer still tries memo, disk, then production analysis.
@@ -134,7 +134,7 @@ pub(crate) fn with_test_config<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
 /// into one value rather than checked severally — a severally-checked key grows
 /// a forgotten term.
 ///
-/// The key does not name the A5 mode: the decide path caches the frame's mode
+/// The key does not name the overlap mode: the decide path caches one mode
 /// only (`PreciseReplay` with the frozen-graph attestation), so the mode
 /// arguments are kept for the callers and not read.
 pub(crate) fn fingerprint(
@@ -227,7 +227,7 @@ fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
         .join(format!("{fingerprint}.json"))
 }
 
-/// Retained API for explicit refusal of legacy key-only migration into era5a.
+/// Retained API for explicit refusal of legacy key-only migration into the current format.
 #[cfg(test)]
 pub(crate) fn rekey_entry(
     _old_path: &Path,
@@ -245,8 +245,8 @@ pub(crate) fn configured_entry_path(fingerprint: &str) -> Option<PathBuf> {
 pub(crate) struct CachedModel {
     /// The exact `VerifiedBo.model` consumed by the rewriter.
     pub(crate) model: FxHashMap<SlotRef, SlotKind>,
-    /// A5's planning baseline, needed to reconstruct current-session C9 mark
-    /// spans without another solver invocation.
+    /// The overlap analysis's planning baseline, needed to reconstruct
+    /// current-session copy-mark spans without another solver invocation.
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
     /// The construction receipt from the solve that produced `model`.
     pub(crate) overlap_receipt: String,
@@ -260,7 +260,7 @@ struct Prepared {
     /// directory is configured, in which case nothing is staged anywhere.
     entry: Option<std::sync::Arc<super::cache_contract::StreamedEntry>>,
     cached: CachedModel,
-    /// R1178-1 (era-5c relay 236, fix (i)): on the writer side, the arm-(a) receipts as `prepare`
+    /// On the writer side, the argument-order receipts as `prepare`
     /// wrote them into the entry -- the same rows, order and not-recorded reason a read of the
     /// staged file decodes -- so the hoist's loader never re-opens that file. `None` on the
     /// reader side, whose `Metadata` captured them while the entry was read.
@@ -343,9 +343,9 @@ pub(crate) fn prepare(
                     .ok_or("invalid accepted model keys")?;
                 let entry_baseline = model_map(program.tcx, slots, &verified.baseline_model)
                     .ok_or("invalid baseline model keys")?;
-                // R473-4 design (A): stream the canonical origin bytes to a file,
-                // per element, and hand the cache the PATH. The whole-`Value` form that
-                // cost 31 GiB on libzahl is never built. The file is removed once the
+                // Stream the canonical origin bytes to a file, per element, and hand
+                // the cache the PATH. The whole-`Value` form (31 GiB on one large
+                // program) is never built. The file is removed once the
                 // entry has copied it in (and by the guard on any early return).
                 struct OriginFile(std::path::PathBuf);
                 impl Drop for OriginFile {
@@ -420,14 +420,14 @@ pub(crate) fn prepare(
     }
 }
 
-/// L01¹¹ (R659-1; wave-5d 133 STOP 2): the prepared entry's arm-(a) receipts,
+/// The prepared entry's argument-order receipts,
 /// for the emission's hoist (`DecisionTable::arg_order_hoists`). Refused unless
 /// the entry records them.
 pub(crate) fn prepared_arg_order_applied(
     fingerprint: &str,
 ) -> Result<Vec<super::portable_export::ArgOrderRow>, String> {
-    // R1178-1 (era-5c relays 236 / 237): the writer side reads the receipts `prepare` kept (fix
-    // (i)); the reader side decodes them from the borrowed `Metadata` (fix (ii): no clone of it).
+    // The writer side reads the receipts `prepare` kept; the reader side decodes them from the
+    // borrowed `Metadata` without cloning it.
     // Only a writer-side entry prepared without them falls back to reading the staged file.
     PREPARED.with(|prepared| {
         let prepared = prepared.borrow();
@@ -451,7 +451,7 @@ pub(crate) fn prepared_arg_order_applied(
     })
 }
 
-/// R1178-1: the arm-(a) receipts as the entry's `arg-order-applied` family records them, decoded
+/// The argument-order receipts as the entry's `arg-order-applied` family records them, decoded
 /// as a read of that family would: `portable_export::arg_order_rows` (the writer's own rows,
 /// sorted by the reader's order), or the family's not-recorded refusal when the arm is off.
 fn writer_arg_order_applied(
@@ -468,8 +468,8 @@ fn writer_arg_order_applied(
     }
 }
 
-/// R1178-1's witness: the receipts read back from the prepared entry's staged FILE, as the loader
-/// read them before fix (i).
+/// Test reference: the receipts read back from the prepared entry's staged FILE, as a loader
+/// without the kept receipts reads them.
 #[cfg(test)]
 pub(crate) fn prepared_arg_order_from_file(
     fingerprint: &str,
@@ -487,7 +487,7 @@ pub(crate) fn prepared_arg_order_from_file(
     super::cache_contract::validate_file(&path)?.arg_order_applied()
 }
 
-/// L01¹¹ (R666-1, the loader): the prepared entry's arm-(a) receipts as the
+/// The loader: the prepared entry's argument-order receipts as the
 /// emission's hoist keys `((lo, hi), caller, lent)`, for the one line the
 /// rewriter needs: `table.arg_order_hoists = prepared_arg_order_hoists(tcx, &fp)`.
 /// Each call's span is re-read from THIS session's MIR at the receipt's
@@ -538,8 +538,8 @@ pub(crate) fn prepared_arg_order_hoists(
         .collect()
 }
 
-/// L01⁹ wall 4 (R574-5 (iii)): the prepared entry's store-as-move obligations,
-/// for the rewriter's discharge (ownership-fields 069 §4). A loaded entry already
+/// The prepared entry's store-as-move obligations,
+/// for the rewriter's discharge. A loaded entry already
 /// carries them from the streamed read; a staged one is read back once.
 /// Refused unless the entry records them.
 #[cfg(test)]
@@ -683,7 +683,7 @@ pub(crate) fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Opt
     }
 }
 
-/// Load only a complete validated era5a envelope. CacheOnly guards block any fallback.
+/// Load only a complete validated envelope. CacheOnly guards block any fallback.
 pub(crate) fn load(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
@@ -752,10 +752,10 @@ pub(crate) fn load(
 mod tests {
     use super::*;
 
-    /// S2's cache fixture (D0): one function, solved in a few seconds.
+    /// The cache fixture: one function, solved in a few seconds.
     const S2_FIXTURE: &str = "pub unsafe fn read(p: *const i32) -> i32 { unsafe { *p } }\n";
 
-    /// The five variables a batch job set to name its inputs; the key reads none of them (S2 D5).
+    /// The five variables a batch job set to name its inputs; the key reads none of them.
     const S2_JOB_VARIABLES: [&str; 5] = [
         "CRAT_ERA5_LAUNCH_DIGEST",
         "CRAT_ERA5_PROGRAM",
@@ -764,7 +764,7 @@ mod tests {
         "CRAT_ERA5_DEPENDENCY_DIGEST",
     ];
 
-    /// Child of `s2_t_key_1_the_key_reads_no_job_environment`: the key of the fixture file named by
+    /// Child of the job-environment key test: the key of the fixture file named by
     /// `S2_KEY_FIXTURE`.
     #[test]
     #[ignore = "child of s2_t_key_1_the_key_reads_no_job_environment"]
@@ -779,7 +779,7 @@ mod tests {
         .unwrap_or_else(|error| error.raise());
     }
 
-    /// T-key-1 (S2 D0a): two children that differ only in the five job variables compute one key
+    /// Two children that differ only in the five job variables compute one key
     /// for one fixture file.
     #[test]
     fn s2_t_key_1_the_key_reads_no_job_environment() {
@@ -841,7 +841,7 @@ mod tests {
         .unwrap_or_else(|error| error.raise())
     }
 
-    /// T-key-2 (S2 D0a): an entry in the format before S2, whose inputs carry `configuration`, is
+    /// An entry in the older format, whose inputs carry `configuration`, is
     /// a validated miss; the same entry without it validates.
     #[test]
     fn s2_t_key_2_an_entry_with_a_configuration_is_a_miss() {
@@ -881,14 +881,14 @@ mod tests {
         );
     }
 
-    /// T-fp-1 (S2 D0b): the analysis fingerprint is a build constant.
+    /// The analysis fingerprint is a build constant.
     #[test]
     fn s2_t_fp_1_the_fingerprint_is_a_build_constant() {
         assert!(option_env!("BO_ANALYSIS_FINGERPRINT").is_some());
     }
 
-    /// T-fp-2 (S2 D0b): the build's covered list names the seven legacy modules the analysis
-    /// runs on, BO's analyses, and the ESC allowlist.
+    /// The build's covered list names the seven legacy modules the analysis
+    /// runs on, BO's analyses, and the escape-minimal allowlist.
     #[test]
     fn s2_t_fp_2_the_covered_list_names_every_analysis_input() {
         let list = option_env!("OUT_DIR")
@@ -912,7 +912,7 @@ mod tests {
         assert!(missing.is_empty(), "not covered: {missing:?}");
     }
 
-    /// T-fp-3 (S2 D4): the baked values equal a recomputation over the source tree now, so
+    /// The baked values equal a recomputation over the source tree now, so
     /// `rerun-if-changed` missed no edit.
     #[test]
     fn s2_t_fp_3_the_build_values_are_the_source_tree_s() {
@@ -944,7 +944,7 @@ mod tests {
         "/../../benchmarks/rs-crown-derived/quadtree/lib.rs"
     );
 
-    /// Child of T-tmp-1 / T-tmp-2: decide `S2_TMP_SOURCE` with no cache directory and print the
+    /// Child of the two no-cache-directory tests: decide `S2_TMP_SOURCE` with no cache directory and print the
     /// argument-order hoists the table carries.
     #[test]
     #[ignore = "child of s2_t_tmp_1 / s2_t_tmp_2"]
@@ -984,7 +984,7 @@ mod tests {
         stderr
     }
 
-    /// T-tmp-1 (S2 D14a): with no cache directory, a solve leaves nothing under `TMPDIR`.
+    /// With no cache directory, a solve leaves nothing under `TMPDIR`.
     #[test]
     fn s2_t_tmp_1_no_cache_directory_writes_nothing() {
         if !Path::new(S2_QUADTREE).is_file() {
@@ -1004,7 +1004,7 @@ mod tests {
         assert!(left.is_empty(), "left under TMPDIR: {left:?}");
     }
 
-    /// T-tmp-2 (S2 D14a): with no cache directory the table still carries quadtree's hoist.
+    /// With no cache directory the table still carries quadtree's hoist.
     #[test]
     fn s2_t_tmp_2_no_cache_directory_keeps_the_hoist() {
         if !Path::new(S2_QUADTREE).is_file() {
@@ -1023,7 +1023,7 @@ mod tests {
         );
     }
 
-    /// T-cache-1 (S2 D0b): with one cache directory and nothing else, the second run of the
+    /// With one cache directory and nothing else, the second run of the
     /// fixture reads the first one's entry.
     #[test]
     fn s2_t_cache_1_one_directory_reads_what_it_wrote() {
@@ -1172,7 +1172,7 @@ mod tests {
     /// produced under another. Checking only the filename would make the cache
     /// trust the one part of the entry an accident can change for free.
     ///
-    /// *Mutation-tested (Rider 0, deletion first):* deleting the body-line
+    /// *Mutation-tested (deletion first):* deleting the body-line
     /// check in [`load`] makes `a_renamed_entry_is_refused` pass a wrong
     /// fingerprint through.
     #[test]
@@ -1284,12 +1284,12 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Solve provenance (§5) and per-phase timing (§7)
+// Solve provenance and per-phase timing
 // ---------------------------------------------------------------------------
 
 /// Where the accepted model came from, and what it cost.
 ///
-/// Recorded so the **row** carries it, not a human's memory. §5's rule is that
+/// Recorded so the **row** carries it, not a human's memory. The rule is that
 /// a number produced under cache cites `solve: cache@<fingerprint>` and a gate
 /// sweep says `solve: real` — and the reader cannot tell by looking, which is
 /// exactly the staleness rule's reasoning applied to one more axis. Mechanized

@@ -1,4 +1,4 @@
-//! Recording-only T2 demand evidence. This schema grants no ownership.
+//! Recording-only demand evidence for endpoint retraction. This schema grants no ownership.
 
 use super::{
     crate_slots::CrateSlots,

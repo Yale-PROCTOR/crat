@@ -33,7 +33,7 @@ use crate::{
 pub(super) struct NativeBorrowContext<'a> {
     pub(super) borrow: GBorrowInferCtxt,
     flows: &'a OriginFlowResults,
-    /// era-5c relay 208 (`CRAT_MERGE_LIVENESS`): the locals the replay demoted (provenance
+    /// `CRAT_MERGE_LIVENESS`: the locals the replay demoted (provenance
     /// disabled, unioned with their base), per function.
     pub(super) demoted: FxHashMap<LocalDefId, FxHashSet<Local>>,
 }
@@ -44,20 +44,20 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) entry_facts:
         Option<std::sync::Arc<crate::analyses::borrow_ownership::protected_entry::EntryAnalysis>>,
     pub(super) copy_lends: super::invalidates::CopyLendLoans,
-    /// Addendum 59: the selected feeder loan keeps its construction-time identity, while the
+    /// The selected feeder loan keeps its construction-time identity, while the
     /// repair boundary sees the resolved source issuer; the destination remains
     /// receipt metadata and is not a guard/repair party.
     /// No ordinary loan can enter this map.
     pub(super) escaped_presentations: FxHashMap<Loan, (ProvenanceOwner, ProvenanceOwner)>,
-    /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so
+    /// The location-sensitive (point-keyed) subset relation, carried HERE and not on `facts`, so
     /// production `BorrowInferenceResults` keeps its type and production's own consumers keep
-    /// their behaviour by construction (port-exploration §2.1).
+    /// their behaviour by construction.
     ///
-    /// `None` is NOT a switch — the runtime selector was retired at landing. It marks the one
+    /// `None` is NOT a switch — there is no runtime selector. It marks the one
     /// `#[cfg(test)]` construction path (`borrow_conflicts_wrapped`) that builds facts from
     /// production `borrow_inference` directly and therefore has no `NativeConstraintGraph` to
-    /// localize; that path keeps the whole-body predicate, which is what its NB5-O differential
-    /// compares against.
+    /// localize; that path keeps the whole-body predicate, which is what its differential
+    /// against the native derivation compares against.
     pub(super) localized_requires: Option<LocalizedRequires>,
 }
 
@@ -162,7 +162,7 @@ impl<'a> NativeBorrowContext<'a> {
                     "selected CopyLend identity matched multiple BorrowSet loans: {identity:?}"
                 );
                 copy_lends.all.insert(loan);
-                // relay 213: a mutable copy-lend's loan is unique.
+                // A mutable copy-lend's loan is unique.
                 if selected.unique {
                     copy_lends.unique.insert(loan);
                 }
@@ -309,9 +309,8 @@ impl<'a> NativeBorrowContext<'a> {
                 &graph.subset,
                 &graph.membership,
             );
-        // The monotonicity tripwire stays RELEASE-ACTIVE (user decision at landing): the landed
-        // flow-insensitive dataflow above is retained solely as its reference, not as a selectable
-        // engine. A fire is a STOP.
+        // The monotonicity tripwire stays RELEASE-ACTIVE: the flow-insensitive dataflow above is
+        // retained solely as its reference, not as a selectable engine. A fire aborts the run.
         loan_liveness::assert_localized_subset(
             &landed_loan_liveness,
             &inference.requires,
@@ -756,7 +755,7 @@ unsafe fn caller() -> i32 {
 
 #[derive(Default)]
 struct NativeConstraintGraph {
-    /// §HLZ-PORT (A2): the third component is the edge's program point, or `All` for the
+    /// Location-sensitive subset: the third component is the edge's program point, or `All` for the
     /// closure-derived depth-0 value flows that have none. `Off` ignores it entirely.
     subset: Vec<(Provenance, Provenance, EdgeLocation)>,
     membership: Vec<(Loan, Provenance)>,
@@ -906,10 +905,10 @@ impl NativeConstraintGraph {
                 ) else {
                     continue;
                 };
-                // A2: `depth0_value_flows` reads the CLOSED matrix (`origin_flow.rs:925-931`), so
+                // `depth0_value_flows` reads the CLOSED matrix (`origin_flow.rs:925-931`), so
                 // these are transitive-closure edges with no single location. Emitting them `All`
-                // reproduces the landed flow-insensitive behaviour exactly; locating them means
-                // touching `origin_flow`, which is A1 and is not authorized here.
+                // reproduces the flow-insensitive behaviour exactly; locating them would mean
+                // changing `origin_flow`.
                 graph.subset.push((source, target, EdgeLocation::All));
             }
         }

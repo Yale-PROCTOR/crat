@@ -267,8 +267,8 @@ fn c07_traversal_activation_holds_open_world_retention_with_cast_premise_control
     let raw = inspect_attested_frame(&raw);
     assert!(raw.accepted);
     eprintln!("R284_RAW_ACTUAL_KINDS={:?}", raw.kinds);
-    // R284 attribution: an integer cast alone is Ref in this frame, so it
-    // cannot witness propagation from an actual Raw kind.
+    // An integer cast alone settles Ref in this attested frame, so it cannot
+    // witness propagation from an actual Raw kind.
     raw.assert_kind("raw_caller::node", SlotKind::Ref);
     assert!(
         raw.export

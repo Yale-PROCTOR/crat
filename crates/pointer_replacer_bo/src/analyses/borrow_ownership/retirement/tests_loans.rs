@@ -366,9 +366,9 @@ pub unsafe fn deep(pp: *mut *mut u8) -> u8 {
                 && row.source.role == SourceRole::Free
                 && replay.free_points.contains(&row.location)
                 && row.holder == *target
-                // R343-1: `q` is the freed pointer and `free(q)` takes it as an
+                // `q` is the freed pointer and `free(q)` takes it as an
                 // argument, so the holder's value leaves the frame: the verdict is
-                // the same demotion, now labelled with why the facts are missing.
+                // the same demotion, labelled with why the facts are missing.
                 && row.reason.inner_loan_depth() == Some(1)
                 && row.chain.contains(target)
         }),
