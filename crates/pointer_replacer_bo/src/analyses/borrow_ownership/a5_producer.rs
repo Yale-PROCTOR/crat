@@ -30,22 +30,6 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
-/// `CRAT_ERA5C_A5_SNAPSHOT` (on|off, fail-loud, absent = on): **L01¹²** (R677-4).
-/// Off (RQ5's `snapshot` row) takes A5's snapshot view away: no mutable-vs-
-/// read-only pair is read as a snapshot, so no C-9 mark is planned. In the identity.
-pub(crate) fn a5_snapshot() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("CRAT_ERA5C_A5_SNAPSHOT") {
-        Err(std::env::VarError::NotPresent) => true,
-        Ok(value) => match value.as_str() {
-            "on" => true,
-            "off" => false,
-            other => panic!("CRAT_ERA5C_A5_SNAPSHOT must be on or off; got {other:?}"),
-        },
-        Err(error) => panic!("CRAT_ERA5C_A5_SNAPSHOT is not valid Unicode: {error}"),
-    })
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedC9Mark {
     pub(crate) key: C9MarkKey,
@@ -1064,7 +1048,7 @@ pub(crate) fn produce_a5_plan(
                         )
                         .expect("distinct params");
                         let (read_only, effect) = match mutability.class {
-                            WitnessMutability::MutReadOnly { read_only } if a5_snapshot() => (
+                            WitnessMutability::MutReadOnly { read_only } => (
                                 Some(read_only),
                                 snapshot_verdict_for_target(tcx, target, left, right, read_only),
                             ),

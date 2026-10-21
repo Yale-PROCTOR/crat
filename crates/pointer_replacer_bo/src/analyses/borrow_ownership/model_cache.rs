@@ -284,10 +284,7 @@ pub(crate) fn solver_identity(
         }
         .to_owned(),
     );
-    fields.insert(
-        "era5c_a5_snapshot",
-        super::a5_producer::a5_snapshot().to_string(),
-    );
+    fields.insert("era5c_a5_snapshot", "true".to_owned());
     for key in [
         "CRAT_BO_EXPORT",
         "CRAT_BO_L2_TRANSITION_DIAGNOSTICS",
