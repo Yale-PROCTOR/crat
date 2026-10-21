@@ -166,10 +166,7 @@ pub(crate) fn solver_identity(
     // with every L01⁶ arm, before the L01⁶ solve writes a cache.
     fields.insert("era5c_field_move", "true".to_owned());
     fields.insert("era5c_leak_parity", "false".to_owned());
-    fields.insert(
-        "era5c_reseat_a1",
-        super::field_moves::reseat_a1().to_string(),
-    );
+    fields.insert("era5c_reseat_a1", "true".to_owned());
     fields.insert(
         "era5c_traversal_ref",
         super::field_moves::traversal_ref().to_string(),

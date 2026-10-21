@@ -1206,7 +1206,6 @@ const W47_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5B_PASS", "joint"),
     ("CRAT_ERA5C_MOVE_TRACKING", "on"),
     ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
-    ("CRAT_ERA5C_RESEAT_A1", "on"),
 ];
 
 #[test]
@@ -4905,27 +4904,6 @@ fn e5c_w67_a_the_ledger_names_a_retirement_conflict() {
         ],
     );
     assert!(off.is_empty(), "{off:?}");
-}
-
-/// W67b: bst with its driver restored and A1 off (015's variant): `main_0`'s
-/// `root` is refused ownership by the temporary finalization.
-#[test]
-fn e5c_w67_b_the_ledger_names_the_temporary_finalization() {
-    let variant = "/home/p51lee/dev/.crat-scratch/era-5c/bst-main/lib-variant.rs";
-    if !std::path::Path::new(variant).is_file() {
-        eprintln!("variant absent; skipping");
-        return;
-    }
-    let rows = w67_rows(
-        &format!("file:{variant}"),
-        &[("CRAT_ERA5C_RESEAT_A1", "off")],
-    );
-    let row = w67_row(&rows, "src::bst::main_0::_2@d0");
-    assert_eq!(row[1], "both", "{row:?}");
-    assert!(
-        row[7].contains("own-assume[temporary-finalization]"),
-        "{row:?}"
-    );
 }
 
 /// W67c: a kind-equate partner. On buffer (the corpus), some Raw slot has no

@@ -1144,12 +1144,7 @@ where
         // set is exactly `x = f(x)`: a named local that is both an argument of a
         // call and the destination of that call's result, directly
         // (`x = f(x)`) or through the result temporary (`t = f(x); x = t`).
-        let named_locals: rustc_data_structures::fx::FxHashSet<Local> =
-            if super::field_moves::reseat_a1() {
-                reseat_destinations(body)
-            } else {
-                Default::default()
-            };
+        let named_locals: rustc_data_structures::fx::FxHashSet<Local> = reseat_destinations(body);
         let null_exit: FxHashSet<Local> = if super::field_moves::null_exit() {
             null_at_exit_locals(infer_cx.tcx, body)
         } else {

@@ -25,22 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_RESEAT_A1=on|off` (fail-loud, absent = off): **L01⁶-A1**.
-/// A call-result re-seat `x = f(x)` transfers the previous version's ownership
-/// to the new version instead of finalizing it `false`, when the callee's
-/// summary returns its parameter or a fresh allocation and the re-seat is the
-/// last use of the previous version on every path. Era-5c report 034 §1:
-/// `own-assume[temporary-finalization]` is in all nine of bst's driver cores,
-/// and it is LOAD-BEARING elsewhere (`0/13/31 → 28/8/8` without it), so this
-/// displaces it at re-seat sites only.
-pub(crate) fn reseat_a1() -> bool {
-    match std::env::var("CRAT_ERA5C_RESEAT_A1").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_RESEAT_A1 must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_MUT_MODEL=on|off` (fail-loud, absent = off): **L01⁸, R545-1**.
 /// A table's reborrow is unique only when a Ref level below it is written. The
 /// verification replay recomputes the mutability facts per round with Foster's
