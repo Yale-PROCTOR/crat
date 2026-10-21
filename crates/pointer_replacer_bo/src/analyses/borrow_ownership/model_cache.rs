@@ -1119,6 +1119,193 @@ t2=endpoint-force-retraction-v1\n\
         );
     }
 
+    /// S2's cache fixture (D0): one function, solved in a few seconds.
+    const S2_FIXTURE: &str = "pub unsafe fn read(p: *const i32) -> i32 { unsafe { *p } }\n";
+
+    /// The five variables a batch job set to name its inputs; the key reads none of them (S2 D5).
+    const S2_JOB_VARIABLES: [&str; 5] = [
+        "CRAT_ERA5_LAUNCH_DIGEST",
+        "CRAT_ERA5_PROGRAM",
+        "CRAT_ERA5_INPUT_ROOT",
+        "CRAT_ERA5_TOOLCHAIN_DIGEST",
+        "CRAT_ERA5_DEPENDENCY_DIGEST",
+    ];
+
+    /// Child of `s2_t_key_1_the_key_reads_no_job_environment`: the key of the fixture file named by
+    /// `S2_KEY_FIXTURE`.
+    #[test]
+    #[ignore = "child of s2_t_key_1_the_key_reads_no_job_environment"]
+    fn s2_print_fixture_key() {
+        let path = std::env::var_os("S2_KEY_FIXTURE").expect("S2_KEY_FIXTURE");
+        ::utils::compilation::run_compiler_on_path(Path::new(&path), |tcx| {
+            eprintln!(
+                "S2_KEY {}",
+                crate::bo_rewriter::cache_fingerprint_for_test(tcx)
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    /// T-key-1 (S2 D0a): two children that differ only in the five job variables compute one key
+    /// for one fixture file.
+    #[test]
+    fn s2_t_key_1_the_key_reads_no_job_environment() {
+        let directory = std::env::temp_dir().join(format!("crat-s2-key-{}", std::process::id()));
+        let source = directory.join("inputs").join("fixture.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("fixture directory");
+        std::fs::write(&source, S2_FIXTURE).expect("fixture");
+        let key = |job: &[(&str, std::ffi::OsString)]| {
+            let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
+            command.args([
+                "analyses::borrow_ownership::model_cache::tests::s2_print_fixture_key",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            command.env("S2_KEY_FIXTURE", &source);
+            for name in S2_JOB_VARIABLES {
+                command.env_remove(name);
+            }
+            for (name, value) in job {
+                command.env(name, value);
+            }
+            let output = command.output().expect("child test");
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(output.status.success(), "child failed:\n{stderr}");
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("S2_KEY "))
+                .unwrap_or_else(|| panic!("no key printed:\n{stderr}"))
+                .to_owned()
+        };
+        let plain = key(&[]);
+        let job = key(&[
+            ("CRAT_ERA5_LAUNCH_DIGEST", "s2-launch".into()),
+            ("CRAT_ERA5_PROGRAM", "s2-program".into()),
+            ("CRAT_ERA5_INPUT_ROOT", directory.clone().into_os_string()),
+            ("CRAT_ERA5_TOOLCHAIN_DIGEST", "a".repeat(64).into()),
+            ("CRAT_ERA5_DEPENDENCY_DIGEST", "b".repeat(64).into()),
+        ]);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(plain, job, "a job variable moved the key");
+    }
+
+    /// One fresh solve of the fixture with `directory` configured, and the entry it wrote.
+    fn s2_fresh_entry(directory: &Path) -> PathBuf {
+        ::utils::compilation::run_compiler_on_str(S2_FIXTURE, |tcx| {
+            reset_for_test();
+            with_test_config(false, directory, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("fresh decision");
+            let entry = last_solve()
+                .and_then(|provenance| provenance.cache_entry)
+                .expect("the fresh solve wrote an entry");
+            reset_for_test();
+            PathBuf::from(entry)
+        })
+        .unwrap_or_else(|error| error.raise())
+    }
+
+    /// T-key-2 (S2 D0a): an entry in the format before S2, whose inputs carry `configuration`, is
+    /// a validated miss; the same entry without it validates.
+    #[test]
+    fn s2_t_key_2_an_entry_with_a_configuration_is_a_miss() {
+        let directory =
+            std::env::temp_dir().join(format!("crat-s2-old-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let entry = s2_fresh_entry(&directory);
+        let text = std::fs::read_to_string(&entry).expect("entry");
+        let inputs = text.find("\"inputs\":{").expect("inputs");
+        let dependencies = inputs
+            + text[inputs..]
+                .find("\"dependencies\":\"")
+                .expect("dependencies");
+        let close = dependencies + "\"dependencies\":\"".len() + 64 + 1;
+        let old = if text[close..].starts_with(",\"configuration\":\"") {
+            text.clone()
+        } else {
+            format!(
+                "{},\"configuration\":\"{}\"{}",
+                &text[..close],
+                "c".repeat(64),
+                &text[close..]
+            )
+        };
+        let old_path = directory.join("old-format.json");
+        std::fs::write(&old_path, old).expect("old-format entry");
+        let current = super::super::cache_contract::validate_file(&entry);
+        let previous = super::super::cache_contract::validate_file(&old_path);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(current.is_ok(), "the entry as written: {current:?}");
+        assert!(
+            previous
+                .as_ref()
+                .is_err_and(|error| error.contains("configuration")),
+            "an entry with a configuration validated: {:?}",
+            previous.map(|metadata| metadata.key)
+        );
+    }
+
+    /// T-fp-1 (S2 D0b): the analysis fingerprint is a build constant.
+    #[test]
+    fn s2_t_fp_1_the_fingerprint_is_a_build_constant() {
+        assert!(option_env!("BO_ANALYSIS_FINGERPRINT").is_some());
+    }
+
+    /// T-fp-2 (S2 D0b): the build's covered list names the seven legacy modules the analysis
+    /// runs on, BO's analyses, and the ESC allowlist.
+    #[test]
+    fn s2_t_fp_2_the_covered_list_names_every_analysis_input() {
+        let list = option_env!("OUT_DIR")
+            .map(|out| Path::new(out).join("bo_analysis_files.txt"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let missing: Vec<_> = [
+            "bo/borrow/",
+            "bo/borrow_ownership/",
+            "bo/borrow_ownership/esc_minimal_allowlist.tsv",
+            "legacy/analyses/type_qualifier/foster/",
+            "legacy/analyses/mir/",
+            "legacy/analyses/offset_sign/",
+            "legacy/analyses/liveness.rs",
+            "legacy/analyses/lattice.rs",
+            "legacy/utils/rustc.rs",
+        ]
+        .into_iter()
+        .filter(|prefix| !list.lines().any(|line| line.starts_with(prefix)))
+        .collect();
+        assert!(missing.is_empty(), "not covered: {missing:?}");
+    }
+
+    /// T-cache-1 (S2 D0b): with one cache directory and nothing else, the second run of the
+    /// fixture reads the first one's entry.
+    #[test]
+    fn s2_t_cache_1_one_directory_reads_what_it_wrote() {
+        let directory =
+            std::env::temp_dir().join(format!("crat-s2-one-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        s2_fresh_entry(&directory);
+        let second = ::utils::compilation::run_compiler_on_str(S2_FIXTURE, |tcx| {
+            reset_for_test();
+            with_test_config(false, &directory, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("second decision");
+            let provenance = last_solve().expect("provenance");
+            reset_for_test();
+            provenance
+        })
+        .unwrap_or_else(|error| error.raise());
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            (second.source, second.cache_status),
+            ("cache", "hit"),
+            "the second run solved again"
+        );
+    }
+
     /// Item E / §39 addendum 74: a production cache key names the accepted
     /// solver world explicitly. The analyses-tree hash remains a backstop, but
     /// it is not a substitute for a readable identity: in particular the
