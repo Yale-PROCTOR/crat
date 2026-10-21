@@ -119,13 +119,6 @@ pub(crate) fn candidates(facts: &Facts) -> Vec<Candidate> {
     out
 }
 
-/// `CRAT_E5C_W61_FAULT`: `no-export` records no obligation (M5); `raw-too`
-/// removes the loans the carve-out keeps (`Raw` members and non-`Ref` derived
-/// pointers) too (M7).
-fn fault(name: &str) -> bool {
-    std::env::var("CRAT_E5C_W61_FAULT").ok().as_deref() == Some(name)
-}
-
 /// One function's qualifying stores in the round, and its locals' depth-0 kinds.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FnRule {
@@ -140,9 +133,6 @@ impl FnRule {
     /// the local is a non-`Ref` pointer derived from the stored value. A local
     /// without a depth-0 slot keeps its loan (conservative).
     fn removable(&self, local: Local) -> bool {
-        if fault("raw-too") {
-            return self.kinds.contains_key(&local);
-        }
         !self.kept.contains(&local)
             && matches!(
                 self.kinds.get(&local),
@@ -343,9 +333,7 @@ fn build(
         });
         entry.stores.insert(store, field);
         entry.kept.extend(kept);
-        if !fault("no-export") {
-            obligations.push(row);
-        }
+        obligations.push(row);
     }
     super::export::record_move_store_obligations(&obligations);
     RECORD.with(|record| record.borrow_mut().obligations = obligations);
