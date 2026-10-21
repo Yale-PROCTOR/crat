@@ -52,27 +52,6 @@ struct ParameterAccess<'tcx> {
     kind: AccessKind,
 }
 
-pub fn compute_invalidates<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    borrow_set: &BorrowSet<'tcx>,
-    provenance_set: &ProvenanceSet,
-    location_map: &DenseLocationMap,
-) -> Invalidates {
-    let copy_lends = CopyLendLoans::new_empty(borrow_set.loans.len());
-    compute_invalidates_inner(
-        tcx,
-        body,
-        borrow_set,
-        provenance_set,
-        location_map,
-        &copy_lends,
-        None,
-        None,
-        None,
-    )
-}
-
 /// The typed CopyLend loans of one function: `all` the selected copy-lends (A12's shared
 /// invalidation), `unique` the subset lent `&mut` (era-5c relay 213), whose loans conflict with
 /// every access to their owner. Derefs to `all`, so a reader that asks only "is this a copy
@@ -118,53 +97,6 @@ pub(crate) fn compute_invalidates_with_copy_lends<'tcx>(
         None,
         None,
     )
-}
-
-/// Compute the unchanged invalidation facts while also retaining the access
-/// local responsible for each conflicting insertion attempt.
-///
-/// Only the L2 feature-on replay calls this entry point. Feature-off callers
-/// continue through `compute_invalidates`, which supplies `None` and therefore
-/// performs no side allocation or collection.
-pub(crate) fn compute_invalidates_capturing<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    borrow_set: &BorrowSet<'tcx>,
-    provenance_set: &ProvenanceSet,
-    location_map: &DenseLocationMap,
-) -> (Invalidates, Vec<InvalidationAccess>) {
-    let copy_lends = CopyLendLoans::new_empty(borrow_set.loans.len());
-    compute_invalidates_capturing_with_copy_lends(
-        tcx,
-        body,
-        borrow_set,
-        provenance_set,
-        location_map,
-        &copy_lends,
-    )
-}
-
-pub(crate) fn compute_invalidates_capturing_with_copy_lends<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    borrow_set: &BorrowSet<'tcx>,
-    provenance_set: &ProvenanceSet,
-    location_map: &DenseLocationMap,
-    copy_lends: &CopyLendLoans,
-) -> (Invalidates, Vec<InvalidationAccess>) {
-    let mut accesses = Vec::new();
-    let invalidates = compute_invalidates_inner(
-        tcx,
-        body,
-        borrow_set,
-        provenance_set,
-        location_map,
-        copy_lends,
-        None,
-        Some(&mut accesses),
-        None,
-    );
-    (invalidates, accesses)
 }
 
 /// R617-1 (the guarded port): the capturing replay with A5's overlap, for the
