@@ -9,10 +9,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    analyses::borrow_ownership::{
-        a5_overlap::{A5Mode, WholeProgramAttestation},
-        model_cache,
-    },
+    analyses::borrow_ownership::model_cache,
     bo_rewriter::{
         self, E1Capture, EmissionRunConfig, decision::exposure::ConfiguredExposureInput,
         plan::FileKey,
@@ -32,8 +29,6 @@ pub struct BoReceipt {
     pub outcome: &'static str,
     pub status: &'static str,
     pub analysis_fingerprint: String,
-    pub configuration_sha256: String,
-    pub execution_role: String,
     pub input_tree_sha256: String,
     pub emitted_tree_sha256: String,
     pub files_changed: usize,
@@ -47,12 +42,10 @@ pub struct BoReceipt {
 impl BoReceipt {
     pub fn summary(&self) -> String {
         format!(
-            "outcome={} status={} analysis_fingerprint={} configuration_sha256={} execution_role={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} solve={}",
+            "outcome={} status={} analysis_fingerprint={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} solve={}",
             self.outcome,
             self.status,
             self.analysis_fingerprint,
-            self.configuration_sha256,
-            self.execution_role,
             self.files_changed,
             self.files_total,
             self.verify_rounds,
@@ -119,18 +112,6 @@ pub fn rewrite_bo(
     z3::set_global_param("sat.random_seed", "0");
 
     let analysis_fingerprint = model_cache::current_analysis_digest();
-    let configuration_sha256 = format!(
-        "{:x}",
-        Sha256::digest(
-            model_cache::solver_identity(
-                A5Mode::PreciseReplay,
-                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-            )
-            .as_bytes()
-        )
-    );
-    let execution_role =
-        std::env::var("CRAT_ERA5_EXECUTION_ROLE").unwrap_or_else(|_| "derive".to_owned());
 
     let configured_exposure =
         ConfiguredExposureInput::from_names("configured-c-exposed-fns", c_exposed_fns)
@@ -139,13 +120,7 @@ pub fn rewrite_bo(
         configured_exposure,
     };
     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
-    persist_in_place(
-        input,
-        &capture,
-        analysis_fingerprint,
-        configuration_sha256,
-        execution_role,
-    )
+    persist_in_place(input, &capture, analysis_fingerprint)
 }
 
 fn rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -232,8 +207,6 @@ fn persist_in_place(
     input: &Path,
     capture: &E1Capture,
     analysis_fingerprint: String,
-    configuration_sha256: String,
-    execution_role: String,
 ) -> Result<BoReceipt, String> {
     let program_root = input
         .parent()
@@ -256,8 +229,6 @@ fn persist_in_place(
             outcome,
             status: "absent-degraded",
             analysis_fingerprint,
-            configuration_sha256,
-            execution_role,
             emitted_tree_sha256: input_tree_sha256.clone(),
             input_tree_sha256,
             files_changed: 0,
@@ -315,8 +286,6 @@ fn persist_in_place(
         outcome,
         status: "present",
         analysis_fingerprint,
-        configuration_sha256,
-        execution_role,
         input_tree_sha256,
         emitted_tree_sha256,
         files_changed,
