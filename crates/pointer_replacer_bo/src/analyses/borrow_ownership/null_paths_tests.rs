@@ -1976,7 +1976,7 @@ fn e5c_inner_shape_decline_reason() {
 /// W55a: the tree owns and the deref temporary is its Ref reader.
 #[test]
 fn e5c_w55_a_deref_only_reads_let_the_field_own() {
-    let on = w55_rows(&[("CRAT_ERA5C_FIELD_OWN_REPAIR", "on")]);
+    let on = w55_rows(&[]);
     let kind = |rows: &std::collections::BTreeMap<String, String>, k: &str| {
         rows.get(k)
             .cloned()
@@ -1989,35 +1989,6 @@ fn e5c_w55_a_deref_only_reads_let_the_field_own() {
         "the deref temporary reads"
     );
     assert_eq!(kind(&on, "INSERT insert::_1@d0"), "owning");
-}
-
-/// W56: rule 1b's companion. Rule 1b opens avl's fields; the rotations then leave
-/// a residual conflict on an Owning field, which declined the program. With
-/// `CRAT_ERA5C_FIELD_OWN_REPAIR` the loop commits `¬own` on the field and accepts.
-#[test]
-fn e5c_w56_an_owning_field_residual_is_repaired_not_declined() {
-    let reason = |repair: &str| -> String {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", repair));
-        env.push(("CRAT_E5C_SHAPE", "AVL"));
-        child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_shape_decline_reason",
-            &env,
-        )
-        .lines()
-        .find_map(|l| l.strip_prefix("E5C_DECLINE ").map(str::to_owned))
-        .expect("a decline line")
-    };
-    let off = reason("off");
-    assert!(
-        off.contains("field_kind=Some(Owning)"),
-        "without the repair the Owning-field residual declines: {off}"
-    );
-    assert_eq!(
-        reason("on"),
-        "none",
-        "with the repair the shape is accepted"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,7 +2284,6 @@ fn e5c_w60_a_parameter_moved_into_a_field_supports_it() {
     let rows = |moved: &str| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         env.push(("CRAT_ERA5C_ORIGIN_SET", "on"));
-        env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"));
         env.push(("CRAT_ERA5C_MOVED_INPUT", moved));
         child(
             "analyses::borrow_ownership::null_paths_tests::e5c_inner_w60",
@@ -2648,13 +2618,12 @@ fn e5c_inner_w61() {
 }
 
 /// The W61 child's lines under the design record's arm set (W47 + `MUT_MODEL` +
-/// 1b + 1a′ + 2′, `FIELD_OWN_REPAIR` off) plus `extra`.
+/// 1b + 1a′ + 2′) plus `extra`.
 fn w61_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
-        ("CRAT_ERA5C_FIELD_OWN_REPAIR", "off"),
     ]);
     env.extend_from_slice(extra);
     child(
@@ -2850,7 +2819,6 @@ fn e5c_w61_n_the_arm_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
     let rows = |arm: &str| -> std::collections::BTreeMap<String, String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
         env.extend_from_slice(&[
-            ("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"),
             ("CRAT_ERA5C_ORIGIN_SET", "on"),
             ("CRAT_ERA5C_MOVED_INPUT", "on"),
             ("CRAT_ERA5C_MOVE_STORE", arm),
@@ -3044,7 +3012,6 @@ fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
     env.extend_from_slice(&[
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
-        ("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"),
     ]);
     env.extend_from_slice(extra);
     child(
@@ -3847,7 +3814,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     env.extend_from_slice(&[
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
         ("CRAT_ERA5C_MOVED_INPUT", "on"),
-        ("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"),
         ("CRAT_ERA5C_MOVE_STORE", "on"),
         // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),
@@ -5382,7 +5348,6 @@ fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
 fn e5c_w69_e_the_field_own_branch_runs_under_the_guarded_repair() {
     let run = |fault: Option<&str>| -> Vec<String> {
         let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_FIELD_OWN_REPAIR", "on"));
         env.push(("CRAT_E5C_SHAPE", "AVL"));
         env.push(("CRAT_BO_REPAIR", "guarded"));
         if let Some(fault) = fault {

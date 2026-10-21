@@ -25,22 +25,6 @@ use rustc_middle::mir::{
 
 use super::null_paths::{NullPlace, Proj};
 
-/// `CRAT_ERA5C_FIELD_OWN_REPAIR=on|off` (fail-loud, absent = off): **L01⁹, rule
-/// 1b's companion**. A residual borrow conflict that names an OWNING field used to
-/// decline the program (`residual_nonref_field`: Mode A can only demote a Ref).
-/// Under this arm the verify loop instead commits `¬own` on every Owning field of
-/// the residual and re-solves -- a monotone restriction, so it is sound and it
-/// terminates. A Raw field in a residual still declines. Rule 1b opens Owning
-/// fields that rotations then conflict on (avl's shape): without this the frame
-/// would decline the program rather than fall back to the fields' old kinds.
-pub(crate) fn field_own_repair() -> bool {
-    match std::env::var("CRAT_ERA5C_FIELD_OWN_REPAIR").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_FIELD_OWN_REPAIR must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_NULL_EXIT=on|off` (fail-loud, absent = off): **L01⁹, R563-1** (era-5c
 /// 055, buffer's wall 1). The exit finalization skips a local that is null on
 /// every path reaching a return (`infer::null_at_exit_locals`): a null pointer

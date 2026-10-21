@@ -1533,12 +1533,9 @@ fn verify_rounds(
         // (No Local fixture forces this arm — its coverage rests on that invariant, not a synthesized
         // case.) The field early-return runs first, so the assert now effectively guards Locals only.
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
-            // L01⁹ (`CRAT_ERA5C_FIELD_OWN_REPAIR`): an OWNING field in a residual
-            // is demoted (`¬own`, monotone) instead of declining the program.
-            if super::field_moves::field_own_repair()
-                && !w69_fault(repair, "no-field-own")
-                && model.get(&field) == Some(&SlotKind::Owning)
-            {
+            // L01⁹: an OWNING field in a residual is demoted (`¬own`, monotone) instead of
+            // declining the program.
+            if !w69_fault(repair, "no-field-own") && model.get(&field) == Some(&SlotKind::Owning) {
                 if !planner_empty_round(planner.as_mut(), &mut stats, &model, diagnostics_enabled) {
                     return (None, stats);
                 }
