@@ -1554,6 +1554,13 @@ t2=endpoint-force-retraction-v1\n\
             std::fs::write(root.join("nested/a.rs"), "pub fn a() {}\n").expect("nested source");
         }
         assert_ne!(a, b, "the control needs distinct roots");
+        let analysis_code_fingerprint_at = |dir: &Path| {
+            super::super::code_fingerprint::fingerprint(&[super::super::code_fingerprint::Root {
+                label: "bo",
+                dir,
+                files: None,
+            }])
+        };
         assert_eq!(
             analysis_code_fingerprint_at(&a),
             analysis_code_fingerprint_at(&b),

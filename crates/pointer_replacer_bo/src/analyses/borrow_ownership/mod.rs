@@ -16,6 +16,7 @@ pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
 pub(crate) mod cache_contract;
 mod call_graph;
+pub(crate) mod code_fingerprint;
 pub mod coherence;
 pub(crate) mod comparison;
 pub(crate) mod construction;
