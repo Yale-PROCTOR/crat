@@ -242,22 +242,15 @@ fn add_coherence_impl<'tcx>(
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
     remove_copy_equates: bool,
 ) {
-    // R351-3: in pass 1 both maps stay empty, so the dispatch below falls
-    // through to the pin's unconditional `equate`. The pin asserted one kind
-    // equality here; era-5b's guarded form is the seat's prime suspect for the
-    // 52 `ref -> raw`, and pass 1 is what tests that.
-    let joint = super::licensing::facts::Pass::current() == super::licensing::facts::Pass::Joint;
     // L01^5 (ii): the strong-update field moves of this body, consulted just
     // before the pin's unconditional `equate`.
     let field_moves = super::field_moves::compute(body);
     let field_readers = solver
         .ownership_facts()
-        .filter(|_| joint)
         .map(|facts| super::licensing::readers::guards_for_body(&facts, solver, fn_did, body))
         .unwrap_or_default();
     let mut reference_readers = FxHashMap::default();
-    if joint
-        && let Some(facts) = solver.ownership_facts()
+    if let Some(facts) = solver.ownership_facts()
         && let Some(frozen) = &facts.licensing
     {
         for candidate in &frozen.reference_effects.candidates {

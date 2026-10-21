@@ -348,7 +348,6 @@ fn bst_probe(arm: &str) -> String {
             ("CRAT_R385_TARGETS", BST_TARGETS),
             ("CRAT_R385_GRANULARITY", "assertion"),
             ("CRAT_R385_WORLD", "closed"),
-            ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", arm),
             ("CRAT_ERA5C_DEBUG", "1"),
             ("DIR", dir.as_str()),
@@ -603,10 +602,7 @@ fn e5c_inner_avl_with_free_full_solve_under_the_arm() {
 fn e5c_w20_avl_with_a_free_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_avl_with_free_full_solve_under_the_arm",
-        &[
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-        ],
+        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
     );
     assert!(text.contains("E5C_AVLFREE totals"), "{text}");
     eprintln!(
@@ -670,10 +666,7 @@ fn e5c_inner_avl_shape_full_solve_under_the_arm() {
 fn e5c_w19_the_avl_shape_model_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_avl_shape_full_solve_under_the_arm",
-        &[
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-        ],
+        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
     );
     assert!(text.contains("E5C_AVL totals"), "{text}");
     eprintln!(
@@ -690,10 +683,7 @@ fn e5c_w19_the_avl_shape_model_is_measured() {
 fn e5c_w18_the_leak_shape_model_is_measured() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_leak_shape_full_solve_under_the_arm",
-        &[
-            ("CRAT_ERA5B_PASS", "joint"),
-            ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-        ],
+        &[("CRAT_ERA5C_MOVE_TRACKING", "on")],
     );
     assert!(text.contains("E5C_LEAK totals"), "{text}");
     eprintln!(
@@ -841,7 +831,6 @@ fn e5c_w10_bst_shape_fields_own_under_the_arm() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_bst_shape_full_solve_under_the_arm",
         &[
-            ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
             ("CRAT_ERA5C_DEBUG", "1"),
         ],
@@ -1037,7 +1026,6 @@ fn e5c_w12_to_w15_the_allocator_contract_on_the_brotli_shape() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_full_solve_under_the_contract",
         &[
-            ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
             ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
         ],
@@ -1081,7 +1069,6 @@ fn e5c_w16_an_indirect_call_result_is_opaque_without_the_contract() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract",
         &[
-            ("CRAT_ERA5B_PASS", "joint"),
             ("CRAT_ERA5C_MOVE_TRACKING", "on"),
             ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "off"),
         ],
@@ -1186,10 +1173,7 @@ pub unsafe extern "C" fn rr(t: *const *mut f64) -> f64 {
 pub static TABLE: [Option<unsafe extern "C" fn(*const *mut f64) -> f64>; 1] = [Some(rr)];
 "#;
 
-const W47_ARMS: &[(&str, &str)] = &[
-    ("CRAT_ERA5B_PASS", "joint"),
-    ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-];
+const W47_ARMS: &[(&str, &str)] = &[("CRAT_ERA5C_MOVE_TRACKING", "on")];
 
 #[test]
 #[ignore = "runs under L01⁸'s arms in a child of e5c_w47"]

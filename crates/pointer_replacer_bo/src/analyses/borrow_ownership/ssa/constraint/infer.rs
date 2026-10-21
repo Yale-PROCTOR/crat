@@ -558,21 +558,15 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 if let Some(lhs_consume) =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
-                    if crate::analyses::borrow_ownership::licensing::facts::joint() {
-                        Infer::constant_source(
-                            infer_cx,
-                            lhs_consume,
-                            crate::analyses::borrow_ownership::source_events::operand_is_null(
-                                operand,
-                                &[],
-                                self.tcx,
-                            ),
-                        );
-                    } else {
-                        // The pin models every constant pointer, null included,
-                        // as an unknown source.
-                        Infer::unknown_source(infer_cx, lhs_consume);
-                    }
+                    Infer::constant_source(
+                        infer_cx,
+                        lhs_consume,
+                        crate::analyses::borrow_ownership::source_events::operand_is_null(
+                            operand,
+                            &[],
+                            self.tcx,
+                        ),
+                    );
                     tracing::debug!("constant pointer rvalue {:?}", rhs)
                 }
             }
@@ -584,19 +578,15 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     if matches!(operand, Operand::Constant(_)) {
-                        if crate::analyses::borrow_ownership::licensing::facts::joint() {
-                            Infer::constant_source(
-                                infer_cx,
-                                lhs_consume,
-                                crate::analyses::borrow_ownership::source_events::operand_is_null(
-                                    operand,
-                                    &[],
-                                    self.tcx,
-                                ),
-                            );
-                        } else {
-                            Infer::unknown_source(infer_cx, lhs_consume);
-                        }
+                        Infer::constant_source(
+                            infer_cx,
+                            lhs_consume,
+                            crate::analyses::borrow_ownership::source_events::operand_is_null(
+                                operand,
+                                &[],
+                                self.tcx,
+                            ),
+                        );
                     } else {
                         Infer::unknown_source(infer_cx, lhs_consume);
                     }
@@ -630,21 +620,15 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
-                    if crate::analyses::borrow_ownership::licensing::facts::joint() {
-                        Infer::constant_source(
-                            infer_cx,
-                            lhs_consume,
-                            crate::analyses::borrow_ownership::source_events::operand_is_null(
-                                operand,
-                                &[],
-                                self.tcx,
-                            ),
-                        );
-                    } else {
-                        // The pin models every constant pointer, null included,
-                        // as an unknown source.
-                        Infer::unknown_source(infer_cx, lhs_consume);
-                    }
+                    Infer::constant_source(
+                        infer_cx,
+                        lhs_consume,
+                        crate::analyses::borrow_ownership::source_events::operand_is_null(
+                            operand,
+                            &[],
+                            self.tcx,
+                        ),
+                    );
                 } else if !lhs.projection.is_empty()
                     && self.state.consume_chain.call_arg_temps.remove(&lhs.local)
                 {

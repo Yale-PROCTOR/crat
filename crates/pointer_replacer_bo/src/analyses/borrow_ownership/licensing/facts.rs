@@ -145,43 +145,6 @@ pub(crate) fn licensing_inputs_digest(facts: &Facts) -> [u8; 32] {
     sink.0.finalize().into()
 }
 
-/// R351-3: which pass this construction is. Pass 1 is the era-5a solve as the
-/// pin wrote it — none of era-5b's constraints are emitted and the solver is
-/// never given licensing facts, so `coherence`'s dispatch falls through to the
-/// unconditional `equate` by construction rather than by a second code path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Pass {
-    /// Era-5b's constraints ride the era-5a solve. The measured co-solve.
-    #[default]
-    Joint,
-    /// The pin's constraint system, unchanged.
-    EraFiveA,
-}
-
-/// R353-2: the pass is read once. It is process-wide by construction — an
-/// environment pin — and the inference walk asks per statement, which is not a
-/// place to re-read the environment.
-pub(crate) fn joint() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| Pass::current() == Pass::Joint)
-}
-
-impl Pass {
-    /// Fail-loud on a set-but-invalid value, as `ForkEngineMode` does: a typo
-    /// must not silently produce the joint solve under a pass-1 label.
-    pub(crate) fn current() -> Self {
-        match std::env::var("CRAT_ERA5B_PASS") {
-            Err(std::env::VarError::NotPresent) => Self::Joint,
-            Ok(value) => match value.as_str() {
-                "joint" => Self::Joint,
-                "era5a" => Self::EraFiveA,
-                other => panic!("CRAT_ERA5B_PASS must be joint or era5a; got {other:?}"),
-            },
-            Err(error) => panic!("CRAT_ERA5B_PASS is not valid Unicode: {error}"),
-        }
-    }
-}
-
 pub(crate) type Builder = Rc<RefCell<Facts>>;
 
 thread_local! {

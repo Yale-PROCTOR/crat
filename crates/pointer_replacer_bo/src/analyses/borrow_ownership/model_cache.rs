@@ -227,15 +227,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_ref_weight_named", "None".to_owned());
     // R551 (spec lane B3 (a)): era-5b's three constraint-changing switches were
     // covered only by the launch digest. They are the identity's now.
-    fields.insert(
-        "era5b_pass",
-        if super::licensing::facts::joint() {
-            "joint"
-        } else {
-            "era5a"
-        }
-        .to_owned(),
-    );
+    fields.insert("era5b_pass", "joint".to_owned());
     fields.insert("era5b_repair", "false".to_owned());
     fields.insert("era5b_relax_frame", "false".to_owned());
     // The test-build fault hooks are compiled into the worker (a test binary):

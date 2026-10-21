@@ -4071,9 +4071,6 @@ impl BoOwnDatabase<'_> {
     pub(crate) fn declare_pending_fold(&mut self, key: (u32, usize)) {
         let candidate = {
             // R353-2: era-5b's own addition; the pin had no such constraint.
-            if !super::licensing::facts::joint() {
-                return;
-            }
             let facts = self.ownership_facts.borrow();
             if facts.fold_declarations.is_none() {
                 return;
@@ -4121,9 +4118,6 @@ impl BoOwnDatabase<'_> {
     pub(crate) fn traversal_view_zero(&mut self, guard: &Bool, var: Var, formal: bool) {
         let operation = if formal {
             // R353-2: era-5b's own addition; the pin had no such constraint.
-            if !super::licensing::facts::joint() {
-                return;
-            }
             "guarded-traversal-formal-zero"
         } else {
             "guarded-traversal-view-zero"
@@ -4154,9 +4148,6 @@ impl BoOwnDatabase<'_> {
 
     pub(crate) fn pending_traversal_pair(&mut self, guard: &Bool, variables: &[Var]) {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() {
-            return;
-        }
         let (operation, clause) = match variables {
             [a, b] => (
                 "guarded-traversal-receiver-legacy",
@@ -4634,9 +4625,6 @@ impl Database for BoOwnDatabase<'_> {
         ensure_move: bool,
     ) {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() {
-            return;
-        }
         super::ownership_evidence::record(
             if ensure_move {
                 "guarded-reader-move"
@@ -4678,9 +4666,6 @@ impl Database for BoOwnDatabase<'_> {
         super::ownership_evidence::record(
             if source {
                 // R353-2: era-5b's own addition; the pin had no such constraint.
-                if !super::licensing::facts::joint() {
-                    return;
-                }
                 "guarded-reader-source-tail"
             } else {
                 "guarded-reader-view-tail"
@@ -4709,9 +4694,6 @@ impl Database for BoOwnDatabase<'_> {
         boundary: &super::ownership_boundary::Substitution,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() {
-            return false;
-        }
         use super::{
             licensing::{cell_effects, facts::EquationId},
             ownership_boundary::Variables,
@@ -4828,9 +4810,6 @@ impl Database for BoOwnDatabase<'_> {
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() {
-            return false;
-        }
         use super::ownership_occurrence::Availability::Present;
         let Some(point) = super::ownership_evidence::point() else { return false };
         let Some(candidate) =
@@ -4900,9 +4879,6 @@ impl Database for BoOwnDatabase<'_> {
         cell: &super::ssa::consume::Consume<std::ops::Range<Var>>,
     ) -> bool {
         // R353-2: era-5b's own addition; the pin had no such constraint.
-        if !super::licensing::facts::joint() {
-            return false;
-        }
         use super::ownership_occurrence::{Availability::Present, PathStep};
         if !super::licensing::facts::active()
             || reference.r#use.end.as_u32() - reference.r#use.start.as_u32() != 2

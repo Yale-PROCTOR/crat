@@ -561,7 +561,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             }
         }
     }
-    let joint = licensing::facts::Pass::current() == licensing::facts::Pass::Joint;
     for carrier in &facts
         .licensing
         .as_ref()
@@ -571,24 +570,20 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         let slot = facts.slot_refs[&carrier.slot_key];
         // O-ORIGIN is independent of endpoint/grant selection. A refused
         // fresh responsibility cannot acquire an invented borrow lifetime.
-        if joint {
-            kind_solver.add_borrow_exclusion(Some(slot), &[]);
-            raw_cause::note_eager(&kind_solver, "no-ref-carrier");
-            raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
-        }
+        kind_solver.add_borrow_exclusion(Some(slot), &[]);
+        raw_cause::note_eager(&kind_solver, "no-ref-carrier");
+        raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
     }
-    if joint {
-        kind_solver.apply_licensing_grants(&facts)?;
-        licensing::readers::block_incomplete_transfers(&facts, kind_solver);
-        kind_solver.constrain_reader_field_support(&facts)?;
-        kind_solver.constrain_reference_field_effects(&facts)?;
-        kind_solver.constrain_first_permissions(&facts)?;
-        kind_solver.constrain_traversal_calls(&facts)?;
-        kind_solver.constrain_fold_callers(&facts)?;
-        // era-5c (R409-1): an allocation is released by its own allocator.
-        kind_solver.constrain_allocator_contract_pairing(&facts);
-        export::record_ownership_facts(&facts);
-    }
+    kind_solver.apply_licensing_grants(&facts)?;
+    licensing::readers::block_incomplete_transfers(&facts, kind_solver);
+    kind_solver.constrain_reader_field_support(&facts)?;
+    kind_solver.constrain_reference_field_effects(&facts)?;
+    kind_solver.constrain_first_permissions(&facts)?;
+    kind_solver.constrain_traversal_calls(&facts)?;
+    kind_solver.constrain_fold_callers(&facts)?;
+    // era-5c (R409-1): an allocation is released by its own allocator.
+    kind_solver.constrain_allocator_contract_pairing(&facts);
+    export::record_ownership_facts(&facts);
     kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))
 }
