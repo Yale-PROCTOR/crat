@@ -233,9 +233,7 @@ impl<'a> NativeBorrowContext<'a> {
         );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
-        if crate::analyses::borrow_ownership::copy_relax::merge_liveness()
-            && let Some(demoted) = self.demoted.get(&f)
-        {
+        if let Some(demoted) = self.demoted.get(&f) {
             let location_map = &inference.location_map;
             let mut liveness = std::mem::replace(
                 &mut inference.provenance_liveness,

@@ -297,19 +297,6 @@ fn r324_a_formal_its_raw_copy_walks_takes_the_slice_form() {
     );
 }
 
-/// The frame without the switches: the copy is equated with `s`, both raw, as
-/// at 58.
-#[test]
-fn r324_control_without_the_switches_the_formal_stays_raw() {
-    let frame = rewrite("GET_ARRAY", false);
-    assert!(frame.type_checks, "{}", frame.source);
-    assert!(
-        frame.signature("get_array").contains("s:*mutf64"),
-        "{}",
-        frame.signature("get_array")
-    );
-}
-
 /// A copy that never steps does not make its source a slice.
 #[test]
 fn r324_control_a_copy_that_does_not_walk_keeps_the_thin_form() {

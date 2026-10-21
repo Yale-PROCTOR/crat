@@ -29,14 +29,6 @@ use crate::analyses::{
     liveness::MaybeLiveLocals,
 };
 
-pub(crate) fn copy_relax() -> bool {
-    match std::env::var("CRAT_COPY_RELAX").as_deref() {
-        Err(_) | Ok("off") => false,
-        Ok("depth0-borrow-to-raw") => true,
-        Ok(other) => panic!("CRAT_COPY_RELAX={other:?}: expected off or depth0-borrow-to-raw"),
-    }
-}
-
 /// The copies the relaxation may take (S39 (b)), installed by the solve before any coherence is
 /// added (`construction::analyze_copy_relax_sites`). Nothing installed: nothing is relaxed.
 static ELIGIBLE: Mutex<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> = Mutex::new(None);
@@ -51,14 +43,6 @@ pub(crate) fn eligible(fn_did: LocalDefId, block: BasicBlock, statement_index: u
             sites.contains(&MirLocationKey::new(block.as_u32(), statement_index))
         })
     })
-}
-
-pub(crate) fn merge_liveness() -> bool {
-    match std::env::var("CRAT_MERGE_LIVENESS").as_deref() {
-        Err(_) | Ok("off") => false,
-        Ok("on") => true,
-        Ok(other) => panic!("CRAT_MERGE_LIVENESS={other:?}: expected off or on"),
-    }
 }
 
 /// Marks, at every point where a demoted local is live, the provenances of the live owners of

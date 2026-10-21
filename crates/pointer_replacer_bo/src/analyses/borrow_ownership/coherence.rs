@@ -305,7 +305,6 @@ fn add_coherence_impl<'tcx>(
     }
     // W55's fault (`CRAT_E5C_W55_FAULT=equate`) restores the full equate.
     let deref_reader = std::env::var("CRAT_E5C_W55_FAULT").as_deref() != Ok("equate");
-    let copy_relax = super::copy_relax::copy_relax();
     for (block, bbdata) in body.basic_blocks.iter_enumerated() {
         for (statement_index, stmt) in bbdata.statements.iter().enumerate() {
             let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
@@ -316,8 +315,7 @@ fn add_coherence_impl<'tcx>(
                 Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
                 | Rvalue::CopyForDeref(rhs) => {
                     // era-5c relay 208 (S39): a bare copy between two locals.
-                    let relax_site = copy_relax
-                        && matches!(rvalue, Rvalue::Use(_))
+                    let relax_site = matches!(rvalue, Rvalue::Use(_))
                         && lhs.projection.is_empty()
                         && rhs.projection.is_empty()
                         && super::copy_relax::eligible(fn_did, block, statement_index);

@@ -172,16 +172,11 @@ pub(crate) fn solver_identity(
     fields.insert("era5c_moved_input", "true".to_owned());
     fields.insert("era5c_move_store", "true".to_owned());
     fields.insert("era5c_lend", "true".to_owned());
-    // era-5c relay 208: present only when set, so the frame's identity is unchanged.
-    if super::copy_relax::copy_relax() {
-        fields.insert(
-            "era5c_copy_relax",
-            "depth0-borrow-to-raw+c3-destination-v2".to_owned(),
-        );
-    }
-    if super::copy_relax::merge_liveness() {
-        fields.insert("era5c_merge_liveness", "on".to_owned());
-    }
+    fields.insert(
+        "era5c_copy_relax",
+        "depth0-borrow-to-raw+c3-destination-v2".to_owned(),
+    );
+    fields.insert("era5c_merge_liveness", "on".to_owned());
     fields.insert("era5c_typed_release", "true".to_owned());
     fields.insert("era5c_arg_order", "true".to_owned());
     fields.insert("era5c_overlap_type_route", "true".to_owned());

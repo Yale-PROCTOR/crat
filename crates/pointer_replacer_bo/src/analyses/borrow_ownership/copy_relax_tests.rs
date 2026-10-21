@@ -1,7 +1,7 @@
-//! era-5c relay 208 (S39): the depth-0 Copy relaxation (`CRAT_COPY_RELAX`) and the merge
-//! liveness (`CRAT_MERGE_LIVENESS`). Each witness runs the full solve of a fixture (the joint
-//! pass, borrow verification, retirement, the relax loop) in a child under the frame of record's
-//! arms (`frames/l01p14u-env.sh`) plus the switches named, and reads the settled kinds by name.
+//! era-5c relay 208 (S39): the depth-0 Copy relaxation and the merge liveness. Each witness runs
+//! the full solve of a fixture (the joint pass, borrow verification, retirement, the relax loop) in
+//! a child under the frame of record's arms (`frames/l01p14u-env.sh`) and reads the settled kinds
+//! by name.
 
 use std::collections::BTreeMap;
 
@@ -237,8 +237,8 @@ fn e5c_inner_copy_relax() {
     }
 }
 
-/// The shape's kinds under the frame's arms with `relax` and `liveness` as the two switches.
-fn rows(shape: &str, relax: &str, liveness: &str) -> BTreeMap<String, String> {
+/// The shape's kinds under the frame's arms.
+fn rows(shape: &str) -> BTreeMap<String, String> {
     let exe = std::env::current_exe().expect("current_exe");
     let mut command = std::process::Command::new(exe);
     command.args([
@@ -252,8 +252,6 @@ fn rows(shape: &str, relax: &str, liveness: &str) -> BTreeMap<String, String> {
         command.env(key, value);
     }
     command.env("CRAT_E5C_CR_SHAPE", shape);
-    command.env("CRAT_COPY_RELAX", relax);
-    command.env("CRAT_MERGE_LIVENESS", liveness);
     let output = command.output().expect("child test");
     let text = format!(
         "{}\n{}",
@@ -267,7 +265,7 @@ fn rows(shape: &str, relax: &str, liveness: &str) -> BTreeMap<String, String> {
         .filter_map(|l| l.rsplit_once(' '))
         .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
         .collect();
-    eprintln!("E5C_CR_ROWS {shape} relax={relax} liveness={liveness} {rows:?}");
+    eprintln!("E5C_CR_ROWS {shape} {rows:?}");
     rows
 }
 
@@ -277,38 +275,21 @@ fn kind<'a>(rows: &'a BTreeMap<String, String>, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {key}: {rows:#?}"))
 }
 
-const RELAX: &str = "depth0-borrow-to-raw";
-
 /// (1) With the relaxation, the liveness rule and the mutable copy-lend, `p` settles raw beside
 /// its raw copy.
 #[test]
 fn e5c_cr_1_a_raw_copy_beside_the_mutable_lend_leaves_its_source_raw() {
-    let r = rows("CASTCOPY", RELAX, "on");
+    let r = rows("CASTCOPY");
     assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
     assert_eq!(kind(&r, "run::q"), "raw", "{r:#?}");
-}
-
-/// (1) at the frame: the copy's equality makes `p` raw beside its raw copy.
-#[test]
-fn e5c_cr_1_control_at_the_frame_the_source_is_raw() {
-    let r = rows("CASTCOPY", "off", "off");
-    assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
 }
 
 /// (2) The referent written between the copy's uses: with the liveness rule `p` is not a
 /// reference.
 #[test]
 fn e5c_cr_2_a_write_between_the_copys_uses_demotes_the_source() {
-    let r = rows("WRITE_BETWEEN", RELAX, "on");
+    let r = rows("WRITE_BETWEEN");
     assert_ne!(kind(&r, "run::p"), "ref", "{r:#?}");
-}
-
-/// (2′) What the liveness rule withholds: without it (printed, an observation).
-#[test]
-#[ignore = "an observation; run with --ignored --nocapture"]
-fn e5c_cr_2_observation_without_the_liveness_rule() {
-    let r = rows("WRITE_BETWEEN", RELAX, "off");
-    eprintln!("E5C_CR_2W {r:?}");
 }
 
 /// S39 (b): a raw copy that escapes (a return, a call, a field) is not relaxed: its source stays
@@ -320,7 +301,7 @@ fn e5c_cr_b_an_escaping_copy_is_not_relaxed() {
         ("ESCAPE_CALL", "give"),
         ("ESCAPE_FIELD", "put"),
     ] {
-        let r = rows(shape, RELAX, "on");
+        let r = rows(shape);
         assert_eq!(
             kind(&r, &format!("{function}::p")),
             kind(&r, &format!("{function}::q")),
@@ -329,23 +310,10 @@ fn e5c_cr_b_an_escaping_copy_is_not_relaxed() {
     }
 }
 
-/// relay 210: a copy into the return place is not relaxed: the formal returned keeps its frame
-/// kind.
-#[test]
-fn e5c_cr_b_a_copy_into_the_return_place_is_not_relaxed() {
-    let frame = rows("RETURN_DIRECT", "off", "off");
-    let relaxed = rows("RETURN_DIRECT", RELAX, "on");
-    assert_eq!(
-        kind(&relaxed, "out::p"),
-        kind(&frame, "out::p"),
-        "{frame:#?} {relaxed:#?}"
-    );
-}
-
 /// (3) An Owning source stays equal: never Owning beside a Raw copy, never a reference.
 #[test]
 fn e5c_cr_3_an_owning_source_stays_equal() {
-    let r = rows("OWNING", RELAX, "on");
+    let r = rows("OWNING");
     assert_eq!(kind(&r, "run::q"), "raw", "{r:#?}");
     assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
 }
@@ -354,66 +322,13 @@ fn e5c_cr_3_an_owning_source_stays_equal() {
 /// though `x` is written between `q`'s uses. The liveness rule alone makes `q` raw.
 #[test]
 fn e5c_cr_4_the_cast_view_used_after_a_write_is_not_a_reference() {
-    let r = rows("CAST", "off", "on");
+    let r = rows("CAST");
     assert_ne!(kind(&r, "run::q"), "ref", "{r:#?}");
-}
-
-/// (4) at the frame (both switches off): 58 decides `q` a reference (era-5c 167).
-#[test]
-fn e5c_cr_4_control_at_the_frame_the_cast_view_is_a_reference() {
-    let r = rows("CAST", "off", "off");
-    assert_eq!(kind(&r, "run::p"), "raw", "{r:#?}");
-    assert_eq!(kind(&r, "run::q"), "ref", "{r:#?}");
 }
 
 /// (4′) The control: the view not used after the write stays a reference under the rule.
 #[test]
 fn e5c_cr_4_control_a_dead_view_stays_a_reference() {
-    let r = rows("CAST_DEAD", "off", "on");
+    let r = rows("CAST_DEAD");
     assert_eq!(kind(&r, "run::q"), "ref", "{r:#?}");
-}
-
-/// The identity names both switches only when set.
-#[test]
-fn e5c_cr_identity_names_the_switches_only_when_set() {
-    let exe = std::env::current_exe().expect("current_exe");
-    for (relax, liveness, expect_relax, expect_live) in
-        [("off", "off", false, false), (RELAX, "on", true, true)]
-    {
-        let output = std::process::Command::new(&exe)
-            .args([
-                "analyses::borrow_ownership::copy_relax_tests::e5c_inner_identity",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("CRAT_COPY_RELAX", relax)
-            .env("CRAT_MERGE_LIVENESS", liveness)
-            .output()
-            .expect("child");
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(
-            text.contains("era5c_copy_relax=depth0-borrow-to-raw+c3-destination-v2"),
-            expect_relax,
-            "{text}"
-        );
-        assert_eq!(
-            text.contains("era5c_merge_liveness=on"),
-            expect_live,
-            "{text}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "child of e5c_cr_identity_names_the_switches_only_when_set"]
-fn e5c_inner_identity() {
-    for line in super::model_cache::solver_identity(
-        super::a5_overlap::A5Mode::PreciseReplay,
-        Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
-    )
-    .lines()
-    {
-        println!("{line}");
-    }
 }

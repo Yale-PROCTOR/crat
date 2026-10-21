@@ -1836,13 +1836,11 @@ fn solve_bo_a5_config_with_source_events(
         "the A5 frame runs Baseline or the LendArm selector, never RemovalOnly"
     );
     // era-5c relay 208 (S39 (b)): the copies the relaxation may take, for this solve.
-    if super::copy_relax::copy_relax() {
-        let (eligible, counts) = analyze_copy_relax_sites(program, slots, origins.native_flows());
-        if std::env::var_os("CRAT_E5C_CR_STATS").is_some() {
-            eprintln!("E5C_CR_SITES {counts:?}");
-        }
-        super::copy_relax::install(eligible);
+    let (eligible, counts) = analyze_copy_relax_sites(program, slots, origins.native_flows());
+    if std::env::var_os("CRAT_E5C_CR_STATS").is_some() {
+        eprintln!("E5C_CR_SITES {counts:?}");
     }
+    super::copy_relax::install(eligible);
 
     let baseline_solver = KindSolver::new(slots);
     let baseline_construction =
