@@ -97,20 +97,6 @@ pub(crate) fn own_named() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_MOVE_STORE=on|off` (fail-loud, absent = off): **L01⁹ wall 4, R573-5
-/// (built behind the switch; the seat's formal review of the design record gates any
-/// frame)**. A store whose transfer is a move into a field that is `Owning` in the
-/// round's model, with the destination's post-store token owning, issues no loan on a
-/// local that is not `Raw`; the model exports the stored value's later uses. See
-/// `move_store` and era-5c report 060a.
-pub(crate) fn move_store() -> bool {
-    match std::env::var("CRAT_ERA5C_MOVE_STORE").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_MOVE_STORE must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_ARG_ORDER=on|off` (fail-loud, absent = off): **L01¹⁰, R609-3 (a)**.
 /// The argument-order premise: a call's pure-read operands are evaluated before
 /// the reborrows the same call receives, when every statement between such a

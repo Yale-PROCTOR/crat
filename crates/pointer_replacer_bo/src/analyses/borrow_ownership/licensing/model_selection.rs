@@ -63,20 +63,16 @@ impl Selection {
                     .map(|value| (node, value))
             })
             .collect();
-        let move_store_owns = if super::super::field_moves::move_store() {
-            super::super::move_store::destination_vars(&facts)
-                .into_iter()
-                .filter_map(|var| {
-                    facts
-                        .ownership_asts
-                        .get(super::super::ssa::constraint::Var::from_u32(var))
-                        .and_then(|ast| evaluate(ast))
-                        .map(|value| (var, value))
-                })
-                .collect()
-        } else {
-            BTreeMap::new()
-        };
+        let move_store_owns = super::super::move_store::destination_vars(&facts)
+            .into_iter()
+            .filter_map(|var| {
+                facts
+                    .ownership_asts
+                    .get(super::super::ssa::constraint::Var::from_u32(var))
+                    .and_then(|ast| evaluate(ast))
+                    .map(|value| (var, value))
+            })
+            .collect();
         Self {
             move_store_owns,
             fold_values: super::fold_custody::capture(&facts, &mut evaluate),

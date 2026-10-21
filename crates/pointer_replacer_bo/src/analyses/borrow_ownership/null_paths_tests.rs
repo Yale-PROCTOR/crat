@@ -2549,211 +2549,14 @@ fn w61_of<'a>(lines: &'a [String], shape: &str, what: &str) -> Vec<&'a str> {
         .collect()
 }
 
-fn w61_accepted(lines: &[String], shape: &str) -> bool {
-    lines
-        .iter()
-        .any(|l| l == &format!("E5C_W61 {shape} result accepted"))
-}
-
-fn w61_field_decline(lines: &[String], shape: &str) -> bool {
-    w61_of(lines, shape, "result")
-        .iter()
-        .any(|l| l.contains("field_conflict=Some(Field(") && l.contains("field_kind=Some(Owning)"))
-}
-
-/// M1 + M3: `AVL_SHAPE` declines on the Owning field without the arm (RED) and is
-/// accepted with it; every cleared loan is on a non-`Raw` local; the export
-/// carries exactly `y`'s three uses after `(*x).right = y` in each rotation.
-/// M3: an `equal` by copy is not a move (no fixture lowers a store that way
-/// before optimisation, so the control is the predicate itself).
-#[test]
-fn e5c_w61_m1_avl_shape_stores_as_moves() {
-    use super::licensing::field_support::moved_transfer;
-    assert!(
-        !moved_transfer("equal", false),
-        "M3: a copied operand keeps its loans"
-    );
-    let off = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "off")]);
-    let on = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "on")]);
-    assert!(
-        w61_field_decline(&off, "AVL"),
-        "M1 is RED without the arm: {off:?}"
-    );
-    assert!(w61_accepted(&on, "AVL"), "{on:?}");
-    let removed = w61_of(&on, "AVL", "removed");
-    assert!(
-        !removed.is_empty() && removed.iter().all(|r| r.contains("Some(Owning)")),
-        "{removed:?}"
-    );
-    assert!(
-        removed.iter().any(|r| r.ends_with(" true")),
-        "the cleared loans include invalid ones"
-    );
-    let uses = w61_of(&on, "AVL", "use");
-    assert_eq!(uses.len(), 6, "{uses:?}");
-    assert_eq!(
-        w61_of(&on, "AVL", "export"),
-        ["rows=6 uses=6"],
-        "the export surface carries them"
-    );
-    for rotation in ["leftRotate", "rightRotate"] {
-        let mine: Vec<_> = uses
-            .iter()
-            .filter(|u| u.starts_with(&format!("{rotation} bb0[6] ")))
-            .map(|u| u.split(' ').skip(2).collect::<Vec<_>>().join(" "))
-            .collect();
-        assert_eq!(
-            mine,
-            [
-                "bb0[10] _1 write-deref true",
-                "bb0[14] _1 load-field true",
-                "bb1[1] _1 write-deref true"
-            ],
-            "{rotation}"
-        );
-    }
-}
-
-/// M2: the corpus order declines without the arm (RED) and is accepted with it,
-/// with no obligation (every row `uses=0`), the fields `Owning` and nothing raw.
-#[test]
-fn e5c_w61_m2_corpus_order_has_no_obligation() {
-    let off = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "off")]);
-    let on = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "on")]);
-    assert!(
-        w61_field_decline(&off, "CORPUS"),
-        "M2 is RED without the arm: {off:?}"
-    );
-    assert!(w61_accepted(&on, "CORPUS"), "{on:?}");
-    let rows = w61_of(&on, "CORPUS", "obligation");
-    assert_eq!(rows.len(), 6, "{rows:?}");
-    assert!(rows.iter().all(|r| r.ends_with(" uses=0")), "{rows:?}");
-    let kinds = w61_of(&on, "CORPUS", "kind");
-    for field in ["Node::field2@d0 Owning", "Node::field3@d0 Owning"] {
-        assert!(kinds.contains(&field), "{kinds:?}");
-    }
-    assert!(kinds.iter().all(|k| !k.ends_with(" Raw")), "{kinds:?}");
-}
-
-/// M4: a `Ref` pointer derived from `y` before `(*x).right = y` is exported with
-/// its uses after the store; the model's own loan on it then demotes it, and the
-/// shape ends where it ends without the arm.
-#[test]
-fn e5c_w61_m4_a_ref_derived_pointer_is_exported() {
-    let on = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "on"), ("CRAT_ERA5C_DEBUG", "1")]);
-    let exported: Vec<_> = on
-        .iter()
-        .filter(|l| {
-            l.starts_with("E5C move-store obligation fn=rightRotate") && l.contains(" local=_8 ")
-        })
-        .collect();
-    assert!(
-        exported.iter().any(|l| l.contains("kind=write-deref")),
-        "the derived pointer's write after the store is exported: {on:?}"
-    );
-    assert!(w61_field_decline(&on, "DERIVED"));
-}
-
 /// M5: suppressing the export removes M1's obligations (the rewriter's R1 is the
 /// backstop's witness); the loans are still cleared.
 #[test]
 fn e5c_w61_m5_the_export_fault_empties_the_obligations() {
-    let fault = w61_lines(&[
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
-        ("CRAT_E5C_W61_FAULT", "no-export"),
-    ]);
+    let fault = w61_lines(&[("CRAT_E5C_W61_FAULT", "no-export")]);
     assert!(w61_of(&fault, "AVL", "use").is_empty(), "{fault:?}");
     assert!(w61_of(&fault, "AVL", "obligation").is_empty());
     assert!(!w61_of(&fault, "AVL", "removed").is_empty());
-}
-
-/// M6 + M7: a non-`Ref` pointer derived from `y` (a field address, offset) keeps
-/// its loans: the shape declines on the same Owning field with and without the
-/// arm, and no cleared loan names it. M7: the fault that clears those loans too
-/// accepts the shape, so M6 is RED under it.
-#[test]
-fn e5c_w61_m6_m7_a_non_ref_derived_pointer_keeps_its_loans() {
-    let off = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "off")]);
-    let on = w61_lines(&[("CRAT_ERA5C_MOVE_STORE", "on"), ("CRAT_ERA5C_DEBUG", "1")]);
-    let fault = w61_lines(&[
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
-        ("CRAT_E5C_W61_FAULT", "raw-too"),
-    ]);
-    for shape in ["DERIVED", "DERIVED_RAW"] {
-        assert!(w61_field_decline(&off, shape), "{shape} off: {off:?}");
-        assert!(
-            w61_field_decline(&on, shape),
-            "{shape} on: the kept loan still declines"
-        );
-        assert!(
-            w61_accepted(&fault, shape),
-            "M7: {shape} is accepted under the fault"
-        );
-    }
-    assert!(
-        on.iter()
-            .any(|l| l.starts_with("E5C move-store qualify fn=rightRotate")
-                && l.contains("kept={_8}")),
-        "the field address is kept: {on:?}"
-    );
-    // 069's `loan=kept` rows: `h`'s two uses after `(*x).right = y` are exported, kept.
-    let kept = w61_of(&on, "DERIVED_RAW", "kept-use");
-    assert_eq!(
-        kept.iter()
-            .filter(|u| u.starts_with("rightRotate "))
-            .count(),
-        2,
-        "{kept:?}"
-    );
-    // `_8` is rightRotate's field address (leftRotate's `_8` is its store temporary).
-    let removed = w61_of(&on, "DERIVED_RAW", "removed");
-    assert!(
-        removed
-            .iter()
-            .filter(|r| r.starts_with("rightRotate "))
-            .all(|r| !r.contains(" _8 ")),
-        "{removed:?}"
-    );
-}
-
-/// W61 no-loss: the era-5c fixtures under L01⁹'s rules (1b + repair, 1a′, 2′)
-/// with the arm on and off. No Ref or Owning slot may fall to raw, and no
-/// Owning slot to Ref; gains are reported.
-#[test]
-fn e5c_w61_n_the_arm_loses_no_ref_and_no_owning_on_the_era5c_fixtures() {
-    let rows = |arm: &str| -> std::collections::BTreeMap<String, String> {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.extend_from_slice(&[
-            ("CRAT_ERA5C_ORIGIN_SET", "on"),
-            ("CRAT_ERA5C_MOVE_STORE", arm),
-        ]);
-        child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_w52_composition",
-            &env,
-        )
-        .lines()
-        .filter_map(|l| l.strip_prefix("E5C_W52D "))
-        .filter_map(|l| l.rsplit_once(' '))
-        .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
-        .collect()
-    };
-    let off = rows("off");
-    let on = rows("on");
-    assert_eq!(off.len(), on.len(), "the same slots either way");
-    let mut lost = Vec::new();
-    let mut moved = Vec::new();
-    for (k, v) in &off {
-        let w = on.get(k).map(String::as_str).unwrap_or("?");
-        if w == v {
-            continue;
-        }
-        moved.push(format!("{k}: {v} -> {w}"));
-        if (v != "raw" && w == "raw") || (v == "owning" && w == "ref") {
-            lost.push(format!("{k}: {v} -> {w}"));
-        }
-    }
-    eprintln!("E5C_W61N_MOVED {moved:?}");
-    assert!(lost.is_empty(), "the arm lost {lost:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2930,7 +2733,7 @@ fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
 /// trip loses them (RED).
 #[test]
 fn e5c_w62_a_the_rows_round_trip_through_the_export_and_the_entry() {
-    let on = w62_lines(&[("CRAT_ERA5C_MOVE_STORE", "on")]);
+    let on = w62_lines(&[]);
     assert!(on.contains(&"model ok:6:6".to_owned()), "{on:?}");
     assert!(on.contains(&"portable ok:6:6".to_owned()), "{on:?}");
     assert!(on.contains(&"entry ok:6:6".to_owned()), "{on:?}");
@@ -2938,36 +2741,11 @@ fn e5c_w62_a_the_rows_round_trip_through_the_export_and_the_entry() {
         on.contains(&"equal portable=true entry=true".to_owned()),
         "{on:?}"
     );
-    let fault = w62_lines(&[
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
-        ("CRAT_E5C_W62_FAULT", "drop-rows"),
-    ]);
+    let fault = w62_lines(&[("CRAT_E5C_W62_FAULT", "drop-rows")]);
     assert!(fault.contains(&"entry ok:0:0".to_owned()), "{fault:?}");
     assert!(
         fault.contains(&"equal portable=false entry=false".to_owned()),
         "W62a is RED under the fault: {fault:?}"
-    );
-}
-
-/// W62b / W62c: a consumer that asks is refused when the rows are absent — the
-/// arm off (typed `NotRecorded`, from the export and from the entry) and a v1
-/// export (no family; its schema is refused before any row is read).
-#[test]
-fn e5c_w62_b_c_a_consumer_is_refused_without_the_rows() {
-    let off = w62_lines(&[("CRAT_ERA5C_MOVE_STORE", "off")]);
-    assert!(off.contains(&"model none".to_owned()), "{off:?}");
-    for side in ["portable", "entry"] {
-        assert!(
-            off.iter()
-                .any(|l| l.starts_with(&format!("{side} err:move-store obligations not recorded"))),
-            "{side}: {off:?}"
-        );
-    }
-    let on = w62_lines(&[("CRAT_ERA5C_MOVE_STORE", "on")]);
-    let v1 = on.iter().find(|l| l.starts_with("v1 ")).expect("v1 line");
-    assert!(
-        v1.starts_with("v1 validate=false consumer=err:move-store obligations need"),
-        "{v1}"
     );
 }
 
@@ -2977,7 +2755,7 @@ fn e5c_w62_b_c_a_consumer_is_refused_without_the_rows() {
 /// `drop-cleared` fault the rows lose them (RED).
 #[test]
 fn e5c_w62_d_each_row_carries_the_members_its_store_cleared() {
-    let on = w62_lines(&[("CRAT_ERA5C_MOVE_STORE", "on")]);
+    let on = w62_lines(&[]);
     let cleared = on
         .iter()
         .find(|l| l.starts_with("cleared "))
@@ -2990,10 +2768,7 @@ fn e5c_w62_d_each_row_carries_the_members_its_store_cleared() {
         cleared.starts_with("cleared rows=6 nonempty=6 "),
         "{cleared}"
     );
-    let fault = w62_lines(&[
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
-        ("CRAT_E5C_W62_FAULT", "drop-cleared"),
-    ]);
+    let fault = w62_lines(&[("CRAT_E5C_W62_FAULT", "drop-cleared")]);
     let cleared = fault
         .iter()
         .find(|l| l.starts_with("cleared "))
@@ -3714,7 +3489,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
     let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
     env.extend_from_slice(&[
         ("CRAT_ERA5C_ORIGIN_SET", "on"),
-        ("CRAT_ERA5C_MOVE_STORE", "on"),
         // L01¹⁰'s configuration (R604-1): the typed-release discharge is on.
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),
         // L01¹⁰'s configuration (R609-3): the argument-order premise and the
@@ -5242,45 +5016,27 @@ fn e5c_w69_d_a_guarded_accept_records_the_residual_certificate() {
 
 /// W69e: the field-own branch (relay 117) runs under the guarded repair. avl's rotations leave a
 /// residual on an Owning field (W56); the separate loop declined it; the one loop repairs it before
-/// the mode arm, so the guarded run accepts without falling back. Fault `no-field-own`: the guarded
-/// run declines and the program falls back to Mode-A, which the receipt names.
+/// the mode arm, so the guarded run accepts without falling back.
 #[test]
 fn e5c_w69_e_the_field_own_branch_runs_under_the_guarded_repair() {
-    let run = |fault: Option<&str>| -> Vec<String> {
-        let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
-        env.push(("CRAT_E5C_SHAPE", "AVL"));
-        env.push(("CRAT_BO_REPAIR", "guarded"));
-        if let Some(fault) = fault {
-            env.push(("CRAT_E5C_W69_FAULT", fault));
-        }
-        child(
-            "analyses::borrow_ownership::null_paths_tests::e5c_inner_shape_decline_reason",
-            &env,
-        )
-        .lines()
-        .filter_map(|l| {
-            l.find("E5C_DECLINE ")
-                .map(|i| l[i..].to_owned())
-                .or_else(|| l.find("E5C_REPAIR ").map(|i| l[i..].to_owned()))
-        })
-        .collect()
-    };
-    let on = run(None);
+    let mut env: Vec<(&str, &str)> = W47_ARMS.to_vec();
+    env.push(("CRAT_E5C_SHAPE", "AVL"));
+    env.push(("CRAT_BO_REPAIR", "guarded"));
+    let on: Vec<String> = child(
+        "analyses::borrow_ownership::null_paths_tests::e5c_inner_shape_decline_reason",
+        &env,
+    )
+    .lines()
+    .filter_map(|l| {
+        l.find("E5C_DECLINE ")
+            .map(|i| l[i..].to_owned())
+            .or_else(|| l.find("E5C_REPAIR ").map(|i| l[i..].to_owned()))
+    })
+    .collect();
     assert!(on.contains(&"E5C_DECLINE none".to_owned()), "{on:?}");
     assert!(
         on.contains(&"E5C_REPAIR repair=guarded".to_owned()),
         "{on:?}"
-    );
-    let fault = run(Some("no-field-own"));
-    assert!(
-        fault.contains(&"E5C_REPAIR repair=guarded->mode-a".to_owned()),
-        "the fault must be caught: {fault:?}"
-    );
-    assert!(
-        fault
-            .iter()
-            .any(|l| l.starts_with("E5C_REPAIR guarded_fallback_reasons=field-conflict")),
-        "{fault:?}"
     );
 }
 

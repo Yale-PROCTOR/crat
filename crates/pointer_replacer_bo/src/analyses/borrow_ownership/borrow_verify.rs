@@ -1338,17 +1338,15 @@ fn verify_rounds(
             base: is_mutable,
             round: &round_facts,
         };
-        // L01⁹ wall 4 (`CRAT_ERA5C_MOVE_STORE`): this round's qualifying stores issue
-        // no loan on a local that is not `Raw` during the replay (era-5c 060a).
-        let _move_store = super::field_moves::move_store().then(|| {
-            super::move_store::enter_round(
-                program,
-                slots,
-                solver.ownership_facts(),
-                solver.original_cell_selection(),
-                &model,
-            )
-        });
+        // L01⁹ wall 4: this round's qualifying stores issue no loan on a local that is not
+        // `Raw` during the replay (era-5c 060a).
+        let _move_store = super::move_store::enter_round(
+            program,
+            slots,
+            solver.ownership_facts(),
+            solver.original_cell_selection(),
+            &model,
+        );
         let is_ref = |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref);
         // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
         // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
