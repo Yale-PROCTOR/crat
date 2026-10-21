@@ -4172,8 +4172,7 @@ fn e5c_w83_a_void_pointer_swap_solves() {
 /// fork's `pub const NULL` item. The item's body names no program function, so
 /// caller coverage is complete and the list settles as it does with `0` for
 /// `NULL`: `next` Owning, `push`'s formal Owning, `last` Ref. RED at L01¹²: the
-/// item held coverage (`CompilerBodies`) and `next` settled Raw. The fault
-/// `CRAT_E5C_W84_FAULT=no-inert` (test builds) admits no inert body.
+/// item held coverage (`CompilerBodies`) and `next` settled Raw.
 const W84_LIST: &str = r#"
 #![allow(unused_mut)]
 extern "C" {
@@ -4235,12 +4234,6 @@ fn e5c_w84_an_inert_const_item_holds_no_caller_coverage() {
     assert_eq!(w63_kind(&null, "last::_1@d0"), "ref");
     let with_static = l01p13_lines("w84-static", &[]);
     assert_eq!(w63_kind(&with_static, "Node::field1@d0"), "owning");
-    let fault = l01p13_lines("w84-null", &[("CRAT_E5C_W84_FAULT", "no-inert")]);
-    assert_eq!(
-        w63_kind(&fault, "Node::field1@d0"),
-        "raw",
-        "the fault must be caught: {fault:?}"
-    );
 }
 
 /// W84's corpus read (R697-3 (3)): the compiler bodies a derived program's caller
@@ -4300,8 +4293,7 @@ fn e5c_inner_w84_coverage_of_file() {
 /// non-owning, so `new_node`'s `n->next = NULL` forbade `next`'s ownership
 /// (`coherence::field-and` -> `link-own` -> `own-assume[opaque-call-arg]`) and `next`
 /// settled Ref. GREEN: the null constructor is a null constant, as the cast is; `next`
-/// Owning, `put` Owning in and out, `last` Ref -- equal to the cast text. The fault
-/// `CRAT_E5C_W85_FAULT=opaque-null` (test builds) gives the opaque arm back.
+/// Owning, `put` Owning in and out, `last` Ref -- equal to the cast text.
 const W85_G: &str = r#"
 #![allow(unused_mut)]
 extern "C" { fn malloc(__size: usize) -> *mut ::core::ffi::c_void; }
@@ -4348,12 +4340,6 @@ fn e5c_w85_the_null_constructor_is_a_null_constant() {
     assert_eq!(w63_kind(&call, "Node::field1@d0"), "owning");
     assert_eq!(w63_kind(&call, "put::_1@d0"), "owning");
     assert_eq!(w63_kind(&call, "last::_1@d0"), "ref");
-    let fault = l01p13_lines("w85-call", &[("CRAT_E5C_W85_FAULT", "opaque-null")]);
-    assert_eq!(
-        w63_kind(&fault, "Node::field1@d0"),
-        "ref",
-        "the fault must be caught: {fault:?}"
-    );
 }
 
 /// W80–W82 (R691-1, era-5c 108): brotli's memory manager reduced (era-5c 100b's

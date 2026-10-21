@@ -31,9 +31,7 @@ where
         // fork's `NULL` initializes could never own. `source_events` and
         // `nullability` already read this call as null; `origin_evidence` gives
         // its occurrence the `Null` origin a null literal has.
-        if crate::analyses::borrow_ownership::source_events::null_constructor(self.tcx, callee)
-            && !(cfg!(test) && std::env::var("CRAT_E5C_W85_FAULT").as_deref() == Ok("opaque-null"))
-        {
+        if crate::analyses::borrow_ownership::source_events::null_constructor(self.tcx, callee) {
             if let Some(destination) = destination {
                 <Analysis as InferMode>::constant_source(self, destination, true);
             }

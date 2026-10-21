@@ -73,16 +73,11 @@ impl Coverage {
                 })
                 .map(|f| tcx.def_path_str(f))
                 .collect(),
-            inert_bodies: if cfg!(test)
-                && std::env::var("CRAT_E5C_W84_FAULT").as_deref() == Ok("no-inert")
-            {
-                BTreeSet::new()
-            } else {
-                tcx.hir_body_owners()
-                    .filter(|&owner| inert_body(tcx, owner))
-                    .map(|f| tcx.def_path_str(f))
-                    .collect()
-            },
+            inert_bodies: tcx
+                .hir_body_owners()
+                .filter(|&owner| inert_body(tcx, owner))
+                .map(|f| tcx.def_path_str(f))
+                .collect(),
             ..Self::default()
         };
         result.duplicate_functions = result.configured_functions.len() != program.functions.len();
