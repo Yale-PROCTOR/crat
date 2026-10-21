@@ -6559,7 +6559,7 @@ mod run {
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
-            SafeMonoMode, SlotKind,
+            SlotKind,
             a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
             borrow_verify::{
                 RepairMode, model_accepts_with_flows, model_accepts_with_flows_and_copy_lends,
@@ -9001,7 +9001,7 @@ mod run {
         );
         // §NB1: record the active safety-monotonicity mode so the ablation
         // sweeps (per_site vs chain) are self-labeling in the results.
-        row.set("safe_mono", SafeMonoMode::current().label());
+        row.set("safe_mono", "per_site");
         // §NB2: record the active mutability-facts mode (on = fact-driven immutability from
         // Foster; off = pre-NB2 forced-mut) so the dual-mode sweep is self-labeling.
         row.set("mut_facts", "on");
@@ -32674,11 +32674,6 @@ fn boc1_corpus() {
                 "L2 RED requires the frozen base contract with {name} unset"
             );
         }
-        assert_eq!(
-            crate::analyses::borrow_ownership::SafeMonoMode::current(),
-            crate::analyses::borrow_ownership::SafeMonoMode::PerSite,
-            "L2 RED requires the frozen per-site safety profile"
-        );
         assert_eq!(
             std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
             Ok("1"),

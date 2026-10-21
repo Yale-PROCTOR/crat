@@ -450,12 +450,9 @@ fn add_coherence_impl<'tcx>(
     }
 
     // §NB1: per-site SAFE-MONO is emitted alongside coherence (every consumer
-    // adds coherence per body, so this is the single chokepoint). Gated to the
-    // `PerSite` mode; `Chain`/`Off` skip it (the structural `i1-adjacency` in
-    // `solver::add_universe` is the `Chain` arm).
-    if super::SafeMonoMode::current() == super::SafeMonoMode::PerSite {
-        super::safety_mono::add_safety_mono(solver, slots, fn_did, body);
-    }
+    // adds coherence per body, so this is the single chokepoint), beside the
+    // structural `i1-adjacency` in `solver::add_universe`.
+    super::safety_mono::add_safety_mono(solver, slots, fn_did, body);
 }
 
 pub fn add_coherence<'tcx>(

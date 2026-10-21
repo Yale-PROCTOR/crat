@@ -3697,17 +3697,10 @@ fn add_universe<F>(
         vars.insert(sref, kind_vars);
     }
 
-    // §NB1: the structural `i1-adjacency` chain clause. Emitted under `Chain`
-    // AND `PerSite`, skipped only under `Off`. It is NOT redundant under
-    // `PerSite`: the per-site SAFE-MONO walk fires only on READ/borrow sites
-    // (write destinations excluded — `safety_mono`), so this clause is what
-    // still covers write-only and never-dereferenced same-owner chains. It
-    // stays under `PerSite` PERMANENTLY (the NB-plan's "delete after subsumption"
-    // is resolved the other way). Ablation stays clean: `Chain` = this clause
-    // only; `PerSite` = this clause + the read-site walk. See `SafeMonoMode`.
-    if super::SafeMonoMode::current() == super::SafeMonoMode::Off {
-        return;
-    }
+    // §NB1: the structural `i1-adjacency` chain clause. It is NOT redundant beside
+    // the per-site SAFE-MONO walk: the walk fires only on READ/borrow sites (write
+    // destinations excluded — `safety_mono`), so this clause is what still covers
+    // write-only and never-dereferenced same-owner chains.
     for i in 0..universe.len().saturating_sub(1) {
         let a = SlotId::from_usize(i);
         let b = SlotId::from_usize(i + 1);

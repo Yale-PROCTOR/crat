@@ -26,7 +26,7 @@ use rustc_span::def_id::LOCAL_CRATE;
 use sha2::{Digest, Sha256};
 
 use super::{
-    SafeMonoMode, SlotKind,
+    SlotKind,
     a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
     borrow_verify::RepairMode,
     construction::{A2Mode, CopyLendMode},
@@ -263,7 +263,7 @@ pub(crate) fn solver_identity(
         .to_owned(),
     );
     fields.insert("repair_mode", RepairMode::current().label().to_owned());
-    fields.insert("safe_mono", SafeMonoMode::current().label().to_owned());
+    fields.insert("safe_mono", "per_site".to_owned());
     fields.insert("t2", T2_MARKER.to_owned());
     fields.insert("mutability", "foster-from-program-v1".to_owned());
     fields.insert("era5c_a5_snapshot", "true".to_owned());

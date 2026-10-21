@@ -4538,7 +4538,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
 /// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines and the guarded
 /// repair.
 const L01P13_ARMS: &[(&str, &str)] = &[
-    ("CRAT_BO_SAFE_MONO", "per_site"),
     ("CRAT_NB4R_ROUTING", "on"),
     ("CRAT_E5C_W63_MODEL_ONLY", "1"),
 ];

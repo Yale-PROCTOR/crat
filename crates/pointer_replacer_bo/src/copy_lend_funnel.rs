@@ -12,7 +12,7 @@ use z3::{SatResult, ast::Bool};
 
 use super::{CORE_LABEL_FAMILIES, CORPUS, collect_program, orchestrate, provenance, report::Row};
 use crate::analyses::borrow_ownership::{
-    SafeMonoMode, SlotKind,
+    SlotKind,
     borrow_verify::RepairMode,
     coherence::{constrain_field_ownership, selected_copy_lend_sites},
     construction::{
@@ -232,7 +232,6 @@ struct PairStage {
 fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
     assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
     assert_eq!(RepairMode::current(), RepairMode::ModeA);
-    assert_eq!(SafeMonoMode::current(), SafeMonoMode::PerSite);
 
     let program = collect_program(tcx);
     let origins = compute_origins(&program);
@@ -584,7 +583,7 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row.set("copy_lend_mode", CopyLendMode::current().label());
     row.set("repair", RepairMode::current().label());
     row.set("l2", "0");
-    row.set("safe_mono", SafeMonoMode::current().label());
+    row.set("safe_mono", "per_site");
     row.set("mut_facts", "on");
     row.set("z3_full_version", z3::full_version().to_string());
     row.set("smt_seed", 0);
