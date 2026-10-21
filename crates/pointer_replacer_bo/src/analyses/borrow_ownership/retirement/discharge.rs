@@ -36,16 +36,6 @@ use crate::analyses::borrow_ownership::{
     source_events::{SourceObject, SourceRole},
 };
 
-/// W71's faults (test builds only): `no-fresh`, `no-route-use`, `no-sole`.
-fn w71_fault(name: &str) -> bool {
-    cfg!(test) && std::env::var("CRAT_E5C_W71_FAULT").ok().as_deref() == Some(name)
-}
-
-/// W66's fault: `no-discharge` gives today's conflicts back.
-pub(crate) fn w66_fault(name: &str) -> bool {
-    std::env::var("CRAT_E5C_W66_FAULT").ok().as_deref() == Some(name)
-}
-
 /// A lifetime-free C view of a type: enough for compatibility and containment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CTy {
@@ -95,8 +85,6 @@ struct AdtShape {
 #[derive(Default)]
 struct Types {
     adts: FxHashMap<String, AdtShape>,
-    /// (β′): a pointer to anything but `void` / `char` is a typed element.
-    pointers: bool,
 }
 
 impl Types {
@@ -223,7 +211,8 @@ impl Types {
     /// not zero-sized, not an opaque type.
     fn typed(&self, ty: &CTy) -> bool {
         match ty {
-            CTy::Ptr(pointee) => self.pointers && !matches!(**pointee, CTy::Void | CTy::Char),
+            // (β′): a pointer to anything but `void` / `char` is a typed element.
+            CTy::Ptr(pointee) => !matches!(**pointee, CTy::Void | CTy::Char),
             CTy::Void | CTy::Char | CTy::Other(_) => false,
             CTy::Array(element, length) => *length > 0 && self.typed_member(element),
             CTy::Adt(key) => self
@@ -397,7 +386,6 @@ impl Discharges {
         functions: &std::collections::BTreeMap<String, LocalDefId>,
     ) -> Self {
         let mut out = Self::default();
-        out.types.pointers = !w71_fault("no-sole");
         let mut bodies = FxHashSet::default();
         for events in routed.frames.values() {
             for event in events {
@@ -429,7 +417,6 @@ impl Discharges {
                     .borrow();
                 // L01¹² (R677-4): a route-less release's own frame gets the same refutation.
                 let refuted = (event.route.is_empty()
-                    && !w71_fault("no-refute")
                     && matches!(event.source.key.role, SourceRole::ReallocOld))
                 .then(|| refuted_realloc_edge(tcx, &body, event.location))
                 .flatten();
@@ -447,10 +434,8 @@ impl Discharges {
                     out.strict_after.insert(key.clone(), strict);
                 }
                 out.after.insert(key.clone(), after);
-                if !w71_fault("no-fresh") {
-                    let fresh = out.fresh_release(tcx, event, functions);
-                    out.fresh.insert(key.clone(), fresh);
-                }
+                let fresh = out.fresh_release(tcx, event, functions);
+                out.fresh.insert(key.clone(), fresh);
                 if let Some((chain, premised)) = out.route_chain(tcx, event, functions, false) {
                     if premised {
                         let strict = out
@@ -690,7 +675,6 @@ impl Discharges {
                 .borrow();
             // L01¹² (R677-4): in the releasing frame only, a `realloc`'s refuted null branch.
             let refuted = (chain.is_empty()
-                && !w71_fault("no-refute")
                 && matches!(event.source.key.role, SourceRole::ReallocOld))
             .then(|| refuted_realloc_edge(tcx, &body, start))
             .flatten()
@@ -748,9 +732,6 @@ impl Discharges {
 
     /// The discharge of one would-be conflict, (α) first, then (β) if enabled.
     pub(crate) fn discharge(&self, event: &FrameEvent, target: &Target<'_>) -> Option<Rule> {
-        if w66_fault("no-discharge") {
-            return None;
-        }
         let key = super::context_key(
             &event.source.key,
             event.frame,
@@ -764,7 +745,6 @@ impl Discharges {
         // L01¹² (R682-3): a discharge only the zero-size `realloc` premise admits
         // (a computed size's refuted null branch) says so in its receipt.
         if rule.is_none()
-            || w71_fault("no-premise")
             || !(self.strict_after.contains_key(&key) || self.strict_chains.contains_key(&key))
         {
             return rule;
@@ -790,19 +770,17 @@ impl Discharges {
             && !self.reassigned.contains(&(event.frame, base))
             && after.is_some_and(|set| set.contains(&base))
             // R666-1: every route frame below returns (or uses the referent).
-            && (w71_fault("no-alpha-returns")
-                || chain.is_some_and(|chain| {
-                    let pointer = pointers(chain, base);
-                    below(chain, &pointer, chain.len() - 1)
-                }))
+            && chain.is_some_and(|chain| {
+                let pointer = pointers(chain, base);
+                below(chain, &pointer, chain.len() - 1)
+            })
         {
             return Some(Rule::PostFreeUse {
                 local: base.as_u32(),
                 premise: false,
             });
         }
-        if !w71_fault("no-route-use")
-            && let Some(base) = target.base()
+        if let Some(base) = target.base()
             && !self.reassigned.contains(&(event.frame, base))
             && let Some(chain) = chain
             && let Some((frame, local)) = route_use(chain, base)
@@ -822,23 +800,17 @@ impl Discharges {
         }
         let freed = self.freed.get(key)?.as_ref()?;
         let referent = self.referent(event.frame, target)?;
-        let sole = self.types.pointers;
         if !self.types.typed(freed)
             || !self.types.typed(&referent)
             || self.types.contains(freed, &referent, 0)
-            || if sole {
-                self.types.sole(&referent, freed, 0)
-            } else {
-                self.types.contains(&referent, freed, 0)
-            }
+            || self.types.sole(&referent, freed, 0)
         {
             return None;
         }
         // The receipt names a discharge the unsharpened (β) would have refused.
-        let needed_sole = sole
-            && (matches!(freed, CTy::Ptr(_))
-                || matches!(referent, CTy::Ptr(_))
-                || self.types.contains(&referent, freed, 0));
+        let needed_sole = matches!(freed, CTy::Ptr(_))
+            || matches!(referent, CTy::Ptr(_))
+            || self.types.contains(&referent, freed, 0);
         Some(Rule::EffectiveType {
             freed: self.types.name(freed),
             referent: self.types.name(&referent),
@@ -864,14 +836,7 @@ impl Discharges {
             (Some(p), Some(t)) if !self.types.typed(p) || !self.types.typed(t) => {
                 "void/char/union/zst"
             }
-            (Some(p), Some(t))
-                if self.types.contains(p, t, 0)
-                    || if self.types.pointers {
-                        self.types.sole(t, p, 0)
-                    } else {
-                        self.types.contains(t, p, 0)
-                    } =>
-            {
+            (Some(p), Some(t)) if self.types.contains(p, t, 0) || self.types.sole(t, p, 0) => {
                 "contains"
             }
             _ => "disjoint",

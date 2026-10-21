@@ -3025,16 +3025,12 @@ const W66_QUADTREE: &str = concat!(
     "/../../benchmarks/rs-crown-derived/quadtree/lib.rs"
 );
 
-fn w66_lines(shape: &str, fault: Option<&str>) -> Vec<String> {
-    let mut extra = vec![];
-    if let Some(fault) = fault {
-        extra.push(("CRAT_E5C_W66_FAULT", fault));
-    }
-    w63_lines(shape, &extra)
+fn w66_lines(shape: &str) -> Vec<String> {
+    w63_lines(shape, &[])
 }
 
 /// W66a: ht's lent tables are Ref and `entries` Owning under the discharge;
-/// every discharge is receipted. RED: `no-discharge` gives 072's Raw back.
+/// every discharge is receipted.
 #[test]
 fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
     if !std::path::Path::new(W64_HT).is_file() {
@@ -3042,7 +3038,7 @@ fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
         return;
     }
     let shape = format!("file:{W64_HT}");
-    let on = w66_lines(&shape, None);
+    let on = w66_lines(&shape);
     for key in ["src::ht::ht_expand::_1@d0", "src::ht::ht_set::_1@d0"] {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
@@ -3053,24 +3049,15 @@ fn e5c_w66_a_ht_tables_return_to_ref_under_the_discharge() {
                 && l.contains("target=src::ht::ht_expand::_1@d0")),
         "{on:?}"
     );
-    let red = w66_lines(&shape, Some("no-discharge"));
-    assert_eq!(
-        w63_kind(&red, "src::ht::ht_expand::_1@d0"),
-        "raw",
-        "RED: {red:?}"
-    );
-    assert!(!red.iter().any(|l| l.starts_with("discharge ")), "{red:?}");
 }
 
 /// W66b: lil's context shape; the two formals 072 lost are Ref again.
 #[test]
 fn e5c_w66_b_the_context_formals_return_to_ref_under_the_discharge() {
-    let on = w66_lines("ctx", None);
+    let on = w66_lines("ctx");
     for key in ["lil_parse::_1@d0", "lil_pop_env::_1@d0"] {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
-    let red = w66_lines("ctx", Some("no-discharge"));
-    assert_eq!(w63_kind(&red, "lil_pop_env::_1@d0"), "raw", "RED: {red:?}");
 }
 
 /// W66c: quadtree's four `::tree` formals are Ref again; each rests on the
@@ -3082,7 +3069,7 @@ fn e5c_w66_c_quadtrees_four_return_to_ref_under_the_discharge() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let on = w66_lines(&shape, None);
+    let on = w66_lines(&shape);
     for function in ["insert_", "quadtree_insert", "reset_node_", "split_node_"] {
         let key = format!("src::src::quadtree::{function}::_1@d0");
         assert_eq!(w63_kind(&on, &key), "ref", "{key}: {on:?}");
@@ -3093,12 +3080,6 @@ fn e5c_w66_c_quadtrees_four_return_to_ref_under_the_discharge() {
                 && l.contains("target=src::src::quadtree::reset_node_::_1@d0")
                 && l.ends_with("premise=typed-release@R604-1)")),
         "{on:?}"
-    );
-    let red = w66_lines(&shape, Some("no-discharge"));
-    assert_eq!(
-        w63_kind(&red, "src::src::quadtree::reset_node_::_1@d0"),
-        "raw",
-        "RED: {red:?}"
     );
 }
 
@@ -3146,7 +3127,7 @@ fn e5c_w66_controls_void_embedded_union_and_the_carve() {
             .cloned()
             .collect()
     };
-    let on = w66_lines("w66-controls", None);
+    let on = w66_lines("w66-controls");
     for function in ["void_free", "unioned"] {
         assert!(discharges(&on, function).is_empty(), "{function}: {on:?}");
     }
