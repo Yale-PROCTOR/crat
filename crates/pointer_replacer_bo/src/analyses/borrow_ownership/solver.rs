@@ -859,7 +859,7 @@ impl KindSolver {
             let big = vars.len() as u64 + 1;
             // Ref > Owning > Raw: `own` weighs 1 and `raw` nothing. Exactly one kind holds per
             // slot, so a flip gains at most |slots| - 1 < `big`: no reference is ever displaced.
-            for (slot, kind_vars) in &vars {
+            for (_, kind_vars) in &vars {
                 solver.assert_soft(&kind_vars.ref_, big, None);
                 solver.assert_soft(&kind_vars.own, 1u64, None);
             }
