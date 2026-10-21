@@ -1,9 +1,8 @@
 #[cfg(test)]
 use std::cell::Cell;
-use std::{
-    collections::BTreeSet,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
@@ -22,11 +21,12 @@ use super::borrow_verify::verify_l2_to_fixpoint_counting_impl;
 use super::borrow_verify::verify_to_fixpoint_counting_with_flows;
 #[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
+#[cfg(test)]
+use super::{BoOwnEmissionStats, a5_overlap::C9MarkKey};
 use super::{
-    BoOwnEmissionStats, CrateCtxt, SlotKind,
+    CrateCtxt, SlotKind,
     a5_overlap::{
-        A5Mode, A5World, AbiGuardDisposition, C9MarkKey, WholeProgramAttestation,
-        apply_coarse_constraints,
+        A5Mode, A5World, AbiGuardDisposition, WholeProgramAttestation, apply_coarse_constraints,
     },
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{LoopBackend, verify_to_fixpoint_counting_with_flows_impl},
@@ -173,10 +173,13 @@ pub(crate) struct BoConstruction {
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
     pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
+    #[cfg(test)]
     pub(crate) stats: BoOwnEmissionStats,
     #[cfg(test)]
     pub(crate) eligibility_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) emit_elapsed: Duration,
+    #[cfg(test)]
     pub(crate) coherence_elapsed: Duration,
 }
 
@@ -525,6 +528,7 @@ fn summary_digest(plan: &A5Plan) -> String {
     )
 }
 
+#[cfg(test)]
 fn a5_mark_artifact(
     mode: A5Mode,
     plan: &A5Plan,
@@ -557,6 +561,7 @@ fn a5_mark_artifact(
     out
 }
 
+#[cfg(test)]
 pub(crate) fn a5_site_artifact(mode: A5Mode, plan: &A5Plan) -> String {
     let mut out = String::from(
         "caller\tblock\tstatement\ttarget\tleft_parameter\tright_parameter\tleft_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\tclass\ta5_world\ta5_mode\ta5_abi_guard\n",
@@ -1095,6 +1100,7 @@ fn construct_bo_into_with_esc(
     };
     #[cfg(test)]
     let eligibility_elapsed = t.elapsed();
+    #[cfg(test)]
     let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
         CopyLendMode::LendArm => emit_crate_ownership_constraints_with_copy_lends(
@@ -1108,7 +1114,11 @@ fn construct_bo_into_with_esc(
             emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)
         }
     })?;
+    #[cfg(not(test))]
+    let _ = stats;
+    #[cfg(test)]
     let emit_elapsed = t.elapsed();
+    #[cfg(test)]
     let t = Instant::now();
     if let Some(tracker) = solver.tracker() {
         tracker.set_context("coherence");
@@ -1136,6 +1146,7 @@ fn construct_bo_into_with_esc(
     );
     let array_fields = super::array_fields::constrain(program, slots, solver, &mut nullability);
     super::export::record(|export| export.array_fields = Some(array_fields.clone()));
+    #[cfg(test)]
     let coherence_elapsed = t.elapsed();
     let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
     super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
@@ -1160,10 +1171,13 @@ fn construct_bo_into_with_esc(
         selectors,
         eligibility,
         esc_minimal,
+        #[cfg(test)]
         stats,
         #[cfg(test)]
         eligibility_elapsed,
+        #[cfg(test)]
         emit_elapsed,
+        #[cfg(test)]
         coherence_elapsed,
     })
 }

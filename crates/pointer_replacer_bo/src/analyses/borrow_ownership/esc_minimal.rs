@@ -75,6 +75,7 @@ fn artifact_keys() -> &'static [ArtifactKey] {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg(test)]
 pub(crate) struct EscCopySiteKey {
     pub(crate) program: String,
     pub(crate) function: String,
@@ -96,10 +97,12 @@ pub(crate) struct EscRuntimeSite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum EscExclusionReason {
     FieldIssuerOutOfScope,
 }
 
+#[cfg(test)]
 impl EscExclusionReason {
     #[cfg(test)]
     pub(crate) const fn label(self) -> &'static str {
@@ -494,6 +497,7 @@ fn collect_sites(
 
         struct Pending<'tcx> {
             location: Location,
+            #[cfg(test)]
             source: Place<'tcx>,
             destination: Place<'tcx>,
             origin: Place<'tcx>,
@@ -552,6 +556,7 @@ fn collect_sites(
                         block,
                         statement_index,
                     },
+                    #[cfg(test)]
                     source,
                     destination: assign.0,
                     origin,

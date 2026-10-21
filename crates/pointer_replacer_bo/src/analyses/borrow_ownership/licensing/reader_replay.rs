@@ -46,6 +46,7 @@ pub(crate) struct Receipt {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailureReason {
+    #[cfg(test)]
     MissingFrozenFacts,
     MissingTarget,
     InvalidTarget,
@@ -55,6 +56,7 @@ pub(crate) enum FailureReason {
     MatchCount,
     OriginUnlinked,
     InvalidOwnedCell,
+    #[cfg(test)]
     TraversalLoan,
 }
 

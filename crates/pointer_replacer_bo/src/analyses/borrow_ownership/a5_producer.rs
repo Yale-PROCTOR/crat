@@ -68,6 +68,7 @@ pub(crate) struct A5Plan {
     pub(crate) effective_overlaps: FxHashMap<LocalDefId, ParameterOverlap>,
     pub(crate) coarse_pairs: Vec<(SlotRef, SlotRef)>,
     pub(crate) planned_marks: Vec<PlannedC9Mark>,
+    #[cfg(test)]
     pub(crate) site_ledger: Vec<A5ProductionSiteRow>,
     pub(crate) summary_artifact: A5SummaryArtifact,
     pub(crate) stats: A5ProducerStats,
@@ -95,6 +96,7 @@ impl A5Plan {
             effective_overlaps: FxHashMap::default(),
             coarse_pairs: Vec::new(),
             planned_marks: Vec::new(),
+            #[cfg(test)]
             site_ledger: Vec::new(),
             summary_artifact: render_summary_artifact(&fixpoint, A5Mode::Baseline, &guard),
             stats: A5ProducerStats::default(),
@@ -155,12 +157,19 @@ impl A5Plan {
 
 #[derive(Clone, Debug)]
 pub(crate) struct A5ProductionSiteRow {
+    #[cfg(test)]
     pub(crate) caller: u32,
+    #[cfg(test)]
     pub(crate) location: MirLocationKey,
+    #[cfg(test)]
     pub(crate) target: u32,
+    #[cfg(test)]
     pub(crate) left_parameter: u32,
+    #[cfg(test)]
     pub(crate) right_parameter: u32,
+    #[cfg(test)]
     pub(crate) left_actual: SlotKey,
+    #[cfg(test)]
     pub(crate) right_actual: SlotKey,
     pub(crate) class: WitnessMutability,
 }
@@ -1223,15 +1232,35 @@ pub(crate) fn produce_a5_plan(
                     right_actual,
                 ),
                 classes,
-            )| A5ProductionSiteRow {
-                caller,
-                location,
-                target,
-                left_parameter,
-                right_parameter,
-                left_actual,
-                right_actual,
-                class: join_classes(classes),
+            )| {
+                // Outside tests a row is its class only: the receipt counts classes.
+                #[cfg(not(test))]
+                let _ = (
+                    caller,
+                    location,
+                    target,
+                    left_parameter,
+                    right_parameter,
+                    left_actual,
+                    right_actual,
+                );
+                A5ProductionSiteRow {
+                    #[cfg(test)]
+                    caller,
+                    #[cfg(test)]
+                    location,
+                    #[cfg(test)]
+                    target,
+                    #[cfg(test)]
+                    left_parameter,
+                    #[cfg(test)]
+                    right_parameter,
+                    #[cfg(test)]
+                    left_actual,
+                    #[cfg(test)]
+                    right_actual,
+                    class: join_classes(classes),
+                }
             },
         )
         .collect::<Vec<_>>();
@@ -1256,6 +1285,7 @@ pub(crate) fn produce_a5_plan(
         effective_overlaps,
         coarse_pairs: coarse.into_values().collect(),
         planned_marks: planned,
+        #[cfg(test)]
         site_ledger,
         summary_artifact,
         stats,

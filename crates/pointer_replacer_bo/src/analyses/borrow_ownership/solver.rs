@@ -2644,26 +2644,32 @@ impl KindSolver {
         self.check_with_assumptions(&[])
     }
 
+    #[cfg(test)]
     pub(crate) fn check_sat_count(&self) -> usize {
         self.check_sat_count.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn hard_check_count(&self) -> usize {
         self.hard_check_count.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn optimize_materialization_count(&self) -> usize {
         self.optimize_materialization_count.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn lazy_plain_hard_check_count(&self) -> usize {
         self.lazy_plain_hard_check_count.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn lazy_tracked_recheck_count(&self) -> usize {
         self.lazy_tracked_recheck_count.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn lazy_plain_materialization_count(&self) -> usize {
         self.lazy_plain_materialization_count.get()
     }
@@ -2679,10 +2685,12 @@ impl KindSolver {
         self.round_model_failure.borrow().clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn hard_check_elapsed(&self) -> Duration {
         self.hard_check_elapsed.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn optimize_materialization_elapsed(&self) -> Duration {
         self.optimize_materialization_elapsed.get()
     }
@@ -3244,6 +3252,7 @@ impl KindSolver {
     /// §NB-F reporting twin of `model_kinds_relaxing`: also returns WHICH
     /// selectors were dropped (leaked sources and/or leaked sinks — classify
     /// via `Selectors`). Same semantics; the plain fn delegates here.
+    #[cfg(test)]
     pub(crate) fn model_kinds_relaxing_reporting(
         &self,
         selectors: &Selectors,
@@ -3404,6 +3413,7 @@ impl KindSolver {
     /// fail-closed distinction between non-selector UNSAT and Z3 Unknown so the
     /// feature-on loop can emit the ruled diagnostic without altering the
     /// feature-off solver path.
+    #[cfg(test)]
     pub(crate) fn model_kinds_relaxing_reporting_l2(&self, selectors: &Selectors) -> L2SolveResult {
         if self.tracker.as_ref().is_some_and(CoreTracker::is_mandatory) {
             let hard = self.hard_loop_solver();
@@ -4123,6 +4133,7 @@ impl Selectors {
         &self.all
     }
 
+    #[cfg(test)]
     pub(crate) fn sources(&self) -> &[Bool] {
         &self.all[..self.n_sources]
     }

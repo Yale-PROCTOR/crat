@@ -354,8 +354,11 @@ impl StreamCollector {
             sort_records(&self.fragments.file, &mut family.records)?;
         }
         sort_records(&self.fragments.file, &mut self.diagnostics)?;
+        // The typed packet is read only by tests (`write_portable_typed`).
+        #[cfg(test)]
         let mut typed = OwnedFile::create(&self.directory, "typed.json")?;
         let mut wire = OwnedFile::create(&self.directory, "wire.json")?;
+        #[cfg(test)]
         {
             let mut writer = std::io::BufWriter::with_capacity(COPY_BUFFER, &mut typed.file);
             self.write_packet(&mut writer, false)?;
