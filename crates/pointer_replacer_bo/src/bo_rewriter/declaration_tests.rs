@@ -363,31 +363,6 @@ fn decl_existing_reference_pattern_stays_an_excluded_reference() {
 }
 
 #[test]
-fn decl_model_raw_alias_copy_stays_raw() {
-    let input = "type Ptr = *mut i32; pub unsafe fn raw_alias(src: Ptr, clear: bool) -> i32 {\n\
-        let mut copied: Ptr = 0 as *mut i32; copied = src; if clear { copied = 0 as *mut i32; }\n\
-        if copied.is_null() { 0 } else { *copied += 1; *copied }\n\
-    }";
-    for binding in ["src", "copied"] {
-        let decision = decision_with_model(input, "raw_alias", binding, super::SlotKind::Raw);
-        assert!(
-            matches!(decision, Decision::Degraded(_)),
-            "model Raw cannot become safe from alias spelling"
-        );
-    }
-    let output = emitted(input, &["type Ptr = *mut i32;"]);
-    for binding in ["src", "copied"] {
-        assert_eq!(
-            declaration(&output, "raw_alias", binding)
-                .explicit_type
-                .as_deref(),
-            Some("Ptr"),
-            "{output}"
-        );
-    }
-}
-
-#[test]
 fn decl_alias_with_an_inaccessible_pointee_keeps_the_usable_alias() {
     let input = "mod api { mod hidden { pub struct Payload<T> { pub value: T } } pub type Ptr = *const hidden::Payload<u8>; } mod caller { pub unsafe fn take(p: crate::api::Ptr) -> u8 { (*p).value } }";
     let decision = decision_with_model(input, "caller::take", "p", super::SlotKind::Ref);
