@@ -33,7 +33,6 @@ pub(crate) struct Expected {
     pub(crate) field: crate::analyses::borrow::StructFieldSlot,
     pub(crate) root: Root,
     pub(crate) target: SlotRef,
-    pub(crate) field_target: SlotRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +286,6 @@ pub(crate) fn begin_round(
                         },
                         root: Root::Parameter(candidate.clone()),
                         target,
-                        field_target: field_ref,
                     },
                     matched_loans: 0,
                     origin_linked: false,
@@ -414,7 +412,6 @@ pub(crate) fn begin_round(
                         },
                         root: Root::OwnedCell(effect.clone()),
                         target,
-                        field_target: field_ref,
                     },
                     matched_loans: 0,
                     origin_linked: false,
