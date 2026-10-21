@@ -30095,6 +30095,13 @@ fn boc1_run_one() {
     };
     let mode = std::env::var("CRAT_BOC1_MODE").unwrap_or_else(|_| "bo".to_string());
     let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+    // S2 D12: the drivers hand every worker its cache directory as CRAT_BO_CACHE_DIR; the
+    // analysis reads the cache option (one directory, read and written), set here once.
+    crate::analyses::borrow_ownership::model_cache::configure(
+        std::env::var_os("CRAT_BO_CACHE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from),
+    );
 
     // §NB5-Z (2026-07-17): pin z3's random seeds for the BO sweep — HERE, at the ignored per-program
     // worker entry, before ANY z3 op in this fresh process. z3 0.19's `Context` is a per-thread
