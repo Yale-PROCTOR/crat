@@ -405,67 +405,6 @@ fn extract_conflict_edges(
                     Some(localized) => localized.contains(row, provenance, loan),
                     None => requires.contains(provenance, loan),
                 };
-                // §6.4 drop attribution: a requirer the WHOLE-BODY relation keeps at a live,
-                // erroring point and the point-keyed one drops. `all_only` says whether it is
-                // reachable using `All` edges alone — those apply at every point, so `all_only =
-                // false` attributes the drop to a LOCATED reborrow edge rather than to any
-                // approximation A2 introduces.
-                if let Some(closure) = &inference.all_only_closure
-                    && !required
-                    && requires.contains(provenance, loan)
-                {
-                    let all_only = closure
-                        .get(&loan)
-                        .is_some_and(|set| set.contains(provenance));
-                    // Was the requirer even live where the loan was reserved? If not, its
-                    // liveness at the error point comes from a LATER definition, so the value it
-                    // holds there cannot be the borrow reserved earlier — which is what makes the
-                    // drop a true point-sensitive unreachability rather than a lost path.
-                    let reserve_point = inference
-                        .facts
-                        .location_map
-                        .point_from_location(borrow_set.loans[loan].location());
-                    let live_at_reserve = inference
-                        .facts
-                        .provenance_liveness
-                        .row(reserve_point)
-                        .is_some_and(|live| live.contains(provenance));
-                    let verdict = census_drop(inference, loan, provenance, row, live_at_reserve);
-                    crate::analyses::borrow_ownership::borrow_engine::record_requirer_drop(
-                        format!(
-                            "loan={} point={row:?} provenance={provenance:?} owner={:?} \
-                             all_only_reachable={all_only} live_at_reserve={live_at_reserve} \
-                             {verdict}",
-                            loan.index(),
-                            provenance_set.provenance_data[provenance].owner(),
-                        ),
-                    );
-                }
-                // Instrument control: run the SAME census over requirers the port KEEPS. A census
-                // that can only ever answer "unreachable" would make "0 counterexamples" vacuous;
-                // these rows demonstrate the reachability arm firing on the same code path.
-                if let Some(_closure) = &inference.all_only_closure
-                    && required
-                    && requires.contains(provenance, loan)
-                {
-                    let reserve_point = inference
-                        .facts
-                        .location_map
-                        .point_from_location(borrow_set.loans[loan].location());
-                    let live_at_reserve = inference
-                        .facts
-                        .provenance_liveness
-                        .row(reserve_point)
-                        .is_some_and(|live| live.contains(provenance));
-                    let verdict = census_drop(inference, loan, provenance, row, live_at_reserve);
-                    crate::analyses::borrow_ownership::borrow_engine::record_requirer_drop(
-                        format!(
-                            "control=kept loan={} point={row:?} provenance={provenance:?} \
-                             live_at_reserve={live_at_reserve} {verdict}",
-                            loan.index(),
-                        ),
-                    );
-                }
                 if required && seen.insert(provenance) {
                     requirers.push(provenance_set.provenance_data[provenance].owner());
                 }
@@ -487,122 +426,6 @@ fn extract_conflict_edges(
         });
     }
     edges
-}
-
-/// §8.1 census — per-drop proof obligation, re-derived INDEPENDENTLY of the walk.
-///
-/// For a requirer `q` the whole-body relation keeps at a live erroring point `e` and the
-/// point-keyed relation drops, this recomputes the liveness-gated propagation of `q` from the
-/// loan's reservation point using only the raw CFG, `provenance_liveness` and `killed` — none of
-/// the walk's own state. If `e` is reachable under that gate the drop is a **COUNTEREXAMPLE** and
-/// the realized path is printed; otherwise the drop is **PROVEN-TRUE-UNREACHABLE** and the gap is
-/// located.
-///
-/// The gap is necessarily EPOCH-SEPARATING and that follows from backward liveness rather than
-/// from a second check: `q` is dead on exit at the gap point `p` but live at `e`, and `e` is
-/// CFG-reachable from `p`; a backward may-liveness that reports `q` dead at `p` asserts that every
-/// path out of `p` redefines `q` before any use, so the use that makes `q` live at `e` is fed by a
-/// definition strictly after `p`. The value `q` holds at `e` therefore cannot be the borrow
-/// reserved before `p`.
-fn census_drop(
-    inference: &NativeInference<'_>,
-    loan: Loan,
-    q: Provenance,
-    e: rustc_mir_dataflow::points::PointIndex,
-    live_at_reserve: bool,
-) -> String {
-    use rustc_mir_dataflow::points::PointIndex;
-    let (Some(succ), Some(reserve_of)) = (&inference.succ_points, &inference.loan_reserve) else {
-        return "verdict=NO-CENSUS".to_string();
-    };
-    if !live_at_reserve {
-        // Not live where the loan was reserved: the walk never seeds it, and its liveness at the
-        // error point is fed by a later definition. Nothing to trace.
-        return "verdict=PROVEN-TRUE-UNREACHABLE gap=seed reason=not-live-at-reserve".to_string();
-    }
-    let reserve = reserve_of[&loan];
-    let live = |p: PointIndex| {
-        inference
-            .facts
-            .provenance_liveness
-            .row(p)
-            .is_some_and(|r| r.contains(q))
-    };
-    let killed = |p: PointIndex| inference.facts.killed[p].contains(loan);
-
-    // Gated forward closure, with parent links so a counterexample can print its path.
-    let mut parent: FxHashMap<PointIndex, PointIndex> = FxHashMap::default();
-    let mut seen: FxHashSet<PointIndex> = FxHashSet::default();
-    let mut work: Vec<PointIndex> = Vec::new();
-    if live(reserve) {
-        for &s in succ.get(&reserve).map(|v| &v[..]).unwrap_or(&[]) {
-            if seen.insert(s) {
-                parent.insert(s, reserve);
-                work.push(s);
-            }
-        }
-    }
-    while let Some(p) = work.pop() {
-        if killed(p) || !live(p) {
-            continue;
-        }
-        for &s in succ.get(&p).map(|v| &v[..]).unwrap_or(&[]) {
-            if seen.insert(s) {
-                parent.insert(s, p);
-                work.push(s);
-            }
-        }
-    }
-    if seen.contains(&e) {
-        let mut path = vec![e];
-        let mut cur = e;
-        while let Some(&pp) = parent.get(&cur) {
-            path.push(pp);
-            cur = pp;
-            if path.len() > 64 {
-                break;
-            }
-        }
-        path.reverse();
-        return format!(
-            "verdict=COUNTEREXAMPLE realized_path={:?}",
-            path.iter().map(|p| p.index()).collect::<Vec<_>>()
-        );
-    }
-
-    // Locate the gap: a point the gate REACHED whose raw successor set leads on toward `e`, and at
-    // which the gate then failed. Restrict to points that can still reach `e` in the raw CFG.
-    let mut reaches_e: FxHashSet<PointIndex> = FxHashSet::default();
-    reaches_e.insert(e);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (&p, outs) in succ.iter() {
-            if !reaches_e.contains(&p) && outs.iter().any(|s| reaches_e.contains(s)) {
-                reaches_e.insert(p);
-                changed = true;
-            }
-        }
-    }
-    let mut gap = None;
-    for &p in seen.iter().chain(std::iter::once(&reserve)) {
-        if reaches_e.contains(&p) && (killed(p) || !live(p)) {
-            let reason = if killed(p) { "killed" } else { "dead-on-exit" };
-            match gap {
-                Some((g, _)) if p.index() >= g => {}
-                _ => gap = Some((p.index(), reason)),
-            }
-        }
-    }
-    match gap {
-        Some((p, reason)) => format!(
-            "verdict=PROVEN-TRUE-UNREACHABLE gap_point={p} gap_reason={reason} \
-             epoch_separating=by-backward-liveness"
-        ),
-        // No gated-reached point on a path to `e` at all: the propagation never entered `e`'s
-        // dominating region, which is a stronger form of the same conclusion.
-        None => "verdict=PROVEN-TRUE-UNREACHABLE gap=no-gated-point-reaches-error".to_string(),
-    }
 }
 
 /// §HLZ-PORT — the demotion-witness half of the SAME predicate.
@@ -951,9 +774,6 @@ where
             escaped_lends,
             escaped_presentations: FxHashMap::default(),
             localized_requires: None,
-            all_only_closure: None,
-            succ_points: None,
-            loan_reserve: None,
         };
         out.insert(
             f,

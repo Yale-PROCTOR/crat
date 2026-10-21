@@ -9,7 +9,6 @@ use rustc_middle::{
     mir::{Body, Local, PlaceElem},
     ty::TyCtxt,
 };
-use rustc_mir_dataflow::points::PointIndex;
 use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 
@@ -61,18 +60,6 @@ pub(super) struct NativeInference<'tcx> {
     /// localize; that path keeps the whole-body predicate, which is what its NB5-O differential
     /// compares against.
     pub(super) localized_requires: Option<LocalizedRequires>,
-    /// §6.4 drop attribution (env-gated, `Some` only under `CRAT_BO_REQUIRER_DROP_OUT`).
-    /// Per loan, the provenances reachable from its membership provenance using **`All` edges
-    /// only** — i.e. ignoring every located reborrow edge. `All` edges apply at EVERY point, so a
-    /// provenance in this set can never be dropped by an edge LOCATION; if a dropped requirer is
-    /// NOT in it, the drop is attributable to a located reborrow edge, which A2 places at the
-    /// reborrow's own `data.location()`.
-    pub(super) all_only_closure: Option<FxHashMap<Loan, DenseBitSet<Provenance>>>,
-    /// §8.1 census support (same env gate). The raw MIR CFG over points, and each loan's
-    /// reservation point — the two things `extract_conflict_edges` needs to re-derive the
-    /// liveness-gated propagation INDEPENDENTLY of the walk that produced the facts.
-    pub(super) succ_points: Option<FxHashMap<PointIndex, Vec<PointIndex>>>,
-    pub(super) loan_reserve: Option<FxHashMap<Loan, PointIndex>>,
 }
 
 pub(crate) fn selected_copy_lend_contains(
@@ -355,78 +342,6 @@ impl<'a> NativeBorrowContext<'a> {
             traversal_replay::observe(f, body, &inference, expected, *loan);
         }
         let localized_requires = Some(ported_requires);
-        let all_only_closure = if std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT").is_some() {
-            let mut all_graph: IndexVec<Provenance, SmallVec<[Provenance; 4]>> =
-                IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
-            for &(sub, sup, location) in &graph.subset {
-                if matches!(location, EdgeLocation::All) {
-                    all_graph[sub].push(sup);
-                }
-            }
-            let mut per_loan = FxHashMap::default();
-            for &(loan, provenance) in &graph.membership {
-                let mut seen = DenseBitSet::new_empty(provenance_set.provenance_data.len());
-                let mut stack = vec![provenance];
-                while let Some(p) = stack.pop() {
-                    if !seen.insert(p) {
-                        continue;
-                    }
-                    stack.extend_from_slice(&all_graph[p]);
-                }
-                per_loan.insert(loan, seen);
-            }
-            Some(per_loan)
-        } else {
-            None
-        };
-        let (succ_points, loan_reserve) = if all_only_closure.is_some() {
-            let mut succ: FxHashMap<PointIndex, Vec<PointIndex>> = FxHashMap::default();
-            for (bb, data) in body.basic_blocks.iter_enumerated() {
-                let len = data.statements.len() + data.terminator.is_some() as usize;
-                for i in 0..len {
-                    let loc = rustc_middle::mir::Location {
-                        block: bb,
-                        statement_index: i,
-                    };
-                    let pt = inference.location_map.point_from_location(loc);
-                    let outs = if i + 1 < len {
-                        vec![inference.location_map.point_from_location(
-                            rustc_middle::mir::Location {
-                                block: bb,
-                                statement_index: i + 1,
-                            },
-                        )]
-                    } else {
-                        data.terminator()
-                            .successors()
-                            .map(|b| {
-                                inference.location_map.point_from_location(
-                                    rustc_middle::mir::Location {
-                                        block: b,
-                                        statement_index: 0,
-                                    },
-                                )
-                            })
-                            .collect()
-                    };
-                    succ.insert(pt, outs);
-                }
-            }
-            let reserve = inference
-                .borrow_set
-                .loans
-                .iter_enumerated()
-                .map(|(loan, data)| {
-                    (
-                        loan,
-                        inference.location_map.point_from_location(data.location()),
-                    )
-                })
-                .collect();
-            (Some(succ), Some(reserve))
-        } else {
-            (None, None)
-        };
         NativeInference {
             facts: inference,
             entry_facts: crate::analyses::borrow_ownership::protected_entry::current(),
@@ -434,9 +349,6 @@ impl<'a> NativeBorrowContext<'a> {
             escaped_lends,
             escaped_presentations,
             localized_requires,
-            all_only_closure,
-            succ_points,
-            loan_reserve,
         }
     }
 }
