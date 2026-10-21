@@ -45,11 +45,7 @@ mod tests {
         // → NB5-F2 (field candidacy: the fork disables a Raw field's loan via the manifest-widened
         //   `disable_owner(ProvenanceOwner::Field(field))`; `StructFieldSlot` is the field key):
         "StructFieldSlot",
-        // → VALIDATOR SEAM / NB6 (production replay as the independent judge — the one permanent
-        //   §0.2 exception, retiring only at the post-C2 rustc validation net). `self` is the
-        //   `use borrow::{self, …}` that lets `borrow::borrow_conflicts[_replaying]` resolve:
-        "borrow_conflicts",
-        "borrow_conflicts_replaying",
+        // `self` is the `use borrow::{self, …}` the module's `borrow::…` paths resolve through:
         "self",
     ];
 
