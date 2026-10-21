@@ -1044,7 +1044,7 @@ pub(crate) fn begin_round() {
         // Back to "not recorded this round" — NOT to "recorded, none found".
         export.residual_conflicts = None;
         export.move_store_obligations = None;
-        export.arg_order_applied = super::field_moves::arg_order().then(Vec::new);
+        export.arg_order_applied = Some(Vec::new());
     });
 }
 

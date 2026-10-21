@@ -3493,7 +3493,6 @@ fn w63_child(shape: &str, extra: &[(&str, &str)]) -> String {
         ("CRAT_ERA5C_TYPED_RELEASE", "on"),
         // L01¹⁰'s configuration (R609-3): the argument-order premise and the
         // A5 type route are on.
-        ("CRAT_ERA5C_ARG_ORDER", "on"),
         ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
         ("CRAT_E5C_W63_SHAPE", shape),
     ]);
@@ -4183,13 +4182,12 @@ fn e5c_w67_e_the_ledger_names_the_objective() {
 }
 
 /// W68 (R609-3): the W63 child's lines on `W68_SHAPES` with the lend on and the
-/// two arms as given, plus the type route's debug rows.
-fn w68_lines(arg_order: &str, type_route: &str) -> Vec<String> {
+/// type route as given, plus the type route's debug rows.
+fn w68_lines(type_route: &str) -> Vec<String> {
     w63_lines(
         "w68-shapes",
         &[
             ("CRAT_ERA5C_LEND", "on"),
-            ("CRAT_ERA5C_ARG_ORDER", arg_order),
             ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", type_route),
         ],
     )
@@ -4206,21 +4204,15 @@ fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let lines = |arg_order: &str| {
-        w63_lines(
-            &shape,
-            &[
-                ("CRAT_ERA5C_LEND", "on"),
-                ("CRAT_ERA5C_ARG_ORDER", arg_order),
-                ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
-                ("CRAT_E5C_W63_MODEL_ONLY", "1"),
-            ],
-        )
-    };
+    let on = w63_lines(
+        &shape,
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
+            ("CRAT_E5C_W63_MODEL_ONLY", "1"),
+        ],
+    );
     let key = "src::src::quadtree::quadtree_insert::_1@d0";
-    let red = lines("off");
-    assert_eq!(w63_kind(&red, key), "raw", "RED: {red:?}");
-    let on = lines("on");
     assert_ne!(w63_kind(&on, key), "raw", "{on:?}");
     assert_ne!(
         w63_kind(&on, "src::src::quadtree::quadtree_insert::_23@d0"),
@@ -4234,10 +4226,10 @@ fn e5c_w68_a_a_read_in_the_receiving_calls_arguments_precedes_the_reborrow() {
 /// an argument of the receiving call, so only the type route clears it.
 #[test]
 fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
-    let red = w68_lines("on", "off");
+    let red = w68_lines("off");
     assert_ne!(w63_kind(&red, "reset_::_2@d0"), "ref", "RED: {red:?}");
     assert!(!red.iter().any(|l| l.starts_with("a5-receipt ")), "{red:?}");
-    let on = w68_lines("on", "on");
+    let on = w68_lines("on");
     assert_eq!(w63_kind(&on, "reset_::_2@d0"), "ref", "{on:?}");
     assert!(
         on.iter()
@@ -4250,7 +4242,7 @@ fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
 /// nothing and the conflict stays.
 #[test]
 fn e5c_w68_c_one_type_keeps_its_overlap_partner() {
-    let on = w68_lines("on", "on");
+    let on = w68_lines("on");
     assert_ne!(w63_kind(&on, "same_::_2@d0"), "ref", "{on:?}");
 }
 
@@ -4594,7 +4586,7 @@ fn e5c_w71_a_the_jail_release_is_fresh() {
 /// W72 (R659-1; wave-5d 133 STOP 2): the arm-(a) receipt export. On quadtree's
 /// own `insert_(tree, (*tree).root, …)` the model's receipts equal the portable
 /// export's and the prepared entry's, and one names `quadtree_insert`'s call
-/// with the tree as its lent pointer; with the arm off the family is not recorded.
+/// with the tree as its lent pointer.
 #[test]
 fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
     if !std::path::Path::new(W66_QUADTREE).is_file() {
@@ -4602,18 +4594,14 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
         return;
     }
     let shape = format!("file:{W66_QUADTREE}");
-    let lines = |arg_order: &str| {
-        w63_lines(
-            &shape,
-            &[
-                ("CRAT_ERA5C_LEND", "on"),
-                ("CRAT_ERA5C_ARG_ORDER", arg_order),
-                ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
-                ("CRAT_E5C_W72", "1"),
-            ],
-        )
-    };
-    let on = lines("on");
+    let on = w63_lines(
+        &shape,
+        &[
+            ("CRAT_ERA5C_LEND", "on"),
+            ("CRAT_ERA5C_OVERLAP_TYPE_ROUTE", "on"),
+            ("CRAT_E5C_W72", "1"),
+        ],
+    );
     let summary = on
         .iter()
         .find(|l| l.starts_with("arg-order model="))
@@ -4639,20 +4627,6 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
             && l.contains("text=insert_(")
             && l.contains(".root")),
         "{on:?}"
-    );
-    let off = lines("off");
-    let summary = off
-        .iter()
-        .find(|l| l.starts_with("arg-order model="))
-        .unwrap_or_else(|| panic!("{off:?}"));
-    assert!(
-        summary.starts_with("arg-order model=none") && summary.contains("not recorded"),
-        "{summary}"
-    );
-    assert!(
-        off.iter()
-            .any(|l| l == "arg-order-memory-vs-file equal=true"),
-        "{off:?}"
     );
 }
 

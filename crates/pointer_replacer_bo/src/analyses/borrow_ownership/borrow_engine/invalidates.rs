@@ -913,9 +913,8 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                         self.deferring_from = Some(location);
                         // R609-3 (a): a deferred argument read is a read of the
                         // receiving call's argument list.
-                        if crate::analyses::borrow_ownership::field_moves::arg_order()
-                            && let TerminatorKind::Call { args, .. } =
-                                &self.body.basic_blocks[location.block].terminator().kind
+                        if let TerminatorKind::Call { args, .. } =
+                            &self.body.basic_blocks[location.block].terminator().kind
                         {
                             self.receiving = Some(
                                 args.iter()
@@ -1002,14 +1001,10 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 self.consume_operand(location, func, AccessKind::Read);
                 let copy_lend_deallocator = exact_foreign_sink(func, self.body, self.tcx);
                 // R609-3 (a): the locals this call receives, for its other operands' reads.
-                let passed: Vec<Local> =
-                    if crate::analyses::borrow_ownership::field_moves::arg_order() {
-                        args.iter()
-                            .filter_map(|arg| arg.node.place().and_then(|p| p.as_local()))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                let passed: Vec<Local> = args
+                    .iter()
+                    .filter_map(|arg| arg.node.place().and_then(|p| p.as_local()))
+                    .collect();
                 for arg in args {
                     // §NB4-4a-ii: labeled `Read` here; 4a-ii's GATING commit refines the arg
                     // access by the callee's effect class (a `no-access` callee gets a SHALLOW

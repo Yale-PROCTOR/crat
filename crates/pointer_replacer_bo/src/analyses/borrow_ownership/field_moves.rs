@@ -97,19 +97,6 @@ pub(crate) fn own_named() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_ARG_ORDER=on|off` (fail-loud, absent = off): **L01¹⁰, R609-3 (a)**.
-/// The argument-order premise: a call's pure-read operands are evaluated before
-/// the reborrows the same call receives, when every statement between such a
-/// reborrow and the call is a pure read (E5C-3's pattern). The emission side owes
-/// the hoist (`let r = (*tree).root; insert_(&mut *tree, r, …)`).
-pub(crate) fn arg_order() -> bool {
-    match std::env::var("CRAT_ERA5C_ARG_ORDER").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_ARG_ORDER must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_REF_PEEL_ZERO=on|off` (fail-loud, absent = off): **L01¹¹, R645-2**
 /// (era-5c 086). At a local call whose actual is the address of a place (`is_ref`),
 /// the formal's peeled outer component -- the formal pointer's own window, use and
