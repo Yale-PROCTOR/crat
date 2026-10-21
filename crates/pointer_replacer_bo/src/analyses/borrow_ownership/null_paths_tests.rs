@@ -1935,8 +1935,10 @@ fn e5c_inner_w62() {
         let portable = decoded.move_store_obligations();
         let inputs = super::model_cache::semantic_inputs(&program).unwrap();
         let key = super::cache_contract::semantic_key(&inputs).unwrap();
-        super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
-        let entry = super::model_cache::prepared_move_store_obligations(&key);
+        let entry = super::model_cache::with_scratch_cache(|| {
+            super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
+            super::model_cache::prepared_move_store_obligations(&key)
+        });
         let mut v1 = decoded.clone();
         v1.schema = "era5a-portable-export-v1".into();
         v1.families
@@ -2570,8 +2572,11 @@ fn e5c_inner_w63() {
                 serde_json::from_str(&packet.canonical_json().unwrap()).unwrap();
             let inputs = super::model_cache::semantic_inputs(&program).unwrap();
             let key = super::cache_contract::semantic_key(&inputs).unwrap();
-            super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
-            let entry = super::model_cache::prepared_entry(&key).unwrap_or_else(|| {
+            let entry = super::model_cache::with_scratch_cache(|| {
+                super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
+                super::model_cache::prepared_entry(&key)
+            })
+            .unwrap_or_else(|| {
                 panic!(
                     "the prepared entry: {:?}",
                     super::model_cache::prepare_error()
@@ -2603,11 +2608,15 @@ fn e5c_inner_w63() {
             let portable = decoded.arg_order_applied();
             let inputs = super::model_cache::semantic_inputs(&program).unwrap();
             let key = super::cache_contract::semantic_key(&inputs).unwrap();
-            super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
-            let entry = super::model_cache::prepared_arg_order_applied(&key);
             // R1178-1 (fix (i)): the receipts the loader now takes from memory equal the ones
             // the staged entry's file decodes, rows and refusal alike.
-            let from_file = super::model_cache::prepared_arg_order_from_file(&key);
+            let (entry, from_file) = super::model_cache::with_scratch_cache(|| {
+                super::model_cache::prepare(&program, &slots, &origins, &verified, &captured);
+                (
+                    super::model_cache::prepared_arg_order_applied(&key),
+                    super::model_cache::prepared_arg_order_from_file(&key),
+                )
+            });
             eprintln!(
                 "E5C_W63 arg-order-memory-vs-file equal={}",
                 entry == from_file

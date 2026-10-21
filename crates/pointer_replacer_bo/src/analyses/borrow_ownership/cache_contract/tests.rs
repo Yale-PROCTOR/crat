@@ -79,8 +79,11 @@ pub unsafe fn caller()->i32 {
         });
         let inputs = model_cache::semantic_inputs(&program).unwrap();
         let key = semantic_key(&inputs).unwrap();
-        model_cache::prepare(&program, &slots, &origins, &verified, &captured);
-        let entry = model_cache::prepared_entry(&key).unwrap_or_else(|| {
+        let entry = model_cache::with_scratch_cache(|| {
+            model_cache::prepare(&program, &slots, &origins, &verified, &captured);
+            model_cache::prepared_entry(&key)
+        })
+        .unwrap_or_else(|| {
             panic!(
                 "accepted in-memory traversal envelope: {:?}",
                 model_cache::prepare_error()

@@ -99,6 +99,21 @@ thread_local! {
     };
 }
 
+/// `run` with a fresh scratch cache directory configured (unique per call, under
+/// `temp_dir()`), removed afterwards: for tests that read the staged entry.
+#[cfg(test)]
+pub(crate) fn with_scratch_cache<T>(run: impl FnOnce() -> T) -> T {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "crat-staged-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let out = with_test_config(&dir, run);
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
 #[cfg(test)]
 pub(crate) fn with_test_config<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<PathBuf>);
@@ -236,7 +251,11 @@ pub(crate) struct CachedModel {
 
 #[derive(Clone)]
 struct Prepared {
-    entry: std::sync::Arc<super::cache_contract::StreamedEntry>,
+    /// The semantic key the model is cached under.
+    key: String,
+    /// The staged entry, under the configured cache directory; `None` when no
+    /// directory is configured, in which case nothing is staged anywhere.
+    entry: Option<std::sync::Arc<super::cache_contract::StreamedEntry>>,
     cached: CachedModel,
     /// R1178-1 (era-5c relay 236, fix (i)): on the writer side, the arm-(a) receipts as `prepare`
     /// wrote them into the entry -- the same rows, order and not-recorded reason a read of the
@@ -282,8 +301,11 @@ fn model_map(
         .collect()
 }
 
-/// Preserve the complete accepted capture before the unchanged consumer drops
-/// its recording. Serialization failure affects cache completeness, not kinds.
+/// Preserve the accepted capture before the unchanged consumer drops its
+/// recording: the key, the model and the argument-order receipts the emission
+/// reads, in memory; and, only when a cache directory is configured, the
+/// complete entry staged under it (nothing is written anywhere else).
+/// Serialization failure affects cache completeness, not kinds.
 pub(crate) fn prepare(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -294,74 +316,85 @@ pub(crate) fn prepare(
     let result = (|| -> Result<Prepared, String> {
         let inputs = semantic_inputs(program)?;
         let key = super::cache_contract::semantic_key(&inputs)?;
-        let directory = dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("era5b-model-cache-v1");
-        let portable =
-            super::portable_export::stream::collect_to_path(program, slots, captured, &directory)?;
-        let origin = super::origin_evidence::collect(program, slots, origins, Some(captured));
-        let mut functions: Vec<_> = program
-            .functions
-            .iter()
-            .map(|did| program.tcx.def_path_str(did.to_def_id()))
-            .collect();
-        functions.sort();
-        let e5c_universe: Vec<_> = universe(program.tcx, slots)
-            .ok_or("invalid slot universe")?
-            .into_keys()
-            .collect();
-        let e5c_model =
-            model_map(program.tcx, slots, &verified.model).ok_or("invalid accepted model keys")?;
-        let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
-            .ok_or("invalid baseline model keys")?;
-        // R473-4 design (A): stream the canonical origin bytes to a file,
-        // per element, and hand the cache the PATH. The whole-`Value` form that
-        // cost 31 GiB on libzahl is never built. The file is removed once the
-        // entry has copied it in (and by the guard on any early return).
-        struct OriginFile(std::path::PathBuf);
-        impl Drop for OriginFile {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
+        let entry = match dir() {
+            None => None,
+            Some(cache) => {
+                let directory = cache.join("era5b-model-cache-v1");
+                let portable = super::portable_export::stream::collect_to_path(
+                    program, slots, captured, &directory,
+                )?;
+                let origin =
+                    super::origin_evidence::collect(program, slots, origins, Some(captured));
+                let mut functions: Vec<_> = program
+                    .functions
+                    .iter()
+                    .map(|did| program.tcx.def_path_str(did.to_def_id()))
+                    .collect();
+                functions.sort();
+                let e5c_universe: Vec<_> = universe(program.tcx, slots)
+                    .ok_or("invalid slot universe")?
+                    .into_keys()
+                    .collect();
+                let e5c_model = model_map(program.tcx, slots, &verified.model)
+                    .ok_or("invalid accepted model keys")?;
+                let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
+                    .ok_or("invalid baseline model keys")?;
+                // R473-4 design (A): stream the canonical origin bytes to a file,
+                // per element, and hand the cache the PATH. The whole-`Value` form that
+                // cost 31 GiB on libzahl is never built. The file is removed once the
+                // entry has copied it in (and by the guard on any early return).
+                struct OriginFile(std::path::PathBuf);
+                impl Drop for OriginFile {
+                    fn drop(&mut self) {
+                        let _ = std::fs::remove_file(&self.0);
+                    }
+                }
+                std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+                // Unique per call, as the exports spool is: one process runs many
+                // prepares concurrently and a pid-only name collides between them.
+                static NEXT_ORIGIN: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let origin_path = directory.join(format!(
+                    ".origin-{}-{}.json",
+                    std::process::id(),
+                    NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                {
+                    let file = std::fs::File::options()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&origin_path)
+                        .map_err(|error| error.to_string())?;
+                    let mut writer = std::io::BufWriter::new(file);
+                    origin.write_canonical_json(&mut writer)?;
+                    std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
+                }
+                let _origin_file = OriginFile(origin_path.clone());
+                let e5c_origin = super::cache_contract::stream::OriginSource::File(origin_path);
+                let metadata = super::cache_contract::stream::Metadata {
+                    schema: super::cache_contract::SCHEMA.into(),
+                    key: key.clone(),
+                    inputs,
+                    functions,
+                    universe: e5c_universe,
+                    model: e5c_model,
+                    baseline: e5c_baseline,
+                    receipt: verified.receipt.clone(),
+                    origin: e5c_origin,
+                    move_store: Default::default(),
+                    arg_order: Default::default(),
+                };
+                Some(std::sync::Arc::new(super::cache_contract::stage_streamed(
+                    &directory,
+                    metadata,
+                    &portable.path,
+                )?))
             }
-        }
-        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        // Unique per call, as the exports spool is: one process runs many
-        // prepares concurrently and a pid-only name collides between them.
-        static NEXT_ORIGIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let origin_path = directory.join(format!(
-            ".origin-{}-{}.json",
-            std::process::id(),
-            NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        {
-            let file = std::fs::File::options()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&origin_path)
-                .map_err(|error| error.to_string())?;
-            let mut writer = std::io::BufWriter::new(file);
-            origin.write_canonical_json(&mut writer)?;
-            std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
-        }
-        let _origin_file = OriginFile(origin_path.clone());
-        let e5c_origin = super::cache_contract::stream::OriginSource::File(origin_path);
-        let metadata = super::cache_contract::stream::Metadata {
-            schema: super::cache_contract::SCHEMA.into(),
-            key,
-            inputs,
-            functions,
-            universe: e5c_universe,
-            model: e5c_model,
-            baseline: e5c_baseline,
-            receipt: verified.receipt.clone(),
-            origin: e5c_origin,
-            move_store: Default::default(),
-            arg_order: Default::default(),
         };
-        let entry = super::cache_contract::stage_streamed(&directory, metadata, &portable.path)?;
         Ok(Prepared {
-            entry: std::sync::Arc::new(entry),
+            key,
+            entry,
             cached: CachedModel {
                 model: verified.model.clone(),
                 baseline_model: verified.baseline_model.clone(),
@@ -395,16 +428,20 @@ pub(crate) fn prepared_arg_order_applied(
         let prepared = prepared.borrow();
         let prepared = prepared
             .as_ref()
-            .filter(|prepared| prepared.entry.metadata.key == fingerprint)
+            .filter(|prepared| prepared.key == fingerprint)
             .ok_or("no prepared entry for this fingerprint")?;
         if let Some(rows) = &prepared.arg_order_applied {
             return rows.clone();
         }
-        match prepared.entry.metadata.arg_order {
+        let entry = prepared
+            .entry
+            .as_ref()
+            .ok_or("no staged entry for this fingerprint")?;
+        match entry.metadata.arg_order {
             super::cache_contract::stream::MoveStoreCapture::Missing => {
-                super::cache_contract::validate_file(&prepared.entry.path)?.arg_order_applied()
+                super::cache_contract::validate_file(&entry.path)?.arg_order_applied()
             }
-            _ => prepared.entry.metadata.arg_order_applied(),
+            _ => entry.metadata.arg_order_applied(),
         }
     })
 }
@@ -437,10 +474,11 @@ pub(crate) fn prepared_arg_order_from_file(
             prepared
                 .borrow()
                 .as_ref()
-                .filter(|prepared| prepared.entry.metadata.key == fingerprint)
-                .map(|prepared| prepared.entry.path.clone())
+                .filter(|prepared| prepared.key == fingerprint)
+                .and_then(|prepared| prepared.entry.as_ref())
+                .map(|entry| entry.path.clone())
         })
-        .ok_or("no prepared entry for this fingerprint")?;
+        .ok_or("no staged entry for this fingerprint")?;
     super::cache_contract::validate_file(&path)?.arg_order_applied()
 }
 
@@ -507,10 +545,11 @@ pub(crate) fn prepared_move_store_obligations(
             prepared
                 .borrow()
                 .as_ref()
-                .filter(|prepared| prepared.entry.metadata.key == fingerprint)
-                .map(|prepared| (prepared.entry.path.clone(), prepared.entry.metadata.clone()))
+                .filter(|prepared| prepared.key == fingerprint)
+                .and_then(|prepared| prepared.entry.as_ref())
+                .map(|entry| (entry.path.clone(), entry.metadata.clone()))
         })
-        .ok_or("no prepared entry for this fingerprint")?;
+        .ok_or("no staged entry for this fingerprint")?;
     match metadata.move_store {
         super::cache_contract::stream::MoveStoreCapture::Missing => {
             super::cache_contract::validate_file(&path)?.move_store_obligations()
@@ -526,8 +565,8 @@ pub(crate) fn prepared_entry(fingerprint: &str) -> Option<super::cache_contract:
         prepared
             .borrow()
             .as_ref()
-            .filter(|prepared| prepared.entry.metadata.key == fingerprint)
-            .map(|prepared| std::sync::Arc::clone(&prepared.entry))
+            .filter(|prepared| prepared.key == fingerprint)
+            .and_then(|prepared| prepared.entry.clone())
     })?;
     let bytes = std::fs::read(&entry.path).ok()?;
     // A spooled entry its own contract refuses is a refusal worth reading, not
@@ -609,12 +648,12 @@ pub(crate) fn store(
             .borrow()
             .as_ref()
             .filter(|p| {
-                p.entry.metadata.key == fp
+                p.key == fp
                     && p.cached.model == cached.model
                     && p.cached.baseline_model == cached.baseline_model
                     && p.cached.a5_receipt == cached.a5_receipt
             })
-            .map(|p| std::sync::Arc::clone(&p.entry))
+            .and_then(|p| p.entry.clone())
     })?;
     match super::cache_contract::publish_streamed(&directory, &entry) {
         Ok(path) => Some(path),
@@ -698,7 +737,10 @@ pub(crate) fn load(
     };
     PREPARED.with(|p| {
         *p.borrow_mut() = Some(Prepared {
-            entry: std::sync::Arc::new(super::cache_contract::existing_streamed(path, entry)),
+            key: fp,
+            entry: Some(std::sync::Arc::new(
+                super::cache_contract::existing_streamed(path, entry),
+            )),
             cached: cached.clone(),
             arg_order_applied: None,
         })
@@ -1366,7 +1408,7 @@ pub(crate) fn memo_get(fp: &str) -> Option<CachedModel> {
                 k == fp
                     && PREPARED.with(|prepared| {
                         prepared.borrow().as_ref().is_some_and(|p| {
-                            p.entry.metadata.key == fp
+                            p.key == fp
                                 && p.cached.model == cached.model
                                 && p.cached.baseline_model == cached.baseline_model
                                 && p.cached.a5_receipt == cached.a5_receipt
