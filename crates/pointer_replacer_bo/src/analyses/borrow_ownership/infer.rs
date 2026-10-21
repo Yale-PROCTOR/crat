@@ -1266,31 +1266,6 @@ pub(crate) fn reseat_destinations(
         })
         .collect();
     let mut reseated = rustc_data_structures::fx::FxHashSet::default();
-    if std::env::var_os("CRAT_ERA5C_RESEAT_DUMP").is_some() {
-        eprintln!("E5C_MIR_FN {:?}", body.source.def_id());
-        for (block, data) in body.basic_blocks.iter_enumerated() {
-            for st in &data.statements {
-                if let rustc_middle::mir::StatementKind::Assign(a) = &st.kind {
-                    eprintln!("E5C_MIR {:?} {:?} = {:?}", block, a.0, a.1);
-                }
-            }
-            if let rustc_middle::mir::TerminatorKind::Call {
-                args,
-                destination,
-                func,
-                ..
-            } = &data.terminator().kind
-            {
-                eprintln!(
-                    "E5C_MIR {:?} CALL dest={:?} func={:?} args={:?}",
-                    block,
-                    destination,
-                    func,
-                    args.iter().map(|a| a.node.place()).collect::<Vec<_>>()
-                );
-            }
-        }
-    }
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let rustc_middle::mir::TerminatorKind::Call {
             args,
@@ -1357,13 +1332,6 @@ pub(crate) fn reseat_destinations(
         // direct form: `x = f(x)`
         if named.contains(&result) && argument_sources.contains(&result) {
             reseated.insert(result);
-            if std::env::var_os("CRAT_ERA5C_RESEAT_WHY").is_some() {
-                let rustc_middle::mir::TerminatorKind::Call { func, .. } = &data.terminator().kind
-                else {
-                    unreachable!()
-                };
-                eprintln!("E5C_RESEAT_WHY direct _{} {:?}", result.as_u32(), func);
-            }
         }
         // through the result temporary: `t = f(x); x = move t`
         for (_, later) in body
@@ -1385,18 +1353,6 @@ pub(crate) fn reseat_destinations(
                     && argument_sources.contains(&target.local)
                 {
                     reseated.insert(target.local);
-                    if std::env::var_os("CRAT_ERA5C_RESEAT_WHY").is_some() {
-                        let rustc_middle::mir::TerminatorKind::Call { func, .. } =
-                            &data.terminator().kind
-                        else {
-                            unreachable!()
-                        };
-                        eprintln!(
-                            "E5C_RESEAT_WHY via-temp _{} {:?}",
-                            target.local.as_u32(),
-                            func
-                        );
-                    }
                 }
             }
         }
