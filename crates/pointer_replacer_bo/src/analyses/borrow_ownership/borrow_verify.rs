@@ -63,6 +63,7 @@ thread_local! {
 /// path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RepairMode {
+    /// Each residual conflict commits `¬ref` on its representative slot.
     Plain,
     /// R617-1 (era-5c 082, approved R631-7): the guarded planner's clauses in
     /// Mode-A's loop, at the point where Mode-A commits. Everything around the
@@ -127,6 +128,7 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// One commit of the plain repair: its target, its round and the conflict behind it.
 #[derive(Clone, Debug)]
 pub(crate) struct PlainCommitTrace {
     #[cfg(test)]
@@ -947,6 +949,7 @@ fn solve_round_model(
     }
 }
 
+/// One round's model for the guarded repair, through `backend`.
 fn solve_guarded_round_model(
     solver: &KindSolver,
     selectors: &Selectors,
@@ -1708,6 +1711,7 @@ pub(crate) fn verify_guarded_to_fixpoint_counting(
     )
 }
 
+/// The guarded repair's own fixpoint loop, as a separate driver.
 #[cfg(test)]
 pub(super) fn verify_guarded_to_fixpoint_counting_impl(
     program: &RustProgram,
@@ -1980,6 +1984,7 @@ pub(super) fn verify_guarded_to_fixpoint_counting_impl(
     }
 }
 
+/// Record why the guarded repair declined; the program then falls back to the plain repair.
 fn record_guarded_decline(stats: &mut RoundStats, reason: GuardedDeclineReason) {
     stats.guarded_decline = Some(reason);
 }

@@ -113,6 +113,7 @@ pub(crate) struct CopyLendEligibility {
 pub(crate) enum CopyLendEligibilityDrop {
     C2MutableOrMissingDestination,
     C3FieldInClosure,
+    /// The copy's destination flows to a release.
     FreeDestination,
     C3AggregateStore,
     C3FieldStore,
@@ -188,8 +189,10 @@ pub(crate) struct BoConstruction {
 pub(crate) struct VerifiedBo {
     pub(crate) model: FxHashMap<SlotRef, SlotKind>,
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
+    /// The copy marks the accepted model kept.
     #[cfg(test)]
     pub(crate) retained_copy_marks: BTreeSet<CopyMarkKey>,
+    /// The kept copy marks with what the rewriter needs to place them.
     pub(crate) retained_copy_plans: Vec<PlannedCopyMark>,
     #[cfg(test)]
     pub(crate) summary_artifact: super::param_overlap::OverlapSummaryArtifact,
@@ -232,7 +235,9 @@ pub(crate) struct VerifiedBo {
     pub(crate) hard_check_elapsed: Duration,
     #[cfg(test)]
     pub(crate) optimize_materialization_elapsed: Duration,
+    /// How many return-refinement links the construction added.
     pub(crate) return_refined_links: usize,
+    /// The copy marks the overlap plan proposed.
     #[cfg(test)]
     pub(crate) planned_copy_marks: BTreeSet<CopyMarkKey>,
     #[cfg(test)]
@@ -246,6 +251,7 @@ pub(crate) struct VerifiedBo {
 pub(crate) enum OverlapPreledgerDeclineReason {
     BaselineConstruction,
     BaselineVerification,
+    /// The overlap plan could not be produced.
     OverlapPlanProduction,
     RefinedFallbackConstruction,
     RefinedFallbackVerification,
@@ -315,6 +321,8 @@ fn precise_verification_cause(stats: &super::borrow_verify::RoundStats) -> Strin
     )
 }
 
+/// Why an overlap solve declined before its ledger: the stage, and the detail
+/// where one exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OverlapPreledgerDecline {
     reason: OverlapPreledgerDeclineReason,
@@ -354,6 +362,7 @@ impl OverlapPreledgerDecline {
     }
 }
 
+/// The digest of the frozen overlap pair ledger; the overlap receipt prints it.
 const OVERLAP_PAIR_LEDGER_SHA256: &str =
     "16dac90cf269c5480e6f612e54733dd210e41393a879202c7138e93cd7d360e1";
 const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
@@ -394,6 +403,8 @@ fn nullability_artifacts(construction: &BoConstruction) -> NullabilityArtifacts 
     }
 }
 
+/// The field-reference plan's opacity facts: a per-field table and the counts the
+/// receipt prints.
 struct OpacityArtifacts {
     artifact: String,
     opaque_stores: usize,
@@ -401,6 +412,7 @@ struct OpacityArtifacts {
     nullable_store_fields: usize,
 }
 
+/// The opacity facts of `construction`'s field-reference plan.
 fn opacity_artifacts(construction: &BoConstruction) -> OpacityArtifacts {
     let mut artifact =
         String::from("variant\towner\tslot\topaque\tunresolved_unresolvable\tnullable\tsafe\n");
@@ -529,6 +541,7 @@ fn summary_digest(plan: &OverlapPlan) -> String {
     )
 }
 
+/// The proposed and kept copy marks as a table.
 #[cfg(test)]
 fn overlap_mark_artifact(
     mode: OverlapMode,
@@ -562,6 +575,7 @@ fn overlap_mark_artifact(
     out
 }
 
+/// The overlap site ledger as a table.
 #[cfg(test)]
 pub(crate) fn overlap_site_artifact(mode: OverlapMode, plan: &OverlapPlan) -> String {
     let mut out = String::from(
@@ -736,6 +750,8 @@ pub(crate) fn construct_bo_into(
     construct_bo_into_with_esc(program, slots, origins, mut_facts, solver, mode, true)
 }
 
+/// The overlap solve's reference construction: the ordinary construction under
+/// the active copy-lend mode, without the escape-minimal selection.
 fn construct_bo_overlap_reference(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1634,6 +1650,8 @@ pub(crate) fn verify_bo_construction_l2_for_test(
     })
 }
 
+/// Solve under `mode` and `attestation`; `None` when the solve declines (its
+/// reasons are `solve_bo_overlap_config_reporting`'s).
 pub(crate) fn solve_bo_overlap_config(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1721,6 +1739,8 @@ fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> Verifie
     verified
 }
 
+/// The overlap solve inside its attested world and model-entry count, with the
+/// source events collected once.
 fn solve_bo_overlap_config_inner(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1748,6 +1768,8 @@ fn solve_bo_overlap_config_inner(
     })
 }
 
+/// The overlap solve itself: the baseline solve, the overlap plan, then the
+/// precise solve or its refined fallback.
 fn solve_bo_overlap_config_with_source_events(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1764,7 +1786,7 @@ fn solve_bo_overlap_config_with_source_events(
     assert_ne!(
         CopyLendMode::current(),
         CopyLendMode::RemovalOnly,
-        "the A5 frame runs Baseline or the LendArm selector, never RemovalOnly"
+        "the overlap solve runs the baseline or the lend-arm copy-lend mode, never removal-only"
     );
     // era-5c relay 208 (S39 (b)): the copies the relaxation may take, for this solve.
     let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());

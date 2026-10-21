@@ -32,6 +32,8 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
+/// A copy mark the overlap plan places: its key, the endpoint slots it covers, the
+/// call it marks, and the function that owns it.
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedCopyMark {
     pub(crate) key: CopyMarkKey,
@@ -42,6 +44,7 @@ pub(crate) struct PlannedCopyMark {
     pub(crate) owner_fn: String,
 }
 
+/// What the overlap producer saw and planned; the overlap receipt prints these counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OverlapProducerStats {
     pub(crate) calls: usize,
@@ -58,6 +61,9 @@ pub(crate) struct OverlapProducerStats {
     pub(crate) type_disjoint_pairs: usize,
 }
 
+/// The parameter-overlap plan of one solve: the ABI guard's disposition, each
+/// function's effective overlap pairs, the coarse pairs (coarse mode only) and the
+/// copy marks to place.
 #[derive(Clone, Debug)]
 pub(crate) struct OverlapPlan {
     #[cfg(test)]
@@ -155,6 +161,7 @@ impl OverlapPlan {
     }
 }
 
+/// One call site's overlap pair, classified by the mutability of its two sides.
 #[derive(Clone, Debug)]
 pub(crate) struct OverlapSiteRow {
     #[cfg(test)]
@@ -185,6 +192,7 @@ struct WitnessRecord {
     registered_site: bool,
 }
 
+/// One call site's overlap pair with the facts that decide it, as the branch audit reads it.
 #[derive(Clone, Debug)]
 pub(crate) struct OverlapSiteBranchAudit {
     pub(crate) caller: u32,
@@ -212,6 +220,7 @@ pub(crate) struct OverlapSiteBranchAudit {
     pub(crate) terminator: String,
 }
 
+/// Every call site's overlap pairs with the facts that decide them, for the branch audit.
 pub(crate) fn audit_overlap_site_branches(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -883,6 +892,8 @@ fn site_seed_disposition(verdict: PairClass, dependencies_empty: bool) -> SiteSe
     }
 }
 
+/// The parameter-overlap plan for `mode`, from the baseline model: empty in
+/// `Baseline`, the may-overlap pairs and their copy marks otherwise.
 pub(crate) fn produce_overlap_plan(
     program: &RustProgram<'_>,
     slots: &CrateSlots,

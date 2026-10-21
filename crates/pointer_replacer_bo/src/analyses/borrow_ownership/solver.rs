@@ -609,10 +609,12 @@ enum HardRelaxResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RoundModelFailure {
     HardUnsat {
+        /// How many endpoint-retraction assertions were active.
         active_endpoint_retraction: usize,
         core_labels: Vec<String>,
     },
     HardUnknown {
+        /// How many endpoint-retraction assertions were active.
         active_endpoint_retraction: usize,
         reason: String,
     },
@@ -3217,6 +3219,8 @@ impl KindSolver {
         kinds
     }
 
+    /// The decomposed round model (hard relaxation, then the optimized model under
+    /// it), reported as a guarded-repair round's result.
     pub(crate) fn model_kinds_decomposed_reporting_guarded(
         &self,
         hard: &HardLoopSolver,
@@ -3564,6 +3568,8 @@ impl KindSolver {
     }
 }
 
+/// One guarded-repair round's solve: the model with the selectors it dropped, or
+/// the solver's unsat / unknown verdict (a decline in the planner's taxonomy).
 pub(crate) enum GuardedSolveResult {
     Sat {
         kinds: FxHashMap<SlotRef, SlotKind>,

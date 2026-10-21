@@ -611,6 +611,9 @@ pub(crate) fn all_witnesses_gate(
     }
 }
 
+/// The identity of one copy mark: the caller and the call's location and targets,
+/// the overlapping parameter pair with its two actuals, the side they share, and
+/// the pointee type.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CopyMarkKey {
     pub(crate) caller: FnKey,
@@ -663,6 +666,8 @@ impl CopyMarkKey {
     }
 }
 
+/// The copy marks to retain: every witness's mark when all witnesses discharge
+/// the gate, none otherwise.
 #[cfg(test)]
 pub(crate) fn plan_copy_marks(
     witnesses: impl IntoIterator<Item = (CopyMarkKey, WitnessMarkability)>,
@@ -684,6 +689,9 @@ pub(crate) enum OverlapWorld {
     ClosedWorldFrozenGraph,
 }
 
+/// How parameter-overlap facts enter the solve: `Baseline` adds none,
+/// `PreciseReplay` replays the precise may-overlap pairs (the production mode),
+/// `CoarseConstraint` adds one coarse exclusion per may-overlap pair (pricing only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapMode {
     Baseline,
@@ -831,6 +839,9 @@ impl AbiGuardDisposition {
     }
 }
 
+/// Whether a function's parameter-overlap facts may be used: always under the
+/// frozen-graph attestation, otherwise refused for every ABI reason that applies
+/// (externally visible, address taken, ...).
 pub(crate) fn overlap_abi_guard(
     facts: &AbiBoundaryFacts,
     attestation: Option<WholeProgramAttestation>,
@@ -857,6 +868,8 @@ pub(crate) fn overlap_abi_guard(
     }
 }
 
+/// The overlap fixpoint rendered for inspection: one row per may-overlap pair,
+/// and its receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OverlapSummaryArtifact {
     pub(crate) summary_tsv: String,
@@ -1512,6 +1525,7 @@ mod tests {
         );
     }
 
+    /// The fixture's copy mark at `block`.
     fn copy_mark(block: u32) -> CopyMarkKey {
         CopyMarkKey::new(
             3,

@@ -56,6 +56,7 @@ pub(super) fn inspect(code: &str) -> Fixture {
     inspect_profile(code, false)
 }
 
+/// Solve `code` as the frame does: precise overlap replay under the frozen-graph attestation.
 pub(super) fn inspect_attested_frame(code: &str) -> Fixture {
     inspect_profile(code, true)
 }

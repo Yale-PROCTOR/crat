@@ -71,6 +71,7 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for OriginAvailabi
         #[serde(deny_unknown_fields)]
         #[serde(untagged)]
         enum Wire<T> {
+            /// The older bare form: only the missing reason, untagged.
             Bare(OriginMissing),
             Joint(Tagged<T>),
         }
