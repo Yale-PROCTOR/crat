@@ -405,23 +405,13 @@ pub(crate) fn semantic_inputs(
             }
         }
     }
-    let toolchain = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../rust-toolchain.toml"
-    ))
-    .map_err(|e| e.to_string())?;
-    let dependencies = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
-        .map_err(|e| e.to_string())?;
-    let recipe_digest = |name: &str, fallback: &[u8]| {
-        std::env::var(name).unwrap_or_else(|_| format!("{:x}", Sha256::digest(fallback)))
-    };
     Ok(super::cache_contract::SemanticInputs {
         program: std::env::var("CRAT_ERA5_PROGRAM")
             .unwrap_or_else(|_| program.tcx.crate_name(LOCAL_CRATE).to_string()),
         files,
-        analysis: code_fingerprint_cached().to_owned(),
-        toolchain: recipe_digest("CRAT_ERA5_TOOLCHAIN_DIGEST", &toolchain),
-        dependencies: recipe_digest("CRAT_ERA5_DEPENDENCY_DIGEST", &dependencies),
+        analysis: env!("BO_ANALYSIS_FINGERPRINT").to_owned(),
+        toolchain: env!("BO_TOOLCHAIN_SHA256").to_owned(),
+        dependencies: env!("BO_LOCK_SHA256").to_owned(),
         configuration: format!(
             "{:x}",
             Sha256::digest(solver_identity(a5_mode, attestation).as_bytes())
@@ -437,61 +427,9 @@ fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[
     format!("{:x}", h.finalize())
 }
 
-/// SHA-256 over the sorted contents of the analyses source tree.
-///
-/// Computed at runtime rather than baked in at build time: a baked constant
-/// would be stale exactly when the sources change without a rebuild of this
-/// file, which is the failure mode it exists to prevent.
-fn analysis_code_fingerprint_at(root: &Path) -> String {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let rd = std::fs::read_dir(dir).expect("complete analyses tree");
-        for e in rd {
-            let p = e.expect("read analysis entry").path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.is_file() {
-                out.push(p);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(root, &mut files);
-    files.sort_by(|left, right| {
-        left.strip_prefix(root)
-            .expect("walked analysis file is under root")
-            .cmp(
-                right
-                    .strip_prefix(root)
-                    .expect("walked analysis file is under root"),
-            )
-    });
-    let mut h = Sha256::new();
-    for f in &files {
-        let relative = f
-            .strip_prefix(root)
-            .expect("walked analysis file is under root")
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        let content = std::fs::read(f).expect("read every frozen analysis asset");
-        let content_hash = Sha256::digest(content);
-        h.update((relative.len() as u64).to_le_bytes());
-        h.update(relative.as_bytes());
-        h.update(content_hash);
-    }
-    format!("{:x}", h.finalize())
-}
-
+/// The analysis code fingerprint, baked in by `build.rs` (`code_fingerprint.rs`).
 pub(crate) fn current_analysis_digest() -> String {
-    analysis_code_fingerprint()
-}
-
-fn analysis_code_fingerprint() -> String {
-    analysis_code_fingerprint_at(Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/analyses"
-    )))
+    env!("BO_ANALYSIS_FINGERPRINT").to_owned()
 }
 
 fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
@@ -1279,6 +1217,32 @@ t2=endpoint-force-retraction-v1\n\
         assert!(missing.is_empty(), "not covered: {missing:?}");
     }
 
+    /// T-fp-3 (S2 D4): the baked values equal a recomputation over the source tree now, so
+    /// `rerun-if-changed` missed no edit.
+    #[test]
+    fn s2_t_fp_3_the_build_values_are_the_source_tree_s() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let analyses = manifest.join("src/analyses");
+        let legacy = manifest.join("../pointer_replacer/src");
+        let roots = super::super::code_fingerprint::analysis_roots(&analyses, &legacy);
+        assert_eq!(
+            env!("BO_ANALYSIS_FINGERPRINT"),
+            super::super::code_fingerprint::fingerprint(&roots),
+            "the baked fingerprint is stale"
+        );
+        let sha = |path: &str| {
+            format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(manifest.join(path)).expect("recipe file"))
+            )
+        };
+        assert_eq!(
+            env!("BO_TOOLCHAIN_SHA256"),
+            sha("../../rust-toolchain.toml")
+        );
+        assert_eq!(env!("BO_LOCK_SHA256"), sha("../../Cargo.lock"));
+    }
+
     /// T-cache-1 (S2 D0b): with one cache directory and nothing else, the second run of the
     /// fixture reads the first one's entry.
     #[test]
@@ -1517,8 +1481,8 @@ t2=endpoint-force-retraction-v1\n\
     /// must not be trivial.
     #[test]
     fn the_analysis_code_fingerprint_is_stable_and_nonempty() {
-        let a = analysis_code_fingerprint();
-        let b = analysis_code_fingerprint();
+        let a = current_analysis_digest();
+        let b = current_analysis_digest();
         assert_eq!(a, b, "the fingerprint must be deterministic within a run");
         assert_eq!(a.len(), 64, "SHA-256 hex: {a}");
         assert_ne!(
@@ -1714,13 +1678,6 @@ thread_local! {
     static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MEMO: std::cell::RefCell<Option<(String, CachedModel)>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The analyses-tree hash is constant for the life of the process; computing it
-/// walks and reads the whole source tree, which is cheap once and silly thrice.
-fn code_fingerprint_cached() -> &'static str {
-    static ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ONCE.get_or_init(analysis_code_fingerprint)
 }
 
 /// The in-process memo, keyed by the **same fingerprint the on-disk cache
