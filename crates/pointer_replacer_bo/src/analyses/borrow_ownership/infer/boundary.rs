@@ -302,10 +302,8 @@ where 'tcx: 'infercx
                     // formal pointer itself, a view of the actual's place; nothing
                     // else constrains it, so without this law Owning could appear
                     // at the formal from no source.
-                    if crate::analyses::borrow_ownership::field_moves::ref_peel_zero() {
-                        for var in [skipped.r#use, skipped.def] {
-                            infer_cx.database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), var, false);
-                        }
+                    for var in [skipped.r#use, skipped.def] {
+                        infer_cx.database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((), var, false);
                     }
                     ty.builtin_deref(true).unwrap()
                 } else {

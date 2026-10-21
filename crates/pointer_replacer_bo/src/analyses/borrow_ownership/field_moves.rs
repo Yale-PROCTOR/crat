@@ -97,18 +97,6 @@ pub(crate) fn own_named() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_REF_PEEL_ZERO=on|off` (fail-loud, absent = off): **L01¹¹, R645-2**
-/// (era-5c 086). At a local call whose actual is the address of a place (`is_ref`),
-/// the formal's peeled outer component -- the formal pointer's own window, use and
-/// def -- is `¬own`: the view of a place is never its owner. Forbid-only.
-pub(crate) fn ref_peel_zero() -> bool {
-    match std::env::var("CRAT_ERA5C_REF_PEEL_ZERO").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_REF_PEEL_ZERO must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// The locations whose field load is a strong-update MOVE.
 #[derive(Debug, Default)]
 pub(crate) struct FieldMoves {

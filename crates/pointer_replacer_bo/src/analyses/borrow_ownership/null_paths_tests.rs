@@ -3728,62 +3728,6 @@ fn e5c_w64_d_no_slot_of_the_five_falls() {
     }
 }
 
-/// W64f (R659-1, R668-4: W64d restated for L01¹¹, losses only): on the five and
-/// `ctx`, L01¹⁰'s configuration (the lend on) against every L01¹¹ switch on --
-/// the zero law, (γ), (α⁺), (β′), (α)'s route condition and the allocator
-/// contract. No slot falls to Raw and no Ref becomes Owning; every move is
-/// printed (`E5C_W64F`).
-#[test]
-fn e5c_w64_f_no_slot_of_the_six_falls_under_l01p11() {
-    const L01P11: [&str; 6] = [
-        "CRAT_ERA5C_REF_PEEL_ZERO",
-        "CRAT_ERA5C_RETIRE_FRESH",
-        "CRAT_ERA5C_RETIRE_ROUTE_USE",
-        "CRAT_ERA5C_TYPED_SOLE",
-        "CRAT_ERA5C_ALPHA_RETURNS",
-        "CRAT_ERA5C_ALLOCATOR_CONTRACT",
-    ];
-    let root = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../benchmarks/rs-crown-derived"
-    );
-    let mut shapes = vec![("ctx".to_owned(), "ctx".to_owned())];
-    for program in ["bst", "avl", "ht", "buffer", "quadtree"] {
-        let path = format!("{root}/{program}/lib.rs");
-        if std::path::Path::new(&path).is_file() {
-            shapes.push((program.to_owned(), format!("file:{path}")));
-        } else {
-            eprintln!("corpus absent; skipping {program}");
-        }
-    }
-    for (program, shape) in &shapes {
-        let model = |value: &str| -> std::collections::BTreeMap<String, String> {
-            let mut env = vec![("CRAT_ERA5C_LEND", "on"), ("CRAT_E5C_W63_MODEL_ONLY", "1")];
-            env.extend(L01P11.iter().map(|switch| (*switch, value)));
-            w63_lines(shape, &env)
-                .into_iter()
-                .filter_map(|l| {
-                    let (k, v) = l.rsplit_once(' ')?;
-                    k.contains("@d").then(|| (k.to_owned(), v.to_owned()))
-                })
-                .collect()
-        };
-        let (off, on) = (model("off"), model("on"));
-        assert_eq!(off.len(), on.len(), "{program}: the slot universe");
-        let moved: Vec<_> = off
-            .iter()
-            .filter(|(k, v)| on.get(*k) != Some(*v))
-            .map(|(k, v)| format!("{k} {v}->{}", on[k]))
-            .collect();
-        eprintln!("E5C_W64F {program} moved={} {moved:?}", moved.len());
-        let lost: Vec<_> = moved
-            .iter()
-            .filter(|m| m.ends_with("->raw") || m.ends_with("ref->owning"))
-            .collect();
-        assert!(lost.is_empty(), "{program}: a slot fell: {lost:?}");
-    }
-}
-
 /// W64e (R590-5 L-B): the validator refuses a `Lent` row with an interior
 /// zero, one missing an interior equality, and one whose certificate is
 /// absent from the snapshot (three faults, each RED).
@@ -5185,7 +5129,6 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
 /// repair, and the allocator contract on (R691-1).
 const L01P13_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5C_LEND", "on"),
-    ("CRAT_ERA5C_REF_PEEL_ZERO", "on"),
     ("CRAT_ERA5C_RETIRE_FRESH", "on"),
     ("CRAT_ERA5C_RETIRE_ROUTE_USE", "on"),
     ("CRAT_ERA5C_TYPED_SOLE", "on"),
