@@ -1178,27 +1178,6 @@ pub unsafe fn keep(p:*mut Node){ROOT=p;}
         super::graph_tests::with_facts(&code, move |facts| {
             let origins = super::value_origins::ValueOrigins::build(facts);
             let (keys, _holds) = fold_caller::return_port_owning(facts, &origins);
-            // The rule's own readout, for a fixture that refuses unexpectedly.
-            if std::env::var("CRAT_R377_DEBUG").is_ok() {
-                eprintln!("R377DBG fn={function} admitted={keys:?}");
-                for row in &facts.boundary_substitutions {
-                    if format!("{:?}", row.role) == "ExitReturn"
-                        && row.point.function.as_deref() == Some(function)
-                    {
-                        for pair in &row.matched {
-                            if let super::super::ownership_boundary::Variables::Single { var } =
-                                pair.formal
-                            {
-                                let n = super::transport::Node {
-                                    construction: row.point.construction,
-                                    var,
-                                };
-                                eprintln!("R377DBG port {var} atoms {:?}", origins.at(n));
-                            }
-                        }
-                    }
-                }
-            }
             send.send(keys.iter().any(|key| key.contains(function)))
                 .expect("one verdict");
         });

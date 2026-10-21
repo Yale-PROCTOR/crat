@@ -2188,31 +2188,6 @@ impl KindSolver {
                 .iter()
                 .find(|proof| proof.field_key == candidate.field_key && proof.supported())
             else {
-                // era-5c R706 (instrument, test builds): why the reader's field is held.
-                if cfg!(test) && std::env::var_os("CRAT_E5C_READER_DEBUG").is_some() {
-                    for proof in frozen
-                        .field_support
-                        .iter()
-                        .filter(|proof| proof.field_key == candidate.field_key)
-                    {
-                        eprintln!(
-                            "E5C_READER_HELD {key} {} stores={} input_stores={} holds={:?} classified={:?}",
-                            proof.field_key,
-                            proof.stores.len(),
-                            proof.input_stores.len(),
-                            proof
-                                .holds
-                                .iter()
-                                .map(|h| (format!("{:?}", h.reason), h.site.clone()))
-                                .collect::<Vec<_>>(),
-                            proof
-                                .classified
-                                .iter()
-                                .map(|c| (c.site.clone(), format!("{:?}", c.origin)))
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                }
                 clauses.push((
                     format!("field-reader-support-held({key},{})", candidate.field_key),
                     !reader,
@@ -3235,13 +3210,6 @@ impl KindSolver {
             outcome = self.solver.check(&[]);
         }
         self.return_port_kept.borrow_mut().push(rows.len());
-        if std::env::var("CRAT_R377_DEBUG").is_ok() {
-            eprintln!(
-                "R377ROUND admitted={} kept={} outcome={outcome:?}",
-                self.return_port_admitted.borrow().len(),
-                rows.len()
-            );
-        }
         let outcome = outcome;
         let query_reason = (outcome == SatResult::Unknown)
             .then(|| self.solver.get_reason_unknown())
@@ -4656,17 +4624,6 @@ impl Database for BoOwnDatabase<'_> {
     }
 
     fn push_equal_impl(&mut self, x: Var, y: Var) {
-        // R471-3 (ii): name the emitter of one specific equality. Diagnosis only.
-        if let Ok(want) = std::env::var("CRAT_ERA5C_EQ_BACKTRACE") {
-            let here = format!("{x:?},{y:?}");
-            let here = here.replace("Var(", "").replace(')', "");
-            if here.split(',').map(str::trim).collect::<Vec<_>>().join(",") == want {
-                eprintln!(
-                    "E5C_EQ_BACKTRACE pair=({x:?},{y:?})\n{}",
-                    std::backtrace::Backtrace::force_capture()
-                );
-            }
-        }
         super::ownership_evidence::record("equal", &[x, y], None, None);
         let label = || format!("own-equal({x:?},{y:?})");
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);

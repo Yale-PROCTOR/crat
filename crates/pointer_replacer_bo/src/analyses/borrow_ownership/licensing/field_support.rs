@@ -1368,13 +1368,6 @@ pub(crate) fn audit(
             ) {
                 Ok(selected) => selected,
                 Err(reason) => {
-                    // era-5c R706 (instrument, test builds): the meets behind a held store.
-                    if cfg!(test) && std::env::var_os("CRAT_E5C_READER_DEBUG").is_some() {
-                        eprintln!(
-                            "E5C_TERMINAL_HELD {:?} {:?} meets={:?}",
-                            store.site, reason, meets
-                        );
-                    }
                     hold(Some(construction), reason);
                     continue;
                 }
@@ -1507,12 +1500,6 @@ pub(crate) fn audit(
                 .map(|input| (input.site.clone(), input.destination_def))
                 .collect();
             for (site, token) in moved {
-                if std::env::var("CRAT_R388_DEBUG").is_ok() {
-                    eprintln!(
-                        "R388SET {} {}:{} -> MovedInput(token={})",
-                        site.function, site.block, site.statement, token.var
-                    );
-                }
                 proof.classified.push(ClassifiedStore {
                     site,
                     origin: StoreSourceOrigin::MovedInput { token },
@@ -1569,12 +1556,6 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
         return StoreSourceOrigin::Unknown;
     };
     let atoms = origins.at(*node);
-    if std::env::var("CRAT_R388_DEBUG").is_ok() {
-        eprintln!(
-            "R388CLASS {} {}:{} node={} atoms={atoms:?}",
-            site.function, site.block, site.statement, node.var
-        );
-    }
     if atoms.iter().all(|atom| matches!(atom, OriginAtom::Null)) {
         return StoreSourceOrigin::Null;
     }
@@ -1609,12 +1590,6 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
                     keys.insert(key);
                 }
                 None => {
-                    if std::env::var("CRAT_R388_DEBUG").is_ok() {
-                        eprintln!(
-                            "R388SET {} {}:{} no entry row for port {port:?}",
-                            site.function, site.block, site.statement
-                        );
-                    }
                     return StoreSourceOrigin::Unknown;
                 }
             },
@@ -1644,12 +1619,6 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
                     .map(|load| load.site.field_key.clone())
                     .collect();
                 if loaded.is_empty() {
-                    if std::env::var("CRAT_R388_DEBUG").is_ok() {
-                        eprintln!(
-                            "R388SET {} {}:{} no load for port {port:?}",
-                            site.function, site.block, site.statement
-                        );
-                    }
                     return StoreSourceOrigin::Unknown;
                 }
                 keys.extend(loaded);
@@ -1661,11 +1630,5 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
         0 => StoreSourceOrigin::Fresh,
         _ => StoreSourceOrigin::All(keys.into_iter().collect()),
     };
-    if std::env::var("CRAT_R388_DEBUG").is_ok() {
-        eprintln!(
-            "R388SET {} {}:{} -> {result:?}",
-            site.function, site.block, site.statement
-        );
-    }
     result
 }
