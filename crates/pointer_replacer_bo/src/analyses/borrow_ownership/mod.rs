@@ -69,7 +69,6 @@ mod ptr;
 #[cfg(test)]
 pub(crate) mod ptr;
 pub(crate) mod qualifier_facts;
-pub(crate) mod raw_cause;
 pub(crate) mod realloc;
 pub(crate) mod realloc_ssa;
 pub mod resolve;
