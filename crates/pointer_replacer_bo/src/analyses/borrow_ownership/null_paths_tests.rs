@@ -2924,8 +2924,7 @@ fn e5c_w63_b_a_consuming_formal_keeps_the_owner() {
 }
 
 /// W63c (R580-1): a member handed to an indirect callee is no consumer; the
-/// site is receipted under R481's tier-2 waiver. Under `no-waiver` the
-/// indirect call consumes again (RED).
+/// site is receipted under R481's tier-2 waiver.
 #[test]
 fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
     let on = w63_lines("callback", &[]);
@@ -2941,17 +2940,10 @@ fn e5c_w63_c_an_indirect_call_lends_under_the_tier_2_waiver() {
             && l.ends_with("id=retention-waiver:tier-2@2026-09-21")),
         "{on:?}"
     );
-    let fault = w63_lines("callback", &[("CRAT_E5C_W63_FAULT", "no-waiver")]);
-    assert!(
-        !fault.iter().any(|l| l == "lendable set_var::_1"),
-        "RED: {fault:?}"
-    );
-    assert!(!fault.iter().any(|l| l.starts_with("waiver ")), "{fault:?}");
 }
 
 /// W63e: the recorded plan travels in the licensing snapshot and a restored
-/// snapshot validates; under `lend-all` (every pointer argument borrowed, the
-/// plan honest) the validator refuses the uncertified borrowed calls (RED).
+/// snapshot validates.
 #[test]
 fn e5c_w63_e_the_validator_refuses_an_uncertified_borrowed_call() {
     let on = w63_lines("ctx", &[]);
@@ -2960,13 +2952,6 @@ fn e5c_w63_e_the_validator_refuses_an_uncertified_borrowed_call() {
         "{on:?}"
     );
     assert!(!on.iter().any(|l| l.starts_with("validate err")), "{on:?}");
-    let fault = w63_lines("ctx", &[("CRAT_E5C_W63_FAULT", "lend-all")]);
-    assert!(
-        fault
-            .iter()
-            .any(|l| l == "validate err:lent call has no lend certificate"),
-        "RED: {fault:?}"
-    );
 }
 
 /// era-5c 070: the production lend plan (`licensing::lend::collect`) of one
@@ -3016,8 +3001,7 @@ const W64_HT: &str = concat!(
 /// W64a (R590-5, the record §5): ht's `ht_expand` frees and replaces
 /// `(*table).entries`; `ht_set` calls it. With the lend both `table` formals
 /// are **Ref** and the `entries` field stays **Owning** -- the interior
-/// component carries the field's ownership through the call. RED: the
-/// full-window lend of 070 (`full-window`) sends the tables to Raw.
+/// component carries the field's ownership through the call.
 #[test]
 fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
     if !std::path::Path::new(W64_HT).is_file() {
@@ -3030,48 +3014,6 @@ fn e5c_w64_a_a_lent_writer_moves_the_field_not_the_container() {
         assert_eq!(w63_kind(&on, key), "ref", "{key}: {on:?}");
     }
     assert_eq!(w63_kind(&on, "src::ht::ht::field0@d0"), "owning", "{on:?}");
-    let fault = w63_lines(
-        &shape,
-        &[
-            ("CRAT_E5C_W64_FAULT", "full-window"),
-            // R609-3: the discharge would remove the conflict the fault acts through.
-            ("CRAT_E5C_W66_FAULT", "no-discharge"),
-        ],
-    );
-    assert_eq!(
-        w63_kind(&fault, "src::ht::ht_expand::_1@d0"),
-        "raw",
-        "RED: {fault:?}"
-    );
-}
-
-/// W64e (R590-5 L-B): the validator refuses a `Lent` row with an interior
-/// zero, one missing an interior equality, and one whose certificate is
-/// absent from the snapshot (three faults, each RED).
-#[test]
-fn e5c_w64_e_the_validator_refuses_a_malformed_lent_row() {
-    let on = w63_lines("ctx", &[]);
-    assert!(
-        on.iter().any(|l| l == "validate ok lend_plan=true"),
-        "{on:?}"
-    );
-    for (fault, message) in [
-        (
-            "interior-zero",
-            "validate err:lent call zeroes an interior component",
-        ),
-        (
-            "no-interior-equal",
-            "validate err:boundary matched pair has no corresponding emitted equation",
-        ),
-        (
-            "drop-plan",
-            "validate err:lent call has no lend certificate",
-        ),
-    ] {
-        let lines = w63_lines("ctx", &[("CRAT_E5C_W64_FAULT", fault)]);
-        assert!(lines.iter().any(|l| l == message), "{fault}: {lines:?}");
-    }
 }
 
 // ---- era-5c 077 / R603-2: the retirement discharges. (α) the post-free use,

@@ -346,7 +346,7 @@ impl Snapshot {
             reader_transfers: frozen.reader_transfers.clone(),
             field_support: frozen.field_support.clone(),
             reference_effects: frozen.reference_effects.clone(),
-            lend_plan: (!super::lend::w64_fault("drop-plan")).then(|| facts.lend_plan.clone()),
+            lend_plan: Some(facts.lend_plan.clone()),
         })
     }
 

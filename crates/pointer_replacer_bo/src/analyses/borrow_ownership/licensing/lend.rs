@@ -59,18 +59,6 @@ impl Plan {
     }
 }
 
-/// W63's fault hooks (`CRAT_E5C_W63_FAULT`), carried by the identity.
-pub(crate) fn fault(name: &str) -> bool {
-    std::env::var("CRAT_E5C_W63_FAULT").ok().as_deref() == Some(name)
-}
-
-/// W64's fault hooks (`CRAT_E5C_W64_FAULT`), carried by the identity:
-/// `full-window` (070's whole-window lend), `interior-zero`,
-/// `no-interior-equal`, `drop-plan`.
-pub(crate) fn w64_fault(name: &str) -> bool {
-    std::env::var("CRAT_E5C_W64_FAULT").ok().as_deref() == Some(name)
-}
-
 /// libc callees that neither free nor retain a pointer argument.
 const NO_RETAIN: &[&str] = &[
     "strlen",
@@ -136,7 +124,6 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> Plan {
             .filter(|&l| body.local_decls[l].ty.is_raw_ptr())
             .collect()
     };
-    let waived = !fault("no-waiver");
     let mut consumer: BTreeMap<(String, u32), String> = BTreeMap::new();
     let mut sites: BTreeMap<(String, u32), BTreeSet<WaiverSite>> = BTreeMap::new();
     loop {
@@ -250,18 +237,14 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> Plan {
                             }
                             CallKind::Closure | CallKind::Dynamic => {
                                 // The waiver covers every indirect call.
-                                if waived {
-                                    for &argument in &hits {
-                                        indirect.insert(WaiverSite {
-                                            caller: key.0.clone(),
-                                            formal: key.1,
-                                            block: block.as_u32(),
-                                            statement: data.statements.len(),
-                                            argument,
-                                        });
-                                    }
-                                } else {
-                                    reason.get_or_insert("indirect".into());
+                                for &argument in &hits {
+                                    indirect.insert(WaiverSite {
+                                        caller: key.0.clone(),
+                                        formal: key.1,
+                                        block: block.as_u32(),
+                                        statement: data.statements.len(),
+                                        argument,
+                                    });
                                 }
                             }
                         }
