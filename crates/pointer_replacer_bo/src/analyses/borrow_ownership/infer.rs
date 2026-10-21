@@ -966,8 +966,8 @@ where
         destination: Option<Consume<Self::LocalSig>>,
         args: &[Spanned<Operand<'tcx>>],
         callee: &Operand<'tcx>,
-        body: &Body<'tcx>,
-        location: Location,
+        _body: &Body<'tcx>,
+        _location: Location,
     ) {
         let mut registrations = super::licensing::facts::active().then(Vec::new);
         let args = args
@@ -1030,42 +1030,9 @@ where
         } else {
             // closure or fn ptr
             //
-            // era-5c (R409-1, R412-12): under the frame an indirect call's
-            // result is OPAQUE — an unknown call: destination borrowed,
-            // arguments lent — and the named allocator contract is the only
-            // route to Owning for such a result: a call through `alloc_func`
-            // is a receipted source, through `free_func` a sink.
-            let class = super::allocator_contract::classify(infer_cx.tcx, body, location);
-            if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-                eprintln!(
-                    "E5C contract-call {:?} at {location:?}: {class:?} callee-ty={:?}",
-                    infer_cx.tcx.def_path_str(body.source.def_id()),
-                    callee.ty(body, infer_cx.tcx)
-                );
-            }
-            match class {
-                Some(super::allocator_contract::ContractCall::Alloc) => {
-                    super::allocator_contract::note_producer(body.source.def_id());
-                    with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                        super::export::with_callee(super::allocator_contract::CONTRACT, || {
-                            if let Some(destination) = destination {
-                                Self::source(infer_cx, destination);
-                            }
-                        })
-                    })
-                }
-                Some(super::allocator_contract::ContractCall::Free) => {
-                    with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                        super::export::with_callee(super::allocator_contract::CONTRACT, || {
-                            if let Some(Some((arg, is_ref))) = args.get(1) {
-                                assert!(!is_ref);
-                                Self::sink(infer_cx, arg.clone());
-                            }
-                        })
-                    })
-                }
-                None => infer_cx.unknown_call(destination, &args),
-            }
+            // era-5c (R409-1, R412-12): an indirect call's result is OPAQUE — an
+            // unknown call: destination borrowed, arguments lent.
+            infer_cx.unknown_call(destination, &args)
         }
     }
 

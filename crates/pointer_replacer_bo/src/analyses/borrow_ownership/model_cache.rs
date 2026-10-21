@@ -147,10 +147,7 @@ pub(crate) fn solver_identity(
     fields.insert("era5b_return_port", "true".to_owned());
     fields.insert("era5b_interface_own", "true".to_owned());
     fields.insert("era5c_move_tracking", "true".to_owned());
-    fields.insert(
-        "era5c_allocator_contract",
-        super::allocator_contract::enabled().to_string(),
-    );
+    fields.insert("era5c_allocator_contract", "false".to_owned());
     // R517-2(1): the L01⁵ pins were NOT in the identity, so two solves differing
     // only in `CRAT_ERA5C_FIELD_MOVE` or `CRAT_ERA5C_LEAK_PARITY` computed one
     // semantic key -- the R374-1 gap the seat found at `34fd7f68a`. Added here

@@ -9,7 +9,6 @@ use std::ops::Range;
 pub(crate) mod a5_overlap;
 pub(crate) mod a5_producer;
 pub(crate) mod a5_snapshot_effects;
-pub(crate) mod allocator_contract;
 pub(crate) mod array_fields;
 mod assoc;
 pub(crate) mod borrow_engine;
@@ -320,14 +319,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     let mut var_gen = Gen::new();
     // §NB-R: hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
-    allocator_contract::prepare(
-        crate_ctxt.tcx,
-        &crate_ctxt
-            .fns()
-            .iter()
-            .map(|did| did.expect_local())
-            .collect::<Vec<_>>(),
-    );
     let mut database = BoOwnDatabase::new(kind_solver.optimize(), kind_solver.tracker());
     let facts_scope = database.activate_facts();
     let transfer_scope = ownership_occurrence::reset();
@@ -581,8 +572,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     kind_solver.constrain_first_permissions(&facts)?;
     kind_solver.constrain_traversal_calls(&facts)?;
     kind_solver.constrain_fold_callers(&facts)?;
-    // era-5c (R409-1): an allocation is released by its own allocator.
-    kind_solver.constrain_allocator_contract_pairing(&facts);
     export::record_ownership_facts(&facts);
     kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))

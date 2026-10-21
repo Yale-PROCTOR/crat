@@ -6,7 +6,6 @@ use rustc_middle::{
     mir::Body,
     ty::{Ty, TyCtxt, TyKind},
 };
-use z3::ast::Bool;
 
 use super::{CallArgs, InferCtxt, matcher};
 use crate::analyses::{
@@ -126,20 +125,6 @@ where 'tcx: 'infercx
             let output_ty = fn_sig.output().skip_binder();
 
             let ret = ret.expect_normal();
-            // era-5c (R409-1): a contract producer's return port is guarded so
-            // the pairing check can close it for a misusing caller only.
-            let contract_port = crate::analyses::borrow_ownership::allocator_contract::is_producer(
-                callee,
-            )
-            .then(|| {
-                let guard = Bool::fresh_const("contract-port");
-                crate::analyses::borrow_ownership::allocator_contract::note_port(
-                    infer_cx.tcx.def_path_str(infer_cx.function()),
-                    guard.clone(),
-                );
-                guard
-            });
-            let mut port_depth = 0usize;
             if let Some((guard, _)) = &traversal {
                 ownership_boundary::traversal_borrow(&mut return_record);
                 let vars: std::collections::BTreeSet<_> =
@@ -169,12 +154,9 @@ where 'tcx: 'infercx
                         );
                     if let Some((guard, _)) = &traversal {
                         database.pending_traversal_pair(guard, &[dest.def, ret]);
-                    } else if let Some(guard) = contract_port.as_ref().filter(|_| port_depth == 0) {
-                        database.push_guarded_contract_port(guard, dest.def, ret);
                     } else {
                         database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>((),dest.def,ret);
                     }
-                    port_depth += 1;
                 },
             );
         }
@@ -310,24 +292,6 @@ where 'tcx: 'infercx
                     ty
                 };
                 let arg = arg.transpose();
-                // L01¹³ (c)(iii), era-5c 115: the formal a contract releaser frees
-                // through `free_func` takes the caller's token through a guarded
-                // equality, as a producer's return port does; a retracted guard
-                // releases a raw value (the consumer keeps `p` raw).
-                let contract_sink = (!lent
-                    && !borrowed
-                    && crate::analyses::borrow_ownership::allocator_contract::is_sink_formal(
-                        callee, index,
-                    ))
-                .then(|| {
-                    let guard = Bool::fresh_const("contract-sink");
-                    crate::analyses::borrow_ownership::allocator_contract::note_port(
-                        infer_cx.tcx.def_path_str(infer_cx.function()),
-                        guard.clone(),
-                    );
-                    guard
-                });
-                let mut sink_depth = 0usize;
 
                 matcher(
                     ty,
@@ -336,8 +300,6 @@ where 'tcx: 'infercx
                     infer_cx.struct_ctxt.unrestricted,
                     infer_cx.database,
                     |param, arg, database| {
-                        let first = sink_depth == 0;
-                        sink_depth += 1;
                         ownership_boundary::matched(
                             &mut argument_record,
                             Variables::consume(&arg),
@@ -374,15 +336,11 @@ where 'tcx: 'infercx
                             ownership_boundary::original_cell(&mut argument_record);
                             return;
                         }
-                        if let Some(guard) = contract_sink.as_ref().filter(|_| first) {
-                            database.push_guarded_contract_sink(guard, param.r#use, arg.r#use);
-                        } else {
-                            database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                                (),
-                                param.r#use,
-                                arg.r#use,
-                            );
-                        }
+                        database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            param.r#use,
+                            arg.r#use,
+                        );
                         database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
                             (),
                             param.def,

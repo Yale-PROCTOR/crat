@@ -258,27 +258,8 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> Plan {
                                 }
                             }
                             CallKind::Closure | CallKind::Dynamic => {
-                                // L01¹³ (c)(i), era-5c 108: the allocator contract's
-                                // release (`free_func(opaque, p)`) consumes its
-                                // argument 1, as `free` does. The waiver covers every
-                                // other indirect call.
-                                if hits.contains(&1)
-                                    && super::super::allocator_contract::classify(
-                                        tcx,
-                                        &body,
-                                        rustc_middle::mir::Location {
-                                            block,
-                                            statement_index: data.statements.len(),
-                                        },
-                                    ) == Some(
-                                        super::super::allocator_contract::ContractCall::Free,
-                                    )
-                                    && !(cfg!(test)
-                                        && std::env::var("CRAT_E5C_W80_FAULT").as_deref()
-                                            == Ok("no-contract-sink"))
-                                {
-                                    reason.get_or_insert("contract-sink".into());
-                                } else if waived {
+                                // The waiver covers every indirect call.
+                                if waived {
                                     for &argument in &hits {
                                         indirect.insert(WaiverSite {
                                             caller: key.0.clone(),

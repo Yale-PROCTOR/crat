@@ -937,72 +937,11 @@ fn brotli_shape_model() -> Vec<(String, String)> {
     shape_model(BROTLI_SHAPE)
 }
 
-#[test]
-#[ignore = "runs under the contract pin in a child of e5c_w12"]
-fn e5c_inner_brotli_shape_full_solve_under_the_contract() {
-    assert!(super::allocator_contract::enabled());
-    let rows = brotli_shape_model();
-    let kind = |k: &str| {
-        rows.iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.clone())
-    };
-    // W12: the wrapper-seeded local (`make::p` = `_4`, the cast of the call
-    // result `_3`) decides Owning; the wrapper's own result too.
-    assert_eq!(
-        kind("make::_4@d0").as_deref(),
-        Some("owning"),
-        "make::p {rows:?}"
-    );
-    assert_eq!(kind("make::_3@d0").as_deref(), Some("owning"), "{rows:?}");
-    assert_eq!(
-        kind("BrotliAllocate::_0@d0").as_deref(),
-        Some("owning"),
-        "{rows:?}"
-    );
-    // W13: the BrotliFree sink pairs — the callee's parameter consumes.
-    assert_eq!(
-        kind("BrotliFree::_2@d0").as_deref(),
-        Some("owning"),
-        "BrotliFree::p {rows:?}"
-    );
-    // W14: a wrapper whose return is not the allocation stays opaque: nothing
-    // in `not_an_allocation` is Owning.
-    assert!(
-        rows.iter()
-            .all(|(k, v)| !k.starts_with("not_an_allocation::") || v != "owning"),
-        "{rows:?}"
-    );
-    // W15: a contract allocation released through libc `free` is refused
-    // Owning (`wrong_free::q` = `_4`), while `make` keeps its token.
-    assert_eq!(
-        kind("wrong_free::_4@d0").as_deref(),
-        Some("raw"),
-        "wrong_free::q {rows:?}"
-    );
-    assert_eq!(
-        kind("wrong_free::_3@d0").as_deref(),
-        Some("raw"),
-        "{rows:?}"
-    );
-    eprintln!("E5C_CONTRACT_OK");
-}
-
-#[test]
-fn e5c_w12_to_w15_the_allocator_contract_on_the_brotli_shape() {
-    let text = child(
-        "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_full_solve_under_the_contract",
-        &[("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on")],
-    );
-    assert!(text.contains("E5C_CONTRACT_OK"), "{text}");
-}
-
 /// R412-12: with the contract pin OFF an indirect call's result is opaque
 /// under the frame — never Owning by the objective alone.
 #[test]
 #[ignore = "runs under CRAT_ERA5C_MOVE_TRACKING=on, contract off, in a child of e5c_w16"]
 fn e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract() {
-    assert!(!super::allocator_contract::enabled());
     let rows = brotli_shape_model();
     let kind = |k: &str| {
         rows.iter()
@@ -1031,7 +970,7 @@ fn e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract() {
 fn e5c_w16_an_indirect_call_result_is_opaque_without_the_contract() {
     let text = child(
         "analyses::borrow_ownership::null_paths_tests::e5c_inner_brotli_shape_indirect_result_is_opaque_without_the_contract",
-        &[("CRAT_ERA5C_ALLOCATOR_CONTRACT", "off")],
+        &[],
     );
     assert!(text.contains("E5C_OPAQUE_OK"), "{text}");
 }
@@ -4673,11 +4612,10 @@ fn e5c_w79_a_c_variadic_tail_binds_no_loan() {
     );
 }
 
-/// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines, the guarded
-/// repair, and the allocator contract on (R691-1).
+/// L01¹³'s arms over the W63 child's: L01¹¹'s and L01¹²'s lines and the guarded
+/// repair.
 const L01P13_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5C_LEND", "on"),
-    ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
     ("CRAT_BO_REPAIR", "guarded"),
     ("CRAT_BO_SAFE_MONO", "per_site"),
     ("CRAT_NB4R_ROUTING", "on"),
@@ -4995,152 +4933,6 @@ pub unsafe fn lent(m: *mut MemoryManager, n: u64) -> u32 {
     return v;
 }
 "#;
-
-/// W80 (R691-1, era-5c 108 (i)): the lend reads the contract's `free_func` as
-/// consuming, so `BrotliFree`'s `p` is the contract's sink and `make` owns its
-/// allocation. RED at L01¹² with the contract on: `BrotliFree::p` lent, `make::p`
-/// raw. W12–W15 restated under the frame's arms ride along as controls. The fault
-/// `CRAT_E5C_W80_FAULT=no-contract-sink` (test builds) lends `p` again.
-#[test]
-fn e5c_w80_the_contract_sink_consumes() {
-    let lines = l01p13_lines("w80-base", &[]);
-    for key in [
-        "make::_4@d0",
-        "make::_3@d0",
-        "BrotliAllocate::_0@d0",
-        "BrotliFree::_2@d0",
-    ] {
-        assert_eq!(w63_kind(&lines, key), "owning", "{key}");
-    }
-    assert_eq!(w63_kind(&lines, "wrong_free::_4@d0"), "raw");
-    assert_eq!(w63_kind(&lines, "wrong_free::_3@d0"), "raw");
-    assert!(
-        lines
-            .iter()
-            .all(|l| !l.starts_with("not_an_allocation::") || !l.ends_with(" owning")),
-        "{lines:?}"
-    );
-    let fault = l01p13_lines("w80-base", &[("CRAT_E5C_W80_FAULT", "no-contract-sink")]);
-    assert_eq!(
-        w63_kind(&fault, "make::_4@d0"),
-        "raw",
-        "the fault must be caught: {fault:?}"
-    );
-}
-
-/// W81 (R691-1, era-5c 108 (ii) and 115 (iii)): `grow`'s ensure-capacity swap
-/// cannot own its receivers. Its ports and its releases through `BrotliFree`'s
-/// sink formal are retracted per call site, so the swap stays raw in `grow`
-/// alone: `make`, the port and the sink keep Owning, and the receipt counts the
-/// four retractions. RED at L01¹² with the contract on (every receiver raw), and
-/// with 108's port guard alone (the swap reaches `make` through the sink's one
-/// formal). The fault `CRAT_E5C_W81_FAULT=no-site-guard` asserts every open guard.
-#[test]
-fn e5c_w81_a_swap_site_retracts_its_own_ports() {
-    let lines = l01p13_lines("w81-grow", &[]);
-    for key in ["make::_4@d0", "BrotliAllocate::_0@d0", "BrotliFree::_2@d0"] {
-        assert_eq!(w63_kind(&lines, key), "owning", "{key}");
-    }
-    assert_eq!(w63_kind(&lines, "grow::_4@d0"), "raw");
-    assert_eq!(w63_kind(&lines, "grow::_8@d0"), "raw");
-    let debug = w63_child("w81-grow", &{
-        let mut env = L01P13_ARMS.to_vec();
-        env.push(("CRAT_ERA5C_DEBUG", "1"));
-        env
-    });
-    assert!(debug.contains("contract-port retracted grow"), "{debug}");
-    assert!(!debug.contains("contract-port retracted make"), "{debug}");
-    let full: Vec<(&str, &str)> = L01P13_ARMS
-        .iter()
-        .copied()
-        .filter(|(name, _)| *name != "CRAT_E5C_W63_MODEL_ONLY")
-        .collect();
-    let full = w63_lines("w81-grow", &full);
-    assert!(
-        full.iter()
-            .any(|l| l == "allocator_contract_ports_retracted=4"),
-        "{full:?}"
-    );
-    let fault = l01p13_lines("w81-grow", &[("CRAT_E5C_W81_FAULT", "no-site-guard")]);
-    assert_eq!(
-        w63_kind(&fault, "make::_4@d0"),
-        "raw",
-        "the fault must be caught: {fault:?}"
-    );
-}
-
-/// W81b (Codex, era-5c 115): the sink formal is the incoming value. On `W80_BASE`
-/// with `W81_REASSIGNED`, `BrotliFree`'s `p` is recorded; `keep_and_free` and
-/// `wrap_free`, which release a fresh allocation in place of the incoming value,
-/// record no sink formal. The fault `CRAT_E5C_W81_FAULT=reassigned-formal` (test
-/// builds) skips the checks. No solve: the analysis refuses `wrap_free`'s struct
-/// transmute (`infer.rs`'s cast arm), so the records are read from `prepare`.
-#[test]
-fn e5c_w81_b_a_reassigned_formal_is_not_a_sink() {
-    const INNER: &str = "analyses::borrow_ownership::null_paths_tests::e5c_inner_w81_sink_formals";
-    let mut env = vec![
-        ("CRAT_ERA5C_ALLOCATOR_CONTRACT", "on"),
-        ("CRAT_ERA5C_DEBUG", "1"),
-    ];
-    let text = child(INNER, &env);
-    assert!(text.contains("E5C_W81B_OK"), "{text}");
-    assert!(
-        text.contains("E5C contract-sink-formal BrotliFree 1"),
-        "{text}"
-    );
-    for releaser in ["keep_and_free", "wrap_free"] {
-        assert!(
-            !text.contains(&format!("E5C contract-sink-formal {releaser}")),
-            "{releaser}: {text}"
-        );
-    }
-    env.push(("CRAT_E5C_W81_FAULT", "reassigned-formal"));
-    let fault = child(INNER, &env);
-    for releaser in ["keep_and_free", "wrap_free"] {
-        assert!(
-            fault.contains(&format!("E5C contract-sink-formal {releaser} 1")),
-            "the fault must be caught: {fault}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "runs under the contract pin in a child of e5c_w81_b"]
-fn e5c_inner_w81_sink_formals() {
-    use rustc_hir::{ItemKind, OwnerNode};
-    assert!(super::allocator_contract::enabled());
-    let source = format!("{W80_BASE}{W81_REASSIGNED}");
-    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-        let functions: Vec<_> = tcx
-            .hir_crate(())
-            .owners
-            .iter()
-            .filter_map(|owner| {
-                let OwnerNode::Item(item) = owner.as_owner()?.node() else {
-                    return None;
-                };
-                matches!(item.kind, ItemKind::Fn { .. }).then_some(item.owner_id.def_id)
-            })
-            .collect();
-        super::allocator_contract::prepare(tcx, &functions);
-    })
-    .unwrap_or_else(|error| error.raise());
-    eprintln!("E5C_W81B_OK");
-}
-
-/// W82 (R691-1, era-5c 108): a conditional allocation and one lent to a local
-/// callee own under the contract. RED at L01¹² with the contract on.
-#[test]
-fn e5c_w82_a_conditional_or_lent_allocation_owns() {
-    let cond = l01p13_lines("w82-cond", &[]);
-    for key in ["cond::_4@d0", "cond::_7@d0", "make::_4@d0"] {
-        assert_eq!(w63_kind(&cond, key), "owning", "{key}");
-    }
-    let lent = l01p13_lines("w82-lent", &[]);
-    for key in ["lent::_4@d0", "lent::_5@d0", "make::_4@d0"] {
-        assert_eq!(w63_kind(&lent, key), "owning", "{key}");
-    }
-}
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement
 /// review's discharged rows. On W71's shapes with L01¹¹'s discharges on, the
