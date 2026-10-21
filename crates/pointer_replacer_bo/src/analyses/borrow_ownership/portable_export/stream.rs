@@ -535,9 +535,7 @@ fn write_review_fields(
     // L01¹² (R677-4; era-5c 099 STOP 1 (ii)): the discharged rows, as the in-memory
     // writer writes them (absent when nothing was discharged). The streamed entry
     // carried none before.
-    // W76's fault (test builds only): the streamed rows are skipped.
-    let skip = cfg!(test) && std::env::var("CRAT_E5C_W76_FAULT").as_deref() == Ok("no-discharged");
-    if !review.discharged.is_empty() && !skip {
+    if !review.discharged.is_empty() {
         raw(w, b",\"discharged\":")?;
         values(
             w,
@@ -711,7 +709,7 @@ pub(crate) fn collect_to_path(
             reason: "producer did not record an L2 residual certificate".into(),
         };
     }
-    match written_move_store_rows(program, slots, export)? {
+    match move_store_rows(program, slots, export)? {
         Some(rows) => {
             for row in rows {
                 let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;

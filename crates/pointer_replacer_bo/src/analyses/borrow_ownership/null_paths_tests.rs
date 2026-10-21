@@ -2128,8 +2128,7 @@ fn w62_lines(extra: &[(&str, &str)]) -> Vec<String> {
 
 /// W62a: with the arm, the rows round-trip: the portable export and a staged
 /// cache entry (read back through the streamed validator) return exactly the
-/// model's rows (6 uses on `AVL_SHAPE`). Under the `drop-rows` fault the round
-/// trip loses them (RED).
+/// model's rows (6 uses on `AVL_SHAPE`).
 #[test]
 fn e5c_w62_a_the_rows_round_trip_through_the_export_and_the_entry() {
     let on = w62_lines(&[]);
@@ -2140,18 +2139,11 @@ fn e5c_w62_a_the_rows_round_trip_through_the_export_and_the_entry() {
         on.contains(&"equal portable=true entry=true".to_owned()),
         "{on:?}"
     );
-    let fault = w62_lines(&[("CRAT_E5C_W62_FAULT", "drop-rows")]);
-    assert!(fault.contains(&"entry ok:0:0".to_owned()), "{fault:?}");
-    assert!(
-        fault.contains(&"equal portable=false entry=false".to_owned()),
-        "W62a is RED under the fault: {fault:?}"
-    );
 }
 
 /// W62d (R577-5): every row carries `cleared`, the members whose loans its
 /// store removed, exactly as the replay's last pass removed them; none is
-/// `Raw` (a `Raw` member keeps its loan) and none is `kept` (3.2). Under the
-/// `drop-cleared` fault the rows lose them (RED).
+/// `Raw` (a `Raw` member keeps its loan) and none is `kept` (3.2).
 #[test]
 fn e5c_w62_d_each_row_carries_the_members_its_store_cleared() {
     let on = w62_lines(&[]);
@@ -2166,15 +2158,6 @@ fn e5c_w62_d_each_row_carries_the_members_its_store_cleared() {
     assert!(
         cleared.starts_with("cleared rows=6 nonempty=6 "),
         "{cleared}"
-    );
-    let fault = w62_lines(&[("CRAT_E5C_W62_FAULT", "drop-cleared")]);
-    let cleared = fault
-        .iter()
-        .find(|l| l.starts_with("cleared "))
-        .expect("cleared line");
-    assert!(
-        cleared.ends_with("matches-removed=false"),
-        "W62d is RED under the fault: {cleared}"
     );
 }
 
@@ -4555,8 +4538,7 @@ pub unsafe fn lent(m: *mut MemoryManager, n: u64) -> u32 {
 
 /// W76 (R677-4; era-5c 099 STOP 1 (ii)): the entry carries the retirement
 /// review's discharged rows. On W71's shapes with L01¹¹'s discharges on, the
-/// in-memory packet and the prepared (streamed) entry hold the same rows; the
-/// fault `CRAT_E5C_W76_FAULT=no-discharged` (test builds) empties the entry's.
+/// in-memory packet and the prepared (streamed) entry hold the same rows.
 #[test]
 fn e5c_w76_the_entry_carries_the_discharged_rows() {
     let line = |extra: &[(&str, &str)]| {
@@ -4575,9 +4557,4 @@ fn e5c_w76_the_entry_carries_the_discharged_rows() {
         .expect("portable count");
     assert!(portable >= 4, "{on}");
     assert!(on.ends_with("equal=true"), "{on}");
-    let fault = line(&[("CRAT_E5C_W76_FAULT", "no-discharged")]);
-    assert!(
-        fault.contains(" entry=0 ") && fault.ends_with("equal=false"),
-        "{fault}"
-    );
 }

@@ -848,8 +848,6 @@ pub(crate) fn move_store_rows(
     let Some(rows) = &export.move_store_obligations else {
         return Ok(None);
     };
-    // R577-5's witness fault: the cleared members vanish from the rows.
-    let drop_cleared = std::env::var("CRAT_E5C_W62_FAULT").ok().as_deref() == Some("drop-cleared");
     let tcx = program.tcx;
     let span = |span: rustc_span::Span| super::ownership_occurrence::SourceSpan {
         file: tcx
@@ -892,22 +890,19 @@ pub(crate) fn move_store_rows(
                 uses: uses(&row.uses),
                 kept: row.kept.iter().map(|l| l.as_u32()).collect(),
                 kept_uses: uses(&row.kept_uses),
-                cleared: if drop_cleared {
-                    Vec::new()
-                } else {
-                    row.cleared
-                        .iter()
-                        .map(|&(local, kind)| MoveStoreCleared {
-                            local: local.as_u32(),
-                            kind: match kind {
-                                super::SlotKind::Raw => "raw",
-                                super::SlotKind::Ref => "ref",
-                                super::SlotKind::Owning => "owning",
-                            }
-                            .into(),
-                        })
-                        .collect()
-                },
+                cleared: row
+                    .cleared
+                    .iter()
+                    .map(|&(local, kind)| MoveStoreCleared {
+                        local: local.as_u32(),
+                        kind: match kind {
+                            super::SlotKind::Raw => "raw",
+                            super::SlotKind::Ref => "ref",
+                            super::SlotKind::Owning => "owning",
+                        }
+                        .into(),
+                    })
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>, String>>()
@@ -915,21 +910,6 @@ pub(crate) fn move_store_rows(
             rows.sort_by(move_store_order);
             Some(rows)
         })
-}
-
-/// The rows both writers serialize: `move_store_rows`, except under W62's
-/// `drop-rows` fault, where they vanish from the export only (the round trip
-/// must see the loss against the model's own rows).
-pub(crate) fn written_move_store_rows(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    export: &BoExport,
-) -> Result<Option<Vec<MoveStoreRow>>, String> {
-    let rows = move_store_rows(program, slots, export)?;
-    if std::env::var("CRAT_E5C_W62_FAULT").ok().as_deref() == Some("drop-rows") {
-        return Ok(rows.map(|_| Vec::new()));
-    }
-    Ok(rows)
 }
 
 /// The family's one row order, for the writer and every reader alike: the
@@ -1118,7 +1098,7 @@ pub(crate) fn collect(
             reason: "producer did not record an L2 residual certificate".into(),
         };
     }
-    match written_move_store_rows(program, slots, export)? {
+    match move_store_rows(program, slots, export)? {
         Some(rows) => {
             for row in rows {
                 let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
