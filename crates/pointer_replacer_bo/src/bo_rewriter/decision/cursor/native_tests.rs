@@ -73,7 +73,7 @@ pub(super) fn emitted(input: &str) -> String {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let held = emission.plan.held_classes();

@@ -32,7 +32,7 @@ pub(super) fn ast_emitted_source_of_attested(input: &str) -> Result<String, Stri
     ast_emitted_source_in(
         input,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )
@@ -40,7 +40,7 @@ pub(super) fn ast_emitted_source_of_attested(input: &str) -> Result<String, Stri
 
 fn ast_emitted_source_in(
     input: &str,
-    world: Option<(super::A5Mode, Option<super::WholeProgramAttestation>)>,
+    world: Option<(super::OverlapMode, Option<super::WholeProgramAttestation>)>,
 ) -> Result<String, String> {
     match ::utils::compilation::run_compiler_on_input(
         ::utils::compilation::str_to_input(input),
@@ -54,7 +54,7 @@ fn ast_emitted_source_in(
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let held = emission.plan.held_classes();
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
@@ -3510,7 +3510,7 @@ fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let (events, _, rows) = emission.plan.mechanical_receipts(&BTreeSet::new());
             Ok::<_, String>((events, rows))
@@ -6186,7 +6186,7 @@ fn e2_attempt(
             &ctx.facts,
             &ctx.subjects,
             &table,
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
             &ctx.a5_site_proofs,
             &ctx.retention,
             &ctx.lifetime_eligibility,
@@ -6196,7 +6196,7 @@ fn e2_attempt(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("wave-2 attempted emission");
         (emission, receipt)
@@ -6221,9 +6221,9 @@ fn raw_boundary_attempt_with(
             let (mut table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -6248,7 +6248,7 @@ fn raw_boundary_attempt_with(
                 &ctx.facts,
                 &ctx.subjects,
                 &table,
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
                 &ctx.a5_site_proofs,
                 &raw_boundary,
                 &ctx.coconv,
@@ -6275,7 +6275,7 @@ fn raw_boundary_attempt_with(
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("raw-boundary attempted emission");
             (emission, receipt)
@@ -7048,12 +7048,12 @@ fn e3_attempt_with_mutability(
         ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("wave-3 AST capture");
         let attestation = attested.then_some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         );
         let (mut table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 attestation,
             )),
         )
@@ -7067,7 +7067,7 @@ fn e3_attempt_with_mutability(
         );
         assert_eq!(
             ctx.analysis.a5_mode,
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay
         );
         assert_eq!(ctx.analysis.attestation, attestation);
         inject(&mut table);
@@ -7077,7 +7077,7 @@ fn e3_attempt_with_mutability(
                 &ctx.facts,
                 &ctx.subjects,
                 &table,
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
                 &ctx.a5_site_proofs,
                 &super::decision::raw_boundary::RawBoundaryDispositionIndex::default(),
                 &super::decision::co_conversion::CoConv::default(),
@@ -7091,7 +7091,7 @@ fn e3_attempt_with_mutability(
                 &ctx.facts,
                 &ctx.subjects,
                 &table,
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
                 &ctx.a5_site_proofs,
                 &ctx.retention,
                 &ctx.lifetime_eligibility,
@@ -7103,7 +7103,7 @@ fn e3_attempt_with_mutability(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("wave-3 attempted emission");
         let held = emission.plan.held_classes();
@@ -7424,9 +7424,9 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
             let (mut table, mut ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -7447,7 +7447,7 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
                 &ctx.facts,
                 &ctx.subjects,
                 &table,
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
                 &ctx.a5_site_proofs,
                 &ctx.raw_boundary,
                 &ctx.coconv,
@@ -7476,7 +7476,7 @@ fn inv_w1_non_subject_mir_call_is_bridged_or_holds_the_class() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("INV-W1 attempted emission");
             (emission, receipt)
@@ -7561,9 +7561,9 @@ fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
             let (mut table, mut ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -7588,7 +7588,7 @@ fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
                 &ctx.facts,
                 &ctx.subjects,
                 &table,
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
                 &ctx.a5_site_proofs,
                 &ctx.raw_boundary,
                 &ctx.coconv,
@@ -7612,7 +7612,7 @@ fn d1_w1_base_parameter_callee_requires_each_mir_call_site() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("D1-W1 attempted emission");
             (emission, receipt, omitted_control)
@@ -7919,9 +7919,9 @@ fn br_w4_static_table_function_item_uses_atomic_raw_wrapper_surface() {
     let fixture = Fixture::new(&[("lib.rs", source)]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -7994,7 +7994,7 @@ fn br_w4_const_mir_static_table_cardinality_is_exactly_207() {
             let web = super::decision::lifetime::derive_fn_ptr_web(
                 &program,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )
             .expect("attested fn-pointer web");
@@ -8037,9 +8037,9 @@ fn br_w4_generated_safe_inner_name_collision_is_typed_and_held() {
     let fixture = Fixture::new(&[("lib.rs", source)]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -8085,9 +8085,9 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
         let (mut table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -8125,7 +8125,7 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
             &ctx.facts,
             &ctx.subjects,
             &table,
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
             &ctx.a5_site_proofs,
             &raw_boundary,
             &ctx.coconv,
@@ -8145,7 +8145,7 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("BR-W5b emission")
     })
@@ -8233,9 +8233,9 @@ fn br_w5b_fat_and_non_variable_depth2_storage_are_typed_holds() {
         let (mut table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -8732,9 +8732,9 @@ fn br_w10_write_stream_lifecycle_and_missing_evidence_all_hold() {
         let (mut table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -8969,9 +8969,9 @@ fn br_w12_local_static_wrapper_and_return_temp_types_are_explicit() {
     let fixture = Fixture::new(&[("lib.rs", source)]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -9037,8 +9037,8 @@ mod client {
     let fixture = Fixture::new(&[("lib.rs", input)]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-        Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+        Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         &|table| {
             let (_, decision) = table.entries.iter().find(|(subject, _)|
                 subject.label == "target::p").expect("I11 target parameter");
@@ -9103,9 +9103,9 @@ fn br_w13_raw_tail_to_safe_return_reuses_reborrow_and_lifetime_permit() {
     let fixture = Fixture::new(&[("lib.rs", source)]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -9146,9 +9146,9 @@ fn br_w13_surface_safe_return_to_raw_has_class_receipt() {
     )]);
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &super::EmissionRunConfig {
             configured_exposure: configured_exposure_input("api"),
@@ -9192,9 +9192,9 @@ fn br_w13_caller_receive_is_owned_by_the_returned_callee_class() {
     )]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -9235,9 +9235,9 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
         let (mut table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -9255,7 +9255,7 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
             &ctx.facts,
             &ctx.subjects,
             &table,
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
             &ctx.a5_site_proofs,
             &ctx.raw_boundary,
             &ctx.coconv,
@@ -9275,7 +9275,7 @@ fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("BR-W13 negative emission")
     })
@@ -9323,9 +9323,9 @@ fn life_w1_kazmath_return_reuses_the_origin_parameter_lifetime() {
     )]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -9361,9 +9361,9 @@ fn life_w2_multi_source_return_uses_one_common_lifetime_and_receipt() {
     )]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -9374,9 +9374,9 @@ fn life_w2_multi_source_return_uses_one_common_lifetime_and_receipt() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -9397,9 +9397,9 @@ fn pair_w1_outcome(source: &str) -> super::RewriteOutcome {
     let fixture = Fixture::new(&[("lib.rs", source)]);
     super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     )
@@ -9577,9 +9577,9 @@ fn pair_w1_positive_retention_holds_instead_of_spending_t2() {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -9625,9 +9625,9 @@ fn e2_x1_carrier_reaches_the_lifetime_producer_intact() {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -9654,9 +9654,9 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -9709,9 +9709,9 @@ fn e2_w8_return_permit_reports_secondary_degradation_payload() {
             let (_, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -9849,9 +9849,9 @@ fn e2_w7_direct_call_result_local_is_inferred_safe() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -9898,9 +9898,9 @@ fn e2_w7_only_a_direct_local_call_result_may_be_inferred_safe() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -9989,9 +9989,9 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -10061,9 +10061,9 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
     )]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -10104,9 +10104,9 @@ fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
     )]);
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -10145,9 +10145,9 @@ fn e2_w2_local_reassignment_reuses_the_common_return_lifetime() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -10174,9 +10174,9 @@ fn e2_w2_local_reassignment_reuses_the_common_return_lifetime() {
 
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -10212,9 +10212,9 @@ fn e2_w2b_mutual_output_storage_collapses_and_emits() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -10245,9 +10245,9 @@ fn e2_w2b_mutual_output_storage_collapses_and_emits() {
 
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -10278,9 +10278,9 @@ fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -10299,9 +10299,9 @@ fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
 
     let outcome = super::rewrite_m1_path_a5_injected(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &|_| {},
     );
@@ -10333,9 +10333,9 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -10425,9 +10425,9 @@ fn c_w4_fnptr_web_members_open_only_behind_ruled_surfaces() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )),
         )
@@ -10480,9 +10480,9 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
                 let (table, ctx) = super::decide_table_with_ctx_config(
                     tcx,
                     Some((
-                        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                         Some(
-                            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                         ),
                     )),
                 )?;
@@ -10506,7 +10506,7 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
                 Ok::<_, String>((
                     format!(
                         "model={model}\na5={}\nplan={}\nsource={files:?}",
-                        ctx.a5_receipt,
+                        ctx.overlap_receipt,
                         table.lifetime_plan.canonical_receipt(tcx),
                     ),
                     provenance.source,
@@ -10545,9 +10545,9 @@ fn e2_n5_two_roots_share_plan_receipts_and_unowned_source_bytes() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )?;
@@ -10639,9 +10639,9 @@ fn e2_receipts_reconcile_subject_function_and_plan_identity_once() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )
@@ -12267,9 +12267,9 @@ fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
     };
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &run_config,
     );
@@ -12328,9 +12328,9 @@ fn c_w5_empty_seed_direct_conversion_has_no_surface_wrapper() {
     let run_config = super::EmissionRunConfig::default();
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &run_config,
     );
@@ -12373,9 +12373,9 @@ fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
     };
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &run_config,
     );
@@ -12403,9 +12403,9 @@ fn c_w4_fnptr_web_uses_raw_surfaces_and_safe_inner_calls() {
     )]);
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &super::EmissionRunConfig::default(),
     );
@@ -12442,9 +12442,9 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
             let (mut table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )?;
@@ -12473,7 +12473,7 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let held = emission.plan.held_classes();
             let leaf_held = held.contains(&super::bridge_receipt::SignatureClassId::of(leaf.0));
@@ -12532,9 +12532,9 @@ fn d8_w1_ordinary_caller_uses_terminal_safe_inner_interface() {
     )]);
     let outcome = super::rewrite_m1_path_with_emission_config(
         &fixture.root(),
-        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
         Some(
-            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &super::EmissionRunConfig::default(),
     );
@@ -12625,9 +12625,9 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
             let (mut table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )),
             )?;
@@ -12675,7 +12675,7 @@ fn d13_w3_pair_parse_failure_does_not_abort_program_emission() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let class = &emission.plan.class_finalization.classes
                 [&super::bridge_receipt::SignatureClassId::of(callee)];
@@ -12761,7 +12761,7 @@ fn slc_w1_common_and_specialized_receipts_are_exact() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let (events, _, rows) = emission
                 .plan
@@ -12946,11 +12946,11 @@ fn slu_w1_assert_use_receipt_count(
         |tcx| {
             let capture = super::ast_transform::capture_ast(tcx)?;
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-                Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+                Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
             )))?;
             let emission = emit_files(
-                tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans,
+                tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans,
             )?;
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
                 &emission.plan.held_classes(), &BTreeSet::new(), &table,
@@ -13231,10 +13231,10 @@ fn slu_w1_positive_retention_stays_held() {
     let (artifacts, retired, emitted) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx)?;
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )))?;
-        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)?;
+        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)?;
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &emission.plan.held_classes(), &BTreeSet::new(), &table,
         )?;
@@ -13415,7 +13415,7 @@ fn opt_r213_slice_assignment_wraps_the_view_and_preserves_pointer_distance() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let rows = emission.plan.slice_use_receipt_rows(&BTreeSet::new());
@@ -13515,7 +13515,7 @@ fn opt_r213_pointer_distance_cast_preserves_operand_pointee() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let hold = emission
@@ -13808,7 +13808,7 @@ fn slu_r210_settled_option_destinations_use_same_form_or_typed_hold() {
                 assert_eq!(copy.obligation.intended_terminal_reason,
                     Some(super::mechanical_receipt::MechanicalTerminalReason::SliceUseDestinationUnbuilt("opt-ref-shared".to_owned())));
                 let owner = copy.owner_class;
-                let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+                let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
                     .expect("different-safe-form hold plans");
                 assert!(emission.plan.held_classes().contains(&owner));
             }
@@ -13878,7 +13878,7 @@ fn opt_w1_assert_receipted(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("OPT plan");
         (
@@ -14168,7 +14168,7 @@ fn opt_w1_held_terminal_callee_cannot_license_unwrap() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::from_iter([callee]),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("held terminal callee plans");
         let call = emission
@@ -14417,7 +14417,7 @@ fn opt_w1_nested_raw_result_preserves_the_inner_outbound_adapter() {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("nested plan");
             emission
@@ -14485,7 +14485,7 @@ fn opt_w1_null_argument_has_its_own_presentation_receipt() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("null argument plan")
         .plan
@@ -14619,7 +14619,7 @@ fn opt_w1_exact_span_composition_keeps_the_completed_option_value() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("exact-span plan");
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(

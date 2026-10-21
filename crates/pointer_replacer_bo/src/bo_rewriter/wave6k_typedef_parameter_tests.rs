@@ -26,13 +26,14 @@ fn emitted_signature(input: &str) -> String {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
         .expect("native decisions");
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
-            .expect("emission plan");
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("emission plan");
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &emission.plan.held_classes(),
             &Default::default(),
@@ -63,7 +64,7 @@ fn decisions(input: &str) -> Vec<(String, Decision)> {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

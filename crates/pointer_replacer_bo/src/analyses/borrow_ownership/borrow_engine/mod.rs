@@ -27,18 +27,17 @@
 // as they did under production `borrow` — keeps the mirrors byte-identical (no import rewiring).
 pub(crate) use crate::analyses::borrow::{BorrowSet, Loan};
 
-mod a5_places_conflict;
 mod conflicts;
 mod errors;
 mod invalidates;
 mod loan_liveness;
 mod origin_replay;
+mod overlap_places_conflict;
 mod places_conflict;
 mod traversal_targets;
 
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
-pub(crate) use a5_places_conflict::ParameterOverlap;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
@@ -63,6 +62,7 @@ pub(crate) use invalidates::{RoutedCompose, route_compose};
 pub(crate) use loan_liveness::with_escaped_extension_trace;
 #[cfg(test)]
 pub(crate) use origin_replay::selected_copy_lend_contains;
+pub(crate) use overlap_places_conflict::ParameterOverlap;
 pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 
 #[cfg(test)]

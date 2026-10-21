@@ -6,7 +6,7 @@
 
 use rustc_hash::FxHashMap;
 
-use super::{A5Mode, WholeProgramAttestation};
+use super::{OverlapMode, WholeProgramAttestation};
 
 const ALLOW: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments, unused_variables, non_snake_case, non_camel_case_types)]\n";
 
@@ -16,7 +16,7 @@ fn decisions(source: &str) -> FxHashMap<String, String> {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

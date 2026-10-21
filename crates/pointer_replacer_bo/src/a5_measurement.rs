@@ -20,23 +20,23 @@ use crate::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
             SlotKind,
-            a5_overlap::{
-                A5Mode, A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
-                SnapshotVerdict, WholeProgramAttestation, classify_pair,
-            },
-            a5_producer::{audit_a5_site_branches, produce_a5_plan},
-            a5_snapshot_effects::snapshot_verdict_for_target,
             borrow_engine::ParameterOverlap,
             borrow_verify::revalidate_replaying_with_parameter_overlap,
             construction::{
-                CopyLendMode, a5_site_artifact, construct_bo_into, verify_bo_construction,
+                CopyLendMode, construct_bo_into, overlap_site_artifact, verify_bo_construction,
                 verify_bo_construction_with_parameter_overlaps,
             },
             crate_slots::CrateSlots,
             export::with_bo_export,
-            l2::{MirLocationKey, SlotKey},
+            guarded_repair::{MirLocationKey, SlotKey},
             mutability_facts::MutFacts,
             origins::compute_origins,
+            overlap_producer::{audit_overlap_site_branches, produce_overlap_plan},
+            overlap_snapshot_effects::snapshot_verdict_for_target,
+            param_overlap::{
+                CopyMarkKey, OverlapMode, OverlapWorld, PairClass, PairFacts, PairSide,
+                SetPairEvidence, SnapshotVerdict, WholeProgramAttestation, classify_pair,
+            },
             resolve::{ResolvedSlot, resolve_place},
             slots::SlotId,
             solver::{KindSolver, SlotRef},
@@ -143,7 +143,7 @@ struct Measurement {
     pairs: Vec<PairLedgerRow>,
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
-    final_marks: Vec<C9MarkKey>,
+    final_marks: Vec<CopyMarkKey>,
     w14: Option<W14Measurement>,
     coverage: CoverageCounts,
     timings: Timings,
@@ -191,7 +191,7 @@ struct W14Measurement {
 
 struct BatchPrecise<'a> {
     model: &'a rustc_hash::FxHashMap<SlotRef, SlotKind>,
-    planned_marks: &'a BTreeSet<C9MarkKey>,
+    planned_marks: &'a BTreeSet<CopyMarkKey>,
     model_retained_marks: usize,
     rounds: usize,
 }
@@ -449,7 +449,7 @@ struct CallSite {
     pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
     snapshot_verdicts: BTreeMap<(usize, usize), SnapshotVerdict>,
     post_filter: BTreeMap<(usize, usize), (bool, bool)>,
-    mark_keys: BTreeMap<(usize, usize), C9MarkKey>,
+    mark_keys: BTreeMap<(usize, usize), CopyMarkKey>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -527,7 +527,7 @@ struct MeasuredProgram {
     extended_pairs: Vec<ExtendedPairLedgerRow>,
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
-    final_marks: Vec<C9MarkKey>,
+    final_marks: Vec<CopyMarkKey>,
 }
 
 fn target_formal_pairs(site: &CallSite, left: usize, right: usize) -> Vec<TargetFormalPair> {
@@ -1736,7 +1736,7 @@ fn measure_tcx(
                                 .builtin_deref(true)
                                 .expect("type filter proved a pointee")
                                 .to_string();
-                            if let Some(mark) = C9MarkKey::new(
+                            if let Some(mark) = CopyMarkKey::new(
                                 caller.local_def_index.as_u32(),
                                 MirLocationKey::new(
                                     block.as_u32(),
@@ -1820,7 +1820,7 @@ pub(super) fn run_batch_w14(
     tcx: TyCtxt<'_>,
     baseline_model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
     precise_model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
-    planned_marks: &BTreeSet<C9MarkKey>,
+    planned_marks: &BTreeSet<CopyMarkKey>,
     model_retained_marks: usize,
     precise_rounds: usize,
     artifact_dir: &Path,
@@ -2439,7 +2439,7 @@ pub(super) fn run_site_scope_repartition_worker(
     let slots = CrateSlots::build(&program);
     let origins = compute_origins(&program);
     let mutability = MutFacts::from_program(&program);
-    let audits = audit_a5_site_branches(&program, &slots, origins.native_flows());
+    let audits = audit_overlap_site_branches(&program, &slots, origins.native_flows());
     let audit_by_key = audits
         .iter()
         .map(|audit| {
@@ -2511,13 +2511,13 @@ pub(super) fn run_site_scope_repartition_worker(
         );
         registered.push(audit);
     }
-    let plan = produce_a5_plan(
+    let plan = produce_overlap_plan(
         &program,
         &slots,
         origins.native_flows(),
         &mutability,
         &model,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     )
     .expect("attempt-3 in-process A5 plan");
@@ -2553,8 +2553,11 @@ pub(super) fn run_site_scope_repartition_worker(
     let receipt_path = shard.join("construction-receipt.txt");
     let pair_path = shard.join("w14-pair-ledger.tsv");
     fs::write(&summary_path, &plan.summary_artifact.summary_tsv).expect("write scope summary");
-    fs::write(&site_path, a5_site_artifact(A5Mode::PreciseReplay, &plan))
-        .expect("write scope production-site ledger");
+    fs::write(
+        &site_path,
+        overlap_site_artifact(OverlapMode::PreciseReplay, &plan),
+    )
+    .expect("write scope production-site ledger");
     fs::write(
         &receipt_path,
         format!(
@@ -4005,7 +4008,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
     let mut row = super::report::Row::default();
     let focused_w14 = std::env::var("CRAT_A5_W14_FOCUSED").as_deref() == Ok("1");
     row.set("copy_lend_mode", CopyLendMode::Baseline.label());
-    row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
+    row.set("a5_world", OverlapWorld::ClosedWorldFrozenGraph.label());
     row.set(
         "a5_mode",
         if focused_w14 {
@@ -6017,8 +6020,8 @@ mod tests {
         }
     }
 
-    fn mark(block: u32) -> C9MarkKey {
-        C9MarkKey::new(
+    fn mark(block: u32) -> CopyMarkKey {
+        CopyMarkKey::new(
             9,
             MirLocationKey::new(block, 0),
             [7],

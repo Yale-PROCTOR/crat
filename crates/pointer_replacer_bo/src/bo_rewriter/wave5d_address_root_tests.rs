@@ -18,10 +18,10 @@ fn run(input: &str) -> (String, String) {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx)?;
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )))?;
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)?;
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)?;
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &emission.plan.held_classes(), &BTreeSet::new(), &table,
         )?;

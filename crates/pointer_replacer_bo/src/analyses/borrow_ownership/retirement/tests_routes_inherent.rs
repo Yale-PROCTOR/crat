@@ -194,7 +194,7 @@ fn z_w04_receipt_joins_conflicts_to_unresolved_callee_coverage() {
 
     use crate::{
         analyses::borrow_ownership::{
-            borrow_verify::with_mode_a_commit_trace,
+            borrow_verify::with_plain_commit_trace,
             construction::{
                 CopyLendMode, TestValidationBackend, construct_bo_into,
                 verify_bo_construction_counting_for_test,
@@ -247,7 +247,7 @@ fn z_w04_receipt_joins_conflicts_to_unresolved_callee_coverage() {
                 .filter(|(_, event)| event.coverage == Coverage::UnresolvedCalleeEffects)
                 .map(|(key, _)| key.clone())
                 .collect();
-            let _ = with_mode_a_commit_trace(|| {
+            let _ = with_plain_commit_trace(|| {
                 verify_bo_construction_counting_for_test(
                     &program,
                     &slots,

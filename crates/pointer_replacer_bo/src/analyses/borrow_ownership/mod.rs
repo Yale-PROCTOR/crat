@@ -5,9 +5,6 @@
 
 use std::ops::Range;
 
-pub(crate) mod a5_overlap;
-pub(crate) mod a5_producer;
-pub(crate) mod a5_snapshot_effects;
 pub(crate) mod array_fields;
 mod assoc;
 pub(crate) mod borrow_engine;
@@ -25,12 +22,13 @@ pub(crate) mod demand_evidence;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
-#[cfg(test)]
-pub(crate) mod era5_instruments;
 pub(crate) mod esc_minimal;
 pub(crate) mod execution_guard;
 pub(crate) mod export;
 mod infer;
+pub(crate) mod overlap_producer;
+pub(crate) mod overlap_snapshot_effects;
+pub(crate) mod param_overlap;
 // era-5c report 040: the A1 spare-set, for the MIR-walk market count.
 pub(crate) use infer::reseat_destinations;
 #[cfg(test)]
@@ -41,9 +39,9 @@ pub(crate) mod copy_relax;
 #[cfg(test)]
 mod copy_relax_tests;
 pub(crate) mod field_moves;
+pub(crate) mod guarded_repair;
 #[cfg(test)]
 mod kind_order_tests;
-pub(crate) mod l2;
 pub(crate) mod licensing;
 pub(crate) mod model_cache;
 pub(crate) mod move_store;

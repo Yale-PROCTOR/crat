@@ -219,7 +219,7 @@ fn alias_return_output(attested: bool) -> String {
         let attestation = attested.then_some(super::WholeProgramAttestation::FrozenBenchmarkGraph);
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
-            Some((super::A5Mode::PreciseReplay, attestation)),
+            Some((super::OverlapMode::PreciseReplay, attestation)),
         )
         .expect("configured alias-return decisions");
         assert_eq!(ctx.analysis.attestation, attestation);
@@ -269,7 +269,7 @@ fn alias_return_output(attested: bool) -> String {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("configured alias-return plan");
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
@@ -397,7 +397,7 @@ fn decl_w1_receipt_tracks_the_annotation_and_its_terminal_owner() {
         |tcx| {
             let (table, ctx) = super::decide_table_with_ctx(tcx).unwrap();
             let emission =
-                super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+                super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
                     .unwrap();
             let none = Default::default();
             let rows = emission.plan.declaration_receipt_rows(&none);

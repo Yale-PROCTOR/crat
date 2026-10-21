@@ -112,7 +112,7 @@ fn outbound_alias_permission_local_const_alias_result_preserves_writable_view() 
     let (emitted, observation) = ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original alias-permission AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary alias-permission fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("OUTBOUND-ALIAS-PERMISSION solve={solve:#?}\nINPUT:\n{INPUT}");
@@ -128,7 +128,7 @@ fn outbound_alias_permission_local_const_alias_result_preserves_writable_view() 
             .and_then(|slot| ctx.model.get(&super::SlotRef::Local(owner, slot)));
         let permit = ctx.lifetime_eligibility.return_permit((source.fn_did, source.hir_id));
         let retention = ctx.retention.get(alias.fn_did, 0).expect("actual aliaser retention row");
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual alias-permission emission plan");
         let owner = SignatureClassId::of(source.fn_did);
         let held = emission.plan.held_classes();
@@ -317,7 +317,7 @@ fn outbound_alias_permission_shared_source_written_child_holds_the_native_view()
     let (emitted, hold) = ::utils::compilation::run_compiler_on_str(SHARED_INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original shared-source AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary shared-source alias-permission decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("OUTBOUND-ALIAS-PERMISSION-SHARED solve={solve:#?}\nINPUT:\n{SHARED_INPUT}");
@@ -334,7 +334,7 @@ fn outbound_alias_permission_shared_source_written_child_holds_the_native_view()
         let permit = ctx.lifetime_eligibility.return_permit((source.fn_did, source.hir_id));
         let retention = ctx.retention.get(alias.fn_did, 0).expect("actual aliaser retention row");
         let interface = table.return_interfaces.functions.get(&source.fn_did).cloned();
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual shared-source emission plan");
         let owner = SignatureClassId::of(source.fn_did);
         let held = emission.plan.held_classes();
@@ -493,7 +493,7 @@ fn outbound_carrier(input: &'static str, sink: &str) -> (String, Option<BridgeTe
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -510,7 +510,7 @@ fn outbound_carrier(input: &'static str, sink: &str) -> (String, Option<BridgeTe
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("actual return-shape emission plan");
         let held = emission.plan.held_classes();

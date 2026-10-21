@@ -1,9 +1,9 @@
 //! Typed C-9 call-site emission.
 
-use crate::analyses::borrow_ownership::a5_overlap::{C9MarkKey, PairSide};
+use crate::analyses::borrow_ownership::param_overlap::{CopyMarkKey, PairSide};
 
 pub(crate) fn render_marked_call(
-    mark: &C9MarkKey,
+    mark: &CopyMarkKey,
     callee: &str,
     arguments: &[String],
 ) -> Result<String, String> {
@@ -34,7 +34,7 @@ pub(crate) fn render_marked_call(
     ))
 }
 
-pub(crate) fn render_marked_source(mark: &C9MarkKey, source: &str) -> Result<String, String> {
+pub(crate) fn render_marked_source(mark: &CopyMarkKey, source: &str) -> Result<String, String> {
     let (open, close) = argument_list(source, "C-9")?;
     let callee = source[..open].trim();
     if callee.is_empty() {
@@ -320,12 +320,12 @@ fn split_arguments(source: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::analyses::borrow_ownership::{
-        a5_overlap::{C9MarkKey, PairSide},
-        l2::{MirLocationKey, SlotKey},
+        guarded_repair::{MirLocationKey, SlotKey},
+        param_overlap::{CopyMarkKey, PairSide},
     };
 
-    fn mark() -> C9MarkKey {
-        C9MarkKey::new(
+    fn mark() -> CopyMarkKey {
+        CopyMarkKey::new(
             1,
             MirLocationKey::new(4, 2),
             [2],

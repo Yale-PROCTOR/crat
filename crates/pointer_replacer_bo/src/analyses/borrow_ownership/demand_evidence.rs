@@ -2,7 +2,7 @@
 
 use super::{
     crate_slots::CrateSlots,
-    export::{BoundaryRole, ProjKey, T2AssertKey},
+    export::{BoundaryRole, EndpointRetractionKey, ProjKey},
     realloc::ReallocOutcome,
 };
 use crate::utils::rustc::RustProgram;
@@ -124,7 +124,7 @@ pub(crate) struct DemandEvidence {
 pub(crate) fn begin_construction(
     program: &RustProgram<'_>,
     _slots: &CrateSlots,
-    keys: &[T2AssertKey],
+    keys: &[EndpointRetractionKey],
 ) -> Option<ConstructionId> {
     let mut id = None;
     super::export::record(|output| {
@@ -162,7 +162,7 @@ pub(crate) fn begin_construction(
     id
 }
 
-fn source_operand(program: &RustProgram<'_>, key: &T2AssertKey) -> OperandIdentity {
+fn source_operand(program: &RustProgram<'_>, key: &EndpointRetractionKey) -> OperandIdentity {
     use rustc_middle::mir::{BasicBlock, Operand};
 
     use super::export::PlaceKey;

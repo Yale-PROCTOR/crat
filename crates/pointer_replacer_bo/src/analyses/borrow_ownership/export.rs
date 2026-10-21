@@ -57,7 +57,7 @@ use rustc_index::IndexVec;
 use rustc_middle::mir::{Local, Location, Place};
 use z3::ast::Bool;
 
-use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
+use super::{guarded_repair::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
 
 // ---------------------------------------------------------------------------
 // Flag gating — resolve once, fail loud, default off
@@ -269,7 +269,7 @@ pub(crate) struct LoanKey {
 
 impl LoanKey {
     /// Total order over primitives. `LocalDefId` is projected through
-    /// `local_def_index.as_u32()`, the idiom `l2::StableLoanKey` already uses.
+    /// `local_def_index.as_u32()`, the idiom `guarded_repair::StableLoanKey` already uses.
     fn ord_key(&self) -> (u32, &Local, &Vec<ProjKey>, MirLocationKey, BorrowerKind) {
         (
             self.fn_did.local_def_index.as_u32(),
@@ -392,7 +392,7 @@ pub(crate) enum BoundaryRole {
 /// render `fn_did` through `TyCtxt::def_path_str`; the in-process key keeps the
 /// typed MIR/function identities used by construction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct T2AssertKey {
+pub(crate) struct EndpointRetractionKey {
     pub(crate) fn_did: LocalDefId,
     pub(crate) function_path: String,
     pub(crate) location: MirLocationKey,
@@ -403,7 +403,7 @@ pub(crate) struct T2AssertKey {
     pub(crate) endpoint: Option<PlaceKey>,
 }
 
-impl T2AssertKey {
+impl EndpointRetractionKey {
     pub(crate) fn sort_key(
         &self,
     ) -> (
@@ -882,11 +882,14 @@ pub(crate) fn current_call_site() -> Option<CallSite> {
 /// Join the always-scoped call cursor into the key used by T2 construction.
 /// Unlike `record_selector`, this is normative construction input and
 /// therefore remains available when export capture is off.
-pub(crate) fn current_t2_assert_key(role: BoundaryRole, var: Var) -> T2AssertKey {
+pub(crate) fn current_endpoint_retraction_key(
+    role: BoundaryRole,
+    var: Var,
+) -> EndpointRetractionKey {
     let call = current_call_site().unwrap_or_else(|| {
         panic!("T2 endpoint assertion emitted outside a modeled call-site cursor")
     });
-    T2AssertKey {
+    EndpointRetractionKey {
         fn_did: call.fn_did,
         function_path: call.function_path,
         location: call.location,

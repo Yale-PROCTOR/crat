@@ -19,7 +19,7 @@ use crate::{
         coherence::positive_opaque_return_slots,
         construction::pure_modeled_return_origin,
         crate_slots::{CrateSlots, ptr_chain_depth},
-        l2::SlotKey,
+        guarded_repair::SlotKey,
         origin_summary::SignatureRoot,
         origins::compute_origins,
         resolve::{ResolvedSlot, resolve_place},

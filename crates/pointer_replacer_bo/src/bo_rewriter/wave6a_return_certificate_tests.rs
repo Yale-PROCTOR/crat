@@ -2876,7 +2876,7 @@ fn w6a_r583_field_moves_follow_the_current_delivery() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

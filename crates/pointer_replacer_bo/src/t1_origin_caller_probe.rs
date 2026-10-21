@@ -15,16 +15,16 @@ use rustc_middle::{
 
 use crate::{
     analyses::borrow_ownership::{
-        a5_overlap::WholeProgramAttestation,
-        a5_producer::{ClosedWorldCallWorld, resolve_closed_world_call_world},
         boundary_table,
         construction::{CopyLendMode, construct_bo_into},
         crate_slots::CrateSlots,
         export::with_bo_export,
-        l2::SlotKey,
+        guarded_repair::SlotKey,
         mutability_facts::MutFacts,
         origin_flow::OriginFlowResults,
         origin_summary::OriginSummaries,
+        overlap_producer::{ClosedWorldCallWorld, resolve_closed_world_call_world},
+        param_overlap::WholeProgramAttestation,
         resolve::{ResolvedSlot, resolve_place},
         slots::SlotOwner,
         solver::{KindSolver, SlotRef},
@@ -279,7 +279,7 @@ fn resolved_actual_slot(
 #[derive(Clone, Debug)]
 struct SinkEndpoint {
     function: rustc_span::def_id::LocalDefId,
-    location: crate::analyses::borrow_ownership::l2::MirLocationKey,
+    location: crate::analyses::borrow_ownership::guarded_repair::MirLocationKey,
     callee: String,
     operand_local: Local,
     chain: Vec<Local>,
@@ -1509,7 +1509,7 @@ impl<'a, 'tcx> SlotClassifier<'a, 'tcx> {
         argument: usize,
     ) -> Vec<(
         rustc_span::def_id::LocalDefId,
-        crate::analyses::borrow_ownership::l2::MirLocationKey,
+        crate::analyses::borrow_ownership::guarded_repair::MirLocationKey,
         Option<SlotRef>,
     )> {
         let mut rows = Vec::new();
@@ -1531,7 +1531,7 @@ impl<'a, 'tcx> SlotClassifier<'a, 'tcx> {
             });
             rows.push((
                 caller,
-                crate::analyses::borrow_ownership::l2::MirLocationKey::new(
+                crate::analyses::borrow_ownership::guarded_repair::MirLocationKey::new(
                     block.as_u32(),
                     body.basic_blocks[block].statements.len(),
                 ),

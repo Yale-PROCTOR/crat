@@ -3251,7 +3251,7 @@ fn move_callee_into(rendered: &mut rustc_ast::Expr, callee: P<rustc_ast::Expr>) 
 struct C9GraftVisitor<'a> {
     marks: &'a FxHashMap<
         (u32, u32),
-        &'a crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark,
+        &'a crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark,
     >,
     guard: &'a mut Composition,
     consumed: FxHashSet<(u32, u32)>,
@@ -11357,9 +11357,9 @@ mod graft_floor_tests {
         use rustc_span::{BytePos, Span, SyntaxContext};
 
         use crate::analyses::borrow_ownership::{
-            a5_overlap::{C9MarkKey, PairSide},
-            a5_producer::PlannedC9Mark,
-            l2::{MirLocationKey, SlotKey},
+            guarded_repair::{MirLocationKey, SlotKey},
+            overlap_producer::PlannedCopyMark,
+            param_overlap::{CopyMarkKey, PairSide},
         };
 
         let slot = |slot| SlotKey {
@@ -11370,7 +11370,7 @@ mod graft_floor_tests {
         // The same shape `c9::tests::mark()` builds: the shared side is the
         // RIGHT formal, param 2, so the rendering rewrites argument index 1 and
         // a two-argument call is within arity.
-        let key = C9MarkKey::new(
+        let key = CopyMarkKey::new(
             1,
             MirLocationKey::new(4, 2),
             [2],
@@ -11384,7 +11384,7 @@ mod graft_floor_tests {
         )
         .expect("the pair key is well-formed");
         let span = Span::new(BytePos(10), BytePos(20), SyntaxContext::root(), None);
-        let mark = PlannedC9Mark {
+        let mark = PlannedCopyMark {
             key,
             endpoint_slots: std::collections::BTreeSet::new(),
             call_span: span,
@@ -11392,7 +11392,7 @@ mod graft_floor_tests {
             owner_did: rustc_hir::def_id::CRATE_DEF_ID,
             owner_fn: "fixture".to_owned(),
         };
-        let marks: FxHashMap<(u32, u32), &PlannedC9Mark> =
+        let marks: FxHashMap<(u32, u32), &PlannedCopyMark> =
             [((10u32, 20u32), &mark)].into_iter().collect();
 
         let drive = |contested: bool| {

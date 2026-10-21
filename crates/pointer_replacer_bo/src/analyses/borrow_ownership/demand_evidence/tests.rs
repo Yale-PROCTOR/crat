@@ -26,7 +26,7 @@ use crate::{
 struct Run {
     model: FxHashMap<SlotRef, SlotKind>,
     stats: BoOwnEmissionStats,
-    keys: Vec<T2AssertKey>,
+    keys: Vec<EndpointRetractionKey>,
     trace: SelectorTrace,
 }
 
@@ -311,7 +311,7 @@ fn e5_h_opaque_old_realloc_preserves_exact_mixed_cores_and_restoration() {
             .find(|endpoint| endpoint.key.role == BoundaryRole::Sink)
             .unwrap();
         assert_eq!(sink.key.realloc_outcome, Some(ReallocOutcome::Success));
-        let labels: BTreeSet<_> = run.keys.iter().map(T2AssertKey::label).collect();
+        let labels: BTreeSet<_> = run.keys.iter().map(EndpointRetractionKey::label).collect();
         let epoch = run.trace.epochs.last().expect("actual selector epoch");
         for (phase, expected_phase, outcome) in [
             (

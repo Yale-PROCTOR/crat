@@ -10,8 +10,8 @@ use std::{
 
 use super::{
     super::{
-        a5_overlap::WholeProgramAttestation, crate_slots::CrateSlots,
-        ownership_access::PlaceSyntax, ownership_evidence::Point,
+        crate_slots::CrateSlots, ownership_access::PlaceSyntax, ownership_evidence::Point,
+        param_overlap::WholeProgramAttestation,
     },
     facts::{EquationId, Facts},
     matched::{CallKey, SourceInstance},
@@ -383,7 +383,7 @@ mod tests {
     use super::{
         super::{
             super::{
-                construction::construct_bo_into_a16_refined, execution_guard,
+                construction::construct_bo_into_return_refined, execution_guard,
                 mutability_facts::MutFacts, origins::compute_origins, solver::KindSolver,
             },
             ref_effects,
@@ -454,7 +454,7 @@ pub unsafe fn f() -> i32 {
             let mutability = MutFacts::from_program(&program);
             let solver = KindSolver::new(&slots);
             let model_entries = execution_guard::model_entries();
-            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver)
+            construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver)
                 .unwrap();
             let facts = solver.ownership_facts().unwrap();
             check(&program, &slots, &facts);

@@ -2604,7 +2604,7 @@ mod tests {
 
         let solver = KindSolver::new(&slots);
         solver.assume(peer, SlotKind::Ref);
-        solver.add_l2_commit(&action);
+        solver.add_guarded_commit(&action);
         let model = solver.model_kinds().expect("guarded L2 model");
         assert_eq!(model.get(&peer), Some(&SlotKind::Ref));
         assert_ne!(
@@ -2614,7 +2614,7 @@ mod tests {
         );
 
         let tracked = KindSolver::new_tracked(&slots);
-        tracked.add_l2_commit(&action);
+        tracked.add_guarded_commit(&action);
         let tracker = tracked.tracker().expect("tracked L2 solver");
         assert!(
             tracker

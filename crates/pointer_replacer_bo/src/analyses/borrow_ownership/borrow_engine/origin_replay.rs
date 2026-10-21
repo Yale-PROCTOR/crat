@@ -361,7 +361,7 @@ mod reader_root_tests {
     use crate::analyses::{
         borrow::ProvenanceData,
         borrow_ownership::{
-            construction::construct_bo_into_a16_refined,
+            construction::construct_bo_into_return_refined,
             crate_slots::CrateSlots,
             licensing::reader_replay,
             mutability_facts::MutFacts,
@@ -406,7 +406,7 @@ pub unsafe fn f() -> i32 {
             let origins = compute_origins(&program);
             let mutability = MutFacts::from_program(&program);
             let solver = KindSolver::new(&slots);
-            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
+            construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
             let facts = solver.ownership_facts().unwrap();
             let effects = &facts.licensing.as_ref().unwrap().reference_effects.candidates;
             assert_eq!(effects.len(), 1, "unchanged IFL3 reference-effect candidate");
@@ -498,7 +498,7 @@ pub unsafe fn peek(_a: &H, b: &H) -> i32 { let view = b.ptr; *view }
             let origins = compute_origins(&program);
             let mutability = MutFacts::from_program(&program);
             let solver = KindSolver::new(&slots);
-            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
+            construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver).unwrap();
             let facts = solver.ownership_facts().expect("actual reader construction");
             let proofs = &facts.licensing.as_ref().unwrap().reader_transfers;
             assert_eq!(proofs.len(), 1);
@@ -568,7 +568,7 @@ mod copy_lend_identity_tests {
                 crate_slots::CrateSlots,
                 esc_minimal::with_fixture_selection,
                 export::{BorrowerKind, OwnerKey, PlaceKey},
-                l2::MirLocationKey,
+                guarded_repair::MirLocationKey,
                 origin_flow::analyze_program_origin_flow,
             },
         },

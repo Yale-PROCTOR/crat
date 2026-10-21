@@ -139,9 +139,9 @@ mod tests {
 
     use super::{
         super::super::{
-            SlotKind, a5_overlap::WholeProgramAttestation, coherence,
-            construction::construct_bo_into_a16_refined, crate_slots::CrateSlots, export,
-            mutability_facts::MutFacts, origins::compute_origins, solver::KindSolver,
+            SlotKind, coherence, construction::construct_bo_into_return_refined,
+            crate_slots::CrateSlots, export, mutability_facts::MutFacts, origins::compute_origins,
+            param_overlap::WholeProgramAttestation, solver::KindSolver,
         },
         *,
     };
@@ -179,7 +179,7 @@ pub unsafe fn f(){let owner=calloc(1,4) as *mut i32;let mut cell=Cell{ptr:0 as *
             assert!(!export::capturing(), "selection must not need BoExport");
             let solver = KindSolver::new(&slots);
             let (construction, _) =
-                construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver)
+                construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver)
                     .unwrap();
             coherence::constrain_field_ownership(&solver, &slots, &program);
             let facts = solver.ownership_facts().unwrap();

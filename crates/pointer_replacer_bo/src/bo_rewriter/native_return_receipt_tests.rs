@@ -63,7 +63,7 @@ fn native_return_receipts_inventory_both_null_and_parameter_branches() {
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original native-return capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary native-return fixture pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("NATIVE-RETURN-J27 solve={solve:#?}\nINPUT:\n{INPUT}");
@@ -100,7 +100,7 @@ fn native_return_receipts_inventory_both_null_and_parameter_branches() {
         assert_eq!(sites.len(), 2, "exact null and parameter return-site inventory");
         let mut hir = ExactExpressions { spans: sites.iter().map(|site| site.span).collect(), expressions: Vec::new() };
         hir.visit_expr(tcx.hir_body_owned_by(p.fn_did).value);
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual native-return emission plan");
         let owner = SignatureClassId::of(p.fn_did);
         assert!(emission.plan.class_finalization.classes[&owner].is_ready());

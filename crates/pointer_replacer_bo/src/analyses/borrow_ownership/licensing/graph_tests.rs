@@ -5,7 +5,7 @@ use rustc_hir::{ItemKind, OwnerNode};
 
 use super::{
     super::{
-        construction::{CopyLendMode, construct_bo_into, construct_bo_into_a16_refined},
+        construction::{CopyLendMode, construct_bo_into, construct_bo_into_return_refined},
         crate_slots::CrateSlots,
         execution_guard, export,
         mutability_facts::MutFacts,
@@ -71,7 +71,7 @@ fn with_solver_facts_mode(
         assert!(!export::capturing());
         let solver = KindSolver::new(&slots);
         if mode == CopyLendMode::Baseline {
-            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver)
+            construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver)
                 .unwrap();
         } else {
             construct_bo_into(&program, &slots, &origins, &mutability, &solver, mode).unwrap();

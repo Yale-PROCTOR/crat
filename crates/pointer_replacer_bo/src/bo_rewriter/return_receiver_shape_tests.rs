@@ -60,7 +60,7 @@ fn check(shape: ReceiverShape) {
     let emitted = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original receiver-shape AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual receiver-shape decision call");
         let solve = super::model_cache::solve_receipt();
@@ -105,7 +105,7 @@ fn check(shape: ReceiverShape) {
         assert!(origins.body.depth0_value_flows().contains(&(
             SlotOwner::Local(parameter.local), SlotOwner::Local(RETURN_PLACE))));
         let permit = ctx.lifetime_eligibility.return_permit((parameter.fn_did, parameter.hir_id));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual receiver-shape emission plan");
         let caller = SignatureClassId::of(receiver.fn_did);
         let callee_owner = SignatureClassId::of(parameter.fn_did);
@@ -263,7 +263,7 @@ fn check_caller_reversion(shape: ReceiverShape) {
         ::utils::compilation::run_compiler_on_str(&source, |tcx| {
             let capture = super::ast_transform::capture_ast(tcx).expect("one original receiver-reversion capture");
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             ))).expect("one actual receiver-reversion decision call");
             let solve = super::model_cache::solve_receipt();
@@ -292,7 +292,7 @@ fn check_caller_reversion(shape: ReceiverShape) {
             });
             let caller = SignatureClassId::of(subject.fn_did);
             let callee = SignatureClassId::of(receiver.callee);
-            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans).unwrap();
+            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans).unwrap();
             assert!(emission.plan.class_finalization.classes[&caller].is_ready());
             assert!(emission.plan.class_finalization.classes[&callee].is_ready());
             let held = emission.plan.held_classes();

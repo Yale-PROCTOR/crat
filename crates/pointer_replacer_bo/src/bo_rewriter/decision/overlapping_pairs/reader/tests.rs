@@ -5,7 +5,7 @@ use rustc_middle::{
 
 use super::{Hold, Request, prove, replay};
 use crate::{
-    analyses::borrow_ownership::l2::MirLocationKey,
+    analyses::borrow_ownership::guarded_repair::MirLocationKey,
     bo_rewriter::decision::a5_site_proof::{A5ProofSiteKey, ATTESTED_GUARD, ATTESTED_WORLD},
 };
 

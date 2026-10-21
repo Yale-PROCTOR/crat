@@ -21,7 +21,7 @@
 use std::sync::OnceLock;
 
 use super::{
-    A5Mode, RewriteOutcome, WholeProgramAttestation,
+    OverlapMode, RewriteOutcome, WholeProgramAttestation,
     decision::{DegradeReason, lifetime::LifetimeFailure},
 };
 
@@ -93,7 +93,7 @@ fn observe(source: &str) -> Observed {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -162,7 +162,7 @@ fn emitted(name: &str, source: &str, exposed: &[&str]) -> RewriteOutcome {
     .unwrap();
     let outcome = super::rewrite_m1_path_with_emission_config(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &super::EmissionRunConfig {
             configured_exposure,

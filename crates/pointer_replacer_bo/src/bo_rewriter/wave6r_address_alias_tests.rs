@@ -112,7 +112,7 @@ fn wave6r_address_handed_to_an_unmodeled_foreign_callee_is_refused_by_the_scan()
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -154,7 +154,7 @@ fn chain_rows(input: &str) -> Vec<String> {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -205,7 +205,7 @@ fn wave6r_raw_subject_delivers_the_read_through_address() {
             let (_, ctx) = super::super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::super::A5Mode::PreciseReplay,
+                    super::super::OverlapMode::PreciseReplay,
                     Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -242,7 +242,7 @@ fn wave6r_child_access_receipt_names_the_outcome_and_the_reason() {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -343,7 +343,7 @@ fn wave6r_urlparser_get_part_chain_is_descendant_free() {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -388,7 +388,7 @@ fn wave6r_offset_from_is_a_known_no_retain_read() {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

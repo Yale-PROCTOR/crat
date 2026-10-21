@@ -78,7 +78,7 @@ fn emitted(source: &str, tag: &str) -> (String, usize) {
     // The census's A5 configuration (precise replay over the frozen graph).
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        super::A5Mode::PreciseReplay,
+        super::OverlapMode::PreciseReplay,
         Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );
@@ -264,7 +264,7 @@ fn r761_2_a_raw_twin_position_with_nothing_to_bridge_issues_no_a5_receipt() {
         true,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
         &config,

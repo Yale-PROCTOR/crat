@@ -154,7 +154,7 @@ fn wave6k_structural_pairs_are_never_narrowed() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

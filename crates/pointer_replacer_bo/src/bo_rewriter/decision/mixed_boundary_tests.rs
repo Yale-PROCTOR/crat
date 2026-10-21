@@ -127,7 +127,7 @@ fn census_world_decisions(input: &str) -> Vec<(String, super::Decision)> {
         crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

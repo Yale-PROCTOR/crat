@@ -3,7 +3,7 @@
 use rustc_hir::{ItemKind, OwnerNode};
 
 use super::super::{
-    borrow_verify::{RepairMode, with_mode_a_commit_trace},
+    borrow_verify::{RepairMode, with_plain_commit_trace},
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
     export,
@@ -53,8 +53,8 @@ pub unsafe fn release() {
             let run = || {
                 with_ownership_model_observation(|| {
                     with_selector_trace(|| {
-                        with_mode_a_commit_trace(|| {
-                            RepairMode::with_override(RepairMode::ModeA, || {
+                        with_plain_commit_trace(|| {
+                            RepairMode::with_override(RepairMode::Plain, || {
                                 let solver = KindSolver::new(&slots);
                                 let construction = construct_bo_into(
                                     &program,

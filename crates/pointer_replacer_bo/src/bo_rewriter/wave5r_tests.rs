@@ -41,7 +41,7 @@ fn wave5r_e0606_counted_foreign_read_stays_raw_without_extent() {
         false,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -134,7 +134,7 @@ fn ast_source_reverting(input: &str, reverted_function: Option<&str>) -> String 
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -142,8 +142,9 @@ fn ast_source_reverting(input: &str, reverted_function: Option<&str>) -> String 
         for (subject, decision) in &table.entries {
             println!("DECISION {} {decision:?}", subject.label);
         }
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
-            .expect("native emission plan");
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("native emission plan");
         let mut held = emission.plan.held_classes();
         if let Some(name) = reverted_function {
             let owner = tcx

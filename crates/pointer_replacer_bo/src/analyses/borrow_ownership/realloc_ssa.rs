@@ -683,7 +683,7 @@ pub(crate) fn constrain_coverage_holds<'tcx>(
         }
         let targets = seen
             .into_iter()
-            .map(|slot| (super::l2::SlotKey::of(slot), slot))
+            .map(|slot| (super::guarded_repair::SlotKey::of(slot), slot))
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect::<Vec<_>>();

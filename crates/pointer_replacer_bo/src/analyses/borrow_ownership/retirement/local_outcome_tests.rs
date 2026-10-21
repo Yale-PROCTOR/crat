@@ -5,15 +5,16 @@ use rustc_middle::mir::VarDebugInfoContents;
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::{A5Mode, WholeProgramAttestation},
         construction::{
-            CopyLendMode, TestValidationBackend, construct_bo_into, solve_bo_a5_config_reporting,
-            verify_bo_construction_counting_for_test, verify_bo_construction_l2_for_test,
+            CopyLendMode, TestValidationBackend, construct_bo_into,
+            solve_bo_overlap_config_reporting, verify_bo_construction_counting_for_test,
+            verify_bo_construction_l2_for_test,
         },
         crate_slots::CrateSlots,
         export,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
         portable_export,
         solver::{KindSolver, SlotRef},
     },
@@ -52,12 +53,12 @@ fn e5_r245_full_draw_foreign_address_carriers_keep_model() {
         let origins = compute_origins(program);
         let facts = MutFacts::from_program(program);
         let (result, capture) = export::with_bo_export(|| {
-            solve_bo_a5_config_reporting(
+            solve_bo_overlap_config_reporting(
                 program,
                 &slots,
                 &origins,
                 &facts,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
         });
@@ -239,12 +240,12 @@ fn e5_r245_multiple_realloc_branch_sites_hold_locally() {
         let origins = compute_origins(program);
         let facts = MutFacts::from_program(program);
         let (model, capture) = export::with_bo_export(|| {
-            solve_bo_a5_config_reporting(
+            solve_bo_overlap_config_reporting(
                 program,
                 &slots,
                 &origins,
                 &facts,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
         });
@@ -268,12 +269,12 @@ fn e5_r245_zero_size_realloc_site_holds_without_program_decline() {
             let origins = compute_origins(program);
             let facts = MutFacts::from_program(program);
             let (model, capture) = export::with_bo_export(|| {
-                solve_bo_a5_config_reporting(
+                solve_bo_overlap_config_reporting(
                     program,
                     &slots,
                     &origins,
                     &facts,
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )
             });
@@ -329,7 +330,7 @@ fn e5_r253_empty_realloc_inventory_fails_closed() {
 #[test]
 fn e5_r253_l2_coverage_propagates_planner_decline_before_commit() {
     use crate::analyses::borrow_ownership::{
-        borrow_verify::coverage_planner_fault, l2::DeclineReason,
+        borrow_verify::coverage_planner_fault, guarded_repair::DeclineReason,
     };
     // R343-1: the inner value is RETURNED, so it leaves the frame and the holder
     // is `Unrepresented(Escaped)` -- which keeps the copy-chain demotion this
@@ -363,7 +364,10 @@ fn e5_r253_l2_coverage_propagates_planner_decline_before_commit() {
             )
         });
         assert!(model.is_none());
-        assert_eq!(stats.l2_decline, Some(DeclineReason::ArithmeticOverflow));
+        assert_eq!(
+            stats.guarded_decline,
+            Some(DeclineReason::ArithmeticOverflow)
+        );
         assert_eq!(
             stats.rounds, 1,
             "a planner decline ends this validation immediately"

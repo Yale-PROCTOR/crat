@@ -23,14 +23,15 @@ use super::{
     SlotKind,
     coherence::{CopyLendPair, SelectedCopyLendLoans, selected_copy_lend_sites},
     crate_slots::CrateSlots,
-    l2::{
-        ConflictObservation, DeclineReason as L2DeclineReason, Planner, RoundPlan as L2RoundPlan,
-        SolverDecline as L2SolverDecline, SolverOutcome as L2SolverOutcome, StableLoanKey,
+    guarded_repair::{
+        ConflictObservation, DeclineReason as GuardedDeclineReason, Planner,
+        RoundPlan as GuardedRoundPlan, SolverDecline as GuardedSolverDecline,
+        SolverOutcome as GuardedSolverOutcome, StableLoanKey,
     },
     mutability_facts::MutProvider,
     origin_flow::OriginFlowResults,
     slots::{SlotId, SlotOwner},
-    solver::{HardLoopSolver, KindSolver, L2SolveResult, Selectors, SlotRef},
+    solver::{GuardedSolveResult, HardLoopSolver, KindSolver, Selectors, SlotRef},
 };
 use crate::{
     analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
@@ -46,23 +47,23 @@ thread_local! {
 
 /// §NB5-L — the repair strategy the CEGAR loop uses to discharge a residual borrow conflict.
 ///
-/// - `ModeA`: commit one `¬ref(representative)` per residual edge — monotone, permanent (the shipped
+/// - `Plain`: commit one `¬ref(representative)` per residual edge — monotone, permanent (the shipped
 ///   loop through NB5-F2).
 /// - `Lemmas` (MVP): emit `⋁¬ref(A′-menu)` per residual edge — an **empty-context, A′-restricted
-///   disjunctive lemma** (`¬ref`-only, invariant 7). It does NOT dominate `ModeA`: the hoped upside
+///   disjunctive lemma** (`¬ref`-only, invariant 7). It does NOT dominate `Plain`: the hoped upside
 ///   (spare a "sparable" requirer) never arises because A′ excludes the only sparable slot (the
 ///   write-issuer); the disjunction's freedom to pick a NON-minimal menu member instead becomes a
 ///   *downside*. The two modes are **incomparable in general** (the loop is non-confluent — different
 ///   commit strategies induce different lemma sets and different optima); on tested fixtures
 ///   `Ref(lemmas) ⊆ Ref(mode_a)` and on a high-arity fan-out strictly ⊊ (Lemmas loses ≥1 Ref). So the
-///   disjunction axis is dead; `ModeA` is the shipped default and the demotion-choice mechanism.
+///   disjunction axis is dead; `Plain` is the shipped default and the demotion-choice mechanism.
 ///
 /// The active repair is `Guarded`; a thread-local `with_override` selects another for one scope (the
 /// differential harnesses). A uniform strategy toggle, constant within an override scope — no
 /// path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RepairMode {
-    ModeA,
+    Plain,
     /// R617-1 (era-5c 082, approved R631-7): the guarded planner's clauses in
     /// Mode-A's loop, at the point where Mode-A commits. Everything around the
     /// commits is Mode-A's. A decline falls back to Mode-A for the program
@@ -79,7 +80,7 @@ impl Default for RepairMode {
 impl RepairMode {
     /// Default until the gate flips it on the S7 differential (NB5-L rider 2). `RoundStats` derives
     /// `Default`, so this is also the mode a default-constructed stats block reports.
-    pub(crate) const DEFAULT: Self = RepairMode::ModeA;
+    pub(crate) const DEFAULT: Self = RepairMode::Plain;
 
     /// The active mode: the thread-local override, else `Guarded`.
     pub(crate) fn current() -> Self {
@@ -92,7 +93,7 @@ impl RepairMode {
     #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
-            RepairMode::ModeA => "mode_a",
+            RepairMode::Plain => "mode_a",
             RepairMode::Guarded => "guarded",
         }
     }
@@ -122,12 +123,12 @@ thread_local! {
     static AUDIT_CAPTURE: RefCell<Option<Vec<(SlotRef, usize)>>> = const { RefCell::new(None) };
     /// Diagnosis-only detailed origin for each Mode-A commit. Kept separate
     /// from the frozen necessity-audit tuple surface.
-    static SELECTOR_CORE_COMMIT_CAPTURE: RefCell<Option<Vec<ModeACommitTrace>>> =
+    static SELECTOR_CORE_COMMIT_CAPTURE: RefCell<Option<Vec<PlainCommitTrace>>> =
         const { RefCell::new(None) };
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ModeACommitTrace {
+pub(crate) struct PlainCommitTrace {
     #[cfg(test)]
     pub target: SlotRef,
     #[cfg(test)]
@@ -161,8 +162,8 @@ pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)
 /// conflict edge for the second-order attribution of any tracked
 /// `borrow-exclusion` core member.
 #[cfg(test)]
-pub(crate) fn with_mode_a_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<ModeACommitTrace>) {
-    struct Restore(Option<Vec<ModeACommitTrace>>);
+pub(crate) fn with_plain_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<PlainCommitTrace>) {
+    struct Restore(Option<Vec<PlainCommitTrace>>);
     impl Drop for Restore {
         fn drop(&mut self) {
             SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| {
@@ -789,17 +790,17 @@ pub(crate) struct RoundStats {
     pub field_conflict_kind: Option<SlotKind>,
     /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
     /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so the S7
-    /// differential is never mode-ambiguous. Defaults to `ModeA` (= `RepairMode::DEFAULT`).
+    /// differential is never mode-ambiguous. Defaults to `Plain` (= `RepairMode::DEFAULT`).
     pub repair: RepairMode,
     /// §NB5-L (Codex MEDIUM) — set when the loop declined because the `Lemmas` round cap was exhausted
     /// (the controlled backstop for a hypothetical subset-oscillation blowup, which does not manifest
     /// empirically). A distinct decline KIND: `bo_c1` must tag it before `decline_reason`, which would
     /// otherwise mislabel this relaxed-SAT decline as `sat-in-replay` and hide the cap exhaustion. Never
-    /// set under `ModeA` (that path panics — its linear bound is proven).
+    /// set under `Plain` (that path panics — its linear bound is proven).
     pub cap_exhausted: bool,
     /// L2 feature-on controlled decline. The legacy feature-off Mode-A and
     /// Lemmas paths leave this unset.
-    pub l2_decline: Option<L2DeclineReason>,
+    pub guarded_decline: Option<GuardedDeclineReason>,
     /// Typed source-retirement coverage failure, separate from solver outcome.
     pub source_retirement_decline: Vec<super::retirement::RetirementUnresolved>,
     /// R617-1 STOP 2 (R631-7): set when a `Guarded` run declined and the program
@@ -819,7 +820,7 @@ pub(crate) struct GuardedFallback {
 
 impl GuardedFallback {
     fn of(stats: &RoundStats) -> Self {
-        let reason = if let Some(reason) = &stats.l2_decline {
+        let reason = if let Some(reason) = &stats.guarded_decline {
             reason
                 .diagnostic_label(stats.rounds)
                 .rsplit_once("reason=")
@@ -946,16 +947,16 @@ fn solve_round_model(
     }
 }
 
-fn solve_l2_round_model(
+fn solve_guarded_round_model(
     solver: &KindSolver,
     selectors: &Selectors,
     backend: LoopBackend,
     hard: Option<&HardLoopSolver>,
-) -> L2SolveResult {
+) -> GuardedSolveResult {
     match backend {
         #[cfg(test)]
-        LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting_l2(selectors),
-        LoopBackend::HardCheckRoundOptimize => solver.model_kinds_decomposed_reporting_l2(
+        LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting_guarded(selectors),
+        LoopBackend::HardCheckRoundOptimize => solver.model_kinds_decomposed_reporting_guarded(
             hard.expect("R1a L2 validation owns a hard checker"),
             selectors,
         ),
@@ -975,12 +976,12 @@ fn solve_round(
     if planner.is_none() {
         return solve_round_model(solver, selectors, backend, hard);
     }
-    let decline = match solve_l2_round_model(solver, selectors, backend, hard) {
-        L2SolveResult::Sat { kinds, dropped } => return Some((kinds, dropped)),
-        L2SolveResult::Unsat => L2SolverDecline::Unsat,
-        L2SolveResult::Unknown => L2SolverDecline::Unknown,
+    let decline = match solve_guarded_round_model(solver, selectors, backend, hard) {
+        GuardedSolveResult::Sat { kinds, dropped } => return Some((kinds, dropped)),
+        GuardedSolveResult::Unsat => GuardedSolverDecline::Unsat,
+        GuardedSolveResult::Unknown => GuardedSolverDecline::Unknown,
     };
-    record_l2_decline(stats, L2DeclineReason::Solver(decline));
+    record_guarded_decline(stats, GuardedDeclineReason::Solver(decline));
     None
 }
 
@@ -1104,7 +1105,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     }
     solver.pop_scope();
     let fallback = GuardedFallback::of(&guarded);
-    let (model, mut stats) = rounds(RepairMode::ModeA);
+    let (model, mut stats) = rounds(RepairMode::Plain);
     stats.repair = RepairMode::Guarded;
     stats.guarded_fallback = Some(fallback);
     (model, stats)
@@ -1398,7 +1399,7 @@ fn verify_rounds(
             // iteration is deterministic, but the inner `Vec<ConflictEdge>` follows loan-index order,
             // and loan numbering is not stable (D19). Mode-A is now sorted for the same reason the
             // Lemmas arm always was; the asymmetry is gone.
-            RepairMode::ModeA => {
+            RepairMode::Plain => {
                 // §3/R4 (D19): the inner `Vec<ConflictEdge>` follows loan-INDEX
                 // order, and loan numbering permutes between runs and between
                 // CEGAR rounds (`utils/dsa/union_find.rs` hashes with
@@ -1435,7 +1436,7 @@ fn verify_rounds(
                         });
                         SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| {
                             if let Some(events) = capture.borrow_mut().as_mut() {
-                                events.push(ModeACommitTrace {
+                                events.push(PlainCommitTrace {
                                     #[cfg(test)]
                                     target: slot,
                                     #[cfg(test)]
@@ -1465,14 +1466,14 @@ fn verify_rounds(
                     witnessed,
                     &model,
                 );
-                match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
-                    L2RoundPlan::Accept { validation_round } => {
+                match planner.plan_round(GuardedSolverOutcome::Sat, &observations, &model) {
+                    GuardedRoundPlan::Accept { validation_round } => {
                         assert_eq!(
                             stats.rounds, validation_round,
                             "guarded planner/fixpoint validation-round counters diverged"
                         );
                     }
-                    L2RoundPlan::Continue {
+                    GuardedRoundPlan::Continue {
                         validation_round,
                         actions,
                     } => {
@@ -1481,12 +1482,12 @@ fn verify_rounds(
                             "guarded planner/fixpoint validation-round counters diverged"
                         );
                         for action in &actions {
-                            solver.add_l2_commit(action);
+                            solver.add_guarded_commit(action);
                             committed += 1;
                             stats.commits_conflict += 1;
                         }
                     }
-                    L2RoundPlan::Decline {
+                    GuardedRoundPlan::Decline {
                         validation_round,
                         reason,
                     } => {
@@ -1494,7 +1495,7 @@ fn verify_rounds(
                             stats.rounds, validation_round,
                             "guarded planner/fixpoint validation-round counters diverged"
                         );
-                        record_l2_decline(&mut stats, reason);
+                        record_guarded_decline(&mut stats, reason);
                         return (None, stats);
                     }
                 }
@@ -1551,7 +1552,7 @@ fn verify_rounds(
     // is always legal; the §8 guardrail keeps it harmless). This is exactly rider-1's "real
     // backstop": a rounds explosion becomes a decline the sweep surfaces, never a panic.
     match repair {
-        RepairMode::ModeA => panic!(
+        RepairMode::Plain => panic!(
             "Mode-A CEGAR did not converge within {cap} rounds — this violates the proven linear \
              bound (each round commits ≥1 fresh permanent ¬ref), so it is a genuine analysis bug."
         ),
@@ -1575,19 +1576,21 @@ fn planner_empty_round(
     let Some(planner) = planner else {
         return true;
     };
-    match planner.plan_round(L2SolverOutcome::Sat, &[], model) {
-        L2RoundPlan::Accept { validation_round } => {
+    match planner.plan_round(GuardedSolverOutcome::Sat, &[], model) {
+        GuardedRoundPlan::Accept { validation_round } => {
             assert_eq!(
                 stats.rounds, validation_round,
                 "guarded planner/fixpoint validation-round counters diverged"
             );
             true
         }
-        L2RoundPlan::Decline { reason, .. } => {
-            record_l2_decline(stats, reason);
+        GuardedRoundPlan::Decline { reason, .. } => {
+            record_guarded_decline(stats, reason);
             false
         }
-        L2RoundPlan::Continue { .. } => panic!("empty L2 observations produced commit actions"),
+        GuardedRoundPlan::Continue { .. } => {
+            panic!("empty L2 observations produced commit actions")
+        }
     }
 }
 
@@ -1674,15 +1677,15 @@ fn guarded_observations(
 ///   the only thing standing between a tracked solver and a meaningless model.
 ///   (The review finding that prompted this called the guard bypassed; that was
 ///   checked and is wrong.)
-/// - **`RepairMode::current() == ModeA` — INERT here.** This loop stamps
-///   `repair: RepairMode::ModeA` into its own stats and never reads
+/// - **`RepairMode::current() == Plain` — INERT here.** This loop stamps
+///   `repair: RepairMode::Plain` into its own stats and never reads
 ///   `RepairMode::current()`, so violating it changes nothing about what runs.
 ///   Documented for callers, not enforced.
 ///
 /// An earlier version of this doc named only the inert one, and called the
 /// other load-bearing.
 #[cfg(test)]
-pub(crate) fn verify_l2_to_fixpoint_counting(
+pub(crate) fn verify_guarded_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -1692,7 +1695,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
     escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    verify_l2_to_fixpoint_counting_impl(
+    verify_guarded_to_fixpoint_counting_impl(
         program,
         slots,
         origin_flows,
@@ -1706,7 +1709,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
 }
 
 #[cfg(test)]
-pub(super) fn verify_l2_to_fixpoint_counting_impl(
+pub(super) fn verify_guarded_to_fixpoint_counting_impl(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -1741,25 +1744,28 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     let hard =
         matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
     let mut stats = RoundStats {
-        repair: RepairMode::ModeA,
+        repair: RepairMode::Plain,
         ..RoundStats::default()
     };
 
-    let (mut model, dropped) = match solve_l2_round_model(solver, selectors, backend, hard.as_ref())
-    {
-        L2SolveResult::Sat { kinds, dropped } => (kinds, dropped),
-        L2SolveResult::Unsat => {
-            record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
-            return (None, stats);
-        }
-        L2SolveResult::Unknown => {
-            record_l2_decline(
-                &mut stats,
-                L2DeclineReason::Solver(L2SolverDecline::Unknown),
-            );
-            return (None, stats);
-        }
-    };
+    let (mut model, dropped) =
+        match solve_guarded_round_model(solver, selectors, backend, hard.as_ref()) {
+            GuardedSolveResult::Sat { kinds, dropped } => (kinds, dropped),
+            GuardedSolveResult::Unsat => {
+                record_guarded_decline(
+                    &mut stats,
+                    GuardedDeclineReason::Solver(GuardedSolverDecline::Unsat),
+                );
+                return (None, stats);
+            }
+            GuardedSolveResult::Unknown => {
+                record_guarded_decline(
+                    &mut stats,
+                    GuardedDeclineReason::Solver(GuardedSolverDecline::Unknown),
+                );
+                return (None, stats);
+            }
+        };
     record_dropped(&mut stats, selectors, &dropped);
 
     loop {
@@ -1807,18 +1813,18 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             if coverage_planner_fault::active() {
                 planner = Planner::new(usize::MAX);
             }
-            match planner.plan_round(L2SolverOutcome::Sat, &[], &model) {
-                L2RoundPlan::Accept { validation_round } => {
+            match planner.plan_round(GuardedSolverOutcome::Sat, &[], &model) {
+                GuardedRoundPlan::Accept { validation_round } => {
                     assert_eq!(
                         stats.rounds, validation_round,
                         "L2 coverage/planner validation counters diverged"
                     );
                 }
-                L2RoundPlan::Decline { reason, .. } => {
-                    record_l2_decline(&mut stats, reason);
+                GuardedRoundPlan::Decline { reason, .. } => {
+                    record_guarded_decline(&mut stats, reason);
                     return (None, stats);
                 }
-                L2RoundPlan::Continue { .. } => {
+                GuardedRoundPlan::Continue { .. } => {
                     panic!("empty L2 observations produced commit actions")
                 }
             }
@@ -1827,20 +1833,23 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             }
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
-            match solve_l2_round_model(solver, selectors, backend, hard.as_ref()) {
-                L2SolveResult::Sat { kinds, dropped } => {
+            match solve_guarded_round_model(solver, selectors, backend, hard.as_ref()) {
+                GuardedSolveResult::Sat { kinds, dropped } => {
                     model = kinds;
                     record_dropped(&mut stats, selectors, &dropped);
                     continue;
                 }
-                L2SolveResult::Unsat => {
-                    record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
+                GuardedSolveResult::Unsat => {
+                    record_guarded_decline(
+                        &mut stats,
+                        GuardedDeclineReason::Solver(GuardedSolverDecline::Unsat),
+                    );
                     return (None, stats);
                 }
-                L2SolveResult::Unknown => {
-                    record_l2_decline(
+                GuardedSolveResult::Unknown => {
+                    record_guarded_decline(
                         &mut stats,
-                        L2DeclineReason::Solver(L2SolverDecline::Unknown),
+                        GuardedDeclineReason::Solver(GuardedSolverDecline::Unknown),
                     );
                     return (None, stats);
                 }
@@ -1909,8 +1918,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             }
         }
 
-        let actions = match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
-            L2RoundPlan::Accept { validation_round } => {
+        let actions = match planner.plan_round(GuardedSolverOutcome::Sat, &observations, &model) {
+            GuardedRoundPlan::Accept { validation_round } => {
                 assert_eq!(
                     stats.rounds, validation_round,
                     "L2 planner/fixpoint validation-round counters diverged"
@@ -1919,7 +1928,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                 super::licensing::stack_export::accept(solver.ownership_facts());
                 return (Some(model), stats);
             }
-            L2RoundPlan::Continue {
+            GuardedRoundPlan::Continue {
                 validation_round,
                 actions,
             } => {
@@ -1929,7 +1938,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                 );
                 actions
             }
-            L2RoundPlan::Decline {
+            GuardedRoundPlan::Decline {
                 validation_round,
                 reason,
             } => {
@@ -1937,30 +1946,33 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                     stats.rounds, validation_round,
                     "L2 planner/fixpoint validation-round counters diverged"
                 );
-                record_l2_decline(&mut stats, reason);
+                record_guarded_decline(&mut stats, reason);
                 return (None, stats);
             }
         };
 
         for action in &actions {
-            solver.add_l2_commit(action);
+            solver.add_guarded_commit(action);
         }
         stats.commits_conflict += actions.len();
         stats.commits_per_round.push(actions.len());
 
-        match solve_l2_round_model(solver, selectors, backend, hard.as_ref()) {
-            L2SolveResult::Sat { kinds, dropped } => {
+        match solve_guarded_round_model(solver, selectors, backend, hard.as_ref()) {
+            GuardedSolveResult::Sat { kinds, dropped } => {
                 model = kinds;
                 record_dropped(&mut stats, selectors, &dropped);
             }
-            L2SolveResult::Unsat => {
-                record_l2_decline(&mut stats, L2DeclineReason::Solver(L2SolverDecline::Unsat));
+            GuardedSolveResult::Unsat => {
+                record_guarded_decline(
+                    &mut stats,
+                    GuardedDeclineReason::Solver(GuardedSolverDecline::Unsat),
+                );
                 return (None, stats);
             }
-            L2SolveResult::Unknown => {
-                record_l2_decline(
+            GuardedSolveResult::Unknown => {
+                record_guarded_decline(
                     &mut stats,
-                    L2DeclineReason::Solver(L2SolverDecline::Unknown),
+                    GuardedDeclineReason::Solver(GuardedSolverDecline::Unknown),
                 );
                 return (None, stats);
             }
@@ -1968,8 +1980,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     }
 }
 
-fn record_l2_decline(stats: &mut RoundStats, reason: L2DeclineReason) {
-    stats.l2_decline = Some(reason);
+fn record_guarded_decline(stats: &mut RoundStats, reason: GuardedDeclineReason) {
+    stats.guarded_decline = Some(reason);
 }
 
 /// §NB5-L2 (commit-necessity audit) — does `model` ACCEPT, i.e. is it a Mode-A fixpoint? True iff one

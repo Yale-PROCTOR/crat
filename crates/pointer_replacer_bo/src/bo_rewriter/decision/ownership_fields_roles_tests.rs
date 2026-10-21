@@ -17,13 +17,13 @@ fn require_owning_formal_lend(callee_name: &str, calls: &str, expected_calls: us
         let (table, ctx) = bo::decide_table_with_ctx_config(
             tcx,
             Some((
-                bo::A5Mode::PreciseReplay,
+                bo::OverlapMode::PreciseReplay,
                 Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
         .expect("real native fixture model, no injected kinds");
         let program = bo::collect_program(tcx);
-        let prepared = bo::prepare_plan_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans).unwrap();
+        let prepared = bo::prepare_plan_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans).unwrap();
         let definition = |name: &str| {
             let matches: Vec<_> = program.functions.iter().copied()
                 .filter(|function| tcx.def_path_str(function.to_def_id()) == name)

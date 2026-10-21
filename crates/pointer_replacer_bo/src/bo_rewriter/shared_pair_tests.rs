@@ -1,5 +1,5 @@
 use super::{RewriteOutcome, decision::DecisionTable};
-use crate::analyses::borrow_ownership::a5_overlap::{A5Mode, WholeProgramAttestation};
+use crate::analyses::borrow_ownership::param_overlap::{OverlapMode, WholeProgramAttestation};
 
 const INPUT: &str = r#"
 pub unsafe fn read_pair(a: *mut i32, b: *const i32) -> bool { *a == *b }
@@ -16,7 +16,7 @@ fn run(inject: &(dyn Fn(&mut DecisionTable) + Sync)) -> RewriteOutcome {
         false,
         false,
         Some((
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )
@@ -133,7 +133,7 @@ fn w5p_reverted_callee_withdraws_shared_argument_and_signature() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

@@ -54,7 +54,7 @@ fn assert_withdrawn(corruption: Corruption) {
             tcx,
             &table,
             &Default::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         assert!(
@@ -106,7 +106,7 @@ fn assert_withdrawn(corruption: Corruption) {
             tcx,
             &table,
             &Default::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let held = emission.plan.held_classes();

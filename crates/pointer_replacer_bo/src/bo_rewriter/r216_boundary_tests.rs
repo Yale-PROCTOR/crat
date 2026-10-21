@@ -50,7 +50,7 @@ fn r218_reclassified_option_call_stays_inactive_on_plan_replay() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::from_iter([callee]),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let replayed = emission
@@ -110,7 +110,7 @@ fn r216_terminal_raw_callee_cannot_make_a_new_option_obligation_required() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         emission.plan.hold_terminal_class(
@@ -151,7 +151,7 @@ fn r216_unsatisfied_additive_option_site_keeps_the_delivered_class() {
             Some(receipt::MechanicalTerminalReason::EvidenceMissing("r216-unbuilt-site".to_owned())),
             receipt::MechanicalEvidence::default(),
         ));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans).unwrap();
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans).unwrap();
         assert!(!emission.plan.held_classes().contains(&super::bridge_receipt::SignatureClassId::of(raw.fn_did)),
             "an unsatisfied new site must retain the old raw disposition without holding the delivered class");
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
@@ -190,7 +190,7 @@ fn r216_same_span_identical_option_use_is_composed_once() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         assert!(
@@ -211,7 +211,7 @@ fn r216_color_tree_get_has_no_program_level_apply_rollback() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         assert!(

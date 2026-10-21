@@ -11,7 +11,7 @@ use super::{
         coherence::SelectedCopyLendLoan,
         crate_slots::CrateSlots,
         export::{BorrowerKind, OwnerKey, PlaceKey, ProjKey},
-        l2::MirLocationKey,
+        guarded_repair::MirLocationKey,
         ownership_occurrence::Availability,
         slots::SlotOwner,
         solver::SlotRef,

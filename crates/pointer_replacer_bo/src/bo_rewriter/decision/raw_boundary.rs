@@ -18,7 +18,7 @@ use rustc_span::{Span, def_id::DefId};
 
 use crate::{
     analyses::borrow_ownership::{
-        a5_overlap::WholeProgramAttestation, origin_summary::OriginSummaries,
+        origin_summary::OriginSummaries, param_overlap::WholeProgramAttestation,
     },
     utils::rustc::RustProgram,
 };

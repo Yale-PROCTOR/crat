@@ -84,7 +84,7 @@ fn emit_source(source: &str, family: Family, hold_owner: bool) -> Output {
         let configured_exposure = ConfiguredExposureInput::checked("fixture-config", ["target".to_owned()],
             format!("{:x}", Sha256::digest(b"target"))).expect("existing checked exposure mechanism");
         let (table, ctx) = super::decide_table_with_emission_config(tcx,
-            Some((super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
+            Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
             &super::EmissionRunConfig { configured_exposure }).expect("one actual wrapper decision invocation");
         let solve = super::model_cache::solve_receipt();
         println!("J18 wrapper {family:?} hold={hold_owner}: solve={solve:#?}");
@@ -110,7 +110,7 @@ fn emit_source(source: &str, family: Family, hold_owner: bool) -> Output {
         assert_eq!(lifetime.lifetime_for(FnSignatureSlot::RETURN), Some(parameter_lifetime));
         assert_eq!(table.exposure.as_ref().unwrap().plan(subject.fn_did), ExposureSurfacePlan::PositiveSeedShim);
         println!("J18 {family:?}: permit={permit:?}; lifetime={}", lifetime.receipt());
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual wrapper terminal plan");
         let owner = SignatureClassId::of(subject.fn_did);
         let input_call_count = ctx.facts.call_args.get(&subject.fn_did).map_or(0, Vec::len);
@@ -404,7 +404,7 @@ fn check_nonreturn_parameter_atom(check_missing_receipt: bool) {
             let configured_exposure = ConfiguredExposureInput::checked("fixture-config", ["target".to_owned()],
                 format!("{:x}", Sha256::digest(b"target"))).expect("checked target exposure");
             let (table, ctx) = super::decide_table_with_emission_config(tcx,
-                Some((super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
+                Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
                 &super::EmissionRunConfig { configured_exposure }).expect("one actual nonreturn decision call");
             let solve = super::model_cache::solve_receipt();
             println!("J18 nonreturn parameter-atom solve={solve:#?}");
@@ -421,7 +421,7 @@ fn check_nonreturn_parameter_atom(check_missing_receipt: bool) {
                 .is_none_or(|plan| plan.lifetime_for(FnSignatureSlot::RETURN).is_none()),
                 "AUTHORING PREMISE: scalar output has no generated reference-return dependency");
             assert_eq!(table.exposure.as_ref().unwrap().plan(subject.fn_did), ExposureSurfacePlan::PositiveSeedShim);
-            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
                 .expect("actual nonreturn surface plan");
             let owner = SignatureClassId::of(subject.fn_did);
             let held = emission.plan.held_classes();

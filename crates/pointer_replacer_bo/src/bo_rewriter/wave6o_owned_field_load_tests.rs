@@ -9,7 +9,7 @@
 //! dependent owners (wave-6f 064). Deferred, the base's own edit applies on
 //! its own span and the load takes the transaction's wrap:
 //! `(*node.unwrap()).left.as_deref()`.
-use super::{A5Mode, RewriteOutcome, WholeProgramAttestation};
+use super::{OverlapMode, RewriteOutcome, WholeProgramAttestation};
 
 /// A reduction of the corpus bst: owned children built by `newNode` /
 /// `insert`, and a walker whose local is decided an optional Ref.
@@ -79,7 +79,7 @@ fn emitted(name: &str, source: &str) -> RewriteOutcome {
     std::fs::write(&root, source).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );

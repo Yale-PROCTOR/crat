@@ -62,8 +62,8 @@ fn check(family: Family) {
     let (emitted, lifetime) = ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("original fixture AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one return-family decision call");
         let solve = super::model_cache::solve_receipt();
         println!("RETURN-FAMILY {family:?} solve={solve:#?}\ninput={source}");
@@ -111,7 +111,7 @@ fn check(family: Family) {
         assert_eq!(function_plan.lifetime_for(FnSignatureSlot::RETURN), Some(lifetime.as_str()));
         assert!(function_plan.receipt().contains("return_lifetime_reused=true"));
         let digest = function_plan.digest();
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual return-family emission plan");
         let owner = SignatureClassId::of(subject.fn_did);
         assert!(emission.plan.class_finalization.classes.get(&owner).is_some_and(super::plan::SignatureClassPlan::is_ready));

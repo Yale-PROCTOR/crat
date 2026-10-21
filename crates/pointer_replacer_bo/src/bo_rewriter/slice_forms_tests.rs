@@ -33,7 +33,7 @@ fn emit_reverting(input: &str, revert: Option<&str>) -> String {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -42,8 +42,9 @@ fn emit_reverting(input: &str, revert: Option<&str>) -> String {
         for (subject, decision) in &table.entries {
             println!("DECISION {} {decision:?}", subject.label);
         }
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
-            .expect("native emission plan");
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("native emission plan");
         let mut held = emission.plan.held_classes();
         if let Some(name) = revert {
             let owner = tcx
@@ -307,7 +308,7 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -329,7 +330,7 @@ fn emit_with_family_receipts(input: &str) -> (String, String) {
             "{:#?}",
             ctx.raw_boundary_artifacts.additive_family_receipts
         );
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
             .expect("native emission plan");
         for edits in emission.plan.by_file.values() {
             for edit in edits {
@@ -1178,7 +1179,7 @@ fn wave6s_lodepng_addchunk_ihdr_reduction_reconciles_after_degradation() {
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -2189,7 +2190,7 @@ fn w4_arm_a_mutable_caller_is_never_lifted_shared() {
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )?;
@@ -2258,7 +2259,7 @@ fn delivered_and_emitted(input: &str) -> (String, String) {
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )?;

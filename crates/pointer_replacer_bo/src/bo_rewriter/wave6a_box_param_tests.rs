@@ -2556,7 +2556,7 @@ fn w6a_r561_5_input_form_caller_weakens_the_same_place_twice() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2571,7 +2571,7 @@ fn w6a_r561_5_input_form_caller_weakens_the_same_place_twice() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("emit");
         // The caller in its input form, the callee kept: brotli's tree.

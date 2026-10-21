@@ -27,7 +27,7 @@ fn escape_outcome(input: &str, subject: &str, label: &str) -> EscapeOutcome {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -45,7 +45,7 @@ fn escape_outcome(input: &str, subject: &str, label: &str) -> EscapeOutcome {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("actual emission plan");
         let held = emission.plan.held_classes();

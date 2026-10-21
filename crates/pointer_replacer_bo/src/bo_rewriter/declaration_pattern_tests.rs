@@ -44,7 +44,7 @@ fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
             .copied();
         assert_eq!(kind, Some(super::SlotKind::Ref),
             "the original binding must have an actual model-Ref fact before presentation is tested");
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans).unwrap();
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans).unwrap();
         let none = Default::default();
         let rows = emission.plan.declaration_receipt_rows(&none);
         let events = emission.plan.mechanical_receipts(&none).0;

@@ -124,15 +124,15 @@ fn confirm(case: &Case) -> Value {
         let emission = (|| -> Result<Vec<(String, String)>, String> {
             let capture = super::ast_transform::capture_ast(tcx)?;
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-                Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+                Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
             )))?;
             report["solve_receipt"] = solve_receipt();
             let emission = super::emit_files(
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let held = emission.plan.held_classes();
             report["held_classes"] = json!(

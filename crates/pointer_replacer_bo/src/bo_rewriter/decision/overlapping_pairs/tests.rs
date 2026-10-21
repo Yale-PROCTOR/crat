@@ -1,5 +1,5 @@
 use crate::{
-    analyses::borrow_ownership::a5_overlap::{A5Mode, WholeProgramAttestation},
+    analyses::borrow_ownership::param_overlap::{OverlapMode, WholeProgramAttestation},
     bo_rewriter::{
         self,
         decision::{Decision, DegradeReason},
@@ -10,7 +10,7 @@ fn native_pair(input: &str) {
     ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(input), |tcx| {
         let (table, _) = bo_rewriter::decide_table_with_ctx_config(
             tcx,
-            Some((A5Mode::PreciseReplay, Some(WholeProgramAttestation::FrozenBenchmarkGraph))),
+            Some((OverlapMode::PreciseReplay, Some(WholeProgramAttestation::FrozenBenchmarkGraph))),
         ).expect("native pair decision");
         for (subject, decision) in &table.entries {
             println!("{} {:?} {:?}", subject.label, subject.kind, decision);
@@ -66,7 +66,7 @@ fn w5p_diagnostic_carries_native_forms_and_mutability() {
         let (mut table, ctx) = bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -107,7 +107,7 @@ fn discovery(input: &str, admitted: usize) {
         let (table, ctx) = bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

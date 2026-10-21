@@ -211,7 +211,7 @@ mod tests {
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -226,7 +226,7 @@ mod tests {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .unwrap();
             let formal = resolve(
@@ -279,7 +279,7 @@ mod tests {
             let (mut table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -294,7 +294,7 @@ mod tests {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .unwrap();
             let plan = table
@@ -388,7 +388,7 @@ mod tests {
             let (mut table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -403,7 +403,7 @@ mod tests {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .unwrap();
             let id = SignatureClassId::of(callee);

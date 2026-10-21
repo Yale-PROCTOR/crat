@@ -20,7 +20,7 @@ use crate::analyses::borrow_ownership::{
         verify_bo_construction_counting,
     },
     crate_slots::CrateSlots,
-    l2::slotref_diagnostic,
+    guarded_repair::slotref_diagnostic,
     mutability_facts::MutFacts,
     origins::compute_origins,
     solver::{CoreTracker, KindSolver, SlotRef},
@@ -231,7 +231,7 @@ struct PairStage {
 
 fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
     assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
-    assert_eq!(RepairMode::current(), RepairMode::ModeA);
+    assert_eq!(RepairMode::current(), RepairMode::Plain);
 
     let program = collect_program(tcx);
     let origins = compute_origins(&program);

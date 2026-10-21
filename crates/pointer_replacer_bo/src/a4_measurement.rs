@@ -30,12 +30,12 @@ use super::{
 };
 use crate::analyses::borrow_ownership::{
     SlotKind,
-    borrow_verify::with_mode_a_commit_trace,
+    borrow_verify::with_plain_commit_trace,
     coherence::constrain_field_ownership,
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
     export::{BoExport, VersionSite, location_key, with_bo_export},
-    l2::MirLocationKey,
+    guarded_repair::MirLocationKey,
     mutability_facts::MutFacts,
     origin_summary::OriginSummaries,
     origins::compute_origins,
@@ -1052,7 +1052,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
                 CopyLendMode::current(),
             )
             .expect("A4 ordinary emission");
-            let ((model, stats), trace) = with_mode_a_commit_trace(|| {
+            let ((model, stats), trace) = with_plain_commit_trace(|| {
                 verify_bo_construction_counting(
                     &program,
                     &slots,

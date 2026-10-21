@@ -105,7 +105,7 @@ fn emit(input: &str, functions: &[Function], exposed: &str, hold_exposed: bool) 
         let capture = super::ast_transform::capture_ast(tcx).expect("one original return-fixture AST capture");
         let (table, ctx) = super::decide_table_with_emission_config(
             tcx,
-            Some((super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
+            Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
             &super::EmissionRunConfig { configured_exposure: configured_exposure(exposed) },
         ).expect("one real return-fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
@@ -149,7 +149,7 @@ fn emit(input: &str, functions: &[Function], exposed: &str, hold_exposed: bool) 
         assert_eq!(table.exposure.as_ref().expect("actual exposure policy").plan(exposed_did),
             ExposureSurfacePlan::PositiveSeedShim);
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans).expect("actual terminal return plan");
+            &ctx.retained_copy_plans).expect("actual terminal return plan");
         let held = emission.plan.held_classes();
         for (_, did, _, _) in &witnesses {
             let owner = SignatureClassId::of(*did);

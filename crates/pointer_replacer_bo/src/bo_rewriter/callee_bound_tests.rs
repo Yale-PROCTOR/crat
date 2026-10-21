@@ -10,7 +10,7 @@
 //! fallback. `W4CB-F*` are the fault controls: each one fails when the guard it
 //! names is removed from `decision/callee_bound.rs`.
 
-use super::{A5Mode, WholeProgramAttestation};
+use super::{OverlapMode, WholeProgramAttestation};
 
 const PRE: &str =
     "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments)]\n";
@@ -38,7 +38,7 @@ fn emitted_closed_world(src: &str) -> String {
     std::fs::write(&root, src).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );

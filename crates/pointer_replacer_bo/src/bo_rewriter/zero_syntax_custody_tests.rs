@@ -54,8 +54,8 @@ fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
     let (plan, seam, file, lo, hi, baseline, reverted_source) = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("original fixture AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("actual fixture decisions");
         let solve = super::model_cache::solve_receipt();
         println!("zero-syntax custody readonly={readonly} solve receipt: {solve:#?}");
@@ -69,7 +69,7 @@ fn fixture(readonly: bool) -> (Plan, SeamEdit, FileKey, usize, usize) {
             Decision::Box(_) | Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::Degraded(_) => false,
         };
         assert!(shared, "actual shared source required: {decision:?}");
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans).unwrap();
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans).unwrap();
         let owner = SignatureClassId::of(subject.fn_did);
         assert!(emission.plan.class_finalization.classes[&owner].is_ready());
         let seams = emission.plan.terminal_call_plans.seam_edits.iter().filter(|seam| {
@@ -261,8 +261,8 @@ fn thin_extent_holds_the_returned_parent_zero_syntax_source() {
          }\n";
     ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let (table, _) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("actual fixture decisions");
         let (_, decision) = table
             .entries

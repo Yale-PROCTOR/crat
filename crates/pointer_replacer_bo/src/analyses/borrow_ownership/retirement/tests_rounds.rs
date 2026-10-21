@@ -10,7 +10,7 @@ use crate::{
     analyses::{
         borrow_ownership::{
             SlotKind,
-            borrow_verify::with_mode_a_commit_trace,
+            borrow_verify::with_plain_commit_trace,
             construction::{
                 CopyLendMode, TestValidationBackend, construct_bo_into,
                 verify_bo_construction_counting_for_test, verify_bo_construction_l2_for_test,
@@ -85,7 +85,7 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
                     assert_eq!(initial.get(&target), Some(&SlotKind::Ref),
                         "fixture must expose a real initial Ref; do not force one to manufacture this witness");
                     if force_ref { solver.assume(target, SlotKind::Ref); }
-                    let ((model, stats), commits) = with_mode_a_commit_trace(|| {
+                    let ((model, stats), commits) = with_plain_commit_trace(|| {
                         if l2 {
                             verify_bo_construction_l2_for_test(&program, &slots, &origins, &solver, &construction, &facts, backend)
                         } else {

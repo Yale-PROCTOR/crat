@@ -493,8 +493,10 @@ fn descriptor_for_event(
             for mark in &table.c9_marks {
                 let params = mark.key.pair.params();
                 let parameter = match mark.key.shared_side {
-                    crate::analyses::borrow_ownership::a5_overlap::PairSide::Left => params.first(),
-                    crate::analyses::borrow_ownership::a5_overlap::PairSide::Right => {
+                    crate::analyses::borrow_ownership::param_overlap::PairSide::Left => {
+                        params.first()
+                    }
+                    crate::analyses::borrow_ownership::param_overlap::PairSide::Right => {
                         params.second()
                     }
                 };
@@ -2303,7 +2305,7 @@ mod tests {
                 let (table, context) = crate::bo_rewriter::decide_table_with_ctx_config(
                     tcx,
                     Some((
-                        crate::bo_rewriter::A5Mode::PreciseReplay,
+                        crate::bo_rewriter::OverlapMode::PreciseReplay,
                         Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                     )),
                 )
@@ -2322,7 +2324,7 @@ mod tests {
                     tcx,
                     &table,
                     &rustc_hash::FxHashSet::default(),
-                    &context.retained_c9_plans,
+                    &context.retained_copy_plans,
                 )
                 .expect("fixture emission plan");
                 let held = emission.plan.held_classes();

@@ -49,7 +49,7 @@ fn expression_sibling_actual_writer_keeps_native_source_and_exact_pending_custod
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original expression-sibling AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary expression-sibling fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("EXPRESSION-SIBLING solve={solve:#?}\nINPUT:\n{INPUT}");
@@ -66,7 +66,7 @@ fn expression_sibling_actual_writer_keeps_native_source_and_exact_pending_custod
             .and_then(|slots| slots.slot_for_local_depth(local, 0))
             .and_then(|slot| ctx.model.get(&super::SlotRef::Local(owner, slot)));
         let permit = ctx.lifetime_eligibility.return_permit((source.fn_did, source.hir_id));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual expression-sibling emission plan");
         let owner = SignatureClassId::of(source.fn_did);
         println!("EXPRESSION-SIBLING source model={:?}; return model={:?}; caller model={:?}; source={source_decision:#?}; caller={caller_decision:#?}; reader={reader_decision:#?}; writer={writer_decision:#?}; permit={permit:#?}; lifetime={:#?}; interface={:#?}; source hold={:?}; sink retention={:#?}; plans={:#?}; unavailable={:#?}",

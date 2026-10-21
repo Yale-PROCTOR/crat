@@ -6,7 +6,7 @@ use super::{CallArgs, InferCtxt, LocalSig};
 use crate::analyses::borrow_ownership::{
     AnalysisKind,
     export::{self, CallSite, PlaceKey, ReallocVersionSite},
-    l2::MirLocationKey,
+    guarded_repair::MirLocationKey,
     realloc::{
         self, OldInput, OldResponsibility, ReallocOutcome, ReallocResult, ResultResponsibility,
     },

@@ -2209,7 +2209,7 @@ mod audit_tests {
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2289,7 +2289,7 @@ mod audit_tests {
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2338,7 +2338,7 @@ mod audit_tests {
             let (mut table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2350,11 +2350,15 @@ mod audit_tests {
                 .iter()
                 .find(|id| tcx.def_path_str(id.to_def_id()) == "edt")
                 .unwrap();
-            let mut classes =
-                bo::prepare_plan_files(tcx, &table, &FxHashSet::default(), &ctx.retained_c9_plans)
-                    .unwrap()
-                    .plan
-                    .class_finalization;
+            let mut classes = bo::prepare_plan_files(
+                tcx,
+                &table,
+                &FxHashSet::default(),
+                &ctx.retained_copy_plans,
+            )
+            .unwrap()
+            .plan
+            .class_finalization;
             // Mechanical terminal-class snapshot only: source identities,
             // ownership model, native effects, T1 and A5 remain real. These
             // inserted Slice decisions are not native slice grants.
@@ -2462,7 +2466,7 @@ mod audit_tests {
             let (mut table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2474,11 +2478,15 @@ mod audit_tests {
                 .iter()
                 .find(|id| tcx.def_path_str(id.to_def_id()) == "edt")
                 .unwrap();
-            let mut classes =
-                bo::prepare_plan_files(tcx, &table, &FxHashSet::default(), &ctx.retained_c9_plans)
-                    .unwrap()
-                    .plan
-                    .class_finalization;
+            let mut classes = bo::prepare_plan_files(
+                tcx,
+                &table,
+                &FxHashSet::default(),
+                &ctx.retained_copy_plans,
+            )
+            .unwrap()
+            .plan
+            .class_finalization;
             // Mechanical terminal-class snapshot only: source identities,
             // ownership model, native effects, T1 and A5 remain real. These
             // inserted Slice decisions are not native slice grants.

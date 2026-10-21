@@ -27,8 +27,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     SlotKind,
-    a5_overlap::{A5Mode, WholeProgramAttestation},
     crate_slots::CrateSlots,
+    param_overlap::{OverlapMode, WholeProgramAttestation},
     slot_key::{field_key, local_key},
     solver::SlotRef,
 };
@@ -139,7 +139,7 @@ pub(crate) fn with_test_config<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
 /// arguments are kept for the callers and not read.
 pub(crate) fn fingerprint(
     program: &RustProgram<'_>,
-    _a5_mode: A5Mode,
+    _a5_mode: OverlapMode,
     _attestation: Option<WholeProgramAttestation>,
 ) -> String {
     super::cache_contract::semantic_key(
@@ -249,7 +249,7 @@ pub(crate) struct CachedModel {
     /// spans without another solver invocation.
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
     /// The construction receipt from the solve that produced `model`.
-    pub(crate) a5_receipt: String,
+    pub(crate) overlap_receipt: String,
 }
 
 #[derive(Clone)]
@@ -335,13 +335,13 @@ pub(crate) fn prepare(
                     .map(|did| program.tcx.def_path_str(did.to_def_id()))
                     .collect();
                 functions.sort();
-                let e5c_universe: Vec<_> = universe(program.tcx, slots)
+                let entry_universe: Vec<_> = universe(program.tcx, slots)
                     .ok_or("invalid slot universe")?
                     .into_keys()
                     .collect();
-                let e5c_model = model_map(program.tcx, slots, &verified.model)
+                let entry_model = model_map(program.tcx, slots, &verified.model)
                     .ok_or("invalid accepted model keys")?;
-                let e5c_baseline = model_map(program.tcx, slots, &verified.baseline_model)
+                let entry_baseline = model_map(program.tcx, slots, &verified.baseline_model)
                     .ok_or("invalid baseline model keys")?;
                 // R473-4 design (A): stream the canonical origin bytes to a file,
                 // per element, and hand the cache the PATH. The whole-`Value` form that
@@ -375,17 +375,17 @@ pub(crate) fn prepare(
                     std::io::Write::flush(&mut writer).map_err(|error| error.to_string())?;
                 }
                 let _origin_file = OriginFile(origin_path.clone());
-                let e5c_origin = super::cache_contract::stream::OriginSource::File(origin_path);
+                let entry_origin = super::cache_contract::stream::OriginSource::File(origin_path);
                 let metadata = super::cache_contract::stream::Metadata {
                     schema: super::cache_contract::SCHEMA.into(),
                     key: key.clone(),
                     inputs,
                     functions,
-                    universe: e5c_universe,
-                    model: e5c_model,
-                    baseline: e5c_baseline,
+                    universe: entry_universe,
+                    model: entry_model,
+                    baseline: entry_baseline,
                     receipt: verified.receipt.clone(),
-                    origin: e5c_origin,
+                    origin: entry_origin,
                     #[cfg(test)]
                     move_store: Default::default(),
                     arg_order: Default::default(),
@@ -403,7 +403,7 @@ pub(crate) fn prepare(
             cached: CachedModel {
                 model: verified.model.clone(),
                 baseline_model: verified.baseline_model.clone(),
-                a5_receipt: verified.receipt.clone(),
+                overlap_receipt: verified.receipt.clone(),
             },
             arg_order_applied: Some(writer_arg_order_applied(program, slots, captured)),
         })
@@ -638,11 +638,11 @@ pub(crate) fn store(
     program: &RustProgram<'_>,
     _slots: &CrateSlots,
     cached: &CachedModel,
-    a5_mode: A5Mode,
+    overlap_mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<PathBuf> {
     let directory = dir()?.join("era5b-model-cache-v1");
-    let fp = fingerprint(program, a5_mode, attestation);
+    let fp = fingerprint(program, overlap_mode, attestation);
     let entry = PREPARED.with(|prepared| {
         prepared
             .borrow()
@@ -651,7 +651,7 @@ pub(crate) fn store(
                 p.key == fp
                     && p.cached.model == cached.model
                     && p.cached.baseline_model == cached.baseline_model
-                    && p.cached.a5_receipt == cached.a5_receipt
+                    && p.cached.overlap_receipt == cached.overlap_receipt
             })
             .and_then(|p| p.entry.clone())
     })?;
@@ -688,7 +688,7 @@ pub(crate) fn load(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     slots: &CrateSlots,
-    _a5_mode: A5Mode,
+    _a5_mode: OverlapMode,
     _attestation: Option<WholeProgramAttestation>,
 ) -> Option<CachedModel> {
     if !read_enabled() {
@@ -733,7 +733,7 @@ pub(crate) fn load(
     let cached = CachedModel {
         model: decode(&entry.model)?,
         baseline_model: decode(&entry.baseline)?,
-        a5_receipt: entry.receipt.clone(),
+        overlap_receipt: entry.receipt.clone(),
     };
     PREPARED.with(|p| {
         *p.borrow_mut() = Some(Prepared {
@@ -1135,7 +1135,7 @@ mod tests {
         .unwrap_or_else(|error| error.raise());
     }
 
-    /// The historical test identity is retained. Era5a supersedes the old
+    /// The historical test identity is retained. Bare supersedes the old
     /// key-only migration contract: a complete new derivation is required.
     #[test]
     fn rekey_changes_only_the_key_line_and_round_trips_through_the_loader() {
@@ -1415,7 +1415,7 @@ pub(crate) fn memo_get(fp: &str) -> Option<CachedModel> {
                             p.key == fp
                                 && p.cached.model == cached.model
                                 && p.cached.baseline_model == cached.baseline_model
-                                && p.cached.a5_receipt == cached.a5_receipt
+                                && p.cached.overlap_receipt == cached.overlap_receipt
                         })
                     })
             })

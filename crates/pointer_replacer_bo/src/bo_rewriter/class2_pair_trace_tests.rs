@@ -9,7 +9,8 @@ use points_to::andersen::{self, Var};
 use rustc_middle::mir::TerminatorKind;
 
 use crate::analyses::borrow_ownership::{
-    a5_producer::audit_a5_site_branches, crate_slots::CrateSlots, origins::compute_origins,
+    crate_slots::CrateSlots, origins::compute_origins,
+    overlap_producer::audit_overlap_site_branches,
 };
 
 /// The input's shape (C2Rust form): the call passes one array twice; the control passes two.
@@ -35,7 +36,7 @@ fn e5c_class2_trace_two_borrows_of_one_array() {
         let program = super::collect_program(tcx);
         let slots = CrateSlots::build(&program);
         let origins = compute_origins(&program);
-        for row in audit_a5_site_branches(&program, &slots, origins.native_flows()) {
+        for row in audit_overlap_site_branches(&program, &slots, origins.native_flows()) {
             println!(
                 "AUDIT {} bb{} -> {} #{}/#{} {} | {} classifier={:?} family={}",
                 row.caller_path,
@@ -49,7 +50,7 @@ fn e5c_class2_trace_two_borrows_of_one_array() {
                 row.family
             );
         }
-        // The producer's Andersen, built as `audit_a5_site_branches` builds it.
+        // The producer's Andersen, built as `audit_overlap_site_branches` builds it.
         let arena = typed_arena::Arena::new();
         let type_shapes = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
         let config = andersen::Config {

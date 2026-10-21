@@ -176,7 +176,7 @@ fn gf08_conditional_root_transport_connects_the_original_source_and_free() {
 #[test]
 fn gf08_closed_field_identity_chain_selects_ownership_and_keeps_endpoints() {
     use super::super::SlotKind;
-    let fixture = super::tests::inspect_era5_frame(CODE);
+    let fixture = super::tests::inspect_attested_frame(CODE);
     assert!(fixture.accepted, "{:?}", fixture.construction_error);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     assert!(

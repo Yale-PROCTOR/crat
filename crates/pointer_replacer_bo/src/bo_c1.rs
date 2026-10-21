@@ -5269,7 +5269,7 @@ mod selector_leak_diagnosis {
     use serde::{Deserialize, Serialize};
 
     use crate::analyses::borrow_ownership::{
-        borrow_verify::ModeACommitTrace,
+        borrow_verify::PlainCommitTrace,
         slots::SlotId,
         solver::{
             SelectorTrace, SelectorTraceOutcome as SolverOutcome,
@@ -5474,7 +5474,7 @@ mod selector_leak_diagnosis {
         code_sha: &str,
         functions: &[rustc_span::def_id::LocalDefId],
         trace: SelectorTrace,
-        commits: Vec<ModeACommitTrace>,
+        commits: Vec<PlainCommitTrace>,
     ) -> OfficialTrace {
         let epochs = trace
             .epochs
@@ -6560,23 +6560,23 @@ mod run {
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
             SlotKind,
-            a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
             borrow_verify::{
                 RepairMode, model_accepts_with_flows, model_accepts_with_flows_and_copy_lends,
-                slotref_key, with_capture, with_mode_a_commit_trace,
+                slotref_key, with_capture, with_plain_commit_trace,
             },
             coherence::{
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config_reporting,
-                solve_bo_a5_reference_reporting, verify_bo_construction_counting,
+                BoConstruction, CopyLendMode, construct_bo_into, solve_bo_overlap_config_reporting,
+                solve_bo_overlap_reference_reporting, verify_bo_construction_counting,
                 verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
-            l2, model_cache,
+            guarded_repair, model_cache,
             mutability_facts::{MutFacts, MutProvider},
             origins::compute_origins,
+            param_overlap::{OverlapMode, OverlapWorld, WholeProgramAttestation},
             slots::{SlotId, SlotOwner},
             solver::{
                 CORE_LABEL_FAMILIES, CoreTracker, KindSolver, Selectors, SlotRef,
@@ -7114,7 +7114,7 @@ mod run {
                 "L2TARGET program={} slot={} slot_key={} audit_round={} kind={kind}",
                 target.program,
                 target.slot,
-                crate::analyses::borrow_ownership::l2::slotref_diagnostic(slot),
+                crate::analyses::borrow_ownership::guarded_repair::slotref_diagnostic(slot),
                 target.audit_round
             );
         }
@@ -7428,7 +7428,7 @@ mod run {
             eprintln!(
                 "[bo-l2] event=l2_certified_kind|program={program_name}|slot={}|slot_key={}|kind={kind}",
                 fmt_slot(program, slots, slot),
-                l2::slotref_diagnostic(slot),
+                guarded_repair::slotref_diagnostic(slot),
             );
         }
         row.set("l2_certified_context", "ok");
@@ -8232,12 +8232,12 @@ mod run {
             Ok(value) => panic!("CRAT_PHASE2_BASELINE_ONLY must be absent or 1, got {value:?}"),
             Err(error) => panic!("CRAT_PHASE2_BASELINE_ONLY is not valid Unicode: {error}"),
         };
-        let mode = A5Mode::PreciseReplay;
+        let mode = OverlapMode::PreciseReplay;
         let a16_refined = true;
         let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         row.set("a5_mode", mode.label());
-        row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
+        row.set("a5_world", OverlapWorld::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", "off");
         row.set("soundness_mode", soundness_mode);
@@ -8268,7 +8268,7 @@ mod run {
         let mut_facts = MutFacts::from_program(&program);
         let solve = || {
             if baseline_only {
-                solve_bo_a5_reference_reporting(
+                solve_bo_overlap_reference_reporting(
                     &program,
                     &slots,
                     &origins,
@@ -8276,7 +8276,7 @@ mod run {
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )
             } else {
-                solve_bo_a5_config_reporting(
+                solve_bo_overlap_config_reporting(
                     &program,
                     &slots,
                     &origins,
@@ -8359,7 +8359,7 @@ mod run {
             "permitted:measurement-frozen-graph-attested",
         );
         row.set("a16_refined", a16_refined);
-        row.set("a16_refined_links", verified.a16_refined_links);
+        row.set("a16_refined_links", verified.return_refined_links);
         let receipt_value = |key: &str| {
             verified
                 .receipt
@@ -8494,14 +8494,17 @@ mod run {
             "a5_production_shared_shared",
             verified.producer_stats.raw_site_shared_shared,
         );
-        row.set("a5_planned_marks", verified.planned_c9_marks.len());
-        row.set("a5_model_retained_marks", verified.retained_c9_marks.len());
+        row.set("a5_planned_marks", verified.planned_copy_marks.len());
+        row.set(
+            "a5_model_retained_marks",
+            verified.retained_copy_marks.len(),
+        );
         row.set(
             "a5_demoted_by_model_marks",
             verified
-                .planned_c9_marks
+                .planned_copy_marks
                 .len()
-                .saturating_sub(verified.retained_c9_marks.len()),
+                .saturating_sub(verified.retained_copy_marks.len()),
         );
 
         if let Some(records) =
@@ -8550,7 +8553,7 @@ mod run {
             .model
             .iter()
             .map(|(&slot, kind)| {
-                let key = l2::SlotKey::of(slot);
+                let key = guarded_repair::SlotKey::of(slot);
                 format!("{}\t{}\t{}\t{kind:?}\n", key.variant, key.owner, key.slot)
             })
             .collect::<Vec<_>>();
@@ -8574,15 +8577,15 @@ mod run {
             );
         }
 
-        if mode == A5Mode::PreciseReplay {
+        if mode == OverlapMode::PreciseReplay {
             let name = std::env::var("CRAT_BOC1_NAME").expect("A5 batch program name");
             let summary = super::a5_measurement::run_batch_w14(
                 &name,
                 tcx,
                 &verified.baseline_model,
                 &verified.model,
-                &verified.planned_c9_marks,
-                verified.retained_c9_marks.len(),
+                &verified.planned_copy_marks,
+                verified.retained_copy_marks.len(),
                 verified.round_stats.rounds,
                 &artifact_dir,
             )
@@ -9025,7 +9028,7 @@ mod run {
         );
         let ((model, rstats), captured) = if selector_core_capture {
             let ((model_and_stats, commit_trace), selector_trace) = with_selector_trace(|| {
-                with_mode_a_commit_trace(|| {
+                with_plain_commit_trace(|| {
                     verify_bo_construction_counting(
                         &program,
                         &slots,
@@ -9146,7 +9149,7 @@ mod run {
                 // §NB5-L (Codex MEDIUM): a `Lemmas` cap-exhaustion decline is a relaxed-SAT model that
                 // hit the round cap — NOT an UNSAT. Intercept it FIRST so `decline_reason` (a
                 // selector-core replay) does not mislabel it `sat-in-replay` and hide the cap exhaustion.
-                if let Some(reason) = &rstats.l2_decline {
+                if let Some(reason) = &rstats.guarded_decline {
                     row.set("decline_reason", "l2");
                     row.set("l2_decline", reason.diagnostic_label(rstats.rounds));
                 } else if rstats.cap_exhausted {
@@ -9175,7 +9178,7 @@ mod run {
                 // would not be UNSAT).
                 if rstats.field_conflict_decline.is_none()
                     && !rstats.cap_exhausted
-                    && rstats.l2_decline.is_none()
+                    && rstats.guarded_decline.is_none()
                     && std::env::var("CRAT_BOC1_EXPLAIN")
                         .map(|v| v == "1")
                         .unwrap_or(false)
@@ -9316,7 +9319,7 @@ mod run {
             // Mode-A commit branch — so under any other `CRAT_BO_REPAIR` the events would be empty and the
             // audit would report a plausible-but-meaningless zero. Refuse it with an explicit status and no
             // numeric audit fields, rather than contaminating a comparative sweep.
-            if rstats.repair != RepairMode::ModeA {
+            if rstats.repair != RepairMode::Plain {
                 row.set("na_status", "wrong-repair-mode");
             } else if certified_context {
                 let t = Instant::now();
@@ -11029,7 +11032,7 @@ mod run {
         };
         let receipt_field = |key: &str| {
             capture
-                .a5_receipt
+                .overlap_receipt
                 .lines()
                 .find_map(|line| line.strip_prefix(&format!("{key}=")))
                 .unwrap_or("missing")
@@ -11251,7 +11254,7 @@ mod run {
         let artifact_path = directory.join(format!("{name}.reverts.tsv"));
         std::fs::write(&artifact_path, artifact).expect("write E1 revert artifact");
         let a5_receipt_path = directory.join(format!("{name}.a5-receipt.txt"));
-        std::fs::write(&a5_receipt_path, &capture.a5_receipt).expect("write E1 A5 receipt");
+        std::fs::write(&a5_receipt_path, &capture.overlap_receipt).expect("write E1 A5 receipt");
         let solve = &capture.solve_receipt;
         let cache_receipt = format!(
             "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\tsource\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\nrs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -11415,7 +11418,7 @@ mod run {
         };
         let receipt_field = |key: &str| {
             capture
-                .a5_receipt
+                .overlap_receipt
                 .lines()
                 .find_map(|line| line.strip_prefix(&format!("{key}=")))
                 .unwrap_or("missing")
@@ -11641,7 +11644,7 @@ mod run {
         let cache_path = directory.join(format!("{name}.cache-receipt.tsv"));
         std::fs::write(&cache_path, stamp(&cache_receipt)).expect("write E2 cache receipt");
         let a5_path = directory.join(format!("{name}.a5-receipt.txt"));
-        std::fs::write(&a5_path, &capture.a5_receipt).expect("write E2 A5 receipt");
+        std::fs::write(&a5_path, &capture.overlap_receipt).expect("write E2 A5 receipt");
 
         row.set("corpus", "rs-crown");
         row.set("analysis_frame", model_cache::ANALYSIS_FRAME);
@@ -11737,7 +11740,7 @@ mod run {
             let program = collect_program(tcx);
             model_cache::fingerprint(
                 &program,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
         })
@@ -11752,7 +11755,7 @@ mod run {
                 tcx,
                 &program,
                 &slots,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .is_some()
@@ -14086,7 +14089,7 @@ mod run {
         .expect("write Box subject seed");
         std::fs::write(
             directory.join(format!("{name}.a5-receipt.txt")),
-            &capture.a5_receipt,
+            &capture.overlap_receipt,
         )
         .expect("write Box A5 receipt");
         std::fs::write(
@@ -14261,7 +14264,7 @@ mod run {
         let mut row = Row::default();
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let mode = A5Mode::PreciseReplay;
+        let mode = OverlapMode::PreciseReplay;
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let fingerprint = model_cache::fingerprint(&program, mode, attestation);
         row.set("fingerprint", &fingerprint);
@@ -14298,7 +14301,7 @@ mod run {
         let mut row = Row::default();
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let mode = A5Mode::PreciseReplay;
+        let mode = OverlapMode::PreciseReplay;
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let fingerprint = model_cache::fingerprint(&program, mode, attestation);
         row.set("fingerprint", &fingerprint);
@@ -14496,7 +14499,7 @@ mod run {
         }
         let receipt_field = |key: &str| {
             outcome
-                .a5_receipt()
+                .overlap_receipt()
                 .lines()
                 .find_map(|line| line.strip_prefix(&format!("{key}=")))
                 .map(str::to_owned)
@@ -15047,7 +15050,7 @@ pub unsafe fn f() -> i32 {
                         mode.with_override(|| {
                             crate::analyses::borrow_ownership::model_cache::fingerprint(
                                 &program,
-                                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                                 None,
                             )
                         })
@@ -15728,13 +15731,13 @@ fn null_is_option_none_not_raw_and_is_exported() {
 
     use crate::analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::A5Mode,
         construction::{
-            CopyLendMode, construct_bo_into, solve_bo_a5_config, verify_bo_construction,
+            CopyLendMode, construct_bo_into, solve_bo_overlap_config, verify_bo_construction,
         },
         crate_slots::CrateSlots,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::OverlapMode,
         solver::{KindSolver, SlotRef},
     };
 
@@ -15793,12 +15796,12 @@ fn null_is_option_none_not_raw_and_is_exported() {
                     "is_null evidence must not create a Raw kind"
                 );
             }
-            let verified = solve_bo_a5_config(
+            let verified = solve_bo_overlap_config(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::Baseline,
+                OverlapMode::Baseline,
                 None,
             )
             .expect("null fixture verified artifacts");
@@ -15828,13 +15831,13 @@ fn null_is_option_none_not_raw_and_is_exported() {
 fn a14_opaque_field_is_raw_but_null_initialized_field_stays_ref() {
     use crate::analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::A5Mode,
         construction::{
-            CopyLendMode, construct_bo_into, solve_bo_a5_config, verify_bo_construction,
+            CopyLendMode, construct_bo_into, solve_bo_overlap_config, verify_bo_construction,
         },
         crate_slots::CrateSlots,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::OverlapMode,
         slots::StructFieldSlot,
         solver::{KindSolver, SlotRef},
     };
@@ -15878,12 +15881,12 @@ fn a14_opaque_field_is_raw_but_null_initialized_field_stays_ref() {
             .expect("A14 fixture accepts");
             assert_eq!(model[&field], expected);
 
-            let verified = solve_bo_a5_config(
+            let verified = solve_bo_overlap_config(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::Baseline,
+                OverlapMode::Baseline,
                 None,
             )
             .expect("A14 fixture verified artifacts");
@@ -17156,7 +17159,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         baseline_keys: 0,
         baseline_errors: 0,
         baseline_msg_env: 0,
-        a5_receipt: "a5_mode=baseline\n".to_owned(),
+        overlap_receipt: "a5_mode=baseline\n".to_owned(),
         e1_reverts: Vec::new(),
         e1_adapter_receipt: String::new(),
         e1_subject_receipt: String::new(),
@@ -30201,7 +30204,7 @@ fn boc1_run_one() {
                 let path = std::env::var("CRAT_BOC1_ER4_OUT").expect("CRAT_BOC1_ER4_OUT");
                 let ((row, trace), export) =
                     crate::analyses::borrow_ownership::export::with_bo_export(|| {
-                        crate::analyses::borrow_ownership::borrow_verify::with_mode_a_commit_trace(
+                        crate::analyses::borrow_ownership::borrow_verify::with_plain_commit_trace(
                             || run::run_bo(tcx, t_tcx),
                         )
                     });
@@ -32435,7 +32438,7 @@ fn boc1_corpus() {
         );
         assert_eq!(
             crate::analyses::borrow_ownership::borrow_verify::RepairMode::current(),
-            crate::analyses::borrow_ownership::borrow_verify::RepairMode::ModeA,
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::Plain,
             "ownership-yield measurement repair mode drifted"
         );
         assert_eq!(
@@ -34845,7 +34848,7 @@ fn nb5l2_anchor<'tcx>(
         let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
         add_coherence(&solver, &slots, g, &body);
     }
-    let ((model, _stats), events) = RepairMode::with_override(RepairMode::ModeA, || {
+    let ((model, _stats), events) = RepairMode::with_override(RepairMode::Plain, || {
         borrow_verify::with_capture(|| {
             verify_to_fixpoint_counting_with_flows(
                 &program,
@@ -35736,7 +35739,7 @@ fn r385_forced_assignment_probe() {
         // rather than pending. Default: the unknown world, as before.
         let _world = (std::env::var("CRAT_R385_WORLD").as_deref() == Ok("closed")).then(|| {
             crate::analyses::borrow_ownership::licensing::stack_entry::enter_world(Some(
-                crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
             ))
         });
         let program = collect_program(tcx);

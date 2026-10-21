@@ -15,7 +15,7 @@ use super::{
     crate_slots::CrateSlots,
     domain::SlotKind,
     export::{BorrowerKind, OwnerKey, PlaceKey},
-    l2::MirLocationKey,
+    guarded_repair::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
     slot_key::{field_key, local_key},
     slots::SlotOwner,
@@ -805,7 +805,7 @@ mod tests {
     use crate::analyses::borrow_ownership::{
         coherence::SelectedCopyLendLoan,
         export::{BorrowerKind, OwnerKey, PlaceKey},
-        l2::MirLocationKey,
+        guarded_repair::MirLocationKey,
     };
 
     const ESC_W1: &str = r#"

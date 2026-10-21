@@ -107,7 +107,7 @@ mod tests {
     //! Complete original-cell chain witnesses; embedded programs are never run.
     use super::super::{
         super::SlotKind,
-        tests::{inspect, inspect_era5_frame},
+        tests::{inspect, inspect_attested_frame},
     };
     const CODE: &str = r#"
 unsafe extern "C" {fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
@@ -122,7 +122,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
     /// payload stays raw, and no snapshot carries a complete chain.
     #[test]
     fn c04_under_the_lend_the_ol06_chain_takes_no_certificate() {
-        let fixture = inspect_era5_frame(CODE);
+        let fixture = inspect_attested_frame(CODE);
         for (key, kind) in [
             ("Cell.ptr", SlotKind::Ref),
             ("make::value", SlotKind::Raw),
@@ -155,7 +155,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
             "release(&mut cell);",
             "release(&mut cell);free(owner as *mut core::ffi::c_void);",
         );
-        inspect_era5_frame(&partner).assert_not_owning("Cell.ptr");
+        inspect_attested_frame(&partner).assert_not_owning("Cell.ptr");
     }
 
     /// Under the lend the chain's structural certificate forms on none of the variants.
@@ -239,7 +239,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
     /// could rebuild.
     #[test]
     fn c04_no_snapshot_carries_a_complete_chain_under_the_lend() {
-        let fixture = inspect_era5_frame(CODE);
+        let fixture = inspect_attested_frame(CODE);
         let snapshots = fixture.export.ownership_licensing.as_ref().unwrap();
         assert!(snapshots.iter().all(|s| s.complete_chains.is_empty()));
     }
@@ -282,11 +282,11 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
         use rustc_hir::{ItemKind, OwnerNode};
 
         use super::super::super::{
-            a5_overlap::WholeProgramAttestation,
             construction::{CopyLendMode, construct_bo_into},
             crate_slots::CrateSlots,
             mutability_facts::MutFacts,
             origins::compute_origins,
+            param_overlap::WholeProgramAttestation,
             solver::KindSolver,
         };
         let code = CODE.replace("malloc(4)", "malloc(core::mem::size_of::<i32>())");
@@ -358,7 +358,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
             CODE.replace("pub unsafe fn release(cell:*mut Cell){","static mut SAVED:*mut Cell=0 as *mut Cell;pub unsafe fn release(cell:*mut Cell){SAVED=cell;"),
             format!("{CODE}\npub unsafe fn other(){{let mut n=9;let mut cell=Cell{{ptr:0 as *mut i32}};put(&mut cell,&mut n);}}"),
         ] {
-            let fixture=inspect_era5_frame(&code);
+            let fixture=inspect_attested_frame(&code);
             fixture.assert_not_owning("Cell.ptr");
             assert!(fixture.export.ownership_licensing.as_ref().unwrap().iter().all(|s|s.complete_chains.is_empty()),"unsupported effect/caller must have no chain certificate");
         }

@@ -151,8 +151,10 @@ where
     copy_lend_guards: &'infercx FxHashMap<Location, Bool>,
     field_reader_guards: FxHashMap<Location, Bool>,
     realloc_plans: Vec<super::realloc_ssa::ReallocSsaPlan>,
-    realloc_inputs:
-        std::collections::BTreeMap<super::l2::MirLocationKey, realloc_transition::ReallocInput>,
+    realloc_inputs: std::collections::BTreeMap<
+        super::guarded_repair::MirLocationKey,
+        realloc_transition::ReallocInput,
+    >,
     realloc_versions: Vec<super::export::ReallocVersionSite>,
     realloc_ghosts: FxHashSet<Var>,
     /// era-5c: must-null facts per CFG edge.

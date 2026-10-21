@@ -21,7 +21,9 @@
 //! with a CONVERTED callee return, which the existing receiver path already
 //! serves and this arm must not touch.
 
-use super::{A5Mode, RewriteOutcome, WholeProgramAttestation, decision::lifetime::LifetimeFailure};
+use super::{
+    OverlapMode, RewriteOutcome, WholeProgramAttestation, decision::lifetime::LifetimeFailure,
+};
 
 /// lil `add_func` + `lil_register`: the callee returns a nullable pointer out
 /// of the program's own storage and its return interface stays raw; the
@@ -157,7 +159,7 @@ fn emitted(name: &str, source: &str, exposed: &[&str]) -> RewriteOutcome {
     .unwrap();
     super::rewrite_m1_path_with_emission_config(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &super::EmissionRunConfig {
             configured_exposure,
@@ -242,7 +244,7 @@ fn w6l_a8_probe_the_receiver_and_its_callee() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

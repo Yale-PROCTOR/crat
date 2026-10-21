@@ -17,12 +17,12 @@ use rustc_mir_dataflow::Analysis;
 use crate::analyses::{
     borrow_ownership::{
         SlotKind,
-        a5_overlap::{A5Mode, WholeProgramAttestation},
-        construction::solve_bo_a5_config_reporting,
+        construction::solve_bo_overlap_config_reporting,
         crate_slots::CrateSlots,
         export::with_bo_export,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
     },
     liveness::MaybeLiveLocals,
 };
@@ -58,12 +58,12 @@ fn r316_1_analysis_reason_for_raw_subjects() {
         let origins = compute_origins(&program);
         let facts = MutFacts::from_program(&program);
         let (result, capture) = with_bo_export(|| {
-            solve_bo_a5_config_reporting(
+            solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &facts,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
         });

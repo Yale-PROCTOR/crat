@@ -1565,7 +1565,7 @@ pub unsafe fn f() -> i32 {
             IFL3.replace("release(&mut h);", "release(&mut h); free(owner as *mut core::ffi::c_void);"),
         ];
         for input in inputs {
-            let fixture = super::super::tests::inspect_era5_frame(&input);
+            let fixture = super::super::tests::inspect_attested_frame(&input);
             fixture.assert_not_owning("H.ptr");
         }
     }
@@ -1618,14 +1618,14 @@ pub unsafe fn f() -> i32 {
         let code = IFL3.replace("pub unsafe fn f() -> i32 {", "pub unsafe fn f(heap: bool) -> i32 { let mut stack = 1;")
             .replace("let owner = malloc(core::mem::size_of::<i32>()) as *mut i32;",
                 "let owner = if heap { malloc(core::mem::size_of::<i32>()) as *mut i32 } else { &mut stack as *mut i32 };");
-        let fixture = super::super::tests::inspect_era5_frame(&code);
+        let fixture = super::super::tests::inspect_attested_frame(&code);
         fixture.assert_not_owning("H.ptr");
     }
 
     #[test]
     fn c05_under_the_record_the_ifl3_field_settles_raw() {
         use crate::analyses::borrow_ownership::SlotKind;
-        let fixture = super::super::tests::inspect_era5_frame(IFL3);
+        let fixture = super::super::tests::inspect_attested_frame(IFL3);
         fixture.assert_kind("H.ptr", SlotKind::Raw);
         fixture.assert_kind("release::h", SlotKind::Ref);
     }

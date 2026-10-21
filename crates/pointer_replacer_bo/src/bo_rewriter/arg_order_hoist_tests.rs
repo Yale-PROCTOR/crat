@@ -178,7 +178,7 @@ fn wired(name: &str, as_ref: bool) -> (String, usize, u32) {
     std::fs::write(&root, WIRING).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        super::A5Mode::PreciseReplay,
+        super::OverlapMode::PreciseReplay,
         Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         &|table| {
             let (caller, local) = table

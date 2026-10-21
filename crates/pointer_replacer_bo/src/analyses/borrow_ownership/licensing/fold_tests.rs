@@ -831,7 +831,7 @@ fn gf06_permission_binds_selected_kinds_rho_and_original_endpoint() {
         observed.frame_attested = true;
         let facts = &observed;
         let _world = super::stack_entry::enter_world(Some(
-            super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            super::super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ));
         let call = fold_call_key(facts, "detach");
         let proof = super::fold_call::certify(

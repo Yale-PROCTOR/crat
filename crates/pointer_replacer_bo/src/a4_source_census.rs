@@ -34,7 +34,7 @@ use z3::SatResult;
 use super::{collect_program, report::Row};
 use crate::analyses::borrow_ownership::{
     SlotKind,
-    borrow_verify::with_mode_a_commit_trace,
+    borrow_verify::with_plain_commit_trace,
     coherence::constrain_field_ownership,
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
@@ -4332,7 +4332,7 @@ fn emit_phase(started: Instant, phase: &str, candidate: Option<&str>, completed:
 }
 
 fn commit_lines(
-    commits: &[crate::analyses::borrow_ownership::borrow_verify::ModeACommitTrace],
+    commits: &[crate::analyses::borrow_ownership::borrow_verify::PlainCommitTrace],
 ) -> Vec<String> {
     commits
         .iter()
@@ -5103,7 +5103,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             copy_lend_mode,
         )
         .expect("A4C ordinary ownership emission");
-        let ((model, stats), commits) = with_mode_a_commit_trace(|| {
+        let ((model, stats), commits) = with_plain_commit_trace(|| {
             verify_bo_construction_counting(
                 &program,
                 &slots,
@@ -5281,7 +5281,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         )
         .expect("A4C replay ownership emission");
         replay.assert_owning(field_ref);
-        let ((replay_model, _replay_stats), replay_commits) = with_mode_a_commit_trace(|| {
+        let ((replay_model, _replay_stats), replay_commits) = with_plain_commit_trace(|| {
             verify_bo_construction_counting(
                 &program,
                 &slots,

@@ -59,8 +59,8 @@ fn r230_guarded_fix3_read_only_confirmation() {
         },
         false, false, true,
         Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
     let mut record = observed.into_inner().unwrap();
@@ -158,7 +158,7 @@ fn original_parameter_form(input: &str, optional: bool, reverted: bool) {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("original-interface emission plan");
         let finalization = if reverted {
@@ -175,7 +175,7 @@ fn original_parameter_form(input: &str, optional: bool, reverted: bool) {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::from_iter([owner]),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("production pre-reverted emission plan");
             let class = held
@@ -275,8 +275,8 @@ fn assert_pair_raw_parameter_outbound(
     let output = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("PAIR original AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("PAIR production decision table");
         let (subject, decision) = table.entries.iter()
             .find(|(subject, _)| subject.label == "update::b")
@@ -326,7 +326,7 @@ fn assert_pair_raw_parameter_outbound(
             }
         }
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans).expect("PAIR terminal emission plan");
+            &ctx.retained_copy_plans).expect("PAIR terminal emission plan");
         let class_id = SignatureClassId::of(subject.fn_did);
         let class = emission.plan.class_finalization.classes.get(&class_id)
             .expect("PAIR update class");
@@ -521,8 +521,8 @@ fn r231_raw_role_fixture_with_atom(
     );
     let (pending, gaps) = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (mut table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("PAIR source-reversion production decisions");
         let solve = super::model_cache::solve_receipt();
         println!("R231 fixture solve receipt (caller_reverted={revert_caller}): {solve:#?}");
@@ -561,7 +561,7 @@ fn r231_raw_role_fixture_with_atom(
         assert!(matches!(raw_decision, Decision::Degraded(record) if record.reason == DegradeReason::PairRawView),
             "the callee must have the actual PAIR raw-view role: {raw_decision:?}");
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans).expect("PAIR held-source terminal plan");
+            &ctx.retained_copy_plans).expect("PAIR held-source terminal plan");
         let mut withheld = emission.plan.held_classes();
         if revert_caller { withheld.insert(SignatureClassId::of(source.fn_did)); }
         let atoms = if revert_atom {

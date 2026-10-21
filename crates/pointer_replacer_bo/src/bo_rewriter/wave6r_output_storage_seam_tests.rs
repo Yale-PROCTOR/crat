@@ -28,7 +28,7 @@ fn settled(callee: &str, index: usize) -> bool {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -78,7 +78,7 @@ fn wave6r_twin_placement_is_exported_to_the_artifacts() {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

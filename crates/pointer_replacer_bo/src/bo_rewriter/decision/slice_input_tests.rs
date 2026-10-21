@@ -54,7 +54,7 @@ pub(super) fn decisions(input: &str) -> Vec<(String, super::Decision)> {
         crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -109,7 +109,7 @@ fn census_world_proofs(input: &str) -> Vec<(String, Result<usize, super::slice_i
         let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -329,7 +329,7 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
         let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

@@ -12,7 +12,7 @@ mod bzip2_fixture;
 #[path = "exclusion_rederivation_quadtree_fixture.rs"]
 mod quadtree_fixture;
 
-use super::{A5Mode, WholeProgramAttestation, additive::FamilyFallbackReceipt, decision};
+use super::{OverlapMode, WholeProgramAttestation, additive::FamilyFallbackReceipt, decision};
 
 /// `binn_get_bool` / `is_bool_str` reduced from binn with both pointees `i32`
 /// (the width difference was incidental to the collision, report 007).
@@ -40,7 +40,7 @@ pub(super) fn decide(input: &str) -> Result<Outcome, String> {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )?;
@@ -247,7 +247,7 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("prior terminal plan");
             let mut prior = StageSnapshot {
@@ -706,7 +706,7 @@ pub unsafe fn root(root_value: *const i32) -> i32 { near(root_value) }
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .expect("prior terminal plan");
             // No dependency edges added: the chain's classes are unconnected
@@ -1370,7 +1370,7 @@ fn quadtree_mutable_reborrow_over_weakened_argument_places() {
         false,
         false,
         Some((
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );

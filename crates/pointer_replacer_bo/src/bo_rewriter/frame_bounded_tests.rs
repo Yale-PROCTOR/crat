@@ -37,7 +37,7 @@ fn retention_row(input: &str, function: &str, argument: usize) -> (String, Strin
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

@@ -8,7 +8,7 @@
 //! initializer was refused as `body-unnameable-rhs`. The reborrow bridge
 //! `&*(<initializer>)` / `&mut *(<initializer>)` is the `c` arm's own
 //! `GlueCore::Reborrow` at the declaration.
-use super::{A5Mode, RewriteOutcome, WholeProgramAttestation};
+use super::{OverlapMode, RewriteOutcome, WholeProgramAttestation};
 
 fn rewrite(input: &str) -> RewriteOutcome {
     super::rewrite_core_injected(
@@ -20,7 +20,7 @@ fn rewrite(input: &str) -> RewriteOutcome {
         false,
         false,
         Some((
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )
@@ -128,7 +128,7 @@ pub unsafe fn c(x: *mut i32) {{
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -208,7 +208,7 @@ pub unsafe fn caller(values: *const f64, n: i32) -> f64 {{ return sum_and_first(
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

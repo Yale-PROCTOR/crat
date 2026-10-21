@@ -55,15 +55,15 @@ use rustc_middle::{
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::{A5Mode, WholeProgramAttestation},
-        a5_producer::PlannedC9Mark,
-        construction::{cached_precise_rewriter_payload, solve_bo_a5_config},
+        construction::{cached_precise_rewriter_payload, solve_bo_overlap_config},
         crate_slots::{CrateSlots, ptr_chain_depth},
         export::with_bo_export,
         model_cache,
         mutability_facts::MutFacts,
         origin_summary::OriginSummaries,
         origins::compute_origins,
+        overlap_producer::PlannedCopyMark,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
         solver::SlotRef,
     },
     utils::rustc::RustProgram,
@@ -521,7 +521,7 @@ pub(crate) struct E1Capture {
     pub(crate) attempted_placements: usize,
     pub(crate) files_touched: usize,
     pub(crate) unplaceable: usize,
-    pub(crate) a5_receipt: String,
+    pub(crate) overlap_receipt: String,
     /// D4's emitted-MIR Box-drop reconciliation. Empty on non-census paths.
     pub(crate) box_drop_receipt: String,
     pub(crate) solve_receipt: model_cache::SolveReceipt,
@@ -967,7 +967,7 @@ pub(crate) enum RewriteOutcome {
         /// frozen corpus; a nonzero count is a finding to rule on.
         unplaceable: Vec<plan::Unplaceable>,
         /// Resolved A5 construction and selected-model identity.
-        a5_receipt: String,
+        overlap_receipt: String,
         /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
         e1_reverts: Vec<E1RevertDiagnostic>,
         /// E1's adapter receipt, empty on ordinary runs.
@@ -1040,7 +1040,7 @@ pub(crate) enum RewriteOutcome {
         /// gate rather than a tidy-up.
         unplaceable: Vec<plan::Unplaceable>,
         /// Resolved A5 construction and selected-model identity.
-        a5_receipt: String,
+        overlap_receipt: String,
         /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
         e1_reverts: Vec<E1RevertDiagnostic>,
         /// E1's adapter receipt, empty on ordinary runs.
@@ -1173,7 +1173,7 @@ pub(crate) fn rewrite_m1_census_world(input: &str) -> RewriteOutcome {
         false,
         false,
         Some((
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )
@@ -1318,7 +1318,7 @@ pub(crate) fn rewrite_m1_path_injected(
 #[cfg(test)]
 pub(crate) fn rewrite_m1_path_a5_injected(
     root: &std::path::Path,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
 ) -> RewriteOutcome {
@@ -1337,7 +1337,7 @@ pub(crate) fn rewrite_m1_path_a5_injected(
 #[cfg(test)]
 pub(crate) fn rewrite_m1_path_with_emission_config(
     root: &std::path::Path,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     run_config: &EmissionRunConfig,
 ) -> RewriteOutcome {
@@ -1386,7 +1386,7 @@ fn rewrite_core_injected(
     probe_only: bool,
     census_once: bool,
     raw_boundary_full: bool,
-    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
 ) -> RewriteOutcome {
     rewrite_core_injected_with_config(
         input,
@@ -1410,7 +1410,7 @@ fn rewrite_core_injected_with_config(
     probe_only: bool,
     census_once: bool,
     raw_boundary_full: bool,
-    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
     run_config: &EmissionRunConfig,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
@@ -1453,8 +1453,8 @@ fn rewrite_core_injected_with_config(
         let capture = ast_transform::capture_ast(tcx)?;
         let (mut table, mut decide_ctx) =
             decide_table_with_emission_config(tcx, a5_override, run_config)?;
-        let retained_c9_plans = decide_ctx.retained_c9_plans.clone();
-        let a5_receipt = decide_ctx.a5_receipt.clone();
+        let retained_copy_plans = decide_ctx.retained_copy_plans.clone();
+        let overlap_receipt = decide_ctx.overlap_receipt.clone();
         inject(&mut table);
         let table = table;
         let source_map = tcx.sess.source_map();
@@ -1486,7 +1486,7 @@ fn rewrite_core_injected_with_config(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &retained_c9_plans,
+            &retained_copy_plans,
         )?;
         let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
@@ -1695,7 +1695,7 @@ fn rewrite_core_injected_with_config(
             root_text,
             emitted_sites,
             emitted_subjects,
-            a5_receipt,
+            overlap_receipt,
             e1_subject_receipt,
             decide_ctx.e2_artifacts.clone(),
             decide_ctx.raw_boundary_artifacts.clone(),
@@ -2096,7 +2096,7 @@ fn verify_and_revert(
     root_text: String,
     emitted_sites: Vec<EmittedSite>,
     emitted_subjects: Vec<EmittedSubject>,
-    a5_receipt: String,
+    overlap_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
     mut raw_boundary_artifacts: RawBoundaryArtifacts,
@@ -2273,7 +2273,7 @@ fn verify_and_revert(
         baseline_keys: 0,
         baseline_errors: 0,
         baseline_msg_env: 0,
-        a5_receipt,
+        overlap_receipt,
         e1_reverts: Vec::new(),
         e1_adapter_receipt: if census_once {
             seam_tsv_from_table(tcx, table)
@@ -3861,7 +3861,7 @@ fn decide_table_with_ctx<'tcx>(
 
 #[cfg(test)]
 pub(crate) fn cache_decide_receipt_for_test(tcx: TyCtxt<'_>) -> Result<String, String> {
-    decide_table_with_ctx(tcx).map(|(_, context)| context.a5_receipt)
+    decide_table_with_ctx(tcx).map(|(_, context)| context.overlap_receipt)
 }
 
 #[cfg(test)]
@@ -3869,21 +3869,21 @@ pub(crate) fn cache_fingerprint_for_test(tcx: TyCtxt<'_>) -> String {
     let program = collect_program(tcx);
     model_cache::fingerprint(
         &program,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     )
 }
 
 fn decide_table_with_ctx_config<'tcx>(
     tcx: TyCtxt<'tcx>,
-    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     decide_table_perturbed_config(tcx, |_| {}, a5_override, &EmissionRunConfig::default())
 }
 
 pub(crate) fn decide_table_with_emission_config<'tcx>(
     tcx: TyCtxt<'tcx>,
-    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
     run_config: &EmissionRunConfig,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     decide_table_perturbed_config(tcx, |_| {}, a5_override, run_config)
@@ -4066,7 +4066,7 @@ struct OutcomeFacts {
     /// left inventing a normalization. That is precisely how a second and then
     /// a third path canonicalizer came to exist.
     observed_root: Option<std::path::PathBuf>,
-    a5_receipt: String,
+    overlap_receipt: String,
     e1_reverts: Vec<E1RevertDiagnostic>,
     e1_adapter_receipt: String,
     e1_subject_receipt: String,
@@ -4137,7 +4137,7 @@ impl RewriteOutcome {
             attempted_placements,
             files_touched,
             unplaceable,
-            a5_receipt,
+            overlap_receipt,
             solve_receipt,
             outcome_reason,
             outcome_kind,
@@ -4164,7 +4164,7 @@ impl RewriteOutcome {
                 emitted_count,
                 files_touched,
                 unplaceable,
-                a5_receipt,
+                overlap_receipt,
                 solve_receipt,
                 escalated,
                 bisect_probes,
@@ -4187,7 +4187,7 @@ impl RewriteOutcome {
                 emitted_count,
                 files_touched,
                 unplaceable.len(),
-                a5_receipt,
+                overlap_receipt,
                 solve_receipt,
                 "emitted".to_owned(),
                 CensusOutcomeKind::Emitted,
@@ -4214,7 +4214,7 @@ impl RewriteOutcome {
                 emitted_count,
                 files_touched,
                 unplaceable,
-                a5_receipt,
+                overlap_receipt,
                 solve_receipt,
                 bisect_probes,
                 verify_rounds,
@@ -4236,7 +4236,7 @@ impl RewriteOutcome {
                 emitted_count,
                 files_touched,
                 unplaceable.len(),
-                a5_receipt,
+                overlap_receipt,
                 solve_receipt,
                 reason.clone(),
                 CensusOutcomeKind::Degraded,
@@ -4263,7 +4263,7 @@ impl RewriteOutcome {
             attempted_placements,
             files_touched,
             unplaceable,
-            a5_receipt,
+            overlap_receipt,
             box_drop_receipt: e1_box_drop_receipt,
             solve_receipt: solve_receipt
                 .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
@@ -4277,9 +4277,14 @@ impl RewriteOutcome {
     }
 
     #[cfg(test)]
-    pub(crate) fn a5_receipt(&self) -> &str {
+    pub(crate) fn overlap_receipt(&self) -> &str {
         match self {
-            Self::Emitted { a5_receipt, .. } | Self::Degraded { a5_receipt, .. } => a5_receipt,
+            Self::Emitted {
+                overlap_receipt, ..
+            }
+            | Self::Degraded {
+                overlap_receipt, ..
+            } => overlap_receipt,
         }
     }
 
@@ -4348,7 +4353,7 @@ impl OutcomeFacts {
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
-            a5_receipt: self.a5_receipt,
+            overlap_receipt: self.overlap_receipt,
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
@@ -4450,7 +4455,7 @@ impl OutcomeFacts {
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
-            a5_receipt: self.a5_receipt,
+            overlap_receipt: self.overlap_receipt,
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
@@ -6601,9 +6606,9 @@ pub(crate) fn emit_files<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &decision::DecisionTable,
     reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
-    retained_c9_plans: &[PlannedC9Mark],
+    retained_copy_plans: &[PlannedCopyMark],
 ) -> Result<Emission, String> {
-    prepare_plan_files(tcx, table, reverted, retained_c9_plans)
+    prepare_plan_files(tcx, table, reverted, retained_copy_plans)
 }
 
 /// Pure planning, class finalization and structural validation shared with
@@ -6878,7 +6883,7 @@ fn prepare_plan_files<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &decision::DecisionTable,
     reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
-    retained_c9_plans: &[PlannedC9Mark],
+    retained_copy_plans: &[PlannedCopyMark],
 ) -> Result<Emission, String> {
     // Repeated edits can have one licensed effect; repeated subjects corrupt
     // placement and receipt accounting and are an input invariant violation.
@@ -7168,7 +7173,7 @@ fn prepare_plan_files<'tcx>(
             edit_kind: "pair-raw-view",
         });
     }
-    for mark in retained_c9_plans {
+    for mark in retained_copy_plans {
         if reverted.contains(&mark.owner_did) {
             continue;
         }
@@ -7600,7 +7605,7 @@ fn decide_table_perturbed<'tcx>(
 /// intact rather than being projected into an A5-specific export.
 struct DecisionAnalysisCarrier {
     origins: Option<OriginSummaries>,
-    a5_mode: A5Mode,
+    a5_mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     cache_load_wall_s: f64,
     origin_derivation_wall_s: f64,
@@ -7610,13 +7615,13 @@ fn cached_rewriter_plans(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     mut_facts: &MutFacts,
-    a5_mode: A5Mode,
+    a5_mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     cached: &model_cache::CachedModel,
-) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>, f64), String> {
+) -> Result<(Vec<PlannedCopyMark>, Option<OriginSummaries>, f64), String> {
     match a5_mode {
-        A5Mode::Baseline => Ok((Vec::new(), None, 0.0)),
-        A5Mode::PreciseReplay => {
+        OverlapMode::Baseline => Ok((Vec::new(), None, 0.0)),
+        OverlapMode::PreciseReplay => {
             let origin_started = std::time::Instant::now();
             let origins = compute_origins(program);
             let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
@@ -7628,11 +7633,11 @@ fn cached_rewriter_plans(
                 &cached.baseline_model,
                 &cached.model,
                 attestation,
-                &cached.a5_receipt,
+                &cached.overlap_receipt,
             )?;
             Ok((plans, Some(origins), origin_derivation_wall_s))
         }
-        A5Mode::CoarseConstraint => {
+        OverlapMode::CoarseConstraint => {
             Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
         }
     }
@@ -7641,14 +7646,14 @@ fn cached_rewriter_plans(
 fn decide_table_perturbed_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
-    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
     run_config: &EmissionRunConfig,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
     let (a5_mode, attestation) = a5_override.unwrap_or((
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     ));
 
@@ -7663,7 +7668,7 @@ fn decide_table_perturbed_config<'tcx>(
     // which program this is.
     let fp = model_cache::fingerprint(&program, a5_mode, attestation);
     // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
-    let cacheable = a5_mode == A5Mode::PreciseReplay
+    let cacheable = a5_mode == OverlapMode::PreciseReplay
         && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
     let cache_started = std::time::Instant::now();
 
@@ -7673,7 +7678,7 @@ fn decide_table_perturbed_config<'tcx>(
     // makes a consumer's cost its own work, not another whole solve.
     if cacheable
         && let Some(cached) = model_cache::memo_get(&fp)
-        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
+        && let Ok((retained_copy_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         return finish_decide(
@@ -7682,8 +7687,8 @@ fn decide_table_perturbed_config<'tcx>(
             slots,
             mut_facts,
             cached.model,
-            retained_c9_plans,
-            cached.a5_receipt,
+            retained_copy_plans,
+            cached.overlap_receipt,
             DecisionAnalysisCarrier {
                 origins,
                 a5_mode,
@@ -7699,7 +7704,7 @@ fn decide_table_perturbed_config<'tcx>(
     // Tier 2: the on-disk cache.
     if cacheable
         && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
-        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
+        && let Ok((retained_copy_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
@@ -7720,8 +7725,8 @@ fn decide_table_perturbed_config<'tcx>(
             slots,
             mut_facts,
             cached.model,
-            retained_c9_plans,
-            cached.a5_receipt,
+            retained_copy_plans,
+            cached.overlap_receipt,
             DecisionAnalysisCarrier {
                 origins,
                 a5_mode,
@@ -7738,7 +7743,7 @@ fn decide_table_perturbed_config<'tcx>(
     let origins = compute_origins(&program);
     let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
     let (verified, _export) = with_bo_export(|| {
-        solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
+        solve_bo_overlap_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
     });
     let Some(verified) = verified else {
         return Err("BO declined — no accepted model".to_owned());
@@ -7749,7 +7754,7 @@ fn decide_table_perturbed_config<'tcx>(
     let cached = model_cache::CachedModel {
         model: verified.model.clone(),
         baseline_model: verified.baseline_model.clone(),
-        a5_receipt: verified.receipt.clone(),
+        overlap_receipt: verified.receipt.clone(),
     };
     let cache_entry = if cacheable {
         model_cache::memo_put(&fp, &cached);
@@ -7779,7 +7784,7 @@ fn decide_table_perturbed_config<'tcx>(
         slots,
         mut_facts,
         verified.model,
-        verified.retained_c9_plans,
+        verified.retained_copy_plans,
         verified.receipt,
         DecisionAnalysisCarrier {
             origins: Some(origins),
@@ -7876,8 +7881,8 @@ fn finish_decide<'tcx>(
     slots: CrateSlots,
     mut_facts: MutFacts,
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
-    mut retained_c9_plans: Vec<PlannedC9Mark>,
-    a5_receipt: String,
+    mut retained_copy_plans: Vec<PlannedCopyMark>,
+    overlap_receipt: String,
     analysis: DecisionAnalysisCarrier,
     run_config: &EmissionRunConfig,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
@@ -8460,7 +8465,7 @@ fn finish_decide<'tcx>(
             decision::DegradeReason,
         >,
     ) = (None, Default::default());
-    let original_c9_plans = retained_c9_plans.clone();
+    let original_c9_plans = retained_copy_plans.clone();
     let mut a5_role_profile = None;
     // wave-6f: fields a finalization refused, with the cause; grows only, so
     // the re-derivation below terminates.
@@ -8533,7 +8538,7 @@ fn finish_decide<'tcx>(
             &mut ctors,
             &mut subjects,
         );
-        retained_c9_plans = original_c9_plans.clone();
+        retained_copy_plans = original_c9_plans.clone();
         facts.body_adapters = original_body_adapters.clone();
         let current_slice_uses = additive::select_uses(
             &return_slice_uses,
@@ -8804,7 +8809,7 @@ fn finish_decide<'tcx>(
                 &e2_hypothetical,
                 &escapes,
                 decision::co_conversion::OverlapRule::BlindOnly,
-                &retained_c9_plans,
+                &retained_copy_plans,
                 &lifetime_eligibility,
                 &raw_boundary,
                 Some(&a5_site_proofs),
@@ -9002,7 +9007,7 @@ fn finish_decide<'tcx>(
                         &a5_site_proofs,
                         &mut_facts,
                         coconv.pair_sites(),
-                        &retained_c9_plans,
+                        &retained_copy_plans,
                     ))
                 {
                     if forced.contains_key(&node) {
@@ -9422,7 +9427,7 @@ fn finish_decide<'tcx>(
             &facts,
             &subjects,
             &table,
-            &retained_c9_plans,
+            &retained_copy_plans,
             &a5_site_proofs,
             &raw_boundary,
             &coconv,
@@ -9442,8 +9447,8 @@ fn finish_decide<'tcx>(
         table.arm_requirements = arm_requirements;
         let seam_wall_s = seam_started.elapsed().as_secs_f64();
         let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
-        let c9_before_final_filter = retained_c9_plans.len();
-        retained_c9_plans.retain(|mark| {
+        let c9_before_final_filter = retained_copy_plans.len();
+        retained_copy_plans.retain(|mark| {
             let call_span = mark.call_span.source_callsite();
             let caller = tcx.def_path_str(mark.caller_did.to_def_id());
             let nested_reborrow = table.seams.edits.iter().any(|edit| {
@@ -9470,13 +9475,13 @@ fn finish_decide<'tcx>(
                     })
                 })
         });
-        if retained_c9_plans.len() != c9_before_final_filter {
+        if retained_copy_plans.len() != c9_before_final_filter {
             table.seams = decision::seam::synthesize_with_raw_boundary(
                 tcx,
                 &facts,
                 &subjects,
                 &table,
-                &retained_c9_plans,
+                &retained_copy_plans,
                 &a5_site_proofs,
                 &raw_boundary,
                 &coconv,
@@ -9709,7 +9714,7 @@ fn finish_decide<'tcx>(
         decision::void_region::append_receiver_declarations(&mut table);
         append_literal_local_declaration_plans(tcx, &ctors, &mut table);
         decision::null_init_declaration::append_explicit_declarations(tcx, &mut table);
-        table.c9_marks = retained_c9_plans.clone();
+        table.c9_marks = retained_copy_plans.clone();
         table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
         table.seams.raw_receivers =
             decision::raw_receiver::plan(&program, &table, &ctors, &retention);
@@ -9769,7 +9774,7 @@ fn finish_decide<'tcx>(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &retained_c9_plans,
+            &retained_copy_plans,
         )?;
         let prepared = if decision::nested_slice::promote(
             tcx,
@@ -9814,7 +9819,7 @@ fn finish_decide<'tcx>(
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &retained_c9_plans,
+                &retained_copy_plans,
             )?
         } else {
             prepared
@@ -10236,8 +10241,8 @@ fn finish_decide<'tcx>(
             escapes,
             subjects,
             hypothetical,
-            retained_c9_plans,
-            a5_receipt,
+            retained_copy_plans,
+            overlap_receipt,
             analysis,
             a5_site_proofs,
             box_facts,
@@ -11665,8 +11670,8 @@ pub(crate) struct DecideCtx {
     /// R1's rule, the one that stopped the recon worker solving BO twice.
     subjects: Vec<decision::Subject>,
     hypothetical: decision::DecisionTable,
-    retained_c9_plans: Vec<PlannedC9Mark>,
-    a5_receipt: String,
+    retained_copy_plans: Vec<PlannedCopyMark>,
+    overlap_receipt: String,
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,

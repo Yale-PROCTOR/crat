@@ -34,8 +34,8 @@ const DEAD_LOCAL: &str = "#![allow(dead_code, unused_unsafe)]\n\
 fn inputs(source: &'static str) -> (Vec<Input>, BTreeSet<String>) {
     ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one original fixture decision call");
         let solve = super::model_cache::solve_receipt();
         println!("SIBLING-AUDIT fixture solve={solve:#?}");

@@ -39,7 +39,7 @@ fn outbound_return_receipt_selected_slice_receiver_has_required_and_specialized_
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
             let capture = super::ast_transform::capture_ast(tcx).expect("one original J27 receiver capture");
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             ))).expect("one actual J27 receiver decision pipeline");
             let solve = super::model_cache::solve_receipt();
             println!("J27 actual receiver solve={solve:#?}");
@@ -66,7 +66,7 @@ fn outbound_return_receipt_selected_slice_receiver_has_required_and_specialized_
             use crate::analyses::borrow_ownership::slots::SlotOwner;
             assert!(flow.body.depth0_value_flows().contains(&(
                 SlotOwner::Local(p.local), SlotOwner::Local(RETURN_PLACE))));
-            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
                 .expect("actual receiver emission plan");
             let caller = SignatureClassId::of(q.fn_did);
             let callee = SignatureClassId::of(p.fn_did);

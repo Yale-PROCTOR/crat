@@ -140,7 +140,7 @@ fn a5_view(shape: &'static str, argument: &str) -> super::decision::seam::A5RawV
         raw_boundary::{Depth2Target, RawMutability, RawTargetType},
         seam::{A5RawViewTemp, Form},
     };
-    use crate::analyses::borrow_ownership::l2::MirLocationKey;
+    use crate::analyses::borrow_ownership::guarded_repair::MirLocationKey;
     let target = RawTargetType {
         rendered: "*mut *mut u8".to_owned(),
         pointee: "*mut u8".to_owned(),

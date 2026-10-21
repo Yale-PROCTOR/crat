@@ -164,7 +164,7 @@ impl RetirementReview {
         self.demotions
             .iter()
             .flat_map(|row| row.chain.iter().copied())
-            .map(|slot| (super::super::l2::SlotKey::of(slot), slot))
+            .map(|slot| (super::super::guarded_repair::SlotKey::of(slot), slot))
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect()

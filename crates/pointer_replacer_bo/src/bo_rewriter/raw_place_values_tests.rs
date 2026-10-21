@@ -17,7 +17,7 @@ fn emitted_reverting(input: &str, binding: &str, withdraw: bool) -> (String, Dec
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -25,8 +25,9 @@ fn emitted_reverting(input: &str, binding: &str, withdraw: bool) -> (String, Dec
         for (subject, decision) in &table.entries {
             println!("DECISION {} {decision:?}", subject.label);
         }
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
-            .expect("emission plan");
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("emission plan");
         let mut held = emission.plan.held_classes();
         if withdraw {
             let owner = table
@@ -133,7 +134,7 @@ fn wave6k_urlparser_static_literal_format_keeps_its_thin_extent_hold() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

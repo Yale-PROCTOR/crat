@@ -2,7 +2,7 @@
 
 use super::{
     super::{SlotKind, ssa::constraint::Var},
-    tests::{Fixture, inspect_era5_frame},
+    tests::{Fixture, inspect_attested_frame},
 };
 
 const CODE: &str = r#"
@@ -85,7 +85,7 @@ fn assert_original_endpoints_kept(fixture: &Fixture) {
 
 #[test]
 fn c07_traversal_activation_borrows_return_and_retains_original_owner_free() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     let expected = [
         ("caller::root", SlotKind::Owning),
         ("caller::result", SlotKind::Ref),
@@ -126,7 +126,7 @@ fn c07_traversal_activation_borrows_return_and_retains_original_owner_free() {
 
 #[test]
 fn c07_traversal_activation_fresh_identity_return_keeps_owning_transfer() {
-    let fixture = inspect_era5_frame(
+    let fixture = inspect_attested_frame(
         r#"
 unsafe extern "C" {
     fn malloc(size:usize)->*mut core::ffi::c_void;
@@ -169,11 +169,11 @@ fn c07_traversal_activation_all_original_endpoints_hard_sat() {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
-        a5_overlap::WholeProgramAttestation,
         construction::{CopyLendMode, construct_bo_into},
         crate_slots::CrateSlots,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::WholeProgramAttestation,
         solver::KindSolver,
     };
     ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
@@ -249,7 +249,7 @@ fn c07_traversal_activation_holds_open_world_retention_with_cast_premise_control
             .all(|(_, selected)| !*selected)
     );
     let retained=CODE.replace("pub unsafe fn minimum(mut node:*mut Node)->*mut Node {","static mut SAVED:*mut Node=0 as *mut Node;pub unsafe fn minimum(mut node:*mut Node)->*mut Node {SAVED=node;");
-    let retained = inspect_era5_frame(&retained);
+    let retained = inspect_attested_frame(&retained);
     assert!(retained.accepted);
     assert!(
         retained
@@ -264,7 +264,7 @@ fn c07_traversal_activation_holds_open_world_retention_with_cast_premise_control
     let raw = format!(
         "{CODE}\npub unsafe fn raw_caller(address:usize)->i32{{let node=address as *mut Node;let result=minimum(node);(*result).value}}"
     );
-    let raw = inspect_era5_frame(&raw);
+    let raw = inspect_attested_frame(&raw);
     assert!(raw.accepted);
     eprintln!("R284_RAW_ACTUAL_KINDS={:?}", raw.kinds);
     // R284 attribution: an integer cast alone is Ref in this frame, so it
@@ -289,7 +289,7 @@ fn c07_traversal_activation_raw_write_before_borrow_use_remains_held() {
         "let value=(*result).value;",
         "(*root).value=9;let value=(*result).value;",
     );
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     assert!(fixture.accepted);
     assert!(
         fixture
@@ -307,7 +307,7 @@ fn c07_traversal_activation_raw_write_before_borrow_use_remains_held() {
 
 #[test]
 fn c07_traversal_activation_exports_returned_loan() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     fixture.assert_kind("caller::root", SlotKind::Owning);
     fixture.assert_kind("caller::result", SlotKind::Ref);
     let accepted =
@@ -331,7 +331,7 @@ fn c07_traversal_activation_exports_returned_loan() {
 #[test]
 fn c07_traversal_activation_owner_write_after_last_use_grants() {
     let code = CODE.replace("free(root as", "(*root).value=9;free(root as");
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     fixture.assert_kind("caller::root", SlotKind::Owning);
     fixture.assert_kind("caller::result", SlotKind::Ref);
     assert!(
@@ -352,7 +352,7 @@ fn c07_traversal_activation_copy_keeps_the_returned_loan_live() {
         "let value=(*result).value;",
         "let copy=result;(*root).value=9;let value=(*copy).value;",
     );
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     assert!(fixture.accepted);
     assert!(
         fixture

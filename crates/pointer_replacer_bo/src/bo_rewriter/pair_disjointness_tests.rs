@@ -7,7 +7,7 @@
 //! `2026-09-15-wave-6p-certificate-market/red-*.log`).
 
 use crate::{
-    analyses::borrow_ownership::a5_overlap::{A5Mode, WholeProgramAttestation},
+    analyses::borrow_ownership::param_overlap::{OverlapMode, WholeProgramAttestation},
     bo_rewriter::{
         self,
         decision::{
@@ -18,9 +18,9 @@ use crate::{
     },
 };
 
-fn precise() -> Option<(A5Mode, Option<WholeProgramAttestation>)> {
+fn precise() -> Option<(OverlapMode, Option<WholeProgramAttestation>)> {
     Some((
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     ))
 }
@@ -1347,7 +1347,7 @@ fn path_emission(source: &str, tag: &str) -> (String, usize, Vec<String>) {
     std::fs::write(&root, source).expect("fixture file");
     let outcome = bo_rewriter::rewrite_m1_path_a5_injected(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );
@@ -1595,7 +1595,7 @@ pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
             );
         }
         let emission =
-            bo_rewriter::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            bo_rewriter::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
                 .expect("e");
         for class in emission.plan.held_classes() {
             println!(

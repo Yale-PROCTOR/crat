@@ -57,7 +57,7 @@ fn site_rows(caller: &str, callee: &str) -> Vec<String> {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -120,7 +120,7 @@ fn settled(caller: &str, callee: &str, index: usize) -> bool {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

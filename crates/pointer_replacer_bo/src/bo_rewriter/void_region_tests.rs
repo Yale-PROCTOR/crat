@@ -850,7 +850,7 @@ fn emitted_source_with(
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let held = emission.plan.held_classes();
             let reverts = super::ast_transform::revert_set_from_classes_and_atoms(

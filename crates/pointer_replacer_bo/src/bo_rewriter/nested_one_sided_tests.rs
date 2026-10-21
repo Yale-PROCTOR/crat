@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use super::{
-    A5Mode, SlotKind, SlotRef, WholeProgramAttestation,
+    OverlapMode, SlotKind, SlotRef, WholeProgramAttestation,
     decision::{Decision, nested_slice::Hold},
 };
 
@@ -34,7 +34,7 @@ fn emitted() -> &'static str {
         std::fs::write(&root, SOURCE).unwrap();
         let outcome = super::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
@@ -69,7 +69,7 @@ fn decisions(name: &str) -> Vec<(String, Decision)> {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -104,7 +104,7 @@ fn n1_frame_premises_are_exactly_what_the_rule_consumes() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -169,7 +169,7 @@ fn n1_delivers_every_qualifying_table_where_the_pair_rule_holds() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -355,7 +355,7 @@ fn n1_relocates_the_fabricated_extent_without_adding_one() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -406,7 +406,7 @@ fn n1_never_shadows_an_admitted_pair_plan() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -486,7 +486,7 @@ fn n1_the_mixed_owner_commits_both_parameters_and_rebases_its_cursor_row() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -562,7 +562,7 @@ fn n1_every_planned_row_names_a_construction() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -613,7 +613,7 @@ fn n1_an_owner_it_cannot_type_is_held_not_withdrawn() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -653,7 +653,7 @@ fn n1_standoff_does_not_touch_an_owner_without_a_cursor_row() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -753,7 +753,7 @@ fn w3_a_table_the_arm_cannot_take_is_skipped_not_rolled_back() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

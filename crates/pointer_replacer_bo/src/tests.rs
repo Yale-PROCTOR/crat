@@ -399,8 +399,8 @@ mod borrow_ownership_solver {
     use crate::{
         analyses::borrow_ownership::{
             SlotKind,
-            a5_overlap::{A5Mode, apply_coarse_constraints},
             crate_slots::CrateSlots,
+            param_overlap::{OverlapMode, apply_coarse_constraints},
             slots::SlotId,
             solver::{KindSolver, Selectors, SlotRef},
         },
@@ -627,13 +627,13 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             let expected = KindSolver::new(slots)
                 .model_kinds()
                 .expect("baseline model");
-            for mode in [A5Mode::Baseline, A5Mode::PreciseReplay] {
+            for mode in [OverlapMode::Baseline, OverlapMode::PreciseReplay] {
                 let solver = KindSolver::new(slots);
                 assert_eq!(apply_coarse_constraints(mode, &solver, [(left, right)]), 0);
                 assert_eq!(solver.model_kinds().expect("neutral model"), expected);
             }
-            assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
-            assert!(!A5Mode::PreciseReplay.is_pricing_control());
+            assert_eq!(OverlapMode::proposed_landing(), OverlapMode::PreciseReplay);
+            assert!(!OverlapMode::PreciseReplay.is_pricing_control());
         });
     }
 
@@ -644,13 +644,13 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             let right = SlotRef::Local(g, d1);
             let solver = KindSolver::new(slots);
             assert_eq!(
-                apply_coarse_constraints(A5Mode::CoarseConstraint, &solver, [(right, left)]),
+                apply_coarse_constraints(OverlapMode::CoarseConstraint, &solver, [(right, left)]),
                 1
             );
             solver.assume(left, SlotKind::Ref);
             solver.assume(right, SlotKind::Ref);
             assert_eq!(solver.check(), SatResult::Unsat);
-            assert!(A5Mode::CoarseConstraint.is_pricing_control());
+            assert!(OverlapMode::CoarseConstraint.is_pricing_control());
         });
     }
 }
@@ -670,7 +670,6 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
-                a5_overlap::{A5Mode, WholeProgramAttestation},
                 borrow_engine::{
                     borrow_conflicts_replaying_with_flows_and_copy_lends,
                     borrow_conflicts_replaying_witnessed_with_copy_lends,
@@ -678,7 +677,7 @@ mod borrow_ownership_coherence {
                 },
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
-                    revalidate_replaying, verify_l2_to_fixpoint_counting, verify_to_fixpoint,
+                    revalidate_replaying, verify_guarded_to_fixpoint_counting, verify_to_fixpoint,
                 },
                 coherence::{
                     CopyLendPair, add_coherence, add_coherence_with_copy_lends,
@@ -686,8 +685,8 @@ mod borrow_ownership_coherence {
                 },
                 construction::{
                     CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
-                    construct_bo_into_a16_refined, solve_bo_a5_config,
-                    solve_bo_a5_reference_reporting, verify_bo_construction_counting,
+                    construct_bo_into_return_refined, solve_bo_overlap_config,
+                    solve_bo_overlap_reference_reporting, verify_bo_construction_counting,
                 },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
@@ -695,6 +694,7 @@ mod borrow_ownership_coherence {
                 export::{LoanClass, location_key, with_bo_export},
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
+                param_overlap::{OverlapMode, WholeProgramAttestation},
                 slots::{SlotId, SlotOwner, StructFieldSlot},
                 solver::{
                     BoOwnDatabase, KindSolver, SelectorTrace, Selectors, SlotRef,
@@ -937,7 +937,7 @@ unsafe fn tainted_caller(c: *mut Cell) -> i32 {
                 assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
 
                 let refined_solver = KindSolver::new(&slots);
-                let (refined, links) = construct_bo_into_a16_refined(
+                let (refined, links) = construct_bo_into_return_refined(
                     &program,
                     &slots,
                     &origins,
@@ -982,9 +982,10 @@ pub unsafe fn f() -> i32 {
                 let origins = compute_origins(&program);
                 let mut_facts = MutFacts::from_program(&program);
                 let solver = KindSolver::new(&slots);
-                let (_, links) =
-                    construct_bo_into_a16_refined(&program, &slots, &origins, &mut_facts, &solver)
-                        .expect("input-UB diagnostic construction");
+                let (_, links) = construct_bo_into_return_refined(
+                    &program, &slots, &origins, &mut_facts, &solver,
+                )
+                .expect("input-UB diagnostic construction");
                 assert_eq!(
                     links, 0,
                     "a stack-local return is not a modeled argument origin"
@@ -1044,7 +1045,7 @@ pub unsafe fn f() -> i32 {
                 assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
 
                 let refined_solver = KindSolver::new(&slots);
-                let (refined, links) = construct_bo_into_a16_refined(
+                let (refined, links) = construct_bo_into_return_refined(
                     &program,
                     &slots,
                     &origins,
@@ -1068,34 +1069,34 @@ pub unsafe fn f() -> i32 {
                 .expect("UB-free control refined model");
                 assert_eq!(refined_model.get(&q), Some(&SlotKind::Raw));
 
-                let production = solve_bo_a5_config(
+                let production = solve_bo_overlap_config(
                     &program,
                     &slots,
                     &origins,
                     &mut_facts,
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )
                 .expect("landed precise production model");
                 assert_eq!(production.model.get(&q), Some(&SlotKind::Raw));
-                assert_eq!(production.a16_refined_links, 2);
+                assert_eq!(production.return_refined_links, 2);
                 assert!(
                     production
                         .receipt
                         .contains("soundness_mode=a14_a16_refined\n")
                 );
 
-                let unattested = solve_bo_a5_config(
+                let unattested = solve_bo_overlap_config(
                     &program,
                     &slots,
                     &origins,
                     &mut_facts,
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     None,
                 )
                 .expect("unattested product fallback");
                 assert_eq!(unattested.model.get(&q), Some(&SlotKind::Raw));
-                assert_eq!(unattested.a16_refined_links, 2);
+                assert_eq!(unattested.return_refined_links, 2);
                 assert!(unattested.receipt.contains("a5_abi_guard=refused:"));
             },
         );
@@ -3531,7 +3532,7 @@ unsafe fn caller() -> i32 {
             let facts = MutFacts::from_program(&program);
             let (result, export) = with_bo_export(|| {
                 with_fixture_selection(|| {
-                    solve_bo_a5_reference_reporting(
+                    solve_bo_overlap_reference_reporting(
                         &program,
                         &slots,
                         &origins,
@@ -8020,7 +8021,7 @@ pub unsafe fn f() -> i32 {
                     CopyLendMode::LendArm,
                 )
                 .expect("lend construction");
-                let (model, stats) = verify_l2_to_fixpoint_counting(
+                let (model, stats) = verify_guarded_to_fixpoint_counting(
                     &program,
                     &slots,
                     origins.native_flows(),

@@ -29,8 +29,8 @@ fn potentials(input: &str, source_label: &str) -> Vec<SiblingPotential> {
 fn inventory(input: &str, source_label: &str) -> SiblingInventory {
     ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("R233 real fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("R233 fixture solve receipt ({source_label}): {solve:#?}");
@@ -661,8 +661,8 @@ fn sibling_r233_live_local_ancestor_prevents_the_dead_local_exception() {
     );
     ::utils::compilation::run_compiler_on_str(&input, |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("ancestor fixture uses the actual decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("R233 ancestor-live fixture solve receipt: {solve:#?}");

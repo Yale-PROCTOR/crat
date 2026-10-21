@@ -13,7 +13,7 @@ fn alias_is_another_family(input: &str, name: &str) -> bool {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -31,7 +31,7 @@ fn verify(input: &str, owner_name: &str, shape: BoxShape, transfer: bool) -> Str
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -70,7 +70,7 @@ fn verify(input: &str, owner_name: &str, shape: BoxShape, transfer: bool) -> Str
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -265,7 +265,7 @@ fn r399_heman_gaussian_row_tmp_real_shape_narrowed_nbytes_local() {
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -379,7 +379,7 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -420,7 +420,7 @@ pub unsafe extern "C" fn heman_points_destroy(mut victim: *mut heman_points) {{
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -456,7 +456,7 @@ fn r399_aggregate_owner_with_an_unsupplied_field_holds() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -499,7 +499,7 @@ fn r399_return_transfer_faults_uncovered_live_exit_and_zero_capable_slice() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -533,7 +533,7 @@ fn r399_return_transfer_faults_uncovered_live_exit_and_zero_capable_slice() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -632,7 +632,7 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -711,7 +711,7 @@ pub unsafe extern "C" fn transform_to_coordfield(mut data: *mut libc::c_float, m
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -815,7 +815,7 @@ fn r401_peer_derived_from_the_subject_is_not_disjoint() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -894,7 +894,7 @@ pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -937,7 +937,7 @@ fn r419_annotated_binding_is_retyped_on_both_emission_paths() {
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -1015,7 +1015,7 @@ pub mod points {{
         true,
         true,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -1071,7 +1071,7 @@ unsafe extern "C" fn _match(mut mask: *mut heman_image, mut mask_color: heman_co
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1098,7 +1098,7 @@ unsafe extern "C" fn _match(mut mask: *mut heman_image, mut mask_color: heman_co
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -1352,7 +1352,7 @@ pub static mut INF: libc::c_float = 1E20f64 as libc::c_float;
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1467,7 +1467,7 @@ fn r407_per_iteration_alias_is_admitted_and_its_owner_class_holds() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1547,7 +1547,7 @@ fn r407_view_alias_start_must_be_pure() {
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -1748,7 +1748,7 @@ pub unsafe extern "C" fn heman_image_destroy(mut img: *mut heman_image) {{
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2056,7 +2056,7 @@ fn r395_scalar_arithmetic_call_arguments_are_pure_but_effectful_ones_hold() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2097,7 +2097,7 @@ fn r408_argument_reading_through_the_owner_holds_no_hoist_is_owed() {
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2133,7 +2133,7 @@ fn r395_transfer_site_has_no_later_root_use_or_second_free() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2175,7 +2175,7 @@ fn r395_nonconsuming_void_call_preserves_target_pointer_cast() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2228,7 +2228,7 @@ fn r395_zero_capable_transfer_is_held() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2321,7 +2321,7 @@ pub unsafe extern "C" fn run() {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2369,7 +2369,7 @@ pub unsafe extern "C" fn run() {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -2686,7 +2686,7 @@ fn r434_a_reference_that_cannot_reach_the_owner_keeps_the_owner() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2717,7 +2717,7 @@ fn r434_a_reference_that_cannot_reach_the_owner_keeps_the_owner() {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -2801,7 +2801,7 @@ fn r434_a_reference_that_can_reach_the_owner_still_refuses() {
             let (table, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2860,7 +2860,7 @@ fn r435_an_owner_access_nested_in_another_owners_index_composes() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2935,7 +2935,7 @@ fn moved_out_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxP
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3001,7 +3001,7 @@ fn holder_plan(form: Option<&str>) -> Result<super::decision::box_facts::BoxPlan
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3267,7 +3267,7 @@ fn r466_the_synthesised_literal_is_text_the_graft_accepts() {
             let (table, _) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -3495,7 +3495,7 @@ fn r442_an_alias_another_family_renders_keeps_the_owner_typed() {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3635,7 +3635,7 @@ fn r536_a_selected_literal_joins_its_fields_withdrawal_key() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3721,7 +3721,7 @@ fn r560_a_moved_out_owner_whose_container_is_freed_is_an_optional_box() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3815,7 +3815,7 @@ pub unsafe fn cut(mut root: *mut node) -> *mut node {{
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -4204,7 +4204,7 @@ fn r641_receipts(marker: &str, body: &str) -> Vec<String> {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

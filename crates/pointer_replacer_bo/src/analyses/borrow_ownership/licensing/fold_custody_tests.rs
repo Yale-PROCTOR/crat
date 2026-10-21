@@ -1,9 +1,9 @@
 //! Native same-model custody before fold activation; input never executed.
-use super::{fold_chain_tests::CODE, tests::inspect_era5_frame};
+use super::{fold_chain_tests::CODE, tests::inspect_attested_frame};
 
 #[test]
 fn gf08_custody_records_the_native_ownership_and_endpoint_denominator() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     assert!(fixture.accepted, "{:?}", fixture.construction_error);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
@@ -59,7 +59,7 @@ fn gf08_custody_records_the_native_ownership_and_endpoint_denominator() {
 
 #[test]
 fn gf08_custody_observed_empty_is_explicit_in_the_accepting_stamp() {
-    let fixture = inspect_era5_frame("pub unsafe fn read(p:*const i32)->i32{*p}");
+    let fixture = inspect_attested_frame("pub unsafe fn read(p:*const i32)->i32{*p}");
     assert!(fixture.accepted, "{:?}", fixture.construction_error);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let encoded = serde_json::to_value(accepted).unwrap();
@@ -108,7 +108,7 @@ fn gf08_custody_identity_and_missing_evaluation_never_default() {
 
 #[test]
 fn gf08_custody_rejects_missing_duplicate_and_inconsistent_native_values() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
         .export
@@ -184,7 +184,7 @@ fn gf08_custody_rejects_missing_duplicate_and_inconsistent_native_values() {
 
 #[test]
 fn gf08_custody_checks_every_selected_premise_on_a_proposed_valuation() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     let mut proposed = fixture.export.stack_entry_final.as_ref().unwrap().clone();
     let snapshot = fixture
         .export
@@ -279,7 +279,7 @@ fn gf08_custody_checks_every_selected_premise_on_a_proposed_valuation() {
 
 #[test]
 fn gf08_custody_rejects_joint_false_guard_with_kept_native_endpoints() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     let mut changed = fixture.export.stack_entry_final.as_ref().unwrap().clone();
     let snapshot = fixture
         .export
@@ -335,7 +335,7 @@ fn gf08_custody_rejects_joint_false_guard_with_kept_native_endpoints() {
 #[test]
 fn oc09_custody_covers_the_member_requirements_in_the_accepting_model() {
     use std::collections::BTreeSet;
-    let fixture = inspect_era5_frame(super::fold_subtree_tests::CODE);
+    let fixture = inspect_attested_frame(super::fold_subtree_tests::CODE);
     assert!(fixture.accepted, "{:?}", fixture.construction_error);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
@@ -398,7 +398,7 @@ fn oc09_custody_covers_the_member_requirements_in_the_accepting_model() {
 #[ignore = "diagnostic for the member-selected witness"]
 fn r348_member_selection_preflight() {
     eprintln!(); // R325-1
-    let fixture = inspect_era5_frame(super::witnesses::BST);
+    let fixture = inspect_attested_frame(super::witnesses::BST);
     eprintln!(
         "MEMBERSEL accepted={} error={:?}",
         fixture.accepted, fixture.construction_error
@@ -470,7 +470,7 @@ fn r348_member_selection_preflight() {
 #[ignore = "diagnostic for the deleteNode store control"]
 fn r351_fixture_delete_node_store_control() {
     eprintln!(); // R325-1
-    let fixture = inspect_era5_frame(super::witnesses::BST);
+    let fixture = inspect_attested_frame(super::witnesses::BST);
     eprintln!(
         "FIXTURE accepted={} error={:?}",
         fixture.accepted, fixture.construction_error

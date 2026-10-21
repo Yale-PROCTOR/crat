@@ -80,7 +80,7 @@ fn check(family: Family) {
     let emitted = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original receiver AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual receiver decision call");
         let solve = super::model_cache::solve_receipt();
@@ -171,7 +171,7 @@ fn check(family: Family) {
             assert!(table.option_mut_bindings.contains(&node),
                 "repeated mutable Option uses require their existing binding-reborrow plan");
         }
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual receiver emission plan");
         let receiver_owner = SignatureClassId::of(receiver.fn_did);
         let receiver_class = emission.plan.class_finalization.classes.get(&receiver_owner)
@@ -273,7 +273,7 @@ enum ReceiverWithdrawal {
 fn check_active_initializer_withdrawal(withdrawal: ReceiverWithdrawal) {
     ::utils::compilation::run_compiler_on_str(Family::Nullable.input(), |tcx| {
         let (mut table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("actual receiver decision table");
         let solve = super::model_cache::solve_receipt();
@@ -346,7 +346,7 @@ fn check_caller_class_reversion(family: Family) {
         ::utils::compilation::run_compiler_on_str(family.input(), |tcx| {
             let capture = super::ast_transform::capture_ast(tcx).expect("one original reversion AST capture");
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             ))).expect("one actual receiver reversion decision call");
             let solve = super::model_cache::solve_receipt();
@@ -378,7 +378,7 @@ fn check_caller_class_reversion(family: Family) {
             } else {
                 println!("RETURN-RECEIVER {family:?}: existing receiver atoms={atom_ids:?}; this control selects only the actual caller class");
             }
-            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
                 .expect("actual baseline receiver plan");
             let caller = SignatureClassId::of(subject.fn_did);
             let callee = SignatureClassId::of(receiver.callee);
@@ -602,7 +602,7 @@ fn return_receiver_consumer_selected_unavailable_holds_only_its_interface_closur
     let (baseline, restored) = ::utils::compilation::run_compiler_on_str(Family::Nullable.input(), |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original consumer-control capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual receiver table for the constructed consumer state");
         let solve = super::model_cache::solve_receipt();
@@ -614,7 +614,7 @@ fn return_receiver_consumer_selected_unavailable_holds_only_its_interface_closur
         let slot = ctx.slots.fn_local_slots[&subject.fn_did]
             .slot_for_local_depth(subject.local, 0).expect("actual q model slot");
         assert_eq!(ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)), Some(&super::SlotKind::Ref));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual receiver input plan before consumer injection");
         let input = emission.plan.terminal_call_plans.receiver_inputs.plans.get(&node)
             .expect("actual admitted receiver-input identity and selection metadata").clone();

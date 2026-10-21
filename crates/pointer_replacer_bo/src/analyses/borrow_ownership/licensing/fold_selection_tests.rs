@@ -6,9 +6,9 @@ use rustc_hir::{ItemKind, OwnerNode};
 
 use super::{
     super::{
-        a5_overlap::WholeProgramAttestation, coherence,
-        construction::construct_bo_into_a16_refined, crate_slots::CrateSlots, export,
-        mutability_facts::MutFacts, origins::compute_origins, solver::KindSolver,
+        coherence, construction::construct_bo_into_return_refined, crate_slots::CrateSlots, export,
+        mutability_facts::MutFacts, origins::compute_origins,
+        param_overlap::WholeProgramAttestation, solver::KindSolver,
     },
     model_selection::Selection,
 };
@@ -45,7 +45,7 @@ pub unsafe fn caller(node: *mut Node) -> *mut Node { identity((*node).child) }
         assert!(!export::capturing(), "selection must not require BoExport");
         let solver = KindSolver::new(&slots);
         let (construction, _) =
-            construct_bo_into_a16_refined(&program, &slots, &origins, &mutability, &solver)
+            construct_bo_into_return_refined(&program, &slots, &origins, &mutability, &solver)
                 .expect("synthetic fold construction");
         coherence::constrain_field_ownership(&solver, &slots, &program);
         let facts = solver.ownership_facts().expect("this solver's facts");
@@ -105,7 +105,7 @@ pub unsafe fn caller(node: *mut Node) -> *mut Node { identity((*node).child) }
 
 #[test]
 fn gf07_accepting_round_exports_the_same_model_pending_fold_value() {
-    let fixture = super::tests::inspect_era5_frame(
+    let fixture = super::tests::inspect_attested_frame(
         r#"
 pub struct Node{child:*mut Node}
 pub unsafe fn identity(node:*mut Node)->*mut Node{node}
@@ -145,9 +145,9 @@ fn gf07_native_accepted_export_rejects_missing_and_forged_fold_selections() {
 
     use super::super::{
         SlotKind,
-        a5_overlap::A5Mode,
-        construction::solve_bo_a5_config_reporting,
+        construction::solve_bo_overlap_config_reporting,
         origin_evidence,
+        param_overlap::OverlapMode,
         portable_export::{self, ExportFamily},
         slot_key,
         slots::SlotOwner,
@@ -180,12 +180,12 @@ pub unsafe fn caller(node: *mut Node) -> *mut Node { identity((*node).child) }
         let origins = compute_origins(&program);
         let mutability = MutFacts::from_program(&program);
         let (verified, captured) = export::with_bo_export(|| {
-            solve_bo_a5_config_reporting(
+            solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("accepted synthetic analysis with pending folds")

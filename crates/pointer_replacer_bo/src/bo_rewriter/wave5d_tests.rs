@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use super::{A5Mode, SlotKind, SlotRef, WholeProgramAttestation, decision::Decision};
+use super::{OverlapMode, SlotKind, SlotRef, WholeProgramAttestation, decision::Decision};
 
 #[allow(dead_code, unused_assignments, unused_mut)]
 #[path = "wave5d_ti_abs.rs"]
@@ -23,7 +23,7 @@ fn emitted() -> &'static str {
         std::fs::write(&root, SOURCE).unwrap();
         let outcome = super::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
@@ -48,7 +48,7 @@ fn w5d_native_abs_market_keeps_both_depths_ref() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -98,7 +98,7 @@ fn held_native(source: &str) {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -146,7 +146,7 @@ fn held_native_subject(source: &str, parameter: &str) {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -393,7 +393,7 @@ fn w5d_each_nested_subject_withdraws_the_whole_function() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -524,7 +524,7 @@ fn w5d_surface_atom_withdrawal_closes_both_nested_parameters() {
         let (mut table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

@@ -23,7 +23,7 @@ use rustc_mir_dataflow::{
 };
 use rustc_span::def_id::LocalDefId;
 
-use super::l2::MirLocationKey;
+use super::guarded_repair::MirLocationKey;
 use crate::analyses::{
     borrow::{Provenance, ProvenanceSet},
     liveness::MaybeLiveLocals,

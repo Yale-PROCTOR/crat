@@ -5,11 +5,11 @@ use rustc_hir::{ItemKind, OwnerNode};
 
 use super::{
     SlotKind,
-    a5_overlap::{A5Mode, CallSiteWitnessKey, FunctionPairKey, WholeProgramAttestation},
-    construction::{A5PreledgerDeclineReason, solve_bo_a5_config_reporting},
+    construction::{OverlapPreledgerDeclineReason, solve_bo_overlap_config_reporting},
     crate_slots::CrateSlots,
     mutability_facts::MutFacts,
     origins::compute_origins,
+    param_overlap::{CallSiteWitnessKey, FunctionPairKey, OverlapMode, WholeProgramAttestation},
     slots::SlotId,
     solver::{KindSolver, RoundModelFailure, SlotRef},
     source_events::SourceEvents,
@@ -113,7 +113,7 @@ pub(crate) fn verification(slots: &CrateSlots, solver: &KindSolver) {
             (0..universe.len())
                 .map(move |index| SlotRef::Local(function, SlotId::from_usize(index)))
         })
-        .min_by_key(|slot| super::l2::SlotKey::of(*slot))
+        .min_by_key(|slot| super::guarded_repair::SlotKey::of(*slot))
         .expect("actual pointer slot");
     solver.assume(target, SlotKind::Ref);
     solver.add_borrow_exclusion(Some(target), &[]);
@@ -187,68 +187,68 @@ unsafe fn sink(x:*mut i32,y:*mut i32){*x+=1;*y+=1;}
 unsafe fn forward(x:*mut i32,y:*mut i32){sink(x,y);}
 unsafe fn entry(p:*mut i32){forward(p,p);}
 "#;
-    use A5PreledgerDeclineReason as R;
+    use OverlapPreledgerDeclineReason as R;
     let cases = [
         (
             R::BaselineConstruction,
             C,
-            A5Mode::Baseline,
+            OverlapMode::Baseline,
             false,
             Fault::Construction(1),
         ),
         (
             R::BaselineVerification,
             V,
-            A5Mode::Baseline,
+            OverlapMode::Baseline,
             false,
             Fault::Verification(1),
         ),
         (
-            R::A5PlanProduction,
+            R::OverlapPlanProduction,
             P,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             true,
             Fault::Producer,
         ),
         (
             R::RefinedFallbackConstruction,
             C,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             false,
             Fault::Construction(2),
         ),
         (
             R::RefinedFallbackVerification,
             V,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             false,
             Fault::Verification(2),
         ),
         (
             R::PreciseConstruction,
             C,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             true,
             Fault::Construction(2),
         ),
         (
             R::PreciseVerification,
             V,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             true,
             Fault::Verification(2),
         ),
         (
             R::CoarseConstruction,
             C,
-            A5Mode::CoarseConstraint,
+            OverlapMode::CoarseConstraint,
             true,
             Fault::Construction(2),
         ),
         (
             R::CoarseVerification,
             V,
-            A5Mode::CoarseConstraint,
+            OverlapMode::CoarseConstraint,
             true,
             Fault::Verification(2),
         ),
@@ -260,7 +260,14 @@ unsafe fn entry(p:*mut i32){forward(p,p);}
             let facts = MutFacts::from_program(program);
             let attestation = attested.then_some(WholeProgramAttestation::FrozenBenchmarkGraph);
             let solve = || {
-                solve_bo_a5_config_reporting(program, &slots, &origins, &facts, mode, attestation)
+                solve_bo_overlap_config_reporting(
+                    program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    mode,
+                    attestation,
+                )
             };
             assert!(solve().is_ok(), "unarmed control {expected:?}");
             let (result, receipt) = with_fault(fault, solve);
@@ -368,12 +375,12 @@ pub unsafe fn f(p:*mut u8){let q=realloc(p,16);if q.is_null(){free(p);}else{free
             assert_eq!(source.len(), 1);
             let ((result, capture), plans) = with_recovery(reason.clone(), || {
                 let (result, capture) = super::export::with_bo_export(|| {
-                    solve_bo_a5_config_reporting(
+                    solve_bo_overlap_config_reporting(
                         program,
                         &slots,
                         &origins,
                         &facts,
-                        A5Mode::PreciseReplay,
+                        OverlapMode::PreciseReplay,
                         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                     )
                 });
@@ -451,12 +458,12 @@ pub fn address_only()->usize{let mut value=1i32;(&raw mut value) as usize}
         let facts = MutFacts::from_program(program);
         let (result, capture) = with_all_raw(|| {
             super::export::with_bo_export(|| {
-                solve_bo_a5_config_reporting(
+                solve_bo_overlap_config_reporting(
                     program,
                     &slots,
                     &origins,
                     &facts,
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )
             })
@@ -672,19 +679,19 @@ pub unsafe fn f(p:*mut u8)->*mut u8{realloc(p,16)}
             let origins = compute_origins(program);
             let facts = MutFacts::from_program(program);
             let result = with_recovery(reason.clone(), || {
-                solve_bo_a5_config_reporting(
+                solve_bo_overlap_config_reporting(
                     program,
                     &slots,
                     &origins,
                     &facts,
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )
             });
             let error = result.expect_err("terminal planner cause must remain a refusal");
             assert_eq!(
                 error.reason(),
-                A5PreledgerDeclineReason::BaselineConstruction
+                OverlapPreledgerDeclineReason::BaselineConstruction
             );
             assert!(
                 error
@@ -849,7 +856,7 @@ pub unsafe fn f(){let p=malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i3
         );
         let ((result, _), capture) = super::export::with_bo_export(|| {
             let (result, ordinary) = {
-                borrow_verify::with_mode_a_commit_trace(|| {
+                borrow_verify::with_plain_commit_trace(|| {
                     if l2 {
                         construction::verify_bo_construction_l2_for_test(
                             program,

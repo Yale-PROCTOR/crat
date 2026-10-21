@@ -9,7 +9,7 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 
-use super::a5_overlap::{
+use super::param_overlap::{
     PairSide, SnapshotEffect, SnapshotEffectGraph, SnapshotVerdict, check_snapshot_equivalence,
 };
 

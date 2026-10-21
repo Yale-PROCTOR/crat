@@ -1,6 +1,6 @@
 //! Attested, site-local A5 proofs consumed by call-seam overlap gates.
 //!
-//! This module interprets the existing [`audit_a5_site_branches`] output; it
+//! This module interprets the existing [`audit_overlap_site_branches`] output; it
 //! does not classify aliasing itself. Production may derive the index only in
 //! precise mode with the frozen-graph attestation. Every lookup failure is a
 //! typed conservative result.
@@ -13,11 +13,11 @@ use rustc_span::Span;
 
 use crate::{
     analyses::borrow_ownership::{
-        a5_overlap::{A5Mode, PairClass, WholeProgramAttestation},
-        a5_producer::{A5SiteBranchAudit, audit_a5_site_branches},
         crate_slots::CrateSlots,
-        l2::MirLocationKey,
+        guarded_repair::MirLocationKey,
         origin_summary::OriginSummaries,
+        overlap_producer::{OverlapSiteBranchAudit, audit_overlap_site_branches},
+        param_overlap::{OverlapMode, PairClass, WholeProgramAttestation},
     },
     utils::rustc::RustProgram,
 };
@@ -158,10 +158,10 @@ impl A5SeamProofIndex {
         program: &RustProgram<'_>,
         slots: &CrateSlots,
         origins: Option<&OriginSummaries>,
-        mode: A5Mode,
+        mode: OverlapMode,
         attestation: Option<WholeProgramAttestation>,
     ) -> Self {
-        if mode != A5Mode::PreciseReplay {
+        if mode != OverlapMode::PreciseReplay {
             return Self::unavailable(
                 "seam-a5-mode-not-precise",
                 "-",
@@ -184,7 +184,7 @@ impl A5SeamProofIndex {
         };
 
         let started = std::time::Instant::now();
-        let audits = audit_a5_site_branches(program, slots, origins.native_flows());
+        let audits = audit_overlap_site_branches(program, slots, origins.native_flows());
         let global_setup_wall_s = started.elapsed().as_secs_f64();
         Self::from_audits(program.tcx, program, audits, global_setup_wall_s)
     }
@@ -269,7 +269,7 @@ impl A5SeamProofIndex {
     fn from_audits(
         tcx: TyCtxt<'_>,
         program: &RustProgram<'_>,
-        audits: Vec<A5SiteBranchAudit>,
+        audits: Vec<OverlapSiteBranchAudit>,
         global_setup_wall_s: f64,
     ) -> Self {
         let started = std::time::Instant::now();
@@ -402,7 +402,7 @@ impl A5SeamProofIndex {
 }
 
 fn proof_from_audit(
-    audit: &A5SiteBranchAudit,
+    audit: &OverlapSiteBranchAudit,
     caller: LocalDefId,
     callee: DefId,
     location: MirLocationKey,

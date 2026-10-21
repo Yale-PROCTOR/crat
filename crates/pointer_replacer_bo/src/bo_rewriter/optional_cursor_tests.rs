@@ -404,7 +404,7 @@ pub unsafe fn main_0(mut key: *const i8) -> i32 {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -446,7 +446,7 @@ pub unsafe fn kmVec4Assign(mut pOut: *mut V4, mut pIn: *const V4) -> i32 {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )?;
             let held = emission.plan.held_classes();
             let mut lines = vec![format!("held classes: {}", held.len())];

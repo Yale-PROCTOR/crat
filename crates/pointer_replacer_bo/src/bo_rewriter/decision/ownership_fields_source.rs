@@ -1848,7 +1848,7 @@ mod tests {
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -1913,7 +1913,7 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -1949,7 +1949,7 @@ unsafe extern "C" fn holder_free(mut h: *mut Holder) { free((*h).buf as *mut lib
                 let (table, ctx) = bo::decide_table_with_ctx_config(
                     tcx,
                     Some((
-                        bo::A5Mode::PreciseReplay,
+                        bo::OverlapMode::PreciseReplay,
                         Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                     )),
                 )
@@ -2024,7 +2024,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2116,7 +2116,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2152,7 +2152,7 @@ pub unsafe extern "C" fn peek(mut y: *mut Node) -> *mut Node { let mut token = (
                 let (table, ctx) = bo::decide_table_with_ctx_config(
                     tcx,
                     Some((
-                        bo::A5Mode::PreciseReplay,
+                        bo::OverlapMode::PreciseReplay,
                         Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                     )),
                 )
@@ -2220,7 +2220,7 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
             let (table, ctx) = bo::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    bo::A5Mode::PreciseReplay,
+                    bo::OverlapMode::PreciseReplay,
                     Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -2295,7 +2295,7 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
             true,
             true,
             Some((
-                bo::A5Mode::PreciseReplay,
+                bo::OverlapMode::PreciseReplay,
                 Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         );

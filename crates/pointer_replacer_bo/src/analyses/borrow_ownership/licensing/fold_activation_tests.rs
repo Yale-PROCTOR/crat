@@ -34,12 +34,12 @@ fn with_solver(
         let slots = super::super::crate_slots::CrateSlots::build(&program);
         let origins = super::super::origins::compute_origins(&program);
         let mutability = super::super::mutability_facts::MutFacts::from_program(&program);
-        let _world = super::stack_entry::enter_world(
-            closed
-                .then_some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
-        );
+        let _world =
+            super::stack_entry::enter_world(closed.then_some(
+                super::super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+            ));
         let solver = KindSolver::new(&slots);
-        let (construction, _) = super::super::construction::construct_bo_into_a16_refined(
+        let (construction, _) = super::super::construction::construct_bo_into_return_refined(
             &program,
             &slots,
             &origins,

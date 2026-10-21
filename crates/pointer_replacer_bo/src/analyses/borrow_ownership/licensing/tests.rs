@@ -56,7 +56,7 @@ pub(super) fn inspect(code: &str) -> Fixture {
     inspect_profile(code, false)
 }
 
-pub(super) fn inspect_era5_frame(code: &str) -> Fixture {
+pub(super) fn inspect_attested_frame(code: &str) -> Fixture {
     inspect_profile(code, true)
 }
 
@@ -83,14 +83,14 @@ fn inspect_profile(code: &str, attested_frame: bool) -> Fixture {
         let facts = MutFacts::from_program(&program);
         let ((model, construction_error, commit_trace), export) = export::with_bo_export(|| {
             if attested_frame {
-                use super::super::a5_overlap::{A5Mode, WholeProgramAttestation};
-                let (result, trace) = super::super::borrow_verify::with_mode_a_commit_trace(|| {
-                    super::super::construction::solve_bo_a5_config_reporting(
+                use super::super::param_overlap::{OverlapMode, WholeProgramAttestation};
+                let (result, trace) = super::super::borrow_verify::with_plain_commit_trace(|| {
+                    super::super::construction::solve_bo_overlap_config_reporting(
                         &program,
                         &slots,
                         &origins,
                         &facts,
-                        A5Mode::PreciseReplay,
+                        OverlapMode::PreciseReplay,
                         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                     )
                 });
@@ -112,7 +112,7 @@ fn inspect_profile(code: &str, attested_frame: bool) -> Fixture {
                 Ok(construction) => construction,
                 Err(error) => return (None, Some(error.to_string()), Vec::new()),
             };
-            let ((model, _), trace) = super::super::borrow_verify::with_mode_a_commit_trace(|| {
+            let ((model, _), trace) = super::super::borrow_verify::with_plain_commit_trace(|| {
                 verify_bo_construction_counting(
                     &program,
                     &slots,

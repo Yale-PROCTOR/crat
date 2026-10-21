@@ -62,7 +62,7 @@ fn require_native_r365_bundle(callee_name: &str, calls: &str, expected_calls: us
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -171,7 +171,7 @@ fn check_r365_emitted(callee: &str, calls: &str) {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );
@@ -351,7 +351,7 @@ fn hygienic_output(prefix: &str) -> String {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );

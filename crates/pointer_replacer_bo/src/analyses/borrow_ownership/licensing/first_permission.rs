@@ -340,7 +340,7 @@ pub(crate) fn plan(
 mod tests {
     use super::super::{
         super::{SlotKind, ssa::constraint::Var},
-        tests::{inspect, inspect_era5_frame},
+        tests::{inspect, inspect_attested_frame},
     };
     const CODE: &str = r#"
 unsafe extern "C" {fn calloc(n:usize,size:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
@@ -350,7 +350,7 @@ pub unsafe fn f(){let owner=calloc(1,4) as *mut i32;let mut cell=Cell{ptr:0 as *
 "#;
     #[test]
     fn c04_first_permission_accepts_one_source_original_cell_and_caller_free() {
-        let fixture = inspect_era5_frame(CODE);
+        let fixture = inspect_attested_frame(CODE);
         if fixture.kinds.get("Cell.ptr") != Some(&SlotKind::Owning) {
             eprintln!(
                 "C04_PERMISSION_DIAGNOSTIC={}",
@@ -414,18 +414,18 @@ pub unsafe fn f(){let owner=calloc(1,4) as *mut i32;let mut cell=Cell{ptr:0 as *
             CODE.replace("pub unsafe fn put(cell:*mut Cell,value:*mut i32){","unsafe extern \"C\"{fn unknown(p:*mut i32);}\npub unsafe fn put(cell:*mut Cell,value:*mut i32){unknown(value);"),
             CODE.replace("pub unsafe fn put(cell:*mut Cell,value:*mut i32){","static mut KEEP:*mut i32=0 as *mut i32;\npub unsafe fn put(cell:*mut Cell,value:*mut i32){KEEP=value;"),
             format!("{CODE}\npub unsafe fn other(){{let mut n=2;let p=&mut n as *mut i32;let mut c=Cell{{ptr:0 as *mut i32}};put(&mut c,p);}}"),
-        ] {inspect_era5_frame(&code).assert_not_owning("Cell.ptr");}
+        ] {inspect_attested_frame(&code).assert_not_owning("Cell.ptr");}
     }
     #[test]
     fn c04_first_permission_original_endpoints_are_hard_satisfiable() {
         use rustc_hir::{ItemKind, OwnerNode};
 
         use super::super::super::{
-            a5_overlap::WholeProgramAttestation,
             construction::{CopyLendMode, construct_bo_into},
             crate_slots::CrateSlots,
             mutability_facts::MutFacts,
             origins::compute_origins,
+            param_overlap::WholeProgramAttestation,
             solver::KindSolver,
         };
         ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
@@ -498,11 +498,11 @@ pub unsafe fn f(){let owner=calloc(1,4) as *mut i32;let mut cell=Cell{ptr:0 as *
         use rustc_hir::{ItemKind, OwnerNode};
 
         use super::super::super::{
-            a5_overlap::WholeProgramAttestation,
             construction::{CopyLendMode, construct_bo_into},
             crate_slots::CrateSlots,
             mutability_facts::MutFacts,
             origins::compute_origins,
+            param_overlap::WholeProgramAttestation,
             solver::KindSolver,
         };
         ::utils::compilation::run_compiler_on_str(CODE, move |tcx| {

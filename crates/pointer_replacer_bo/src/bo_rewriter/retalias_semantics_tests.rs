@@ -256,10 +256,10 @@ fn check(case: ChildCase) {
     let source = input(case);
     let emitted = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("RB-RETALIAS original AST capture");
-        let (result, commits) = crate::analyses::borrow_ownership::borrow_verify::with_mode_a_commit_trace(|| {
+        let (result, commits) = crate::analyses::borrow_ownership::borrow_verify::with_plain_commit_trace(|| {
             super::decide_table_with_ctx_config(tcx, Some((
-                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-                Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+                crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+                Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
             )))
         });
         let (table, ctx) = result.expect("RB-RETALIAS actual fixture decision pipeline");
@@ -376,7 +376,7 @@ fn check(case: ChildCase) {
                 let copied_slot = slot(copied);
                 let parent_argument_slot = slot(parent_argument);
                 assert_eq!(crate::analyses::borrow_ownership::borrow_verify::RepairMode::current(),
-                    crate::analyses::borrow_ownership::borrow_verify::RepairMode::ModeA);
+                    crate::analyses::borrow_ownership::borrow_verify::RepairMode::Plain);
                 assert!(commits.iter().any(|commit| commit.target == copied_slot
                     && commit.conflict.issuer == Some(parent_argument_slot)
                     && commit.conflict.requirers.contains(&copied_slot)),
@@ -443,7 +443,7 @@ fn check(case: ChildCase) {
         }
 
         let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans).expect("RB-RETALIAS terminal emission plan");
+            &ctx.retained_copy_plans).expect("RB-RETALIAS terminal emission plan");
         let held = emission.plan.held_classes();
         let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
             &held, &BTreeSet::new(), &table).expect("actual held-class reverts");

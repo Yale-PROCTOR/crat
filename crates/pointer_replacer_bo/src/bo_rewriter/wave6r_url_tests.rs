@@ -31,7 +31,7 @@ fn hostname_arg0_disposition(input: &str) -> String {
         let (table, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

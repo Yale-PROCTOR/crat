@@ -71,11 +71,11 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for OriginAvailabi
         #[serde(deny_unknown_fields)]
         #[serde(untagged)]
         enum Wire<T> {
-            Era5a(OriginMissing),
+            Bare(OriginMissing),
             Joint(Tagged<T>),
         }
         Ok(match Wire::<T>::deserialize(deserializer)? {
-            Wire::Era5a(missing) | Wire::Joint(Tagged::Missing(missing)) => Self::Missing(missing),
+            Wire::Bare(missing) | Wire::Joint(Tagged::Missing(missing)) => Self::Missing(missing),
             Wire::Joint(Tagged::Present(value)) => Self::Present(value),
         })
     }

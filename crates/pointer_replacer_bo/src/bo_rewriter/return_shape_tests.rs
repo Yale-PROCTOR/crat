@@ -36,7 +36,7 @@ fn return_shape_mixed_null_and_parameter_keeps_a_required_parameter() {
     let (emitted, argument_index) = ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original mixed-return AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual mixed-return decision call");
         let solve = super::model_cache::solve_receipt();
@@ -79,7 +79,7 @@ fn return_shape_mixed_null_and_parameter_keeps_a_required_parameter() {
             ctx.hypothetical.entries.iter().find(|(subject, _)| (subject.fn_did, subject.hir_id) == node).map(|(_, decision)| decision),
             ctx.lifetime_eligibility.failure(node), ctx.facts.raw_only_uses.get(&node),
             table.return_interfaces.functions.get(&parameter.fn_did), table.return_interfaces.failures.get(&parameter.fn_did));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual mixed-return emission plan");
         let owner = SignatureClassId::of(parameter.fn_did);
         println!("RETURN-SHAPE owner={owner:?}; class={:#?}; hold_reasons={:?}",
@@ -235,7 +235,7 @@ fn return_shape_constant_parameter_offset_returns_the_remaining_slice() {
     let (emitted, argument_index) = ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original reslice AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual reslice decision call");
         let solve = super::model_cache::solve_receipt();
@@ -284,7 +284,7 @@ fn return_shape_constant_parameter_offset_returns_the_remaining_slice() {
             ctx.hypothetical.entries.iter().find(|(subject, _)| (subject.fn_did, subject.hir_id) == node).map(|(_, decision)| decision),
             ctx.lifetime_eligibility.failure(node), table.return_interfaces.functions.get(&parameter.fn_did),
             ctx.facts.raw_only_uses.get(&node));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual reslice emission plan");
         let owner = SignatureClassId::of(parameter.fn_did);
         println!("RETURN-SHAPE constant-reslice class={:#?}; hold={:?}",

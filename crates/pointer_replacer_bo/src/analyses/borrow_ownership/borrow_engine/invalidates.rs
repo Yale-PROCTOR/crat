@@ -20,7 +20,7 @@ use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use super::{
     BorrowSet, Loan,
-    a5_places_conflict::{ParameterOverlap, places_conflict_with_parameter_overlap},
+    overlap_places_conflict::{ParameterOverlap, places_conflict_with_parameter_overlap},
     places_conflict::{AccessDepth, PlaceConflictBias},
 };
 use crate::analyses::{

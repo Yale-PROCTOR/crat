@@ -1,5 +1,5 @@
 //! F06/C02 projected traversal-call controls; compiler inputs, never executed.
-use super::{super::SlotKind, tests::inspect_era5_frame};
+use super::{super::SlotKind, tests::inspect_attested_frame};
 
 pub(crate) const CODE: &str = r#"
 unsafe extern "C" { fn malloc(n:usize)->*mut core::ffi::c_void; fn free(p:*mut core::ffi::c_void); }
@@ -23,7 +23,7 @@ pub unsafe fn caller()->i32 {
 
 #[test]
 fn c08_projected_traversal_keeps_field_owner_and_sibling_write() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     eprintln!(
         "C08_PROJECTED={}",
         serde_json::json!({
@@ -48,7 +48,7 @@ fn c08_projected_traversal_keeps_field_owner_and_sibling_write() {
 #[test]
 fn c08_projected_traversal_payload_write_holds() {
     let code = CODE.replace("holder.scalar=9;", "(*holder.ptr).value=9;");
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     assert!(fixture.accepted);
     assert!(
         fixture
@@ -72,7 +72,7 @@ fn c08_projected_traversal_deref_field_target_and_metadata() {
         )
         .replace("holder.ptr", "(*holder).ptr")
         .replace("holder.scalar", "(*holder).scalar");
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     eprintln!(
         "C08_DEREF={}",
         serde_json::json!({"commits":fixture.commit_trace,"snapshots":fixture.export.ownership_licensing.as_ref().map(|rows|rows.iter().map(|s|serde_json::json!({"offset":s.offset,"field_support":s.field_support,"traversal":s.traversal_correspondences,"consumes":s.metadata.consumes,"boundaries":s.metadata.boundaries,"matched":s.matched})).collect::<Vec<_>>())})
@@ -98,7 +98,7 @@ fn c08_projected_traversal_deref_field_target_and_metadata() {
 
 #[test]
 fn c08_the_holder_field_has_no_store_under_the_record() {
-    let fixture = inspect_era5_frame(CODE);
+    let fixture = inspect_attested_frame(CODE);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
         .export
@@ -128,7 +128,7 @@ fn c08_projected_traversal_payload_write_with_same_type_sibling_holds() {
             "ptr:root,other:0 as *mut Node,scalar:0",
         )
         .replace("holder.scalar=9;", "(*holder.ptr).value=9;");
-    let fixture = inspect_era5_frame(&code);
+    let fixture = inspect_attested_frame(&code);
     assert!(fixture.accepted);
     assert!(
         fixture
@@ -145,7 +145,7 @@ fn c08_projected_traversal_payload_write_with_same_type_sibling_holds() {
 
 #[test]
 fn s02_traversal_permission_is_mandatory_and_withdraws_for_each_bad_kind() {
-    use super::super::{a5_overlap::WholeProgramAttestation, solver::KindSolver};
+    use super::super::{param_overlap::WholeProgramAttestation, solver::KindSolver};
     super::graph_tests::with_solver_facts(CODE, |facts, original, slots| {
         let mut facts = facts.clone();
         facts.frame_attested = true;

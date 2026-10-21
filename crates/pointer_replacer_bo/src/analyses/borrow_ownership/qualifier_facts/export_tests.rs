@@ -16,7 +16,7 @@ use crate::analyses::borrow_ownership::{
         CopyLendMode, TestValidationBackend, construct_bo_into,
         verify_bo_construction_counting_for_test,
     },
-    export::{self, BoundaryRole, T2AssertKey},
+    export::{self, BoundaryRole, EndpointRetractionKey},
     nullability,
     origins::compute_origins,
     slot_key,
@@ -205,7 +205,7 @@ fn e5_x_export_constructor_capture_and_canonical_json_match_existing_facts() {
 struct Snapshot {
     model: FxHashMap<SlotRef, SlotKind>,
     emission_stats: BoOwnEmissionStats,
-    selectors: Vec<T2AssertKey>,
+    selectors: Vec<EndpointRetractionKey>,
     rounds: RoundStats,
     qualifiers: QualifierFacts,
 }

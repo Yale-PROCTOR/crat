@@ -40,7 +40,7 @@ fn outcome_in(text: &str, attested: bool) -> Outcome {
     let result = if attested {
         super::rewrite_m1_path_a5_injected(
             &root,
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         )

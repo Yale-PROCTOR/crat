@@ -63,7 +63,7 @@ fn decisions(input: &str) -> Vec<(String, super::Decision)> {
         crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -106,7 +106,7 @@ fn w5c_returned_child_pointer_free_no_retain_admits_the_shared_view() {
         let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -205,7 +205,7 @@ fn w5c_returned_child_returned_argument_is_the_waived_tier() {
         let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

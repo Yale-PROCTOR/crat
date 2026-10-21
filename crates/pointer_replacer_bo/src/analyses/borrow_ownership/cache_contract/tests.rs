@@ -22,13 +22,13 @@ fn with_traversal_entry(
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
-        a5_overlap::{A5Mode, WholeProgramAttestation},
         construction,
         crate_slots::CrateSlots,
         export, model_cache,
         mutability_facts::MutFacts,
         origin_evidence::OriginEvidence,
         origins::compute_origins,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
         portable_export::PortableExport,
     };
     const CODE: &str = r#"
@@ -67,12 +67,12 @@ pub unsafe fn caller()->i32 {
         let mutability = MutFacts::from_program(&program);
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let (verified, captured) = export::with_bo_export(|| {
-            construction::solve_bo_a5_config_reporting(
+            construction::solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 attestation,
             )
             .expect("actual activated traversal model")
@@ -381,12 +381,12 @@ fn c05_the_final_replay_uses_no_stack_proof_under_the_record() {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
-        a5_overlap::{A5Mode, WholeProgramAttestation},
         construction,
         crate_slots::CrateSlots,
         export,
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
     };
     const CODE: &str = r#"
 unsafe extern "C" {
@@ -426,12 +426,12 @@ pub unsafe fn f() -> i32 {
         let mutability = MutFacts::from_program(&program);
         let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
         let (_, captured) = export::with_bo_export(|| {
-            construction::solve_bo_a5_config_reporting(
+            construction::solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 attestation,
             )
             .expect("attested OL07 accepted model")

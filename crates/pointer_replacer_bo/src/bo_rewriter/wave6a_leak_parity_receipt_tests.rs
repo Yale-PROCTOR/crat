@@ -244,7 +244,7 @@ fn w6a_r802_a_certificate_owner_with_a_live_null_return_closes_at_scope_exit() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn n_new(mut depth: i32) -> *mut N {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -359,7 +359,7 @@ fn w6a_r802_a_receiver_closed_at_two_exits_is_allowed_two_drops() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -439,7 +439,7 @@ fn w6a_r802_an_assignment_receivers_reseat_drop_is_allowed_and_not_a_waiver() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -483,7 +483,7 @@ fn policy_of(source: &str, function: &str, name: &str) -> Option<super::verify::
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

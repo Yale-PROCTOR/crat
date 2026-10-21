@@ -55,7 +55,9 @@ use super::{
         RawBoundaryDispositionIndex, RawTargetType, RetentionSummaries, RetentionVerdict,
     },
 };
-use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
+use crate::analyses::borrow_ownership::{
+    overlap_producer::PlannedCopyMark, param_overlap::PairSide,
+};
 
 /// A node's identity — the same `(owner, binding)` key A1's emitability gates
 /// use, so a call argument that resolves to `Res::Local(b)` needs no
@@ -706,7 +708,7 @@ pub(crate) fn build(
 }
 
 pub(crate) fn retained_c9_shared_params(
-    marks: &[PlannedC9Mark],
+    marks: &[PlannedCopyMark],
     site: &super::emitability::CallSite,
     callee: LocalDefId,
 ) -> FxHashSet<usize> {
@@ -725,7 +727,7 @@ pub(crate) fn retained_c9_shared_params(
 }
 
 fn c9_mark_matches(
-    mark: &PlannedC9Mark,
+    mark: &PlannedCopyMark,
     site: &super::emitability::CallSite,
     callee: LocalDefId,
 ) -> bool {
@@ -742,7 +744,7 @@ pub(crate) fn build_with_c9_marks(
     hypothetical: &DecisionTable,
     escapes: &[Escape],
     overlap: OverlapRule,
-    c9_marks: &[PlannedC9Mark],
+    c9_marks: &[PlannedCopyMark],
 ) -> CoConv {
     build_with_c9_marks_and_lifetimes(
         facts,
@@ -761,7 +763,7 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
     hypothetical: &DecisionTable,
     escapes: &[Escape],
     overlap: OverlapRule,
-    c9_marks: &[PlannedC9Mark],
+    c9_marks: &[PlannedCopyMark],
     lifetime_eligibility: &LifetimeEligibility,
 ) -> CoConv {
     build_with_c9_marks_lifetimes_and_raw_boundary(
@@ -783,7 +785,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
     hypothetical: &DecisionTable,
     escapes: &[Escape],
     overlap: OverlapRule,
-    c9_marks: &[PlannedC9Mark],
+    c9_marks: &[PlannedCopyMark],
     lifetime_eligibility: &LifetimeEligibility,
     raw_boundary: &RawBoundaryDispositionIndex,
 ) -> CoConv {
@@ -808,7 +810,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
     hypothetical: &DecisionTable,
     escapes: &[Escape],
     overlap: OverlapRule,
-    c9_marks: &[PlannedC9Mark],
+    c9_marks: &[PlannedCopyMark],
     lifetime_eligibility: &LifetimeEligibility,
     raw_boundary: &RawBoundaryDispositionIndex,
     a5_site_proofs: Option<&A5SeamProofIndex>,
@@ -836,7 +838,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
     hypothetical: &DecisionTable,
     escapes: &[Escape],
     overlap: OverlapRule,
-    c9_marks: &[PlannedC9Mark],
+    c9_marks: &[PlannedCopyMark],
     lifetime_eligibility: &LifetimeEligibility,
     raw_boundary: &RawBoundaryDispositionIndex,
     a5_site_proofs: Option<&A5SeamProofIndex>,
@@ -2403,7 +2405,7 @@ mod a5_cast_role_tests {
         },
         *,
     };
-    use crate::analyses::borrow_ownership::l2::MirLocationKey;
+    use crate::analyses::borrow_ownership::guarded_repair::MirLocationKey;
 
     // Construct the same owned Subject/DecisionTable/call-facts inputs used by
     // the production builder. No compiler, analysis, or model run is needed.

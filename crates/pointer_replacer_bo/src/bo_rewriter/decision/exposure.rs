@@ -516,7 +516,7 @@ mod tests {
             let web = super::super::lifetime::derive_fn_ptr_web(
                 &program,
                 Some(
-                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                 ),
             )
             .expect("attested fixture web");
@@ -565,7 +565,7 @@ mod tests {
                 let web = super::super::lifetime::derive_fn_ptr_web(
                     &program,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )
                 .expect("attested fixture web");
@@ -595,7 +595,7 @@ mod tests {
                 let web = super::super::lifetime::derive_fn_ptr_web(
                     &program,
                     Some(
-                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                     ),
                 )
                 .expect("attested fixture web");
@@ -642,9 +642,9 @@ mod tests {
                 let (_, ctx) = super::super::super::decide_table_with_emission_config(
                     tcx,
                     Some((
-                        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
                         Some(
-                            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
                         ),
                     )),
                     &run_config,

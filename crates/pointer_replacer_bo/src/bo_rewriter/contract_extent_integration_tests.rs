@@ -130,7 +130,7 @@ fn attested_promotions(source: &str) -> Vec<super::decision::contract_extent::Pr
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )?;
@@ -160,7 +160,7 @@ fn attested_rewrite(source: &str) -> super::RewriteOutcome {
     std::fs::write(&root, source).expect("attested fixture file");
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        super::A5Mode::PreciseReplay,
+        super::OverlapMode::PreciseReplay,
         Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );
@@ -3565,7 +3565,7 @@ fn w4b104_a_parameter_with_no_call_site_is_unmeasured_not_held() {
             let (table, _) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )?;

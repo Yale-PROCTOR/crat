@@ -161,7 +161,7 @@ fn e5c_l14_construction_digest_named_source() {
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
         let solver = super::solver::KindSolver::new(&slots);
-        let (construction, links) = super::construction::construct_bo_into_a16_refined(
+        let (construction, links) = super::construction::construct_bo_into_return_refined(
             &program,
             &slots,
             &origins,

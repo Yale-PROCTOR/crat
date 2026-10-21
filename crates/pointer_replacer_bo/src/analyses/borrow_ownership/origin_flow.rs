@@ -216,7 +216,7 @@ pub(crate) struct A2OpaqueResultGuard {
     pub(crate) function: LocalDefId,
     pub(crate) local: Local,
     pub(crate) depth: u8,
-    pub(crate) location: crate::analyses::borrow_ownership::l2::MirLocationKey,
+    pub(crate) location: crate::analyses::borrow_ownership::guarded_repair::MirLocationKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,10 +312,11 @@ pub(crate) fn analyze_program_origin_flow_a2(
                     function,
                     local,
                     depth,
-                    location: crate::analyses::borrow_ownership::l2::MirLocationKey::new(
-                        location.block.as_u32(),
-                        location.statement_index,
-                    ),
+                    location:
+                        crate::analyses::borrow_ownership::guarded_repair::MirLocationKey::new(
+                            location.block.as_u32(),
+                            location.statement_index,
+                        ),
                 }
             }));
         plan.restored_self_origins.extend(

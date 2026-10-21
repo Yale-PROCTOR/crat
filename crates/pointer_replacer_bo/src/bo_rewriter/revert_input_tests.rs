@@ -23,7 +23,7 @@ fn revert_probe(input: &str, inject_unowned_use: bool) -> RevertProbe {
         let capture = ast_transform::capture_ast(tcx)?;
         let (mut table, ctx) = super::decide_table_with_ctx(tcx)?;
         let emission =
-            super::emit_files(tcx, &table, &FxHashSet::default(), &ctx.retained_c9_plans)?;
+            super::emit_files(tcx, &table, &FxHashSet::default(), &ctx.retained_copy_plans)?;
         let ready = super::ready_classes(&emission.plan);
         assert!(!ready.is_empty(), "revert-all control needs a ready class");
         let root = emission.plan.root_file.as_ref().expect("fixture root key");

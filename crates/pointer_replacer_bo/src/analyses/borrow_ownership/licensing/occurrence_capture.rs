@@ -9,7 +9,7 @@ fn e06_bst_occurrence_capture() {
     use sha2::{Digest, Sha256};
 
     use super::super::{
-        construction::construct_bo_into_a16_refined, crate_slots::CrateSlots, execution_guard,
+        construction::construct_bo_into_return_refined, crate_slots::CrateSlots, execution_guard,
         export, mutability_facts::MutFacts, origin_evidence, origins::compute_origins,
         solver::KindSolver,
     };
@@ -48,7 +48,7 @@ fn e06_bst_occurrence_capture() {
         let entries=execution_guard::model_entries();
         let ((counts,links),captured)=export::with_bo_export(|| {
             let solver=KindSolver::new(&slots);
-            let (_construction,links)=construct_bo_into_a16_refined(&program,&slots,&origins,&facts,&solver).expect("A5A construction");
+            let (_construction,links)=construct_bo_into_return_refined(&program,&slots,&origins,&facts,&solver).expect("A5A construction");
             // Deliberately no verification, check, raw backend query, model, or cache call.
             let counts=[solver.check_sat_count(),solver.hard_check_count(),solver.optimize_materialization_count(),
                 solver.lazy_plain_hard_check_count(),solver.lazy_tracked_recheck_count(),solver.lazy_plain_materialization_count()];

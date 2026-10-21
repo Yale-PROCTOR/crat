@@ -993,7 +993,7 @@ mod native_tests {
             let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
             let retention = super::super::raw_boundary::RetentionSummaries::derive(
                 &program, Some(&origins),
-                Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+                Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
             );
             let Some(super::super::raw_boundary::RetentionVerdict::NoRetain { certificate }) =
                 retention.get(function, 0)

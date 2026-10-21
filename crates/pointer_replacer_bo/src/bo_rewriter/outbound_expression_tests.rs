@@ -74,7 +74,7 @@ fn outbound_expression_native_slice_return_to_raw_argument_has_one_owned_view() 
     let (emitted, caller_retired, source_retired, expression_audit) = ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original outbound-expression AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary tiny-fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("OUTBOUND-EXPRESSION solve={solve:#?}\nINPUT:\n{INPUT}");
@@ -169,7 +169,7 @@ fn outbound_expression_native_slice_return_to_raw_argument_has_one_owned_view() 
             RetentionVerdict::Unknown { .. } => BridgeRetentionTier::T2,
             RetentionVerdict::Retains { .. } => panic!("authoring premise: retaining callee cannot witness an admitted view"),
         };
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual outbound-expression emission plan");
         assert_eq!(super::terminal_parameter_form(&table, &emission.plan.class_finalization, q.fn_did, 0), Form::Raw);
         let target_owner = SignatureClassId::of(p.fn_did);

@@ -25,7 +25,7 @@ use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{
-    SlotKind, a5_producer::PlannedC9Mark, crate_slots::CrateSlots, solver::SlotRef,
+    SlotKind, crate_slots::CrateSlots, overlap_producer::PlannedCopyMark, solver::SlotRef,
 };
 
 pub(crate) mod a5_site_proof;
@@ -1172,7 +1172,7 @@ pub(crate) struct DecisionTable {
     /// Retained post-solve C-9 call-site emission plans. These are construction
     /// outputs, carried beside the subject decisions so both the span planner
     /// and the structural AST emitter consume the same typed population.
-    pub c9_marks: Vec<PlannedC9Mark>,
+    pub c9_marks: Vec<PlannedCopyMark>,
     /// **S3.6-1 seam adapters.** Computed in this phase — it is the only phase
     /// that may read an analysis — and handed to `plan` as data, exactly as
     /// `Decision::Slice`'s use-edits are.

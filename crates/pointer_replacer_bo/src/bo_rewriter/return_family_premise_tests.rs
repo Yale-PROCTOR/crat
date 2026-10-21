@@ -30,8 +30,8 @@ fn observe(name: &'static str, source: &'static str) {
         // Exactly one ordinary fixture decision invocation. Everything below
         // reads its retained context; no analysis or model is recomputed.
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("premise fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("RETURN-FAMILY-PREMISE {name} solve={solve:#?}");

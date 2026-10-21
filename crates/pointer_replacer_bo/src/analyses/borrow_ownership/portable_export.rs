@@ -256,7 +256,7 @@ fn tag(value: impl std::fmt::Debug) -> Value {
 fn location(value: Location) -> Value {
     json!({"block": value.block.as_u32(), "statement": value.statement_index})
 }
-fn mir_location(value: super::l2::MirLocationKey) -> Value {
+fn mir_location(value: super::guarded_repair::MirLocationKey) -> Value {
     json!({"block": value.block, "statement": value.statement_index})
 }
 fn place(value: &e::PlaceKey) -> Value {

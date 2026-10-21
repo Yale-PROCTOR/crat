@@ -173,7 +173,7 @@ fn build_init_site(input: &str) -> Vec<String> {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -214,7 +214,7 @@ fn wave6r_iterator_frame_confined_site_holds_when_the_callee_keeps_a_copy() {
         let (_, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

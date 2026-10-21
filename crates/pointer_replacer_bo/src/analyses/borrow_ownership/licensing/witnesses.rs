@@ -119,7 +119,7 @@ fn r336_5_bst_has_no_member_decision() {
 #[test]
 #[ignore = "standing since era 5b: a staged licensing witness, red on L01^8 (the standing six, era-5c 049 / 064; R578-5); ignored at the L01^9 seal, era-5c 067"]
 fn c08_bst_attested_chain_obligations() {
-    let fixture = super::tests::inspect_era5_frame(BST);
+    let fixture = super::tests::inspect_attested_frame(BST);
     eprintln!(
         "C08_BST_FRAME={}",
         serde_json::json!({
@@ -335,7 +335,7 @@ pub unsafe fn second(p: *mut i32, n: u32) -> *mut i32 {
 fn ol06_under_the_lend_the_cell_is_a_reference_and_the_payload_stays_raw() {
     // Era-5a's explicit closed frame is required for original-cell caller
     // coverage; the unattested negative remains in chain_permission tests.
-    let fixture = super::tests::inspect_era5_frame(
+    let fixture = super::tests::inspect_attested_frame(
         r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -423,7 +423,7 @@ fn ol07_under_the_record_the_ifl3_payload_and_field_stay_raw() {
     // Literal IFL3 sequence: aggregate, read, callee free, return saved scalar.
     // Use the accepted era-5 frame's explicit frozen-graph attestation. The
     // unattested public-entry case remains a separate conservative control.
-    let fixture = super::tests::inspect_era5_frame(
+    let fixture = super::tests::inspect_attested_frame(
         r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;

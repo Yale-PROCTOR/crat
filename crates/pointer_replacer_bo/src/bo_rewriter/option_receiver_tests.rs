@@ -43,7 +43,7 @@ fn option_receiver_shared_weakening_and_caller_retirement_keep_native_return_cus
     let (baseline, retired) = ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original shared-Option receiver capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary tiny-fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("OPTION-RECEIVER solve={solve:#?}\nINPUT:\n{INPUT}");
@@ -51,7 +51,7 @@ fn option_receiver_shared_weakening_and_caller_retirement_keep_native_return_cus
         let (p, p_decision) = table.entries.iter().find(|(subject, _)| subject.label == "target::p").unwrap();
         let (q, q_decision) = table.entries.iter().find(|(subject, _)| subject.label == "entry::q").unwrap();
         let node = (q.fn_did, q.hir_id);
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual shared-Option receiver emission plan");
         let caller = SignatureClassId::of(q.fn_did);
         let callee = SignatureClassId::of(p.fn_did);

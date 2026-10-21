@@ -1,4 +1,4 @@
-//! Era5a complete-entry and portable semantic identity contract.
+//! Bare complete-entry and portable semantic identity contract.
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

@@ -12,7 +12,7 @@ use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{
-            RoundStats, model_accepts, verify_l2_to_fixpoint_counting, verify_to_fixpoint,
+            RoundStats, model_accepts, verify_guarded_to_fixpoint_counting, verify_to_fixpoint,
             verify_to_fixpoint_counting,
         },
         coherence::add_coherence,
@@ -738,13 +738,13 @@ fn declining_run_records_no_certificate() {
             export.residual_conflicts
         );
         let Some(RoundModelFailure::HardUnsat {
-            active_t2,
+            active_endpoint_retraction,
             core_labels,
         }) = failure
         else {
             panic!("pre-loop contradiction lacks its typed first failure: {failure:?}");
         };
-        assert_eq!(active_t2, 0);
+        assert_eq!(active_endpoint_retraction, 0);
         assert!(core_labels.iter().any(|label| label.contains("kind-pin")));
         assert!(
             core_labels
@@ -1663,7 +1663,7 @@ unsafe fn resize() {
                 }
             }
             let (baseline, checks) = with_assumption_check_trace(|| {
-                solver.model_without_t2_for_test(&construction.selectors)
+                solver.model_without_endpoint_retraction_for_test(&construction.selectors)
             });
             assert_eq!(model, baseline.expect("mandatory no-T2 baseline accepts"));
             assert!(
@@ -1741,7 +1741,7 @@ unsafe fn release() {
         );
         let model = model.expect("T2 retraction preserves acceptance");
         let baseline = solver
-            .model_without_t2_for_test(&construction.selectors)
+            .model_without_endpoint_retraction_for_test(&construction.selectors)
             .expect("no-T2 baseline accepts");
         assert_eq!(
             model, baseline,
@@ -2241,7 +2241,7 @@ fn l2_door_rejects_a_tracked_solver() {
             &solver,
         )
         .expect("emission");
-        let _ = verify_l2_to_fixpoint_counting(
+        let _ = verify_guarded_to_fixpoint_counting(
             &program,
             &slots,
             &origin_flows,

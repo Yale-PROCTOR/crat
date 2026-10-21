@@ -2,7 +2,7 @@
 use std::sync::OnceLock;
 
 use super::{
-    A5Mode, WholeProgramAttestation,
+    OverlapMode, WholeProgramAttestation,
     decision::{Decision, nested_slice::Hold},
 };
 
@@ -22,7 +22,7 @@ fn with_table(source: &str, f: impl Fn(super::decision::DecisionTable) + Send + 
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -57,7 +57,7 @@ fn emitted() -> &'static str {
         std::fs::write(&root, SOURCE).unwrap();
         let result = super::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
@@ -136,7 +136,7 @@ fn held(source: &str) {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

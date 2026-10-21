@@ -16,19 +16,15 @@ use rustc_span::def_id::LocalDefId;
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::borrow_verify::verify_l2_to_fixpoint_counting_impl;
+use super::borrow_verify::verify_guarded_to_fixpoint_counting_impl;
 #[cfg(test)]
 use super::borrow_verify::verify_to_fixpoint_counting_with_flows;
 #[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 #[cfg(test)]
-use super::{BoOwnEmissionStats, a5_overlap::C9MarkKey};
+use super::{BoOwnEmissionStats, param_overlap::CopyMarkKey};
 use super::{
     CrateCtxt, SlotKind,
-    a5_overlap::{
-        A5Mode, A5World, AbiGuardDisposition, WholeProgramAttestation, apply_coarse_constraints,
-    },
-    a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{LoopBackend, verify_to_fixpoint_counting_with_flows_impl},
     boundary_table::{self, Matcher, Role},
     coherence::{
@@ -38,10 +34,15 @@ use super::{
     },
     crate_slots::{CrateSlots, ptr_chain_depth},
     emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
-    l2::{MirLocationKey, SlotKey},
+    guarded_repair::{MirLocationKey, SlotKey},
     mutability_facts::MutFacts,
     origin_flow::OriginFlowResults,
     origin_summary::{OriginSummaries, SignatureRoot},
+    overlap_producer::{OverlapPlan, PlannedCopyMark, produce_overlap_plan},
+    param_overlap::{
+        AbiGuardDisposition, OverlapMode, OverlapWorld, WholeProgramAttestation,
+        apply_coarse_constraints,
+    },
     resolve::{ResolvedSlot, resolve_place},
     slots::SlotOwner,
     solver::{KindSolver, Selectors, SlotRef},
@@ -112,7 +113,7 @@ pub(crate) struct CopyLendEligibility {
 pub(crate) enum CopyLendEligibilityDrop {
     C2MutableOrMissingDestination,
     C3FieldInClosure,
-    S22FreeDestination,
+    FreeDestination,
     C3AggregateStore,
     C3FieldStore,
     C3Return,
@@ -136,7 +137,7 @@ impl CopyLendEligibilityDrop {
         match self {
             Self::C2MutableOrMissingDestination => "c2-mutable-or-missing-destination",
             Self::C3FieldInClosure => "c3-field-in-closure",
-            Self::S22FreeDestination => "s2-2-free-destination",
+            Self::FreeDestination => "s2-2-free-destination",
             Self::C3AggregateStore => "c3-aggregate-store",
             Self::C3FieldStore => "c3-field-store",
             Self::C3Return => "c3-return",
@@ -188,10 +189,10 @@ pub(crate) struct VerifiedBo {
     pub(crate) model: FxHashMap<SlotRef, SlotKind>,
     pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
     #[cfg(test)]
-    pub(crate) retained_c9_marks: BTreeSet<C9MarkKey>,
-    pub(crate) retained_c9_plans: Vec<PlannedC9Mark>,
+    pub(crate) retained_copy_marks: BTreeSet<CopyMarkKey>,
+    pub(crate) retained_copy_plans: Vec<PlannedCopyMark>,
     #[cfg(test)]
-    pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
+    pub(crate) summary_artifact: super::param_overlap::OverlapSummaryArtifact,
     #[cfg(test)]
     pub(crate) mark_artifact: String,
     #[cfg(test)]
@@ -231,21 +232,21 @@ pub(crate) struct VerifiedBo {
     pub(crate) hard_check_elapsed: Duration,
     #[cfg(test)]
     pub(crate) optimize_materialization_elapsed: Duration,
-    pub(crate) a16_refined_links: usize,
+    pub(crate) return_refined_links: usize,
     #[cfg(test)]
-    pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
+    pub(crate) planned_copy_marks: BTreeSet<CopyMarkKey>,
     #[cfg(test)]
-    pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
+    pub(crate) producer_stats: super::overlap_producer::OverlapProducerStats,
 }
 
 /// Typed diagnostic for every `None` boundary before the production A5 worker
 /// can write its model and T2/ESC ledgers. Production callers retain the
 /// historical `Option` API; measurement callers use the reporting twin below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum A5PreledgerDeclineReason {
+pub(crate) enum OverlapPreledgerDeclineReason {
     BaselineConstruction,
     BaselineVerification,
-    A5PlanProduction,
+    OverlapPlanProduction,
     RefinedFallbackConstruction,
     RefinedFallbackVerification,
     PreciseConstruction,
@@ -254,12 +255,12 @@ pub(crate) enum A5PreledgerDeclineReason {
     CoarseVerification,
 }
 
-impl A5PreledgerDeclineReason {
+impl OverlapPreledgerDeclineReason {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 9] = [
         Self::BaselineConstruction,
         Self::BaselineVerification,
-        Self::A5PlanProduction,
+        Self::OverlapPlanProduction,
         Self::RefinedFallbackConstruction,
         Self::RefinedFallbackVerification,
         Self::PreciseConstruction,
@@ -273,7 +274,7 @@ impl A5PreledgerDeclineReason {
         match self {
             Self::BaselineConstruction => "baseline-construction",
             Self::BaselineVerification => "baseline-verification",
-            Self::A5PlanProduction => "a5-plan-production",
+            Self::OverlapPlanProduction => "a5-plan-production",
             Self::RefinedFallbackConstruction => "refined-fallback-construction",
             Self::RefinedFallbackVerification => "refined-fallback-verification",
             Self::PreciseConstruction => "precise-construction",
@@ -315,27 +316,27 @@ fn precise_verification_cause(stats: &super::borrow_verify::RoundStats) -> Strin
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct A5PreledgerDecline {
-    reason: A5PreledgerDeclineReason,
+pub(crate) struct OverlapPreledgerDecline {
+    reason: OverlapPreledgerDeclineReason,
     detail: Option<String>,
 }
 
-impl A5PreledgerDecline {
-    fn at(reason: A5PreledgerDeclineReason) -> Self {
+impl OverlapPreledgerDecline {
+    fn at(reason: OverlapPreledgerDeclineReason) -> Self {
         Self {
             reason,
             detail: None,
         }
     }
 
-    fn from_error(reason: A5PreledgerDeclineReason, error: impl std::fmt::Display) -> Self {
+    fn from_error(reason: OverlapPreledgerDeclineReason, error: impl std::fmt::Display) -> Self {
         Self {
             reason,
             detail: Some(error.to_string()),
         }
     }
 
-    fn with_detail(reason: A5PreledgerDeclineReason, detail: String) -> Self {
+    fn with_detail(reason: OverlapPreledgerDeclineReason, detail: String) -> Self {
         Self {
             reason,
             detail: Some(detail),
@@ -343,7 +344,7 @@ impl A5PreledgerDecline {
     }
 
     #[cfg(test)]
-    pub(crate) fn reason(&self) -> A5PreledgerDeclineReason {
+    pub(crate) fn reason(&self) -> OverlapPreledgerDeclineReason {
         self.reason
     }
 
@@ -353,7 +354,7 @@ impl A5PreledgerDecline {
     }
 }
 
-const A5_PAIR_LEDGER_SHA256: &str =
+const OVERLAP_PAIR_LEDGER_SHA256: &str =
     "16dac90cf269c5480e6f612e54733dd210e41393a879202c7138e93cd7d360e1";
 const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
 
@@ -393,14 +394,14 @@ fn nullability_artifacts(construction: &BoConstruction) -> NullabilityArtifacts 
     }
 }
 
-struct A14Artifacts {
+struct OpacityArtifacts {
     artifact: String,
     opaque_stores: usize,
     unresolved_unresolvable: usize,
     nullable_store_fields: usize,
 }
 
-fn a14_artifacts(construction: &BoConstruction) -> A14Artifacts {
+fn opacity_artifacts(construction: &BoConstruction) -> OpacityArtifacts {
     let mut artifact =
         String::from("variant\towner\tslot\topaque\tunresolved_unresolvable\tnullable\tsafe\n");
     for row in &construction.field_ref_plan.rows {
@@ -416,7 +417,7 @@ fn a14_artifacts(construction: &BoConstruction) -> A14Artifacts {
             row.safe,
         ));
     }
-    A14Artifacts {
+    OpacityArtifacts {
         opaque_stores: construction
             .field_ref_plan
             .rows
@@ -476,14 +477,14 @@ pub(crate) fn cached_precise_rewriter_payload(
     model: &FxHashMap<SlotRef, SlotKind>,
     attestation: Option<WholeProgramAttestation>,
     receipt: &str,
-) -> Result<Vec<PlannedC9Mark>, String> {
-    let plan = produce_a5_plan(
+) -> Result<Vec<PlannedCopyMark>, String> {
+    let plan = produce_overlap_plan(
         program,
         slots,
         origins.native_flows(),
         mut_facts,
         baseline_model,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         attestation,
     )
     .map_err(|error| format!("cached precise A5 plan: {error:#}"))?;
@@ -494,10 +495,10 @@ pub(crate) fn cached_precise_rewriter_payload(
             (plan.retained_marks(model), plan.retained_mark_plans(model))
         };
     let expected = [
-        ("a5_mode", A5Mode::PreciseReplay.label().to_owned()),
+        ("a5_mode", OverlapMode::PreciseReplay.label().to_owned()),
         (
             "a5_world",
-            A5World::ClosedWorldFrozenGraph.label().to_owned(),
+            OverlapWorld::ClosedWorldFrozenGraph.label().to_owned(),
         ),
         ("selected_model_sha256", model_digest(model)),
         ("a5_summary_sha256", summary_digest(&plan)),
@@ -515,7 +516,7 @@ pub(crate) fn cached_precise_rewriter_payload(
     Ok(retained_plans)
 }
 
-fn summary_digest(plan: &A5Plan) -> String {
+fn summary_digest(plan: &OverlapPlan) -> String {
     format!(
         "{:x}",
         Sha256::digest(
@@ -529,18 +530,18 @@ fn summary_digest(plan: &A5Plan) -> String {
 }
 
 #[cfg(test)]
-fn a5_mark_artifact(
-    mode: A5Mode,
-    plan: &A5Plan,
-    retained: &BTreeSet<C9MarkKey>,
+fn overlap_mark_artifact(
+    mode: OverlapMode,
+    plan: &OverlapPlan,
+    retained: &BTreeSet<CopyMarkKey>,
     selected_model_sha256: &str,
 ) -> String {
     let mut out = format!(
         "# a5_mode={}\n# a5_world={}\n# a5_abi_guard={}\n# a5_producer=rustc-mir-current-v1\n\
-         # a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\n# selected_model_sha256={selected_model_sha256}\n\
+         # a5_pair_ledger_sha256={OVERLAP_PAIR_LEDGER_SHA256}\n# selected_model_sha256={selected_model_sha256}\n\
          caller\tblock\tstatement\tcallee\tleft_param\tright_param\tshared_side\tpointee_type\tretained\n",
         mode.label(),
-        A5World::ClosedWorldFrozenGraph.label(),
+        OverlapWorld::ClosedWorldFrozenGraph.label(),
         plan.abi_guard.stamp(),
     );
     for mark in &plan.planned_marks {
@@ -562,15 +563,15 @@ fn a5_mark_artifact(
 }
 
 #[cfg(test)]
-pub(crate) fn a5_site_artifact(mode: A5Mode, plan: &A5Plan) -> String {
+pub(crate) fn overlap_site_artifact(mode: OverlapMode, plan: &OverlapPlan) -> String {
     let mut out = String::from(
         "caller\tblock\tstatement\ttarget\tleft_parameter\tright_parameter\tleft_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\tclass\ta5_world\ta5_mode\ta5_abi_guard\n",
     );
     for site in &plan.site_ledger {
         let class = match site.class {
-            super::a5_overlap::WitnessMutability::MutMut => "mut_mut",
-            super::a5_overlap::WitnessMutability::MutReadOnly { .. } => "mut_read_only",
-            super::a5_overlap::WitnessMutability::SharedShared => "shared_shared",
+            super::param_overlap::WitnessMutability::MutMut => "mut_mut",
+            super::param_overlap::WitnessMutability::MutReadOnly { .. } => "mut_read_only",
+            super::param_overlap::WitnessMutability::SharedShared => "shared_shared",
         };
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -587,7 +588,7 @@ pub(crate) fn a5_site_artifact(mode: A5Mode, plan: &A5Plan) -> String {
             site.right_actual.owner,
             site.right_actual.slot,
             class,
-            A5World::ClosedWorldFrozenGraph.label(),
+            OverlapWorld::ClosedWorldFrozenGraph.label(),
             mode.label(),
             plan.abi_guard.stamp(),
         ));
@@ -663,7 +664,7 @@ fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> 
 
 /// R609-3 (b): the type route's count and digest, only when it removed a pair,
 /// so every receipt without one is byte-identical.
-fn type_disjoint_keys(plan: &A5Plan, mut receipt: String) -> String {
+fn type_disjoint_keys(plan: &OverlapPlan, mut receipt: String) -> String {
     if !plan.type_disjoint.is_empty() {
         receipt.push_str(&format!(
             "a5_type_disjoint_pairs={}\na5_type_disjoint_sha256={:x}\n",
@@ -674,14 +675,14 @@ fn type_disjoint_keys(plan: &A5Plan, mut receipt: String) -> String {
     receipt
 }
 
-fn a5_receipt(
-    mode: A5Mode,
-    plan: &A5Plan,
+fn overlap_receipt(
+    mode: OverlapMode,
+    plan: &OverlapPlan,
     retained: usize,
     retained_sites: usize,
     selected_model_sha256: &str,
     nullability: &NullabilityArtifacts,
-    a14: &A14Artifacts,
+    opacity: &OpacityArtifacts,
 ) -> String {
     canonical_receipt(type_disjoint_keys(
         plan,
@@ -694,13 +695,13 @@ fn a5_receipt(
          a5_planned_marks={}\na5_retained_marks={}\na5_retained_mark_sites={}\n\
          a5_producer=rustc-mir-current-v1\n\
          a5_foster_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\n\
-         a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\nselected_model_sha256={}\n\
+         a5_pair_ledger_sha256={OVERLAP_PAIR_LEDGER_SHA256}\nselected_model_sha256={}\n\
          a5_summary_sha256={}\nnullable_slots={}\nnullable_fields={}\n\
          nullable_ledger_sha256={:x}\na14_opaque_stores={}\n\
          a14_unresolved_unresolvable={}\na14_nullable_store_fields={}\n\
          field_ref_ledger_sha256={:x}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
             mode.label(),
-            A5World::ClosedWorldFrozenGraph.label(),
+            OverlapWorld::ClosedWorldFrozenGraph.label(),
             plan.abi_guard.stamp(),
             plan.stats.raw_pairs,
             plan.stats.effective_pairs,
@@ -716,10 +717,10 @@ fn a5_receipt(
             nullability.slots,
             nullability.fields,
             Sha256::digest(nullability.artifact.as_bytes()),
-            a14.opaque_stores,
-            a14.unresolved_unresolvable,
-            a14.nullable_store_fields,
-            Sha256::digest(a14.artifact.as_bytes()),
+            opacity.opaque_stores,
+            opacity.unresolved_unresolvable,
+            opacity.nullable_store_fields,
+            Sha256::digest(opacity.artifact.as_bytes()),
         ),
     ))
 }
@@ -735,7 +736,7 @@ pub(crate) fn construct_bo_into(
     construct_bo_into_with_esc(program, slots, origins, mut_facts, solver, mode, true)
 }
 
-fn construct_bo_a5_reference(
+fn construct_bo_overlap_reference(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
@@ -794,8 +795,9 @@ pub(crate) fn copy_lend_frame_funnel(
         let solver = KindSolver::new_hard_only(slots);
         solver.set_random_seed(0);
         solver.set_query_timeout(query_timeout);
-        let construction = construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
-            .expect("funnel frame construction");
+        let construction =
+            construct_bo_overlap_reference(program, slots, origins, mut_facts, &solver)
+                .expect("funnel frame construction");
         let eligible = candidates
             .iter()
             .filter(|candidate| candidate.drop.is_none())
@@ -872,7 +874,7 @@ pub(crate) fn a4_wall_probe(
         let solver = KindSolver::new_hard_only(slots);
         solver.set_random_seed(0);
         solver.set_query_timeout(query_timeout);
-        construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+        construct_bo_overlap_reference(program, slots, origins, mut_facts, &solver)
             .expect("a4 frame construction");
         super::coherence::constrain_field_ownership(&solver, slots, program);
         let tracker = solver.tracker().expect("mandatory tracker");
@@ -1292,7 +1294,7 @@ fn add_refined_return_kind_links(
 /// Accepted A16-REFINE construction: add one-way links only for
 /// modeled-origin returns and report their exact site count.
 #[cfg(test)]
-pub(crate) fn construct_bo_into_a16_refined(
+pub(crate) fn construct_bo_into_return_refined(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
@@ -1320,7 +1322,7 @@ fn construct_bo_into_a16_refined_with_esc(
             CopyLendMode::current(),
         )?
     } else {
-        construct_bo_a5_reference(program, slots, origins, mut_facts, solver)?
+        construct_bo_overlap_reference(program, slots, origins, mut_facts, solver)?
     };
     let links = add_refined_return_kind_links(program, slots, origins, solver);
     Ok((construction, links))
@@ -1618,7 +1620,7 @@ pub(crate) fn verify_bo_construction_l2_for_test(
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
     with_construction_replay(construction, || {
-        verify_l2_to_fixpoint_counting_impl(
+        verify_guarded_to_fixpoint_counting_impl(
             program,
             slots,
             origins.native_flows(),
@@ -1632,35 +1634,35 @@ pub(crate) fn verify_bo_construction_l2_for_test(
     })
 }
 
-pub(crate) fn solve_bo_a5_config(
+pub(crate) fn solve_bo_overlap_config(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
     mut_facts: &MutFacts,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<VerifiedBo> {
-    solve_bo_a5_config_reporting(program, slots, origins, mut_facts, mode, attestation).ok()
+    solve_bo_overlap_config_reporting(program, slots, origins, mut_facts, mode, attestation).ok()
 }
 
-/// Diagnostic twin of `solve_bo_a5_config`: identical construction and solve,
+/// Diagnostic twin of `solve_bo_overlap_config`: identical construction and solve,
 /// with a typed reason at every historical pre-ledger `None` exit.
-pub(crate) fn solve_bo_a5_config_reporting(
+pub(crate) fn solve_bo_overlap_config_reporting(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
     mut_facts: &MutFacts,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
-) -> Result<VerifiedBo, A5PreledgerDecline> {
+) -> Result<VerifiedBo, OverlapPreledgerDecline> {
     // A16-REFINE is part of the accepted precise production semantics. The
     // retained Baseline mode is a diagnostic A5 control, not another
     // production configuration.
-    let refined = mode == A5Mode::PreciseReplay;
+    let refined = mode == OverlapMode::PreciseReplay;
     // Complete cache capture is owned here only when no caller already owns
     // it; an existing caller must receive its original recording unchanged.
     let owned_capture = (!super::export::capturing()).then(super::export::arm_scope);
-    let (verified, _links) = solve_bo_a5_config_inner(
+    let (verified, _links) = solve_bo_overlap_config_inner(
         program,
         slots,
         origins,
@@ -1684,19 +1686,19 @@ pub(crate) fn solve_bo_a5_config_reporting(
 /// escaped-loan selection disabled in both the planning baseline and candidate
 /// construction. This is the byte-equivalence path to c080.
 #[cfg(test)]
-pub(crate) fn solve_bo_a5_reference_reporting(
+pub(crate) fn solve_bo_overlap_reference_reporting(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
     mut_facts: &MutFacts,
     attestation: Option<WholeProgramAttestation>,
-) -> Result<VerifiedBo, A5PreledgerDecline> {
-    let (verified, _links) = solve_bo_a5_config_inner(
+) -> Result<VerifiedBo, OverlapPreledgerDecline> {
+    let (verified, _links) = solve_bo_overlap_config_inner(
         program,
         slots,
         origins,
         mut_facts,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         attestation,
         true,
         false,
@@ -1713,27 +1715,27 @@ fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> Verifie
         );
         verified.receipt.push_str(&format!(
             "a16_refined_links={}\n",
-            verified.a16_refined_links
+            verified.return_refined_links
         ));
     }
     verified
 }
 
-fn solve_bo_a5_config_inner(
+fn solve_bo_overlap_config_inner(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
     mut_facts: &MutFacts,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     refined: bool,
     enable_esc_minimal: bool,
-) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
+) -> Result<(VerifiedBo, usize), OverlapPreledgerDecline> {
     let _call_world = super::licensing::stack_entry::enter_world(attestation);
     super::execution_guard::enter_model();
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
     super::source_events::with_inventory(&inventory, || {
-        solve_bo_a5_config_with_source_events(
+        solve_bo_overlap_config_with_source_events(
             program,
             slots,
             origins,
@@ -1746,16 +1748,16 @@ fn solve_bo_a5_config_inner(
     })
 }
 
-fn solve_bo_a5_config_with_source_events(
+fn solve_bo_overlap_config_with_source_events(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origins: &OriginSummaries,
     mut_facts: &MutFacts,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
     refined: bool,
     enable_esc_minimal: bool,
-) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
+) -> Result<(VerifiedBo, usize), OverlapPreledgerDecline> {
     // R549-2 (i): the A5 frame runs Baseline, or LendArm under
     // `CRAT_ERA5C_COPY_LEND=on`; RemovalOnly is a measurement mode with no
     // environment route and never reaches the frame.
@@ -1770,14 +1772,13 @@ fn solve_bo_a5_config_with_source_events(
 
     let baseline_solver = KindSolver::new(slots);
     let baseline_construction =
-        construct_bo_a5_reference(program, slots, origins, mut_facts, &baseline_solver).map_err(
-            |error| {
-                A5PreledgerDecline::from_error(
-                    A5PreledgerDeclineReason::BaselineConstruction,
+        construct_bo_overlap_reference(program, slots, origins, mut_facts, &baseline_solver)
+            .map_err(|error| {
+                OverlapPreledgerDecline::from_error(
+                    OverlapPreledgerDeclineReason::BaselineConstruction,
                     error,
                 )
-            },
-        )?;
+            })?;
     let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,
@@ -1795,8 +1796,8 @@ fn solve_bo_a5_config_with_source_events(
             } else {
                 "source-retirement-coverage".to_owned()
             });
-        A5PreledgerDecline::with_detail(
-            A5PreledgerDeclineReason::BaselineVerification,
+        OverlapPreledgerDecline::with_detail(
+            OverlapPreledgerDeclineReason::BaselineVerification,
             format!(
                 "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?} source_retirement={:?}",
                 baseline_round_stats.rounds,
@@ -1807,25 +1808,25 @@ fn solve_bo_a5_config_with_source_events(
                 baseline_round_stats.field_conflict_decline,
                 baseline_round_stats.field_conflict_kind,
                 baseline_round_stats.cap_exhausted,
-                baseline_round_stats.l2_decline,
+                baseline_round_stats.guarded_decline,
                 baseline_round_stats.source_retirement_decline,
             ),
         )
     })?;
     let baseline_nullability = nullability_artifacts(&baseline_construction);
-    let baseline_a14 = a14_artifacts(&baseline_construction);
-    if mode == A5Mode::Baseline {
+    let baseline_a14 = opacity_artifacts(&baseline_construction);
+    if mode == OverlapMode::Baseline {
         let plan = if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
-            A5Plan::baseline_attested()
+            OverlapPlan::baseline_attested()
         } else {
-            A5Plan::baseline()
+            OverlapPlan::baseline()
         };
         let selected_model_sha256 = model_digest(&baseline_model);
         return Ok((
             VerifiedBo {
                 receipt: repair_keys(
                     &[&baseline_round_stats],
-                    a5_receipt(
+                    overlap_receipt(
                         mode,
                         &plan,
                         0,
@@ -1836,14 +1837,14 @@ fn solve_bo_a5_config_with_source_events(
                     ),
                 ),
                 #[cfg(test)]
-                mark_artifact: a5_mark_artifact(
+                mark_artifact: overlap_mark_artifact(
                     mode,
                     &plan,
                     &BTreeSet::new(),
                     &selected_model_sha256,
                 ),
                 #[cfg(test)]
-                site_artifact: a5_site_artifact(mode, &plan),
+                site_artifact: overlap_site_artifact(mode, &plan),
                 #[cfg(test)]
                 nullable_artifact: baseline_nullability.artifact.clone(),
                 #[cfg(test)]
@@ -1853,8 +1854,8 @@ fn solve_bo_a5_config_with_source_events(
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
                 #[cfg(test)]
-                retained_c9_marks: BTreeSet::new(),
-                retained_c9_plans: Vec::new(),
+                retained_copy_marks: BTreeSet::new(),
+                retained_copy_plans: Vec::new(),
                 #[cfg(test)]
                 round_stats: baseline_round_stats,
                 #[cfg(test)]
@@ -1887,9 +1888,9 @@ fn solve_bo_a5_config_with_source_events(
                 #[cfg(test)]
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
-                a16_refined_links: 0,
+                return_refined_links: 0,
                 #[cfg(test)]
-                planned_c9_marks: BTreeSet::new(),
+                planned_copy_marks: BTreeSet::new(),
                 #[cfg(test)]
                 producer_stats: plan.stats,
             },
@@ -1897,7 +1898,7 @@ fn solve_bo_a5_config_with_source_events(
         ));
     }
 
-    let plan = produce_a5_plan(
+    let plan = produce_overlap_plan(
         program,
         slots,
         origins.native_flows(),
@@ -1907,7 +1908,10 @@ fn solve_bo_a5_config_with_source_events(
         attestation,
     )
     .map_err(|error| {
-        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::A5PlanProduction, error)
+        OverlapPreledgerDecline::from_error(
+            OverlapPreledgerDeclineReason::OverlapPlanProduction,
+            error,
+        )
     })?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         if refined {
@@ -1925,8 +1929,8 @@ fn solve_bo_a5_config_with_source_events(
                 enable_esc_minimal,
             )
             .map_err(|error| {
-                A5PreledgerDecline::from_error(
-                    A5PreledgerDeclineReason::RefinedFallbackConstruction,
+                OverlapPreledgerDecline::from_error(
+                    OverlapPreledgerDeclineReason::RefinedFallbackConstruction,
                     error,
                 )
             })?;
@@ -1939,45 +1943,47 @@ fn solve_bo_a5_config_with_source_events(
                 mut_facts,
             );
             let model = model.ok_or_else(|| {
-                A5PreledgerDecline::at(A5PreledgerDeclineReason::RefinedFallbackVerification)
+                OverlapPreledgerDecline::at(
+                    OverlapPreledgerDeclineReason::RefinedFallbackVerification,
+                )
             })?;
             let selected_model_sha256 = model_digest(&model);
             let nullability = nullability_artifacts(&construction);
-            let a14 = a14_artifacts(&construction);
+            let opacity = opacity_artifacts(&construction);
             return Ok((
                 VerifiedBo {
                     receipt: repair_keys(
                         &[&baseline_round_stats, &round_stats],
-                        a5_receipt(
+                        overlap_receipt(
                             mode,
                             &plan,
                             0,
                             0,
                             &selected_model_sha256,
                             &nullability,
-                            &a14,
+                            &opacity,
                         ),
                     ),
                     #[cfg(test)]
-                    mark_artifact: a5_mark_artifact(
+                    mark_artifact: overlap_mark_artifact(
                         mode,
                         &plan,
                         &BTreeSet::new(),
                         &selected_model_sha256,
                     ),
                     #[cfg(test)]
-                    site_artifact: a5_site_artifact(mode, &plan),
+                    site_artifact: overlap_site_artifact(mode, &plan),
                     #[cfg(test)]
                     nullable_artifact: nullability.artifact,
                     #[cfg(test)]
-                    field_ref_artifact: a14.artifact,
+                    field_ref_artifact: opacity.artifact,
                     #[cfg(test)]
                     summary_artifact: plan.summary_artifact.clone(),
                     baseline_model,
                     model,
                     #[cfg(test)]
-                    retained_c9_marks: BTreeSet::new(),
-                    retained_c9_plans: Vec::new(),
+                    retained_copy_marks: BTreeSet::new(),
+                    retained_copy_plans: Vec::new(),
                     #[cfg(test)]
                     round_stats,
                     #[cfg(test)]
@@ -2008,9 +2014,9 @@ fn solve_bo_a5_config_with_source_events(
                     hard_check_elapsed: solver.hard_check_elapsed(),
                     #[cfg(test)]
                     optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
-                    a16_refined_links: refined_links,
+                    return_refined_links: refined_links,
                     #[cfg(test)]
-                    planned_c9_marks: plan
+                    planned_copy_marks: plan
                         .planned_marks
                         .iter()
                         .map(|mark| mark.key.clone())
@@ -2026,7 +2032,7 @@ fn solve_bo_a5_config_with_source_events(
             VerifiedBo {
                 receipt: repair_keys(
                     &[&baseline_round_stats],
-                    a5_receipt(
+                    overlap_receipt(
                         mode,
                         &plan,
                         0,
@@ -2037,14 +2043,14 @@ fn solve_bo_a5_config_with_source_events(
                     ),
                 ),
                 #[cfg(test)]
-                mark_artifact: a5_mark_artifact(
+                mark_artifact: overlap_mark_artifact(
                     mode,
                     &plan,
                     &BTreeSet::new(),
                     &selected_model_sha256,
                 ),
                 #[cfg(test)]
-                site_artifact: a5_site_artifact(mode, &plan),
+                site_artifact: overlap_site_artifact(mode, &plan),
                 #[cfg(test)]
                 nullable_artifact: baseline_nullability.artifact.clone(),
                 #[cfg(test)]
@@ -2054,8 +2060,8 @@ fn solve_bo_a5_config_with_source_events(
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
                 #[cfg(test)]
-                retained_c9_marks: BTreeSet::new(),
-                retained_c9_plans: Vec::new(),
+                retained_copy_marks: BTreeSet::new(),
+                retained_copy_plans: Vec::new(),
                 #[cfg(test)]
                 round_stats: baseline_round_stats,
                 #[cfg(test)]
@@ -2088,9 +2094,9 @@ fn solve_bo_a5_config_with_source_events(
                 #[cfg(test)]
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
-                a16_refined_links: 0,
+                return_refined_links: 0,
                 #[cfg(test)]
-                planned_c9_marks: plan
+                planned_copy_marks: plan
                     .planned_marks
                     .iter()
                     .map(|mark| mark.key.clone())
@@ -2113,7 +2119,10 @@ fn solve_bo_a5_config_with_source_events(
             enable_esc_minimal,
         )
         .map_err(|error| {
-            A5PreledgerDecline::from_error(A5PreledgerDeclineReason::PreciseConstruction, error)
+            OverlapPreledgerDecline::from_error(
+                OverlapPreledgerDeclineReason::PreciseConstruction,
+                error,
+            )
         })?
     } else {
         (
@@ -2127,17 +2136,20 @@ fn solve_bo_a5_config_with_source_events(
                     CopyLendMode::Baseline,
                 )
             } else {
-                construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+                construct_bo_overlap_reference(program, slots, origins, mut_facts, &solver)
             }
             .map_err(|error| {
-                A5PreledgerDecline::from_error(A5PreledgerDeclineReason::CoarseConstruction, error)
+                OverlapPreledgerDecline::from_error(
+                    OverlapPreledgerDeclineReason::CoarseConstruction,
+                    error,
+                )
             })?,
             0,
         )
     };
     let (model, round_stats) = match mode {
-        A5Mode::Baseline => unreachable!(),
-        A5Mode::PreciseReplay => {
+        OverlapMode::Baseline => unreachable!(),
+        OverlapMode::PreciseReplay => {
             let (model, stats) = verify_bo_construction_with_parameter_overlaps(
                 program,
                 slots,
@@ -2154,15 +2166,15 @@ fn solve_bo_a5_config_with_source_events(
             let detail = precise_verification_cause(&stats);
             (
                 model.ok_or_else(|| {
-                    A5PreledgerDecline::with_detail(
-                        A5PreledgerDeclineReason::PreciseVerification,
+                    OverlapPreledgerDecline::with_detail(
+                        OverlapPreledgerDeclineReason::PreciseVerification,
                         detail,
                     )
                 })?,
                 stats,
             )
         }
-        A5Mode::CoarseConstraint => {
+        OverlapMode::CoarseConstraint => {
             apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
             let (model, stats) = verify_bo_construction_counting(
                 program,
@@ -2174,59 +2186,59 @@ fn solve_bo_a5_config_with_source_events(
             );
             (
                 model.ok_or_else(|| {
-                    A5PreledgerDecline::at(A5PreledgerDeclineReason::CoarseVerification)
+                    OverlapPreledgerDecline::at(OverlapPreledgerDeclineReason::CoarseVerification)
                 })?,
                 stats,
             )
         }
     };
-    let retained_c9_marks = if mode == A5Mode::PreciseReplay {
+    let retained_copy_marks = if mode == OverlapMode::PreciseReplay {
         plan.retained_marks(&model)
     } else {
         BTreeSet::new()
     };
-    let retained_c9_plans = if mode == A5Mode::PreciseReplay {
+    let retained_copy_plans = if mode == OverlapMode::PreciseReplay {
         plan.retained_mark_plans(&model)
     } else {
         Vec::new()
     };
     let selected_model_sha256 = model_digest(&model);
     let nullability = nullability_artifacts(&construction);
-    let a14 = a14_artifacts(&construction);
+    let opacity = opacity_artifacts(&construction);
     Ok((
         VerifiedBo {
             receipt: repair_keys(
                 &[&baseline_round_stats, &round_stats],
-                a5_receipt(
+                overlap_receipt(
                     mode,
                     &plan,
-                    retained_c9_marks.len(),
-                    retained_c9_plans.len(),
+                    retained_copy_marks.len(),
+                    retained_copy_plans.len(),
                     &selected_model_sha256,
                     &nullability,
-                    &a14,
+                    &opacity,
                 ),
             ),
             #[cfg(test)]
-            mark_artifact: a5_mark_artifact(
+            mark_artifact: overlap_mark_artifact(
                 mode,
                 &plan,
-                &retained_c9_marks,
+                &retained_copy_marks,
                 &selected_model_sha256,
             ),
             #[cfg(test)]
-            site_artifact: a5_site_artifact(mode, &plan),
+            site_artifact: overlap_site_artifact(mode, &plan),
             #[cfg(test)]
             nullable_artifact: nullability.artifact,
             #[cfg(test)]
-            field_ref_artifact: a14.artifact,
+            field_ref_artifact: opacity.artifact,
             #[cfg(test)]
             summary_artifact: plan.summary_artifact.clone(),
             model,
             baseline_model,
             #[cfg(test)]
-            retained_c9_marks,
-            retained_c9_plans,
+            retained_copy_marks,
+            retained_copy_plans,
             #[cfg(test)]
             round_stats,
             #[cfg(test)]
@@ -2257,9 +2269,9 @@ fn solve_bo_a5_config_with_source_events(
             hard_check_elapsed: solver.hard_check_elapsed(),
             #[cfg(test)]
             optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
-            a16_refined_links: refined_links,
+            return_refined_links: refined_links,
             #[cfg(test)]
-            planned_c9_marks: plan
+            planned_copy_marks: plan
                 .planned_marks
                 .iter()
                 .map(|mark| mark.key.clone())
@@ -2346,7 +2358,7 @@ pub(crate) fn analyze_copy_relax_sites(
             {
                 Some(CopyLendEligibilityDrop::C3FieldInClosure)
             } else if destination_flows_to_deallocator(program.tcx, &body, &closure) {
-                Some(CopyLendEligibilityDrop::S22FreeDestination)
+                Some(CopyLendEligibilityDrop::FreeDestination)
             } else {
                 copy_relax_escape(program, slots, fn_did, &body, &closure)
             };
@@ -2555,7 +2567,7 @@ pub(crate) fn analyze_copy_lend_candidates(
             {
                 Some(CopyLendEligibilityDrop::C3FieldInClosure)
             } else if destination_flows_to_deallocator(program.tcx, &body, &destination_flow) {
-                Some(CopyLendEligibilityDrop::S22FreeDestination)
+                Some(CopyLendEligibilityDrop::FreeDestination)
             } else {
                 live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
             };
@@ -2925,7 +2937,7 @@ mod mode_tests {
     #[test]
     fn a5_preledger_decline_reason_labels_are_complete_and_stable() {
         assert_eq!(
-            A5PreledgerDeclineReason::ALL.map(A5PreledgerDeclineReason::label),
+            OverlapPreledgerDeclineReason::ALL.map(OverlapPreledgerDeclineReason::label),
             [
                 "baseline-construction",
                 "baseline-verification",

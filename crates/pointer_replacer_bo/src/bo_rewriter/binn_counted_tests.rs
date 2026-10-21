@@ -1196,7 +1196,7 @@ fn iterator_site_rows(input: &str) -> Vec<String> {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1321,7 +1321,7 @@ pub unsafe fn read(p: *mut u8) -> u8 { *p }
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1375,7 +1375,7 @@ pub unsafe fn read_only(q: *const i32) -> i32 { *q.offset(1) }
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1542,7 +1542,7 @@ fn w6v2_counted_call_under_an_a5_raw_view_is_the_collision() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1601,7 +1601,7 @@ fn w6v2_output_storage_settled_at_every_call() {
             let (_, ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )

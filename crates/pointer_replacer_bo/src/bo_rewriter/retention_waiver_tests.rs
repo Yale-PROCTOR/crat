@@ -65,7 +65,7 @@ pub(super) fn dispositions(input: &str, function: &str) -> Vec<Row> {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -302,7 +302,7 @@ fn waived_bridge_receipts(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )?;
         let events = emission
             .plan

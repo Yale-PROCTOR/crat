@@ -44,7 +44,7 @@ fn w6l_local_only_box_owners_deliver_under_the_sibling_hold() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -71,7 +71,7 @@ fn w6l_local_only_box_owners_deliver_under_the_sibling_hold() {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );

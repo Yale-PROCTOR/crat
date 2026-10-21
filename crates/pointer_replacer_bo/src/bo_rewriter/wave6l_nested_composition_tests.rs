@@ -74,7 +74,7 @@ fn rewrite(input: &str) -> RewriteOutcome {
         false,
         false,
         Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )

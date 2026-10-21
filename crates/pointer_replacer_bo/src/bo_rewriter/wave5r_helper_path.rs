@@ -153,7 +153,7 @@ pub mod consumer {
             let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -170,7 +170,7 @@ pub mod consumer {
                 tcx,
                 &table,
                 &Default::default(),
-                &ctx.retained_c9_plans,
+                &ctx.retained_copy_plans,
             )
             .unwrap();
             let mut held = emission.plan.held_classes();

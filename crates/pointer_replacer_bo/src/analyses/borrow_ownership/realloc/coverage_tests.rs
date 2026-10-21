@@ -3,12 +3,12 @@ use rustc_hir::{ItemKind, OwnerNode};
 
 use super::*;
 use crate::analyses::borrow_ownership::{
-    a5_overlap::{A5Mode, WholeProgramAttestation},
-    construction::solve_bo_a5_config_reporting,
+    construction::solve_bo_overlap_config_reporting,
     crate_slots::CrateSlots,
     export,
     mutability_facts::MutFacts,
     origins::compute_origins,
+    param_overlap::{OverlapMode, WholeProgramAttestation},
     portable_export,
 };
 const LABEL: &str = "realloc-result-test:fallback-both-outcomes";
@@ -58,12 +58,12 @@ fn inspect_many(
         let origins = compute_origins(&program);
         let mutability = MutFacts::from_program(&program);
         let (solved, captured) = export::with_bo_export(|| {
-            solve_bo_a5_config_reporting(
+            solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
         });

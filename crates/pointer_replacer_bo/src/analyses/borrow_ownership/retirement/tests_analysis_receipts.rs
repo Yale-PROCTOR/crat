@@ -10,17 +10,17 @@ use rustc_middle::mir::VarDebugInfoContents;
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::WholeProgramAttestation,
-        borrow_verify::with_mode_a_commit_trace,
+        borrow_verify::with_plain_commit_trace,
         construction::{
             CopyLendMode, TestValidationBackend, construct_bo_into,
-            solve_bo_a5_reference_reporting, verify_bo_construction_counting_for_test,
+            solve_bo_overlap_reference_reporting, verify_bo_construction_counting_for_test,
         },
         crate_slots::CrateSlots,
         esc_minimal::with_fixture_selection,
         export::{LoanClass, with_bo_export},
         mutability_facts::MutFacts,
         origins::compute_origins,
+        param_overlap::WholeProgramAttestation,
         slot_key,
         slots::SlotOwner,
         solver::{KindSolver, SlotRef},
@@ -112,8 +112,8 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
         let facts = if case == Case::Outparam { MutFacts::all_mut() } else { MutFacts::from_program(&program) };
         let (model, stats, export, commits) = if case == Case::A5Reference {
             let ((result, commits), export) = with_bo_export(|| {
-                with_mode_a_commit_trace(|| with_fixture_selection(|| {
-                    solve_bo_a5_reference_reporting(&program, &slots, &origins, &facts,
+                with_plain_commit_trace(|| with_fixture_selection(|| {
+                    solve_bo_overlap_reference_reporting(&program, &slots, &origins, &facts,
                         Some(WholeProgramAttestation::FrozenBenchmarkGraph))
                 }))
             });
@@ -131,7 +131,7 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                     if case == Case::EscSelected {
                         assert_eq!(construction.esc_minimal.cross_stage_counts(), (1, 1, 1, 1));
                     }
-                    with_mode_a_commit_trace(|| verify_bo_construction_counting_for_test(
+                    with_plain_commit_trace(|| verify_bo_construction_counting_for_test(
                         &program, &slots, &origins, &solver, &construction, &facts, backend))
                 };
                 if case == Case::EscSelected { with_fixture_selection(solve) } else { solve() }

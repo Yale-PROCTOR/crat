@@ -36,7 +36,7 @@ fn captured() -> Captured {
             let (table, context) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    super::A5Mode::PreciseReplay,
+                    super::OverlapMode::PreciseReplay,
                     Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -73,7 +73,7 @@ fn captured() -> Captured {
                 tcx,
                 &table,
                 &rustc_hash::FxHashSet::default(),
-                &context.retained_c9_plans,
+                &context.retained_copy_plans,
             )
             .expect("accepted fixture emission plan");
             let held = emission.plan.held_classes();

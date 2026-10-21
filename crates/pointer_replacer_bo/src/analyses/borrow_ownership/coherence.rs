@@ -8,7 +8,7 @@ use super::{
     boundary_table::{self, Matcher},
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
     export::{BorrowerKind, OwnerKey, PlaceKey},
-    l2::MirLocationKey,
+    guarded_repair::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
     slots::StructFieldSlot,
     solver::{KindSolver, SlotRef},
@@ -615,7 +615,7 @@ pub(crate) fn constrain_field_ref_worthiness(
             safe,
         });
     }
-    rows.sort_by_key(|row| super::l2::SlotKey::of(row.field));
+    rows.sort_by_key(|row| super::guarded_repair::SlotKey::of(row.field));
     FieldRefPlan { rows }
 }
 

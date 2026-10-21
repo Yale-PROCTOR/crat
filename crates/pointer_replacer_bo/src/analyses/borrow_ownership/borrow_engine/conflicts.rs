@@ -15,9 +15,9 @@ use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
 use super::{
-    a5_places_conflict::ParameterOverlap,
     invalidates::CopyLendLoans,
     origin_replay::{NativeBorrowContext, NativeInference},
+    overlap_places_conflict::ParameterOverlap,
 };
 use crate::{
     analyses::{
@@ -44,7 +44,8 @@ pub(crate) struct WitnessedConflictEdge {
     /// The invalid loan and its location. `None` for an A5 parameter edge (R617-1):
     /// two Ref formals that may overlap, with no loan behind the conflict.
     pub(crate) loan: Option<usize>,
-    pub(crate) loan_location: Option<crate::analyses::borrow_ownership::l2::MirLocationKey>,
+    pub(crate) loan_location:
+        Option<crate::analyses::borrow_ownership::guarded_repair::MirLocationKey>,
     pub(crate) invalidators: Vec<Local>,
     /// R617-1: the invalidators that met the loan only through an A5 overlap
     /// partner (a subset of `invalidators`), part of the hazard key.
@@ -480,10 +481,12 @@ fn extract_witnessed_conflict_edges(
             WitnessedConflictEdge {
                 edge,
                 loan: Some(loan.index()),
-                loan_location: Some(crate::analyses::borrow_ownership::l2::MirLocationKey::new(
-                    location.block.index() as u32,
-                    location.statement_index,
-                )),
+                loan_location: Some(
+                    crate::analyses::borrow_ownership::guarded_repair::MirLocationKey::new(
+                        location.block.index() as u32,
+                        location.statement_index,
+                    ),
+                ),
                 invalidators: invalidators_by_loan.remove(&loan).unwrap_or_default(),
                 overlap_invalidators: overlap_by_loan.remove(&loan).unwrap_or_default(),
             }

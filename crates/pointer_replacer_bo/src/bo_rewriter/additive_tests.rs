@@ -30,7 +30,7 @@ fn with_baseline(test: impl FnOnce(StageSnapshot) + Send) {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("prior terminal plan");
         let prior = StageSnapshot {

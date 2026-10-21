@@ -1594,7 +1594,7 @@ fn production_outcome_injected(
     std::fs::write(&root, fixture).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        super::A5Mode::PreciseReplay,
+        super::OverlapMode::PreciseReplay,
         Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         inject,
     );
@@ -1694,7 +1694,7 @@ fn w6v_counted_position_at_a_pair_owned_call_holds_at_plan_time() {
     std::fs::write(&root, fixture).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        super::A5Mode::PreciseReplay,
+        super::OverlapMode::PreciseReplay,
         Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );
@@ -2097,7 +2097,7 @@ fn w6v_field_load_exemption_reaches_the_census_column() {
         super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2125,7 +2125,7 @@ fn w6v_field_load_exemption_reaches_the_census_column() {
         super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2159,7 +2159,7 @@ fn w6v_field_load_exemption_is_receipted_per_site() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2301,7 +2301,7 @@ fn w6v_qt_insert_recursion_holds_the_tree() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

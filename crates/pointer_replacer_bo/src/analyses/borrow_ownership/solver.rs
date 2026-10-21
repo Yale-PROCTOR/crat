@@ -18,7 +18,7 @@ use super::{
         QueryOutcome, QueryPhase,
     },
     execution_guard::{self, QueryStage},
-    l2::{
+    guarded_repair::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
         RECURRENCE_ESCALATION_CORE_FAMILY,
     },
@@ -609,22 +609,22 @@ enum HardRelaxResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RoundModelFailure {
     HardUnsat {
-        active_t2: usize,
+        active_endpoint_retraction: usize,
         core_labels: Vec<String>,
     },
     HardUnknown {
-        active_t2: usize,
+        active_endpoint_retraction: usize,
         reason: String,
     },
     OptimizeUnsat {
-        active_t2: usize,
+        active_endpoint_retraction: usize,
     },
     OptimizeUnknown {
-        active_t2: usize,
+        active_endpoint_retraction: usize,
         reason: String,
     },
     OptimizeMissingModel {
-        active_t2: usize,
+        active_endpoint_retraction: usize,
     },
 }
 
@@ -632,23 +632,33 @@ impl RoundModelFailure {
     pub(crate) fn summary(&self) -> String {
         match self {
             Self::HardUnsat {
-                active_t2,
+                active_endpoint_retraction,
                 core_labels,
             } => format!(
-                "hard-unsat active_t2={active_t2} core_labels={}",
+                "hard-unsat active_t2={active_endpoint_retraction} core_labels={}",
                 core_labels.join(" | ")
             ),
-            Self::HardUnknown { active_t2, reason } => {
-                format!("hard-unknown active_t2={active_t2} reason={reason}")
+            Self::HardUnknown {
+                active_endpoint_retraction,
+                reason,
+            } => {
+                format!("hard-unknown active_t2={active_endpoint_retraction} reason={reason}")
             }
-            Self::OptimizeUnsat { active_t2 } => {
-                format!("optimize-unsat active_t2={active_t2}")
+            Self::OptimizeUnsat {
+                active_endpoint_retraction,
+            } => {
+                format!("optimize-unsat active_t2={active_endpoint_retraction}")
             }
-            Self::OptimizeUnknown { active_t2, reason } => {
-                format!("optimize-unknown active_t2={active_t2} reason={reason}")
+            Self::OptimizeUnknown {
+                active_endpoint_retraction,
+                reason,
+            } => {
+                format!("optimize-unknown active_t2={active_endpoint_retraction} reason={reason}")
             }
-            Self::OptimizeMissingModel { active_t2 } => {
-                format!("optimize-missing-model active_t2={active_t2}")
+            Self::OptimizeMissingModel {
+                active_endpoint_retraction,
+            } => {
+                format!("optimize-missing-model active_t2={active_endpoint_retraction}")
             }
         }
     }
@@ -2464,7 +2474,7 @@ impl KindSolver {
     /// A5 coarse pricing control: a may-overlapping formal pair cannot both
     /// settle `Ref`. This is deliberately separate from precise replay and is
     /// never the proposed landing consumer.
-    pub(crate) fn add_a5_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
+    pub(crate) fn add_overlap_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
         assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
         let left_ref = &self
             .vars
@@ -2490,7 +2500,7 @@ impl KindSolver {
     /// literals. This method binds that representation to the solver's
     /// hard-assertion and tracked-core path without changing Mode-A's existing
     /// `add_borrow_exclusion` emission.
-    pub(crate) fn add_l2_commit(&self, action: &CommitAction) {
+    pub(crate) fn add_guarded_commit(&self, action: &CommitAction) {
         let expected_family = match action.kind {
             CommitActionKind::GuardedCommit | CommitActionKind::UnconditionalCommit => {
                 GUARDED_COMMIT_CORE_FAMILY
@@ -2797,7 +2807,7 @@ impl KindSolver {
                     // exceptional query once, then run normal housekeeping.
                     self.note_demand_query(assumptions, tracked, &[], unknown.reason.clone());
                     self.record_round_model_failure(RoundModelFailure::HardUnknown {
-                        active_t2: assumptions.len(),
+                        active_endpoint_retraction: assumptions.len(),
                         reason: unknown.reason.unwrap_or_else(|| "-".to_owned()),
                     });
                 }
@@ -2819,7 +2829,7 @@ impl KindSolver {
         }
         if let Some(reason) = initial_unknown_reason {
             self.record_round_model_failure(RoundModelFailure::HardUnknown {
-                active_t2: assumptions.len(),
+                active_endpoint_retraction: assumptions.len(),
                 reason,
             });
         }
@@ -2879,7 +2889,7 @@ impl KindSolver {
     /// W2 baseline-identity oracle: hold every typed endpoint assertion off
     /// while retaining the complete mandatory hard universe and objective.
     #[cfg(test)]
-    pub(crate) fn model_without_t2_for_test(
+    pub(crate) fn model_without_endpoint_retraction_for_test(
         &self,
         selectors: &Selectors,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
@@ -2989,7 +2999,7 @@ impl KindSolver {
                     // era-5c: name the core a leaked selector came from.
                     if t2_core.is_empty() {
                         self.record_round_model_failure(RoundModelFailure::HardUnsat {
-                            active_t2: assumptions.len(),
+                            active_endpoint_retraction: assumptions.len(),
                             core_labels,
                         });
                         return HardRelaxResult::Unsat;
@@ -3177,7 +3187,7 @@ impl KindSolver {
                 }
                 None => {
                     self.record_round_model_failure(RoundModelFailure::OptimizeMissingModel {
-                        active_t2: relaxed.assumptions.len(),
+                        active_endpoint_retraction: relaxed.assumptions.len(),
                     });
                     None
                 }
@@ -3185,10 +3195,10 @@ impl KindSolver {
         } else {
             self.record_round_model_failure(match outcome {
                 SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
-                    active_t2: relaxed.assumptions.len(),
+                    active_endpoint_retraction: relaxed.assumptions.len(),
                 },
                 SatResult::Unknown => RoundModelFailure::OptimizeUnknown {
-                    active_t2: relaxed.assumptions.len(),
+                    active_endpoint_retraction: relaxed.assumptions.len(),
                     reason: unknown_reason.unwrap_or_else(|| "-".to_owned()),
                 },
                 SatResult::Sat => unreachable!(),
@@ -3204,20 +3214,20 @@ impl KindSolver {
         kinds
     }
 
-    pub(crate) fn model_kinds_decomposed_reporting_l2(
+    pub(crate) fn model_kinds_decomposed_reporting_guarded(
         &self,
         hard: &HardLoopSolver,
         selectors: &Selectors,
-    ) -> L2SolveResult {
+    ) -> GuardedSolveResult {
         match self.relax_selectors_hard_typed(hard, selectors) {
             HardRelaxResult::Sat(relaxed) => {
                 let dropped = relaxed.dropped.clone();
                 self.optimized_model_under(&relaxed)
-                    .map(|kinds| L2SolveResult::Sat { kinds, dropped })
-                    .unwrap_or(L2SolveResult::Unknown)
+                    .map(|kinds| GuardedSolveResult::Sat { kinds, dropped })
+                    .unwrap_or(GuardedSolveResult::Unknown)
             }
-            HardRelaxResult::Unsat => L2SolveResult::Unsat,
-            HardRelaxResult::Unknown => L2SolveResult::Unknown,
+            HardRelaxResult::Unsat => GuardedSolveResult::Unsat,
+            HardRelaxResult::Unknown => GuardedSolveResult::Unknown,
         }
     }
 
@@ -3414,10 +3424,13 @@ impl KindSolver {
     /// feature-on loop can emit the ruled diagnostic without altering the
     /// feature-off solver path.
     #[cfg(test)]
-    pub(crate) fn model_kinds_relaxing_reporting_l2(&self, selectors: &Selectors) -> L2SolveResult {
+    pub(crate) fn model_kinds_relaxing_reporting_guarded(
+        &self,
+        selectors: &Selectors,
+    ) -> GuardedSolveResult {
         if self.tracker.as_ref().is_some_and(CoreTracker::is_mandatory) {
             let hard = self.hard_loop_solver();
-            return self.model_kinds_decomposed_reporting_l2(&hard, selectors);
+            return self.model_kinds_decomposed_reporting_guarded(&hard, selectors);
         }
         assert!(
             self.tracker.is_none(),
@@ -3439,7 +3452,7 @@ impl KindSolver {
                         .position(|selector| selectors.is_sink(selector) && in_core(selector))
                         .or_else(|| assumptions.iter().position(in_core))
                     else {
-                        return L2SolveResult::Unsat;
+                        return GuardedSolveResult::Unsat;
                     };
                     self.mark_demand_candidate(
                         selectors
@@ -3448,7 +3461,7 @@ impl KindSolver {
                     );
                     leaked.push(assumptions.swap_remove(index));
                 }
-                SatResult::Unknown => return L2SolveResult::Unknown,
+                SatResult::Unknown => return GuardedSolveResult::Unknown,
             }
         }
 
@@ -3467,7 +3480,7 @@ impl KindSolver {
                     index += 1;
                     final_model_ready = false;
                 }
-                SatResult::Unknown => return L2SolveResult::Unknown,
+                SatResult::Unknown => return GuardedSolveResult::Unknown,
             }
         }
 
@@ -3482,16 +3495,16 @@ impl KindSolver {
             SatResult::Sat => self
                 .solver
                 .get_model()
-                .map(|model| L2SolveResult::Sat {
+                .map(|model| GuardedSolveResult::Sat {
                     kinds: {
                         self.read_version_owns(&model);
                         self.read_kinds(&model)
                     },
                     dropped: leaked,
                 })
-                .unwrap_or(L2SolveResult::Unknown),
-            SatResult::Unsat => L2SolveResult::Unsat,
-            SatResult::Unknown => L2SolveResult::Unknown,
+                .unwrap_or(GuardedSolveResult::Unknown),
+            SatResult::Unsat => GuardedSolveResult::Unsat,
+            SatResult::Unknown => GuardedSolveResult::Unknown,
         }
     }
 
@@ -3548,7 +3561,7 @@ impl KindSolver {
     }
 }
 
-pub(crate) enum L2SolveResult {
+pub(crate) enum GuardedSolveResult {
     Sat {
         kinds: FxHashMap<SlotRef, SlotKind>,
         dropped: Vec<Bool>,
@@ -3702,12 +3715,12 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
     /// hard source, while the relax loop can drop a selector to leak that source.
     source_selectors: Vec<Bool>,
-    source_keys: Vec<super::export::T2AssertKey>,
+    source_keys: Vec<super::export::EndpointRetractionKey>,
     /// §NB-F: one selector per `sink` (free/realloc arg) ownership assertion —
     /// the sink twin of `source_selectors`. Dropping one LEAKS THE FREE (the
     /// freed value's owning is no longer forced; nothing asserts ¬own/¬ref).
     sink_selectors: Vec<Bool>,
-    sink_keys: Vec<super::export::T2AssertKey>,
+    sink_keys: Vec<super::export::EndpointRetractionKey>,
 }
 
 impl BoOwnDatabase<'_> {
@@ -4075,7 +4088,7 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.source_selectors
     }
 
-    pub(crate) fn source_keys(&self) -> &[super::export::T2AssertKey] {
+    pub(crate) fn source_keys(&self) -> &[super::export::EndpointRetractionKey] {
         &self.source_keys
     }
 
@@ -4084,7 +4097,7 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.sink_selectors
     }
 
-    pub(crate) fn sink_keys(&self) -> &[super::export::T2AssertKey] {
+    pub(crate) fn sink_keys(&self) -> &[super::export::EndpointRetractionKey] {
         &self.sink_keys
     }
 }
@@ -4096,7 +4109,7 @@ impl<'opt> BoOwnDatabase<'opt> {
 pub(crate) struct Selectors {
     all: Vec<Bool>,
     n_sources: usize,
-    keys: Vec<super::export::T2AssertKey>,
+    keys: Vec<super::export::EndpointRetractionKey>,
 }
 
 impl Selectors {
@@ -4111,9 +4124,9 @@ impl Selectors {
 
     pub(crate) fn new_with_keys(
         sources: Vec<Bool>,
-        source_keys: Vec<super::export::T2AssertKey>,
+        source_keys: Vec<super::export::EndpointRetractionKey>,
         sinks: Vec<Bool>,
-        sink_keys: Vec<super::export::T2AssertKey>,
+        sink_keys: Vec<super::export::EndpointRetractionKey>,
     ) -> Self {
         assert_eq!(sources.len(), source_keys.len());
         assert_eq!(sinks.len(), sink_keys.len());
@@ -4142,7 +4155,7 @@ impl Selectors {
         &self.all[self.n_sources..]
     }
 
-    pub(crate) fn keys(&self) -> &[super::export::T2AssertKey] {
+    pub(crate) fn keys(&self) -> &[super::export::EndpointRetractionKey] {
         &self.keys
     }
 
@@ -4616,7 +4629,10 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
-        let key = super::export::current_t2_assert_key(super::export::BoundaryRole::Source, var);
+        let key = super::export::current_endpoint_retraction_key(
+            super::export::BoundaryRole::Source,
+            var,
+        );
         super::ownership_evidence::record_endpoint(
             &key,
             self.source_selectors
@@ -4641,7 +4657,8 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.sink_selectors.push(selector);
-        let key = super::export::current_t2_assert_key(super::export::BoundaryRole::Sink, var);
+        let key =
+            super::export::current_endpoint_retraction_key(super::export::BoundaryRole::Sink, var);
         super::ownership_evidence::record_endpoint(
             &key,
             self.sink_selectors

@@ -96,7 +96,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
             let capture = super::ast_transform::capture_ast(tcx).expect("one original AST capture");
             let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-                super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             ))).expect("one actual return-atom decision invocation");
             let solve = super::model_cache::solve_receipt();
             println!("J17/J18 return-atom fixture solve receipt: {solve:#?}");
@@ -132,7 +132,7 @@ fn return_atom_lifetime_revert_cannot_leave_a_return_only_generated_borrow() {
                 .find(|(subject, _)| subject.label == "independent::q").expect("independent parameter");
             assert!(matches!(independent_choice, Decision::Ref { mutable: false }),
                 "AUTHORING PREMISE: actual independent Ref: {independent_choice:?}");
-            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+            let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
                 .expect("actual return-atom terminal plan");
             let owner = SignatureClassId::of(subject.fn_did);
             let other = SignatureClassId::of(independent.fn_did);

@@ -32,7 +32,7 @@ use super::{
     seam::Form,
 };
 use crate::analyses::{
-    borrow_ownership::{l2::MirLocationKey, slots::SlotOwner},
+    borrow_ownership::{guarded_repair::MirLocationKey, slots::SlotOwner},
     liveness::MaybeLiveLocals,
 };
 

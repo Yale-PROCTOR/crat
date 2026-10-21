@@ -24,7 +24,7 @@ use z3::SatResult;
 use super::report::Row;
 use crate::analyses::borrow_ownership::{
     SlotKind,
-    borrow_verify::with_mode_a_commit_trace,
+    borrow_verify::with_plain_commit_trace,
     coherence::constrain_field_ownership,
     construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
@@ -599,7 +599,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         copy_lend_mode,
     )
     .unwrap_or_else(|error| panic!("ordinary emission: {error:#}"));
-    let ((model, repair_stats), commit_trace) = with_mode_a_commit_trace(|| {
+    let ((model, repair_stats), commit_trace) = with_plain_commit_trace(|| {
         verify_bo_construction_counting(
             &program,
             &slots,

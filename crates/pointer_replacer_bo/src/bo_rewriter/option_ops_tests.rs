@@ -42,7 +42,7 @@ fn admitted_raw_return(input: &str, function: &str, binding: &str, null: &str) {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("prepared class");
         assert!(

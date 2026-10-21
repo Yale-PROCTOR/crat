@@ -21,7 +21,7 @@ use crate::{
         crate_slots::CrateSlots,
         esc_minimal,
         export::{BoExport, BoundaryRole, SelectorSite},
-        l2::SlotKey,
+        guarded_repair::SlotKey,
         solver::{SelectorTrace, SelectorTraceOutcome, SelectorTracePhase, SlotRef},
     },
     utils::rustc::RustProgram,

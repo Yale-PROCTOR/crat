@@ -238,13 +238,13 @@ fn e5c_ko_observe_program() {
         let slots = super::crate_slots::CrateSlots::build(&program);
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
-        let verified = super::construction::solve_bo_a5_config(
+        let verified = super::construction::solve_bo_overlap_config(
             &program,
             &slots,
             &origins,
             &mutability,
-            super::a5_overlap::A5Mode::PreciseReplay,
-            Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::param_overlap::OverlapMode::PreciseReplay,
+            Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )
         .expect("the program solves");
         let mut rows: Vec<String> = verified

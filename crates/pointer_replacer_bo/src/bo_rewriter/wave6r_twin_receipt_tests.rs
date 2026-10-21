@@ -15,13 +15,13 @@ fn emitted_with_receipt(input: &str) -> (String, String) {
         let (table, ctx) = super::super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::super::A5Mode::PreciseReplay,
+                super::super::OverlapMode::PreciseReplay,
                 Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
         .expect("native corpus-mode decisions");
         let emission =
-            super::super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            super::super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
                 .expect("native emission plan");
         let held = emission.plan.held_classes();
         let reverts = super::super::ast_transform::revert_set_from_classes_and_atoms(
@@ -134,7 +134,7 @@ pub unsafe fn copy_pointer_storage() -> u8 {
         false,
         false,
         Some((
-            super::super::A5Mode::PreciseReplay,
+            super::super::OverlapMode::PreciseReplay,
             Some(super::super::WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     );

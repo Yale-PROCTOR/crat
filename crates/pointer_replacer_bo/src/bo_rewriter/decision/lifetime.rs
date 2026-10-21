@@ -29,12 +29,12 @@ use super::{
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
-        a5_overlap::WholeProgramAttestation,
-        a5_producer::{ClosedWorldCallWorld, resolve_closed_world_call_world},
         crate_slots::CrateSlots,
         origin_summary::{
             OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot,
         },
+        overlap_producer::{ClosedWorldCallWorld, resolve_closed_world_call_world},
+        param_overlap::WholeProgramAttestation,
         solver::SlotRef,
     },
     utils::rustc::RustProgram,

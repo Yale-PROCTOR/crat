@@ -11,30 +11,30 @@ use rustc_middle::{
 };
 
 #[cfg(test)]
-use super::a5_overlap::A5World;
+use super::param_overlap::OverlapWorld;
 use super::{
     SlotKind,
-    a5_overlap::{
-        A5Mode, A5SummaryArtifact, AbiBoundaryFacts, AbiGuardDisposition, AllWitnessesGate,
-        C9MarkKey, CallSiteWitnessKey, CallTransfer, FunctionPairKey, PairClass, PairFacts,
-        SetPairEvidence, WholeProgramAttestation, WitnessMarkability, WitnessMutability,
-        a5_abi_guard, all_witnesses_gate, classify_pair, join_witness_mutability,
-        render_summary_artifact, solve_may_overlap,
-    },
-    a5_snapshot_effects::snapshot_verdict_for_target,
     borrow_engine::{AccessDepth, ParameterOverlap, PlaceConflictBias, places_conflict},
     crate_slots::CrateSlots,
-    l2::{MirLocationKey, SlotKey},
+    guarded_repair::{MirLocationKey, SlotKey},
     mutability_facts::MutFacts,
     origin_flow::OriginFlowResults,
+    overlap_snapshot_effects::snapshot_verdict_for_target,
+    param_overlap::{
+        AbiBoundaryFacts, AbiGuardDisposition, AllWitnessesGate, CallSiteWitnessKey, CallTransfer,
+        CopyMarkKey, FunctionPairKey, OverlapMode, OverlapSummaryArtifact, PairClass, PairFacts,
+        SetPairEvidence, WholeProgramAttestation, WitnessMarkability, WitnessMutability,
+        all_witnesses_gate, classify_pair, join_witness_mutability, overlap_abi_guard,
+        render_summary_artifact, solve_may_overlap,
+    },
     resolve::{ResolvedSlot, resolve_place},
     solver::SlotRef,
 };
 use crate::utils::rustc::RustProgram;
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlannedC9Mark {
-    pub(crate) key: C9MarkKey,
+pub(crate) struct PlannedCopyMark {
+    pub(crate) key: CopyMarkKey,
     pub(crate) endpoint_slots: BTreeSet<SlotKey>,
     pub(crate) call_span: rustc_span::Span,
     pub(crate) caller_did: LocalDefId,
@@ -43,7 +43,7 @@ pub(crate) struct PlannedC9Mark {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct A5ProducerStats {
+pub(crate) struct OverlapProducerStats {
     pub(crate) calls: usize,
     pub(crate) unresolved_calls: usize,
     pub(crate) raw_pairs: usize,
@@ -59,24 +59,24 @@ pub(crate) struct A5ProducerStats {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct A5Plan {
+pub(crate) struct OverlapPlan {
     #[cfg(test)]
-    pub(crate) mode: A5Mode,
+    pub(crate) mode: OverlapMode,
     #[cfg(test)]
-    pub(crate) world: A5World,
+    pub(crate) world: OverlapWorld,
     pub(crate) abi_guard: AbiGuardDisposition,
     pub(crate) effective_overlaps: FxHashMap<LocalDefId, ParameterOverlap>,
     pub(crate) coarse_pairs: Vec<(SlotRef, SlotRef)>,
-    pub(crate) planned_marks: Vec<PlannedC9Mark>,
+    pub(crate) planned_marks: Vec<PlannedCopyMark>,
     #[cfg(test)]
-    pub(crate) site_ledger: Vec<A5ProductionSiteRow>,
-    pub(crate) summary_artifact: A5SummaryArtifact,
-    pub(crate) stats: A5ProducerStats,
+    pub(crate) site_ledger: Vec<OverlapSiteRow>,
+    pub(crate) summary_artifact: OverlapSummaryArtifact,
+    pub(crate) stats: OverlapProducerStats,
     /// R609-3 (b): `overlap-partner-disjoint:type-rule(…)`, one per removed pair.
     pub(crate) type_disjoint: Vec<String>,
 }
 
-impl A5Plan {
+impl OverlapPlan {
     pub(crate) fn baseline() -> Self {
         Self::baseline_with_guard(AbiGuardDisposition::Permitted { attested: false })
     }
@@ -89,17 +89,17 @@ impl A5Plan {
         let fixpoint = solve_may_overlap(std::iter::empty());
         Self {
             #[cfg(test)]
-            mode: A5Mode::Baseline,
+            mode: OverlapMode::Baseline,
             #[cfg(test)]
-            world: A5World::ClosedWorldFrozenGraph,
+            world: OverlapWorld::ClosedWorldFrozenGraph,
             abi_guard: guard.clone(),
             effective_overlaps: FxHashMap::default(),
             coarse_pairs: Vec::new(),
             planned_marks: Vec::new(),
             #[cfg(test)]
             site_ledger: Vec::new(),
-            summary_artifact: render_summary_artifact(&fixpoint, A5Mode::Baseline, &guard),
-            stats: A5ProducerStats::default(),
+            summary_artifact: render_summary_artifact(&fixpoint, OverlapMode::Baseline, &guard),
+            stats: OverlapProducerStats::default(),
             type_disjoint: Vec::new(),
         }
     }
@@ -107,7 +107,7 @@ impl A5Plan {
     pub(crate) fn retained_marks(
         &self,
         model: &FxHashMap<SlotRef, SlotKind>,
-    ) -> BTreeSet<C9MarkKey> {
+    ) -> BTreeSet<CopyMarkKey> {
         self.planned_marks
             .iter()
             .filter(|mark| {
@@ -125,7 +125,7 @@ impl A5Plan {
     pub(crate) fn retained_mark_plans(
         &self,
         model: &FxHashMap<SlotRef, SlotKind>,
-    ) -> Vec<PlannedC9Mark> {
+    ) -> Vec<PlannedCopyMark> {
         let mut retained = self
             .planned_marks
             .iter()
@@ -141,9 +141,9 @@ impl A5Plan {
             .collect::<Vec<_>>();
         retained.sort_by(|left, right| left.key.cmp(&right.key));
         retained.dedup_by(|left, right| {
-            let shared_actual = |mark: &PlannedC9Mark| match mark.key.shared_side {
-                super::a5_overlap::PairSide::Left => mark.key.actuals.0,
-                super::a5_overlap::PairSide::Right => mark.key.actuals.1,
+            let shared_actual = |mark: &PlannedCopyMark| match mark.key.shared_side {
+                super::param_overlap::PairSide::Left => mark.key.actuals.0,
+                super::param_overlap::PairSide::Right => mark.key.actuals.1,
             };
             left.caller_did == right.caller_did
                 && left.call_span.lo() == right.call_span.lo()
@@ -156,7 +156,7 @@ impl A5Plan {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct A5ProductionSiteRow {
+pub(crate) struct OverlapSiteRow {
     #[cfg(test)]
     pub(crate) caller: u32,
     #[cfg(test)]
@@ -180,13 +180,13 @@ struct WitnessRecord {
     target: LocalDefId,
     class: WitnessMutability,
     markability: WitnessMarkability,
-    mark: Option<PlannedC9Mark>,
+    mark: Option<PlannedCopyMark>,
     endpoints: (SlotRef, SlotRef),
     registered_site: bool,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct A5SiteBranchAudit {
+pub(crate) struct OverlapSiteBranchAudit {
     pub(crate) caller: u32,
     #[cfg(test)]
     pub(crate) caller_path: String,
@@ -212,11 +212,11 @@ pub(crate) struct A5SiteBranchAudit {
     pub(crate) terminator: String,
 }
 
-pub(crate) fn audit_a5_site_branches(
+pub(crate) fn audit_overlap_site_branches(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     flows: &OriginFlowResults,
-) -> Vec<A5SiteBranchAudit> {
+) -> Vec<OverlapSiteBranchAudit> {
     let tcx = program.tcx;
     let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
     let arena = typed_arena::Arena::new();
@@ -349,7 +349,7 @@ pub(crate) fn audit_a5_site_branches(
                         }
                     };
                     for &target in targets {
-                        answer.push(A5SiteBranchAudit {
+                        answer.push(OverlapSiteBranchAudit {
                             caller: caller.local_def_index.as_u32(),
                             #[cfg(test)]
                             caller_path: caller_path.clone(),
@@ -548,10 +548,10 @@ fn join_classes(classes: impl IntoIterator<Item = WitnessMutability>) -> Witness
                 right_mutable = true;
             }
             WitnessMutability::MutReadOnly {
-                read_only: super::a5_overlap::PairSide::Left,
+                read_only: super::param_overlap::PairSide::Left,
             } => right_mutable = true,
             WitnessMutability::MutReadOnly {
-                read_only: super::a5_overlap::PairSide::Right,
+                read_only: super::param_overlap::PairSide::Right,
             } => left_mutable = true,
             WitnessMutability::SharedShared => {}
         }
@@ -559,10 +559,10 @@ fn join_classes(classes: impl IntoIterator<Item = WitnessMutability>) -> Witness
     match (left_mutable, right_mutable) {
         (true, true) => WitnessMutability::MutMut,
         (true, false) => WitnessMutability::MutReadOnly {
-            read_only: super::a5_overlap::PairSide::Right,
+            read_only: super::param_overlap::PairSide::Right,
         },
         (false, true) => WitnessMutability::MutReadOnly {
-            read_only: super::a5_overlap::PairSide::Left,
+            read_only: super::param_overlap::PairSide::Left,
         },
         (false, false) => WitnessMutability::SharedShared,
     }
@@ -689,7 +689,7 @@ fn resolve_closed_world_call_world_from_analysis(
                 unresolved_calls += 1;
                 merge_abi_guard(
                     &mut aggregate_guard,
-                    a5_abi_guard(
+                    overlap_abi_guard(
                         &AbiBoundaryFacts {
                             unresolved_target: true,
                             ..AbiBoundaryFacts::default()
@@ -883,21 +883,21 @@ fn site_seed_disposition(verdict: PairClass, dependencies_empty: bool) -> SiteSe
     }
 }
 
-pub(crate) fn produce_a5_plan(
+pub(crate) fn produce_overlap_plan(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     flows: &OriginFlowResults,
     mut_facts: &MutFacts,
     baseline_model: &FxHashMap<SlotRef, SlotKind>,
-    mode: A5Mode,
+    mode: OverlapMode,
     attestation: Option<WholeProgramAttestation>,
-) -> Result<A5Plan, String> {
-    if mode == A5Mode::Baseline {
+) -> Result<OverlapPlan, String> {
+    if mode == OverlapMode::Baseline {
         return Ok(
             if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
-                A5Plan::baseline_attested()
+                OverlapPlan::baseline_attested()
             } else {
-                A5Plan::baseline()
+                OverlapPlan::baseline()
             },
         );
     }
@@ -932,10 +932,10 @@ pub(crate) fn produce_a5_plan(
     let resolved = &call_world.resolved;
     let indirect_function_targets = &call_world.indirect_function_targets;
     let unknown_reachable = &call_world.unknown_reachable;
-    let mut stats = A5ProducerStats {
+    let mut stats = OverlapProducerStats {
         calls: call_world.calls,
         unresolved_calls: call_world.unresolved_calls,
-        ..A5ProducerStats::default()
+        ..OverlapProducerStats::default()
     };
     let mut aggregate_guard = call_world.aggregate_guard.clone();
 
@@ -961,7 +961,7 @@ pub(crate) fn produce_a5_plan(
                     function_target: indirect_function_targets.contains(&target),
                     ..AbiBoundaryFacts::default()
                 };
-                let guard = a5_abi_guard(&facts, attestation);
+                let guard = overlap_abi_guard(&facts, attestation);
                 merge_abi_guard(&mut aggregate_guard, guard);
             }
             for left in 0..args.len() {
@@ -1090,7 +1090,7 @@ pub(crate) fn produce_a5_plan(
                                 Some(read_only),
                                 snapshot_verdict_for_target(tcx, target, left, right, read_only),
                             ),
-                            _ => (None, super::a5_overlap::SnapshotVerdict::OpaqueEscape),
+                            _ => (None, super::param_overlap::SnapshotVerdict::OpaqueEscape),
                         };
                         let markability = WitnessMarkability {
                             effect,
@@ -1099,8 +1099,8 @@ pub(crate) fn produce_a5_plan(
                             unknown_caller: false,
                         };
                         let mark = read_only.and_then(|read_only| {
-                            Some(PlannedC9Mark {
-                                key: C9MarkKey::new(
+                            Some(PlannedCopyMark {
+                                key: CopyMarkKey::new(
                                     caller.local_def_index.as_u32(),
                                     MirLocationKey::new(block.as_u32(), data.statements.len()),
                                     targets.iter().map(|target| target.local_def_index.as_u32()),
@@ -1244,7 +1244,7 @@ pub(crate) fn produce_a5_plan(
                     left_actual,
                     right_actual,
                 );
-                A5ProductionSiteRow {
+                OverlapSiteRow {
                     #[cfg(test)]
                     caller,
                     #[cfg(test)]
@@ -1276,11 +1276,11 @@ pub(crate) fn produce_a5_plan(
         .map(|(target, pairs)| (target, ParameterOverlap::from_pairs(pairs)))
         .collect();
     let summary_artifact = render_summary_artifact(&fixpoint, mode, &aggregate_guard);
-    Ok(A5Plan {
+    Ok(OverlapPlan {
         #[cfg(test)]
         mode,
         #[cfg(test)]
-        world: A5World::ClosedWorldFrozenGraph,
+        world: OverlapWorld::ClosedWorldFrozenGraph,
         abi_guard: aggregate_guard,
         effective_overlaps,
         coarse_pairs: coarse.into_values().collect(),
@@ -1300,7 +1300,7 @@ mod tests {
     use super::*;
     use crate::analyses::borrow_ownership::{
         construction::{
-            CopyLendMode, construct_bo_into, solve_bo_a5_config, verify_bo_construction,
+            CopyLendMode, construct_bo_into, solve_bo_overlap_config, verify_bo_construction,
         },
         origins::compute_origins,
         solver::KindSolver,
@@ -1387,7 +1387,7 @@ mod tests {
             let program = program(tcx);
             let slots = CrateSlots::build(&program);
             let origins = compute_origins(&program);
-            let audit = audit_a5_site_branches(&program, &slots, origins.native_flows());
+            let audit = audit_overlap_site_branches(&program, &slots, origins.native_flows());
             let site = audit
                 .iter()
                 .find(|row| {
@@ -1418,32 +1418,32 @@ mod tests {
             let mutability = MutFacts::from_program(&program);
             let model = baseline(&program, &slots, &origins, &mutability);
 
-            let precise = produce_a5_plan(
+            let precise = produce_overlap_plan(
                 &program,
                 &slots,
                 origins.native_flows(),
                 &mutability,
                 &model,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("precise plan");
             assert!(precise.stats.raw_pairs > 0);
             assert!(precise.stats.planned_marks > 0);
-            assert_eq!(precise.mode, A5Mode::PreciseReplay);
-            assert_eq!(precise.world, A5World::ClosedWorldFrozenGraph);
+            assert_eq!(precise.mode, OverlapMode::PreciseReplay);
+            assert_eq!(precise.world, OverlapWorld::ClosedWorldFrozenGraph);
 
-            let baseline = produce_a5_plan(
+            let baseline = produce_overlap_plan(
                 &program,
                 &slots,
                 origins.native_flows(),
                 &mutability,
                 &model,
-                A5Mode::Baseline,
+                OverlapMode::Baseline,
                 None,
             )
             .expect("baseline plan");
-            assert_eq!(baseline.stats, A5ProducerStats::default());
+            assert_eq!(baseline.stats, OverlapProducerStats::default());
             assert!(baseline.effective_overlaps.is_empty());
             assert!(baseline.planned_marks.is_empty());
         })
@@ -1470,13 +1470,13 @@ mod tests {
                 .find(|did| tcx.item_name(did.to_def_id()).as_str() == "sink")
                 .expect("sink function");
 
-            let plan = produce_a5_plan(
+            let plan = produce_overlap_plan(
                 &program,
                 &slots,
                 origins.native_flows(),
                 &mutability,
                 &model,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("precise plan");
@@ -1542,33 +1542,33 @@ mod tests {
             let mutability = MutFacts::from_program(&program);
             let baseline_model = baseline(&program, &slots, &origins, &mutability);
 
-            let baseline = solve_bo_a5_config(
+            let baseline = solve_bo_overlap_config(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::Baseline,
+                OverlapMode::Baseline,
                 None,
             )
             .expect("baseline config");
             assert_eq!(baseline.model, baseline_model);
-            assert!(baseline.retained_c9_marks.is_empty());
+            assert!(baseline.retained_copy_marks.is_empty());
 
-            let precise = solve_bo_a5_config(
+            let precise = solve_bo_overlap_config(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("precise config");
-            let coarse = solve_bo_a5_config(
+            let coarse = solve_bo_overlap_config(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                A5Mode::CoarseConstraint,
+                OverlapMode::CoarseConstraint,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("coarse config");
@@ -1599,7 +1599,7 @@ mod tests {
                         .contains(&format!("# a5_mode={mode}\n"))
                 );
             }
-            assert!(coarse.retained_c9_marks.is_empty());
+            assert!(coarse.retained_copy_marks.is_empty());
         })
         .unwrap();
     }
@@ -1628,17 +1628,25 @@ mod tests {
         std::fs::write(&root, code).expect("write production fixture");
         let precise = crate::bo_rewriter::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
-        let baseline =
-            crate::bo_rewriter::rewrite_m1_path_a5_injected(&root, A5Mode::Baseline, None, &|_| {});
+        let baseline = crate::bo_rewriter::rewrite_m1_path_a5_injected(
+            &root,
+            OverlapMode::Baseline,
+            None,
+            &|_| {},
+        );
         let production = crate::bo_rewriter::rewrite_m1_path(&root);
         std::fs::remove_dir_all(&fixture).expect("remove production fixture directory");
-        assert!(precise.a5_receipt().contains("a5_mode=precise_replay\n"));
-        assert!(baseline.a5_receipt().contains("a5_mode=baseline\n"));
-        let precise_receipt = precise.a5_receipt().to_owned();
+        assert!(
+            precise
+                .overlap_receipt()
+                .contains("a5_mode=precise_replay\n")
+        );
+        assert!(baseline.overlap_receipt().contains("a5_mode=baseline\n"));
+        let precise_receipt = precise.overlap_receipt().to_owned();
         let source = |outcome: crate::bo_rewriter::RewriteOutcome| match outcome {
             crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } => source,
             crate::bo_rewriter::RewriteOutcome::Degraded { reason, .. } => {
@@ -1690,13 +1698,15 @@ mod tests {
         std::fs::write(&root, code).expect("write W13 fixture");
         let suppressed = crate::bo_rewriter::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|table| table.c9_marks.clear(),
         );
         std::fs::remove_dir_all(&fixture).expect("remove W13 fixture directory");
         assert!(
-            suppressed.a5_receipt().contains("a5_retained_marks=1\n"),
+            suppressed
+                .overlap_receipt()
+                .contains("a5_retained_marks=1\n"),
             "the accepted model must still require the mark"
         );
         assert!(
@@ -1725,12 +1735,12 @@ mod tests {
         std::fs::write(&root, code).expect("write orphan-mark fixture");
         let outcome = crate::bo_rewriter::rewrite_m1_path_a5_injected(
             &root,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
         std::fs::remove_dir_all(&fixture).expect("remove orphan-mark fixture directory");
-        assert!(outcome.a5_receipt().contains("a5_retained_marks=1\n"));
+        assert!(outcome.overlap_receipt().contains("a5_retained_marks=1\n"));
         let crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } = outcome else {
             panic!("fixture must emit its conservative fallback")
         };

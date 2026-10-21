@@ -295,7 +295,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
             let (mut table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -349,7 +349,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
                     });
                 atoms.insert(id);
             }
-            let emission = emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            let emission = emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
                 .expect("emission plan");
             let mut held = emission.plan.held_classes();
             assert!(
@@ -515,7 +515,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
             let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -583,7 +583,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
             let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -636,7 +636,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
             let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -748,7 +748,7 @@ pub unsafe extern "C" fn __crat_test_live() -> u32 {
             let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )

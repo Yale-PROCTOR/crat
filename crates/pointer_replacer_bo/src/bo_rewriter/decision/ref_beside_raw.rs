@@ -587,7 +587,7 @@ pub(crate) fn holds(
     proofs: &A5SeamProofIndex,
     mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
     pair_sites: &[PairSiteDecision],
-    c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
+    c9_marks: &[crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark],
 ) -> Vec<((LocalDefId, HirId), DegradeReason)> {
     use super::seam::{Form, form_of};
     struct Formal<'a> {

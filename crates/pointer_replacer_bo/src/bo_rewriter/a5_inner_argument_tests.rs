@@ -12,7 +12,7 @@
 //! wrapper is built; taking the walked argument text is therefore the whole of
 //! (α), and the planner then composes the pair with the outer depending on the
 //! inner.
-use super::{A5Mode, RewriteOutcome, WholeProgramAttestation};
+use super::{OverlapMode, RewriteOutcome, WholeProgramAttestation};
 
 #[path = "a5_inner_argument_fixture.rs"]
 mod fixture;
@@ -27,7 +27,7 @@ fn rewrite(input: &str) -> RewriteOutcome {
         false,
         false,
         Some((
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         )),
     )
@@ -99,7 +99,7 @@ fn the_a5_fallback_yields_to_a_pair_rendering_of_the_same_call() {
         let (mut table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

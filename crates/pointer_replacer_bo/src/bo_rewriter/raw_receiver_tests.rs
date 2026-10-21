@@ -44,7 +44,7 @@ fn raw_receiver_keeps_the_borrowed_callee_and_views_its_result_once() {
     let (emitted, retired) = ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original raw-receiver AST capture");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay,
+            super::OverlapMode::PreciseReplay,
             Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one ordinary tiny-fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
@@ -62,7 +62,7 @@ fn raw_receiver_keeps_the_borrowed_callee_and_views_its_result_once() {
         let return_kind = model_kind(parameter.fn_did, RETURN_PLACE);
         let receiver_kind = model_kind(receiver.fn_did, receiver.local);
         let permit = ctx.lifetime_eligibility.return_permit((parameter.fn_did, parameter.hir_id));
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual raw-receiver emission plan");
         let caller = SignatureClassId::of(receiver.fn_did);
         let callee = SignatureClassId::of(parameter.fn_did);
@@ -223,7 +223,7 @@ fn raw_receiver_returned_address_keeps_the_positive_retention_hold() {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -253,7 +253,7 @@ fn raw_receiver_returned_address_keeps_the_positive_retention_hold() {
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let held = emission.plan.held_classes();

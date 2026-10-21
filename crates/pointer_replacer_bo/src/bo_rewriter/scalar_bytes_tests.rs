@@ -16,7 +16,7 @@
 //! T2 raw-view receipt — the practice at binn's `GetValue` sites (R609-4 (a)).
 
 use super::decision::{Decision, DegradeReason};
-use crate::analyses::borrow_ownership::a5_overlap::{A5Mode, WholeProgramAttestation};
+use crate::analyses::borrow_ownership::param_overlap::{OverlapMode, WholeProgramAttestation};
 
 fn compact(source: &str) -> String {
     source.chars().filter(|c| !c.is_whitespace()).collect()
@@ -56,9 +56,9 @@ fn run_binary(source: &str) -> Vec<u8> {
     run.stdout
 }
 
-fn precise() -> Option<(A5Mode, Option<WholeProgramAttestation>)> {
+fn precise() -> Option<(OverlapMode, Option<WholeProgramAttestation>)> {
     Some((
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     ))
 }
@@ -135,7 +135,7 @@ fn emitted(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .expect("emission");
         let held = emission.plan.held_classes();

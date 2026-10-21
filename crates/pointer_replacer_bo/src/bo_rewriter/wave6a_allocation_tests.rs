@@ -271,14 +271,14 @@ unsafe extern "C" fn transform_to_coordfield(mut sdf: *mut heman_image, mut cf: 
 /// The corpus census runs A5 in precise-replay mode over the frozen benchmark
 /// graph; the fixtures run the same configuration so site proofs resolve.
 pub(super) fn rewrite_precise(name: &str, src: &str) -> super::RewriteOutcome {
-    use super::{A5Mode, WholeProgramAttestation};
+    use super::{OverlapMode, WholeProgramAttestation};
     let dir = std::env::temp_dir().join(format!("crat-wave6a-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let root = dir.join("lib.rs");
     std::fs::write(&root, src).unwrap();
     let result = super::rewrite_m1_path_a5_injected(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &|_| {},
     );

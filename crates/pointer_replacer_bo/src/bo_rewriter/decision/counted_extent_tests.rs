@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn w5c_wc2_attestation_does_not_replace_local_retention_proof() {
         ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
-            let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(tcx, Some((crate::bo_rewriter::A5Mode::PreciseReplay, Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph)))).unwrap();
+            let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(tcx, Some((crate::bo_rewriter::OverlapMode::PreciseReplay, Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph)))).unwrap();
 
             let rows = table.slice_use_receipts.iter().filter(|p| p.adapter=="slice-to-raw-const").collect::<Vec<_>>();
             assert_eq!(rows.len(),1);
@@ -135,7 +135,7 @@ mod tests {
             crate::bo_rewriter::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    crate::bo_rewriter::A5Mode::PreciseReplay,
+                    crate::bo_rewriter::OverlapMode::PreciseReplay,
                     Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )

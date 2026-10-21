@@ -24,7 +24,7 @@ fn emit_with_receipts(input: &str) -> (String, String) {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                super::A5Mode::PreciseReplay,
+                super::OverlapMode::PreciseReplay,
                 Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -81,7 +81,7 @@ fn emit_with_receipts(input: &str) -> (String, String) {
             "{plans}{:#?}",
             ctx.raw_boundary_artifacts.additive_family_receipts
         );
-        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
             .expect("native emission plan");
         for (id, class) in &emission.plan.class_finalization.classes {
             println!(

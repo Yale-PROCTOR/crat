@@ -46,7 +46,7 @@ fn check(target_input: bool, source_input: bool) {
     let output = ::utils::compilation::run_compiler_on_str(INPUT, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).expect("one original ordinary-call AST");
         let (table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            super::A5Mode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("one actual ordinary-call decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("CALLEE-INPUT target_input={target_input}, source_input={source_input}: solve={solve:#?}");
@@ -80,7 +80,7 @@ fn check(target_input: bool, source_input: bool) {
             RetentionVerdict::Retains { .. } => panic!(
                 "AUTHORING PREMISE: positive retention cannot witness an admitted raw view: {retention:?}"),
         };
-        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_c9_plans)
+        let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &ctx.retained_copy_plans)
             .expect("actual ordinary-call terminal plan");
         let held = emission.plan.held_classes();
         for owner in [target, caller] {

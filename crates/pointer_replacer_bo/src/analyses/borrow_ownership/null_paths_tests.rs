@@ -692,13 +692,13 @@ fn shape_model(code: &str) -> Vec<(String, String)> {
         let slots = super::crate_slots::CrateSlots::build(&program);
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
-        let verified = super::construction::solve_bo_a5_config(
+        let verified = super::construction::solve_bo_overlap_config(
             &program,
             &slots,
             &origins,
             &mutability,
-            super::a5_overlap::A5Mode::PreciseReplay,
-            Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::param_overlap::OverlapMode::PreciseReplay,
+            Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )
         .expect("the shape solves");
         // R617-1: the receipt's repair stamp (only a guarded run has one).
@@ -1714,13 +1714,13 @@ fn e5c_inner_shape_decline_reason() {
         let slots = super::crate_slots::CrateSlots::build(&program);
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
-        match super::construction::solve_bo_a5_config_reporting(
+        match super::construction::solve_bo_overlap_config_reporting(
             &program,
             &slots,
             &origins,
             &mutability,
-            super::a5_overlap::A5Mode::PreciseReplay,
-            Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            super::param_overlap::OverlapMode::PreciseReplay,
+            Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ) {
             Ok(verified) => {
                 eprintln!("E5C_DECLINE none");
@@ -1905,10 +1905,10 @@ fn e5c_inner_w62() {
         let slots = super::crate_slots::CrateSlots::build(&program);
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
-        let mode = super::a5_overlap::A5Mode::PreciseReplay;
-        let attestation = Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
+        let mode = super::param_overlap::OverlapMode::PreciseReplay;
+        let attestation = Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph);
         let (verified, captured) = super::export::with_bo_export(|| {
-            super::construction::solve_bo_a5_config_reporting(
+            super::construction::solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
@@ -2511,13 +2511,13 @@ fn e5c_inner_w63() {
         let origins = super::origins::compute_origins(&program);
         let mutability = super::mutability_facts::MutFacts::from_program(&program);
         let (verified, captured) = super::export::with_bo_export(|| {
-            super::construction::solve_bo_a5_config_reporting(
+            super::construction::solve_bo_overlap_config_reporting(
                 &program,
                 &slots,
                 &origins,
                 &mutability,
-                super::a5_overlap::A5Mode::PreciseReplay,
-                Some(super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+                super::param_overlap::OverlapMode::PreciseReplay,
+                Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
             )
             .expect("W63 needs an accepted model")
         });
@@ -3546,7 +3546,7 @@ fn e5c_inner_w69_search() {
     ];
     for (name, code) in &shapes {
         eprintln!("E5C_W69S begin {name}");
-        let (mode_a, mode_a_stats, _) = w69_solve(code, RepairMode::ModeA);
+        let (mode_a, mode_a_stats, _) = w69_solve(code, RepairMode::Plain);
         let (refs, stats, accepts) = w69_solve(code, RepairMode::Guarded);
         eprintln!(
             "E5C_W69S {name} guarded_refs={refs} mode_a_refs={mode_a} rounds={}/{} commits={}/{} \
@@ -3567,7 +3567,7 @@ fn e5c_inner_w69_search() {
 #[test]
 fn e5c_w69_a_a_guarded_round_lifts_a_mode_a_over_pin() {
     use super::borrow_verify::RepairMode;
-    let (mode_a, mode_a_stats, _) = w69_solve(W69_CASCADE, RepairMode::ModeA);
+    let (mode_a, mode_a_stats, _) = w69_solve(W69_CASCADE, RepairMode::Plain);
     let (guarded, stats, accepts) = w69_solve(W69_CASCADE, RepairMode::Guarded);
     assert_eq!(stats.repair, RepairMode::Guarded);
     assert_eq!(stats.guarded_fallback, None, "{stats:?}");

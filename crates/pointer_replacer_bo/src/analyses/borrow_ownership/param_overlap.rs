@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
 
 use super::{
-    l2::{FnKey, MirLocationKey, SlotKey},
+    guarded_repair::{FnKey, MirLocationKey, SlotKey},
     solver::{KindSolver, SlotRef},
 };
 
@@ -612,7 +612,7 @@ pub(crate) fn all_witnesses_gate(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct C9MarkKey {
+pub(crate) struct CopyMarkKey {
     pub(crate) caller: FnKey,
     pub(crate) location: MirLocationKey,
     pub(crate) targets: Vec<FnKey>,
@@ -622,7 +622,7 @@ pub(crate) struct C9MarkKey {
     pub(crate) pointee_type: String,
 }
 
-impl C9MarkKey {
+impl CopyMarkKey {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         caller: FnKey,
@@ -664,9 +664,9 @@ impl C9MarkKey {
 }
 
 #[cfg(test)]
-pub(crate) fn plan_c9_marks(
-    witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
-) -> BTreeSet<C9MarkKey> {
+pub(crate) fn plan_copy_marks(
+    witnesses: impl IntoIterator<Item = (CopyMarkKey, WitnessMarkability)>,
+) -> BTreeSet<CopyMarkKey> {
     let witnesses = witnesses.into_iter().collect::<Vec<_>>();
     if !matches!(
         all_witnesses_gate(witnesses.iter().map(|(_, evidence)| *evidence)),
@@ -680,18 +680,18 @@ pub(crate) fn plan_c9_marks(
 /// The only A5 call-world policy authorized for loop 2. Keeping the complete
 /// option set here makes the absence of an O1 build/config arm testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum A5World {
+pub(crate) enum OverlapWorld {
     ClosedWorldFrozenGraph,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum A5Mode {
+pub(crate) enum OverlapMode {
     Baseline,
     PreciseReplay,
     CoarseConstraint,
 }
 
-impl A5Mode {
+impl OverlapMode {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
@@ -712,11 +712,11 @@ impl A5Mode {
 }
 
 pub(crate) fn apply_coarse_constraints(
-    mode: A5Mode,
+    mode: OverlapMode,
     solver: &KindSolver,
     pairs: impl IntoIterator<Item = (SlotRef, SlotRef)>,
 ) -> usize {
-    if mode != A5Mode::CoarseConstraint {
+    if mode != OverlapMode::CoarseConstraint {
         return 0;
     }
     let mut canonical = BTreeMap::new();
@@ -732,12 +732,12 @@ pub(crate) fn apply_coarse_constraints(
         canonical.insert(key, pair);
     }
     for &(left, right) in canonical.values() {
-        solver.add_a5_coarse_exclusion(left, right);
+        solver.add_overlap_coarse_exclusion(left, right);
     }
     canonical.len()
 }
 
-impl A5World {
+impl OverlapWorld {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 1] = [Self::ClosedWorldFrozenGraph];
 
@@ -828,7 +828,7 @@ impl AbiGuardDisposition {
     }
 }
 
-pub(crate) fn a5_abi_guard(
+pub(crate) fn overlap_abi_guard(
     facts: &AbiBoundaryFacts,
     attestation: Option<WholeProgramAttestation>,
 ) -> AbiGuardDisposition {
@@ -855,17 +855,17 @@ pub(crate) fn a5_abi_guard(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct A5SummaryArtifact {
+pub(crate) struct OverlapSummaryArtifact {
     pub(crate) summary_tsv: String,
     pub(crate) receipt: String,
 }
 
 pub(crate) fn render_summary_artifact(
     fixpoint: &MayOverlapFixpoint,
-    mode: A5Mode,
+    mode: OverlapMode,
     guard: &AbiGuardDisposition,
-) -> A5SummaryArtifact {
-    let world = A5World::ClosedWorldFrozenGraph;
+) -> OverlapSummaryArtifact {
+    let world = OverlapWorld::ClosedWorldFrozenGraph;
     let mut summary_tsv = String::from(
         "callee_fn\tleft_param\tright_param\tcaller_fn\tblock\tstatement_index\t\
          left_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\t\
@@ -923,7 +923,7 @@ pub(crate) fn render_summary_artifact(
         sccs,
         fixpoint.scc_iterations,
     );
-    A5SummaryArtifact {
+    OverlapSummaryArtifact {
         summary_tsv,
         receipt,
     }
@@ -1061,19 +1061,19 @@ mod tests {
 
     #[test]
     fn o2_is_the_only_world_and_never_seeds_unknown_callers() {
-        assert_eq!(A5World::ALL, [A5World::ClosedWorldFrozenGraph]);
+        assert_eq!(OverlapWorld::ALL, [OverlapWorld::ClosedWorldFrozenGraph]);
         assert_eq!(
-            A5World::parse("closed_world_frozen_graph"),
-            Ok(A5World::ClosedWorldFrozenGraph)
+            OverlapWorld::parse("closed_world_frozen_graph"),
+            Ok(OverlapWorld::ClosedWorldFrozenGraph)
         );
-        assert!(A5World::parse("open_world").is_err());
-        assert!(!A5World::ClosedWorldFrozenGraph.seeds_unknown_callers());
+        assert!(OverlapWorld::parse("open_world").is_err());
+        assert!(!OverlapWorld::ClosedWorldFrozenGraph.seeds_unknown_callers());
     }
 
     #[test]
     fn accepted_precise_mode_is_the_single_production_selector() {
-        assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
-        assert!(A5Mode::CoarseConstraint.is_pricing_control());
+        assert_eq!(OverlapMode::proposed_landing(), OverlapMode::PreciseReplay);
+        assert!(OverlapMode::CoarseConstraint.is_pricing_control());
     }
 
     #[test]
@@ -1084,7 +1084,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::ExternallyVisible])
         );
     }
@@ -1097,7 +1097,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::AddressTaken])
         );
     }
@@ -1110,7 +1110,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::FunctionTarget])
         );
     }
@@ -1123,7 +1123,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
         );
     }
@@ -1138,7 +1138,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([
                 AbiGuardReason::ExternallyVisible,
                 AbiGuardReason::AddressTaken,
@@ -1158,7 +1158,7 @@ mod tests {
         };
 
         assert_eq!(
-            a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph)),
+            overlap_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph)),
             AbiGuardDisposition::Permitted { attested: true }
         );
     }
@@ -1170,11 +1170,11 @@ mod tests {
             ..AbiBoundaryFacts::default()
         };
 
-        let batch = a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph));
+        let batch = overlap_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph));
         assert_eq!(batch, AbiGuardDisposition::Permitted { attested: true });
         assert_eq!(batch.stamp(), "permitted:measurement-frozen-graph-attested");
         assert_eq!(
-            a5_abi_guard(&facts, None),
+            overlap_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
         );
     }
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn private_resolved_boundary_needs_no_global_attestation() {
         assert_eq!(
-            a5_abi_guard(&AbiBoundaryFacts::default(), None),
+            overlap_abi_guard(&AbiBoundaryFacts::default(), None),
             AbiGuardDisposition::Permitted { attested: false }
         );
     }
@@ -1260,12 +1260,12 @@ mod tests {
         ];
         let forward = render_summary_artifact(
             &solve_may_overlap(transfers),
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             &AbiGuardDisposition::Permitted { attested: true },
         );
         let reverse = render_summary_artifact(
             &solve_may_overlap(transfers.into_iter().rev()),
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             &AbiGuardDisposition::Permitted { attested: true },
         );
 
@@ -1286,7 +1286,7 @@ mod tests {
         ))]);
         let artifact = render_summary_artifact(
             &solved,
-            A5Mode::PreciseReplay,
+            OverlapMode::PreciseReplay,
             &AbiGuardDisposition::refused([
                 AbiGuardReason::ExternallyVisible,
                 AbiGuardReason::AddressTaken,
@@ -1509,8 +1509,8 @@ mod tests {
         );
     }
 
-    fn c9(block: u32) -> C9MarkKey {
-        C9MarkKey::new(
+    fn copy_mark(block: u32) -> CopyMarkKey {
+        CopyMarkKey::new(
             3,
             MirLocationKey::new(block, 0),
             [8, 7, 8],
@@ -1527,8 +1527,8 @@ mod tests {
 
     #[test]
     fn c9_mark_identity_sorts_targets_and_is_location_typed() {
-        let first = c9(1);
-        let second = c9(2);
+        let first = copy_mark(1);
+        let second = copy_mark(2);
         assert_eq!(first.targets, vec![7, 8]);
         assert_ne!(first, second);
     }
@@ -1536,8 +1536,11 @@ mod tests {
     #[test]
     fn c9_planner_emits_all_marks_or_none() {
         let good = markability(SnapshotVerdict::Markable);
-        assert_eq!(plan_c9_marks([(c9(1), good), (c9(2), good)]).len(), 2);
+        assert_eq!(
+            plan_copy_marks([(copy_mark(1), good), (copy_mark(2), good)]).len(),
+            2
+        );
         let bad = markability(SnapshotVerdict::ReadAfterWrite);
-        assert!(plan_c9_marks([(c9(1), good), (c9(2), bad)]).is_empty());
+        assert!(plan_copy_marks([(copy_mark(1), good), (copy_mark(2), bad)]).is_empty());
     }
 }

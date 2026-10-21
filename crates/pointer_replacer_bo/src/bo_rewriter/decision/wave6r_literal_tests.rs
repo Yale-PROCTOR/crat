@@ -11,7 +11,7 @@ fn check_origin(input: &str, held: bool) {
         let (table, ctx) = rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                rewriter::A5Mode::PreciseReplay,
+                rewriter::OverlapMode::PreciseReplay,
                 Some(rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -30,7 +30,7 @@ fn check_origin(input: &str, held: bool) {
             "only immutable origins need a typed permission hold before AST emission"
         );
         let emission =
-            rewriter::emit_files(tcx, &table, &Default::default(), &ctx.retained_c9_plans)
+            rewriter::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
                 .expect("native emission plan");
         let reverts = rewriter::ast_transform::revert_set_from_classes_and_atoms(
             &emission.plan.held_classes(),

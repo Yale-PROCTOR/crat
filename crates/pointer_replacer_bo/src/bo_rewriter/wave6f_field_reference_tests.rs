@@ -16,7 +16,7 @@
 
 use std::sync::OnceLock;
 
-use super::{A5Mode, RewriteOutcome, WholeProgramAttestation, decision::Decision};
+use super::{OverlapMode, RewriteOutcome, WholeProgramAttestation, decision::Decision};
 
 const HT: &str = include_str!("wave6f_fixture_ht.rs");
 const LODEPNG: &str = include_str!("wave6f_fixture_lodepng.rs");
@@ -40,7 +40,7 @@ fn observe(source: &str) -> Observed {
         let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -148,7 +148,7 @@ fn emitted_with(
     std::fs::write(&root, source).unwrap();
     let outcome = super::rewrite_m1_path_a5_injected(
         &root,
-        A5Mode::PreciseReplay,
+        OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         inject,
     );
@@ -1740,7 +1740,7 @@ fn owning_field_forms(source: &str, asks: &[(&str, usize)]) -> Vec<Option<String
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1819,7 +1819,7 @@ fn owning_field_form_of(source: &str, asks: &[(&str, &str)]) -> Vec<Option<Strin
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2199,7 +2199,7 @@ fn receipt_at_reverts(
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2336,7 +2336,7 @@ fn transaction_owner_split(
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2438,7 +2438,7 @@ fn refreshed_revert_status(
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2512,7 +2512,7 @@ fn transaction_edit_owners(source: &str, struct_name: &str, field: &str) -> Vec<
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2643,7 +2643,7 @@ fn field_receipt_row(source: &str, struct_name: &str, field: &str) -> Vec<String
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2854,7 +2854,7 @@ fn w6f_a_held_edit_withdraws_the_transaction_not_its_owner() {
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -2935,7 +2935,7 @@ fn w6f_malloc_free_field_has_an_empty_withdrawal_key() {
             let (table, _ctx) = super::decide_table_with_ctx_config(
                 tcx,
                 Some((
-                    A5Mode::PreciseReplay,
+                    OverlapMode::PreciseReplay,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
                 )),
             )
@@ -3070,7 +3070,7 @@ fn wraps_under_incumbent(
         let (table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3194,7 +3194,7 @@ fn w6f_a_seam_consumer_withdraws_with_its_transaction() {
         let (mut table, _ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -3390,7 +3390,7 @@ fn main_the_seam_plans_no_glue_over_an_owned_field_argument() {
         let (table, _) = super::decide_table_with_ctx_config(
             tcx,
             Some((
-                A5Mode::PreciseReplay,
+                OverlapMode::PreciseReplay,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

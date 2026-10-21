@@ -1142,7 +1142,7 @@ fn emitted_with_exposure(input: &str) -> String {
         let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
@@ -1151,7 +1151,7 @@ fn emitted_with_exposure(input: &str) -> String {
             tcx,
             &table,
             &Default::default(),
-            &ctx.retained_c9_plans,
+            &ctx.retained_copy_plans,
         )
         .unwrap();
         let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(

@@ -1558,7 +1558,7 @@ fn nested_seam_emitted() -> &'static str {
         std::fs::write(&root, NESTED_SEAM_SOURCE).unwrap();
         let outcome = crate::bo_rewriter::rewrite_m1_path_a5_injected(
             &root,
-            crate::bo_rewriter::A5Mode::PreciseReplay,
+            crate::bo_rewriter::OverlapMode::PreciseReplay,
             Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             &|_| {},
         );
@@ -1587,7 +1587,7 @@ fn table_decision(name: &str, parameter: &str) -> Decision {
         let (table, _) = crate::bo_rewriter::decide_table_with_ctx_config(
             tcx,
             Some((
-                crate::bo_rewriter::A5Mode::PreciseReplay,
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
                 Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )

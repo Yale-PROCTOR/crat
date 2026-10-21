@@ -30,8 +30,8 @@ enum RootForm {
 fn check(form: RootForm, shared_address: bool) {
     let (ready, reasons, replacement, declaration, expected_operand, binding_requirement, found, receipt_found, terminal_found) = ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
         let (mut table, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         ))).expect("fixture compiler IDs and input forms");
         let solve = super::model_cache::solve_receipt();
         println!("RETURNED-CHILD-TERMINAL-VIEW {form:?} shared={shared_address} solve={solve:#?}");

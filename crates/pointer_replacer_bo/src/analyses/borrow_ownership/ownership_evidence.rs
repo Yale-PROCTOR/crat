@@ -22,8 +22,8 @@ pub(crate) struct Endpoint {
     pub(crate) operand: Option<(u32, Vec<export::ProjKey>)>,
 }
 
-impl From<&export::T2AssertKey> for Endpoint {
-    fn from(key: &export::T2AssertKey) -> Self {
+impl From<&export::EndpointRetractionKey> for Endpoint {
+    fn from(key: &export::EndpointRetractionKey) -> Self {
         Self {
             function: key.function_path.clone(),
             block: key.location.block,
@@ -278,7 +278,7 @@ pub(crate) fn record_key(
     record_equation(operation, variables, value, guard, None, guard)
 }
 
-pub(crate) fn record_endpoint(key: &export::T2AssertKey, selector: &z3::ast::Bool) {
+pub(crate) fn record_endpoint(key: &export::EndpointRetractionKey, selector: &z3::ast::Bool) {
     let operation = match key.role {
         export::BoundaryRole::Source => "source",
         export::BoundaryRole::Sink => "sink",
