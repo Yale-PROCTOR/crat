@@ -25,10 +25,7 @@ pub(crate) mod demand_evidence;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
-pub(crate) mod emission_guard;
 pub(crate) mod era5_instruments;
-#[cfg(test)]
-mod era5_worker;
 pub(crate) mod esc_minimal;
 pub(crate) mod execution_guard;
 pub(crate) mod export;
