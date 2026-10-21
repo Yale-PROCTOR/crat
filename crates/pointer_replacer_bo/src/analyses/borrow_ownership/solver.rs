@@ -1251,29 +1251,6 @@ impl KindSolver {
         true
     }
 
-    /// **L01⁶ (b)** — the local-slot Owning preference, R517-12.
-    ///
-    /// A slot the licensing layer has already refused a reference has only
-    /// `raw ∨ own` left by the one-hot, and `build` weights `raw` at 1 and gives
-    /// `own` NO weight — so it settles `Raw` for want of a preference. This adds
-    /// a soft `own` at weight 2: strictly above `raw`'s 1, and far below
-    /// `ref_`'s `vars.len() + 1`, so it can never displace a reference anywhere
-    /// and never makes an illegal model legal. Purely objective, and it carries no
-    /// program-wide sink premise -- the caller supplies exactly the slots whose
-    /// reference was already refused.
-    ///
-    /// Era-5c report 034b priced the market before this was built: `own` is SAT
-    /// for **77 of 462** measured subjects and for **7 of the 55** CROWN Box
-    /// units, so this moves those and provably nothing else. The other 385 are
-    /// refused by hard constraints no objective term reaches.
-    pub(crate) fn prefer_owning_for_refused_reference(&self, slot: SlotRef) -> bool {
-        let Some(kind_vars) = self.vars.get(&slot) else {
-            return false;
-        };
-        self.solver.assert_soft(&kind_vars.own, 2u64, None);
-        true
-    }
-
     /// **L01⁶ arm 3, half two** (R518-2) — seat ownership on the NAMED local.
     ///
     /// Weight 3: above L01⁶ (b)'s 2 so a named local outranks an anonymous one,

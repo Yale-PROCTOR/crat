@@ -1205,7 +1205,6 @@ const W47_ARMS: &[(&str, &str)] = &[
     ("CRAT_ERA5B_RETURN_PORT", "on"),
     ("CRAT_ERA5B_PASS", "joint"),
     ("CRAT_ERA5C_MOVE_TRACKING", "on"),
-    ("CRAT_ERA5C_OWN_PREFER_LOCAL", "on"),
 ];
 
 #[test]

@@ -564,7 +564,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
     }
     let joint = licensing::facts::Pass::current() == licensing::facts::Pass::Joint;
-    let mut preferred_own = 0usize;
     for carrier in &facts
         .licensing
         .as_ref()
@@ -580,13 +579,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             kind_solver.add_borrow_exclusion(Some(slot), &[]);
             raw_cause::note_eager(&kind_solver, "no-ref-carrier");
             raw_cause::dump_eager(crate_ctxt.tcx, slots, slot, "no-ref-carrier");
-            // L01⁶ (b) / R517-12: this slot's reference has just been refused,
-            // so `raw ∨ own` is all that remains and only `raw` carries weight.
-            // Prefer `own` where it is legal. Objective-only; report 034b §3
-            // measured the market at 77 of 462 before the rule was written.
-            if field_moves::own_prefer_local() {
-                preferred_own += kind_solver.prefer_owning_for_refused_reference(slot) as usize;
-            }
         }
     }
     // L01⁶ arm 3 half two (R518-2): with the finalization blanket gone, prefer
@@ -629,45 +621,6 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         }
         if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
             eprintln!("E5C l016-arm3: preferred own on {named} NAMED local slots");
-        }
-    }
-    if field_moves::own_prefer_local() {
-        // L01⁷ lever (b), report 043 / R536-4. L01⁶ preferred `own` on every
-        // local slot and over-reached on CALLER-DERIVED values: tulip's 78
-        // indicator-table formals (reached only through the `ti_indicators`
-        // function-pointer table) and heman's seven exported write-then-return
-        // formals with no caller settled Owning -- dragged there through local
-        // copies (`_19 = copy _4`), returns (`_0 = copy pOut`) and pointers
-        // loaded through them (`outputs[k]`). A formal with no allocation site
-        // and no free is a LEND. So the preference skips every local whose
-        // value derives from a formal; call RESULTS are not caller values, so a
-        // caller receiving a constructor's allocation keeps the preference.
-        let mut preferred_locals = 0usize;
-        for did in crate_ctxt.fns() {
-            let fn_did = did.expect_local();
-            let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
-                continue;
-            };
-            let body = crate_ctxt
-                .tcx
-                .mir_drops_elaborated_and_const_checked(fn_did)
-                .borrow();
-            let caller = caller_derived_locals(&body, crate_ctxt.tcx);
-            for index in 0..universe.len() {
-                let id = slots::SlotId::from_u32(index.try_into().expect("slot index"));
-                if let slots::SlotOwner::Local(local) = universe.slot(id).owner
-                    && !caller.contains(&local)
-                {
-                    preferred_locals += kind_solver
-                        .prefer_owning_for_refused_reference(SlotRef::Local(fn_did, id))
-                        as usize;
-                }
-            }
-        }
-        if std::env::var_os("CRAT_ERA5C_DEBUG").is_some() {
-            eprintln!(
-                "E5C l016-b: preferred own on {preferred_own} refused-reference + {preferred_locals} non-caller local slots"
-            );
         }
     }
     if field_moves::ref_weight_named() {

@@ -281,22 +281,6 @@ pub(crate) fn overlap_type_route() -> bool {
     }
 }
 
-/// `CRAT_ERA5C_OWN_PREFER_LOCAL=on|off` (fail-loud, absent = off): **L01⁶ (b)**.
-/// The local-slot Owning preference. A slot the licensing layer has already
-/// refused a reference (`no_ref_carriers`: its origin atoms are all `Fresh`/
-/// `Null`) has only `raw ∨ own` left, and `own` carries no objective weight, so
-/// it settles `Raw`. This adds a soft `own` ABOVE `raw`'s 1 and below `ref_`'s
-/// `big`, so it can never displace a reference and never makes an illegal model
-/// legal. Era-5c report 034b §3 priced the market: 77 of 462 subjects, 7 of the
-/// 55 measured CROWN Box units.
-pub(crate) fn own_prefer_local() -> bool {
-    match std::env::var("CRAT_ERA5C_OWN_PREFER_LOCAL").ok().as_deref() {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(other) => panic!("CRAT_ERA5C_OWN_PREFER_LOCAL must be `on` or `off`, got {other:?}"),
-    }
-}
-
 /// `CRAT_ERA5C_FINALIZE_SOFT=on|off` (fail-loud, absent = off): **L01⁶ arm 3**
 /// (R518-2). `temporary-finalization` stops being a blanket hard assumption and
 /// becomes an objective question, under the R101 leak-parity waiver.
