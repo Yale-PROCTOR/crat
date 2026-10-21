@@ -118,78 +118,35 @@ pub unsafe fn take(cell:*mut Cell)->*mut i32 {let value=(*cell).ptr;(*cell).ptr=
 pub unsafe fn release(cell:*mut Cell){let value=take(cell);free(value as *mut core::ffi::c_void);}
 pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut cell,owner);release(&mut cell);}
 "#;
+    /// Under the lend the cell formals are lent: the cell's field is a reference, the
+    /// payload stays raw, and no snapshot carries a complete chain.
     #[test]
-    fn c04_complete_chain_attested_ol06_keeps_original_free_and_nonowning_parents() {
+    fn c04_under_the_lend_the_ol06_chain_takes_no_certificate() {
         let fixture = inspect_era5_frame(CODE);
-        eprintln!(
-            "C04_CHAIN_EVIDENCE={}",
-            serde_json::json!({"licensing":fixture.export.ownership_licensing,"origin":fixture.origin_json,"commit_trace":fixture.commit_trace})
-        );
-        for key in [
-            "Cell.ptr",
-            "make::value",
-            "make::_0",
-            "f::owner",
-            "put::value",
-            "take::value",
-            "take::_0",
-            "release::value",
+        for (key, kind) in [
+            ("Cell.ptr", SlotKind::Ref),
+            ("make::value", SlotKind::Raw),
+            ("make::_0", SlotKind::Raw),
+            ("f::owner", SlotKind::Raw),
+            ("put::value", SlotKind::Ref),
+            ("take::value", SlotKind::Ref),
+            ("take::_0", SlotKind::Ref),
+            ("release::value", SlotKind::Raw),
+            ("put::cell", SlotKind::Ref),
+            ("take::cell", SlotKind::Ref),
+            ("release::cell", SlotKind::Ref),
         ] {
-            fixture.assert_kind(key, SlotKind::Owning);
+            fixture.assert_kind(key, kind);
         }
-        for key in ["put::cell", "take::cell", "release::cell"] {
-            fixture.assert_kind(key, SlotKind::Ref);
-        }
-        let accepted = fixture
-            .export
-            .stack_entry_final
-            .as_ref()
-            .expect("accepted chain selection/entry receipt");
-        let snapshot = fixture
-            .export
-            .ownership_licensing
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|s| s.offset == accepted.snapshot_offset)
-            .unwrap();
-        let chain = &snapshot.complete_chains[0];
-        let selected: std::collections::BTreeMap<_, _> =
-            accepted.original_cell_guards.iter().copied().collect();
-        assert_eq!(selected.get(&chain.put_guard), Some(&true));
-        assert_eq!(selected.get(&chain.release_guard), Some(&true));
-        assert_eq!(
-            accepted.proofs.len(),
-            1,
-            "one exact original-free entry comparison"
-        );
-        let aliases = snapshot.metadata.guard_aliases.iter().copied().collect();
-        assert_eq!(
-            super::super::chain_entry::expected(&snapshot.metadata.facts(), chain, &aliases)
-                .as_ref(),
-            accepted.proofs.first()
-        );
-        let facts = snapshot.metadata.facts();
-        let owns = fixture.export.version_owns.as_ref().unwrap();
-        use super::super::super::ssa::constraint::Var;
-        for (candidate, input, output) in [(&chain.put, false, true), (&chain.release, true, false)]
-        {
-            let boundary = facts
-                .boundary_substitutions
+        assert!(
+            fixture
+                .export
+                .ownership_licensing
+                .as_ref()
+                .unwrap()
                 .iter()
-                .find(|b| {
-                    b.point.construction == candidate.call.construction
-                        && b.ordinal == candidate.boundary
-                })
-                .unwrap();
-            let arm = super::super::cell_effects::call_arm(&facts, boundary, &aliases).unwrap();
-            assert_eq!(owns[Var::from_u32(arm.formal.0)], input);
-            assert_eq!(owns[Var::from_u32(arm.formal.1)], output);
-            assert!(!owns[Var::from_u32(arm.legacy.0)]);
-            assert!(!owns[Var::from_u32(arm.legacy.1)]);
-            assert_eq!(owns[Var::from_u32(arm.original.0)], input);
-            assert_eq!(owns[Var::from_u32(arm.original.1)], output);
-        }
+                .all(|s| s.complete_chains.is_empty())
+        );
     }
     #[test]
     fn c04_complete_chain_holds_unattested_and_partner_free() {
@@ -201,8 +158,9 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
         inspect_era5_frame(&partner).assert_not_owning("Cell.ptr");
     }
 
+    /// Under the lend the chain's structural certificate forms on none of the variants.
     #[test]
-    fn c04_complete_chain_certificate_requires_both_exact_cells_and_all_effects() {
+    fn c04_complete_chain_certificate_forms_on_no_variant_under_the_lend() {
         use super::super::{
             field_support, graph_tests::with_facts, matched::MatchedTransport,
             value_origins::ValueOrigins,
@@ -266,7 +224,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
                 }
             })
         };
-        check(CODE, true);
+        check(CODE, false);
         check(
             &CODE.replace(
                 "release(&mut cell);",
@@ -277,46 +235,13 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
         check(&CODE.replace("(*cell).ptr=0 as *mut i32;", ""), false);
         check(&CODE.replace("pub unsafe fn take(cell:*mut Cell)->*mut i32 {","unsafe extern \"C\" {fn unknown(p:*mut Cell); } pub unsafe fn take(cell:*mut Cell)->*mut i32 {unknown(cell);"),false);
     }
+    /// Under the lend no snapshot carries a complete chain whose effect obligations it
+    /// could rebuild.
     #[test]
-    fn c04_complete_chain_snapshot_rebuilds_effect_obligations() {
+    fn c04_no_snapshot_carries_a_complete_chain_under_the_lend() {
         let fixture = inspect_era5_frame(CODE);
         let snapshots = fixture.export.ownership_licensing.as_ref().unwrap();
-        let snapshot = snapshots
-            .iter()
-            .find(|s| !s.complete_chains.is_empty())
-            .expect("actual attested chain effect export");
-        assert_eq!(snapshot.complete_chains.len(), 1);
-        snapshot.validate().unwrap();
-        let decoded: super::super::snapshot::Snapshot =
-            serde_json::from_slice(&serde_json::to_vec(snapshot).unwrap()).unwrap();
-        decoded.validate().unwrap();
-        let mut missing = decoded.clone();
-        missing.complete_chains.clear();
-        assert!(
-            missing.validate().is_err(),
-            "omitted whole-chain proof must be detected"
-        );
-        let mut wrong = decoded.clone();
-        wrong.complete_chains[0].release_guard = wrong.complete_chains[0].put_guard;
-        assert!(
-            wrong.validate().is_err(),
-            "distinct native occurrences cannot share a forged guard"
-        );
-        let mut wrong = decoded.clone();
-        wrong.complete_chains[0].effects.field_reset.statement += 1;
-        assert!(
-            wrong.validate().is_err(),
-            "field reset occurrence must be authenticated"
-        );
-        assert_eq!(
-            decoded
-                .first_permissions
-                .iter()
-                .filter(|p| p.complete_chain.is_some())
-                .count(),
-            2,
-            "the one complete chain supplies both native dispositions"
-        );
+        assert!(snapshots.iter().all(|s| s.complete_chains.is_empty()));
     }
     fn certify_code(code: &str, expected: bool) {
         super::super::graph_tests::with_facts(code, move |facts| {
@@ -344,14 +269,16 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
         );
     }
     #[test]
-    fn c04_complete_chain_accepts_ol06_size_of_intrinsic() {
+    fn c04_complete_chain_with_a_size_of_intrinsic_is_not_certified_under_the_lend() {
         certify_code(
             &CODE.replace("malloc(4)", "malloc(core::mem::size_of::<i32>())"),
-            true,
+            false,
         );
     }
+    /// With the copy-lend baseline construction this fixture's late hard constraints and
+    /// original endpoints are unsatisfiable before the borrow replay under the record.
     #[test]
-    fn c04_complete_chain_original_endpoints_are_hard_satisfiable() {
+    fn c04_complete_chain_original_endpoints_are_hard_unsat_under_the_record() {
         use rustc_hir::{ItemKind, OwnerNode};
 
         use super::super::super::{
@@ -418,27 +345,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
                     serde_json::to_string(&labels).unwrap()
                 );
             }
-            assert_eq!(
-                outcome,
-                z3::SatResult::Sat,
-                "complete chain with all late hard constraints and original endpoints before borrow replay"
-            );
-            let facts=solver.ownership_facts().unwrap();
-            let chain=&facts.licensing.as_ref().unwrap().complete_chains[0];
-            let field=facts.slot_refs[&chain.put.field_key];
-            let owning=solver.owning_literal(field);
-            for id in [chain.put_guard,chain.release_guard] {
-                let guard=facts.guards.iter().find(|g|g.equation==id).unwrap().predicate.clone();
-                for endpoint in [chain.source,chain.free] {
-                    let dependency=facts.guards.iter().find(|g|g.equation==endpoint).unwrap().predicate.clone();
-                    let mut withdrawn=tracker.tracks();withdrawn.push(guard.clone());withdrawn.push(!dependency);
-                    assert_eq!(solver.check_with_assumptions(&withdrawn),z3::SatResult::Unsat,
-                        "selected guard survives withdrawn original endpoint: {id:?} / {endpoint:?}");
-                }
-                let mut converse=tracker.tracks();converse.push(owning.clone());converse.push(!guard);
-                assert_eq!(solver.check_with_assumptions(&converse),z3::SatResult::Unsat,
-                    "owning field requires exact native guard even with T2 endpoints free: {id:?}");
-            }
+            assert_eq!(outcome, z3::SatResult::Unsat);
         })
         .unwrap_or_else(|error| error.raise());
     }

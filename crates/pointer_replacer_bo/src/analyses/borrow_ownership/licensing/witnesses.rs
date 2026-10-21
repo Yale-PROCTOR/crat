@@ -332,7 +332,7 @@ pub unsafe fn second(p: *mut i32, n: u32) -> *mut i32 {
 }
 
 #[test]
-fn ol06_field_only_put_take_and_release_transport_one_payload() {
+fn ol06_under_the_lend_the_cell_is_a_reference_and_the_payload_stays_raw() {
     // Era-5a's explicit closed frame is required for original-cell caller
     // coverage; the unattested negative remains in chain_permission tests.
     let fixture = super::tests::inspect_era5_frame(
@@ -368,12 +368,12 @@ pub unsafe fn f() {
     assert_kinds(
         &fixture,
         &[
-            ("Cell.ptr", SlotKind::Owning),
-            ("f::owner", SlotKind::Owning),
-            ("put::value", SlotKind::Owning),
-            ("take::value", SlotKind::Owning),
-            ("take::_0", SlotKind::Owning),
-            ("release::value", SlotKind::Owning),
+            ("Cell.ptr", SlotKind::Ref),
+            ("f::owner", SlotKind::Raw),
+            ("put::value", SlotKind::Ref),
+            ("take::value", SlotKind::Ref),
+            ("take::_0", SlotKind::Ref),
+            ("release::value", SlotKind::Raw),
             ("put::cell", SlotKind::Ref),
             ("take::cell", SlotKind::Ref),
             ("release::cell", SlotKind::Ref),

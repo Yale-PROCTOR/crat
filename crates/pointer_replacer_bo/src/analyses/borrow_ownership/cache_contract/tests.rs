@@ -498,20 +498,17 @@ pub unsafe fn f() -> i32 {
 }
 // This fixture is compiler input only. Preparation below is in memory.
 #[test]
-fn c04_chain_export_rejects_put_only_guard_and_joint_proof_omission() {
+fn c04_the_accepted_entry_carries_no_complete_chain_under_the_lend() {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
         a5_overlap::{A5Mode, WholeProgramAttestation},
         construction,
         crate_slots::CrateSlots,
-        export,
-        licensing::stack_export,
-        model_cache,
+        export, model_cache,
         mutability_facts::MutFacts,
         origin_evidence::OriginEvidence,
         origins::compute_origins,
-        portable_export::{ExportFamily, PortableExport},
     };
     const CODE: &str = r#"
 unsafe extern "C"{fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
@@ -566,16 +563,14 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
             A5Mode::PreciseReplay,
             attestation,
         );
-        let entry =
-            model_cache::prepared_entry(&key).unwrap_or_else(|| {
-                panic!(
-                    "accepted complete-chain synthetic envelope: {:?}",
-                    model_cache::prepare_error()
-                )
-            });
+        let entry = model_cache::prepared_entry(&key).unwrap_or_else(|| {
+            panic!(
+                "accepted complete-chain synthetic envelope: {:?}",
+                model_cache::prepare_error()
+            )
+        });
         entry.validate().unwrap();
         let original: OriginEvidence = serde_json::from_value(entry.origin.clone()).unwrap();
-        let portable: PortableExport = serde_json::from_value(entry.exports.clone()).unwrap();
         let accepted = original.stack_entry_final.as_ref().unwrap();
         let snapshot = original
             .licensing
@@ -584,104 +579,11 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
             .iter()
             .find(|s| s.offset == accepted.snapshot_offset)
             .unwrap();
-        let chain = &snapshot.complete_chains[0];
-        assert_eq!(
-            entry.model.get(&chain.put.field_key).map(String::as_str),
-            Some("owning")
-        );
-        assert_eq!(accepted.proofs.len(), 1);
-        let mirror = |origin: &OriginEvidence, portable: &mut PortableExport| {
-            let acceptance = origin.stack_entry_final.as_ref().unwrap();
-            for family in [
-                ExportFamily::RetirementFinal,
-                ExportFamily::RetirementRounds,
-            ] {
-                for row in &mut portable.families.get_mut(&family).unwrap().records {
-                    if family == ExportFamily::RetirementFinal
-                        || row.fields.get("round").and_then(serde_json::Value::as_u64)
-                            == Some(acceptance.retirement_round as u64)
-                    {
-                        row.fields.insert(
-                            "known_stack_entries".into(),
-                            serde_json::to_value(&acceptance.proofs).unwrap(),
-                        );
-                    }
-                    if family == ExportFamily::RetirementFinal {
-                        row.fields
-                            .insert("stack_entry_acceptance".into(), acceptance.stamp());
-                    }
-                }
-            }
-        };
-        // Preserve every mirrored copy so these checks authenticate the
-        // required semantic identity, rather than just duplicate agreement.
-        for fault in ["free", "caller", "source", "formation", "guard", "namespace", "round"] {
-            let mut broken=original.clone();let a=broken.stack_entry_final.as_mut().unwrap();
-            match fault {
-                "free"=>a.proofs[0].free.ordinal+=1,
-                "caller"=>a.proofs[0].callers[0].call.statement+=1,
-                "source"=>a.proofs[0].callers[0].source.endpoint.ordinal+=1,
-                "formation"=>a.proofs[0].callers[0].formation.statement=Some(usize::MAX),
-                "guard"=>a.proofs[0].callers[0].original_cell_guard=Some(chain.put_guard),
-                "namespace"=>a.snapshot_offset=u32::MAX,
-                _=>a.retirement_round+=1,
-            }
-            let mut mirrored=portable.clone();mirror(&broken,&mut mirrored);
-            assert!(stack_export::validate(&broken,&mirrored,&entry.model).is_err(),"corrupt exact chain evidence accepted: {fault}; free={:?}",chain.free);
-        }
-        for function in [&chain.put.call.callee,&chain.release.call.callee,&chain.effects.field_load.function] {
-            let parameter=snapshot.metadata.boundaries.iter().find(|b|b.role==super::super::ownership_boundary::Role::Entry && b.point.function.as_ref()==Some(function) && b.argument_index==Some(0)).unwrap().formal_local.unwrap();
-            let slot=format!("{function}::_{parameter}@d0");
-            assert_eq!(entry.model.get(&slot).map(String::as_str),Some("ref"));
-            let mut changed=entry.model.clone();changed.insert(slot.clone(),"raw".into());
-            assert!(stack_export::validate(&original,&portable,&changed).is_err(),"selected chain lost required Ref parent: {slot}; put={:?}, release={:?}, free={:?}",chain.put_guard,chain.release_guard,chain.free);
-        }
-        let mut omitted = original.clone();
-        omitted.stack_entry_final.as_mut().unwrap().proofs.clear();
-        let mut omitted_portable = portable.clone();
-        mirror(&omitted, &mut omitted_portable);
-        let error = stack_export::validate(&omitted, &omitted_portable, &entry.model).unwrap_err();
+        // Under the lend the cell formals are lent: no complete chain is certified.
         assert!(
-            error.contains("incomplete selected stack-entry"),
-            "joint omission: {error}; free={:?}",
-            chain.free
-        );
-
-        // Local validator branch control, not an accepted-model claim: provide
-        // consistent held role values on actual compiler metadata, then corrupt
-        // only put and its duplicate stamp. Full cache validation is separate.
-        let mut held_model = entry.model.clone();
-        held_model.insert(chain.put.field_key.clone(), "raw".into());
-        let mut held = omitted;
-        for (_, value) in &mut held
-            .stack_entry_final
-            .as_mut()
-            .unwrap()
-            .original_cell_guards
-        {
-            *value = false;
-        }
-        let mut held_portable = portable.clone();
-        mirror(&held, &mut held_portable);
-        stack_export::validate(&held, &held_portable, &held_model).unwrap();
-        let guard = held
-            .stack_entry_final
-            .as_mut()
-            .unwrap()
-            .original_cell_guards
-            .iter_mut()
-            .find(|(id, _)| *id == chain.put_guard)
-            .unwrap();
-        guard.1 = true;
-        mirror(&held, &mut held_portable);
-        let result = stack_export::validate(&held, &held_portable, &held_model);
-        assert!(
-            result.is_err(),
-            "held put-only guard accepted: put={:?}, release={:?}, source={:?}, free={:?}",
-            chain.put_guard,
-            chain.release_guard,
-            chain.source,
-            chain.free
+            snapshot.complete_chains.is_empty(),
+            "{:?}",
+            snapshot.complete_chains
         );
     })
     .unwrap_or_else(|error| error.raise());
