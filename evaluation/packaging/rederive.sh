@@ -84,7 +84,7 @@ reach_sweep() {  # .rs files no module declares, data files no kept file names
   find $W/crates $W/src $W/deps_crate -name '*.rs' -type f | sort > $KEPT
   for i in 1 2 3; do python3 -I $P/reach.py > $ZS/reach-$i.txt; grep -E '^UNRESOLVED' $ZS/reach-$i.txt | while read _ f name _; do sed -i -E "/^\s*(pub(\([a-z]+\))? )?mod $name;\s*$/d" $W/$f; echo "   unresolved mod $name removed from $f"; done; grep -q '^UNRESOLVED' $ZS/reach-$i.txt || break; done
   head -1 $ZS/reach-$i.txt
-  sed "s#^#$W/#" $ORPHANS | xargs -r git -C $W rm -q -f -- 2>/dev/null; sed "s#^#$W/#" $ORPHANS | xargs -r rm -f --
+  sed -n "/./s#^#$W/#p" $ORPHANS | xargs -r git -C $W rm -q -f -- 2>/dev/null; sed -n "/./s#^#$W/#p" $ORPHANS | xargs -r rm -f --
   find $W/crates $W/src $W/deps_crate -name '*.rs' -type f | sort > $KEPT
   for f in $(find $W/crates/*/src -type f ! -name '*.rs' ! -name 'Cargo.toml'); do b=$(basename $f); grep -q -l -F -- "$b" $(cat $KEPT) || { git -C $W rm -q -f -- $f 2>/dev/null || rm -f $f; echo "   unreferenced data file removed: ${f#$W/}"; }; done
   find $W/crates $W/src -type d -empty -delete

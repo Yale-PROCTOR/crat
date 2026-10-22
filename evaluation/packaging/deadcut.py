@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Step 6: the code the compiler reports dead leaves the derived tree, to a fixpoint. Each round:
   1. `cargo fix` applies the compiler's machine-applicable suggestions (unused imports and extern crates, `mut`,
-     unused variables); cargo checks the result itself and keeps nothing that does not compile;
-  2. `cargo check`: every item a `dead_code` warning names as never used (a function, constant, static, type alias,
-     trait, macro, enum, union, or an inherent impl's associated item) is cut by `itemcut`, with its attributes. Fields
-     never read, variants never constructed and types never constructed stay (counted, not cut);
+     unused variables) to every crate, the sources touched first so that none is replayed from the cache; cargo
+     checks the result itself and keeps nothing that does not compile;
+  2. `cargo check`: every item a `dead_code` warning names as never used or never constructed (a function, constant,
+     static, type alias, struct, trait, macro, enum, union, or an inherent impl's associated item) is cut by `itemcut`,
+     with its attributes and, for a type or trait, its impls in the same file. Fields never read and variants never
+     constructed stay (counted, not cut);
   3. `cargo check` again: if the cuts do not compile, they are undone and made again file group by file group,
-     halving a failing group; an item whose cut alone fails stays for the round and is tried again in the next (its
-     last user's `use` line, for one, is gone after the next `cargo fix`).
+     halving a failing group; an item whose cut alone fails stays. An item that failed in an earlier round is tried
+     again as one group with the others that failed (its last user's `use` line, for one, is gone after the next
+     `cargo fix`), and one by one only in a round that otherwise changes nothing.
 `--force-warn` makes the lints fire where an `allow` attribute would hide them. The round's state is committed in W.
 Stops when a round changes nothing. Then a module file left with no item (nothing but `use` lines and inner attributes)
 goes with its `mod` line, when the tree still checks.
 usage: deadcut.py   Environment: W, ZS (logs), CARGO (default cargo), TOOLS (the helper binaries), DEADCUT_TARGET
        (cargo target of its checks), DEADCUT_ROUNDS (default 20)"""
-import collections, json, os, re, subprocess, sys
+import collections, json, os, re, subprocess, sys, time
 W = os.environ['W'].rstrip('/'); ZS = os.environ['ZS']
 CARGO = os.environ.get('CARGO', 'cargo').split(); TOOLS = os.environ['TOOLS']
 ROUNDS = int(os.environ.get('DEADCUT_ROUNDS', '20'))
@@ -21,7 +24,7 @@ LINTS = ['dead_code', 'unused_imports', 'unused_extern_crates', 'unused_mut', 'u
 ENV = dict(os.environ, CARGO_TARGET_DIR=os.environ.get('DEADCUT_TARGET', ZS + '/deadcut-target'),
            RUSTFLAGS=(os.environ.get('RUSTFLAGS', '') + ' ' + ' '.join('--force-warn ' + l for l in LINTS)).strip())
 ENV.pop('RUSTC_WRAPPER', None)  # cargo fix drives rustc itself
-NOT_CUT = re.compile(r'\b(field|fields|variant|variants)\b|never read|never constructed')
+NOT_CUT = re.compile(r'\b(field|fields|variant|variants)\b|never read')
 log = open(ZS + '/deadcut.log', 'a'); cuts_tsv = open(ZS + '/deadcut.tsv', 'a')
 
 def cargo(args, tag):
@@ -85,6 +88,7 @@ def cut_groups(groups, rnd):
     """Cuts each group of files' items; keeps a group whose cuts check, halves one that does not."""
     kept, failed = [], []
     for g in groups:
+        if not g: continue
         done = itemcut([i for f in g for i in f[1]])
         if checks():
             commit(f'deadcut round {rnd}'); kept += done
@@ -125,38 +129,52 @@ def empty_modules():
         else: undo()
     return kept
 
+def by_file(items):
+    files = collections.OrderedDict()
+    for f, l, n in items: files.setdefault(f, []).append((f, l, n))
+    return [list(files.items())]
+
 def main():
     commit('deadcut: start')
-    first = None; total_cut = 0; failed_all = []
+    first = None; total_cut = 0; failed_keys = set()
     for rnd in range(1, ROUNDS + 1):
         before = git('rev-parse', 'HEAD').strip()
+        # cargo fix replays a crate's cached warnings and fixes nothing when the last check left it fresh
+        for f in git('ls-files', '--', '*.rs').split(): os.utime(os.path.join(W, f))
         cargo(['fix', '--allow-dirty', '--allow-staged', '--allow-no-vcs', '--workspace'], f'fix-{rnd}')
         fixed = git('diff', '--stat').strip().splitlines()
         commit(f'deadcut round {rnd}: cargo fix')
         by_lint, cut, stay, errors = diagnostics(f'check-{rnd}')
         if errors: print(f'   deadcut round {rnd}: the tree does not check ({errors} errors): {ZS}/deadcut-check-{rnd}.out'); sys.exit(1)
         first = first or by_lint
-        files = collections.OrderedDict()
-        for f, l, n in cut: files.setdefault(f, []).append((f, l, n))
-        kept, failed = cut_groups([list(files.items())], rnd) if files else ([], [])
-        failed_all = failed; total_cut += len(kept)
+        new = [c for c in cut if (c[0], c[2]) not in failed_keys]; old = [c for c in cut if (c[0], c[2]) in failed_keys]
+        kept, failed = cut_groups(by_file(new), rnd) if new else ([], [])
+        if old and (fixed or kept):  # the earlier failures as one group
+            done = itemcut(old)
+            if checks(): commit(f'deadcut round {rnd}'); kept += done
+            else: git('checkout', '--', '.'); failed += old
+        elif old:  # a round that otherwise changes nothing: the earlier failures one by one
+            k, fl = cut_groups(by_file(old), rnd); kept += k; failed += fl
+        total_cut += len(kept)
+        failed_keys = (failed_keys | {(f, n) for f, _, n in failed}) - {(c[1], c[3]) for c in kept}
         for c in kept: cuts_tsv.write(f'{rnd}\t' + '\t'.join(c[1:]) + '\n')
         cuts_tsv.flush()
-        print(f'   deadcut round {rnd}: cargo fix changed {max(len(fixed) - 1, 0)} files; warnings '
-              + ', '.join(f'{k} {v}' for k, v in by_lint.most_common()) + f'; {len(kept)} items cut, {len(failed)} cuts do not check',
-              flush=True)
-        if git('rev-parse', 'HEAD').strip() == before or (not fixed and not kept): break
+        print(f'   deadcut round {rnd} ({time.strftime("%H:%M:%S", time.gmtime())}): cargo fix changed {max(len(fixed) - 1, 0)} files; warnings '
+              + ', '.join(f'{k} {v}' for k, v in by_lint.most_common()) + f'; {len(kept)} items cut, {len(failed)} cuts do not check'
+              + (f' ({len(old)} tried before)' if old else ''), flush=True)
+        if git('rev-parse', 'HEAD').strip() == before: break
     gone = empty_modules()
     print(f'   deadcut: {len(gone)} module files left with no item removed' + ''.join(f'; {os.path.relpath(c[2], W)}' for c in gone[:12]))
     by_lint, cut, stay, errors = diagnostics('final')
     assert errors == 0, 'deadcut: the final tree does not check'
     kinds = collections.Counter(re.sub(r'`[^`]*`', '`…`', m) for _, _, m in stay)
     open(ZS + '/deadcut-left.tsv', 'w').write(''.join(f'{f}\t{l}\t{m}\n' for f, l, m in stay))
+    open(ZS + '/deadcut-failed.tsv', 'w').write(''.join(f'{f}\t{l}\t{n}\n' for f, l, n in cut))
     print(f'   deadcut: {total_cut} items cut in {rnd} rounds; warnings at the start (allow attributes overridden): '
           + (', '.join(f'{k} {v}' for k, v in first.most_common()) or '0') + '; at the end: '
           + (', '.join(f'{k} {v}' for k, v in by_lint.most_common()) or '0'))
     print(f'   deadcut: left (not cut by rule): {len(stay)} -- ' + '; '.join(f'{v} {k}' for k, v in kinds.most_common(8))
-          + f'; cuts that do not check (the last round): {len(failed_all)}; lists {ZS}/deadcut.tsv, {ZS}/deadcut-left.tsv')
+          + f'; cuts that do not check: {len(cut)}; lists {ZS}/deadcut.tsv, {ZS}/deadcut-left.tsv, {ZS}/deadcut-failed.tsv')
 
 if __name__ == '__main__':
     main()

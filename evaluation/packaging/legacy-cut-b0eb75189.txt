@@ -1,0 +1,10 @@
+# option 3A, made by legacy_search.py search: the module removals (declaring file, module), the crate
+# dependencies the compiler then reports unused, and the trimmed crates whose roots then need
+# #![allow(warnings)] (the cut leaves unused extern crates and dead items behind), in the order applied
+mod	crates/pointer_replacer/src/analyses/mir/mod.rs	ty
+mod	crates/pointer_replacer/src/coverage_recon/mod.rs	compare
+mod	crates/pointer_replacer/src/coverage_recon/mod.rs	producer_b
+mod	crates/utils/src/lib.rs	bytemuck
+mod	crates/utils/src/lib.rs	c_lib
+mod	crates/utils/src/ir/mod.rs	hir_to_thir
+mod	crates/utils/src/ir/mod.rs	thir_to_mir

@@ -49,10 +49,13 @@ but `README.md` is unlisted). The other parameters are listed at the top of `red
    round removes nothing. The removals are frozen into `legacy-cut-<head>.txt`; every derivation applies the list and
    its release build re-proves it.
 6. **The compiler's dead code** (`deadcut.py`, `tools/itemcut`), to a fixpoint: `cargo fix` applies the compiler's
-   machine-applicable suggestions (unused imports and extern crates, `mut`, unused variables); every item a
-   `dead_code` or `unused_macros` warning names is cut with its attributes; `--force-warn` makes the lints fire where
-   an `allow` attribute would hide them. A set of cuts that does not check is undone and made again by halves. Fields
-   never read, variants and types never constructed stay (listed in `deadcut-left.tsv`; their owners' patches).
+   machine-applicable suggestions (unused imports and extern crates, `mut`, unused variables), the sources touched
+   first (a crate the last check left fresh has its warnings replayed from the cache, and nothing fixed); every item a
+   `dead_code` or `unused_macros` warning names is cut with its attributes (a type or trait with its impls in the same
+   file); `--force-warn` makes the lints fire where an `allow` attribute would hide them. A set of cuts that does not
+   check is undone and made again by halves; an item that failed is tried again with the others that failed, one by
+   one only in a round that otherwise changes nothing. Fields never read and variants never constructed stay (listed in
+   `deadcut-left.tsv`; their owners' patches), as do the cuts that never check (`deadcut-failed.tsv`).
 7. **Unused crate dependencies** (`-W unused_crate_dependencies`) leave every manifest; the lock follows.
 8. **The comment strip** (`tools/rslex strip`; `strip_misc.py` for TOML) and the `reason = "..."` of lint attributes.
 9. **The rename** (`rename.py`): R1 `CRAT_` -> `JOBCRAT_`; R2 the word `crat` -> `jobcrat`; R3 `crat_` -> `jobcrat_`;

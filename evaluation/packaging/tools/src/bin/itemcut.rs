@@ -1,8 +1,9 @@
 //! Removes the items the compiler reports as never used: reads `file<TAB>line<TAB>name` lines on stdin (the line of
 //! the item's name, 1-based) and cuts, from each file, the item (with its attributes) whose name is `name` on that line:
 //! a function, constant, static, type alias, struct, enum, union, trait, macro, or an associated function, constant or
-//! type of an inherent impl. Prints `CUT` or `MISS` per request; a file that does not parse again after the cuts is
-//! left unchanged and reported (exit 2).
+//! type of an inherent impl. A struct, enum, union, type alias or trait goes with the impls of that file whose self
+//! type (for a trait: whose trait) it names. Prints `CUT` or `MISS` per request and `IMPL` per impl cut with an item; a
+//! file that does not parse again after the cuts is left unchanged and reported (exit 2).
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -41,6 +42,12 @@ fn range_of<T: ToTokens>(node: &T) -> Range<usize> {
 struct Finder<'a> {
     want: &'a [(usize, String)],
     found: Vec<(usize, String, &'static str, Range<usize>)>,
+    // every impl of the file: (line, the self type's name, the trait's name, range)
+    impls: Vec<(usize, Option<String>, Option<String>, Range<usize>)>,
+}
+
+fn last_ident(path: &syn::Path) -> Option<String> {
+    path.segments.last().map(|s| s.ident.to_string())
 }
 
 impl Finder<'_> {
@@ -74,6 +81,13 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        let self_name = match &*i.self_ty {
+            syn::Type::Path(p) if p.qself.is_none() => last_ident(&p.path),
+            _ => None,
+        };
+        let trait_name = i.trait_.as_ref().and_then(|(_, p, _)| last_ident(p));
+        let line = i.impl_token.span.start().line;
+        self.impls.push((line, self_name, trait_name, range_of(i)));
         // Only inherent impls: a trait impl's items are required by the trait.
         if i.trait_.is_none() {
             for it in &i.items {
@@ -160,8 +174,18 @@ fn main() {
         let full = if root.is_empty() { path.clone() } else { format!("{root}/{path}") };
         let src = fs::read_to_string(&full).expect("read");
         let file = syn::parse_file(&src).expect("parse");
-        let mut finder = Finder { want: items, found: Vec::new() };
+        let mut finder = Finder { want: items, found: Vec::new(), impls: Vec::new() };
         finder.visit_file(&file);
+        let mut ranges: Vec<Range<usize>> = finder.found.iter().map(|f| f.3.clone()).collect();
+        for (_, name, kind, _) in &finder.found {
+            let is_type = matches!(*kind, "struct" | "enum" | "union" | "type" | "trait");
+            for (il, sname, tname, r) in &finder.impls {
+                if is_type && (sname.as_ref() == Some(name) || (*kind == "trait" && tname.as_ref() == Some(name))) {
+                    println!("IMPL\t{path}\t{il}\t{name}");
+                    ranges.push(r.clone());
+                }
+            }
+        }
         for (l, n) in items {
             match finder.found.iter().find(|(fl, fname, _, _)| fl == l && fname == n) {
                 Some((_, _, kind, _)) => println!("CUT\t{path}\t{l}\t{n}\t{kind}"),
@@ -171,7 +195,7 @@ fn main() {
         if finder.found.is_empty() {
             continue;
         }
-        let out = apply(&src, finder.found.iter().map(|f| f.3.clone()).collect());
+        let out = apply(&src, ranges);
         if let Err(e) = syn::parse_file(&out) {
             println!("REPARSE-FAIL\t{path}\t{e}");
             failed += 1;
