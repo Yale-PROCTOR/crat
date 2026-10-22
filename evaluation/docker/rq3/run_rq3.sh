@@ -6,7 +6,7 @@
 #   <substrate>    the prepared inputs, one directory per program (results/substrate): the text the declared
 #                  repairs are matched against
 #   <out>          this step's results (results/rq3); the tables go to its parent's tables/
-#   --small        skip the two runs that go to the eight-hour cap (genann: ours and CROWN's)
+#   --small        skip genann's two runs (ours goes to the eight-hour cap; CROWN's takes about two hours)
 #   --cap SECONDS  the time limit of one Miri run (default 28800, the paper's eight hours)
 #   --jobs N       Miri processes at a time (default 1)
 #   --tools LIST   whose translations run under Miri (default ours); crown and laertes read $THIRD_PARTY

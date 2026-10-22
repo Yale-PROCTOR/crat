@@ -3,9 +3,8 @@
 
 The paper's test line is the six programs that SHIP a test suite (the same six as the Miri experiment):
 libtree, rgba, quadtree, urlparser, genann, buffer. For each, the suite's OWN verdict on the emitted tree and, where
-it builds, on the C original: the exit status the suite gives (its checks abort or fail the run). The sixteen-program
-runtime harness (`runtime_census.py`) stays an internal instrument; this reads the six suites' rows out of its work
-directory, so the suites run exactly once per census. Inputs authored by the harness (libtree's `/bin/ls`) are not
+it builds, on the C original: the exit status the suite gives (its checks abort or fail the run). This reads the six
+suites' rows out of the native runner's (`runtime_census.py`) work directory, so the suites run exactly once. Inputs authored by the harness (libtree's `/bin/ls`) are not
 part of a suite and are not read.
 
 A suite PASSES on a variant when every one of its runs exits 0. `stdout equals C` is printed beside it (the suites

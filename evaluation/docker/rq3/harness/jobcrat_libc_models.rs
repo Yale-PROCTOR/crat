@@ -882,54 +882,6 @@ pub unsafe extern "C" fn toupper(c: c_int) -> c_int { if (0..128).contains(&c) {
 // signal: Miri's own shim (std's SIGPIPE setup); a model here would clash with it.
 
 
-// harness platform model: macOS ctype (`_DefaultRuneLocale.__runetype`, `__maskrune`) for a
-// translation made on macOS (bzip2). Only `__runetype` (byte offset 60) is read by the tree.
-#[repr(C)]
-pub struct JobcratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
-const fn jobcrat_macos_runetype() -> [u32; 256] {
-    let mut t = [0u32; 256];
-    let mut c = 0usize;
-    while c < 128 {
-        let b = c as u8;
-        let mut m = 0u32;
-        let upper = b >= b'A' && b <= b'Z';
-        let lower = b >= b'a' && b <= b'z';
-        let digit = b >= b'0' && b <= b'9';
-        let space = b == b' ' || (b >= 9 && b <= 13);
-        let print = b >= 0x20 && b < 0x7f;
-        let graph = b > 0x20 && b < 0x7f;
-        if upper || lower { m |= 0x100 }          // _CTYPE_A
-        if b < 0x20 || b == 0x7f { m |= 0x200 }   // _CTYPE_C
-        if digit { m |= 0x400 }                   // _CTYPE_D
-        if graph { m |= 0x800 }                   // _CTYPE_G
-        if lower { m |= 0x1000 }                  // _CTYPE_L
-        if graph && !(upper || lower || digit) { m |= 0x2000 } // _CTYPE_P
-        if space { m |= 0x4000 }                  // _CTYPE_S
-        if upper { m |= 0x8000 }                  // _CTYPE_U
-        if digit || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') { m |= 0x10000 } // _CTYPE_X
-        if b == b' ' || b == b'\t' { m |= 0x20000 } // _CTYPE_B
-        if print { m |= 0x40000 }                 // _CTYPE_R
-        t[c] = m;
-        c += 1;
-    }
-    t
-}
-#[no_mangle]
-pub static mut _DefaultRuneLocale: JobcratRuneLocaleModel =
-    JobcratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
-#[no_mangle]
-pub unsafe extern "C" fn __maskrune(c: c_int, mask: c_ulong) -> c_int {
-    if (0..256).contains(&c) { (jobcrat_macos_runetype()[c as usize] as c_ulong & mask) as c_int } else { 0 }
-}
-
-// macOS stdio names (a macOS translation's `__stdoutp` / `__stderrp` / `__stdinp`)
-#[no_mangle]
-pub static mut __stdinp: *mut CFile = unsafe { &raw mut STDIN_F };
-#[no_mangle]
-pub static mut __stdoutp: *mut CFile = unsafe { &raw mut STDOUT_F };
-#[no_mangle]
-pub static mut __stderrp: *mut CFile = unsafe { &raw mut STDERR_F };
-
 // ---------------------------------------------------------------- asserts
 #[no_mangle]
 pub unsafe extern "C" fn __assert_fail(expr: *const c_char, file: *const c_char, line: c_uint, func: *const c_char) -> ! {
@@ -943,22 +895,6 @@ pub unsafe extern "C" fn __assert_fail(expr: *const c_char, file: *const c_char,
 pub unsafe extern "C" fn __assert_rtn(func: *const c_char, file: *const c_char, line: c_int, expr: *const c_char) -> ! {
     let s = |p: *const c_char| if p.is_null() { String::new() } else { String::from_utf8_lossy(cstr(p)).into_owned() };
     eprintln!("Assertion failed: ({}), function {}, file {}, line {}.", s(expr), s(func), s(file), line);
-    std::process::abort()
-}
-
-// ---------------------------------------------------------------- setjmp / longjmp
-/// Miri supports neither. The model makes `setjmp` return 0 (its first return, the only one a run
-/// without a library error takes) and stops the run at the first `longjmp` with a named report,
-/// so the Miri receipt states its coverage as "up to the first longjmp" (libzahl: the first
-/// `assert_nr`, or a library error). The native runs use the C library's real setjmp / longjmp.
-#[no_mangle]
-pub unsafe extern "C" fn _setjmp(_env: *mut c_void) -> c_int {
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn longjmp(_env: *mut c_void, _val: c_int) -> ! {
-    eprintln!("longjmp-reached: the harness models setjmp as a single return; the Miri run ends here");
     std::process::abort()
 }
 
@@ -993,18 +929,6 @@ pub extern "C" fn sin(x: f64) -> f64 { x.sin() }
 pub extern "C" fn cos(x: f64) -> f64 { x.cos() }
 #[no_mangle]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 { x % y }
-
-// ht's demo reads words with scanf; the same scanner as fscanf, on stdin
-#[no_mangle]
-pub unsafe extern "C" fn scanf(fmt: *const c_char, mut args: ...) -> c_int {
-    let f = stdin;
-    let mut input = |take: bool| -> c_int {
-        let c = file_getc(f);
-        if !take && c >= 0 { (*f).unget = c }
-        c
-    };
-    scan(&mut input, fmt, &mut args)
-}
 
 // glibc's versioned stat entry points (`__xstat`, `__lxstat`, `__fxstat`, ver = _STAT_VER), which
 // the translation calls where the C source calls stat / lstat / fstat; Miri shims the unversioned

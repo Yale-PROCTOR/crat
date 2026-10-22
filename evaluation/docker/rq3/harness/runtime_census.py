@@ -8,7 +8,6 @@ prints one receipt per program:
   runtime program=<p> inputs=<n> panics=<k> fabricated_extent_panics=<f>
   other_panics=<o> (fabricated_extent_panics: a bounds panic whose len IS the tree's fabricated extent N, explained) differential_mismatches=<m> N=<extent: --extent, else the tree's own const, '-' if none> c_baseline=<built|absent>
   substrate_mismatches=<s> substrate_differs_from_c=<d> unwrap_none=<e9> overflow=<v> ub_precondition=<u>
-  abi_changed_drivers=<a> frame=<analysis_frame> code_frame=<sha>
 and writes <work-dir>/<p>/runs.tsv (one row per input and variant).
 
 Three variants per input: `c` (the C original, gcc), `substrate`
@@ -17,13 +16,10 @@ variants are built identically: rustc nightly-2025-06-23, every deps_crate
 rlib as an --extern, -C panic=abort, overflow checks and
 debug assertions on, opt-level 1.
 
-Driver kinds.
+Driver kind.
   main0   the tree keeps the C `main` as `main_0`; the harness makes TWO
           textual edits to a copy (the visibility of that `main_0`, and an
           appended `fn main` building argv in the tree's own argv type).
-  cdriver a C driver (the program's own test / sample / example, or a harness
-          transcription of a commented-out main) linked to the library built
-          as a staticlib: the C sources for `c`, the tree for the others.
 The two textual edits are written to <work-dir>/<p>/<variant>.shim.diff.
 
 Panic kinds (the message the default hook prints before SIGABRT):
@@ -34,7 +30,7 @@ Panic kinds (the message the default hook prints before SIGABRT):
   ub-precondition  `unsafe precondition(s) violated` (counted as other)
   other        anything else
 """
-import csv, difflib, functools, glob, os, re, shutil, subprocess, sys, time
+import difflib, functools, glob, os, re, shutil, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rust_scan import functions, owner_of, tokens  # noqa: E402
@@ -43,60 +39,12 @@ SRC = os.path.abspath(os.environ.get("SRC", os.getcwd()))                      #
 RESULTS = os.path.abspath(os.environ.get("RESULTS", os.path.join(SRC, "results")))
 CROWN = os.path.join(os.environ.get("THIRD_PARTY", os.path.join(RESULTS, "third-party")), "crown", "c-code")  # C originals (optional)
 SUBSTRATE = os.path.abspath(os.environ.get("SUBSTRATE", os.path.join(RESULTS, "substrate")))  # the prepared inputs
-RS = os.path.join(SRC, "benchmarks", "rs")
 BENCH = os.path.join(SRC, "benchmarks")
 DEPS = os.path.join(SRC, "deps_crate", "target", "debug", "deps")
-DRIVERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drivers")
 TOOLCHAIN = "+nightly-2025-06-23"
 RUST_FLAGS = ["-C", "panic=abort", "-C", "opt-level=1", "-C", "overflow-checks=on",
               "-C", "debug-assertions=on", "--cap-lints", "allow"]
 CC = ["gcc", "-O1", "-w", "-fno-strict-aliasing"]
-
-
-def run_pty(binary, keys, cwd, timeout):
-    """A scripted terminal session: the keys are fed one by one with a pause;
-    the screen bytes are kept, the exit status is what the differential reads."""
-    import pty, select
-    t0 = time.time()
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.chdir(cwd)
-        os.environ["TERM"] = "vt100"
-        os.execv(binary, [binary])
-    screen = b""
-    for k in keys:
-        end = time.time() + 0.3
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if r:
-                try:
-                    screen += os.read(fd, 65536)
-                except OSError:
-                    break
-        try:
-            os.write(fd, k.encode())
-        except OSError:
-            break
-    deadline = t0 + timeout
-    status = None
-    while time.time() < deadline:
-        r, _, _ = select.select([fd], [], [], 0.1)
-        if r:
-            try:
-                screen += os.read(fd, 65536)
-            except OSError:
-                pass
-        done, st = os.waitpid(pid, os.WNOHANG)
-        if done:
-            status = st
-            break
-    if status is None:
-        os.kill(pid, 9)
-        os.waitpid(pid, 0)
-        return "timeout", b"", screen, time.time() - t0
-    code = os.waitstatus_to_exitcode(status)
-    # the screen is random (srand(time)); only the exit status is compared
-    return code, b"", screen, time.time() - t0
 
 
 def run_cmd(cmd, cwd=None, stdin=None, timeout=600, env=None):
@@ -198,82 +146,6 @@ fn main() {{
     return out
 
 
-# Harness-side platform models: C-library entry points the
-# translation references that this platform's libc lacks. They model the C
-# library, never the program.
-PLATFORM_SHIMS = {
-    "macos_ctype": """
-// harness platform model: macOS ctype (`_DefaultRuneLocale.__runetype`, `__maskrune`) for a
-// translation made on macOS (bzip2). Only `__runetype` (byte offset 60) is read by the tree.
-#[repr(C)]
-pub struct JobcratRuneLocaleModel { head: [u8; 60], runetype: [u32; 256], rest: [u8; 8192] }
-const fn jobcrat_macos_runetype() -> [u32; 256] {
-    let mut t = [0u32; 256];
-    let mut c = 0usize;
-    while c < 128 {
-        let b = c as u8;
-        let mut m = 0u32;
-        let upper = b >= b'A' && b <= b'Z';
-        let lower = b >= b'a' && b <= b'z';
-        let digit = b >= b'0' && b <= b'9';
-        let space = b == b' ' || (b >= 9 && b <= 13);
-        let print = b >= 0x20 && b < 0x7f;
-        let graph = b > 0x20 && b < 0x7f;
-        if upper || lower { m |= 0x100 }          // _CTYPE_A
-        if b < 0x20 || b == 0x7f { m |= 0x200 }   // _CTYPE_C
-        if digit { m |= 0x400 }                   // _CTYPE_D
-        if graph { m |= 0x800 }                   // _CTYPE_G
-        if lower { m |= 0x1000 }                  // _CTYPE_L
-        if graph && !(upper || lower || digit) { m |= 0x2000 } // _CTYPE_P
-        if space { m |= 0x4000 }                  // _CTYPE_S
-        if upper { m |= 0x8000 }                  // _CTYPE_U
-        if digit || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') { m |= 0x10000 } // _CTYPE_X
-        if b == b' ' || b == 9 { m |= 0x20000 } // _CTYPE_B
-        if print { m |= 0x40000 }                 // _CTYPE_R
-        t[c] = m;
-        c += 1;
-    }
-    t
-}
-#[no_mangle]
-pub static mut _DefaultRuneLocale: JobcratRuneLocaleModel =
-    JobcratRuneLocaleModel { head: [0; 60], runetype: jobcrat_macos_runetype(), rest: [0; 8192] };
-#[no_mangle]
-pub unsafe extern "C" fn __maskrune(c: std::ffi::c_int, mask: std::ffi::c_ulong) -> std::ffi::c_int {
-    if (0..256).contains(&c) { (jobcrat_macos_runetype()[c as usize] as std::ffi::c_ulong & mask) as std::ffi::c_int } else { 0 }
-}
-// harness platform model: macOS stdio pointers and errno, bound to glibc's at startup
-extern "C" {
-    #[link_name = "stdin"] static mut jobcrat_glibc_stdin: *mut std::ffi::c_void;
-    #[link_name = "stdout"] static mut jobcrat_glibc_stdout: *mut std::ffi::c_void;
-    #[link_name = "stderr"] static mut jobcrat_glibc_stderr: *mut std::ffi::c_void;
-    #[link_name = "__errno_location"] fn jobcrat_glibc_errno() -> *mut std::ffi::c_int;
-}
-#[no_mangle] pub static mut __stdinp: *mut std::ffi::c_void = core::ptr::null_mut();
-#[no_mangle] pub static mut __stdoutp: *mut std::ffi::c_void = core::ptr::null_mut();
-#[no_mangle] pub static mut __stderrp: *mut std::ffi::c_void = core::ptr::null_mut();
-#[no_mangle] pub unsafe extern "C" fn __error() -> *mut std::ffi::c_int { jobcrat_glibc_errno() }
-#[used]
-#[link_section = ".init_array"]
-static JOBCRAT_MACOS_STDIO_INIT: unsafe extern "C" fn() = {
-    unsafe extern "C" fn init() { __stdinp = jobcrat_glibc_stdin; __stdoutp = jobcrat_glibc_stdout; __stderrp = jobcrat_glibc_stderr; }
-    init
-};
-""",
-    # macOS's assert-failure entry (tulipindicators was translated on macOS)
-    "assert_rtn": """
-// harness platform model: macOS `__assert_rtn` (the assert macro's failure path), as the C library would
-#[no_mangle]
-pub unsafe extern "C" fn __assert_rtn(func: *const std::ffi::c_char, file: *const std::ffi::c_char,
-                                      line: std::ffi::c_int, expr: *const std::ffi::c_char) -> ! {
-    let s = |p: *const std::ffi::c_char| if p.is_null() { String::new() } else { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() };
-    eprintln!("Assertion failed: ({}), function {}, file {}, line {}.", s(expr), s(func), s(file), line);
-    std::process::abort()
-}
-""",
-}
-
-
 # --- per-program configuration -------------------------------------------------
 # runs: (input_id, driver, argv list, stdin file or None, output files to compare)
 def P(**kw):
@@ -281,15 +153,6 @@ def P(**kw):
 
 
 PROGRAMS = {
-    "avl": P(kind="cdriver", c_lib=["avl.c"], c_dir="avl", drivers={"main": "avl/driver.c"},
-             runs=[("main", "main", [], None, [])]),
-    "bst": P(kind="cdriver", c_lib=["bst.c"], c_dir="bst", drivers={"main": "bst/driver.c"},
-             runs=[("main", "main", [], None, [])]),
-    # upstream: `$(CC) -g -Wall -DDEBUG -o test/test_binn test/test_binn.c test/test_binn2.c src/binn.c`
-    "binn": P(kind="cdriver", c_lib=["src/binn.c"], c_dir="binn-3.0", c_inc=["src"],
-              cflags=["-std=gnu99", "-Wno-error=implicit-function-declaration"],
-              drivers={"test_binn": ["@test/test_binn.c", "@test/test_binn2.c", "binn/internals.c"]},
-              runs=[("test_binn", "test_binn", [], None, [])]),
     "buffer": P(kind="main0", c_dir="buffer-0.4.0", mains={"test": ("src::test", ["test.c", "buffer.c"])},
                 runs=[("test", "test", [], None, [])]),
     "rgba": P(kind="main0", c_dir="rgba", c_inc=["src"], mains={"test": ("src::test", ["test.c", "src/rgba.c"])},
@@ -303,68 +166,11 @@ PROGRAMS = {
                 mains={m: (f"src::{m}", [f"{m}.c", "genann.c"]) for m in ("test", "example1", "example2", "example3", "example4")},
                 setup=["example"],
                 runs=[(m, m, [], None, []) for m in ("test", "example1", "example2", "example3", "example4")]),
-    "ht": P(kind="cdriver", c_lib=["ht.c"], c_dir="ht",
-            drivers={"demo": "@samples/demo.c", "dump": "@samples/dump.c", "stats": "@samples/stats.c"},
-            runs=[("demo", "demo", [], f"{DRIVERS}/ht/demo.stdin", []), ("dump", "dump", [], None, []),
-                  ("stats-words", "stats", [], f"{CROWN}/ht/samples/words.txt", [])]),
-    "libcsv": P(kind="cdriver", c_lib=["libcsv.c"], c_dir="libcsv", drivers={"test_csv": "@test_csv.c"},
-                runs=[("test_csv", "test_csv", [], None, [])]),
-    "lodepng": P(kind="cdriver", c_lib=["lodepng.c"], c_dir="lodepng",
-                 drivers={"encode": "@examples/example_encode.c", "decode": "@examples/example_decode.c"},
-                 runs=[("encode", "encode", ["test.png"], None, ["test.png"]),
-                       ("decode", "decode", ["in.png"], "@stage:encode/test.png:in.png", [])]),
-    "bzip2": P(kind="main0", c_dir="bzip2", platform_shims=["macos_ctype"],
-               mains={"bzip2": ("bzip2", ["bzip2.c", "blocksort.c", "huffman.c", "crctable.c", "randtable.c",
-                                           "compress.c", "decompress.c", "bzlib.c"])},
-               runs=[(f"compress-{n}", "bzip2", [f"-{n}"], f"{BENCH}/script-tests/bzip2/sample{n}.ref", []) for n in (1, 2, 3)]
-                    + [("decompress-1", "bzip2", ["-d"], f"{BENCH}/script-tests/bzip2/sample1.bz2", []),
-                       ("decompress-2", "bzip2", ["-d"], f"{BENCH}/script-tests/bzip2/sample2.bz2", []),
-                       ("decompress-3", "bzip2", ["-ds"], f"{BENCH}/script-tests/bzip2/sample3.bz2", [])]),
-    "brotli": P(kind="main0", c_dir="brotli-1.0.9", c_inc=["c/include"], timeout=900,
-                mains={"brotli": ("src::tools::brotli",
-                                  [os.path.relpath(f, f"{CROWN}/brotli-1.0.9") for d in ("common", "dec", "enc", "tools")
-                                   for f in sorted(glob.glob(f"{CROWN}/brotli-1.0.9/c/{d}/*.c"))])},
-                setup_abs=[f"{CROWN}/brotli-1.0.9/c/enc/encode.c", f"{CROWN}/brotli-1.0.9/c/common/dictionary.h",
-                           f"{CROWN}/brotli-1.0.9/c/dec/decode.c"],
-                # the repo's roundtrip test (q 1/6/9/11) plus q10 compress / stream (known defect (a) shows on q10)
-                runs=[r for f in ("encode.c", "dictionary.h", "decode.c") for q in (1, 6, 9, 11) for r in (
-                    (f"{f}-q{q}-compress", "brotli", ["-fq", str(q), f, "-o", "out.br"], None, ["out.br"]),
-                    (f"{f}-q{q}-decompress", "brotli", ["-fd", "in.br", "-o", "out"], f"@stage:{f}-q{q}-compress/out.br:in.br", ["out"]),
-                    (f"{f}-q{q}-stream", "brotli", ["-cq", str(q)], f, []))]
-                     + [r for f in ("encode.c", "dictionary.h", "decode.c") for r in (
-                    (f"{f}-q10-compress", "brotli", ["-fq", "10", f, "-o", "out.br"], None, ["out.br"]),
-                    (f"{f}-q10-stream", "brotli", ["-cq", "10"], f, []))]),
     "libtree": P(kind="main0", c_dir="libtree-3.1.1/c", mains={"libtree": ("src::libtree", ["libtree.c"])},
                  setup_abs=[f"{BENCH}/crown/libtree/tests"],
                  runs=[("bin-ls", "libtree", ["/bin/ls"], None, [])]
                       + [(f"test-{os.path.basename(d)}", "libtree", ["@sh", f"ln -sf \"$BIN\" libtree && make -s -C tests/{os.path.basename(d)} check"], None, [])
                          for d in sorted(glob.glob(f"{BENCH}/crown/libtree/tests/[0-9]*"))]),
-    "tulipindicators": P(kind="main0", c_dir=None, timeout=900, platform_shims=["assert_rtn"],
-                         mains={m: (m, None) for m in ("example1", "example2", "smoke", "fuzzer", "sample")},
-                         setup_abs=[f"{RS}/tulipindicators/tests"],
-                         runs=[("example1", "example1", [], None, []), ("example2", "example2", [], None, []),
-                               ("smoke", "smoke", [], None, []), ("fuzzer", "fuzzer", [], None, []),
-                               ("sample-ma-5", "sample", ["ma", "5"], None, []),
-                               ("sample-version", "sample", ["--version"], None, []),
-                               ("sample-list", "sample", ["--list"], None, [])]),
-    # heman: the two tests whose calls keep the C ABI (test_heman / test_pts / test_planet
-    # call functions the emitted tree delivers with fat signatures)
-    "heman": P(kind="cdriver", c_dir="heman", c_inc=["include", "kazmath", "src", "test"], cflags=["-fopenmp"],
-               c_lib=[os.path.relpath(f, f"{CROWN}/heman") for d in ("src", "kazmath")
-                      for f in sorted(glob.glob(f"{CROWN}/heman/{d}/*.c"))],
-               drivers={"test_sdf": "@test/test_sdf.c", "test_earth": "@test/test_earth.c"},
-               setup=["test"], timeout=600,
-               runs=[("test_sdf", "test_sdf", ["@sh", "mkdir -p build && \"$BIN\""], None, ["build/sdfresult.png"]),
-                     ("test_earth", "test_earth", ["@sh", "mkdir -p build && \"$BIN\""], None,
-                      ["build/colorized.png", "build/litearth.png", "build/masked.png", "build/sweep.png"])]),
-    # ncurses: the runtime library is present, the headers are not (no C baseline); pty, exit status only
-    "robotfindskitten": P(kind="main0", c_dir=None, link_args=["-l:libncurses.so.6", "-l:libtinfo.so.6"], timeout=60,
-                          mains={"rfk": ("src::robotfindskitten", None)},
-                          runs=[("pty-session", "rfk", ["@pty", " hhhjjjlllkkkyubn q"], None, [])]),
-    "lil": P(kind="main0", c_dir="lil", mains={"lil": ("src::main", ["main.c", "lil.c"])},
-             setup=["*.lil"],
-             runs=[(os.path.basename(f)[:-4], "lil", [os.path.basename(f)], None, [])
-                   for f in sorted(glob.glob(f"{CROWN}/lil/*.lil"))]),
 }
 
 
@@ -377,132 +183,25 @@ def c_build(cfg, driver_src, out, log):
     return code == 0
 
 
-# Rust drivers generated from the tree under test at build time (not committed). Empty: libzahl's,
-# the only one, was dropped (its test is a client outside the program).
-GENERATED_DRIVERS = set()
-
-
-def prepare_driver(program, tree):
-    if program in GENERATED_DRIVERS:
-        subprocess.run([sys.executable, os.path.join(DRIVERS, program, "make_rs.py"), tree], check=True,
-                       stdout=subprocess.DEVNULL)
-
-
-def rust_driver(program, drv):
-    """A Rust driver transcribed from the program's own C test:
-    drivers/<program>/<driver>.driver.rs, appended to the emitted crate, calling the
-    emitted API as the tree declares it. None where the program has none."""
-    p = os.path.join(DRIVERS, program, f"{drv}.driver.rs")
-    return p if os.path.exists(p) else None
-
-
-def driver_paths(cfg, spec):
-    """A driver is one source or a list; `@x` is relative to the C repo, else to drivers/."""
-    specs = spec if isinstance(spec, list) else [spec]
-    return [os.path.join(CROWN, cfg["c_dir"], x[1:]) if x.startswith("@") else os.path.join(DRIVERS, x) for x in specs]
-
-
 def build(program, cfg, census, work, extent=None):
     """-> {variant: {driver: binary path or None}}"""
     bins = {"c": {}, "substrate": {}, "emitted": {}}
     trees = {"substrate": os.path.join(SUBSTRATE, program), "emitted": os.path.join(census, "emitted-trees", program)}
     os.makedirs(work, exist_ok=True)
-    if cfg["kind"] == "main0":
-        for drv, (module, csrcs) in cfg["mains"].items():
-            out = os.path.join(work, f"c-{drv}")
-            bins["c"][drv] = (out if c_build(cfg, csrcs, out, out + ".log") else None) if cfg["c_dir"] else "absent"
-            for var, tree in trees.items():
-                root = crate_root(tree)
-                text = open(root, encoding="utf-8", errors="replace").read()
-                shimmed = shim(text, module, extent if var == "emitted" else None)
-                shimmed += "".join(PLATFORM_SHIMS[n] for n in cfg.get("platform_shims", []))
-                src = os.path.join(work, f"{var}-{drv}.rs")
-                open(src, "w").write(shimmed)
-                with open(os.path.join(work, f"{var}-{drv}.shim.diff"), "w") as d:
-                    d.writelines(difflib.unified_diff(text.splitlines(True), shimmed.splitlines(True), root, src, n=0))
-                out = os.path.join(work, f"{var}-{drv}")
-                bins[var][drv] = out if rustc(src, out, "bin", out + ".log", cfg.get("link_args", ())) else None
-    else:
-        libs = {}
+    for drv, (module, csrcs) in cfg["mains"].items():
+        out = os.path.join(work, f"c-{drv}")
+        bins["c"][drv] = (out if c_build(cfg, csrcs, out, out + ".log") else None) if cfg["c_dir"] else "absent"
         for var, tree in trees.items():
             root = crate_root(tree)
-            src = root
-            if extent and var == "emitted":
-                text = open(root, encoding="utf-8", errors="replace").read()
-                src = os.path.join(work, f"{var}-lib.rs")
-                open(src, "w").write(re.sub(r"const FALLBACK_SLICE_EXTENT: usize = \d+;",
-                                            f"const FALLBACK_SLICE_EXTENT: usize = {extent};", text))
-            out = os.path.join(work, f"lib{var}.a")
-            libs[var] = out if rustc(src, out, "staticlib", out + ".log") else None
-        base = os.path.join(CROWN, cfg["c_dir"])
-        inc = [f"-I{os.path.join(base, i)}" for i in cfg.get("c_inc", [])] + [f"-I{base}"]
-        for drv, spec in cfg["drivers"].items():
-            dsrc = driver_paths(cfg, spec)
-            out = os.path.join(work, f"c-{drv}")
-            code, so, se, _ = run_cmd([*CC, *cfg.get("cflags", []), *inc, *dsrc, *[os.path.join(base, s) for s in cfg["c_lib"]],
-                                       "-o", out, "-lm", "-lpthread", "-ldl"], timeout=1200)
-            open(out + ".log", "wb").write(se)
-            bins["c"][drv] = out if code == 0 else None
-            for var in ("substrate", "emitted"):
-                out = os.path.join(work, f"{var}-{drv}")
-                rsd = rust_driver(program, drv)
-                if var == "emitted" and rsd:
-                    prepare_driver(program, trees[var])
-                    # the emitted crate + its Rust driver, one binary: no C caller, so no ABI question
-                    text = open(crate_root(trees[var]), encoding="utf-8", errors="replace").read()
-                    if extent:
-                        text = re.sub(r"const FALLBACK_SLICE_EXTENT: usize = \d+;",
-                                      f"const FALLBACK_SLICE_EXTENT: usize = {extent};", text)
-                    src = os.path.join(work, f"{var}-{drv}.rs")
-                    open(src, "w").write(text + "\n" + open(rsd).read().replace("@DRIVERS@", DRIVERS)
-                                         + "".join(PLATFORM_SHIMS[n] for n in cfg.get("platform_shims", [])))
-                    bins[var][drv] = out if rustc(src, out, "bin", out + ".log", cfg.get("link_args", ())) else None
-                    continue
-                changed = abi_changed(cfg, spec, crate_root(trees[var]))
-                if changed:
-                    bins[var][drv] = ("abi-changed", changed)
-                    continue
-                if not libs[var]:
-                    bins[var][drv] = None
-                    continue
-                code, so, se, _ = run_cmd([*CC, *cfg.get("cflags", []), *inc, *dsrc, libs[var], "-o", out, "-lm", "-lpthread", "-ldl"], timeout=1200)
-                open(out + ".log", "wb").write(se)
-                bins[var][drv] = out if code == 0 else None
+            text = open(root, encoding="utf-8", errors="replace").read()
+            shimmed = shim(text, module, extent if var == "emitted" else None)
+            src = os.path.join(work, f"{var}-{drv}.rs")
+            open(src, "w").write(shimmed)
+            with open(os.path.join(work, f"{var}-{drv}.shim.diff"), "w") as d:
+                d.writelines(difflib.unified_diff(text.splitlines(True), shimmed.splitlines(True), root, src, n=0))
+            out = os.path.join(work, f"{var}-{drv}")
+            bins[var][drv] = out if rustc(src, out, "bin", out + ".log", cfg.get("link_args", ())) else None
     return bins
-
-
-FAT = re.compile(r"&\s*(?:'\w+\s+)?(?:mut\s+)?\[|Box<\[|SliceCursor|&str\b")
-
-
-def fat_exports(root):
-    """Exported `extern "C"` functions whose signature no longer matches the C
-    prototype (a fat pointer where C passes one word)."""
-    t = open(root, encoding="utf-8", errors="replace").read()
-    out = set()
-    for m in re.finditer(r'#\[no_mangle\]\s*pub (?:unsafe )?extern "C" fn (\w+)(<[^>]*>)?\s*\((.*?)\)\s*(->\s*[^{]+?)?\s*\{', t, re.S):
-        if FAT.search(m.group(0)):
-            out.add(m.group(1))
-    return out
-
-
-def abi_changed(cfg, spec, tree_root):
-    """The library functions a C driver calls whose emitted ABI changed."""
-    fat = fat_exports(tree_root)
-    called = set()
-    seen, todo = set(), list(driver_paths(cfg, spec))
-    local = {os.path.dirname(p) for p in todo}
-    while todo:  # the driver and the headers it includes from its own directory (not the library's)
-        src = todo.pop()
-        if src in seen or not os.path.exists(src):
-            continue
-        seen.add(src)
-        t = open(src, encoding="utf-8", errors="replace").read()
-        called |= {f for f in fat if re.search(r"\b" + f + r"\s*\(", t)}
-        for inc in re.findall(r'#\s*include\s*"([^"]+)"', t):
-            cand = os.path.normpath(os.path.join(os.path.dirname(src), inc))
-            if os.path.exists(cand) and os.path.dirname(cand) in local:
-                todo.append(cand)
-    return sorted(called)
 
 
 ADDR = re.compile(rb"0x[0-9a-f]{6,16}")
@@ -695,28 +394,15 @@ def run_program(program, cfg, census, work, extent=None):
             if b == "absent":
                 res[var] = ("absent", b"", b"", 0.0, {})
                 continue
-            if isinstance(b, tuple):
-                res[var] = ("abi-changed:" + ",".join(b[1]), b"", b"", 0.0, {})
-                continue
             if not b:
                 res[var] = ("build-failed", b"", b"", 0.0, {})
                 continue
             fin = subprocess.DEVNULL
-            if stdin and stdin.startswith("@stage:"):
-                # the C variant's output of an earlier input, staged as this run's input file
-                src, dst = stdin[len("@stage:"):].rsplit(":", 1)
-                prior = os.path.join(work, "runs", src.split("/", 1)[0], "c", src.split("/", 1)[1])
-                if not os.path.exists(prior):
-                    prior = os.path.join(work, "runs", src.split("/", 1)[0], "substrate", src.split("/", 1)[1])
-                shutil.copy(prior, os.path.join(rundir, dst))
-            elif stdin:
+            if stdin:
                 fin = open(stdin if os.path.isabs(stdin) else os.path.join(rundir, stdin), "rb")
             cmd = ["bash", "-c", argv[1]] if argv[:1] == ["@sh"] else [b, *argv]
             env = dict(os.environ, BIN=b)
-            if argv[:1] == ["@pty"]:
-                code, so, se, wall = run_pty(b, argv[1], rundir, cfg.get("timeout", 120))
-            else:
-                code, so, se, wall = run_cmd(cmd, cwd=rundir, stdin=fin, timeout=cfg.get("timeout", 120), env=env)
+            code, so, se, wall = run_cmd(cmd, cwd=rundir, stdin=fin, timeout=cfg.get("timeout", 120), env=env)
             outs = {f: open(os.path.join(rundir, f), "rb").read() if os.path.exists(os.path.join(rundir, f)) else None for f in files}
             open(os.path.join(rundir, "stdout"), "wb").write(so)
             open(os.path.join(rundir, "stderr"), "wb").write(se)
@@ -734,11 +420,6 @@ def main(argv):
         # second configuration: the debug-assertion precondition
         # checks (alignment, from_raw_parts) off; bounds and overflow checks stay on
         RUST_FLAGS.extend(["-Zub-checks=no"])
-    first = next(iter(glob.glob(os.path.join(census, "*.raw-boundary-subject-outcomes.tsv"))), None)
-    frame = code = "-"
-    if first:
-        r = next(csv.DictReader(open(first), delimiter="\t"))
-        frame, code = r["analysis_frame"], r["code_frame"][:9]
     for program, cfg in PROGRAMS.items():
         if only and program not in only:
             continue
@@ -746,7 +427,7 @@ def main(argv):
         if inputs:
             cfg = dict(cfg, _only_inputs=inputs)
         rows = run_program(program, cfg, census, pw, extent)
-        panics = fabricated = other = mism = smism = e9 = ov = ub = abi = bfail = bounds = unexplained = input_ub_panics = 0
+        panics = fabricated = other = mism = smism = e9 = ov = ub = bfail = bounds = unexplained = input_ub_panics = 0
         known = {}
         reproduced, known_crash = [], 0
         substrate_only, sub_differs = [], 0
@@ -763,7 +444,7 @@ def main(argv):
             t.write("input\tvariant\texit\twall_s\tpanic_kind\tsite\tfn\tmessage\tstdout_eq_c\tstdout_eq_substrate\tsubstrate_eq_c\n")
             for input_id, res in rows:
                 c, s, e = res["c"], res["substrate"], res["emitted"]
-                ran = lambda r: not (isinstance(r[0], str) and (r[0] in ("build-failed", "absent") or r[0].startswith("abi-changed")))
+                ran = lambda r: not (isinstance(r[0], str) and r[0] in ("build-failed", "absent"))
                 # does the substrate equal C on this input? '-' where either did not run (no C baseline).
                 sub_eq_c = (s[0] == c[0] and s[1] == c[1] and s[4] == c[4]) if ran(c) and ran(s) else None
                 if sub_eq_c is False:
@@ -817,12 +498,9 @@ def main(argv):
                     ub += kind == "ub-precondition"
                     other += kind in ("other", "ub-precondition")
                     bounds += kind == "bounds"
-                ran = lambda r: not (isinstance(r[0], str) and (r[0] in ("build-failed", "absent") or r[0].startswith("abi-changed")))
+                ran = lambda r: not (isinstance(r[0], str) and r[0] in ("build-failed", "absent"))
                 if e[0] == "build-failed" or s[0] == "build-failed":
                     bfail += 1
-                if isinstance(e[0], str) and e[0].startswith("abi-changed"):
-                    abi += 1
-                    continue
                 if ran(c) and ran(e) and not (e[0] == c[0] and e[1] == c[1] and e[4] == c[4]):
                     mism += 1
                     if (program, input_id) not in EXPLAINED and not at_fabricated_extent and not repro \
@@ -834,9 +512,9 @@ def main(argv):
               f"other_panics={other} bounds_unattributed={bounds} known_defect_panics={sum(known.values())}{'(' + ','.join(f'{k}:{v}' for k, v in sorted(known.items())) + ')' if known else ''} differential_mismatches={mism} N={extent or tree_extent(os.path.join(census, 'emitted-trees', program)) or '-'} "
               f"c_baseline={'absent' if not cfg['c_dir'] else ('built' if any(res['c'][0] != 'build-failed' for _, res in rows) else 'build-failed')} "
               f"substrate_mismatches={smism} substrate_differs_from_c={sub_differs} unwrap_none={e9} overflow={ov} ub_precondition={ub} "
-              f"abi_changed_inputs={abi} build_failed_inputs={bfail} unexplained_mismatches={unexplained} input_ub_panics={input_ub_panics} "
+              f"build_failed_inputs={bfail} unexplained_mismatches={unexplained} input_ub_panics={input_ub_panics} "
               f"known_crashes={known_crash}{'(' + KNOWN_CRASHES[(program, 'test_binn')][0] + ')' if known_crash and program == 'binn' else ''} "
-              f"landing={'pass' if panics == fabricated and known_crash == 0 and bfail == 0 and unexplained == 0 else 'fail'} frame={frame} code_frame={code}", flush=True)
+              f"landing={'pass' if panics == fabricated and known_crash == 0 and bfail == 0 and unexplained == 0 else 'fail'}", flush=True)
         for line in reproduced:
             print(f"  input-ub (c2rust / substrate reproduces): {line}", flush=True)
         for line in substrate_only:

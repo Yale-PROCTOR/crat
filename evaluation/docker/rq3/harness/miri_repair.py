@@ -17,9 +17,37 @@ import csv, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from miri_oracle import mask  # noqa: E402
-from pair_sites import module_spans  # noqa: E402
 
 REPAIRS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "repairs.tsv")
+
+
+def module_spans(mk):
+    """[(fn name, module path tuple, body start, body end)] from the masked text."""
+    out, stack, depth, i = [], [], 0, 0
+    tok = re.compile(r"\bmod\s+(\w+)\s*\{|\bfn\s+(\w+)\b|[{};]")
+    pending_fn = None
+    fn_open = []
+    for m in tok.finditer(mk):
+        if m.group(1):
+            depth += 1
+            stack.append((m.group(1), depth))
+        elif m.group(2):
+            pending_fn = m.group(2)
+        elif m.group(0) == ";":
+            pending_fn = None
+        elif m.group(0) == "{":
+            depth += 1
+            if pending_fn:
+                fn_open.append((pending_fn, tuple(n for n, _ in stack), m.start(), depth))
+                pending_fn = None
+        else:
+            if fn_open and fn_open[-1][3] == depth:
+                name, mods, start, _ = fn_open.pop()
+                out.append((name, mods, start, m.start()))
+            if stack and stack[-1][1] == depth:
+                stack.pop()
+            depth -= 1
+    return out
 
 
 def load(path=REPAIRS):

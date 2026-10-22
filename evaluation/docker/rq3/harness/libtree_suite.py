@@ -8,7 +8,7 @@ import os, re, shutil, subprocess, sys
 T = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, T)
 import runtime_census as rc, miri_census as mc, miri_repair
 census, work, pss, var = sys.argv[1:5]
-p = "libtree"; cfg = rc.PROGRAMS[p]; mc.PROGRAM[0] = p
+p = "libtree"; cfg = rc.PROGRAMS[p]
 tree = os.path.join(census, "emitted-trees", p) if var == "emitted" else os.path.join(rc.SUBSTRATE, p)
 pw = os.path.join(work, f"libtree-{pss}-{var}"); os.makedirs(pw, exist_ok=True)
 proj = os.path.join(pw, "proj"); tgt = os.path.join(pw, "target")
@@ -16,7 +16,7 @@ repairs = (miri_repair.load(os.environ["JOBCRAT_MIRI_REPAIRS"]) if os.environ.ge
 pass_c = pss in ("C", "D") and var == "emitted"
 module = cfg["mains"]["libtree"][0]
 if not os.path.exists(os.path.join(proj, "src", "main.rs")):
-    mc.project(rc.crate_root(tree), module, var, cfg, proj, p, False, pass_c, None, repairs)
+    mc.project(rc.crate_root(tree), module, var, cfg, proj, p, False, pass_c, repairs)
 flags = "-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-tree-borrows" + (" -Zmiri-address-reuse-rate=0" if pass_c else "")
 # cargo/rustup put the toolchain's lib dir into LD_LIBRARY_PATH, which Miri forwards to the program (isolation off):
 # the tests set LD_LIBRARY_PATH themselves, so the wrapper hands the CALLER's value to the program (an unset one

@@ -14,7 +14,7 @@ Environment (set by the artifact's run.sh; defaults for a run from the unpacked 
                repairs are matched against in an output (an edit applies only where the output kept the input's text)
   THIRD_PARTY  the comparison tools' outputs (default $RESULTS/third-party): trees/crown/<p>/ (CROWN's output) and
                comparison/laertes-{crown,laertes}/after/<p>/ (the Laertes translations CROWN's artifact distributes)
-  SMALL        1: the 8-hour genann runs are skipped
+  SMALL        1: genann's runs (ours and CROWN's) are skipped
   MIRI_CAP     seconds per Miri run (default 28800, eight hours)
   RQ3_OUT      this step's results (default $RESULTS/rq3)
   RQ3_JOBS     Miri processes at a time (default 1)
@@ -43,7 +43,7 @@ os.environ.setdefault('SUBSTRATE', os.path.join(RESULTS, 'substrate'))
 
 SIX = ['libtree', 'rgba', 'quadtree', 'urlparser', 'genann', 'buffer']     # the programs that ship a test suite
 FIVE = ['buffer', 'genann', 'libtree', 'quadtree', 'rgba']                  # Table miri (urlparser: an input defect)
-LONG = ('genann',)                                                          # runs to the eight-hour cap
+LONG = ('genann',)                                                          # ours to the eight-hour cap, CROWN's ~2 h
 SKIP_SMALL = 'skipped (--small: 8 h cap)'
 TOOLS = ('ours', 'crown', 'laertes')
 LAERTES_SRC = {'genann': 'laertes-laertes'}                                 # the others: laertes-crown
@@ -118,7 +118,7 @@ def miri_one(tool, p):
         else:
             cmd = [sys.executable, os.path.join(HARNESS, 'miri_census.py'), census(tool), work, '--programs', p,
                    '--discipline', 'TB', '--variant', 'emitted', '--timeout', str(CAP),
-                   '--native', os.path.join(OUT, 'native'), '--oracle', '--repair', REPAIRS]
+                   '--oracle', '--repair', REPAIRS]
             if p == 'genann':
                 cmd[cmd.index('--programs') + 2:cmd.index('--programs') + 2] = ['--inputs', 'test']
         subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)

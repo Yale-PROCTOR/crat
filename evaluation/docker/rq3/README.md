@@ -21,7 +21,7 @@ It writes:
 - **Flags:** `-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks`, plus `-Zmiri-address-reuse-rate=0` with the extents below; every crate is built with `panic = "abort"`.
 - **The slice lengths.** The translator gives a slice whose length it cannot infer an arbitrary bound (`FALLBACK_SLICE_EXTENT`). Before the run, `harness/miri_oracle.py` replaces each such construction by the allocation's real extent, read from an allocation registry the harness adds (array-bound inference is outside the translator's scope).
 - **The input defects.** `repairs.tsv` declares the fixes of defects already in the C2Rust translations: libtree's four sites (rows) where C2Rust builds a raw pointer through a reference (`&mut x as *mut T`, `.as_mut_ptr()`) become `&raw mut x`, and genann's test closes a stream twice. They are applied identically to every tool's tree, but only where the tree kept the C2Rust text; the receipts say where they applied. The C2Rust text is the prepared input in `results/substrate/<p>`. The applying code is `harness/miri_repair.py`.
-- **The time limit:** `--cap` / `MIRI_CAP`, in seconds per run (default 28,800, the paper's eight hours). genann does not finish within it: its cell counts the run with no UB found, as the paper's dagger says.
+- **The time limit:** `--cap` / `MIRI_CAP`, in seconds per run (default 28,800, the paper's eight hours). Our genann does not finish within it: its cell counts the run with no UB found, as the paper's dagger says. CROWN's genann finishes within it (6,904 s in the paper's measurement).
 
 ## The table's cells
 
@@ -36,21 +36,21 @@ It writes:
 
 ## `--small`
 
-- **Skipped:** the two runs that go to the cap, genann on our translation and on CROWN's. Their keys are written `skipped (--small: 8 h cap)`.
+- **Skipped:** genann on our translation and on CROWN's, the two longest runs. Ours runs to the eight-hour cap; CROWN's finishes in about two hours. Their keys are written `skipped (--small: 8 h cap)`.
 - **Still run:** everything else, the native suites and Miri on the other programs. This takes minutes.
 
-On a slower host the full run's genann may complete fewer of its test groups before the cap; its cell (runs 1, no UB) does not change.
+On a slower host our genann may complete fewer of its test groups before the cap; its cell (runs 1, no UB) does not change. CROWN's genann reaches the cap only on a host about four times slower than the paper's (28,800 s against 6,904 s).
 
 ## The harness
 
-`harness/` is the measurement harness, unmodified except for its paths (the artifact's roots) and the names of the translator's helpers. It contains:
+`harness/` is the measurement harness, cut to the six programs; otherwise only its paths (the artifact's roots) and the names of the translator's helpers are changed. It contains:
 - `miri_census.py`: one Cargo project per program and run, then the Miri run and its first report;
 - `miri_oracle.py`: the extents;
 - `miri_repair.py`: the declared repairs;
 - `jobcrat_libc_models.rs`: models of the C library functions Miri has no shim for (`sscanf`, `strdup`, …), compiled into each project;
 - `libtree_suite.py`: libtree's nine `make check` runs, each reaching the Miri project through a wrapper;
 - `runtime_census.py` + `six_suites.py`: the native runs;
-- `pair_sites.py`, `rust_scan.py`, `miri_trace.py`: helpers.
+- `rust_scan.py`: a helper (the function that owns a source line).
 
 `lib/flatten.py` turns a multi-file tree (CROWN's, Laertes's) into one crate root, as ours are. `lib/rq3.py` drives the steps and reads the results.
 
