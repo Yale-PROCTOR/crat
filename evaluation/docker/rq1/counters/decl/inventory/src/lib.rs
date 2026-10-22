@@ -101,41 +101,6 @@ impl RustCounts {
         self.free_calls += other.free_calls;
         self.drop_calls += other.drop_calls;
     }
-
-    pub fn box_type_positions(&self) -> u64 {
-        self.types.local_box
-            + self.types.local_option_box
-            + self.types.param_box
-            + self.types.param_option_box
-            + self.types.return_box
-            + self.types.return_option_box
-            + self.types.field_box
-            + self.types.field_option_box
-    }
-
-    pub fn allocation_calls(&self) -> u64 {
-        self.malloc_calls + self.calloc_calls + self.realloc_calls
-    }
-
-    pub fn raw_pointer_type_positions(&self) -> u64 {
-        self.declarations.raw_pointer_type_positions()
-    }
-
-    pub fn reference_family_type_positions(&self) -> u64 {
-        self.declarations.reference_family_type_positions()
-    }
-
-    pub fn reference_function_slots(&self) -> u64 {
-        self.reference_function_slot_keys.len() as u64
-    }
-
-    pub fn box_expression_evidence(&self) -> u64 {
-        self.box_new_local_initializers + self.box_new_assignment_rhs
-    }
-
-    pub fn box_function_slots(&self) -> u64 {
-        self.box_function_slot_keys.len() as u64
-    }
 }
 
 impl DeclarationPositionCounts {
@@ -165,36 +130,6 @@ impl DeclarationPositionCounts {
         self.field_option_ref += other.field_option_ref;
         self.field_option_mut_ref += other.field_option_mut_ref;
     }
-
-    fn raw_pointer_type_positions(&self) -> u64 {
-        self.local_raw_mut
-            + self.local_raw_const
-            + self.param_raw_mut
-            + self.param_raw_const
-            + self.return_raw_mut
-            + self.return_raw_const
-            + self.field_raw_mut
-            + self.field_raw_const
-    }
-
-    fn reference_family_type_positions(&self) -> u64 {
-        self.local_ref
-            + self.local_mut_ref
-            + self.local_option_ref
-            + self.local_option_mut_ref
-            + self.param_ref
-            + self.param_mut_ref
-            + self.param_option_ref
-            + self.param_option_mut_ref
-            + self.return_ref
-            + self.return_mut_ref
-            + self.return_option_ref
-            + self.return_option_mut_ref
-            + self.field_ref
-            + self.field_mut_ref
-            + self.field_option_ref
-            + self.field_option_mut_ref
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -215,103 +150,6 @@ pub struct JsonClaimCounts {
     pub fn_d0_mut_ptr: u64,
     pub fn_d0_mut_ptr_keys: BTreeSet<String>,
     pub max_depth: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OfficialEvaluation {
-    pub declaration_before: u64,
-    pub declaration_after: u64,
-    pub declaration_rate: String,
-    pub usage_before: u64,
-    pub usage_after: u64,
-    pub usage_rate: String,
-}
-
-pub fn parse_official_evaluation(
-    source: &str,
-) -> Result<BTreeMap<String, OfficialEvaluation>, String> {
-    const HEADER: &str =
-        "Benchmark Name,#Unsafe Mutable Non-Array Pointers,,,#Unsafe Mutable Non-Array Usages,,";
-    let mut lines = source.lines();
-    if lines.next() != Some(HEADER) {
-        return Err("evaluation.tsv: unexpected header".to_owned());
-    }
-    let mut rows = BTreeMap::new();
-    for (index, line) in lines.enumerate() {
-        let values: Vec<_> = line.split(',').collect();
-        if values.len() != 7 {
-            return Err(format!("evaluation.tsv:{}: expected 7 columns", index + 2));
-        }
-        let parse_count = |column: usize| -> Result<u64, String> {
-            values[column].parse().map_err(|_| {
-                format!(
-                    "evaluation.tsv:{}: column {} must be a non-negative integer",
-                    index + 2,
-                    column + 1
-                )
-            })
-        };
-        let row = OfficialEvaluation {
-            declaration_before: parse_count(1)?,
-            declaration_after: parse_count(2)?,
-            declaration_rate: values[3].to_owned(),
-            usage_before: parse_count(4)?,
-            usage_after: parse_count(5)?,
-            usage_rate: values[6].to_owned(),
-        };
-        validate_official_rate(
-            index + 2,
-            "declaration",
-            row.declaration_before,
-            row.declaration_after,
-            &row.declaration_rate,
-        )?;
-        validate_official_rate(
-            index + 2,
-            "usage",
-            row.usage_before,
-            row.usage_after,
-            &row.usage_rate,
-        )?;
-        if rows.insert(values[0].to_owned(), row).is_some() {
-            return Err(format!(
-                "evaluation.tsv:{}: duplicate program {}",
-                index + 2,
-                values[0]
-            ));
-        }
-    }
-    let before: u64 = rows.values().map(|row| row.declaration_before).sum();
-    let after: u64 = rows.values().map(|row| row.declaration_after).sum();
-    if (before, after) != (2_414, 1_711) {
-        return Err(format!(
-            "evaluation.tsv: declaration totals must be 2414/1711, got {before}/{after}"
-        ));
-    }
-    Ok(rows)
-}
-
-fn validate_official_rate(
-    line: usize,
-    metric: &str,
-    before: u64,
-    after: u64,
-    actual: &str,
-) -> Result<(), String> {
-    let expected = if before == 0 {
-        "NaN%".to_owned()
-    } else {
-        format!(
-            "{:.1}%",
-            (before.saturating_sub(after)) as f64 * 100.0 / before as f64
-        )
-    };
-    if actual != expected {
-        return Err(format!(
-            "evaluation.tsv:{line}: {metric} rate {actual} does not match {expected}"
-        ));
-    }
-    Ok(())
 }
 
 pub fn analyze_rust_source(source: &str) -> Result<RustCounts, syn::Error> {

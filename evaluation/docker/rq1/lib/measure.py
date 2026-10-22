@@ -31,7 +31,6 @@ RAWF = {'raw-mut', 'raw-const', 'opt-raw-mut', 'opt-raw-const', 'nonnull', 'opt-
 _base = {'ref', 'mut-ref', 'slice-ref', 'slice-mut', 'str-ref', 'box', 'box-slice'}
 SAFEF = _base | {'opt-' + b for b in _base}
 CUR = {'cursor', 'cursor-mut', 'opt-cursor', 'opt-cursor-mut'}
-SKIP = {'borrow', 'borrow_mut', 'owned_as_ref', 'owned_as_mut', 'option_to_raw', '_ref_eq', '_ref_ne', 'main'}
 P = C.pct
 
 
@@ -166,7 +165,7 @@ def alldecl_ours(p, pop):
 def d0(rows, U, flat=False):
     out = defaultdict(list)
     for r in rows:
-        if r['kind'] in ('param', 'local') and r['depth'] == '0' and r['layer'] == '0' and tail(r['owner']) not in SKIP:
+        if r['kind'] in ('param', 'local') and r['depth'] == '0' and r['layer'] == '0':
             kk = r['owner'] + '::' + r['name']
             kk = C.unsrc(kk) if flat else kk
             if kk in U:

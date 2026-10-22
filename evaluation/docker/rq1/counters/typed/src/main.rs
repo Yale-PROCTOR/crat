@@ -7,8 +7,8 @@
 //! crate) and writes:
 //!
 //! `positions.tsv` (T1) -- one row per pointer-like LAYER of every declaration:
-//!   kind      param | return | local | field | static
-//!   owner     `tcx.def_path_str` of the function / struct / static (`src::avl::insert`)
+//!   kind      param | return | local | field
+//!   owner     `tcx.def_path_str` of the function / struct (`src::avl::insert`)
 //!   name      the binding / field name (`_0` for a return)
 //!   idx       params: the argument index; locals: the ordinal among same-named bindings of the function
 //!   binding   locals: `typed` (`let x: T`), `untyped` (the type is typeck's), `byref` (a `ref`/`ref mut` binding,
@@ -31,7 +31,6 @@
 //!   full_roots     every place, outside non-use contexts and cleanup blocks, rooted at ANY local whose declared type
 //!                  is a raw pointer, whose projection holds a Deref -- on `mir_promoted` (before the runtime passes,
 //!                  so a Box dereference is a Box dereference, not a raw temporary)
-//!   full_deref     every such place holding a Deref whose base type is a raw pointer, whatever its root's type
 #![feature(rustc_private)]
 
 extern crate rustc_data_structures;
@@ -67,7 +66,7 @@ use rustc_hir::{
 use rustc_interface::Config;
 use rustc_middle::{
     mir::{
-        Body, Local, Location, Place, PlaceRef, ProjectionElem, VarDebugInfoContents,
+        Body, Local, Location, Place, ProjectionElem, VarDebugInfoContents,
         visit::{PlaceContext, Visitor as MirVisitor},
     },
     ty::{self, Ty, TyCtxt},
@@ -333,8 +332,8 @@ impl<'tcx> HirVisitor<'tcx> for Bindings<'_, 'tcx> {
     }
 }
 
-fn items(tcx: TyCtxt<'_>) -> (Vec<LocalDefId>, Vec<LocalDefId>, Vec<LocalDefId>) {
-    let (mut fns, mut adts, mut statics) = (vec![], vec![], vec![]);
+fn items(tcx: TyCtxt<'_>) -> (Vec<LocalDefId>, Vec<LocalDefId>) {
+    let (mut fns, mut adts) = (vec![], vec![]);
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else { continue };
         let OwnerNode::Item(item) = owner.node() else { continue };
@@ -342,15 +341,14 @@ fn items(tcx: TyCtxt<'_>) -> (Vec<LocalDefId>, Vec<LocalDefId>, Vec<LocalDefId>)
         match tcx.def_kind(did) {
             DefKind::Fn => fns.push(did),
             DefKind::Struct | DefKind::Union | DefKind::Enum => adts.push(did),
-            DefKind::Static { .. } => statics.push(did),
             _ => {}
         }
     }
-    (fns, adts, statics)
+    (fns, adts)
 }
 
 fn t1<'tcx>(tcx: TyCtxt<'tcx>) -> String {
-    let (fns, adts, statics) = items(tcx);
+    let (fns, adts) = items(tcx);
     let mut out: Vec<(Row, Vec<Layer>)> = Vec::new();
     let push = |out: &mut Vec<(Row, Vec<Layer>)>, mut r: Row, ty: Ty<'tcx>| {
         let mut layers = Vec::new();
@@ -429,15 +427,6 @@ fn t1<'tcx>(tcx: TyCtxt<'tcx>) -> String {
             push(&mut out, r, tcx.type_of(field.did).instantiate_identity());
         }
     }
-    for &did in &statics {
-        let path = tcx.def_path_str(did);
-        let (owner, name) = path
-            .rsplit_once("::")
-            .map(|(a, b)| (a.to_owned(), b.to_owned()))
-            .unwrap_or((String::new(), path.clone()));
-        let r = Row { kind: "static", owner, name, idx: "-".into(), binding: "-", synthetic: false, ty: String::new() };
-        push(&mut out, r, tcx.type_of(did).instantiate_identity());
-    }
     let mut s = String::from("kind\towner\tname\tidx\tbinding\tsynthetic\tdepth\tlayer\tform\tctx\ttype\n");
     for (r, layers) in out {
         let mut at_depth: BTreeMap<usize, usize> = BTreeMap::new();
@@ -502,10 +491,8 @@ impl<'tcx> MirVisitor<'tcx> for Official<'_> {
 
 /// The full scope on pre-runtime MIR, cleanup blocks skipped.
 struct Full<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     roots: u64,
-    deref: u64,
 }
 
 impl<'tcx> MirVisitor<'tcx> for Full<'_, 'tcx> {
@@ -517,16 +504,6 @@ impl<'tcx> MirVisitor<'tcx> for Full<'_, 'tcx> {
             if matches!(self.body.local_decls[place.local].ty.kind(), ty::RawPtr(..)) {
                 self.roots += 1;
             }
-            let through_raw = place.projection.iter().enumerate().any(|(i, elem)| {
-                matches!(elem, ProjectionElem::Deref)
-                    && matches!(
-                        PlaceRef { local: place.local, projection: &place.projection[..i] }.ty(self.body, self.tcx).ty.kind(),
-                        ty::RawPtr(..)
-                    )
-            });
-            if through_raw {
-                self.deref += 1;
-            }
         }
         self.visit_projection(place.as_ref(), context, location);
     }
@@ -534,7 +511,7 @@ impl<'tcx> MirVisitor<'tcx> for Full<'_, 'tcx> {
 
 /// Pre-runtime MIR for every fn, cloned before borrowck steals it (`mir_promoted`).
 fn promoted_bodies(tcx: TyCtxt<'_>) -> HashMap<LocalDefId, Body<'_>> {
-    let (fns, _, _) = items(tcx);
+    let (fns, _) = items(tcx);
     fns.into_iter().map(|did| (did, tcx.mir_promoted(did).0.borrow().clone())).collect()
 }
 
@@ -544,12 +521,12 @@ fn t2<'tcx>(
     universe: &BTreeSet<String>,
     strip_src: bool,
 ) -> (String, BTreeSet<String>) {
-    let (fns, _, _) = items(tcx);
+    let (fns, _) = items(tcx);
     let paths: BTreeSet<String> = fns.iter().map(|&d| tcx.def_path_str(d)).collect();
     let has_twin: BTreeSet<String> =
         paths.iter().filter_map(|p| detwin(p).1.then(|| detwin(p).0)).filter(|p| paths.contains(p)).collect();
     let mut seen = BTreeSet::new();
-    let mut s = String::from("function\ttwin\tofficial\tofficial_raw\tfull_roots\tfull_deref\n");
+    let mut s = String::from("function\ttwin\tofficial\tofficial_raw\tfull_roots\n");
     for &did in &fns {
         let path = tcx.def_path_str(did);
         let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
@@ -582,10 +559,10 @@ fn t2<'tcx>(
         let mut oraw = Official { roots: &official_raw, n: 0 };
         oraw.visit_body(&body);
         let pb = &promoted[&did];
-        let mut f = Full { tcx, body: pb, roots: 0, deref: 0 };
+        let mut f = Full { body: pb, roots: 0 };
         f.visit_body(pb);
         let twin = if is_twin { "twin" } else if wrapper { "wrapper" } else { "-" };
-        let _ = writeln!(s, "{path}\t{twin}\t{}\t{}\t{}\t{}", o.n, oraw.n, f.roots, f.deref);
+        let _ = writeln!(s, "{path}\t{twin}\t{}\t{}\t{}", o.n, oraw.n, f.roots);
     }
     (s, seen)
 }
