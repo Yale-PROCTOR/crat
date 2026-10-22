@@ -1,0 +1,453 @@
+# 10-main-dev-hooks.patch: main's owner patch against borrow-ownership@b0eb75189, applied by the AE
+# derivation's step 2 (`git apply`; crat-packaging 025, relay main/356, R1265-1).
+#
+# Rows of docs/agents/artifacts/2026-10-22-crat-packaging-025/d-rows.tsv, lane main, that it closes:
+#   dead code    analyses/mir/ty.rs: `is_from_libtree` inside `TyGate::gated`. The gate (debug-only, a no-op in
+#                release) has no caller in the crate; the trait and the libtree clause go together.
+#   dead code    bo_rewriter/ownership_fields_raw_audit.rs: `pub fn bst_emitted_zero_raw` (no caller), and its
+#                only type `RawAuditHold`.
+#   dev switch   CRAT_CURSOR_ADMISSION_OUTPUT, CRAT_NESTED_ADMISSION_OUTPUT, CRAT_WAVE5P_DIAGNOSTIC_DIR,
+#                CRAT_NESTED_DROP_DIAGNOSTIC, CRAT_E5C_HOLD_TRACE, CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE,
+#                and the labels the three observers read (CRAT_RAW_BOUNDARY_CODE_FRAME, CRAT_ERA5_PROGRAM).
+#                The inline readers are removed. The three observers' call sites are cut
+#                (cursor_native::observe, nested_slice::observe, overlapping_pairs::publish); the functions
+#                themselves are then dead and go by step 6's deadcut.
+#   test hook    analyses/borrow/mod.rs: CRAT_E5C_W79_FAULT ("no-fixed", behind cfg!(test)); the branch is
+#                removed. Its one test (null_paths_tests.rs) goes by step 5's cfg(test) cut.
+#   measurement  bo_pipeline.rs: BoReceipt's `configuration_sha256=` / `execution_role=` fields and their
+#                computation. No kit file reads them; the kit reads outcome=, files_changed, verify_rounds,
+#                reverted, solve_wall_s.
+#
+# Not in this patch (main's other rows):
+#   - the census producers and their TSV row template (two measurement-instrument rows): a second patch
+#     after S4 removes them on the lineage, identity-gated;
+#   - the ownership_fields module family: its unreached items are dead under the private `bo_rewriter`
+#     module, so they go by deadcut; its names go by R7+;
+#   - rewriter/diagnostics.rs: with era-5c's l2 instrument row;
+#   - the 594 compiler-listed items: deadcut (step 6);
+#   - regex / indexmap / cadical / etrace: step 7.
+#
+# Output: unchanged. None of these switches is set by the frame env the AE exports (only
+# CRAT_ERA5_EXECUTION_ROLE=derive is set; its other readers stay). Checks on the patched b0eb75189:
+# `cargo fmt --check` clean, and `cargo build --release --bin crat`.
+diff --git a/crates/pointer_replacer/src/analyses/borrow/mod.rs b/crates/pointer_replacer/src/analyses/borrow/mod.rs
+index 56d2f947b..f25f5c2d7 100644
+--- a/crates/pointer_replacer/src/analyses/borrow/mod.rs
++++ b/crates/pointer_replacer/src/analyses/borrow/mod.rs
+@@ -575,18 +575,13 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
+                     // A C-variadic callee has no parameter local past its fixed
+                     // inputs: `_(i+1)` there is a body local (tisp's `mk_list`,
+                     // RQ3 / analysis-fanout 018), so no loan is bound to it.
+-                    let fixed = if cfg!(test)
+-                        && std::env::var("CRAT_E5C_W79_FAULT").as_deref() == Ok("no-fixed")
+-                    {
+-                        usize::MAX
+-                    } else {
+-                        self.tcx
+-                            .fn_sig(callee)
+-                            .skip_binder()
+-                            .inputs()
+-                            .skip_binder()
+-                            .len()
+-                    };
++                    let fixed = self
++                        .tcx
++                        .fn_sig(callee)
++                        .skip_binder()
++                        .inputs()
++                        .skip_binder()
++                        .len();
+                     for (arg_index, arg) in mir_call.args.iter().enumerate().take(fixed) {
+                         let arg = &arg.node;
+                         if let Some(arg) = arg.place() {
+diff --git a/crates/pointer_replacer/src/analyses/mir/ty.rs b/crates/pointer_replacer/src/analyses/mir/ty.rs
+index b8b682964..ee8aa4ed0 100644
+--- a/crates/pointer_replacer/src/analyses/mir/ty.rs
++++ b/crates/pointer_replacer/src/analyses/mir/ty.rs
+@@ -7,9 +7,6 @@ pub trait TyExt {
+ 
+     /// is of the form `Option<unsafe extern "C" fn(...) -> ...>`
+     fn is_c2rust_fn_ptr(&self, tcx: TyCtxt) -> bool;
+-
+-    /// Bruh...
+-    fn is_from_libtree(&self) -> bool;
+ }
+ 
+ impl TyExt for Ty<'_> {
+@@ -26,30 +23,4 @@ impl TyExt for Ty<'_> {
+             _ => false,
+         }
+     }
+-
+-    fn is_from_libtree(&self) -> bool {
+-        format!("{self}").starts_with("src::libtree::")
+-    }
+-}
+-
+-#[allow(unused)]
+-pub trait TyGate {
+-    fn gated(&self, tcx: TyCtxt);
+-}
+-
+-impl TyGate for Ty<'_> {
+-    #[cfg(debug_assertions)]
+-    fn gated(&self, tcx: TyCtxt) {
+-        let ty = self;
+-        if ty.is_non_unit_tuple()
+-            || (ty.is_enum() && !ty.is_c_void(tcx) && !ty.is_c2rust_fn_ptr(tcx))
+-            || ty.is_union() && !ty.is_from_libtree()
+-        {
+-            unimplemented!("only user-defined structs are allowed, found {self}")
+-        }
+-    }
+-
+-    #[cfg(not(debug_assertions))]
+-    #[inline(always)]
+-    fn gated(&self, _: TyCtxt) {}
+ }
+diff --git a/crates/pointer_replacer/src/bo_pipeline.rs b/crates/pointer_replacer/src/bo_pipeline.rs
+index 7549b653d..6a773be14 100644
+--- a/crates/pointer_replacer/src/bo_pipeline.rs
++++ b/crates/pointer_replacer/src/bo_pipeline.rs
+@@ -9,10 +9,7 @@ use std::{
+ use sha2::{Digest, Sha256};
+ 
+ use crate::{
+-    analyses::borrow_ownership::{
+-        a5_overlap::{A5Mode, WholeProgramAttestation},
+-        model_cache,
+-    },
++    analyses::borrow_ownership::model_cache,
+     bo_rewriter::{
+         self, E1Capture, EmissionRunConfig, decision::exposure::ConfiguredExposureInput,
+         plan::FileKey,
+@@ -25,8 +22,6 @@ pub struct BoReceipt {
+     pub outcome: &'static str,
+     pub status: &'static str,
+     pub analysis_fingerprint: String,
+-    pub configuration_sha256: String,
+-    pub execution_role: String,
+     pub input_tree_sha256: String,
+     pub emitted_tree_sha256: String,
+     pub files_changed: usize,
+@@ -40,12 +35,10 @@ pub struct BoReceipt {
+ impl BoReceipt {
+     pub fn summary(&self) -> String {
+         format!(
+-            "outcome={} status={} analysis_fingerprint={} configuration_sha256={} execution_role={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} solve={}",
++            "outcome={} status={} analysis_fingerprint={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} solve={}",
+             self.outcome,
+             self.status,
+             self.analysis_fingerprint,
+-            self.configuration_sha256,
+-            self.execution_role,
+             self.files_changed,
+             self.files_total,
+             self.verify_rounds,
+@@ -112,18 +105,6 @@ pub fn rewrite_bo(
+     z3::set_global_param("sat.random_seed", "0");
+ 
+     let analysis_fingerprint = model_cache::current_analysis_digest();
+-    let configuration_sha256 = format!(
+-        "{:x}",
+-        Sha256::digest(
+-            model_cache::solver_identity(
+-                A5Mode::production(),
+-                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+-            )
+-            .as_bytes()
+-        )
+-    );
+-    let execution_role =
+-        std::env::var("CRAT_ERA5_EXECUTION_ROLE").unwrap_or_else(|_| "derive".to_owned());
+ 
+     let configured_exposure =
+         ConfiguredExposureInput::from_names("configured-c-exposed-fns", c_exposed_fns)
+@@ -132,13 +113,7 @@ pub fn rewrite_bo(
+         configured_exposure,
+     };
+     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
+-    persist_in_place(
+-        input,
+-        &capture,
+-        analysis_fingerprint,
+-        configuration_sha256,
+-        execution_role,
+-    )
++    persist_in_place(input, &capture, analysis_fingerprint)
+ }
+ 
+ fn rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+@@ -225,8 +200,6 @@ fn persist_in_place(
+     input: &Path,
+     capture: &E1Capture,
+     analysis_fingerprint: String,
+-    configuration_sha256: String,
+-    execution_role: String,
+ ) -> Result<BoReceipt, String> {
+     let program_root = input
+         .parent()
+@@ -249,8 +222,6 @@ fn persist_in_place(
+             outcome,
+             status: "absent-degraded",
+             analysis_fingerprint,
+-            configuration_sha256,
+-            execution_role,
+             emitted_tree_sha256: input_tree_sha256.clone(),
+             input_tree_sha256,
+             files_changed: 0,
+@@ -308,8 +279,6 @@ fn persist_in_place(
+         outcome,
+         status: "present",
+         analysis_fingerprint,
+-        configuration_sha256,
+-        execution_role,
+         input_tree_sha256,
+         emitted_tree_sha256,
+         files_changed,
+diff --git a/crates/pointer_replacer/src/bo_rewriter/ast_transform.rs b/crates/pointer_replacer/src/bo_rewriter/ast_transform.rs
+index b12356c6a..056b3552e 100644
+--- a/crates/pointer_replacer/src/bo_rewriter/ast_transform.rs
++++ b/crates/pointer_replacer/src/bo_rewriter/ast_transform.rs
+@@ -4529,23 +4529,19 @@ fn apply_surface_plans(
+     // consumer below only errors when the surface argument's own form is `NestedSlice`,
+     // so an owner missing from this map with an ordinarily-formed argument simply emits
+     // the ordinary argument. No revert, no hold, no diagnostic — which is exactly the
+-    // signature nested reported. The reason is recorded so the drop is visible.
+-    let mut nested_dropped: Vec<String> = Vec::new();
++    // signature nested reported.
+     let nested = table
+         .nested_receipts
+         .iter()
+         .filter_map(|receipt| {
+             let plan = receipt.result.as_ref().ok()?;
+-            let owner = format!("{:?}", plan.owner);
+             if reverts.fns.contains(&plan.owner) {
+-                nested_dropped.push(format!("{owner}\tfunction-reverted"));
+                 return None;
+             }
+             if !plan
+                 .required_nodes()
+                 .all(|h| reverts.keeps_subject(plan.owner, h))
+             {
+-                nested_dropped.push(format!("{owner}\trequired-subject-reverted"));
+                 return None;
+             }
+             for p in &plan.parameters {
+@@ -4562,26 +4558,12 @@ fn apply_surface_plans(
+                     })
+                     .count();
+                 if matches != 1 {
+-                    nested_dropped.push(format!(
+-                        "{owner}\tsurface-arguments-not-exactly-one:{matches}:hir={:?}",
+-                        p.hir
+-                    ));
+                     return None;
+                 }
+             }
+             Some((plan.owner, plan))
+         })
+         .collect::<FxHashMap<_, _>>();
+-    if !nested_dropped.is_empty()
+-        && let Some(dir) = std::env::var_os("CRAT_NESTED_DROP_DIAGNOSTIC")
+-    {
+-        nested_dropped.sort();
+-        let _ = std::fs::create_dir_all(&dir);
+-        let _ = std::fs::write(
+-            std::path::PathBuf::from(dir).join("nested-dropped.tsv"),
+-            format!("owner\treason\n{}\n", nested_dropped.join("\n")),
+-        );
+-    }
+     let mut surface_arguments =
+         FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
+     for argument in &table.seams.surface_arguments {
+diff --git a/crates/pointer_replacer/src/bo_rewriter/decision/mod.rs b/crates/pointer_replacer/src/bo_rewriter/decision/mod.rs
+index 8d0286baa..4e28345f3 100644
+--- a/crates/pointer_replacer/src/bo_rewriter/decision/mod.rs
++++ b/crates/pointer_replacer/src/bo_rewriter/decision/mod.rs
+@@ -1464,7 +1464,6 @@ pub(crate) fn decide_with_raw_fallbacks(
+     // never taken where the exact width, the mask companion or a root proved one.
+     let mut licensed_lifts = licensed_lifts;
+     licensed_lifts.extend(licensed_lift::promote_fallback(ctx, &mut entries));
+-    cursor_native::observe(ctx, &entries, &cursor_receipts);
+     let contract_extent_promotions = entries
+         .iter()
+         .filter_map(|(subject, decision)| {
+diff --git a/crates/pointer_replacer/src/bo_rewriter/decision/retained_access.rs b/crates/pointer_replacer/src/bo_rewriter/decision/retained_access.rs
+index dde502c67..875f5f450 100644
+--- a/crates/pointer_replacer/src/bo_rewriter/decision/retained_access.rs
++++ b/crates/pointer_replacer/src/bo_rewriter/decision/retained_access.rs
+@@ -794,35 +794,19 @@ impl<'tcx> Relation<'tcx> {
+         this.find_addr_taken();
+         this.find_allocators();
+         this.seed_statics();
+-        let trace = std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
+-        let started = std::time::Instant::now();
+-        let mark = |what: &str| {
+-            if trace {
+-                eprintln!(
+-                    "E5C_HOLD_TRACE {what} {:.1} s",
+-                    started.elapsed().as_secs_f64()
+-                );
+-            }
+-        };
+         this.solve_points();
+-        mark("points");
+         this.compute_escapes();
+-        mark("escapes");
+         while !this.options.closed
+             && this.on(Rule::Escape)
+             && this.on(Rule::IncomingStores)
+             && this.publish()
+         {
+             this.solve_points();
+-            mark("points again");
+             this.compute_escapes();
+-            mark("escapes again");
+         }
+         this.solve_accesses();
+-        mark("accesses");
+         if this.facts(Rule::OneDerivation) {
+             this.solve_returns();
+-            mark("returns");
+         }
+         this
+     }
+@@ -3055,31 +3039,13 @@ impl<'tcx> Relation<'tcx> {
+                     .insert(i);
+             }
+         }
+-        let trace = std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
+-        let mut round = 0usize;
+         loop {
+             let mut changed = false;
+-            let mut grew: Vec<LocalDefId> = vec![];
+             for &f in &functions {
+                 let body = self.body(f);
+                 let c = self.flow_body(f, &body);
+-                if c && trace {
+-                    grew.push(f);
+-                }
+                 changed |= c;
+             }
+-            round += 1;
+-            if trace {
+-                let points: usize = self.points.values().map(|s| s.len()).sum();
+-                let contents: usize = self.contents.values().map(|s| s.len()).sum();
+-                eprintln!(
+-                    "E5C_HOLD_TRACE round {round}: changed in {} fns (first {:?}), fresh {}, points {points}, contents {contents}, fresh_backed {}",
+-                    grew.len(),
+-                    grew.first().map(|g| self.tcx.def_path_str(g.to_def_id())),
+-                    self.fresh.len(),
+-                    self.fresh_backed.len()
+-                );
+-            }
+             if !changed {
+                 break;
+             }
+@@ -3442,12 +3408,6 @@ impl<'tcx> Relation<'tcx> {
+                     if (output && holds_pointers) || printed {
+                         self.exposed_output = true;
+                         changed = true;
+-                        if std::env::var("CRAT_E5C_HOLD_TRACE").is_ok() {
+-                            eprintln!(
+-                                "E5C_HOLD_TRACE exposure {name} arg {j} in {} (output {output}, printed {printed})",
+-                                tcx.def_path_str(f.to_def_id())
+-                            );
+-                        }
+                     }
+                 }
+                 if matches!(eff, Eff::Write | Eff::ReadWrite) && self.exposed_output {
+diff --git a/crates/pointer_replacer/src/bo_rewriter/mod.rs b/crates/pointer_replacer/src/bo_rewriter/mod.rs
+index 7d8d5bdf3..424d0bd88 100644
+--- a/crates/pointer_replacer/src/bo_rewriter/mod.rs
++++ b/crates/pointer_replacer/src/bo_rewriter/mod.rs
+@@ -629,9 +629,7 @@ pub(crate) struct RawBoundaryArtifacts {
+     /// the FIRST failing verify round and nothing after it — one round, one
+     /// program, so a later round cannot overwrite the evidence for an earlier one.
+     ///
+-    /// Empty unless `CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE` names a
+-    /// directory: brotli's tree alone is ~35 MB, and the standing census has no
+-    /// use for it.
++    /// The pass leaves it empty.
+     pub(crate) first_failing_verify_tree: String,
+     /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
+     pub(crate) box_param_receipts: String,
+@@ -2488,27 +2486,6 @@ fn verify_and_revert(
+         let probe_started = std::time::Instant::now();
+         facts.verify_rounds += 1;
+         let diagnosis = verify::diagnose_crate(staged.root());
+-        // **R459-3 (wave-6b 019 STOP 2)** — the bytes the verify stage actually
+-        // compiled, captured at the FIRST failing round and never overwritten.
+-        // The post-revert tree the census publishes no longer contains the class
+-        // that produced the diagnostic, so the formal a `*mut u8` error names is
+-        // unreadable after the fact.
+-        if diagnosis.errors > 0
+-            && facts
+-                .raw_boundary_artifacts
+-                .first_failing_verify_tree
+-                .is_empty()
+-            && std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE").is_some()
+-        {
+-            // `TempCrate::root()` is the crate ROOT FILE, not its directory
+-            // (`materialize_single_file` returns `dir.join("lib.rs")`), which is
+-            // also what `diagnose_crate` is handed one line above. Joining
+-            // "lib.rs" onto it wrote `Not a directory (os error 20)` into the
+-            // capture on its first real census — caught at batch 13d.
+-            facts.raw_boundary_artifacts.first_failing_verify_tree =
+-                std::fs::read_to_string(staged.root())
+-                    .unwrap_or_else(|error| format!("// unreadable verify tree: {error}\n"));
+-        }
+         let probe_wall_s = probe_started.elapsed().as_secs_f64();
+         if atom_reverify_count > 0 {
+             facts.raw_boundary_artifacts.timings.atom_reverify_wall_s =
+@@ -10251,8 +10228,6 @@ fn finish_decide<'tcx>(
+                 &context,
+                 &table.seams.outbound_expressions,
+             );
+-        decision::overlapping_pairs::publish(tcx, &table, &context)?;
+-        decision::nested_slice::observe(tcx, &table);
+         return Ok((table, context));
+     }
+ }
+diff --git a/crates/pointer_replacer/src/bo_rewriter/ownership_fields_raw_audit.rs b/crates/pointer_replacer/src/bo_rewriter/ownership_fields_raw_audit.rs
+index f5bc8f5c2..6bc7f5747 100644
+--- a/crates/pointer_replacer/src/bo_rewriter/ownership_fields_raw_audit.rs
++++ b/crates/pointer_replacer/src/bo_rewriter/ownership_fields_raw_audit.rs
+@@ -36,36 +36,3 @@ pub struct RawAudit {
+     pub custody: TreeCheck,
+     pub literal_exceptions: BTreeSet<PrintfLiteralCast>,
+ }
+-#[derive(Clone, Debug, PartialEq, Eq)]
+-pub enum RawAuditHold {
+-    Inventory,
+-    Compile,
+-    Custody,
+-    Duplicate(SiteId),
+-    Residual(SiteId),
+-}
+-pub fn bst_emitted_zero_raw(audit: &RawAudit) -> Result<(), RawAuditHold> {
+-    if audit.complete_inventory != Some(audit.source_hash) {
+-        return Err(RawAuditHold::Inventory);
+-    }
+-    if !audit.compile.passed || audit.compile.source_hash != audit.source_hash {
+-        return Err(RawAuditHold::Compile);
+-    }
+-    if !audit.custody.passed || audit.custody.source_hash != audit.source_hash {
+-        return Err(RawAuditHold::Custody);
+-    }
+-    let mut sites = BTreeSet::new();
+-    for occurrence in &audit.occurrences {
+-        if !sites.insert(occurrence.site) {
+-            return Err(RawAuditHold::Duplicate(occurrence.site));
+-        }
+-        match &occurrence.kind {
+-            RawKind::LiteralCast(key)
+-                if key.site == occurrence.site
+-                    && key.argument == 0
+-                    && audit.literal_exceptions.contains(key) => {}
+-            _ => return Err(RawAuditHold::Residual(occurrence.site)),
+-        }
+-    }
+-    Ok(())
+-}
