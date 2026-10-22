@@ -17,7 +17,7 @@
 #              c2rust on the eight; one trial each
 #   --trials N the trial count for every tool (default: the record's -- CROWN 3, Laertes 3 where it completes,
 #              &inator 5 where trial 1 is under 600 s, c2rust 3)
-# environment: SRC, RESULTS, THIRD_PARTY, TP_DOWNLOADS, DOCKER, TP_ONLY, INATOR_BENCHMARKS (lib/common.sh)
+# environment: SRC, RESULTS, THIRD_PARTY, TP_DOWNLOADS, DOCKER, INATOR_BENCHMARKS (lib/common.sh)
 # Times are reported, not expected to equal the record's; run on an otherwise idle machine, as the record did.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)

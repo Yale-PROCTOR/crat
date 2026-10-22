@@ -5,7 +5,7 @@
 # excluded): the minimum is rq3.inator.<q>.c2rust-s. Each trial's crate and compile_commands.json are compared with
 # the translations of record (translations-sha256.tsv; the same files as the source tree's benchmarks/inator/).
 # Needs the step `inator`'s benchmarks (or INATOR_BENCHMARKS). Writes c2rust/runs/<q>/t<k>/ (meta.txt with the
-# identity line, inner.time, stdout, stderr; the crate is removed once it is checked) and c2rust/build.log.
+# identity line, inner.time, stdout, stderr; the crate is removed once it is checked) and c2rust-build.log.
 set -euo pipefail
 source "$(dirname "$0")/../lib/common.sh"
 T=$THIRD_PARTY
@@ -18,7 +18,7 @@ if ! $DOCKER image inspect "$IMG" >/dev/null 2>&1; then
 fi
 gnu_time
 N=$(trials_of 3)
-for q in $EIGHT_RUN; do
+for q in $EIGHT; do
   extra=(); [ "$q" = jccc ] && extra=(-Isrc)
   for k in $(seq 1 "$N"); do
     d=$T/c2rust/runs/$q/t$k

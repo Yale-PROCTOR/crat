@@ -58,7 +58,7 @@ Each tool runs one program at a time, in one throw-away container per trial (`--
 
 | path under `results/third-party/` | reader |
 |---|---|
-| `trees/crown/<p>/`, `crown/evaluation.csv`, `comparison/` | rq1 (Tables effect-all / effect-crown); rq3's `third_party.sh` (the CROWN and Laertes Miri rows, with its own crate-root and gate shims) |
+| `trees/crown/<p>/`, `crown/evaluation.csv`, `comparison/` | rq1 (Tables effect-all / effect-crown); rq3 (`run_rq3.sh` adds the CROWN and Laertes Miri rows when these exist) |
 | `inator/<q>/{rtypes,stypes}.txt`, `inator/src/<q>/` | rq1 (Table effect-inator, `loc`) |
 | `times.tsv` (`key`, `trials`, `min`, `status`; the value is `min` when set, else `status`) | rq2 (Table scale) |
 

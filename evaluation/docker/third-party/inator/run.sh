@@ -46,7 +46,7 @@ sys.exit(1 if bad else 0)
 PY
   touch "$B/.ok"
 fi
-for q in $EIGHT_RUN; do [ -d "$T/inator/src/$q" ] || { mkdir -p "$T/inator/src"; cp -r "$B/$q" "$T/inator/src/$q"; }; done
+for q in $EIGHT; do [ -d "$T/inator/src/$q" ] || { mkdir -p "$T/inator/src"; cp -r "$B/$q" "$T/inator/src/$q"; }; done
 
 if echo " $EIGHT_INATOR " | grep -q ' tisp ' && ! $DOCKER image inspect "$SRC_IMAGE" >/dev/null 2>&1; then
   fetch refinator-src.tar.gz

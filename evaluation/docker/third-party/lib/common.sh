@@ -31,14 +31,6 @@ else
   EIGHT_INATOR=$EIGHT
 fi
 
-# TP_ONLY="p q ...": restrict every step to these programs (a partial run; the keys of the others stay absent)
-if [ -n "${TP_ONLY:-}" ]; then
-  only() { for x in $1; do case " $TP_ONLY " in *" $x "*) printf '%s ' "$x";; esac; done; }
-  TWENTY_RUN=$(only "$TWENTY_RUN"); EIGHT_INATOR=$(only "$EIGHT_INATOR"); EIGHT_RUN=$(only "$EIGHT")
-else
-  EIGHT_RUN=$EIGHT
-fi
-
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$THIRD_PARTY/run.log" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 key_of() { [ "$1" = json.h ] && echo jsonh || echo "$1"; }
@@ -103,7 +95,7 @@ gnu_time() {
     cp time /out/gnu-time-1.9-static && chmod 755 /out/gnu-time-1.9-static' || die "GNU time build failed"
 }
 
-# CROWN's image (the zip of record carries cav-artifact/crown.tar.gz); its /root/crown holds the benchmarks and comparison/
+# CROWN's image (CROWN's artifact.zip carries cav-artifact/crown.tar.gz); its /root/crown holds the benchmarks and comparison/
 CROWN_IMAGE=crown:latest
 crown_image() {
   $DOCKER image inspect "$CROWN_IMAGE" >/dev/null 2>&1 && return 0

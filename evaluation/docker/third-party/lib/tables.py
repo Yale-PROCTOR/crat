@@ -17,8 +17,7 @@ Writes, under $THIRD_PARTY:
              CROWN's analysis_results/{ownership,mutability,fatness}.json are maps written in hash order, so their
              bytes differ from trial to trial. expected-trees.tsv's third column is the sha256 of the record's file
              as json.dumps(obj, sort_keys=True, separators=(",", ":")): such a file is `equal (content)` when that
-             digest matches. Without the column, `order-variant` means the content (keys sorted) is the same
-             across this run's trials and only the bytes differ from the record."""
+             digest matches."""
 import hashlib, json, os, re, sys
 
 T = os.path.abspath(os.environ['THIRD_PARTY'])
@@ -109,7 +108,7 @@ with open(os.path.join(T, 'times.tsv'), 'w') as f:
 
 # ---- checks
 out = []
-exp_path = os.environ.get('EXPECTED_TREES') or os.path.join(os.path.dirname(HOME), 'expected-trees.tsv')
+exp_path = os.path.join(os.path.dirname(HOME), 'expected-trees.tsv')
 if os.path.exists(exp_path):
     exp = [(l.rstrip('\n').split('\t') + [''])[:3] for l in open(exp_path) if l.strip()]
     groups = {}
@@ -118,7 +117,7 @@ if os.path.exists(exp_path):
         if path == 'crown/evaluation.csv' and os.environ.get('SMALL') == '1':
             continue   # CROWN's table covers the twenty: a full run only
         if g.startswith('trees/crown/') and not os.path.isdir(os.path.join(T, 'trees', 'crown', path.split('/')[2])):
-            continue   # not run (--small, TP_ONLY, or CROWN did not complete)
+            continue   # not run (--small, or CROWN did not complete)
         f = os.path.join(T, path)
         if not os.path.exists(f):
             v = 'missing'
@@ -127,20 +126,12 @@ if os.path.exists(exp_path):
         elif canon_h:
             c = json.dumps(json.load(open(f)), sort_keys=True, separators=(',', ':'))
             v = 'equal (content)' if hashlib.sha256(c.encode()).hexdigest() == canon_h else 'differs'
-        elif re.search(r'/analysis_results/(ownership|mutability|fatness)\.json$', path):
-            p = path.split('/')[2]
-            canon = set()
-            for t in trial_dirs(os.path.join(T, 'crown', 'runs', p)):
-                g2 = os.path.join(t, 'tree', 'analysis_results', os.path.basename(path))
-                if os.path.exists(g2):
-                    canon.add(json.dumps(json.load(open(g2)), sort_keys=True))
-            v = 'order-variant' if len(canon) == 1 else 'differs'
         else:
             v = 'differs'
         groups.setdefault(g, {}).setdefault(v, []).append(path)
     for g in sorted(groups):
         c = groups[g]
-        out.append('%-40s %s' % (g, ', '.join('%s %d' % (v, len(c[v])) for v in ('equal', 'equal (content)', 'order-variant', 'differs', 'missing') if v in c)))
+        out.append('%-40s %s' % (g, ', '.join('%s %d' % (v, len(c[v])) for v in ('equal', 'equal (content)', 'differs', 'missing') if v in c)))
         for v in ('differs', 'missing'):
             for path in c.get(v, [])[:20]:
                 out.append('    %s %s' % (v, path))
