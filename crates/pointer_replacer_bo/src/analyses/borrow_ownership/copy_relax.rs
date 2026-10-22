@@ -8,7 +8,7 @@
 //!   live wherever it is live. Under Tree Borrows a raw view carries its source's tag, so the
 //!   loans the source's origin requires must stay live through the view's uses.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::SparseBitMatrix;
@@ -28,18 +28,25 @@ use crate::analyses::{
     liveness::MaybeLiveLocals,
 };
 
-/// The copies the relaxation may take, installed by the solve before any coherence is
-/// added (`construction::analyze_copy_relax_sites`). Nothing installed: nothing is relaxed.
-static ELIGIBLE: Mutex<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> = Mutex::new(None);
+thread_local! {
+    /// The copies the relaxation may take, installed by the solve before any coherence is
+    /// added (`construction::analyze_copy_relax_sites`). Nothing installed: nothing is relaxed.
+    /// Per thread: the solve installs and reads it on the compiler's thread, and compiler
+    /// sessions running side by side in one process do not see each other's sites.
+    static ELIGIBLE: RefCell<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> =
+        const { RefCell::new(None) };
+}
 
 pub(crate) fn install(eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>) {
-    *ELIGIBLE.lock().unwrap() = Some(eligible);
+    ELIGIBLE.with_borrow_mut(|slot| *slot = Some(eligible));
 }
 
 pub(crate) fn eligible(fn_did: LocalDefId, block: BasicBlock, statement_index: usize) -> bool {
-    ELIGIBLE.lock().unwrap().as_ref().is_some_and(|eligible| {
-        eligible.get(&fn_did).is_some_and(|sites| {
-            sites.contains(&MirLocationKey::new(block.as_u32(), statement_index))
+    ELIGIBLE.with_borrow(|slot| {
+        slot.as_ref().is_some_and(|eligible| {
+            eligible.get(&fn_did).is_some_and(|sites| {
+                sites.contains(&MirLocationKey::new(block.as_u32(), statement_index))
+            })
         })
     })
 }
