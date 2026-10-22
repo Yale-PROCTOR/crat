@@ -8,19 +8,30 @@ usage: legacy_search.py search <list>   cut the legacy rewriter to the two items
                                         the crates searched. Writes every removal to <list>.
        legacy_search.py apply <list>    the item cuts, then a list made by `search`, entry by entry; stops at an entry
                                         that does not apply (the head is not the one the list was made for)
+       legacy_search.py deps                    drops the crate dependencies the compiler reports unused (below)
 Environment: W (the derived worktree), CARGO (default cargo), CHECK_TARGET (cargo target of the checks),
-  SEARCH_CRATES (default: pointer_replacer passes points_to utils; the pointer pass's crate is never searched)"""
+  SEARCH_CRATES (default: pointer_replacer passes points_to utils),
+  ITEM_CUTS (a script run instead of the built-in item cuts: the frozen source's legacy rewriter shares the pointer
+    pass's crate, and option3.py cuts it there), SEARCH_SKIP (module files or directories, relative to W, never tried:
+    the pointer pass's own modules), SEARCH_DEPS / SEARCH_ALLOW (default 1: `search` also lists the unused
+    dependencies / the #![allow(warnings)] roots; 0 leaves them to later steps)"""
 import os, re, shutil, subprocess, sys, tempfile
 sys.dont_write_bytecode = True; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modscan import decls
 W = os.environ['W'].rstrip('/')
 CARGO = os.environ.get('CARGO', 'cargo').split()
 CRATES = os.environ.get('SEARCH_CRATES', 'pointer_replacer passes points_to utils').split()
+SKIP = os.environ.get('SEARCH_SKIP', '').split()
 MOD = re.compile(r'^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+([A-Za-z_]\w*)[ \t]*;[ \t]*\n', re.M)
 
 def item_cuts():
     """The legacy rewriter keeps `collector::collect_fn_ptrs` and `diagnostics::DiagnosticsMode`, which the pointer pass
-    reads; nothing else of it ships, and the crate root exports none of the legacy pass's entry points."""
+    reads; nothing else of it ships, and the crate root exports none of the legacy pass's entry points. ITEM_CUTS names
+    a script that makes the cuts instead."""
+    if os.environ.get('ITEM_CUTS'):
+        r = subprocess.run([sys.executable, '-I', os.environ['ITEM_CUTS']])
+        assert r.returncode == 0, 'option 3A: the item cuts failed: ' + os.environ['ITEM_CUTS']
+        return
     R = W + '/crates/pointer_replacer/src/rewriter/'
     s = open(R + 'collector.rs').read()
     i = s.index('pub fn collect_fn_ptrs(')
@@ -150,6 +161,7 @@ def search(listfile):
             while todo:
                 n, decl, rs, dr = todo.pop(0)
                 if not os.path.exists(rs): continue
+                if any(rel(x).startswith(k) for k in SKIP for x in (rs, dr) if x): continue
                 undo, done = remove(n, decl, rs, dr); n_checks += 1
                 if check(log):
                     done(); removed.append((rel(decl), n)); print(f'   round {rnd}: removed {rel(decl)} mod {n}', flush=True)
@@ -161,8 +173,8 @@ def search(listfile):
                 verdicts.flush()
         print(f'   round {rnd}: {len(removed) - before} removed ({n_checks} checks so far)', flush=True)
         if len(removed) == before: break
-    deps = unused_deps()
-    allows = allow_where_warned(log)
+    deps = unused_deps() if os.environ.get('SEARCH_DEPS', '1') == '1' else []
+    allows = allow_where_warned(log) if os.environ.get('SEARCH_ALLOW', '1') == '1' else []
     with open(listfile, 'w') as f:
         f.write('# option 3A, made by legacy_search.py search: the module removals (declaring file, module), the crate\n'
                 '# dependencies the compiler then reports unused, and the trimmed crates whose roots then need\n'
@@ -235,5 +247,9 @@ def apply(listfile):
     print(f'   option 3A from {os.path.basename(listfile)}: {n} module subtrees removed, {d} dependencies dropped, '
           f'{w} crate roots given #![allow(warnings)]')
 
+def deps(_=None):
+    found = unused_deps()
+    print(f'   unused crate dependencies dropped: {len(found)}' + ''.join(f'; {t} {d}' for t, d in found))
+
 if __name__ == '__main__':
-    {'search': search, 'apply': apply}[sys.argv[1]](sys.argv[2])
+    {'search': search, 'apply': apply, 'deps': deps}[sys.argv[1]](*sys.argv[2:])

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""crat -> jobcrat rename, rules R1-R6 (relays 002 and 003), over every text file of the worktree W. mode: map | apply | untouched"""
+"""crat -> jobcrat rename, rules R1-R6 (relays 002 and 003), over every text file of the worktree W. mode: map | apply | untouched
+R7 and on: the rules of RENAME_RULES (default rename-rules.tsv beside this script; absent or empty: none), one per line,
+`label<TAB>regex<TAB>replacement`, applied after R1-R6 in order, to the text and to the paths (a module file whose name
+a rule renames moves with it)."""
 import os, re, sys, collections
 W = os.environ['W'].rstrip('/')
 mode = sys.argv[1]
@@ -15,6 +18,13 @@ def files():
             ext = os.path.splitext(f)[1]
             if ext in TEXT_EXT or f in ('Makefile',):
                 yield p
+RULES_FILE = os.environ.get('RENAME_RULES', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rename-rules.tsv'))
+EXTRA = []
+if os.path.exists(RULES_FILE):
+    for l in open(RULES_FILE, encoding='utf-8'):
+        if not l.strip() or l.startswith('#'): continue
+        label, rx, rep = l.rstrip('\n').split('\t')
+        EXTRA.append((label, re.compile(rx), rep))
 RULES = [
     ('R1 CRAT_ -> JOBCRAT_', re.compile(r'\bCRAT_'), 'JOBCRAT_'),
     ('R2 whole word crat -> jobcrat', re.compile(r'\bcrat\b'), 'jobcrat'),
@@ -23,7 +33,7 @@ RULES = [
     ('R5 whole word Crat -> Jobcrat', re.compile(r'\bCrat\b'), 'Jobcrat'),
     ('R6a __crat_ -> __jobcrat_', re.compile(r'__crat_'), '__jobcrat_'),
     ('R6b __CRAT_ -> __JOBCRAT_', re.compile(r'__CRAT_'), '__JOBCRAT_'),
-]
+] + EXTRA
 counts = collections.Counter(); per_file = collections.Counter()
 rows = []
 for p in sorted(files()):
@@ -45,6 +55,19 @@ for p in sorted(files()):
             w = m.group(0)
             if 'crat' not in re.sub('(?i)jobcrat', '', w).lower(): continue
             rows.append((rel, new.count('\n', 0, m.start()) + 1, 'UNTOUCHED', w))
+if mode == 'apply' and EXTRA:
+    left = set()
+    for root, dirs, fs in os.walk(W):
+        dirs[:] = [d for d in dirs if d not in ('.git', 'target') and not (root == W and d == 'benchmarks')]
+        for f in fs:
+            rel = os.path.relpath(os.path.join(root, f), W); new = rel
+            for name, rx, rep in EXTRA: new = rx.sub(rep, new)
+            if new != rel:
+                os.makedirs(os.path.dirname(os.path.join(W, new)) or W, exist_ok=True)
+                os.rename(os.path.join(W, rel), os.path.join(W, new)); counts['path moved'] += 1
+                print('#MOVED', rel, new, file=sys.stderr); left.add(os.path.dirname(os.path.join(W, rel)))
+    for d in sorted(left, key=len, reverse=True):
+        while d != W and os.path.isdir(d) and not os.listdir(d): os.rmdir(d); d = os.path.dirname(d)
 if mode in ('map', 'apply'):
     for r in rows: print('\t'.join(map(str, r)))
     print('#COUNTS', dict(counts), file=sys.stderr)

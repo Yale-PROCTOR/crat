@@ -16,4 +16,8 @@ path = "src/bin/cfgcut.rs"
 name = "rslex"
 path = "src/bin/rslex.rs"
 
+[[bin]]
+name = "itemcut"
+path = "src/bin/itemcut.rs"
+
 [workspace]

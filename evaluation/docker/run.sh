@@ -7,8 +7,9 @@
 #              JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off
 #              [JOBCRAT_FALLBACK_SLICE_EXTENT=268435456: CROWN's twenty; unset for &inator's eight]
 #              /usr/bin/time -v -o results/rq2/runs/<p>.time
-#                jobcrat -v --pass translate --inplace --receipt results/rq2/runs/<p>.receipt results/trees/<p>
-#            every other switch from config/analysis-env.sh; jobcrat is target/release/jobcrat with the environment the
+#                jobcrat -v --pass translate --inplace --bo-receipt results/rq2/runs/<p>.receipt results/trees/<p>
+#            every other switch exported from config/analysis-env.sh (analysis_env below: a variable already set in the
+#            environment wins); jobcrat is target/release/jobcrat with the environment the
 #            top-level wrapper gives it (DIR, SYSROOT, LD_LIBRARY_PATH), so that the times hold the pass alone;
 #            results/rq2/runs/<p>.wall is the wall in seconds around the same command. A program whose
 #            results/rq2/runs/<p>.rc reads 0 is not run again (delete results/ to start over).
@@ -49,6 +50,16 @@ exec > >(tee -a "$RESULTS/logs/run.log") 2>&1
 small_flag() { [ $SMALL = 1 ] && echo --small; }
 echo "RUN START $(date -u +%FT%TZ) step=$STEP small=$SMALL third-party=$TP host: $(nproc) threads, $(awk '/MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
 
+analysis_env() {  # analysis_env <file>: exports each `export NAME=value` of the file whose value is one plain word,
+  local k v        # unless NAME is set already; the toolchain's four names are the wrapper's, not the analysis's
+  while IFS='=' read -r k v; do
+    k=${k//[[:space:]]/}; case $k in ''|SYSROOT|LD_LIBRARY_PATH|RUSTUP_TOOLCHAIN|TMPDIR) continue ;; esac
+    v=${v#"${v%%[![:space:]]*}"}; v=${v%%[[:space:]]*}; v=${v#\"}; v=${v%\"}
+    case $v in ''|'#'*|*'$'*) continue ;; esac
+    [ -n "${!k+x}" ] || export "$k=$v"
+  done < <(sed -n -E 's/^[[:space:]]*export[[:space:]]+//p' "$1")
+}
+
 translate() {
   local p suite small rc ext t0 t1 sysroot
   sysroot=$(rustc --print sysroot)
@@ -64,19 +75,19 @@ translate() {
     cp -a "$SUBSTRATE/$p" "$TREES/$p"
     ext=; [ "$suite" = crown ] && ext=JOBCRAT_FALLBACK_SLICE_EXTENT=268435456
     t0=$(date +%s.%N)
-    env -u JOBCRAT_FALLBACK_SLICE_EXTENT JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off $ext \
-      DIR="$SRC" SYSROOT="$sysroot" LD_LIBRARY_PATH="$sysroot/lib" \
-      /usr/bin/time -v -o "$RUNS/$p.time" target/release/jobcrat -v --pass translate --inplace \
-      --receipt "$RUNS/$p.receipt" "$TREES/$p" > "$RESULTS/logs/translate-$p.log" 2>&1
+    ( analysis_env "$SRC/config/analysis-env.sh"
+      env -u JOBCRAT_FALLBACK_SLICE_EXTENT JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off $ext \
+        DIR="$SRC" SYSROOT="$sysroot" LD_LIBRARY_PATH="$sysroot/lib" \
+        /usr/bin/time -v -o "$RUNS/$p.time" target/release/jobcrat -v --pass translate --inplace \
+        --bo-receipt "$RUNS/$p.receipt" "$TREES/$p" > "$RESULTS/logs/translate-$p.log" 2>&1 )
     rc=$?; t1=$(date +%s.%N); echo $rc > "$RUNS/$p.rc"
     python3 -c "import sys; print(f'{float(sys.argv[2]) - float(sys.argv[1]):.3f}')" "$t0" "$t1" > "$RUNS/$p.wall"
     echo "translate $p: END $(date -u +%FT%TZ) rc=$rc wall=$(cat "$RUNS/$p.wall")s $(grep -m1 -o 'outcome=[^ ]*' "$RESULTS/logs/translate-$p.log")"
   done < "$A/lists/programs.tsv"
 }
 
-run_rq() {  # run_rq <rqN> <script> <args...>: runs a research question's script when this tree has it
+run_rq() {  # run_rq <rqN> <script> <args...>: runs a research question's script
   local rq=$1 s=$2 rc; shift 2
-  if [ ! -f "$A/$s" ]; then echo "$rq: artifact/$s is not in this tree; its keys read skipped"; return; fi
   echo "$rq START $(date -u +%FT%TZ)"; bash "$A/$s" "$@"; rc=$?; echo "$rq END $(date -u +%FT%TZ) rc=$rc"
 }
 rq1() { run_rq rq1 rq1/run.sh $(small_flag); }

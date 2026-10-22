@@ -57,7 +57,8 @@ docker run --rm -v "$PWD/results:/jobcrat-source/results" jobcrat-artifact all [
 ```
 
 `third-party/README.md` gives its steps, walls and options (e.g. `TP_DOWNLOADS`, a directory of archives fetched
-beforehand, since the downloads can be slow).
+beforehand, since the downloads can be slow). The full `all --third-party` takes about 1.8 hours longer than `all`:
+its rq3 step also runs Miri on CROWN's translation of genann.
 
 Without this step, those keys read `skipped` and every other column is still produced. `--third-party` makes the
 container stop if `results/third-party/` is missing.

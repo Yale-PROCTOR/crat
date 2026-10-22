@@ -1,0 +1,3 @@
+# R7 and on: identifier renames of the internal names (the survey's N rows), once their wording is ruled.
+# One rule per line: label<TAB>regex (Python, applied to the text and to the paths)<TAB>replacement.
+# The derivation's maps record every replacement; the trees are compared modulo these rules, as modulo R6.
