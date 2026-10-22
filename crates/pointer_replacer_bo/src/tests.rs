@@ -2217,6 +2217,12 @@ pub unsafe fn stash(s: *mut S) {
     /// is read ONLY in `invalidates` — so an immutable loan still fully participates in
     /// liveness; only its invalidation is suppressed. That participation is structural (no
     /// fixture can break it), which is why this pair pins invalidation, not liveness.
+    ///
+    /// Under the record's mutability model the verification round asks the caller's provider AND
+    /// the round's own model-conditional facts (`RoundMut`), so a forced-mutable caller no longer
+    /// makes a read-only view mutable. Both prongs therefore see immutable loans and all four
+    /// slots stay `Ref`, which is sound for shared reads; the control no longer separates the
+    /// prongs.
     #[test]
     fn nb2_two_shared_reads_both_ref() {
         run_compiler(
@@ -2242,8 +2248,8 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
                 let names = ["p", "r1", "r2", "q"];
 
-                // Control: forced-mutable (pre-NB2) — the aliasing reads are treated as
-                // mutable, so the CEGAR loop demotes >=1 slot off Ref.
+                // Control: forced-mutable — the round's own facts still read the views as
+                // read-only (`RoundMut`), so no slot leaves Ref.
                 let model_ctrl = {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) = emit_crate_ownership_constraints(
@@ -2261,9 +2267,10 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     .iter()
                     .filter(|n| model_ctrl.get(&slot_of(n)) == Some(&SlotKind::Ref))
                     .count();
-                assert!(
-                    ctrl_ref < names.len(),
-                    "forced-mut control: aliasing reads must demote >=1 slot; all stayed Ref"
+                assert_eq!(
+                    ctrl_ref,
+                    names.len(),
+                    "forced-mut control: the round's facts keep the reads immutable; all stay Ref"
                 );
 
                 // Treatment: fact-driven — all reads ⇒ Foster Imm ⇒ immutable loans skipped ⇒
@@ -2586,6 +2593,11 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// unconsumed by codegen (§8). It FLIPS (`p` back to `Ref`, return out of the set) when the
     /// deferred "definitely-overwritten vs may-reach unknown-def" distinction lands (one bucket, gate
     /// = effect-row + opaque-interaction detection). Tripwire, not a regression.
+    ///
+    /// Under the record's kind order (Ref > Owning > Raw) the collaterally demoted `p` settles
+    /// Owning, the non-Ref kind the order prefers where the ownership constraints allow it; the
+    /// marker's point, that `p` leaves Ref although it has a modeled origin, is unchanged. `f` has
+    /// no caller in the program, so whoever would pass `p` is outside the closed program (R816).
     #[test]
     fn nb4_4c_marker_coherence_collateral_demotes_modeled_origin() {
         use rustc_middle::mir::RETURN_PLACE;
@@ -2657,9 +2669,9 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
                 assert_eq!(
                     m.get(&p0),
-                    Some(&SlotKind::Raw),
-                    "TODAY: coherence collaterally demotes the modeled-origin param p to Raw \
-                     (conservative, §8-guarded); flips to Ref when the deferred fix lands"
+                    Some(&SlotKind::Owning),
+                    "TODAY: coherence collaterally demotes the modeled-origin param p off Ref, to the \
+                     kind order's Owning; flips to Ref when the deferred fix lands"
                 );
             },
         );
@@ -3985,6 +3997,11 @@ unsafe fn caller() -> i32 {
     /// same raw pointer twice into a callee whose params BOTH settle `Ref`, so the call site
     /// materializes **two overlapping `&mut` to one cell**. That is UB at materialization — no
     /// during-call write is even required. Accepted today; §8-guarded.
+    ///
+    /// Under the record (the guarded repair) the caller's `p` settles `Ref`: the conflict that made
+    /// the plain repair demote it is discharged at another of its participants. That is this
+    /// marker's pinned value, not its rule; the residual it names, two `&mut` materialized for one
+    /// pointer at the call because call-argument loans are not modeled, is unchanged.
     #[test]
     fn nb4_marker_two_aliasing_args_both_ref() {
         run_compiler(
@@ -3995,7 +4012,7 @@ unsafe fn caller() -> i32 {
                 let program = collect_program(tcx);
                 let callee = nb4_accept(tcx, &program, "id2", &["a", "b"]);
                 let caller = nb4_accept(tcx, &program, "f", &["p"]);
-                assert_eq!(caller[0].0, Some(SlotKind::Raw), "the caller's `p` is Raw");
+                assert_eq!(caller[0].0, Some(SlotKind::Ref), "the caller's `p` is Ref");
                 assert_eq!(
                     (callee[0].0, callee[1].0),
                     (Some(SlotKind::Ref), Some(SlotKind::Ref)),
@@ -4145,6 +4162,12 @@ unsafe fn caller() -> i32 {
     /// the correct conservative treatment of a use of a BORROWED BASE, and there is no
     /// over-invalidation class to gate at the argument level. `call_effects`'s `no-access` facts
     /// are real, but gating invalidation on them is unsound. **Do not re-add the gate.**
+    ///
+    /// Under the record (the guarded repair) the conflict is still seen, and it is discharged at
+    /// the loan's issuer: `p` leaves `Ref` and `x` stays a reference. `ignores` then receives the
+    /// raw pointer by value and dereferences nothing, which is no access under Tree Borrows, so
+    /// `x` stays valid. The borrow-check reading above (a use of a `&mut` base while a reborrow
+    /// lives) applies only while `p` is a reference.
     #[test]
     fn nb4_no_deref_callee_still_conflicts() {
         run_compiler(
@@ -4155,14 +4178,16 @@ unsafe fn caller() -> i32 {
             ),
             |tcx| {
                 let program = collect_program(tcx);
-                let m = nb4_accept(tcx, &program, "f", &["x"]);
+                let m = nb4_accept(tcx, &program, "f", &["x", "p"]);
                 assert_eq!(
                     m[0].0,
-                    Some(SlotKind::Raw),
-                    "`x` MUST be demoted: passing `p` to `ignores` is a USE of `p` while `x` holds \
-                     a live reborrow of `(*p)` — a genuine conflict, independent of what the callee \
-                     does with the pointee. The no-call control (`let v = p as usize`) demotes `x` \
-                     identically, which is what refuted the no-access gate. Do not gate this."
+                    Some(SlotKind::Ref),
+                    "`x` stays a reference: the conflict of the use of `p` is discharged at the issuer"
+                );
+                assert_ne!(
+                    m[1].0,
+                    Some(SlotKind::Ref),
+                    "`p`, the issuer, leaves `Ref`: a raw value use with no access"
                 );
             },
         );
@@ -4232,8 +4257,14 @@ unsafe fn caller() -> i32 {
     /// grouping from demoting a `&mut` with a live foreign read, this marker flips (x → Ref) and the
     /// residue becomes real — at which point route read-derefs but check only MUTABLE loans
     /// (borrowck's read-vs-`&mut`; the immutable-loan skip already spares read-only cells).
+    ///
+    /// Under the record (the guarded repair) the group conflict is discharged at the loan's issuer
+    /// and `x` stays a reference. Under Tree Borrows, the model of record, that is defined: `x` is
+    /// an unprotected `&mut` that has not been written yet (Reserved), and a foreign read leaves a
+    /// Reserved tag Reserved, so the later `*x = 1` is allowed. The freeze the paragraph above
+    /// describes is Stacked Borrows' rule, not Tree Borrows'.
     #[test]
-    fn nb4r_marker_read_vs_mut_grouping_masked() {
+    fn nb4r_marker_read_vs_mut_is_defined_under_tree_borrows() {
         let src = format!(
             "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
              {{ let x = id(p); let b = p; let v = *b; *x = 1; v + *x }}"
@@ -4243,9 +4274,9 @@ unsafe fn caller() -> i32 {
             let m = nb4_accept(tcx, &program, "f", &["x"]);
             assert_eq!(
                 m[0].0,
-                Some(SlotKind::Raw),
-                "x (a &mut call-return frozen by the foreign read `*b`) is demoted to Raw by the \
-                 grouping safety net — so WRITE-gating opens no observable read-vs-&mut residue."
+                Some(SlotKind::Ref),
+                "x (a Reserved &mut call-return) stays a reference: a foreign read before its first \
+                 write does not disable it under Tree Borrows"
             );
         });
     }
@@ -4492,6 +4523,11 @@ unsafe fn caller() -> i32 {
     /// handling of the offset write (dump 2026-07-15: `c=Raw` today), so this shape cannot isolate the
     /// −17.7% over-demotion the exclusion prevents — that guard lives at the CORPUS gate (§8). This
     /// unit only pins that routing handles the offset shape without a crash/regression.
+    ///
+    /// Under the record (the guarded repair) the offset write's conflict is discharged at the
+    /// loan's issuer, so `c` stays a reference. That is sound: `*r = 9` writes `p + 1`, a cell `c`
+    /// does not cover, and Tree Borrows permissions are per location. The old `Raw` was the plain
+    /// repair's demotion of the requirer, not a rule of this shape.
     #[test]
     fn nb4r_offset_excluded() {
         run_compiler(
@@ -4504,10 +4540,10 @@ unsafe fn caller() -> i32 {
                 let m = nb4_accept(tcx, &program, "f", &["c"]);
                 assert_eq!(
                     m[0].0,
-                    Some(SlotKind::Raw),
-                    "`c` stays `Raw` (already demoted by the existing offset-write handling); routing \
-                     with offset EXCLUDED must not crash or regress it. The over-demotion guard is the \
-                     corpus gate, not this unit."
+                    Some(SlotKind::Ref),
+                    "`c` stays a reference: the offset write reaches `p + 1`, not `c`'s cell; routing \
+                     with offset EXCLUDED must not crash. The over-demotion guard is the corpus gate, \
+                     not this unit."
                 );
             },
         );

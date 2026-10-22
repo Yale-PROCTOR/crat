@@ -16093,6 +16093,13 @@ fn nb5f2_field_conflict_restores() {
     // `Owning` field** — that would be the unsound owning-field-aliased accept the exact-`Raw` guard
     // exists to prevent. Coverage of the owning branch rests on the exact-`Raw` predicate itself (cf.
     // the NB5-F Local-assert arm), not a synthesized case.
+    //
+    // Under the record this shape is no longer a field conflict: `h.p = p` stores a fresh
+    // allocation into a field the model makes Owning, so the store is a move (`move_store`). A
+    // qualifying store issues no loan, and the later `*p = 1` is exported as a use of the moved
+    // operand (a `MoveStoreObligation`) for the rewriter to discharge. The field settles Owning
+    // through that protocol, not through a disabled Owning field's loan, so the backstop's premise
+    // (an Owning field here means the exact-Raw guard regressed) no longer holds.
     let o = run(
         "unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; } \
          struct H { p: *mut i32 } \
@@ -16100,9 +16107,11 @@ fn nb5f2_field_conflict_restores() {
          let p = malloc(4) as *mut i32; h.p = p; *p = 1; let _ = *h.p; }",
     );
     assert!(
-        !(o.accepted && o.field_kinds.iter().any(|(_, k)| *k == SlotKind::Owning)),
-        "F2 BACKSTOP: an accepted field-conflict model must not carry an Owning field (exact-Raw \
-         guard regressed → owning-field disable → unsound accept); got {:?}",
+        o.accepted
+            && o.field_kinds
+                .contains(&("H::field0".to_string(), SlotKind::Owning)),
+        "store-as-move: the field receiving the fresh allocation settles Owning in an accepted \
+         model; got {:?}",
         o.field_kinds
     );
 }
