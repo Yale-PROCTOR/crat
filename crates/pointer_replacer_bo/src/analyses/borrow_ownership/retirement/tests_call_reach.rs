@@ -136,6 +136,28 @@ fn a_w08_buffer_free_self_free_pair_stays_raw() {
     );
 }
 
+/// The freed block comes from a function declared in the crate's own `extern`
+/// block. It has a local definition but no body, so nothing is known about what
+/// it returns: the free may release `keep`'s block. The fresh-producer walk
+/// refuses such a callee instead of asking for its MIR.
+const FOREIGN_PRODUCER: &str = r#"
+unsafe extern "C" { fn opaque(n: usize) -> *mut u8; fn free(p: *mut core::ffi::c_void); }
+pub unsafe fn hostname(u: *mut u8, keep: *const u8) -> u8 {
+    let protocol = opaque(8);
+    let value = *keep;
+    free(protocol as *mut core::ffi::c_void);
+    value
+}
+"#;
+
+#[test]
+fn a_foreign_producer_result_is_not_a_fresh_block() {
+    assert!(
+        !super::tests::accepts(FOREIGN_PRODUCER, &[("hostname", 2, 0)]),
+        "a foreign function's result may be any block, `keep`'s included"
+    );
+}
+
 /// A pointer stored BEHIND an argument is memory,
 /// not a caller local, so an opaque local call must still clobber it. The
 /// selection is at depth 1 -- the cell reached by dereferencing the argument.

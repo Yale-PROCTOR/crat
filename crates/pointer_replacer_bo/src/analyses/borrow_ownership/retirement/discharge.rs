@@ -1146,9 +1146,10 @@ fn fresh_value<'tcx>(
 
 /// (γ): a local function whose return value is always a fresh block: `_0`'s
 /// every definition is a fresh value (bounded; a null constant is allowed, as
-/// releasing null releases nothing).
+/// releasing null releases nothing). A function with no MIR, such as one
+/// declared in the crate's own `extern` block, is never known to be fresh.
 fn returns_fresh(tcx: TyCtxt<'_>, function: LocalDefId, depth: usize) -> bool {
-    if depth > 4 || !tcx.def_kind(function).is_fn_like() {
+    if depth > 4 || !tcx.def_kind(function).is_fn_like() || !tcx.is_mir_available(function) {
         return false;
     }
     let body = tcx
