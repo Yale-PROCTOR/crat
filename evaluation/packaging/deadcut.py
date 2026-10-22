@@ -6,9 +6,11 @@
      trait, macro, enum, union, or an inherent impl's associated item) is cut by `itemcut`, with its attributes. Fields
      never read, variants never constructed and types never constructed stay (counted, not cut);
   3. `cargo check` again: if the cuts do not compile, they are undone and made again file group by file group,
-     halving a failing group, and an item whose cut alone fails stays (counted).
+     halving a failing group; an item whose cut alone fails stays for the round and is tried again in the next (its
+     last user's `use` line, for one, is gone after the next `cargo fix`).
 `--force-warn` makes the lints fire where an `allow` attribute would hide them. The round's state is committed in W.
-Stops when a round changes nothing.
+Stops when a round changes nothing. Then a module file left with no item (nothing but `use` lines and inner attributes)
+goes with its `mod` line, when the tree still checks.
 usage: deadcut.py   Environment: W, ZS (logs), CARGO (default cargo), TOOLS (the helper binaries), DEADCUT_TARGET
        (cargo target of its checks), DEADCUT_ROUNDS (default 20)"""
 import collections, json, os, re, subprocess, sys
@@ -97,6 +99,32 @@ def cut_groups(groups, rnd):
                 k, fl = cut_groups([g[:h], g[h:]], rnd); kept += k; failed += fl
     return kept, failed
 
+def empty_modules():
+    """Module files left with no item: removed with their `mod` lines (legacy_search.remove), all at once when the
+    tree then checks, else one by one."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import legacy_search as ls
+    empty = []
+    def walk(f):
+        for c in ls.children(f):
+            t = re.sub(r'//[^\n]*|/\*.*?\*/', '', open(c[2]).read(), flags=re.S)
+            t = re.sub(r'#!\[[^\]]*\]|(?:pub(?:\([^)]*\))?\s+)?use\s[^;]*;', '', t)
+            if not t.strip() and not ls.children(c[2]): empty.append(c)
+            walk(c[2])
+    for root in sorted(set(f'{W}/{os.path.relpath(r, W)}' for r in __import__('glob').glob(W + '/crates/*/src/lib.rs'))): walk(root)
+    done = []
+    for c in empty:
+        undo, fin = ls.remove(*c); done.append((c, undo, fin))
+    if done and checks():
+        for _, _, fin in done: fin()
+        commit('deadcut: empty modules'); return [c for c, _, _ in done]
+    for _, undo, _ in reversed(done): undo()
+    kept = []
+    for c in empty:
+        undo, fin = ls.remove(*c)
+        if checks(): fin(); kept.append(c); commit('deadcut: empty module')
+        else: undo()
+    return kept
+
 def main():
     commit('deadcut: start')
     first = None; total_cut = 0; failed_all = []
@@ -108,17 +136,18 @@ def main():
         by_lint, cut, stay, errors = diagnostics(f'check-{rnd}')
         if errors: print(f'   deadcut round {rnd}: the tree does not check ({errors} errors): {ZS}/deadcut-check-{rnd}.out'); sys.exit(1)
         first = first or by_lint
-        cut = [i for i in cut if (i[0], i[2]) not in {(f, n) for f, _, n in failed_all}]
         files = collections.OrderedDict()
         for f, l, n in cut: files.setdefault(f, []).append((f, l, n))
         kept, failed = cut_groups([list(files.items())], rnd) if files else ([], [])
-        failed_all += failed; total_cut += len(kept)
+        failed_all = failed; total_cut += len(kept)
         for c in kept: cuts_tsv.write(f'{rnd}\t' + '\t'.join(c[1:]) + '\n')
         cuts_tsv.flush()
         print(f'   deadcut round {rnd}: cargo fix changed {max(len(fixed) - 1, 0)} files; warnings '
               + ', '.join(f'{k} {v}' for k, v in by_lint.most_common()) + f'; {len(kept)} items cut, {len(failed)} cuts do not check',
               flush=True)
         if git('rev-parse', 'HEAD').strip() == before or (not fixed and not kept): break
+    gone = empty_modules()
+    print(f'   deadcut: {len(gone)} module files left with no item removed' + ''.join(f'; {os.path.relpath(c[2], W)}' for c in gone[:12]))
     by_lint, cut, stay, errors = diagnostics('final')
     assert errors == 0, 'deadcut: the final tree does not check'
     kinds = collections.Counter(re.sub(r'`[^`]*`', '`…`', m) for _, _, m in stay)
@@ -127,7 +156,7 @@ def main():
           + (', '.join(f'{k} {v}' for k, v in first.most_common()) or '0') + '; at the end: '
           + (', '.join(f'{k} {v}' for k, v in by_lint.most_common()) or '0'))
     print(f'   deadcut: left (not cut by rule): {len(stay)} -- ' + '; '.join(f'{v} {k}' for k, v in kinds.most_common(8))
-          + f'; cuts that do not check: {len(failed_all)}; lists {ZS}/deadcut.tsv, {ZS}/deadcut-left.tsv')
+          + f'; cuts that do not check (the last round): {len(failed_all)}; lists {ZS}/deadcut.tsv, {ZS}/deadcut-left.tsv')
 
 if __name__ == '__main__':
     main()

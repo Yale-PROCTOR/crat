@@ -109,7 +109,8 @@ fn expand_lines(src: &[u8], r: &Range<usize>) -> Range<usize> {
         }
         s..e
     } else {
-        r.clone()
+        // an item sharing its line with another: the spaces between them go with it
+        if at_line_end { s..e } else { r.start..e }
     }
 }
 
