@@ -1,9 +1,9 @@
-//! Two switches, both off in the reference configuration.
+//! Two rules.
 //!
-//! - `CRAT_COPY_RELAX=off|depth0-borrow-to-raw`: a bare copy `x := y` between two locals
+//! - The depth-0 copy relaxation: a bare copy `x := y` between two locals, at an eligible site,
 //!   keeps `x_0 ≡ y_0` or takes `y_0 = Ref ∧ x_0 = Raw` (a raw view of a reference). Raw → Ref
 //!   stays forbidden and an Owning source stays equal; depths ≥ 1 stay equal.
-//! - `CRAT_MERGE_LIVENESS=off|on`: in the engine's replay (the CEGAR validation and its
+//! - Merged liveness: in the engine's replay (the CEGAR validation and its
 //!   witnessed pass), a local the replay demoted keeps its group's live owners' provenances
 //!   live wherever it is live. Under Tree Borrows a raw view carries its source's tag, so the
 //!   loans the source's origin requires must stay live through the view's uses.

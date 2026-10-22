@@ -29,8 +29,8 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
 /// separate from coherence: the final producer combines Foster mutability, closed origin flow, and
 /// MIR liveness; this type is only the narrow solver/coherence handoff.
 ///
-/// Under `CRAT_ERA5C_COPY_LEND_MUT`, `mutable` marks a pair lent `&mut` (its
-/// destination is written through and its window is clean). It is an attribute of the pair, not
+/// `mutable` marks a pair lent `&mut` (its destination is written through and
+/// its window is clean). It is an attribute of the pair, not
 /// part of its identity: equality and hashing read `(lhs, rhs)` only, so every lookup keyed by
 /// `CopyLendPair::new` finds a mutable pair, and `Debug` names it only when set (a read-only pair
 /// prints without it).

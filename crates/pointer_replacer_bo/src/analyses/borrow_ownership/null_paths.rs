@@ -16,7 +16,7 @@
 //! to any place behind a pointer, conservatively, when the fact itself is behind
 //! one), by storage ends, and by every call except the pure `is_null` and the
 //! non-writing `free`; joins intersect. The solver consumes the facts at phi
-//! edges only (`infer.rs::join_phi_nodes`), behind `CRAT_ERA5C_MOVE_TRACKING`.
+//! edges only (`infer.rs::join_phi_nodes`).
 
 use std::collections::BTreeSet;
 

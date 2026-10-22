@@ -1285,7 +1285,7 @@ where
             if invalid_loans.is_empty() {
                 // The witnessed replay is structurally identical to the
                 // plain one and had no capture at all, so `loans` was silently
-                // empty under CRAT_BO_L2_GUARDED_COMMITS=1. The same reasoning
+                // empty on the guarded path. The same reasoning
                 // as the plain path applies here: a
                 // conflict-free function is where every loan SURVIVED.
                 record_loan_identities(

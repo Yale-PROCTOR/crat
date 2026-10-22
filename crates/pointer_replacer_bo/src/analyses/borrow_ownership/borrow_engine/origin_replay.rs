@@ -33,7 +33,7 @@ use crate::{
 pub(super) struct NativeBorrowContext<'a> {
     pub(super) borrow: GBorrowInferCtxt,
     flows: &'a OriginFlowResults,
-    /// `CRAT_MERGE_LIVENESS`: the locals the replay demoted (provenance
+    /// For merged liveness: the locals the replay demoted (provenance
     /// disabled, unioned with their base), per function.
     pub(super) demoted: FxHashMap<LocalDefId, FxHashSet<Local>>,
 }

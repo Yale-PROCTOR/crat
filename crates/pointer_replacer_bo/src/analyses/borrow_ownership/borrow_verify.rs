@@ -1636,14 +1636,11 @@ fn guarded_observations(
     observations
 }
 
-/// No production route reaches this loop. `CRAT_BO_L2_GUARDED_COMMITS=1` is the alias of
-/// `RepairMode::Guarded`, the guarded arm of the one loop above; this separate loop is kept as the
-/// door the guarded-repair tests call directly.
+/// No production route reaches this loop. `RepairMode::Guarded` is the guarded arm of the one
+/// loop above; this separate loop is kept as the door the guarded-repair tests call directly.
 ///
-/// `pub(crate)` so a test can route through the guarded loop **directly**
-/// instead of mutating `CRAT_BO_L2_GUARDED_COMMITS` inside a parallel test
-/// binary; it removes the need to perturb process-wide state to reach the same
-/// loop.
+/// `pub(crate)` so a test can route through the guarded loop **directly**, without
+/// perturbing process-wide state inside a parallel test binary.
 ///
 /// # Preconditions this door must carry
 ///

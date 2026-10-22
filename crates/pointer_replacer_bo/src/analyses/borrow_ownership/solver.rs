@@ -1081,7 +1081,7 @@ impl KindSolver {
         }
     }
 
-    /// Under `CRAT_COPY_RELAX=depth0-borrow-to-raw`: a bare depth-0 copy
+    /// At a relaxation site (`copy_relax::eligible`): a bare depth-0 copy
     /// `lhs := rhs` keeps the equal-kind reading or takes `lhs.raw ∧ rhs.ref` (a raw view of a
     /// reference). Raw → Ref is never allowed and an Owning source stays equal.
     pub(crate) fn copy_relax_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {

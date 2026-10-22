@@ -126,7 +126,7 @@ pub(crate) enum CopyLendEligibilityDrop {
     /// so the lend reading would make an owner of a value the function was only
     /// handed.
     GuardCallerDerivedSource,
-    /// Mutable copy-lend (`CRAT_ERA5C_COPY_LEND_MUT=on`): the destination is written through and
+    /// Mutable copy-lend: the destination is written through and
     /// `p`, or another copy of `p`, is used while `q` is live, so `q = &mut *p` would not be
     /// unique.
     C2MutableWindowAccess,
@@ -790,8 +790,8 @@ pub(crate) struct FrameFunnelRow {
 
 /// The copy-lend funnel S0 → S2 on the overlap solve's reference construction:
 /// S0 = every depth-0 local copy pair, S1 = C1–C4 eligible, S2 = the lend
-/// reading satisfiable in the hard universe (endpoint selectors free) built under
-/// the caller's arms, `CRAT_ERA5C_COPY_LEND=on` included. Measurement only.
+/// reading satisfiable in the hard universe (endpoint selectors free).
+/// Measurement only.
 #[cfg(test)]
 pub(crate) fn copy_lend_frame_funnel(
     program: &RustProgram<'_>,
@@ -1781,9 +1781,8 @@ fn solve_bo_overlap_config_with_source_events(
     refined: bool,
     enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), OverlapPreledgerDecline> {
-    // The overlap solve runs Baseline, or LendArm under
-    // `CRAT_ERA5C_COPY_LEND=on`; RemovalOnly is a measurement mode with no
-    // environment route and never reaches this solve.
+    // The overlap solve runs LendArm, or Baseline under a test's override;
+    // RemovalOnly is a measurement mode and never reaches this solve.
     assert_ne!(
         CopyLendMode::current(),
         CopyLendMode::RemovalOnly,
