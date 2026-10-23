@@ -78,7 +78,9 @@ container stop if `results/third-party/` is missing.
 - `equal`: a count, rate or verdict equal to the paper's;
 - `reported`: a time, with its ratio to the paper's;
 - `skipped`: the run did not produce the key, e.g. under `--small` or without the third-party step;
-- `differ`.
+- `differ (documented: …)`: one of the six keys below (What is not reproduced bit for bit), with the value
+  `expected-differ.tsv` lists for it;
+- `differ`: any other difference.
 
 Its last line sums them up. The `.tex` files hold the rows in the paper's `numbers.tex` form.
 
@@ -99,6 +101,23 @@ results/logs/                one log per program and step, run.log            re
   translation takes about 2.6 hours on that machine, and the `--small` run's about 80 minutes (`rq2/HARDWARE.md`).
 - **genann's Miri run.** It stops at its 8-hour cap, as in the paper; a slower machine completes fewer of its test
   groups by then. `--miri-cap` changes the cap.
+- **Six RQ1 rates: four of brotli, two of the total.** One pointer parameter of brotli that the paper's run made a
+  reference, `insert_length` of `ReadCommand`, stays a raw pointer in this build, which holds it by its rule: two
+  other parameters of `ReadCommand`, `s` and `br`, may point into the same object, so they stay raw, and this build
+  leaves the function as its input text. `DecodeMetaBlockLength` also keeps its input text here; no key counts it.
+  So brotli's four RQ1 rates and two of the totals read 0.1 point lower than the paper prints them:
+
+  | key | the paper | this artifact |
+  |---|---|---|
+  | `rq1.brotli.alldecl.rate` | 43.1% | 43.0% |
+  | `rq1.brotli.decl-twin.rate` | 42.9% | 42.8% |
+  | `rq1.brotli.decl-uses-twin.rate` | 44.5% | 44.4% |
+  | `rq1.brotli.uses.rate` | 47.8% | 47.7% |
+  | `rq1.total.decl-uses-twin.rate` | 41.6% | 41.5% |
+  | `rq1.total.uses.rate` | 40.1% | 40.0% |
+
+  `compare.txt` marks these six `differ (documented: …)` and counts them apart from any other difference. The
+  paper's next version carries this artifact's values. `--small` leaves brotli out, so it reads them `skipped`.
 - **Everything else is expected to be `equal`:**
   - the counts and rates, deterministic given the solver;
   - the Miri verdicts.

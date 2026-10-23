@@ -1,0 +1,7 @@
+# keys whose value here differs from the paper's: key, the value this artifact produces, where the difference is documented
+rq1.brotli.alldecl.rate	43.0%	README.md, What is not reproduced bit for bit
+rq1.brotli.decl-twin.rate	42.8%	README.md, What is not reproduced bit for bit
+rq1.brotli.decl-uses-twin.rate	44.4%	README.md, What is not reproduced bit for bit
+rq1.brotli.uses.rate	47.7%	README.md, What is not reproduced bit for bit
+rq1.total.decl-uses-twin.rate	41.5%	README.md, What is not reproduced bit for bit
+rq1.total.uses.rate	40.0%	README.md, What is not reproduced bit for bit
