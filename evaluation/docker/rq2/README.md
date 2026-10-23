@@ -7,7 +7,7 @@
 - `results/tables/scale.tex`: the produced keys as the paper's `numbers.tex` rows.
 
 ## What the times are
-For each program, one at a time, the translate step runs `jobcrat --pass prepare` (not timed), then `jobcrat --pass translate --inplace --receipt <p>.receipt` on the prepared tree under GNU time (`<p>.time`). Its environment is fixed by `run.sh`: `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`, and `JOBCRAT_FALLBACK_SLICE_EXTENT=268435456` for the twenty (unset for the eight).
+For each program, one at a time, the translate step runs `jobcrat --pass prepare` (not timed), then `jobcrat --pass translate --inplace --bo-receipt <p>.receipt` on the prepared tree under GNU time (`<p>.time`). Its environment is fixed by `run.sh`: `JOBCRAT_ERA5C_RAW_CAUSE_LEDGER=off`, and `JOBCRAT_FALLBACK_SLICE_EXTENT=268435456` for the twenty (unset for the eight).
 
 | key | definition |
 |---|---|

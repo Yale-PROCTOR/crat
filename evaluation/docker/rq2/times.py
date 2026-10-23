@@ -4,7 +4,7 @@
 The artifact's translate step runs, per program and one at a time, `jobcrat --pass translate --inplace` on the PREPARED
 input (`jobcrat --pass prepare` runs before it and is not timed) and leaves in RECEIPTS / TIMES (default
 $RESULTS/rq2/runs):
-  <p>.receipt  the pass's receipt (--receipt); its first line ends `solve=SolveReceipt { ..., solve_wall_s: "<s>" }`
+  <p>.receipt  the pass's receipt (--bo-receipt); its first line ends `solve=SolveReceipt { ..., solve_wall_s: "<s>" }`
   <p>.time     GNU time -v around the pass
   <p>.wall     optional: the wall in seconds around the same invocation; without it, GNU time's "Elapsed (wall clock)"
                line is read (it truncates to 10 ms)
