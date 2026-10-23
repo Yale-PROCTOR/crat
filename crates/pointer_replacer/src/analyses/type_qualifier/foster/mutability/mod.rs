@@ -158,15 +158,15 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     &mut rhs_deref,
                 );
 
-                // type safety
-                assert_eq!(
-                    lhs.end.index() - lhs.start.index(),
-                    rhs.end.index() - rhs.start.index(),
-                    "{:?}: {} = {:?}",
-                    place,
-                    local_decls.local_decls()[place.local].ty,
-                    rvalue
-                );
+                if lhs.end.index() - lhs.start.index() != rhs.end.index() - rhs.start.index() {
+                    // MIR projections introduced for nested pattern bindings can
+                    // lack a corresponding qualifier range. Fall back to the
+                    // conservative lattice value instead of aborting analysis.
+                    for variable in lhs {
+                        database.bottom(variable);
+                    }
+                    return;
+                }
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {

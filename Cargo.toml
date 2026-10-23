@@ -9,6 +9,7 @@ members = [
   "crates/pointer_replacer_bo",
   "crates/points_to",
   "crates/static_replacer",
+  "crates/tools",
   "crates/union_replacer",
   "crates/utils",
 ]
@@ -45,6 +46,7 @@ pointer_replacer = { path = "crates/pointer_replacer" }
 pointer_replacer_bo = { path = "crates/pointer_replacer_bo" }
 points_to = { path = "crates/points_to" }
 static_replacer = { path = "crates/static_replacer" }
+tools = { path = "crates/tools" }
 union_replacer = { path = "crates/union_replacer" }
 utils = { path = "crates/utils" }
 clap = { version = "4.5.40", features = ["derive"] }

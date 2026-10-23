@@ -1,0 +1,1735 @@
+use std::collections::{HashMap, HashSet};
+
+use rustc_ast::{
+    AttrKind, Attribute, Expr, ExprKind, Item, ItemKind, Local, LocalKind, Stmt, StmtKind,
+    ptr::P,
+    visit::{self, Visitor},
+};
+use rustc_ast_pretty::pprust;
+use thin_vec::ThinVec;
+
+use crate::{
+    SkeletonView, StatementDisposition, StatementDispositionKind,
+    printf::{parse_print_macro_statement, validate_print_template_statement},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreservationError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+pub(crate) fn make_disposition_forest(
+    item: &Item,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+    mechanical: &HashSet<u32>,
+) -> Result<Vec<StatementDisposition>, PreservationError> {
+    let topology = collect_label_topology(item)?;
+    let parents = topology.iter().copied().collect::<HashMap<_, _>>();
+    if let Some(label) = transformed
+        .union(preserved_shells)
+        .copied()
+        .chain(rule_applied.iter().copied())
+        .chain(mechanical.iter().copied())
+        .find(|label| !parents.contains_key(label))
+    {
+        return Err(metadata_error(
+            "unknown_disposition_label",
+            format!("disposition label {label} does not occur in the skeleton"),
+        ));
+    }
+    if let Some(label) = transformed.intersection(rule_applied).next() {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} cannot be both transform and rule_applied"),
+        ));
+    }
+    if let Some(label) = preserved_shells
+        .intersection(transformed)
+        .chain(preserved_shells.intersection(rule_applied))
+        .chain(preserved_shells.intersection(mechanical))
+        .next()
+    {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} has conflicting statement dispositions"),
+        ));
+    }
+    if let Some(label) = transformed
+        .intersection(mechanical)
+        .chain(rule_applied.intersection(mechanical))
+        .next()
+    {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} has conflicting statement dispositions"),
+        ));
+    }
+    fn build(
+        parent: Option<u32>,
+        topology: &[(u32, Option<u32>)],
+        transformed: &HashSet<u32>,
+        preserved_shells: &HashSet<u32>,
+        rule_applied: &HashSet<u32>,
+        mechanical: &HashSet<u32>,
+    ) -> Vec<StatementDisposition> {
+        let labels = topology
+            .iter()
+            .filter_map(|(label, actual)| (*actual == parent).then_some(*label))
+            .collect::<Vec<_>>();
+        labels
+            .into_iter()
+            .map(|label| StatementDisposition {
+                label,
+                disposition: if transformed.contains(&label) {
+                    StatementDispositionKind::Transform
+                } else if preserved_shells.contains(&label) {
+                    StatementDispositionKind::PreserveShell
+                } else if rule_applied.contains(&label) {
+                    StatementDispositionKind::RuleApplied
+                } else if mechanical.contains(&label) {
+                    StatementDispositionKind::Mechanical
+                } else {
+                    StatementDispositionKind::Preserve
+                },
+                children: build(
+                    Some(label),
+                    topology,
+                    transformed,
+                    preserved_shells,
+                    rule_applied,
+                    mechanical,
+                ),
+            })
+            .collect()
+    }
+    Ok(build(
+        None,
+        &topology,
+        transformed,
+        preserved_shells,
+        rule_applied,
+        mechanical,
+    ))
+}
+
+pub(crate) fn validate_skeleton_view(
+    item: &Item,
+    view: &SkeletonView,
+) -> Result<(), PreservationError> {
+    let topology = collect_label_topology(item)?;
+    let mut flattened = vec![];
+    fn flatten(
+        nodes: &[StatementDisposition],
+        parent: Option<u32>,
+        flattened: &mut Vec<(u32, Option<u32>, StatementDispositionKind)>,
+    ) -> Result<(), PreservationError> {
+        for node in nodes {
+            flattened.push((node.label, parent, node.disposition));
+            if matches!(
+                node.disposition,
+                StatementDispositionKind::Preserve | StatementDispositionKind::Mechanical
+            ) && node
+                .children
+                .iter()
+                .any(|child| child.disposition != StatementDispositionKind::Preserve)
+            {
+                return Err(metadata_error(
+                    "open_preserved_parent",
+                    format!(
+                        "preserved label {} contains a non-preserved child",
+                        node.label
+                    ),
+                ));
+            }
+            flatten(&node.children, Some(node.label), flattened)?;
+        }
+        Ok(())
+    }
+    flatten(&view.statement_dispositions, None, &mut flattened)?;
+    if flattened.len() != topology.len() {
+        return Err(metadata_error(
+            "invalid_disposition_tree",
+            "statement disposition tree does not contain every skeleton label exactly once",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for (index, (label, parent, _)) in flattened.iter().enumerate() {
+        if !seen.insert(*label) || topology.get(index) != Some(&(*label, *parent)) {
+            return Err(metadata_error(
+                "invalid_disposition_tree",
+                format!("statement disposition label {label} has invalid topology"),
+            ));
+        }
+    }
+    let transform_labels = flattened
+        .iter()
+        .filter_map(|(label, _, disposition)| {
+            (*disposition == StatementDispositionKind::Transform).then_some(*label)
+        })
+        .collect::<Vec<_>>();
+    if view.needs_transformation == transform_labels.is_empty() {
+        return Err(metadata_error(
+            "inconsistent_preservation_metadata",
+            "`needs_transformation` must equal whether a recursive disposition is `transform`",
+        ));
+    }
+    let report_labels = flattened
+        .iter()
+        .filter_map(|(label, _, disposition)| {
+            matches!(
+                disposition,
+                StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
+            )
+            .then_some(*label)
+        })
+        .collect::<Vec<_>>();
+    let metadata_labels = view
+        .statement_pair_metadata
+        .iter()
+        .map(|metadata| metadata.label)
+        .collect::<Vec<_>>();
+    if metadata_labels != report_labels {
+        return Err(metadata_error(
+            "invalid_statement_pair_metadata",
+            "statement-pair metadata labels must equal reportable labels in depth-first order",
+        ));
+    }
+    for (label, _, disposition) in &flattened {
+        if !matches!(
+            disposition,
+            StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
+        ) {
+            continue;
+        }
+        let metadata = view
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == *label)
+            .expect("metadata labels were validated above");
+        let Some(group) = canonical_statement_group(item, *label) else {
+            if metadata.printf_template.is_none() {
+                continue;
+            }
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} has no statement group"),
+            ));
+        };
+        if metadata.printf_template.is_none() {
+            if group.len() == 1 && parse_print_macro_statement(&group[0]).is_ok() {
+                return Err(metadata_error(
+                    "invalid_printf_template",
+                    format!("print template label {label} has no trusted printf metadata"),
+                ));
+            }
+            continue;
+        }
+        let template = metadata
+            .printf_template
+            .as_ref()
+            .expect("presence was checked above");
+        let expected_arguments = usize::try_from(template.argument_count).map_err(|_| {
+            metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} has an invalid argument count"),
+            )
+        })?;
+        if (*disposition == StatementDispositionKind::Mechanical) != (expected_arguments == 0) {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!(
+                    "printf template label {label} has an argument count inconsistent with its disposition"
+                ),
+            ));
+        }
+        if group.len() != 1 {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} must contain exactly one statement"),
+            ));
+        }
+        let result = if *disposition == StatementDispositionKind::Mechanical {
+            crate::printf::validate_print_macro_statement(
+                &group[0],
+                &template.rust_format,
+                expected_arguments,
+            )
+        } else {
+            validate_print_template_statement(&group[0], &template.rust_format, expected_arguments)
+        };
+        if let Err(problem) = result {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!(
+                    "printf template label {label} is invalid: {}",
+                    problem.message
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cross_view_topology(
+    baseline: &Item,
+    applied: &Item,
+) -> Result<(), PreservationError> {
+    let baseline_data = collect_label_data(baseline)?;
+    let applied_data = collect_label_data(applied)?;
+    if baseline_data.topology != applied_data.topology
+        || baseline_data.shells != applied_data.shells
+    {
+        return Err(metadata_error(
+            "cross_view_topology_mismatch",
+            "baseline and applied skeletons have different depth-first label/control topology",
+        ));
+    }
+    for (label, _) in &baseline_data.topology {
+        let Some(baseline_group) = canonical_statement_group(baseline, *label) else {
+            continue;
+        };
+        let Some(applied_group) = canonical_statement_group(applied, *label) else {
+            continue;
+        };
+        if baseline_group.len() == 1
+            && parse_print_macro_statement(&baseline_group[0])
+                .is_ok_and(|parsed| parsed.arguments.is_empty())
+            && baseline_group
+                .iter()
+                .map(pprust::stmt_to_string)
+                .collect::<Vec<_>>()
+                != applied_group
+                    .iter()
+                    .map(pprust::stmt_to_string)
+                    .collect::<Vec<_>>()
+        {
+            return Err(metadata_error(
+                "cross_view_mechanical_mismatch",
+                format!("fixed print payload at label {label} differs between skeleton views"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn canonicalize_function_with_view(
+    expected: &Item,
+    result: &Item,
+    view: &SkeletonView,
+    require_complete_alignment: bool,
+) -> Result<P<Item>, PreservationError> {
+    validate_skeleton_view(expected, view)?;
+    let mut transformed = HashSet::new();
+    let mut preserved_shells = HashSet::new();
+    let mut rule_applied = HashSet::new();
+    fn collect(
+        nodes: &[StatementDisposition],
+        transformed: &mut HashSet<u32>,
+        preserved_shells: &mut HashSet<u32>,
+        rule_applied: &mut HashSet<u32>,
+    ) {
+        for node in nodes {
+            match node.disposition {
+                StatementDispositionKind::Transform => {
+                    transformed.insert(node.label);
+                }
+                StatementDispositionKind::RuleApplied => {
+                    rule_applied.insert(node.label);
+                }
+                StatementDispositionKind::Mechanical => {
+                    rule_applied.insert(node.label);
+                }
+                StatementDispositionKind::PreserveShell => {
+                    preserved_shells.insert(node.label);
+                }
+                StatementDispositionKind::Preserve => {}
+            }
+            collect(&node.children, transformed, preserved_shells, rule_applied);
+        }
+    }
+    collect(
+        &view.statement_dispositions,
+        &mut transformed,
+        &mut preserved_shells,
+        &mut rule_applied,
+    );
+    canonicalize_function_impl_sets(
+        expected,
+        result,
+        &transformed,
+        &preserved_shells,
+        &rule_applied,
+        require_complete_alignment,
+    )
+}
+
+fn canonicalize_function_impl_sets(
+    expected: &Item,
+    result: &Item,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+    require_complete_alignment: bool,
+) -> Result<P<Item>, PreservationError> {
+    let ItemKind::Fn(box expected_function) = &expected.kind else {
+        return Err(metadata_error(
+            "invalid_expected_skeleton",
+            "preservation metadata requires one function skeleton",
+        ));
+    };
+    if !require_complete_alignment
+        && rule_applied.is_empty()
+        && preserved_shells.is_empty()
+        && collect_label_parents(expected)?.len() == transformed.len()
+    {
+        return Ok(P(result.clone()));
+    }
+    let ItemKind::Fn(box returned_function) = &result.kind else {
+        return Err(structural_error(
+            "unexpected_function",
+            "the returned item is not a function",
+        ));
+    };
+    let mut canonical = P(expected.clone());
+    let ItemKind::Fn(box result_function) = &mut canonical.kind else {
+        unreachable!("the expected item was checked above")
+    };
+    result_function.body = returned_function.body.clone();
+    let editable_shells = transformed
+        .union(preserved_shells)
+        .copied()
+        .chain(rule_applied.iter().copied())
+        .collect::<HashSet<_>>();
+    canonicalize_statement_list(
+        &expected_function
+            .body
+            .as_ref()
+            .expect("validated function skeleton has a body")
+            .stmts,
+        &mut result_function
+            .body
+            .as_mut()
+            .expect("returned function has a body")
+            .stmts,
+        false,
+        &editable_shells,
+        preserved_shells,
+        rule_applied,
+    )?;
+    Ok(canonical)
+}
+
+fn metadata_error(code: &'static str, message: impl Into<String>) -> PreservationError {
+    PreservationError {
+        code,
+        message: message.into(),
+    }
+}
+
+fn structural_error(code: &'static str, message: impl Into<String>) -> PreservationError {
+    PreservationError {
+        code,
+        message: message.into(),
+    }
+}
+
+fn collect_label_parents(item: &Item) -> Result<HashMap<u32, Option<u32>>, PreservationError> {
+    Ok(collect_label_topology(item)?.into_iter().collect())
+}
+
+fn collect_label_topology(item: &Item) -> Result<Vec<(u32, Option<u32>)>, PreservationError> {
+    collect_label_data(item).map(|data| data.topology)
+}
+
+struct LabelData {
+    topology: Vec<(u32, Option<u32>)>,
+    shells: Vec<(u32, String)>,
+}
+
+fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
+    let ItemKind::Fn(box function) = &item.kind else {
+        return Err(metadata_error(
+            "invalid_expected_skeleton",
+            "preservation metadata requires one function skeleton",
+        ));
+    };
+    crate::skeleton::collect_opaque_nested_ifs(item, "").map_err(|error| {
+        metadata_error(
+            "invalid_expected_skeleton",
+            format!(
+                "expected skeleton has unsupported nested control: {}",
+                error.message
+            ),
+        )
+    })?;
+    let mut collector = LabelTreeCollector {
+        parents: HashMap::new(),
+        topology: vec![],
+        shells: vec![],
+        parent: None,
+        error: None,
+    };
+    collector.collect_block(
+        function
+            .body
+            .as_ref()
+            .expect("validated function skeleton has a body"),
+    );
+    match collector.error {
+        Some(error) => Err(error),
+        None => Ok(LabelData {
+            topology: collector.topology,
+            shells: collector.shells,
+        }),
+    }
+}
+
+struct LabelTreeCollector {
+    parents: HashMap<u32, Option<u32>>,
+    topology: Vec<(u32, Option<u32>)>,
+    shells: Vec<(u32, String)>,
+    parent: Option<u32>,
+    error: Option<PreservationError>,
+}
+
+impl LabelTreeCollector {
+    fn collect_block(&mut self, block: &rustc_ast::Block) {
+        for statement in &block.stmts {
+            self.collect_statement(statement);
+            if self.error.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn collect_statement(&mut self, statement: &Stmt) {
+        let Some(label) = statement_label(statement) else {
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                "every expected statement must have one canonical `#[proctor(N)]` label",
+            ));
+            return;
+        };
+        if self.parents.insert(label, self.parent).is_some() {
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                format!("expected statement label {label} is duplicated"),
+            ));
+            return;
+        }
+        self.topology.push((label, self.parent));
+        let statement_kind = match &statement.kind {
+            StmtKind::Let(local) => match local.kind {
+                LocalKind::Decl => "let_declaration",
+                LocalKind::Init(_) => "let_initializer",
+                LocalKind::InitElse(..) => "let_else",
+            },
+            StmtKind::Expr(_) => "tail_expression",
+            StmtKind::Semi(_) => "semicolon_expression",
+            StmtKind::Item(_) => "item",
+            StmtKind::Empty => "empty",
+            StmtKind::MacCall(_) => "macro",
+        };
+        let control = control_root(statement, false)
+            .map(|root| format!("{:?}:{:?}", root.kind, root.role))
+            .unwrap_or_else(|| "payload".to_owned());
+        self.shells
+            .push((label, format!("{statement_kind}:{control}")));
+        if non_control_payload(statement).is_some_and(contains_statement_label) {
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                format!(
+                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                ),
+            ));
+            return;
+        }
+        let previous = self.parent.replace(label);
+        if let StmtKind::Let(local) = &statement.kind
+            && let LocalKind::InitElse(_, else_block) = &local.kind
+        {
+            self.collect_block(else_block);
+        }
+        if let Some(root) = control_root(statement, false) {
+            self.collect_control(root.expression);
+        }
+        self.parent = previous;
+    }
+
+    fn collect_control(&mut self, expression: &Expr) {
+        match &expression.kind {
+            ExprKind::If(condition, then_block, else_expression) => {
+                if self.reject_opaque_operand_labels(condition) {
+                    return;
+                }
+                self.collect_block(then_block);
+                if let Some(else_expression) = else_expression {
+                    match &else_expression.kind {
+                        ExprKind::If(..) => self.collect_control(else_expression),
+                        ExprKind::Block(block, _) => self.collect_block(block),
+                        _ => {}
+                    }
+                }
+            }
+            ExprKind::While(condition, body, _) => {
+                if self.reject_opaque_operand_labels(condition) {
+                    return;
+                }
+                self.collect_block(body);
+            }
+            ExprKind::ForLoop { iter, body, .. } => {
+                if self.reject_opaque_operand_labels(iter) {
+                    return;
+                }
+                self.collect_block(body);
+            }
+            ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => self.collect_block(body),
+            ExprKind::Match(scrutinee, arms, _) => {
+                if self.reject_opaque_operand_labels(scrutinee) {
+                    return;
+                }
+                for arm in arms {
+                    if let Some(guard) = &arm.guard
+                        && self.reject_opaque_operand_labels(guard)
+                    {
+                        return;
+                    }
+                    if let Some(body) = &arm.body
+                        && let ExprKind::Block(block, _) = &body.kind
+                    {
+                        self.collect_block(block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reject_opaque_operand_labels(&mut self, expression: &Expr) -> bool {
+        if self.error.is_none() && contains_statement_label(expression) {
+            let label = self
+                .parent
+                .expect("control operand is visited beneath its statement label");
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                format!(
+                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                ),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn non_control_payload(statement: &Stmt) -> Option<&Expr> {
+    let (expression, role) = match &statement.kind {
+        StmtKind::Let(local) => match &local.kind {
+            LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => {
+                (expression.as_ref(), ControlRole::LetInitializer)
+            }
+            LocalKind::Decl => return None,
+        },
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
+            ExprKind::Ret(Some(value)) => (value.as_ref(), ControlRole::ReturnValue),
+            ExprKind::Break(_, Some(value)) => (value.as_ref(), ControlRole::BreakValue),
+            _ => (expression.as_ref(), ControlRole::Statement),
+        },
+        _ => return None,
+    };
+    control_expression(expression, role)
+        .is_none()
+        .then_some(expression)
+}
+
+fn contains_statement_label(expression: &Expr) -> bool {
+    struct Finder(bool);
+
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if effective_statement_attributes(statement)
+                .iter()
+                .any(|attribute| !matches!(parse_label_attribute(attribute), Ok(None)))
+            {
+                self.0 = true;
+                return;
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+
+    let mut finder = Finder(false);
+    finder.visit_expr(expression);
+    finder.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlKind {
+    PlainBlock,
+    If,
+    IfLet,
+    While,
+    WhileLet,
+    For,
+    Loop,
+    Match,
+}
+
+impl ControlKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PlainBlock => "plain block",
+            Self::If => "if",
+            Self::IfLet => "if let",
+            Self::While => "while",
+            Self::WhileLet => "while let",
+            Self::For => "for",
+            Self::Loop => "loop",
+            Self::Match => "match",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlRole {
+    Statement,
+    LetInitializer,
+    ReturnValue,
+    BreakValue,
+    MatchArmTail,
+}
+
+impl ControlRole {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Statement => "statement root",
+            Self::LetInitializer => "direct let initializer",
+            Self::ReturnValue => "direct return value",
+            Self::BreakValue => "direct break value",
+            Self::MatchArmTail => "match-arm block tail",
+        }
+    }
+}
+
+struct ControlRoot<'a> {
+    kind: ControlKind,
+    role: ControlRole,
+    expression: &'a Expr,
+}
+
+struct ControlRootMut<'a> {
+    expression: &'a mut Expr,
+}
+
+fn control_root(statement: &Stmt, arm_tail: bool) -> Option<ControlRoot<'_>> {
+    match &statement.kind {
+        StmtKind::Let(local) => match &local.kind {
+            LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => {
+                control_expression(expression, ControlRole::LetInitializer)
+            }
+            LocalKind::Decl => None,
+        },
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
+            ExprKind::Ret(Some(value)) => control_expression(value, ControlRole::ReturnValue),
+            ExprKind::Break(_, Some(value)) => control_expression(value, ControlRole::BreakValue),
+            _ => control_expression(
+                expression,
+                if arm_tail && matches!(statement.kind, StmtKind::Expr(..)) {
+                    ControlRole::MatchArmTail
+                } else {
+                    ControlRole::Statement
+                },
+            ),
+        },
+        _ => None,
+    }
+}
+
+fn control_root_mut(statement: &mut Stmt, arm_tail: bool) -> Option<ControlRootMut<'_>> {
+    match &mut statement.kind {
+        StmtKind::Let(local) => match &mut local.kind {
+            LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => {
+                control_expression_mut(expression, ControlRole::LetInitializer)
+            }
+            LocalKind::Decl => None,
+        },
+        StmtKind::Expr(expression) => control_statement_expression_mut(
+            expression,
+            if arm_tail {
+                ControlRole::MatchArmTail
+            } else {
+                ControlRole::Statement
+            },
+        ),
+        StmtKind::Semi(expression) => {
+            control_statement_expression_mut(expression, ControlRole::Statement)
+        }
+        _ => None,
+    }
+}
+
+fn control_statement_expression_mut(
+    expression: &mut Expr,
+    default_role: ControlRole,
+) -> Option<ControlRootMut<'_>> {
+    let special_role = match expression.kind {
+        ExprKind::Ret(Some(..)) => Some(ControlRole::ReturnValue),
+        ExprKind::Break(_, Some(..)) => Some(ControlRole::BreakValue),
+        _ => None,
+    };
+    match special_role {
+        Some(ControlRole::ReturnValue) => {
+            let ExprKind::Ret(Some(value)) = &mut expression.kind else { unreachable!() };
+            control_expression_mut(value, ControlRole::ReturnValue)
+        }
+        Some(ControlRole::BreakValue) => {
+            let ExprKind::Break(_, Some(value)) = &mut expression.kind else { unreachable!() };
+            control_expression_mut(value, ControlRole::BreakValue)
+        }
+        _ => control_expression_mut(expression, default_role),
+    }
+}
+
+fn control_expression(expression: &Expr, role: ControlRole) -> Option<ControlRoot<'_>> {
+    let kind = expression_control_kind(expression)?;
+    Some(ControlRoot {
+        kind,
+        role,
+        expression,
+    })
+}
+
+fn control_expression_mut(expression: &mut Expr, _role: ControlRole) -> Option<ControlRootMut<'_>> {
+    expression_control_kind(expression)?;
+    Some(ControlRootMut { expression })
+}
+
+fn expression_control_kind(expression: &Expr) -> Option<ControlKind> {
+    Some(match &expression.kind {
+        ExprKind::Block(..) => ControlKind::PlainBlock,
+        ExprKind::If(condition, ..) if matches!(condition.kind, ExprKind::Let(..)) => {
+            ControlKind::IfLet
+        }
+        ExprKind::If(..) => ControlKind::If,
+        ExprKind::While(condition, ..) if matches!(condition.kind, ExprKind::Let(..)) => {
+            ControlKind::WhileLet
+        }
+        ExprKind::While(..) => ControlKind::While,
+        ExprKind::ForLoop { .. } => ControlKind::For,
+        ExprKind::Loop(..) => ControlKind::Loop,
+        ExprKind::Match(..) => ControlKind::Match,
+        _ => return None,
+    })
+}
+
+fn canonicalize_statement_list(
+    expected: &[Stmt],
+    result: &mut ThinVec<Stmt>,
+    arm_tail: bool,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+) -> Result<(), PreservationError> {
+    let expected_groups = groups(expected);
+    let result_groups = groups(result);
+    let expected_labels = expected_groups
+        .iter()
+        .map(|group| {
+            group.label.ok_or_else(|| {
+                metadata_error(
+                    "invalid_expected_skeleton",
+                    "every expected statement must have one canonical label",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(group) = result_groups.iter().find(|group| group.malformed) {
+        return Err(structural_error(
+            "malformed_label",
+            format!(
+                "returned statement at sibling position {} has a malformed `proctor` label",
+                group.start
+            ),
+        ));
+    }
+    let observed_labels = result_groups
+        .iter()
+        .filter_map(|group| group.label)
+        .collect::<Vec<_>>();
+
+    let mut seen = HashSet::new();
+    for label in &observed_labels {
+        if !seen.insert(*label) {
+            return Err(structural_error(
+                "nonconsecutive_label",
+                format!(
+                    "label {label} reappears after another expansion group begins; keep same-label siblings consecutive"
+                ),
+            ));
+        }
+    }
+    if result_groups.len() == expected_groups.len()
+        && result_groups.iter().all(|group| group.label.is_some())
+        && observed_labels
+            .iter()
+            .all(|label| expected_labels.contains(label))
+        && observed_labels != expected_labels
+    {
+        return Err(structural_error(
+            "label_order_mismatch",
+            "returned statement groups are not in target-skeleton order",
+        ));
+    }
+
+    for (position, expected_group) in expected_groups.iter().enumerate() {
+        let label = expected_labels[position];
+        let Some(result_group) = result_groups.get(position) else {
+            return Err(structural_error(
+                "missing_label",
+                format!("label {label} is not locatable in its expected structural role"),
+            ));
+        };
+        match result_group.label {
+            Some(observed) if observed == label => {}
+            Some(observed) if expected_labels.contains(&observed) => {
+                return Err(structural_error(
+                    if result_groups.len() == expected_groups.len() {
+                        "label_order_mismatch"
+                    } else {
+                        "missing_label"
+                    },
+                    format!(
+                        "expected label {label} at sibling position {position}, observed label {observed}"
+                    ),
+                ));
+            }
+            Some(observed) => {
+                return Err(structural_error(
+                    "unexpected_label",
+                    format!(
+                        "unexpected label {observed} occupies sibling position {position} for expected label {label}"
+                    ),
+                ));
+            }
+            None => {
+                return Err(structural_error(
+                    "unlabeled_sibling",
+                    format!(
+                        "unlabeled statement occupies sibling position {position} for expected label {label}"
+                    ),
+                ));
+            }
+        }
+        if rule_applied.contains(&label) && result_group.statements.len() != 1 {
+            return Err(structural_error(
+                "rule_applied_expansion",
+                format!("rule-applied label {label} must remain exactly one statement"),
+            ));
+        }
+        if preserved_shells.contains(&label) && result_group.statements.len() != 1 {
+            return Err(structural_error(
+                "preserved_shell_expansion",
+                format!("preserved-shell label {label} must remain exactly one statement"),
+            ));
+        }
+        if transformed.contains(&label) {
+            canonicalize_transformed_group(
+                &expected_group.statements[0],
+                &mut result[result_group.start..result_group.end],
+                arm_tail,
+                label,
+                transformed,
+                preserved_shells,
+                rule_applied,
+            )?;
+        }
+    }
+    if let Some(extra) = result_groups.get(expected_groups.len()) {
+        return Err(structural_error(
+            if extra.label.is_some() {
+                "unexpected_label"
+            } else {
+                "unlabeled_sibling"
+            },
+            format!(
+                "returned function has an extra statement group at sibling position {}",
+                expected_groups.len()
+            ),
+        ));
+    }
+
+    for expected_group in expected_groups.iter().rev() {
+        let label = expected_group.label.expect("expected labels were checked");
+        if transformed.contains(&label)
+            && !preserved_shells.contains(&label)
+            && !rule_applied.contains(&label)
+        {
+            continue;
+        }
+        let current_groups = groups(result);
+        let Some(result_group) = current_groups
+            .iter()
+            .find(|group| group.label == Some(label))
+        else {
+            return Err(structural_error(
+                "missing_label",
+                format!("preserved label {label} is not locatable"),
+            ));
+        };
+        let restored = if rule_applied.contains(&label) || preserved_shells.contains(&label) {
+            restore_canonical_shell_statement(
+                &expected_group.statements[0],
+                &result[result_group.start..result_group.end],
+                arm_tail,
+                label,
+            )?
+        } else {
+            expected_group.statements[0].clone()
+        };
+        result.splice(
+            result_group.start..result_group.end,
+            std::iter::once(restored),
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_transformed_group(
+    expected: &Stmt,
+    result_group: &mut [Stmt],
+    arm_tail: bool,
+    label: u32,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+) -> Result<(), PreservationError> {
+    if let StmtKind::Let(expected_local) = &expected.kind
+        && let LocalKind::InitElse(_, expected_else) = &expected_local.kind
+    {
+        let candidates = result_group
+            .iter()
+            .enumerate()
+            .filter(|(_, statement)| {
+                matches!(
+                    statement.kind,
+                    StmtKind::Let(box Local {
+                        kind: LocalKind::InitElse(..),
+                        ..
+                    })
+                )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(structural_error(
+                if candidates.is_empty() {
+                    "missing_control_root"
+                } else {
+                    "multiple_control_roots"
+                },
+                format!("label {label} must contain exactly one let-else structural anchor"),
+            ));
+        }
+        let scope = result_group
+            .iter()
+            .flat_map(statement_labels)
+            .collect::<HashSet<_>>();
+        let StmtKind::Let(result_local) = &mut result_group[candidates[0]].kind else {
+            unreachable!()
+        };
+        let LocalKind::InitElse(_, result_else) = &mut result_local.kind else { unreachable!() };
+        return canonicalize_nested_statement_list(
+            &expected_else.stmts,
+            &mut result_else.stmts,
+            false,
+            transformed,
+            preserved_shells,
+            rule_applied,
+            &scope,
+        );
+    }
+
+    let Some(expected_control) = control_root(expected, arm_tail) else {
+        return Ok(());
+    };
+    let candidates = result_group
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            control_root(statement, arm_tail).map(|root| (index, root))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(structural_error(
+            "missing_control_root",
+            format!(
+                "label {label} must contain exactly one {} structural anchor",
+                expected_control.kind.name()
+            ),
+        ));
+    }
+    if candidates.len() > 1 {
+        return Err(structural_error(
+            "multiple_control_roots",
+            format!("label {label} contains multiple control structural anchors"),
+        ));
+    }
+    let (index, observed) = &candidates[0];
+    if observed.role != expected_control.role {
+        return Err(structural_error(
+            "control_role_mismatch",
+            format!(
+                "label {label} expected {} but observed {}",
+                expected_control.role.name(),
+                observed.role.name()
+            ),
+        ));
+    }
+    if observed.kind != expected_control.kind {
+        return Err(structural_error(
+            "control_kind_mismatch",
+            format!(
+                "label {label} expected {} but observed {}",
+                expected_control.kind.name(),
+                observed.kind.name()
+            ),
+        ));
+    }
+    let result_control =
+        control_root_mut(&mut result_group[*index], arm_tail).expect("candidate still exists");
+    canonicalize_control(
+        expected_control.expression,
+        result_control.expression,
+        label,
+        transformed,
+        preserved_shells,
+        rule_applied,
+    )
+}
+
+fn restore_canonical_shell_statement(
+    expected: &Stmt,
+    returned_group: &[Stmt],
+    arm_tail: bool,
+    label: u32,
+) -> Result<Stmt, PreservationError> {
+    let mut restored = expected.clone();
+    if let StmtKind::Let(expected_local) = &mut restored.kind
+        && let LocalKind::InitElse(_, expected_else) = &mut expected_local.kind
+    {
+        let returned = returned_group.iter().find_map(|statement| {
+            let StmtKind::Let(local) = &statement.kind else {
+                return None;
+            };
+            let LocalKind::InitElse(_, else_block) = &local.kind else {
+                return None;
+            };
+            Some(else_block)
+        });
+        let Some(returned) = returned else {
+            return Err(structural_error(
+                "missing_control_root",
+                format!("label {label} lost its let-else descendant slots"),
+            ));
+        };
+        expected_else.stmts = returned.stmts.clone();
+        return Ok(restored);
+    }
+    let Some(expected_control) = control_root_mut(&mut restored, arm_tail) else {
+        return Ok(restored);
+    };
+    let returned_controls = returned_group
+        .iter()
+        .filter_map(|statement| control_root(statement, arm_tail))
+        .collect::<Vec<_>>();
+    if returned_controls.len() != 1 {
+        return Err(structural_error(
+            "missing_control_root",
+            format!("label {label} lost its canonical-shell descendant slots"),
+        ));
+    }
+    copy_control_descendants(expected_control.expression, returned_controls[0].expression)?;
+    Ok(restored)
+}
+
+fn copy_control_descendants(expected: &mut Expr, returned: &Expr) -> Result<(), PreservationError> {
+    match (&mut expected.kind, &returned.kind) {
+        (
+            ExprKind::If(_, expected_then, expected_else),
+            ExprKind::If(_, returned_then, returned_else),
+        ) => {
+            expected_then.stmts = returned_then.stmts.clone();
+            copy_else_descendants(expected_else.as_deref_mut(), returned_else.as_deref())
+        }
+        (ExprKind::While(_, expected_body, _), ExprKind::While(_, returned_body, _))
+        | (ExprKind::Loop(expected_body, ..), ExprKind::Loop(returned_body, ..))
+        | (ExprKind::Block(expected_body, ..), ExprKind::Block(returned_body, ..)) => {
+            expected_body.stmts = returned_body.stmts.clone();
+            Ok(())
+        }
+        (
+            ExprKind::ForLoop {
+                body: expected_body,
+                ..
+            },
+            ExprKind::ForLoop {
+                body: returned_body,
+                ..
+            },
+        ) => {
+            expected_body.stmts = returned_body.stmts.clone();
+            Ok(())
+        }
+        (ExprKind::Match(_, expected_arms, _), ExprKind::Match(_, returned_arms, _)) => {
+            for (expected_arm, returned_arm) in expected_arms.iter_mut().zip(returned_arms) {
+                let (Some(expected_body), Some(returned_body)) =
+                    (&mut expected_arm.body, &returned_arm.body)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        "rule-applied match arm lost its block body",
+                    ));
+                };
+                let (ExprKind::Block(expected_block, _), ExprKind::Block(returned_block, _)) =
+                    (&mut expected_body.kind, &returned_body.kind)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        "rule-applied match arm lost its block body",
+                    ));
+                };
+                expected_block.stmts = returned_block.stmts.clone();
+            }
+            Ok(())
+        }
+        _ => Err(structural_error(
+            "control_kind_mismatch",
+            "rule-applied control changed shape",
+        )),
+    }
+}
+
+fn copy_else_descendants(
+    expected: Option<&mut Expr>,
+    returned: Option<&Expr>,
+) -> Result<(), PreservationError> {
+    match (expected, returned) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(returned)) => match (&mut expected.kind, &returned.kind) {
+            (ExprKind::Block(expected, _), ExprKind::Block(returned, _)) => {
+                expected.stmts = returned.stmts.clone();
+                Ok(())
+            }
+            (ExprKind::If(..), ExprKind::If(..)) => copy_control_descendants(expected, returned),
+            _ => Err(structural_error(
+                "branch_shape_mismatch",
+                "rule-applied else branch changed shape",
+            )),
+        },
+        _ => Err(structural_error(
+            "branch_shape_mismatch",
+            "rule-applied statement changed else-branch presence",
+        )),
+    }
+}
+
+fn canonicalize_control(
+    expected: &Expr,
+    result: &mut Expr,
+    label: u32,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+) -> Result<(), PreservationError> {
+    let scope = expression_labels(result);
+    match (&expected.kind, &mut result.kind) {
+        (
+            ExprKind::If(_, expected_then, expected_else),
+            ExprKind::If(_, result_then, result_else),
+        ) => {
+            canonicalize_nested_statement_list(
+                &expected_then.stmts,
+                &mut result_then.stmts,
+                false,
+                transformed,
+                preserved_shells,
+                rule_applied,
+                &scope,
+            )?;
+            canonicalize_else(
+                expected_else.as_deref(),
+                result_else.as_deref_mut(),
+                label,
+                transformed,
+                preserved_shells,
+                rule_applied,
+                &scope,
+            )
+        }
+        (ExprKind::While(_, expected_body, _), ExprKind::While(_, result_body, _))
+        | (ExprKind::Loop(expected_body, ..), ExprKind::Loop(result_body, ..))
+        | (ExprKind::Block(expected_body, ..), ExprKind::Block(result_body, ..)) => {
+            canonicalize_nested_statement_list(
+                &expected_body.stmts,
+                &mut result_body.stmts,
+                false,
+                transformed,
+                preserved_shells,
+                rule_applied,
+                &scope,
+            )
+        }
+        (
+            ExprKind::ForLoop {
+                body: expected_body,
+                ..
+            },
+            ExprKind::ForLoop {
+                body: result_body, ..
+            },
+        ) => canonicalize_nested_statement_list(
+            &expected_body.stmts,
+            &mut result_body.stmts,
+            false,
+            transformed,
+            preserved_shells,
+            rule_applied,
+            &scope,
+        ),
+        (ExprKind::Match(_, expected_arms, _), ExprKind::Match(_, result_arms, _)) => {
+            if expected_arms.len() != result_arms.len() {
+                return Err(structural_error(
+                    "match_arm_shape_mismatch",
+                    format!(
+                        "label {label} expected {} match arms but observed {}",
+                        expected_arms.len(),
+                        result_arms.len()
+                    ),
+                ));
+            }
+            for (index, (expected_arm, result_arm)) in
+                expected_arms.iter().zip(result_arms).enumerate()
+            {
+                if expected_arm.guard.is_some() != result_arm.guard.is_some() {
+                    return Err(structural_error(
+                        "match_guard_mismatch",
+                        format!("label {label} match arm {index} changed guard presence"),
+                    ));
+                }
+                let (Some(expected_body), Some(result_body)) =
+                    (&expected_arm.body, &mut result_arm.body)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        format!("label {label} match arm {index} lost its block body"),
+                    ));
+                };
+                let (ExprKind::Block(expected_block, _), ExprKind::Block(result_block, _)) =
+                    (&expected_body.kind, &mut result_body.kind)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        format!("label {label} match arm {index} must retain its block body"),
+                    ));
+                };
+                canonicalize_nested_statement_list(
+                    &expected_block.stmts,
+                    &mut result_block.stmts,
+                    true,
+                    transformed,
+                    preserved_shells,
+                    rule_applied,
+                    &scope,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err(structural_error(
+            "control_kind_mismatch",
+            format!("label {label} changed its control shape"),
+        )),
+    }
+}
+
+fn canonicalize_else(
+    expected: Option<&Expr>,
+    result: Option<&mut Expr>,
+    label: u32,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+    scope: &HashSet<u32>,
+) -> Result<(), PreservationError> {
+    match (expected, result) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(result)) => {
+            let same_control_kind =
+                expression_control_kind(expected) == expression_control_kind(result);
+            match (&expected.kind, &mut result.kind) {
+                (ExprKind::Block(expected, _), ExprKind::Block(result, _)) => {
+                    canonicalize_nested_statement_list(
+                        &expected.stmts,
+                        &mut result.stmts,
+                        false,
+                        transformed,
+                        preserved_shells,
+                        rule_applied,
+                        scope,
+                    )
+                }
+                (
+                    ExprKind::If(_, expected_then, expected_else),
+                    ExprKind::If(_, result_then, result_else),
+                ) if same_control_kind => {
+                    canonicalize_nested_statement_list(
+                        &expected_then.stmts,
+                        &mut result_then.stmts,
+                        false,
+                        transformed,
+                        preserved_shells,
+                        rule_applied,
+                        scope,
+                    )?;
+                    canonicalize_else(
+                        expected_else.as_deref(),
+                        result_else.as_deref_mut(),
+                        label,
+                        transformed,
+                        preserved_shells,
+                        rule_applied,
+                        scope,
+                    )
+                }
+                _ => Err(structural_error(
+                    "branch_shape_mismatch",
+                    format!("label {label} changed its recursive else-if shape"),
+                )),
+            }
+        }
+        _ => Err(structural_error(
+            "branch_shape_mismatch",
+            format!("label {label} changed the existence of an else branch"),
+        )),
+    }
+}
+
+fn canonicalize_nested_statement_list(
+    expected: &[Stmt],
+    result: &mut ThinVec<Stmt>,
+    arm_tail: bool,
+    transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+    scope: &HashSet<u32>,
+) -> Result<(), PreservationError> {
+    let local_labels = groups(result)
+        .into_iter()
+        .filter_map(|group| group.label)
+        .collect::<HashSet<_>>();
+    match canonicalize_statement_list(
+        expected,
+        result,
+        arm_tail,
+        transformed,
+        preserved_shells,
+        rule_applied,
+    ) {
+        Err(error) if matches!(error.code, "missing_label" | "label_order_mismatch") => {
+            let misplaced = groups(expected).into_iter().find_map(|group| {
+                let label = group.label?;
+                (!local_labels.contains(&label) && scope.contains(&label)).then_some(label)
+            });
+            if let Some(label) = misplaced {
+                Err(structural_error(
+                    "descendant_location_mismatch",
+                    format!("label {label} occurs outside its expected control branch or arm"),
+                ))
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    }
+}
+
+fn expression_labels(expression: &Expr) -> HashSet<u32> {
+    struct Collector(HashSet<u32>);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let Some(label) = statement_label(statement) {
+                self.0.insert(label);
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+
+    let mut collector = Collector(HashSet::new());
+    collector.visit_expr(expression);
+    collector.0
+}
+
+fn statement_labels(statement: &Stmt) -> HashSet<u32> {
+    struct Collector(HashSet<u32>);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let Some(label) = statement_label(statement) {
+                self.0.insert(label);
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+
+    let mut collector = Collector(HashSet::new());
+    collector.visit_stmt(statement);
+    collector.0
+}
+
+struct Group {
+    label: Option<u32>,
+    start: usize,
+    end: usize,
+    malformed: bool,
+    statements: Vec<Stmt>,
+}
+
+fn groups(statements: &[Stmt]) -> Vec<Group> {
+    let mut output: Vec<Group> = vec![];
+    for (index, statement) in statements.iter().enumerate() {
+        let label = statement_label(statement);
+        if label.is_some() && output.last().is_some_and(|group| group.label == label) {
+            let group = output.last_mut().unwrap();
+            group.end = index + 1;
+            group.statements.push(statement.clone());
+        } else {
+            output.push(Group {
+                label,
+                start: index,
+                end: index + 1,
+                malformed: statement_has_malformed_label(statement),
+                statements: vec![statement.clone()],
+            });
+        }
+    }
+    output
+}
+
+pub(crate) fn canonical_statement_group(item: &Item, target: u32) -> Option<Vec<Stmt>> {
+    struct Collector {
+        target: u32,
+        statements: Option<Vec<Stmt>>,
+    }
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_block(&mut self, block: &'ast rustc_ast::Block) {
+            if self.statements.is_some() {
+                return;
+            }
+            if let Some(group) = groups(&block.stmts)
+                .into_iter()
+                .find(|group| group.label == Some(self.target))
+            {
+                self.statements = Some(group.statements);
+                return;
+            }
+            visit::walk_block(self, block);
+        }
+    }
+
+    let ItemKind::Fn(box function) = &item.kind else {
+        return None;
+    };
+    let mut collector = Collector {
+        target,
+        statements: None,
+    };
+    collector.visit_block(function.body.as_ref()?);
+    collector.statements
+}
+
+fn statement_label(statement: &Stmt) -> Option<u32> {
+    effective_statement_attributes(statement)
+        .iter()
+        .find_map(|attribute| parse_label_attribute(attribute).ok().flatten())
+}
+
+fn statement_has_malformed_label(statement: &Stmt) -> bool {
+    effective_statement_attributes(statement)
+        .iter()
+        .any(|attribute| parse_label_attribute(attribute).is_err())
+}
+
+fn effective_statement_attributes(statement: &Stmt) -> &[Attribute] {
+    match &statement.kind {
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
+            leading_expression_attributes(expression)
+        }
+        StmtKind::Let(local) => &local.attrs,
+        StmtKind::Item(item) => &item.attrs,
+        StmtKind::MacCall(mac) => &mac.attrs,
+        StmtKind::Empty => &[],
+    }
+}
+
+fn leading_expression_attributes(expression: &Expr) -> &[Attribute] {
+    if !expression.attrs.is_empty() {
+        return &expression.attrs;
+    }
+    match &expression.kind {
+        ExprKind::Binary(_, left, _)
+        | ExprKind::Unary(_, left)
+        | ExprKind::Assign(left, ..)
+        | ExprKind::AssignOp(_, left, _)
+        | ExprKind::Cast(left, _)
+        | ExprKind::Type(left, _)
+        | ExprKind::Field(left, _)
+        | ExprKind::Index(left, _, _)
+        | ExprKind::Paren(left)
+        | ExprKind::Try(left)
+        | ExprKind::Await(left, _)
+        | ExprKind::Use(left, _) => leading_expression_attributes(left),
+        ExprKind::Call(callee, _) => leading_expression_attributes(callee),
+        _ => &expression.attrs,
+    }
+}
+
+fn parse_label_attribute(attribute: &Attribute) -> Result<Option<u32>, ()> {
+    let AttrKind::Normal(normal) = &attribute.kind else {
+        return Ok(None);
+    };
+    let segments = &normal.item.path.segments;
+    if segments
+        .last()
+        .is_none_or(|segment| segment.ident.name.as_str() != "proctor")
+    {
+        return Ok(None);
+    }
+    if segments.len() != 1 {
+        return Err(());
+    }
+    let rendered = pprust::attribute_to_string(attribute);
+    let Some(argument) = rendered
+        .strip_prefix("#[proctor(")
+        .and_then(|value| value.strip_suffix(")]"))
+    else {
+        return Err(());
+    };
+    if argument.is_empty()
+        || (argument != "0"
+            && (argument.starts_with('0') || !argument.bytes().all(|byte| byte.is_ascii_digit())))
+    {
+        return Err(());
+    }
+    argument.parse::<u32>().map(Some).map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SkeletonView, StatementPairMetadata};
+
+    fn parse_item(source: &str) -> P<Item> {
+        P(utils::ast::parse_item(source.to_owned()))
+    }
+
+    #[test]
+    fn mechanical_payload_is_canonical_and_cross_view_immutable() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let item = parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("fixed"); }"#);
+                let view = SkeletonView {
+                    skeleton: pprust::item_to_string(&item),
+                    needs_transformation: false,
+                    statement_dispositions: vec![StatementDisposition {
+                        label: 0,
+                        disposition: StatementDispositionKind::Mechanical,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![StatementPairMetadata {
+                        label: 0,
+                        before_statement: r#"c_print(b"fixed\0" as *const u8 as *const i8);"#
+                            .to_owned(),
+                        printf_template: Some(crate::PrintfTemplateMetadata {
+                            rust_format: "fixed".to_owned(),
+                            argument_count: 0,
+                        }),
+                        pointer_variables_complete: true,
+                        pointer_variables: vec![],
+                    }],
+                };
+                validate_skeleton_view(&item, &view).unwrap();
+
+                let changed =
+                    parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("changed"); }"#);
+                assert_eq!(
+                    validate_cross_view_topology(&item, &changed)
+                        .unwrap_err()
+                        .code,
+                    "cross_view_mechanical_mismatch"
+                );
+
+                let mut invalid = view.clone();
+                invalid.statement_pair_metadata[0]
+                    .printf_template
+                    .as_mut()
+                    .unwrap()
+                    .rust_format = "other".to_owned();
+                assert_eq!(
+                    validate_skeleton_view(&item, &invalid).unwrap_err().code,
+                    "invalid_printf_template"
+                );
+
+                let mut missing = view.clone();
+                missing.statement_pair_metadata[0].printf_template = None;
+                assert_eq!(
+                    validate_skeleton_view(&item, &missing).unwrap_err().code,
+                    "invalid_printf_template"
+                );
+
+                let consuming =
+                    parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#);
+                let mut consuming_view = view;
+                consuming_view.skeleton = pprust::item_to_string(&consuming);
+                consuming_view.needs_transformation = true;
+                consuming_view.statement_dispositions[0].disposition =
+                    StatementDispositionKind::Transform;
+                consuming_view.statement_pair_metadata[0].printf_template =
+                    Some(crate::PrintfTemplateMetadata {
+                        rust_format: "{}".to_owned(),
+                        argument_count: 1,
+                    });
+                validate_skeleton_view(&consuming, &consuming_view).unwrap();
+
+                let attributed = parse_item(
+                    r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", #[allow(unused)] todo!()); }"#,
+                );
+                consuming_view.skeleton = pprust::item_to_string(&attributed);
+                assert_eq!(
+                    validate_skeleton_view(&attributed, &consuming_view)
+                        .unwrap_err()
+                        .code,
+                    "invalid_printf_template"
+                );
+
+                consuming_view.skeleton = pprust::item_to_string(&consuming);
+                consuming_view.statement_pair_metadata[0]
+                    .printf_template
+                    .as_mut()
+                    .unwrap()
+                    .argument_count = 0;
+                assert_eq!(
+                    validate_skeleton_view(&consuming, &consuming_view)
+                        .unwrap_err()
+                        .code,
+                    "invalid_printf_template"
+                );
+            },
+        );
+    }
+}

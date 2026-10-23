@@ -419,6 +419,35 @@ pub fn parse_ty(ty: String) -> Ty {
     *parser.parse_ty().unwrap()
 }
 
+#[inline]
+pub fn try_parse_ty(ty: String) -> Result<Ty, String> {
+    let parse_sess = new_parse_sess();
+    let file_name = FileName::Custom("main.rs".to_string());
+    let mut parser =
+        rustc_parse::new_parser_from_source_str(&parse_sess, file_name, ty).map_err(|error| {
+            let message = format!("{error:?}");
+            for diagnostic in error {
+                diagnostic.cancel();
+            }
+            message
+        })?;
+    let ty = parser.parse_ty().map(|ty| *ty).map_err(|error| {
+        let message = format!("{error:?}");
+        error.cancel();
+        message
+    })?;
+    if parser.token.kind != token::Eof {
+        return Err(format!(
+            "unexpected trailing token `{:?}` after type",
+            parser.token
+        ));
+    }
+    if parse_sess.dcx().has_errors().is_some() {
+        return Err("type parser recovered from an error".to_owned());
+    }
+    Ok(ty)
+}
+
 #[macro_export]
 macro_rules! ty {
     ($($arg:tt)*) => {{

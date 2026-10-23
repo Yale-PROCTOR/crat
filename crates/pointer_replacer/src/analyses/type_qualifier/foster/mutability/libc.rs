@@ -18,7 +18,8 @@ pub fn libc_call<'tcx>(
 ) {
     match callee.as_str() {
         // _1 flows to _0
-        "strchr" | "strrchr" | "strstr" => {
+        "strchr" | "strrchr" | "strstr" | "strtod" | "strtof" | "strtold" | "strtol"
+        | "strtoll" | "strtoul" | "strtoull" => {
             call_strchr(
                 destination,
                 args,

@@ -143,26 +143,35 @@ impl Emitter for ErrorEmitter {
 fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];
 
-    let dep = std::env::var("DIR")
+    let host = host_tuple().expect("failed to determine rustc host tuple");
+    let dependency_dir = |target_dir: &Path| target_dir.join(&host).join("debug/deps");
+    let target_dir = std::env::var("DIR")
         .ok()
-        .and_then(|dir| {
-            let dep = format!("{dir}/deps_crate/target/debug/deps");
-            Path::new(&dep).exists().then_some(dep)
+        .map(|dir| PathBuf::from(dir).join("deps_crate/target"))
+        .filter(|target_dir| dependency_dir(target_dir).exists())
+        .or_else(|| {
+            let target_dir = PathBuf::from("deps_crate/target");
+            dependency_dir(&target_dir).exists().then_some(target_dir)
         })
         .or_else(|| {
-            let dep = "deps_crate/target/debug/deps";
-            Path::new(dep).exists().then(|| dep.to_string())
+            let target_dir = PathBuf::from("../../deps_crate/target");
+            dependency_dir(&target_dir).exists().then_some(target_dir)
         })
-        .or_else(|| {
-            let dep = "../../deps_crate/target/debug/deps";
-            Path::new(dep).exists().then(|| dep.to_string())
-        })
-        .expect("deps_crate not found");
+        .expect(
+            "deps_crate target dependencies not found; build deps_crate with an explicit host target",
+        );
 
-    if let Ok(dir) = std::fs::read_dir(&dep) {
+    let target_deps = dependency_dir(&target_dir);
+    let host_deps = target_dir.join("debug/deps");
+
+    args.push("-L".to_string());
+    args.push(format!("dependency={}", target_deps.display()));
+    if host_deps.exists() {
         args.push("-L".to_string());
-        args.push(format!("dependency={dep}"));
+        args.push(format!("dependency={}", host_deps.display()));
+    }
 
+    if let Ok(dir) = std::fs::read_dir(&target_deps) {
         for f in dir {
             let f = ok_or!(f, continue);
             let f = f.file_name().to_str().unwrap().to_string();
@@ -171,7 +180,7 @@ fn find_deps() -> Options {
             }
             let i = f.find('-').unwrap();
             let name = f[3..i].to_string();
-            let d = format!("{name}={dep}/{f}");
+            let d = format!("{name}={}/{f}", target_deps.display());
             args.push("--extern".to_string());
             args.push(d);
         }
@@ -180,6 +189,16 @@ fn find_deps() -> Options {
     let mut handler = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = rustc_driver::handle_options(&handler, &args).unwrap();
     rustc_session::config::build_session_options(&mut handler, &matches)
+}
+
+fn host_tuple() -> Option<String> {
+    Command::new("rustc")
+        .args(["--print", "host-tuple"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|host| host.trim().to_string())
 }
 
 fn sys_root() -> Option<PathBuf> {
