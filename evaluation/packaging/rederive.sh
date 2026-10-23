@@ -13,7 +13,8 @@
 #   CARGO              the cargo command (default: cargo). The solver and libclang variables the top-level README
 #                      names must be in the environment, as for any build of the repository.
 #   ENVREL             the environment of record, relative to the head (default: the final frame's env file); it becomes
-#                      config/analysis-env.sh without the names in CONFIG_DROP (the toolchain's)
+#                      config/analysis-env.sh without the names in CONFIG_DROP (the toolchain's, and the record's
+#                      names no reader takes once patches/20- is applied)
 #   ARTIFACT_REV       the revision whose evaluation/docker/ becomes artifact/ (default: <head>)
 #   PATCHES            the owners' patches against <head>, applied in name order (default: patches/ beside this script)
 #   LEGACY_LIST        option 3A's list (default: legacy-cut-<head>.txt beside this script); LEGACY_SEARCH=1 makes it
@@ -43,7 +44,7 @@ TOOLS_TARGET=${TOOLS_TARGET:-$SCRATCH/tools-target}; TOOLS=$TOOLS_TARGET/release
 CARGO=${CARGO:-cargo}; DRY_RUN=${DRY_RUN:-0}; LEGACY_SEARCH=${LEGACY_SEARCH:-0}
 LEGACY_LIST=${LEGACY_LIST:-$P/legacy-cut-$(git -C $REPO rev-parse --short=9 "$HEAD^{commit}").txt}
 ENVREL=${ENVREL:-crates/pointer_replacer/frames/l01p14u-s39-mutlend-o-env.sh}
-CONFIG_DROP=${CONFIG_DROP:-SYSROOT LD_LIBRARY_PATH TMPDIR RUSTUP_TOOLCHAIN}
+CONFIG_DROP=${CONFIG_DROP:-SYSROOT LD_LIBRARY_PATH TMPDIR RUSTUP_TOOLCHAIN CRAT_ERA5_EXECUTION_ROLE CRAT_ERA5_TOOLCHAIN_DIGEST CRAT_ERA5_DEPENDENCY_DIGEST CRAT_ERA5C_RAW_CAUSE_LEDGER CRAT_ERA5C_RAW_CAUSE_BUDGET_S}
 PATCHES=${PATCHES:-$P/patches}
 IDENTITY_PATTERNS=${IDENTITY_PATTERNS:-'/home/|agent-worktrees|anthropic|claude|codex|openai|github\.com|Co-Authored'}
 HASH_REPOS=${HASH_REPOS:-$REPO}

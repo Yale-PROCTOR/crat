@@ -29,7 +29,8 @@ but `README.md` is unlisted). The other parameters are listed at the top of `red
 ## The derivation, one commit per step on the branch `rederive-<tag>`
 
 1. **The worktree** at `<head>`; `config/analysis-env.sh` = the environment of record's exports, less the toolchain's
-   names (`CONFIG_DROP`).
+   names and the five no reader takes once `patches/20-` is applied (the execution role, the two recipe digests, the
+   raw-cause ledger and its budget) (`CONFIG_DROP`).
 2. **The owners' patches** (`patches/NN-<lane>-<topic>.patch`, against `<head>` in its own paths and names), in name
    order with `git apply --index`; one that does not apply stops the derivation. Each patch names its survey rows in
    its header; its owner builds `<head>` with it applied as their own check.
