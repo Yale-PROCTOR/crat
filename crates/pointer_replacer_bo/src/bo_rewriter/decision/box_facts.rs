@@ -133,7 +133,9 @@ fn numeric_default_fill(
             return None;
         }
         return Some(DefaultFillPlan {
-            initializer: format!("vec![0 as u8; ({extent}) as usize].into_boxed_slice()"),
+            initializer: format!(
+                "::std::vec::from_elem(0 as u8, ({extent}) as usize).into_boxed_slice()"
+            ),
             receipt: "default-fill-slice-u8",
             shape: BoxShape::Slice,
             fabricated_extent: false,
@@ -163,7 +165,9 @@ fn numeric_default_fill(
             return None;
         }
         return Some(DefaultFillPlan {
-            initializer: format!("vec![0 as {normalized}; {extent}].into_boxed_slice()"),
+            initializer: format!(
+                "::std::vec::from_elem(0 as {normalized}, {extent}).into_boxed_slice()"
+            ),
             receipt: "default-fill-slice",
             shape: BoxShape::Slice,
             fabricated_extent: false,
@@ -181,7 +185,7 @@ fn numeric_default_fill(
     }
     Some(DefaultFillPlan {
         initializer: format!(
-            "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
+            "::std::vec::from_elem(0 as {normalized}, crate::FALLBACK_SLICE_EXTENT).into_boxed_slice()"
         ),
         receipt: "default-fill-slice-fallback",
         shape: BoxShape::Slice,
@@ -2210,7 +2214,7 @@ impl BoxOwnershipFacts {
                         delete_statements.push(memset.statement_span);
                         (
                             format!(
-                                "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
+                                "::std::vec::from_elem(0 as {normalized}, crate::FALLBACK_SLICE_EXTENT).into_boxed_slice()"
                             ),
                             "memset-zero-slice",
                             BoxShape::Slice,
@@ -2250,7 +2254,9 @@ impl BoxOwnershipFacts {
                         )
                     } else {
                         (
-                            format!("vec![0 as {normalized}; {count}].into_boxed_slice()"),
+                            format!(
+                                "::std::vec::from_elem(0 as {normalized}, {count}).into_boxed_slice()"
+                            ),
                             "calloc-zero-slice",
                             BoxShape::Slice,
                             false,
@@ -3039,5 +3045,28 @@ mod tests {
             numeric_default_fill("Pair", "malloc", "size_of::<Pair>()", None).is_none(),
             "mutation killer: an unadmitted element type must not receive a fill"
         );
+    }
+
+    /// R1298-1 (d): the lab's `io` pass prints the tree it reads with every macro
+    /// expanded, and `vec![e; n]` prints as `::alloc::vec::from_elem` (E0433 in a crate
+    /// with no `extern crate alloc`); every fill spells `::std::vec::from_elem` itself.
+    #[test]
+    fn r1298_d_default_fill_initializers_invoke_no_macro() {
+        for (normalized, size) in [
+            ("core::ffi::c_void", "(items * size) as core::ffi::c_ulong"),
+            ("i32", "n * ::std::mem::size_of::<i32>()"),
+            ("i32", "::std::mem::size_of::<i32>()"),
+            ("i32", "n.wrapping_mul(::std::mem::size_of::<i32>())"),
+        ] {
+            let fill = numeric_default_fill(normalized, "malloc", size, None).expect(size);
+            assert!(!fill.initializer.contains('!'), "{}", fill.initializer);
+            if fill.shape == super::BoxShape::Slice {
+                assert!(
+                    fill.initializer.starts_with("::std::vec::from_elem("),
+                    "{}",
+                    fill.initializer
+                );
+            }
+        }
     }
 }

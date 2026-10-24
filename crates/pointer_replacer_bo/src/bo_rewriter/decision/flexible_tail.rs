@@ -4,7 +4,7 @@
 //! A C struct hack `struct S { header…; T tail[1]; }` allocated as
 //! `malloc(sizeof(S) + (n - 1) * sizeof(T))` becomes
 //! `struct S { header…, tail: Box<[T]> }` with the allocation
-//! `Box::new(S { header defaults…, tail: vec![0 as T; n].into_boxed_slice() })`,
+//! `Box::new(S { header defaults…, tail: ::std::vec::from_elem(0 as T, n).into_boxed_slice() })`,
 //! every tail access `*(*p).tail.as_mut_ptr().offset(e)` → `(*p).tail[(e) as usize]`,
 //! the allocating callee returning `Box<S>` (its C-ABI wrapper `Box::into_raw`),
 //! every receiver a `Box<S>` local, the freeing callee taking `Box<S>` (its
@@ -906,7 +906,7 @@ pub(crate) fn derive<'tcx>(
                     span: init_span,
                     // Trailing comma: the AST printer's round trip keeps one.
                     replacement: format!(
-                        "Box::new({} {{ {}{}{}: vec![0 as {element_source}; {count}].into_boxed_slice(), }})",
+                        "Box::new({} {{ {}{}{}: ::std::vec::from_elem(0 as {element_source}, {count}).into_boxed_slice(), }})",
                         struct_path,
                         header_initializers.join(", "),
                         if header_initializers.is_empty() { "" } else { ", " },

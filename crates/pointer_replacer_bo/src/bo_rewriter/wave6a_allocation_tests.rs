@@ -772,7 +772,7 @@ fn w6a_t1_tulip_cci_and_smoke_deliver_the_split_struct() {
         out.source
     );
     assert!(
-        src.contains("letmutret:Box<ti_buffer>=Box::new(crate::ti_buffer{size:0asi32,pushes:0asi32,index:0asi32,sum:0asf64,vals:vec![0asf64;(((size-1asstd::os::raw::c_int))+1)asusize].into_boxed_slice(),});"),
+        src.contains("letmutret:Box<ti_buffer>=Box::new(crate::ti_buffer{size:0asi32,pushes:0asi32,index:0asi32,sum:0asf64,vals:::std::vec::from_elem(0asf64,(((size-1asstd::os::raw::c_int))+1)asusize).into_boxed_slice(),});"),
         "{}",
         out.source
     );

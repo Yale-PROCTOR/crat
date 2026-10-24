@@ -671,6 +671,10 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) custody_expectations: Vec<DeliveryExpectation>,
     pub(crate) additive_family_receipts: Vec<additive::FamilyFallbackReceipt>,
     pub(crate) exposure: String,
+    /// R1295-1: the configured exposure names that matched no local function, and
+    /// those that matched several (with how many), as the seed received them.
+    pub(crate) configured_unmatched: Vec<String>,
+    pub(crate) configured_ambiguous: Vec<(String, usize)>,
     /// wave-6f: the struct-field reference transactions, applied and held.
     pub(crate) field_transactions: String,
     pub(crate) d4_edges: String,
@@ -5704,32 +5708,6 @@ pub(crate) fn validate_plan(
     // ⇒ exactly one, in the crate root, so no `E0433` when a single fabricated
     // site's function reverts and its siblings do not.
     //
-    // **R448-1 (B′) — the System global allocator** (R760-1: stand-alone for 54),
-    // one per emitted crate in which at least one edit survives (decided before
-    // either crate-level item is added). A fully reverted crate keeps its input
-    // bytes (R216), and a Box cannot exist without a surviving edit. Appended at
-    // the same anchor, before the const, so both emitters append the two in one order.
-    let an_edit_survives = kept_by_file.values().any(|kept| !kept.is_empty());
-    if an_edit_survives
-        && let Some(root) = planned.root_file.clone()
-        && let Some(item) = planned.global_allocator_item.as_deref()
-        && let Some(source) = texts.get(&root)
-    {
-        let at = source.len();
-        kept_by_file.entry(root).or_default().push(plan::Edit {
-            lo: at,
-            hi: at,
-            replacement: format!("\n{item}\n"),
-            justification: plan::Justification::GlobalAllocator,
-            owner_class: None,
-            owner_path: "<crate>".to_owned(),
-            bridge: None,
-            atom_ids: Vec::new(),
-            subject_id: "<crate>".to_owned(),
-            required_arms: "-".to_owned(),
-            edit_kind: "global-allocator",
-        });
-    }
     if kept_by_file.values().flatten().any(|e| {
         matches!(
             e.justification,
@@ -7497,9 +7475,6 @@ fn prepare_plan_files<'tcx>(
     // put a second copy of the survivor rule in a place that cannot see the
     // survivors.
     planned.len_const_item = Some(decision::seam::fabricated_len_item());
-    // R448-1 (B′). Same place, same reason: parsed and printed where a session exists.
-    planned.global_allocator_item =
-        decision::seam::emits_global_allocator(tcx).then(decision::seam::global_allocator_item);
 
     let mut texts = std::collections::BTreeMap::new();
     for key in planned.by_file.keys() {
@@ -10125,6 +10100,8 @@ fn finish_decide<'tcx>(
             custody_expectations: Vec::new(),
             additive_family_receipts: family_receipts,
             exposure: exposure.receipts_tsv(),
+            configured_unmatched: exposure.unmatched.clone(),
+            configured_ambiguous: exposure.ambiguous.clone(),
             field_transactions: table.field_transactions.receipt_tsv(tcx),
             d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
             pairs: coconv.pair_receipts_tsv(tcx),

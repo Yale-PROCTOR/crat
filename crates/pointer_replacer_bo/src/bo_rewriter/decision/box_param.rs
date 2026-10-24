@@ -1309,13 +1309,11 @@ fn inside_loop(tcx: TyCtxt<'_>, mut hir: HirId) -> bool {
 
 /// **R620-3 (a) — the emitted crate's allocator is the system's** (R443-1):
 /// then a block Rust allocates is a `malloc` block, and a C `free` of it is
-/// defined. **Composed with R448-1 (B′)**, which appends
-/// `#[global_allocator] static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` to
-/// every emitted crate with a surviving edit (a crate with none has no Box): a
-/// crate graph that declares no allocator of its own is emitted with exactly
-/// that one, and a crate that declares one keeps it. So the question is the
-/// pinned Linux System / libc-free contract itself — no user allocator in the
-/// graph except a local `System` (R619-8), std present, Linux.
+/// defined. The emitted crate declares no allocator (R1298-1 removed (B′)'s
+/// appended declaration), and a crate graph that declares none runs on
+/// `std::alloc::System`; a crate that declares one keeps it. So the question is
+/// the pinned Linux System / libc-free contract itself — no user allocator in
+/// the graph except a local `System` (R619-8), std present, Linux.
 pub(crate) fn emitted_allocator_is_system(tcx: TyCtxt<'_>) -> bool {
     super::ownership_fields_native::c_free_allocator_compatible(tcx)
 }
@@ -2408,6 +2406,18 @@ pub(crate) fn derive<'tcx>(
         // surface, so that chain still holds typed.
         if slice && raw_surface(param.fn_did) {
             hold(format!("chain-endpoint-raw:{callee_path}:slice"), &mut out);
+            continue;
+        }
+        // **R1295-1 (main relay 364 (b))** — nor does an `Option<Box<T>>` formal:
+        // the wrapper's constructor re-enters ownership only for a SIZED,
+        // non-null one. The chain holds typed here, at the planner, so the shape
+        // never reaches the AST's wrapper builder (which fails the whole
+        // program on it); the function keeps its raw formal.
+        if optional && raw_surface(param.fn_did) {
+            hold(
+                format!("inbound-wrapper-unplaceable:{callee_path}:optional-owner"),
+                &mut out,
+            );
             continue;
         }
         if pointee_override.is_some() {

@@ -89,16 +89,8 @@ impl ConfiguredExposureInput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExposureInputFailure {
-    DigestMismatch {
-        claimed: String,
-        observed: String,
-    },
+    DigestMismatch { claimed: String, observed: String },
     DuplicateName(String),
-    UnmatchedName(String),
-    AmbiguousName {
-        name: String,
-        functions: Vec<String>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,6 +156,11 @@ pub(crate) struct SeedCounts {
 #[derive(Clone, Debug)]
 pub(crate) struct ExposureSeed {
     members: FxHashMap<LocalDefId, SeedProvenance>,
+    /// Configured names that match no local function (R1295-1): ignored, listed.
+    pub(crate) unmatched: Vec<String>,
+    /// Configured names that match several local functions, with how many: every
+    /// match is configured (R1295-1).
+    pub(crate) ambiguous: Vec<(String, usize)>,
     pub(crate) configured_input_sha256: String,
     pub(crate) manifest_sha256: String,
 }
@@ -193,20 +190,19 @@ impl ExposureSeed {
         }
 
         let mut members = FxHashMap::<LocalDefId, SeedProvenance>::default();
+        let mut unmatched = Vec::new();
+        let mut ambiguous = Vec::new();
         for name in &configured.names {
             let Some(candidates) = by_name.get(name) else {
-                return Err(ExposureInputFailure::UnmatchedName(name.clone()));
+                unmatched.push(name.clone());
+                continue;
             };
-            let [did] = candidates.as_slice() else {
-                return Err(ExposureInputFailure::AmbiguousName {
-                    name: name.clone(),
-                    functions: candidates
-                        .iter()
-                        .map(|did| tcx.def_path_str(did.to_def_id()))
-                        .collect(),
-                });
-            };
-            members.entry(*did).or_default().configured_name = true;
+            if candidates.len() > 1 {
+                ambiguous.push((name.clone(), candidates.len()));
+            }
+            for did in candidates {
+                members.entry(*did).or_default().configured_name = true;
+            }
         }
         if let Some(web) = web {
             for did in web.roots() {
@@ -239,9 +235,18 @@ impl ExposureSeed {
             manifest.push_str(&row);
             manifest.push('\n');
         }
+        // Present only where there are some, so an exact list's manifest is unchanged.
+        for name in &unmatched {
+            manifest.push_str(&format!("unmatched\t{name}\n"));
+        }
+        for (name, matches) in &ambiguous {
+            manifest.push_str(&format!("ambiguous\t{name}\t{matches}\n"));
+        }
         let manifest_sha256 = sha256(manifest.as_bytes());
         Ok(Self {
             members,
+            unmatched,
+            ambiguous,
             configured_input_sha256: configured.names_sha256.clone(),
             manifest_sha256,
         })
@@ -281,6 +286,10 @@ pub(crate) struct ExposurePolicy {
     functions: Vec<FunctionExposure>,
     static_fnptr_seeds: Vec<StaticFnPtrSeed>,
     seed_counts: SeedCounts,
+    /// The seed's configured names that matched no local function (R1295-1).
+    pub(crate) unmatched: Vec<String>,
+    /// The seed's configured names that matched several, with how many (R1295-1).
+    pub(crate) ambiguous: Vec<(String, usize)>,
     pub(crate) configured_input_sha256: String,
     pub(crate) manifest_sha256: String,
 }
@@ -314,6 +323,8 @@ impl ExposurePolicy {
             functions,
             static_fnptr_seeds: web.map_or_else(Vec::new, |web| web.static_seeds().to_vec()),
             seed_counts: seed.counts(),
+            unmatched: seed.unmatched.clone(),
+            ambiguous: seed.ambiguous.clone(),
             configured_input_sha256: seed.configured_input_sha256.clone(),
             manifest_sha256: seed.manifest_sha256.clone(),
         }
@@ -584,8 +595,14 @@ mod tests {
         .expect("configured-name fixture compiles");
     }
 
+    /// **R1295-1 / main relay 364 (a)** — the lab's lists name every `FUNCTION_DECL`
+    /// spelling in a project's headers (proctor's c2rust adapter), so a configured
+    /// name may match no local function, or several (a static defined once per
+    /// translation unit). Neither fails the program: an unmatched name is ignored,
+    /// counted and listed; an ambiguous name configures every match (legacy's
+    /// membership meaning). Replaces `c_n1`'s loud refusal.
     #[test]
-    fn c_n1_unmatched_and_ambiguous_configured_names_are_loud() {
+    fn r1298_a_unmatched_names_are_ignored_and_ambiguous_names_configure_every_match() {
         ::utils::compilation::run_compiler_on_str(
             "#![allow(dead_code, unused_unsafe)]\n\
              mod a { pub unsafe fn api(p: *const i32) -> *const i32 { p } }\n\
@@ -608,18 +625,69 @@ mod tests {
                     )
                     .expect("configured input")
                 };
-                assert!(matches!(
-                    ExposureSeed::derive(&program, &input("missing"), Some(&web)),
-                    Err(ExposureInputFailure::UnmatchedName(name)) if name == "missing"
-                ));
-                assert!(matches!(
-                    ExposureSeed::derive(&program, &input("api"), Some(&web)),
-                    Err(ExposureInputFailure::AmbiguousName { name, functions })
-                        if name == "api" && functions.len() == 2
-                ));
+                let missing = ExposureSeed::derive(&program, &input("missing"), Some(&web))
+                    .expect("an unmatched name is ignored, not an error");
+                assert_eq!(missing.unmatched, ["missing".to_owned()]);
+                assert!(missing.ambiguous.is_empty());
+                assert_eq!(missing.counts().configured_matches, 0);
+                let api = ExposureSeed::derive(&program, &input("api"), Some(&web))
+                    .expect("an ambiguous name configures every match");
+                assert_eq!(api.ambiguous, [("api".to_owned(), 2)]);
+                assert!(api.unmatched.is_empty());
+                assert_eq!(api.counts().configured_matches, 2);
+                // An exact list (the rs-crown record's) leaves the manifest as it was:
+                // the unmatched / ambiguous rows appear only where there are some.
+                let exact = ExposureSeed::derive(
+                    &program,
+                    &ConfiguredExposureInput::explicit_empty("fixture-config"),
+                    Some(&web),
+                )
+                .expect("the empty list");
+                assert!(exact.unmatched.is_empty() && exact.ambiguous.is_empty());
             },
         )
         .expect("ambiguous-name fixture compiles");
+    }
+
+    /// **R1295-1 (a), through the pipeline** — a list carrying a name that no
+    /// local function has decides the program (the program does not fail at the
+    /// seed), configures the names that match, and hands the unmatched name to the
+    /// artifacts the pass receipt reads.
+    #[test]
+    fn r1298_a_pipeline_ignores_an_unmatched_configured_name_and_receipts_it() {
+        ::utils::compilation::run_compiler_on_str(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             pub unsafe fn api(p: *const i32) -> *const i32 { p }\n\
+             pub unsafe fn helper(p: *const i32) -> *const i32 { p }\n",
+            |tcx| {
+                let configured = ConfiguredExposureInput::from_names(
+                    "fixture-config",
+                    ["api".to_owned(), "SPX_NAMESPACE".to_owned()],
+                )
+                .expect("configured input");
+                let run_config = super::super::super::EmissionRunConfig {
+                    configured_exposure: configured,
+                };
+                let (_, ctx) = super::super::super::decide_table_with_emission_config(
+                    tcx,
+                    Some((
+                        crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
+                        Some(
+                            crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        ),
+                    )),
+                    &run_config,
+                )
+                .expect("an unmatched configured name does not fail the program");
+                assert_eq!(
+                    ctx.raw_boundary_artifacts.configured_unmatched,
+                    ["SPX_NAMESPACE".to_owned()]
+                );
+                assert!(ctx.raw_boundary_artifacts.configured_ambiguous.is_empty());
+                assert_eq!(ctx.exposure.seed_counts().configured_matches, 1);
+            },
+        )
+        .expect("pipeline exposure fixture compiles");
     }
 
     #[test]

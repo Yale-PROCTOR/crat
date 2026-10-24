@@ -262,7 +262,7 @@ fn box2_w1_unannotated_calloc_cast_chain_reaches_the_subject() {
         panic!("BOX2-W1 fixture must emit");
     };
     assert!(
-        source.contains("let mut ff = vec![0 as f32; size].into_boxed_slice()"),
+        source.contains("let mut ff = ::std::vec::from_elem(0 as f32, size).into_boxed_slice()"),
         "degradations={degradations:#?}\n{source}"
     );
     assert!(source.contains("drop(ff)"), "{source}");
@@ -339,7 +339,7 @@ fn box2_w2_malloc_slice_uses_numeric_default_fill() {
         panic!("BOX2-W2 fixture must emit");
     };
     assert!(
-        source.contains("p: Box<[f64]> = vec![0 as f64; n].into_boxed_slice()"),
+        source.contains("p: Box<[f64]> = ::std::vec::from_elem(0 as f64, n).into_boxed_slice()"),
         "degradations={degradations:#?}\n{source}"
     );
     assert!(source.contains("drop(p)"), "{source}");
@@ -408,7 +408,7 @@ fn box2_n3_flexible_tail_is_a_typed_hold_with_layout_evidence() {
     let compact = source.split_whitespace().collect::<String>();
     assert!(compact.contains("values:Box<[f64]>}"), "{source}");
     assert!(
-        compact.contains("letp:Box<Tail>=Box::new(crate::Tail{len:0asi32,values:vec![0asf64;(((n-1))+1)asusize].into_boxed_slice(),});"),
+        compact.contains("letp:Box<Tail>=Box::new(crate::Tail{len:0asi32,values:::std::vec::from_elem(0asf64,(((n-1))+1)asusize).into_boxed_slice(),});"),
         "{source}"
     );
     assert!(compact.contains("drop(p);"), "{source}");
@@ -502,7 +502,7 @@ fn box2_w5_void_byte_extent_emits_u8_box_when_no_boundary_blocks() {
         panic!("BOX2-W5 fixture must emit");
     };
     assert!(
-        source.contains("v: Box<[u8]> = vec![0 as u8; (items * size) as usize]"),
+        source.contains("v: Box<[u8]> = ::std::vec::from_elem(0 as u8, (items * size) as usize)"),
         "degradations={degradations:#?}\n{source}"
     );
     assert!(source.contains("drop(v)"), "{source}");
@@ -558,7 +558,7 @@ fn box_w2_calloc_uses_licensed_slice_extent() {
     };
     assert!(source.contains("p: Box<[i32]>"), "{source}");
     assert!(
-        source.contains("vec![0 as i32; n].into_boxed_slice()"),
+        source.contains("::std::vec::from_elem(0 as i32, n).into_boxed_slice()"),
         "licensed count was not consumed: {source}"
     );
     assert!(source.contains("drop(p)"), "{source}");
@@ -971,16 +971,13 @@ fn a_subject_in_a_module_is_emitted_into_that_module() {
         module.contains("p: &mut i32"),
         "the module's subject was not rewritten: {module}"
     );
-    // MIGRATED under R217-2 by R760-1, (B′) (R619-3 (1) in 53's line): an edit
-    // survives (in the module), so the crate root carries the crate's one
-    // `#[global_allocator]` declaration, appended after its input bytes. The point
-    // stands: no subject edit lands in the root.
-    let root = text_for(&emission, "lib.rs").expect("the root carries the declaration");
-    assert_eq!(root.matches("#[global_allocator]").count(), 1, "{root}");
-    assert!(
-        root.starts_with(ROOT_WITH_MODULE),
-        "the root's own bytes are untouched: {root}"
-    );
+    // RE-PINNED by R1298-1 (USER): no `#[global_allocator]` item is emitted, so
+    // nothing is appended to the root. The point stands: no subject edit lands in
+    // the root, which is absent from the map or carries exactly its input bytes.
+    if let Some(root) = text_for(&emission, "lib.rs") {
+        assert!(!root.contains("#[global_allocator]"), "{root}");
+        assert_eq!(root, ROOT_WITH_MODULE, "the root's own bytes are untouched");
+    }
     assert!(emission.rollbacks.is_empty(), "{:?}", emission.rollbacks);
     assert!(
         emission.unplaceable.is_empty(),
@@ -11659,21 +11656,18 @@ fn a_reverted_fn_keeps_its_raw_declaration() {
     );
 }
 
-/// **(B′) — the allocator declaration rides a surviving edit, once** (R443-1,
-/// R448-1; relay main/201 R619-3 (1)). A crate in which an edit survives
-/// declares `#[global_allocator] static …: std::alloc::System` at its root,
-/// so a Rust drop of a C-allocated `Box` is libc `free` (R443); a crate whose
-/// every edit is withdrawn keeps its input bytes (R216) and gains nothing.
-/// Both layers: the text layer (`validate_plan`) and the AST layer of record.
-///
-/// *Mutation-tested:* drop the `an_edit_survives` guard, or the AST layer's
-/// `!edited.is_empty()`, and the withdrawn half fails; drop the insertion and
-/// the surviving half fails.
+/// **R1298-1 (USER) — no allocator declaration, in either layer.** Supersedes
+/// (B′) (R443-1, R448-1), which appended `#[global_allocator] static …:
+/// std::alloc::System` to every crate with a surviving edit: the lab's next pass
+/// prints that item expanded, with `#[rustc_std_internal_symbol]`, which the pass
+/// after it cannot compile (main 248-partial §2, 309 rows). Natively the program
+/// is the same: no declared allocator is `std::alloc::System`. A crate whose edit
+/// survives is emitted with no declaration; a withdrawn one keeps its input bytes.
 #[test]
-fn b_prime_the_allocator_declaration_rides_a_surviving_edit_once() {
+fn r1298_c_no_allocator_declaration_rides_a_surviving_edit() {
     const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                        pub unsafe fn f(p: *mut i32) -> i32 { *p }\n";
-    const DECLARED: &str = "__CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;";
+    const DECLARED: &str = "__CRAT_GLOBAL_ALLOCATOR";
     let fixture = Fixture::new(&[("lib.rs", SRC)]);
     let (plan, texts) =
         ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
@@ -11687,8 +11681,8 @@ fn b_prime_the_allocator_declaration_rides_a_surviving_edit_once() {
     let [root] = files.values().collect::<Vec<_>>()[..] else {
         panic!("one emitted file: {files:?}")
     };
-    assert_eq!(root.matches("#[global_allocator]").count(), 1, "{root}");
-    assert!(root.contains(DECLARED), "{root}");
+    assert_eq!(root.matches("#[global_allocator]").count(), 0, "{root}");
+    assert!(!root.contains(DECLARED), "{root}");
     assert!(
         !root.contains("p: *mut i32"),
         "the subject's edit survives: {root}"
@@ -11704,11 +11698,12 @@ fn b_prime_the_allocator_declaration_rides_a_surviving_edit_once() {
             .all(|text| !text.contains("#[global_allocator]")),
         "{files:?}"
     );
-    // The AST layer: one declaration beside the surviving edit, none when the
-    // only subject is reverted.
+    // The AST layer: no declaration beside the surviving edit, none when the only
+    // subject is reverted.
     let kept = ast_emitted_source_of(SRC).expect("the AST layer emits");
-    assert_eq!(kept.matches("#[global_allocator]").count(), 1, "{kept}");
-    assert!(kept.contains(DECLARED), "{kept}");
+    assert_eq!(kept.matches("#[global_allocator]").count(), 0, "{kept}");
+    assert!(!kept.contains(DECLARED), "{kept}");
+    assert!(!kept.contains("p: *mut i32"), "the edit survives: {kept}");
     let reverted = super::ast_emitted_source_of_reverting(SRC, "f::p#1")
         .expect("the AST layer emits under a revert set");
     assert!(!reverted.contains("#[global_allocator]"), "{reverted}");

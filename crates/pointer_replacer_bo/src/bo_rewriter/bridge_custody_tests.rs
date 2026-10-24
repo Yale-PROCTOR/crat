@@ -3229,8 +3229,9 @@ static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;
 }
 
 /// **R760-1 x R605-2 (main 160d) — the emitted crate's `#[global_allocator]` does not
-/// hide its modules' bindings.** Every emitted tree declares `#[global_allocator] static
-/// __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` at its root (R760-1, batch 54), and the
+/// hide its modules' bindings.** Every emitted tree declared `#[global_allocator] static
+/// __CRAT_GLOBAL_ALLOCATOR: std::alloc::System` at its root (R760-1, batch 54; KEPT after
+/// R1298-1 removed that item: an input crate may still declare one), and the
 /// inventory reads any attribute it does not know as one that may add items, so the
 /// root went opaque and R605-2's alias resolution failed closed crate-wide: brotli's
 /// `BrotliBuildMetaBlockGreedyInternal(.., literal_context_lut: ContextLut, ..)` read

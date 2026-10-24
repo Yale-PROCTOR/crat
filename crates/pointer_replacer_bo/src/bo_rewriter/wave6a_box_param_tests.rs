@@ -529,7 +529,7 @@ pub unsafe extern "C" fn table_put(mut slots: *mut slot, mut index: usize) {
     assert!(src.contains("key[0]=0asi8;"), "{}", out.source);
     assert!(
         src.contains(
-            "letmutkey:Box<[i8]>=::std::vec![0i8;((8asusize)asusize)].into_boxed_slice();"
+            "letmutkey:Box<[i8]>=::std::vec::from_elem(0i8,((8asusize)asusize)).into_boxed_slice();"
         ),
         "{}",
         out.source
@@ -3664,5 +3664,72 @@ fn w6a_162_a_lend_without_ownership_evidence_is_withheld() {
         super::verify::type_checks_str(&out.source),
         "{}",
         out.source
+    );
+}
+
+/// **R1295-1 / main relay 364 (b) — an exposed consumer's optional owner keeps
+/// its raw formal; the program emits.** `ht_destroy` takes `Option<Box<ht>>`
+/// under the exported-consumer waiver; configured as exposed (the lab's
+/// `c_exposed_fns`), it sits behind the raw wrapper, whose argument constructor
+/// re-enters ownership only for a sized, non-null formal (`Box::from_raw(p)`).
+/// The chain holds typed at the planner (`inbound-wrapper-unplaceable`), so the
+/// shape never reaches the AST's wrapper builder, and the rest of the program is
+/// emitted. generic_foreach's shape in TRACTOR (main 248-partial §2).
+#[test]
+fn r1298_b_an_exposed_consumer_with_an_optional_owner_keeps_its_raw_formal() {
+    const SOURCE: &str = r#"
+#[repr(C)]
+pub struct ht { pub length: usize, pub capacity: usize }
+#[no_mangle]
+pub unsafe extern "C" fn ht_create() -> *mut ht {
+    let mut table = malloc(::std::mem::size_of::<ht>()) as *mut ht;
+    if table.is_null() { return 0 as *mut ht; }
+    (*table).length = 0 as usize;
+    (*table).capacity = 16 as usize;
+    return table;
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_destroy(mut table: *mut ht) {
+    free(table as *mut core::ffi::c_void);
+}
+#[no_mangle]
+pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table).length; }
+"#;
+    let dir = std::env::temp_dir().join(format!("crat-r1298-b-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, format!("{PRELUDE}{SOURCE}")).unwrap();
+    let run_config = super::EmissionRunConfig {
+        configured_exposure: super::decision::exposure::ConfiguredExposureInput::from_names(
+            "fixture-config",
+            ["ht_destroy".to_owned()],
+        )
+        .expect("configured input"),
+    };
+    let capture = super::diagnose_raw_boundary_census_with_config(&root, &run_config);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let capture = capture.expect("the program emits; the optional owner does not fail it");
+    let files = capture.emitted_files.as_ref().expect("an emitted tree");
+    let src = compact(&files.values().cloned().collect::<String>());
+    assert!(
+        src.contains("fnht_destroy(muttable:*mutht)"),
+        "the exposed consumer keeps its raw formal:\n{src}"
+    );
+    assert!(
+        capture
+            .raw_boundary_artifacts
+            .box_param_receipts
+            .contains("inbound-wrapper-unplaceable"),
+        "{}",
+        capture.raw_boundary_artifacts.box_param_receipts
+    );
+    assert_eq!(
+        crate::bo_pipeline::inbound_wrapper_unplaceable(
+            &capture.raw_boundary_artifacts.box_param_receipts
+        )
+        .len(),
+        1,
+        "the CLI receipt counts the held formal once: {}",
+        capture.raw_boundary_artifacts.box_param_receipts
     );
 }

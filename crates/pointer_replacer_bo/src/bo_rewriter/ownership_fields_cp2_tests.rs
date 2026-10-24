@@ -237,7 +237,7 @@ fn r376_uint16_cast_target_emits_native_numeric_boxes() {
     "#,
     );
     let source = require_emitted(&input, "u16");
-    assert!(source.contains("::std::vec![0u16;"));
+    assert!(source.contains("::std::vec::from_elem(0u16,"));
 }
 
 #[test]

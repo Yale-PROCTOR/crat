@@ -252,38 +252,18 @@ pub(super) fn canonicalize(label: &str, src: &str) -> String {
     String::from_utf8(out.stdout).expect("rustfmt emitted valid UTF-8")
 }
 
-/// **(B′) — the allocator declaration** (R443-1, R448-1; relay main/201
-/// R619-3 (1)). An emitted crate in which an edit survives declares
-/// `#[global_allocator] static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System`.
-/// The goldens are the M1 spec, landed verbatim, and predate it. So instead
-/// of adding the same two lines to every expected file, the comparison takes
-/// the declaration off the emitted side, having asserted that the crate
-/// declares it exactly when its text moved, and returns the rest canonically
-/// formatted. The expected files are unchanged (migration receipted under
-/// R217-2).
-pub(super) fn without_allocator_declaration(label: &str, input: &str, emitted: &str) -> String {
-    const ATTRIBUTE: &str = "#[global_allocator]";
-    const ITEM: &str = "static __CRAT_GLOBAL_ALLOCATOR: std::alloc::System = std::alloc::System;";
+/// **R1298-1 (USER) — no allocator declaration.** The goldens are the M1 spec,
+/// landed verbatim; (B′)'s `#[global_allocator]` item, which they predated and
+/// this comparison used to take off the emitted side, is no longer emitted. The
+/// emitted side is asserted to declare none and compared canonically formatted.
+pub(super) fn without_allocator_declaration(label: &str, _input: &str, emitted: &str) -> String {
     let canonical = canonicalize(label, emitted);
-    let declared = canonical.matches(ATTRIBUTE).count();
-    let rest = if declared == 0 {
-        canonical.clone()
-    } else {
-        assert_eq!(canonical.matches(ITEM).count(), 1, "{label}:\n{canonical}");
-        let kept = canonical
-            .lines()
-            .filter(|line| line.trim() != ATTRIBUTE && line.trim() != ITEM)
-            .collect::<Vec<_>>()
-            .join("\n");
-        canonicalize(label, &(kept + "\n"))
-    };
-    let edited = rest != canonicalize("input", input);
     assert_eq!(
-        declared,
-        usize::from(edited),
-        "{label}: a crate declares the allocator once exactly when an edit survives:\n{canonical}"
+        canonical.matches("#[global_allocator]").count(),
+        0,
+        "{label}: no allocator declaration is emitted (R1298-1):\n{canonical}"
     );
-    rest
+    canonical
 }
 
 /// The ten goldens. RED until the emitter exists.

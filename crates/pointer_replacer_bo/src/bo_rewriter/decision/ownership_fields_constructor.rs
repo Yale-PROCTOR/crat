@@ -359,7 +359,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                 .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
             let count =
                 format!("((({original}) as usize) / ::core::mem::size_of::<{element_spelling}>())");
-            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            let replacement = format!("::std::vec::from_elem({zero}, {count}).into_boxed_slice()");
             return Ok(Constructor {
                 allocation,
                 field_load: false,
@@ -388,7 +388,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                 .span_to_snippet(bytes.span)
                 .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
             let count = format!("(({original}) as usize)");
-            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            let replacement = format!("::std::vec::from_elem({zero}, {count}).into_boxed_slice()");
             return Ok(Constructor {
                 allocation,
                 field_load: false,
@@ -440,7 +440,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
                 .map_err(|_| SourceHold::Missing("constructor-byte-spelling"))?;
             let count =
                 format!("((({original}) as usize) / ::core::mem::size_of::<{element_spelling}>())");
-            let replacement = format!("::std::vec![{zero}; {count}].into_boxed_slice()");
+            let replacement = format!("::std::vec::from_elem({zero}, {count}).into_boxed_slice()");
             (BoxShape::Slice, count, replacement)
         };
         return Ok(Constructor {
@@ -526,7 +526,7 @@ pub(crate) fn derive_with_field_forms<'tcx>(
         element_spelling,
         edit: BoxExprEdit {
             span: init.span,
-            replacement: format!("::std::vec![{zero}; {count}].into_boxed_slice()"),
+            replacement: format!("::std::vec::from_elem({zero}, {count}).into_boxed_slice()"),
             receipt: if element == tcx.types.f32 {
                 "native-calloc-zero-f32"
             } else {
@@ -1316,7 +1316,7 @@ mod tests {
             );
             assert_eq!(
                 edit,
-                format!("::std::vec![0.0f32; {count}].into_boxed_slice()")
+                format!("::std::vec::from_elem(0.0f32, {count}).into_boxed_slice()")
             );
             assert_eq!(edit.matches(bytes).count(), 1);
             assert_eq!(receipt, "native-malloc-zero-numeric");
@@ -1364,7 +1364,7 @@ mod tests {
             );
             assert_eq!(
                 edit,
-                format!("::std::vec![0i32; {count}].into_boxed_slice()")
+                format!("::std::vec::from_elem(0i32, {count}).into_boxed_slice()")
             );
             assert_eq!(edit.matches(bytes).count(), 1);
             assert_eq!(receipt, "native-malloc-zero-numeric-wrapping-count");
@@ -1388,7 +1388,7 @@ mod tests {
         );
         assert_eq!(
             edit,
-            format!("::std::vec![0i32; {count}].into_boxed_slice()")
+            format!("::std::vec::from_elem(0i32, {count}).into_boxed_slice()")
         );
         assert_eq!(receipt, "native-malloc-zero-numeric-wrapping-count");
     }
@@ -1564,7 +1564,7 @@ mod tests {
             ),
             Ok((
                 "2".into(),
-                "::std::vec![0.0f32; 2].into_boxed_slice()".into(),
+                "::std::vec::from_elem(0.0f32, 2).into_boxed_slice()".into(),
                 "native-calloc-zero-f32"
             ))
         );
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(edit.matches("n + 1").count(), 1);
         assert_eq!(
             edit,
-            format!("::std::vec![0.0f32; {count}].into_boxed_slice()")
+            format!("::std::vec::from_elem(0.0f32, {count}).into_boxed_slice()")
         );
         assert_eq!(receipt, "native-calloc-zero-f32");
     }
@@ -1595,7 +1595,7 @@ mod tests {
         ).unwrap();
         assert_eq!(
             edit,
-            "::std::vec![0u16; ((n as libc::c_ulong) as usize)].into_boxed_slice()"
+            "::std::vec::from_elem(0u16, ((n as libc::c_ulong) as usize)).into_boxed_slice()"
         );
         assert_eq!(receipt, "native-calloc-zero-numeric");
     }
@@ -1611,7 +1611,7 @@ mod tests {
         assert_eq!(edit.matches("next(&mut n)").count(), 1);
         assert_eq!(
             edit,
-            "::std::vec![0.0f32; ((next(&mut n)) as usize)].into_boxed_slice()"
+            "::std::vec::from_elem(0.0f32, ((next(&mut n)) as usize)).into_boxed_slice()"
         );
     }
 

@@ -722,7 +722,7 @@ pub(crate) fn collect(
                     ("&", "as_ptr")
                 };
                 format!(
-                    "{{ let __crat_region: {amp}[u8] = {name}; assert!(__crat_region.as_ptr() as usize % core::mem::align_of::<{element}>() == 0, \"void region is misaligned for its typed view\"); __crat_region.{ptr}().cast::<{element}>() }}"
+                    "{{ let __crat_region: {amp}[u8] = {name}; if __crat_region.as_ptr() as usize % core::mem::align_of::<{element}>() != 0 {{ ::std::panic::panic_any(\"void region is misaligned for its typed view\") }} __crat_region.{ptr}().cast::<{element}>() }}"
                 )
             }
         };

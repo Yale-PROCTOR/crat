@@ -37,12 +37,19 @@ pub struct BoReceipt {
     pub reverted_count: usize,
     pub solve: String,
     pub file_rows: String,
+    /// R1295-1: configured exposure names that matched no local function (ignored).
+    pub configured_unmatched: Vec<String>,
+    /// R1295-1: configured names that matched several local functions (every match configured).
+    pub configured_ambiguous: Vec<(String, usize)>,
+    /// R1298-1 (b): exposed owning parameters whose inbound wrapper cannot be placed; each
+    /// keeps its raw formal (`<parameter>\t<reason>` from the Box-parameter receipts).
+    pub inbound_wrapper_unplaceable: Vec<String>,
 }
 
 impl BoReceipt {
     pub fn summary(&self) -> String {
         format!(
-            "outcome={} status={} analysis_fingerprint={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} solve={}",
+            "outcome={} status={} analysis_fingerprint={} files_changed={}/{} verify_rounds={} reverted={} input_tree_sha256={} emitted_tree_sha256={} configured_unmatched={} configured_ambiguous={} inbound_wrapper_unplaceable={} solve={}",
             self.outcome,
             self.status,
             self.analysis_fingerprint,
@@ -52,13 +59,52 @@ impl BoReceipt {
             self.reverted_count,
             self.input_tree_sha256,
             self.emitted_tree_sha256,
+            self.configured_unmatched.len(),
+            self.configured_ambiguous.len(),
+            self.inbound_wrapper_unplaceable.len(),
             self.solve,
         )
     }
 
     pub fn render(&self) -> String {
-        format!("{}\n{}", self.summary(), self.file_rows)
+        let mut out = format!("{}\n{}", self.summary(), self.file_rows);
+        if !self.file_rows.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "configured-unmatched: {}\t{}\n",
+            self.configured_unmatched.len(),
+            self.configured_unmatched.join(" ")
+        ));
+        out.push_str(&format!(
+            "configured-ambiguous: {}\t{}\n",
+            self.configured_ambiguous.len(),
+            self.configured_ambiguous
+                .iter()
+                .map(|(name, matches)| format!("{name}:{matches}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        out.push_str(&format!(
+            "inbound-wrapper-unplaceable: {}\t{}\n",
+            self.inbound_wrapper_unplaceable.len(),
+            self.inbound_wrapper_unplaceable.join(" ")
+        ));
+        out
     }
+}
+
+/// The Box-parameter receipts' `held` rows whose reason is `inbound-wrapper-unplaceable`.
+pub(crate) fn inbound_wrapper_unplaceable(box_param_receipts: &str) -> Vec<String> {
+    box_param_receipts
+        .lines()
+        .filter_map(|line| {
+            let mut cells = line.split('\t');
+            let (parameter, kind, detail) = (cells.next()?, cells.next()?, cells.next()?);
+            (kind == "held" && detail.starts_with("inbound-wrapper-unplaceable"))
+                .then(|| parameter.to_owned())
+        })
+        .collect()
 }
 
 /// Sets every `export KEY=VALUE` line of a frame env file that is not already set in the
@@ -244,6 +290,11 @@ fn persist_in_place(
             reverted_count: capture.reverted_count,
             solve,
             file_rows: header.to_owned(),
+            configured_unmatched: capture.raw_boundary_artifacts.configured_unmatched.clone(),
+            configured_ambiguous: capture.raw_boundary_artifacts.configured_ambiguous.clone(),
+            inbound_wrapper_unplaceable: inbound_wrapper_unplaceable(
+                &capture.raw_boundary_artifacts.box_param_receipts,
+            ),
         });
     };
 
@@ -301,5 +352,10 @@ fn persist_in_place(
         reverted_count: capture.reverted_count,
         solve,
         file_rows,
+        configured_unmatched: capture.raw_boundary_artifacts.configured_unmatched.clone(),
+        configured_ambiguous: capture.raw_boundary_artifacts.configured_ambiguous.clone(),
+        inbound_wrapper_unplaceable: inbound_wrapper_unplaceable(
+            &capture.raw_boundary_artifacts.box_param_receipts,
+        ),
     })
 }

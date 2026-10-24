@@ -252,7 +252,7 @@ fn r399_heman_gaussian_row_tmp_real_shape_narrowed_nbytes_local() {
     // `generate_gaussian_row::tmp#68`: the byte count is the `c_int` local
     // `nbytes`, initialised once from the `wrapping_mul` chain.
     let s = verify(&gaussian_fixture(), "tmp", BoxShape::Slice, false);
-    assert!(s.contains("let mut tmp: ::std::boxed::Box<[i32]> = ::std::vec![0i32; (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())].into_boxed_slice();"), "{s}");
+    assert!(s.contains("let mut tmp: ::std::boxed::Box<[i32]> = ::std::vec::from_elem(0i32, (((nbytes as libc::c_ulong) as usize) / ::core::mem::size_of::<i32>())).into_boxed_slice();"), "{s}");
     assert!(s.contains("::std::mem::drop(tmp);"), "{s}");
     // The census (AST) emission path must annotate the same declarations and
     // the custody instrument must find them by tree (R402-2(a)).
@@ -879,7 +879,7 @@ pub unsafe extern "C" fn political_3(mut width: libc::c_int, mut ncolors: libc::
         c_declarations()
     );
     let s = verify(&input, "elevations", BoxShape::Slice, false);
-    assert!(s.contains("let mut elevations: ::std::boxed::Box<[*mut crate::heman_image_s]> = ::std::vec![::core::ptr::null_mut(); "), "{s}");
+    assert!(s.contains("let mut elevations: ::std::boxed::Box<[*mut crate::heman_image_s]> = ::std::vec::from_elem(::core::ptr::null_mut(), "), "{s}");
     assert!(
         s.contains("heman_image_destroy(elevations[(cindex_0) as usize]);"),
         "{s}"
@@ -924,7 +924,7 @@ fn r419_annotated_binding_is_retyped_on_both_emission_paths() {
     let s = verify(&input, "buffer", BoxShape::Slice, false);
     assert!(
         s.contains(
-            "let mut buffer: ::std::boxed::Box<[u32]> = ::std::vec![0u32; 4].into_boxed_slice();"
+            "let mut buffer: ::std::boxed::Box<[u32]> = ::std::vec::from_elem(0u32, 4).into_boxed_slice();"
         ),
         "{s}"
     );
@@ -1603,7 +1603,7 @@ unsafe extern "C" fn compute_occlusion(mut thispt: kmVec3, mut horizonpt: kmVec3
     );
     let s = verify(&input, "hull_buffer", BoxShape::Slice, false);
     assert!(
-        s.contains("let mut hull_buffer: ::std::boxed::Box<[crate::kmVec3]> = ::std::vec![crate::kmVec3 { x: 0.0f32, y: 0.0f32, z: 0.0f32, };"),
+        s.contains("let mut hull_buffer: ::std::boxed::Box<[crate::kmVec3]> = ::std::vec::from_elem(crate::kmVec3 { x: 0.0f32, y: 0.0f32, z: 0.0f32, },"),
         "{s}"
     );
     assert!(
@@ -4033,7 +4033,7 @@ fn r618_a_calloc_aggregate_of_zero_valid_fields_needs_no_supplied_fields() {
     assert!(row.contains("\tselected\t"), "{context}");
     assert!(
         text.contains(
-            "entry]>=::std::vec![crate::entry{key:::core::ptr::null(),value:::core::ptr::null_mut()"
+            "entry]>=::std::vec::from_elem(crate::entry{key:::core::ptr::null(),value:::core::ptr::null_mut()"
         ) && text.contains("into_boxed_slice()"),
         "{context}"
     );

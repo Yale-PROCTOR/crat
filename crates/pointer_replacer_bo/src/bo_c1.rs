@@ -9812,7 +9812,6 @@ mod run {
                     seam_adapter,
                     seam_adapter_fabricated,
                     fabricated_len_const,
-                    global_allocator,
                     reroute,
                     drop_form,
                     store_form,
@@ -9832,7 +9831,6 @@ mod run {
                          a5_raw_view\t{a5_raw_view}\n\
                          lifetime_plan\t{lifetime_plan}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
-                         global_allocator\t{global_allocator}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),
                 )
