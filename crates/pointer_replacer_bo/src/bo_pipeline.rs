@@ -148,9 +148,27 @@ pub fn env_from_file(path: &Path) -> Result<usize, String> {
 
 /// Runs the emission path of record on the crate whose root file is `input` and writes the
 /// emitted files over the program's own tree.
+///
+/// **R1305-1 (relay main/367): `CRAT_BO_ARTIFACT_DIR=<dir>`** makes the pass also write its
+/// per-subject rows and receipt strings there ([`write_artifacts`]). Read once, here, at the
+/// pass boundary; unset or empty, nothing is written.
 pub fn rewrite_bo(
     input: &Path,
     c_exposed_fns: impl IntoIterator<Item = String>,
+) -> Result<BoReceipt, String> {
+    let artifact_dir = std::env::var_os("CRAT_BO_ARTIFACT_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    rewrite_bo_with_artifacts(input, c_exposed_fns, artifact_dir.as_deref())
+}
+
+/// [`rewrite_bo`] with the artifact directory passed in rather than read from the environment.
+/// The files are written after the tree is persisted, from the capture alone: they never decide
+/// anything, and a failure to write them is reported on stderr, never returned.
+pub(crate) fn rewrite_bo_with_artifacts(
+    input: &Path,
+    c_exposed_fns: impl IntoIterator<Item = String>,
+    artifact_dir: Option<&Path>,
 ) -> Result<BoReceipt, String> {
     // The per-program worker pinned both seeds before its first z3 call; the driver states the
     // pin rather than relying on the library's default.
@@ -173,7 +191,163 @@ pub fn rewrite_bo(
         configured_exposure,
     };
     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
-    persist_in_place(input, &capture, analysis_fingerprint)
+    let receipt = persist_in_place(input, &capture, analysis_fingerprint)?;
+    if let Some(dir) = artifact_dir
+        && let Err(error) = write_artifacts(dir, input, &capture)
+    {
+        eprintln!(
+            "pointer: artifacts not written to {}: {error}",
+            dir.display()
+        );
+    }
+    Ok(receipt)
+}
+
+/// **R1305-1 (relay main/367) — the per-subject writer.** Writes into `dir`, from the capture
+/// the pass already holds and nothing else:
+/// - `subjects.tsv`: the census subject seed (`subject_receipt`: one row per decided subject
+///   plus the universe's excluded ones, with the model kind, the decision and its first
+///   failing reason), joined by `subject_key` to the subject facts (name, owner kind,
+///   fatness, mutability, raw-only operations, pointer comparison, null initializer), with
+///   the program and two columns derived here: `outcome` (`delivered` / `reverted` / `held`
+///   / `excluded`) and `first_hold_reason`;
+/// - `reverted.tsv`: the verify loop's revert diagnostics (function, site, attribution, the
+///   diagnostic's first line); `final_reverts.tsv`: its reverted classes, verbatim;
+/// - the receipt strings verbatim, one file each.
+///
+/// `outcome`: an excluded subject is `excluded`; one the plan did not place is `held`; a
+/// placed one is `reverted` when the outcome's final degradations take it back after a
+/// failed verify (or the whole program degraded), `held` when they hold it for another
+/// reason, else `delivered`.
+fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let write = |name: &str, text: &str| {
+        std::fs::write(dir.join(name), text)
+            .map_err(|error| format!("write {}: {error}", dir.join(name).display()))
+    };
+    let program = input
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_owned());
+    let clean = |text: &str| text.replace(['\t', '\r', '\n'], " ");
+
+    let mut facts_lines = capture.raw_boundary_artifacts.subject_facts.lines();
+    let facts_header = facts_lines.next().unwrap_or("subject_key");
+    let facts_width = facts_header.split('\t').count().saturating_sub(1);
+    let facts = facts_lines
+        .filter_map(|line| line.split_once('\t'))
+        .collect::<BTreeMap<_, _>>();
+    let final_degradations = capture
+        .final_degradations
+        .iter()
+        .map(|d| (d.subject.as_str(), d))
+        .collect::<BTreeMap<_, _>>();
+    let degraded_program = matches!(
+        capture.outcome_kind,
+        bo_rewriter::CensusOutcomeKind::Degraded
+    );
+
+    let mut seed = capture.subject_receipt.lines();
+    let seed_header = seed.next().unwrap_or_default();
+    let columns = seed_header.split('\t').collect::<Vec<_>>();
+    let column = |name: &str| columns.iter().position(|c| *c == name);
+    let (Some(key_at), Some(decision_at), Some(reason_at), Some(placed_at), Some(exclusion_at)) = (
+        column("subject_key"),
+        column("decision"),
+        column("reason"),
+        column("placed"),
+        column("exclusion"),
+    ) else {
+        return Err(format!(
+            "subject receipt header lacks a column: {seed_header}"
+        ));
+    };
+    let detail_at = column("reason_detail");
+    let mut out = format!(
+        "program\t{seed_header}\t{}\toutcome\tfirst_hold_reason\n",
+        facts_header.split_once('\t').map_or("", |(_, rest)| rest)
+    );
+    for line in seed {
+        let cells = line.split('\t').collect::<Vec<_>>();
+        let cell = |at: usize| cells.get(at).copied().unwrap_or("-");
+        let key = cell(key_at);
+        let (outcome, reason) = if cell(decision_at) == "excluded" {
+            ("excluded", cell(exclusion_at).to_owned())
+        } else if cell(placed_at) != "1" {
+            let reason = if cell(decision_at) == "degraded" {
+                match detail_at.map(cell).filter(|d| *d != "-") {
+                    Some(detail) => format!("{}:{detail}", cell(reason_at)),
+                    None => cell(reason_at).to_owned(),
+                }
+            } else if cell(exclusion_at) != "-" {
+                cell(exclusion_at).to_owned()
+            } else {
+                "not-placed".to_owned()
+            };
+            ("held", reason)
+        } else if let Some(degradation) = final_degradations.get(key) {
+            let reason = degradation.reason.key().to_owned();
+            if matches!(
+                degradation.reason,
+                bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
+            ) {
+                ("reverted", reason)
+            } else {
+                ("held", reason)
+            }
+        } else if degraded_program {
+            ("reverted", "program-degraded".to_owned())
+        } else {
+            ("delivered", "-".to_owned())
+        };
+        let facts_cells = facts
+            .get(key)
+            .map(|rest| rest.to_string())
+            .unwrap_or_else(|| vec!["-"; facts_width].join("\t"));
+        out.push_str(&format!(
+            "{program}\t{line}\t{facts_cells}\t{outcome}\t{}\n",
+            clean(&reason)
+        ));
+    }
+    write("subjects.tsv", &out)?;
+
+    let mut reverted = String::from("function\tsite_kind\tattribution\tcode\tdiagnostic\n");
+    for revert in &capture.reverts {
+        reverted.push_str(&format!(
+            "{}\t{:?}\t{}\t{}\t{}\n",
+            clean(&revert.function),
+            revert.site_kind,
+            clean(&revert.attribution),
+            revert.diagnostic.code.as_deref().unwrap_or("-"),
+            clean(revert.diagnostic.message.lines().next().unwrap_or_default()),
+        ));
+    }
+    write("reverted.tsv", &reverted)?;
+
+    let receipts = &capture.raw_boundary_artifacts;
+    for (name, text) in [
+        ("final_reverts.tsv", &receipts.final_reverts),
+        ("box_param_receipts.tsv", &receipts.box_param_receipts),
+        (
+            "return_certificate_receipts.tsv",
+            &receipts.return_certificate_receipts,
+        ),
+        (
+            "flexible_tail_receipts.tsv",
+            &receipts.flexible_tail_receipts,
+        ),
+        (
+            "counted_void_call_receipts.tsv",
+            &receipts.counted_void_call_receipts,
+        ),
+        ("entry_window_receipts.tsv", &receipts.entry_window_receipts),
+        ("settled_hold_receipts.tsv", &receipts.settled_hold_receipts),
+        ("exposure.tsv", &receipts.exposure),
+    ] {
+        write(name, text)?;
+    }
+    Ok(())
 }
 
 fn rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -358,4 +532,144 @@ fn persist_in_place(
             &capture.raw_boundary_artifacts.box_param_receipts,
         ),
     })
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    //! **R1305-1 (relay main/367) — the per-subject writer's witnesses.** The writer reads the
+    //! capture and decides nothing: unset, it writes no file; set, it writes its files and the
+    //! emitted tree is byte-identical to the unset run's.
+
+    use std::path::{Path, PathBuf};
+
+    const FIXTURE: &str = "#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments)]
+pub unsafe fn get(mut p: *mut i32) -> i32 { *p }
+pub unsafe fn sum(mut v: *const i32, mut n: usize) -> i32 {
+    let mut s = 0;
+    let mut i = 0;
+    while i < n { s += *v.offset(i as isize); i += 1; }
+    s
+}
+pub unsafe fn addr(mut p: *mut i32) -> usize { p as usize }
+pub unsafe fn caller() -> i32 {
+    let mut x = [1, 2, 3];
+    let mut y = 5;
+    get(&mut y) + sum(x.as_ptr(), 3) + addr(&mut y) as i32
+}
+";
+
+    fn fixture(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("crat-r1305-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), FIXTURE).unwrap();
+        dir
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn r1305_1_unset_writes_nothing_set_writes_the_files_and_the_tree_is_identical() {
+        let (unset, set) = (fixture("unset"), fixture("set"));
+        let artifacts = set.join("artifacts");
+        let a = super::rewrite_bo_with_artifacts(&unset.join("lib.rs"), [], None).unwrap();
+        let b =
+            super::rewrite_bo_with_artifacts(&set.join("lib.rs"), [], Some(&artifacts)).unwrap();
+        assert_eq!(
+            files(&unset),
+            ["lib.rs"],
+            "unset: nothing beside the program"
+        );
+        assert_eq!(
+            std::fs::read(unset.join("lib.rs")).unwrap(),
+            std::fs::read(set.join("lib.rs")).unwrap(),
+            "the emitted tree is byte-identical with and without the writer"
+        );
+        assert_eq!(a.emitted_tree_sha256, b.emitted_tree_sha256);
+        assert_ne!(
+            a.emitted_tree_sha256, a.input_tree_sha256,
+            "the fixture is edited"
+        );
+        let written = files(&artifacts);
+        for name in [
+            "subjects.tsv",
+            "reverted.tsv",
+            "final_reverts.tsv",
+            "box_param_receipts.tsv",
+            "return_certificate_receipts.tsv",
+            "flexible_tail_receipts.tsv",
+            "counted_void_call_receipts.tsv",
+            "entry_window_receipts.tsv",
+            "settled_hold_receipts.tsv",
+            "exposure.tsv",
+        ] {
+            assert!(
+                written.iter().any(|w| w == name),
+                "{name} missing from {written:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&unset);
+        let _ = std::fs::remove_dir_all(&set);
+    }
+
+    #[test]
+    fn r1305_1_subjects_tsv_has_one_row_per_table_entry_each_with_a_model_kind() {
+        let root = fixture("rows");
+        let artifacts = root.join("artifacts");
+        let config = crate::bo_rewriter::EmissionRunConfig {
+            configured_exposure:
+                crate::bo_rewriter::decision::exposure::ConfiguredExposureInput::from_names(
+                    "configured-c-exposed-fns",
+                    std::iter::empty::<String>(),
+                )
+                .unwrap(),
+        };
+        // The table the pass decides, from the program before it is rewritten in place.
+        let entries = ::utils::compilation::run_compiler_on_path(&root.join("lib.rs"), |tcx| {
+            crate::bo_rewriter::decide_table_with_emission_config(tcx, None, &config)
+                .map(|(table, _)| table.entries.len())
+        })
+        .unwrap()
+        .unwrap();
+        super::rewrite_bo_with_artifacts(&root.join("lib.rs"), [], Some(&artifacts)).unwrap();
+        let text = std::fs::read_to_string(artifacts.join("subjects.tsv")).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap().split('\t').collect::<Vec<_>>();
+        let column = |name: &str| header.iter().position(|h| *h == name).unwrap();
+        let (kind, decision, outcome) =
+            (column("model_kind"), column("decision"), column("outcome"));
+        let rows = lines
+            .map(|l| l.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|r| r.len() == header.len()), "{text}");
+        assert_eq!(
+            rows.iter().filter(|r| r[decision] != "excluded").count(),
+            entries,
+            "{text}"
+        );
+        assert!(entries >= 2, "the fixture's subjects: {text}");
+        assert!(
+            rows.iter()
+                .all(|r| ["raw", "ref", "owning", "unmodeled"].contains(&r[kind])),
+            "{text}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| ["delivered", "reverted", "held", "excluded"].contains(&r[outcome])),
+            "{text}"
+        );
+        assert!(rows.iter().any(|r| r[outcome] == "delivered"), "{text}");
+        assert!(rows.iter().any(|r| r[outcome] == "held"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

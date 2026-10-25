@@ -536,6 +536,11 @@ pub(crate) struct E1Capture {
     /// The complete emitted Rust-file map on success. A degraded outcome has
     /// no delivered tree and therefore carries `None`, never an empty map.
     pub(crate) emitted_files: Option<std::collections::BTreeMap<plan::FileKey, String>>,
+    /// R1305-1 (relay main/367): the outcome's final degradations, keyed by the
+    /// subject identity `subject_receipt` uses, so a subject placed before the
+    /// verify loop and taken back by it (`RevertedAfterVerifyFailure`) is told
+    /// apart from one delivered. Read by the per-subject writer only.
+    pub(crate) final_degradations: Vec<decision::Degradation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -655,6 +660,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// Relay 297: the settled-table holds' receipts, one row per predicate that
     /// named a subject (`<p>.raw-boundary-settled-holds.tsv`).
     pub(crate) settled_hold_receipts: String,
+    /// R1305-1 (relay main/367): per decided subject, the facts the census
+    /// ledger's columns need beside `subject_receipt` (`e1_subject_facts_tsv`).
+    pub(crate) subject_facts: String,
     /// wave-6a: allocator-contract owners (admitted / held).
     pub(crate) allocator_contract_receipts: String,
     /// R369 FIELD-CP observer, captured from the same frozen decision pass.
@@ -1534,6 +1542,8 @@ fn rewrite_core_injected_with_config(
                 .pair_certificates()
                 .map(|certificates| certificates.premise_receipts_tsv(tcx))
                 .unwrap_or_default();
+            decide_ctx.raw_boundary_artifacts.subject_facts =
+                e1_subject_facts_tsv(tcx, &table, &decide_ctx);
             e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission_plan)?
         } else {
             String::new()
@@ -4125,6 +4135,10 @@ impl RewriteOutcome {
         reason = "consumed only by Item E's cfg(test) one-iteration corpus worker"
     )]
     fn into_e1_capture(self) -> Result<E1Capture, String> {
+        let final_degradations = match &self {
+            RewriteOutcome::Emitted { degradations, .. }
+            | RewriteOutcome::Degraded { degradations, .. } => degradations.clone(),
+        };
         let (
             observed_root,
             first_diags,
@@ -4277,6 +4291,7 @@ impl RewriteOutcome {
             verify_rounds,
             reverted_count,
             emitted_files,
+            final_degradations,
         })
     }
 
@@ -7979,6 +7994,10 @@ fn finish_decide<'tcx>(
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.
     let fat = fat_facts::FatFacts::from_program(&program);
+    let subject_fatness = subjects
+        .iter()
+        .map(|s| ((s.fn_did, s.local), fat.render(s.fn_did, s.local)))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
     let names: rustc_hash::FxHashMap<_, _> = subjects
         .iter()
         .filter_map(|s| s.param_name.clone().map(|n| ((s.fn_did, s.hir_id), n)))
@@ -10086,6 +10105,8 @@ fn finish_decide<'tcx>(
                 .map(|certificates| certificates.premise_receipts_tsv(tcx))
                 .unwrap_or_default(),
             settled_hold_receipts: decision::settled_holds::receipts_tsv(tcx, &table),
+            // R1305-1: filled with the subject seed, on the census path only.
+            subject_facts: String::new(),
             a5_hold_views: String::new(),
             ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
             shared_permissions: table.seams.shared_required.clone(),
@@ -10230,6 +10251,7 @@ fn finish_decide<'tcx>(
             exposure,
             raw_boundary_artifacts,
             e2_artifacts,
+            subject_fatness,
         };
         table.sibling_overlap_inventory =
             decision::sibling_overlap::collect_inventory_with_expressions(
@@ -11659,6 +11681,9 @@ pub(crate) struct DecideCtx {
     exposure: decision::exposure::ExposurePolicy,
     raw_boundary_artifacts: RawBoundaryArtifacts,
     e2_artifacts: E2Artifacts,
+    /// R1305-1: the fatness verdict of each subject's local (`FatFacts::render`),
+    /// kept for the per-subject writer; nothing decides on it here.
+    subject_fatness: rustc_hash::FxHashMap<(rustc_hir::def_id::LocalDefId, Local), &'static str>,
 }
 
 impl DecideCtx {
@@ -12425,6 +12450,77 @@ fn delivery_expectations(
 /// from the exact table and plan that emission consumes.  Classification of
 /// first-pass reverts happens after verification, but no subject or model fact
 /// is re-derived there.
+/// **R1305-1 (relay main/367) — the per-subject facts beside the seed.** One row
+/// per decided subject, keyed by the seed's `subject_key`: the subject's name and
+/// owner kind, the fatness verdict of its local, its decision's mutability where
+/// the decision has one, the raw-only operations at its uses, whether it is
+/// compared as a pointer, and whether it is initialized from a null literal. Read
+/// from facts the decision already used; it decides nothing.
+fn e1_subject_facts_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ctx: &DecideCtx,
+) -> String {
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let node = (subject.fn_did, subject.hir_id);
+        let owner_kind = match subject.kind {
+            decision::SubjectKind::Param { .. } => "param",
+            decision::SubjectKind::Local => "local",
+        };
+        let mutable = match decision {
+            decision::Decision::Ref { mutable }
+            | decision::Decision::InferredRef { mutable, .. }
+            | decision::Decision::Cursor { mutable, .. }
+            | decision::Decision::Slice { mutable, .. }
+            | decision::Decision::NestedSlice { mutable, .. } => {
+                if *mutable {
+                    "mut"
+                } else {
+                    "shared"
+                }
+            }
+            decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => "-",
+        };
+        let mut ops = std::collections::BTreeMap::<&str, usize>::new();
+        for (op, _) in ctx.facts.raw_only_uses.get(&node).into_iter().flatten() {
+            *ops.entry(op.as_str()).or_default() += 1;
+        }
+        let ops = if ops.is_empty() {
+            "-".to_owned()
+        } else {
+            ops.iter()
+                .map(|(op, n)| format!("{op}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let null_initializer = ctx.constructions.init_hirs.get(&node).is_some_and(|hir| {
+            decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+        });
+        rows.push(format!(
+            "{}\t{}\t{owner_kind}\t{}\t{mutable}\t{}\t{}\t{}\n",
+            subject.identity_key(&owner),
+            subject.label.replace(['\t', '\r', '\n'], " "),
+            ctx.subject_fatness
+                .get(&(subject.fn_did, subject.local))
+                .copied()
+                .unwrap_or("-"),
+            ops.replace(['\t', '\r', '\n'], " "),
+            u8::from(ctx.facts.ptr_comparisons.contains_key(&node)),
+            u8::from(null_initializer),
+        ));
+    }
+    rows.sort();
+    let mut out = String::from(
+        "subject_key\tlabel\towner_kind\tfatness\tmutable\traw_only_ops\tptr_comparison\tnull_initializer\n",
+    );
+    out.extend(rows);
+    out
+}
+
 fn e1_subject_seed_tsv(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
