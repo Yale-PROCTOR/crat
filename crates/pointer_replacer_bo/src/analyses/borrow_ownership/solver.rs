@@ -324,8 +324,8 @@ pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
 
 /// Diagnosis-only provenance for hard `own-assume` constraints. The wrappers set
 /// the thread-local tag in every build; it names the assumption's track label
-/// (side data, never a model input), which the raw-cause ledger and the
-/// test-only corpus harness read.
+/// (side data, never a model input) in test builds and, with the raw-cause
+/// ledger on, in release builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnAssumeSite {
     OpaqueCallArg,
@@ -563,6 +563,10 @@ pub struct KindSolver {
     /// refusals they must yield to — the objective, a caller's final-zero —
     /// enter the system after emission ends.
     return_port_admitted: RefCell<Vec<(String, SlotRef)>>,
+    /// The return-port rows the last materialisation asserted (the admissible subset
+    /// when the bisection ran): the raw-cause ledger's probes assume them, so a slot
+    /// they force to own is not read as free. Recorded only; nothing reads it back.
+    return_port_last_rows: RefCell<Vec<SlotRef>>,
     /// One entry per materialisation round: how many of those rows survived.
     return_port_kept: RefCell<Vec<usize>>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
@@ -748,6 +752,16 @@ impl KindSolver {
     /// Can `slot` take `kind` under the hard system and the
     /// selectors `kept`? `Ok(None)`: yes. `Ok(Some(core))`: no, and the tracked
     /// core says why. `Err`: unknown. Asserts nothing and touches no counter
+    /// The raw-cause ledger: the `own` literal of every return-port row the accepted
+    /// model's materialisation asserted, for the probes' assumptions.
+    pub(crate) fn return_port_literals(&self) -> Vec<Bool> {
+        self.return_port_last_rows
+            .borrow()
+            .iter()
+            .map(|slot| self.vars[slot].own.clone())
+            .collect()
+    }
+
     /// the entry records, so the accepted model and its entry are unchanged.
     pub(crate) fn raw_cause_probe(
         &self,
@@ -887,6 +901,7 @@ impl KindSolver {
             hard_check_elapsed: Cell::new(Duration::ZERO),
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
             return_port_admitted: RefCell::new(Vec::new()),
+            return_port_last_rows: RefCell::new(Vec::new()),
             return_port_kept: RefCell::new(Vec::new()),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
             round_model_failure: RefCell::new(None),
@@ -3214,6 +3229,7 @@ impl KindSolver {
             outcome = self.solver.check(&[]);
         }
         self.return_port_kept.borrow_mut().push(rows.len());
+        *self.return_port_last_rows.borrow_mut() = rows.iter().map(|(_, slot)| *slot).collect();
         let outcome = outcome;
         let query_reason = (outcome == SatResult::Unknown)
             .then(|| self.solver.get_reason_unknown())
@@ -4618,11 +4634,16 @@ impl Database for BoOwnDatabase<'_> {
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
         super::ownership_evidence::record("assume", &[x], Some(sign), None);
-        // The site's class names the assumption in every build: the raw-cause ledger
-        // reports it from release cores. A label is the track's side data only.
+        // The site's class names the assumption in test builds, and in release builds
+        // when the raw-cause ledger is on (it reports the class from release cores);
+        // otherwise the label is the base's. A label is the track's side data only.
         let label = || {
-            let site = current_own_assume_site();
-            format!("own-assume[{}]({x:?}={sign})", site.as_str())
+            if cfg!(test) || super::raw_cause::enabled() {
+                let site = current_own_assume_site();
+                format!("own-assume[{}]({x:?}={sign})", site.as_str())
+            } else {
+                format!("own-assume({x:?}={sign})")
+            }
         };
         let x = &self.z3_ast[x];
         let value = Bool::from_bool(sign);

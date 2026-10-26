@@ -362,6 +362,9 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
                 .skip(1)
                 .filter_map(|line| {
                     let cells = line.split('\t').collect::<Vec<_>>();
+                    if cells.get(decision_at) == Some(&"excluded") {
+                        return None;
+                    }
                     let depth = cells.get(depth_at)?.parse::<u8>().ok()?.checked_sub(1)?;
                     Some((
                         (
@@ -399,6 +402,8 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
             ledger.push_str(&format!("{program}\t{subject_key}\t{row}\n"));
         }
         write("raw-cause-ledger.tsv", &ledger)?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("raw-cause-ledger.tsv"));
     }
     Ok(())
 }

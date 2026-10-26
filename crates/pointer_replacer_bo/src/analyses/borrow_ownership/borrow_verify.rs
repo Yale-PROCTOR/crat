@@ -201,7 +201,7 @@ struct Revalidated<T> {
     reader_failures: Vec<super::licensing::reader_replay::Failure>,
     /// With the raw-cause ledger on, each conflict's
     /// invalidating slots, in the order of `conflicts`' per-function lists (the
-    /// L2 capture's, mapped as the witnessed replay maps them). Empty otherwise.
+    /// guarded repair's capture's, mapped as the witnessed replay maps them). Empty otherwise.
     edge_invalidators: FxHashMap<LocalDefId, Vec<Vec<SlotRef>>>,
 }
 

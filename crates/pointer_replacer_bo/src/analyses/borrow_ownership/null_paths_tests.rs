@@ -2279,6 +2279,26 @@ const W67_VLA: &str = r#"
 }
 "#;
 
+/// W67h: an allocation returned. `make`'s return place owns because the return-port
+/// row requires it, a row asserted only where the model is materialised.
+const W67_RET: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
+#[repr(C)] pub struct Node { pub v: i32, pub next: *mut Node }
+pub unsafe fn make(v: i32) -> *mut Node {
+    let mut n: *mut Node = malloc(16) as *mut Node;
+    (*n).v = v;
+    (*n).next = 0 as *mut Node;
+    n
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 {
+    let mut a: *mut Node = make(1);
+    let r = (*a).v;
+    free(a as *mut core::ffi::c_void);
+    r
+}
+"#;
+
 const W67_SHAPES: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
 extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
@@ -2369,6 +2389,7 @@ fn e5c_inner_w63() {
         Ok("w66-controls") => W66_CONTROLS,
         Ok("w67-shapes") => W67_SHAPES,
         Ok("w67-vla") => W67_VLA,
+        Ok("w67-ret") => W67_RET,
         Ok("w68-shapes") => W68_SHAPES,
         Ok("w71-shapes") => W71_SHAPES,
         Ok("ctx-jail") => W71_CTX_JAIL,
@@ -2624,11 +2645,12 @@ fn e5c_inner_w63() {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |rows| rows.len().to_string())
         );
-        // W67: the raw-cause ledger of the accepted model, and every slot's kind beside it.
+        // W67: the raw-cause ledger of the accepted model, whenever the solve produced
+        // one, and with the ledger on every slot's kind beside it.
+        for row in super::raw_cause::last().unwrap_or_default() {
+            eprintln!("E5C_W63 ledger {}", row.tsv());
+        }
         if super::raw_cause::enabled() {
-            for row in super::raw_cause::last().unwrap_or_default() {
-                eprintln!("E5C_W63 ledger {}", row.tsv());
-            }
             for (slot, kind) in &verified.model {
                 if let Some(key) = super::model_cache::render_key(program.tcx, &slots, *slot) {
                     eprintln!("E5C_W63 kind {key}\t{kind:?}");
@@ -3197,6 +3219,20 @@ fn e5c_w67_f_every_owning_slot_has_a_row_with_its_first_noref_and_admitting_fami
     );
 }
 
+/// W67h: a slot the return-port row forces to own says so. The probes assume the
+/// return-port rows the accepted model was materialised under (they are not in the
+/// hard system), so `make::_0` is `return-port`, not `objective`.
+#[test]
+fn e5c_w67_h_a_return_port_owner_names_the_row() {
+    let rows = w67_rows("w67-ret", &[]);
+    let row = w67_row(&rows, "make::_0@d0");
+    assert_eq!(
+        (row[1].as_str(), row[12].as_str(), row[13].as_str()),
+        ("ref-excluded,own-admitted", "owning", "return-port"),
+        "{row:?}"
+    );
+}
+
 /// The lend witnesses' child's lines on `W68_SHAPES` with the lend on, plus the
 /// type route's debug rows.
 fn w68_lines() -> Vec<String> {
@@ -3537,8 +3573,8 @@ const W74_SHAPES: &str = r#"
 /// asserted -- `guarded` with its Ref peers, or `unconditional` -- and any other
 /// cause names none. In `g`, `_7`'s guarded commit names `_6`, its Ref peer; in
 /// `h`, `_2`'s commit is unconditional, with no peer. (The plain repair's
-/// recorded invalidators, which `CRAT_E5C_W74_FAULT` drops, are read only on a
-/// guarded decline's fallback; this child cannot select it.)
+/// recorded invalidators are read only on a guarded decline's fallback, which
+/// this child cannot select.)
 #[test]
 fn e5c_w74_the_ledger_names_each_commits_clause() {
     let rows = w67_rows("w74-shapes", &[]);

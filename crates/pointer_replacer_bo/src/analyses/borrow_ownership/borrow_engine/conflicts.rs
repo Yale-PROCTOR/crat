@@ -60,7 +60,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run `replay` recording each edge's invalidators, as the L2 capture keeps
+/// Run `replay` recording each edge's invalidators, as the guarded repair's capture keeps
 /// them (the accesses behind the error rows that made the loan invalid).
 /// Observation only: the replay's facts and edges are unchanged.
 pub(crate) fn recording_edge_invalidators<R>(

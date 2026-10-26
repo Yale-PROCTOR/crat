@@ -322,7 +322,7 @@ pub(crate) fn prepare(
         let key = super::cache_contract::semantic_key(&inputs)?;
         // The raw-cause ledger that explains the accepted model, taken whenever the ledger is on:
         // beside the entry below when a cache directory is configured, and kept for the
-        // per-subject writer (`raw_cause::last`). Neither sink touches the entry.
+        // per-subject writer (`raw_cause::take_last`). Neither sink touches the entry.
         let ledger = super::raw_cause::enabled()
             .then(|| super::raw_cause::take_for(&verified.model))
             .flatten();

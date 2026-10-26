@@ -54,12 +54,8 @@ fn budget() -> Option<std::time::Duration> {
 }
 
 /// Whether the plain repair's replay records each conflict's invalidators: with
-/// the ledger. W74 fault (test builds only): they are not recorded.
+/// the ledger.
 pub(crate) fn records_invalidators() -> bool {
-    #[cfg(test)]
-    if std::env::var("CRAT_E5C_W74_FAULT").as_deref() == Ok("no-invalidators") {
-        return false;
-    }
     enabled()
 }
 
@@ -119,8 +115,9 @@ pub(crate) struct Commit {
 /// `¬ref(t) ∨ ⋁¬ref(ref_peers) ∨ ⋁ref(raw_invalidators)`.
 #[derive(Clone, Debug)]
 pub(crate) struct Clause {
-    /// `guarded`; or `self-issued` -- no issuer other than the target, which
-    /// the planner commits unconditionally (its invalidators are still listed).
+    /// The plain repair's: `guarded`, or `self-issued` -- no issuer other than the
+    /// target, which the planner commits unconditionally (its invalidators are
+    /// still listed). The guarded repair's: `guarded` or `unconditional`.
     pub shape: &'static str,
     /// The issuer, when it is not the target. Every residual conflict's slot is
     /// Ref at a plain-repair commit (`guard_slots_are_ref`), so it is witnessed Ref.
@@ -329,11 +326,15 @@ pub(crate) fn publish(
             &owned
         }
     };
+    // The surviving selectors, and the return-port rows the accepted model was optimized
+    // under (asserted only in that scope, never in the hard system).
+    let return_ports = solver.return_port_literals();
     let kept: Vec<Bool> = selectors
         .all()
         .iter()
         .filter(|s| !dropped.contains(s))
         .cloned()
+        .chain(return_ports.iter().cloned())
         .collect();
     // (function, MIR local, depth) of a slot; a field names its struct.
     let parts = |slot: SlotRef| -> (String, String, u8) {
@@ -381,6 +382,7 @@ pub(crate) fn publish(
             };
             (s.clone(), family)
         })
+        .chain(return_ports.iter().map(|row| (row.clone(), "return-port")))
         .collect();
     let by_track: FxHashMap<Bool, &Commit> = commits.iter().map(|c| (c.track.clone(), c)).collect();
     // The exclusion a label asserts, by the exact text the solver formats.
