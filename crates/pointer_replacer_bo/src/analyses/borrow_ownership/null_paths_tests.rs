@@ -700,7 +700,7 @@ fn shape_model(code: &str) -> Vec<(String, String)> {
             Some(super::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
         )
         .expect("the shape solves");
-        // R609-3 (080 / 074): the raw-cause ledger of this model, as the entry's
+        // The raw-cause ledger of this model, as the entry's
         // sidecar would carry it, when a path is named.
         if let Ok(path) = std::env::var("CRAT_E5C_SIDE_LEDGER") {
             let program =
@@ -2262,7 +2262,7 @@ unsafe extern "C" fn get_var(mut c: *mut ctx_t) -> i32 { return (*c).n; }
 }
 "#;
 
-/// W67 (R607-1): small shapes for the raw-cause ledger's classes -- a pointer
+/// W67: small shapes for the raw-cause ledger's classes -- a pointer
 /// joined at a phi with null or with a borrowed pointer, and locals no rule
 /// reaches.
 const W67_SHAPES: &str = r#"
@@ -2609,7 +2609,7 @@ fn e5c_inner_w63() {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |rows| rows.len().to_string())
         );
-        // W67 (R607-1): the raw-cause ledger of the accepted model.
+        // W67: the raw-cause ledger of the accepted model.
         if super::raw_cause::enabled() {
             for row in super::raw_cause::last().unwrap_or_default() {
                 eprintln!("E5C_W63 ledger {}", row.tsv());
@@ -3005,9 +3005,9 @@ fn e5c_free_types_of() {
     .unwrap();
 }
 
-/// W67 (R607-1 leg A): the raw-cause ledger's rows, from the W63 child with L01¹⁰'s
-/// arms and the lend on. `CRAT_E5C_W67_FAULT=no-ledger` (test builds) silences the
-/// ledger: every W67 witness is RED under it.
+/// W67: the raw-cause ledger's rows, from the lend witnesses' child with the
+/// ledger on. `CRAT_E5C_W67_FAULT=no-ledger` (test builds) silences the ledger:
+/// every W67 witness is RED under it.
 fn w67_rows(shape: &str, extra: &[(&str, &str)]) -> Vec<Vec<String>> {
     let mut env = vec![("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on")];
     env.extend_from_slice(extra);
@@ -3228,49 +3228,6 @@ fn e5c_inner_ref_peel_market() {
     .unwrap();
 }
 
-/// lil's no-ref-carrier losses (R645-3, era-5c 088), construction only: the
-/// emission-time exclusions of a named source under the caller's arms, one
-/// `E5C_EAGER kind slot` line each (`CRAT_ERA5C_EAGER_DUMP=on`). No solve.
-#[test]
-#[ignore = "the eager-exclusion dump, run on a named source"]
-fn e5c_inner_eager_exclusions() {
-    let path = std::env::var("CRAT_E5C_SIDE_SOURCE").expect("CRAT_E5C_SIDE_SOURCE");
-    let source = std::fs::read_to_string(&path).expect("source");
-    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-        let mut functions = Vec::new();
-        let mut structs = Vec::new();
-        for owner in tcx.hir_crate(()).owners.iter() {
-            let Some(owner) = owner.as_owner() else { continue };
-            let OwnerNode::Item(item) = owner.node() else { continue };
-            match item.kind {
-                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
-                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
-                _ => {}
-            }
-        }
-        let program = crate::utils::rustc::RustProgram {
-            tcx,
-            functions,
-            structs,
-        };
-        let slots = super::crate_slots::CrateSlots::build(&program);
-        let origins = super::origins::compute_origins(&program);
-        let mutability = super::mutability_facts::MutFacts::from_program(&program);
-        let solver = super::solver::KindSolver::new(&slots);
-        super::construction::construct_bo_into(
-            &program,
-            &slots,
-            &origins,
-            &mutability,
-            &solver,
-            super::construction::CopyLendMode::Baseline,
-        )
-        .expect("the construction");
-        eprintln!("E5C_EAGER_DONE");
-    })
-    .unwrap();
-}
-
 /// One program with a positive shape per discharge and the three controls. Each
 /// conflict frame reads its formal, then calls a routed release, and does not
 /// touch the formal again, so (α) never discharges.
@@ -3454,7 +3411,7 @@ fn e5c_w72_the_arg_order_receipts_reach_the_entry() {
     );
 }
 
-/// W74 (R668-4; analysis-fanout 014 STOP 1 (i)): the ledger names each Mode-A
+/// W74: the ledger names each plain-repair
 /// commit's witnessed clause. `g`: `p` lends `(*s).x`, `q` copies it, and a
 /// write through `r`, a Raw copy of `s` (cast to an integer), invalidates the
 /// loan while `q` is live -- the commit falls on `q` with `p` its Ref peer and
@@ -3479,7 +3436,7 @@ const W74_SHAPES: &str = r#"
 "#;
 
 /// W74: the ledger's clause columns (`tsv` 9–11: `noref_clause`,
-/// `noref_ref_peers`, `noref_raw_invalidators`). A Mode-A first cause names its
+/// `noref_ref_peers`, `noref_raw_invalidators`). A plain-repair first cause names its
 /// commit's clause; any other names none. `CRAT_E5C_W74_FAULT=no-invalidators`
 /// (test builds) drops the recorded invalidators: RED.
 #[test]

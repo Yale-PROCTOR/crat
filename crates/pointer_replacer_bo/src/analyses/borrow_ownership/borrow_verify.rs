@@ -199,7 +199,7 @@ struct Revalidated<T> {
     conflicts: T,
     retirement: super::retirement::RetirementReview,
     reader_failures: Vec<super::licensing::reader_replay::Failure>,
-    /// era-5c L01¹¹ (R668-4): with the raw-cause ledger on, each conflict's
+    /// With the raw-cause ledger on, each conflict's
     /// invalidating slots, in the order of `conflicts`' per-function lists (the
     /// L2 capture's, mapped as the witnessed replay maps them). Empty otherwise.
     edge_invalidators: FxHashMap<LocalDefId, Vec<Vec<SlotRef>>>,
@@ -479,7 +479,7 @@ fn revalidate_replaying_reviewed(
         }
     };
 
-    // era-5c L01¹¹ (R668-4): the ledger records each Mode-A commit's clause, so
+    // The ledger records each plain-repair commit's clause, so
     // the replay records each edge's invalidators (observation only).
     let (edges, invalidators) = if super::raw_cause::records_invalidators() {
         super::borrow_engine::recording_edge_invalidators(replay)
@@ -1188,7 +1188,7 @@ fn verify_rounds(
         return (None, stats);
     };
     record_dropped(&mut stats, selectors, &dropped);
-    // era-5c R607-1: the raw-cause ledger's inputs -- every Mode-A commit with
+    // The raw-cause ledger's inputs -- every plain-repair commit with
     // its track, and the selectors the accepted round dropped.
     let ledger = super::raw_cause::enabled();
     let mut ledger_commits: Vec<super::raw_cause::Commit> = Vec::new();
@@ -1483,7 +1483,7 @@ fn verify_rounds(
                                 }
                                 _ => CommitKind::BorrowExclusion,
                             };
-                            // R668-4: the clause the guarded planner would assert here.
+                            // The clause the guarded planner would assert here.
                             let invalidators = reviewed
                                 .edge_invalidators
                                 .get(&did)
@@ -1585,7 +1585,7 @@ fn verify_rounds(
                                         CommitKind::BorrowExclusion
                                     }
                                 };
-                                // R668-4: under the guarded repair the ledger names the clause
+                                // Under the guarded repair the ledger names the clause
                                 // the planner asserted (its Ref peers and Raw invalidators).
                                 ledger_commits.push(super::raw_cause::Commit {
                                     track,

@@ -1,27 +1,32 @@
-//! era-5c R607-1 leg A: **the raw-cause ledger.** For every slot the accepted
-//! model settles Raw, why:
+//! **The raw-cause ledger.** For every slot the accepted model settles not Ref
+//! (Raw or Owning), why Ref is not its kind, and how ownership fared:
 //!
 //! - `first_noref`: the `¬ref` commit in the tracked core of "can this slot be
-//!   Ref?" -- a Mode-A commit (retirement conflict, retirement raw target,
-//!   reader obligation, borrow exclusion) or an eager exclusion named by its
-//!   emission context; on another slot, the constraint families that carry it
-//!   here (`kind-equate`, `safe-mono`, ...);
-//! - `own_refusal`: the family of the tracked core of "can it own?"
-//!   (`own-assume[<class>]`, `link-own`, a selector, ...);
-//! - `verdict_class`: `ref-excluded`, `own-refused`, `both`, or `objective`
-//!   (neither: the optimum chose Raw for a joint reason).
+//!   Ref?" -- a plain-repair commit (retirement conflict, retirement raw target,
+//!   reader obligation, borrow exclusion), a guarded-repair commit, or an
+//!   emission-time exclusion named by its context (`eager:<kind>`); when the
+//!   commit is on another slot, `noref_via` names the constraint families that
+//!   carry it here (`kind-equate`, `safe-mono`, ...);
+//! - for a Raw slot, `own_refusal` / `own_core`: the families of the tracked core
+//!   of "can it own?" (`own-assume[<class>]`, `link-own`, a selector, ...);
+//!   `verdict_class` is `ref-excluded`, `own-refused`, `both`, or `objective`
+//!   (neither: the optimum chose Raw for a joint reason);
+//! - for an Owning slot, `own_admitted` / `own_core`: the families of the tracked
+//!   core of "can it be Raw?" -- what forces ownership -- or `objective` when Raw
+//!   is feasible and the kind order (Ref > Owning > Raw) chose Owning;
+//!   `verdict_class` is `ref-excluded,own-admitted` (or `objective,own-admitted`
+//!   when Ref is feasible too);
+//! - `noref_clause` / `noref_ref_peers` / `noref_raw_invalidators`: for a commit
+//!   named as the first cause, the clause the guarded repair asserts there,
+//!   `¬ref(t) ∨ ⋁¬ref(Ref peers) ∨ ⋁ref(Raw invalidators)`.
 //!
-//! - `noref_clause` / `noref_ref_peers` / `noref_raw_invalidators` (L01¹¹,
-//!   R668-4): for a Mode-A commit named as the first cause, the clause the
-//!   guarded planner (R617-1) would assert there, `¬ref(t) ∨ ⋁¬ref(Ref peers) ∨
-//!   ⋁ref(Raw invalidators)`, from the commit round's model.
-//!
-//! Observation only: two hard queries per Raw slot after the fixpoint, no
-//! assertion added and no counter the entry records touched, so the model, the
-//! entry's bytes and its identity are unchanged. `CRAT_ERA5C_RAW_CAUSE_LEDGER`
-//! (`on|off`, default off) is not a model input and stays out of
-//! `solver_identity`; the sidecar is `<program>.raw-cause-ledger.tsv` beside the
-//! entry, keyed by the entry's own slot keys.
+//! Observation only: hard queries after the fixpoint, no assertion added and no
+//! counter the entry records touched, so the model, the entry and its identity
+//! are unchanged. `CRAT_ERA5C_RAW_CAUSE_LEDGER` (`on|off`, default off) is not a
+//! model input and stays out of the cache key; `CRAT_ERA5C_RAW_CAUSE_BUDGET_S`
+//! bounds the queries. The rows go beside the cache entry as
+//! `<program>.raw-cause-ledger.tsv` when a cache directory is configured, and to
+//! the per-subject writer's directory as `raw-cause-ledger.tsv` when one is set.
 
 use std::cell::RefCell;
 
@@ -48,7 +53,7 @@ fn budget() -> Option<std::time::Duration> {
         })
 }
 
-/// Whether Mode-A's replay records each conflict's invalidators (R668-4): with
+/// Whether the plain repair's replay records each conflict's invalidators: with
 /// the ledger. W74 fault (test builds only): they are not recorded.
 pub(crate) fn records_invalidators() -> bool {
     #[cfg(test)]
@@ -77,9 +82,9 @@ pub(crate) enum CommitKind {
     RetirementRaw,
     ReaderObligation,
     BorrowExclusion,
-    /// R617-1: a guarded clause `¬ref(t) ∨ ⋁¬ref(n) ∨ ⋁ref(p)`.
+    /// A guarded clause `¬ref(t) ∨ ⋁¬ref(n) ∨ ⋁ref(p)`.
     GuardedCommit,
-    /// R617-1: a guarded hazard re-witnessed with no re-enabler, made permanent.
+    /// A guarded hazard re-witnessed with no re-enabler, made permanent.
     RecurrenceEscalation,
 }
 
@@ -96,7 +101,7 @@ impl CommitKind {
     }
 }
 
-/// One Mode-A commit, with the track literal it was asserted under.
+/// One plain-repair commit, with the track literal it was asserted under.
 #[derive(Clone, Debug)]
 pub(crate) struct Commit {
     pub track: Bool,
@@ -108,9 +113,9 @@ pub(crate) struct Commit {
     pub clause: Option<Clause>,
 }
 
-/// L01¹¹ (R668-4; analysis-fanout 014 STOP 1 (i)): the peers the guarded
-/// planner (R617-1) witnesses for a Mode-A commit on `t`, read from the round's
-/// model as `l2::Candidate::from_observation` reads them. Its clause is
+/// The peers the guarded planner witnesses for a plain-repair commit on `t`, read
+/// from the round's model as `guarded_repair::Candidate::from_observation` reads
+/// them. Its clause is
 /// `¬ref(t) ∨ ⋁¬ref(ref_peers) ∨ ⋁ref(raw_invalidators)`.
 #[derive(Clone, Debug)]
 pub(crate) struct Clause {
@@ -118,7 +123,7 @@ pub(crate) struct Clause {
     /// the planner commits unconditionally (its invalidators are still listed).
     pub shape: &'static str,
     /// The issuer, when it is not the target. Every residual conflict's slot is
-    /// Ref at a Mode-A commit (`guard_slots_are_ref`), so it is witnessed Ref.
+    /// Ref at a plain-repair commit (`guard_slots_are_ref`), so it is witnessed Ref.
     pub ref_peers: Vec<SlotRef>,
     /// The conflict's invalidators, other than the target, that are Raw.
     pub raw_invalidators: Vec<SlotRef>,
@@ -151,10 +156,12 @@ impl Clause {
 /// The sidecar's columns: keyed (program, function, MIR local, depth) as the
 /// census keys its subjects (`owner_fn`, `mir_local`, `ptr_depth` less one), with
 /// the entry's own slot key beside them. A field slot names its struct and
-/// `field<N>` in place of the function and the local.
+/// `field<N>` in place of the function and the local. `model_kind` and
+/// `own_admitted` close the row, so the earlier columns keep their places.
 pub(crate) const HEADER: &str = "program\tfunction\tmir_local\tdepth\tslot_key\t\
 verdict_class\tfirst_noref_kind\tnoref_slot\tnoref_round\tnoref_issuer\tnoref_partner\t\
-noref_via\town_refusal\town_core\tnoref_clause\tnoref_ref_peers\tnoref_raw_invalidators";
+noref_via\town_refusal\town_core\tnoref_clause\tnoref_ref_peers\tnoref_raw_invalidators\t\
+model_kind\town_admitted";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -173,6 +180,10 @@ pub(crate) struct Row {
     pub noref_clause: String,
     pub noref_ref_peers: String,
     pub noref_raw_invalidators: String,
+    /// `raw` or `owning`.
+    pub model_kind: &'static str,
+    /// An Owning slot's: what forces ownership, or `objective`; `-` on a Raw slot.
+    pub own_admitted: String,
 }
 
 impl Row {
@@ -191,6 +202,8 @@ impl Row {
             &self.noref_clause,
             &self.noref_ref_peers,
             &self.noref_raw_invalidators,
+            self.model_kind,
+            &self.own_admitted,
         ]
         .join("\t")
     }
@@ -219,6 +232,8 @@ impl Row {
             &self.noref_clause,
             &self.noref_ref_peers,
             &self.noref_raw_invalidators,
+            self.model_kind,
+            &self.own_admitted,
         ]
         .join("\t")
     }
@@ -233,21 +248,6 @@ thread_local! {
     static LEDGERS: RefCell<Vec<(String, Vec<Row>)>> = const { RefCell::new(Vec::new()) };
     /// The ledger the last `take_for` returned, for the witnesses.
     static LAST: RefCell<Option<Vec<Row>>> = const { RefCell::new(None) };
-}
-
-/// R645-2 (era-5c 088): `CRAT_ERA5C_EAGER_DUMP=on` prints every emission-time
-/// `¬ref` with its kind (`E5C_EAGER kind slot`). Instrument only.
-pub(crate) fn dump_eager(
-    tcx: rustc_middle::ty::TyCtxt<'_>,
-    slots: &super::crate_slots::CrateSlots,
-    slot: SlotRef,
-    kind: &str,
-) {
-    if std::env::var_os("CRAT_ERA5C_EAGER_DUMP").is_some() {
-        let key =
-            super::model_cache::render_key(tcx, slots, slot).unwrap_or_else(|| format!("{slot:?}"));
-        eprintln!("E5C_EAGER\t{kind}\t{key}");
-    }
 }
 
 /// Name the exclusion `solver` asserted last (an emission-time `¬ref`).
@@ -296,8 +296,8 @@ fn joined(mut families: Vec<String>) -> String {
     }
 }
 
-/// Run the two queries on every Raw slot of the accepted `model` and keep the
-/// ledger for the writer.
+/// Run the two queries on every slot the accepted `model` settles not Ref (Raw
+/// or Owning) and keep the ledger for the writers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish(
     tcx: TyCtxt<'_>,
@@ -440,30 +440,54 @@ pub(crate) fn publish(
             row.noref_raw_invalidators = keys(&clause.raw_invalidators);
         }
     };
+    // The families of a core, and the one a row names: every `own-assume` class
+    // the core holds (a core is not minimal, so all of them), else `link-own` or a
+    // selector, else the first other family.
+    let core_families = |core: &[Bool]| -> Vec<String> {
+        core.iter()
+            .filter_map(|literal| {
+                selector_family
+                    .get(literal)
+                    .map(|f| (*f).to_owned())
+                    .or_else(|| by_track.get(literal).map(|c| c.kind.label().to_owned()))
+                    .or_else(|| labels.get(literal).map(|l| family(l)))
+            })
+            .collect()
+    };
+    let named_family = |families: &[String]| -> String {
+        let mut assumes: Vec<&String> = families
+            .iter()
+            .filter(|f| f.starts_with("own-assume"))
+            .collect();
+        assumes.sort();
+        assumes.dedup();
+        if assumes.is_empty() {
+            ["link-own", "source-selector", "sink-selector"]
+                .iter()
+                .find(|head| families.iter().any(|f| f == *head))
+                .map(|head| (*head).to_owned())
+                .or_else(|| families.iter().find(|f| *f != "one-hot").cloned())
+                .unwrap_or_else(|| "structural".to_owned())
+        } else {
+            assumes
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join("+")
+        }
+    };
     let started = std::time::Instant::now();
     let budget = budget();
     let (mut probes, mut unprobed) = (0usize, 0usize);
-    // era-5c R701 (instrument, test builds): `CRAT_E5C_LEDGER_ALSO=<substring>` also
-    // probes the non-Raw slots whose key contains it, and prints why each is not Raw
-    // and not Ref (`E5C_ALSO`). The ledger's rows for Raw slots are unchanged.
-    let also = if cfg!(test) {
-        std::env::var("CRAT_E5C_LEDGER_ALSO").ok()
-    } else {
-        None
-    };
-    let mut raw: Vec<(String, SlotRef)> = model
+    let mut settled: Vec<(String, SlotRef, SlotKind)> = model
         .iter()
-        .filter(|(slot, kind)| {
-            **kind == SlotKind::Raw
-                || also
-                    .as_deref()
-                    .is_some_and(|filter| key(**slot).contains(filter))
-        })
-        .map(|(slot, _)| (key(*slot), *slot))
+        .filter(|(_, kind)| **kind != SlotKind::Ref)
+        .map(|(slot, kind)| (key(*slot), *slot, *kind))
         .collect();
-    raw.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut rows = Vec::with_capacity(raw.len());
-    for (slot_key, slot) in raw {
+    settled.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut rows = Vec::with_capacity(settled.len());
+    for (slot_key, slot, kind) in settled {
+        let owning = kind == SlotKind::Owning;
         let direct_commit = direct.get(&slot).cloned();
         let (function, mir_local, depth) = parts(slot);
         let mut row = Row {
@@ -477,11 +501,13 @@ pub(crate) fn publish(
             noref_round: "-".to_owned(),
             noref_issuer: "-".to_owned(),
             noref_via: "-".to_owned(),
-            own_refusal: "none".to_owned(),
+            own_refusal: if owning { "-" } else { "none" }.to_owned(),
             own_core: "-".to_owned(),
             noref_clause: "-".to_owned(),
             noref_ref_peers: "-".to_owned(),
             noref_raw_invalidators: "-".to_owned(),
+            model_kind: if owning { "owning" } else { "raw" },
+            own_admitted: "-".to_owned(),
         };
         if let Some((kind, round, issuer, clause)) = &direct_commit {
             row.first_noref = kind.clone();
@@ -504,42 +530,18 @@ pub(crate) fn publish(
                 solver.raw_cause_probe(hard, &kept, slot, SlotKind::Ref)
             }
         };
+        // A Raw slot: can it own? An Owning slot: can it be Raw (what forces ownership)?
         probes += 1;
-        let own_probe = solver.raw_cause_probe(hard, &kept, slot, SlotKind::Owning);
-        if model[&slot] != SlotKind::Raw {
-            let render = |core: &[Bool]| -> String {
-                core.iter()
-                    .map(|literal| {
-                        selector_family
-                            .get(literal)
-                            .map(|f| format!("selector:{f}"))
-                            .or_else(|| {
-                                by_track
-                                    .get(literal)
-                                    .map(|c| format!("commit:{}({:?})", c.kind.label(), c.slot))
-                            })
-                            .or_else(|| labels.get(literal).cloned())
-                            .unwrap_or_else(|| format!("{literal:?}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            };
-            for (name, kind) in [
-                ("raw", SlotKind::Raw),
-                ("ref", SlotKind::Ref),
-                ("own", SlotKind::Owning),
-            ] {
-                let verdict = match solver.raw_cause_probe(hard, &kept, slot, kind) {
-                    Ok(None) => "sat".to_owned(),
-                    Ok(Some(core)) => format!("unsat {}", render(&core)),
-                    Err(reason) => format!("unknown {reason}"),
-                };
-                eprintln!(
-                    "E5C_ALSO {} model={:?} {name}-probe={verdict}",
-                    row.key, model[&slot]
-                );
-            }
-        }
+        let own_probe = solver.raw_cause_probe(
+            hard,
+            &kept,
+            slot,
+            if owning {
+                SlotKind::Raw
+            } else {
+                SlotKind::Owning
+            },
+        );
         // (slot, kind, round, issuer, position, clause) of every exclusion in the Ref core.
         let mut exclusions: Vec<(
             SlotRef,
@@ -605,71 +607,31 @@ pub(crate) fn publish(
                 }
             }
         }
-        let own_refused = match &own_probe {
+        // A Raw slot: whether ownership was refused, and by what. An Owning slot:
+        // what forces it, or `objective` when Raw is feasible too.
+        let own_named = match &own_probe {
             Ok(Some(core)) => {
-                // R0 (R645-3, group (a)): `CRAT_ERA5C_RAW_CAUSE_LABELS=<substring>` prints
-                // the full label of every literal in the own core of a matching slot.
-                // Instrument only: the ledger's rows are unchanged.
-                if let Ok(filter) = std::env::var("CRAT_ERA5C_RAW_CAUSE_LABELS")
-                    && row.key.contains(filter.as_str())
-                {
-                    for literal in core.iter() {
-                        let label = selector_family
-                            .get(literal)
-                            .map(|f| format!("selector:{f}"))
-                            .or_else(|| {
-                                by_track
-                                    .get(literal)
-                                    .map(|c| format!("commit:{}({:?})", c.kind.label(), c.slot))
-                            })
-                            .or_else(|| labels.get(literal).cloned())
-                            .unwrap_or_else(|| format!("{literal:?}"));
-                        eprintln!("E5C_OWN_CORE {}\t{label}", row.key);
-                    }
-                }
-                let families: Vec<String> = core
-                    .iter()
-                    .filter_map(|literal| {
-                        selector_family
-                            .get(literal)
-                            .map(|f| (*f).to_owned())
-                            .or_else(|| by_track.get(literal).map(|c| c.kind.label().to_owned()))
-                            .or_else(|| labels.get(literal).map(|l| family(l)))
-                    })
-                    .collect();
-                // Every `own-assume` class the core holds (a core is not
-                // minimal, so all of them), else the first other family.
-                let mut assumes: Vec<&String> = families
-                    .iter()
-                    .filter(|f| f.starts_with("own-assume["))
-                    .collect();
-                assumes.sort();
-                assumes.dedup();
+                let families = core_families(core);
                 row.own_core = joined(families.clone());
-                row.own_refusal = if assumes.is_empty() {
-                    ["link-own", "source-selector", "sink-selector"]
-                        .iter()
-                        .find(|head| families.iter().any(|f| f == *head))
-                        .map(|head| (*head).to_owned())
-                        .or_else(|| families.iter().find(|f| *f != "one-hot").cloned())
-                        .unwrap_or_else(|| "structural".to_owned())
-                } else {
-                    assumes
-                        .iter()
-                        .map(|f| f.as_str())
-                        .collect::<Vec<_>>()
-                        .join("+")
-                };
-                true
+                Some(named_family(&families))
             }
-            Ok(None) => false,
-            Err(reason) => {
-                row.own_refusal = format!("unknown:{reason}");
-                false
-            }
+            Ok(None) => None,
+            Err(reason) => Some(format!("unknown:{reason}")),
         };
+        if owning {
+            row.own_admitted = own_named.unwrap_or_else(|| "objective".to_owned());
+        } else if let Some(named) = &own_named {
+            row.own_refusal = named.clone();
+        }
+        let own_refused = !owning && matches!(own_probe, Ok(Some(_)));
         row.verdict = if ref_probe.is_err() || own_probe.is_err() {
             "unknown"
+        } else if owning {
+            if ref_excluded {
+                "ref-excluded,own-admitted"
+            } else {
+                "objective,own-admitted"
+            }
         } else {
             match (ref_excluded, own_refused) {
                 (true, true) => "both",

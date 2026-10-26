@@ -137,10 +137,10 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends_and_parameter_overla
     (invalidates, accesses, conflicts)
 }
 
-/// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own replay.
+/// The raw-cause ledger's capture on the plain repair's own replay.
 /// The invalidation matrix and the parameter conflicts are computed exactly as
 /// the two entry points above compute them; every insertion's accessor is also
-/// recorded, write-only, as the L2 capture records it.
+/// recorded, write-only, as the guarded repair's capture records it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_invalidates_recording<'tcx>(
     tcx: TyCtxt<'tcx>,

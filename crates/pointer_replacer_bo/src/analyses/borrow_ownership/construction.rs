@@ -1427,12 +1427,6 @@ pub(crate) fn construct_bo_into_a2(
         };
         solver.add_borrow_exclusion(Some(SlotRef::Local(guard.function, slot)), &[]);
         super::raw_cause::note_eager(solver, "opaque-result-guard");
-        super::raw_cause::dump_eager(
-            program.tcx,
-            slots,
-            SlotRef::Local(guard.function, slot),
-            "opaque-result-guard",
-        );
         guards += 1;
     }
     construction.a2_killed_memberships = a2.killed_memberships;

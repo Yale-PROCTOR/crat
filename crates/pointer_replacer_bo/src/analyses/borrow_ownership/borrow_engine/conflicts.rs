@@ -53,7 +53,7 @@ pub(crate) struct WitnessedConflictEdge {
 }
 
 thread_local! {
-    /// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own
+    /// The raw-cause ledger's capture on the plain repair's own
     /// replay -- per function, each returned edge's invalidating access roots,
     /// in the edges' order (a parameter edge has none). `None`: not recording.
     static EDGE_INVALIDATORS: std::cell::RefCell<Option<FxHashMap<LocalDefId, Vec<Vec<Local>>>>> =
@@ -125,7 +125,7 @@ fn overwrite_with_engine_facts<'tcx>(
     )
 }
 
-/// era-5c L01¹¹ (R668-4): the seam above, with every invalidation's accessor
+/// The seam above, with every invalidation's accessor
 /// recorded into `accesses` when it is given (the raw-cause ledger's capture).
 /// The facts are the seam's own either way.
 fn overwrite_with_engine_facts_recording<'tcx>(

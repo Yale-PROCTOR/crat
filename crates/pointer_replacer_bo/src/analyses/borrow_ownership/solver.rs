@@ -196,7 +196,7 @@ impl CoreTracker {
             .collect()
     }
 
-    /// era-5c R607-1 (the raw-cause ledger): the track of the constraint
+    /// The raw-cause ledger: the track of the constraint
     /// recorded last, and every track with its label.
     fn last_track(&self) -> Option<Bool> {
         self.entries.borrow().last().map(|(track, _)| track.clone())
@@ -322,9 +322,10 @@ pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
         .find(|family| label.contains(family))
 }
 
-/// Diagnosis-only provenance for hard `own-assume` constraints. The wrappers
-/// are present in normal builds but inline to a direct call; only the test-only
-/// corpus harness stores or reads the thread-local tag.
+/// Diagnosis-only provenance for hard `own-assume` constraints. The wrappers set
+/// the thread-local tag in every build; it names the assumption's track label
+/// (side data, never a model input), which the raw-cause ledger and the
+/// test-only corpus harness read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnAssumeSite {
     OpaqueCallArg,
@@ -726,7 +727,7 @@ impl KindSolver {
         self.tracker.as_ref()
     }
 
-    /// era-5c R607-1: the production track of the hard constraint asserted
+    /// The production track of the hard constraint asserted
     /// last, so a core literal names the commit it came from.
     pub(crate) fn last_track(&self) -> Option<Bool> {
         self.tracker
@@ -735,7 +736,7 @@ impl KindSolver {
             .and_then(CoreTracker::last_track)
     }
 
-    /// era-5c R607-1: every production track with its label.
+    /// Every production track with its label.
     pub(crate) fn tracked_labels(&self) -> Vec<(Bool, String)> {
         self.tracker
             .as_ref()
@@ -744,7 +745,7 @@ impl KindSolver {
             .unwrap_or_default()
     }
 
-    /// era-5c R607-1: can `slot` take `kind` under the hard system and the
+    /// Can `slot` take `kind` under the hard system and the
     /// selectors `kept`? `Ok(None)`: yes. `Ok(Some(core))`: no, and the tracked
     /// core says why. `Err`: unknown. Asserts nothing and touches no counter
     /// the entry records, so the accepted model and its entry are unchanged.
@@ -4617,13 +4618,12 @@ impl Database for BoOwnDatabase<'_> {
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
         super::ownership_evidence::record("assume", &[x], Some(sign), None);
-        #[cfg(test)]
+        // The site's class names the assumption in every build: the raw-cause ledger
+        // reports it from release cores. A label is the track's side data only.
         let label = || {
             let site = current_own_assume_site();
             format!("own-assume[{}]({x:?}={sign})", site.as_str())
         };
-        #[cfg(not(test))]
-        let label = || format!("own-assume({x:?}={sign})");
         let x = &self.z3_ast[x];
         let value = Bool::from_bool(sign);
         assert_hard(self.optimize, self.tracker, label, &!(x.xor(&value)));
