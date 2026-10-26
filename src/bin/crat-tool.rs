@@ -23,10 +23,14 @@ struct Args {
 enum Command {
     MakeInitial {
         #[arg(long)]
+        frozen: Option<PathBuf>,
+        #[arg(long)]
         output: PathBuf,
         input: PathBuf,
     },
     MakeSkeleton {
+        #[arg(long)]
+        frozen_output: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -46,6 +50,8 @@ enum Command {
     },
     AddFunctions {
         #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
         request: PathBuf,
         #[arg(long)]
         current_project: PathBuf,
@@ -61,6 +67,8 @@ enum Command {
     },
     FinalizeProject {
         #[arg(long)]
+        frozen: Option<PathBuf>,
+        #[arg(long)]
         manifest: PathBuf,
         #[arg(long)]
         current_project: PathBuf,
@@ -69,6 +77,14 @@ enum Command {
         #[arg(long)]
         manifest_output: PathBuf,
         input: PathBuf,
+    },
+    AssembleProject {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     ExtractObservations {
         #[arg(long)]
@@ -97,7 +113,6 @@ enum Command {
 
 #[derive(Serialize)]
 struct StatementPairsSidecar<'a> {
-    schema_version: u64,
     statements: &'a [tools::ReplacementStatementPair],
 }
 
@@ -105,7 +120,6 @@ fn serialize_replacement_outputs(
     output: &tools::ReplacementOutput,
 ) -> Result<(String, String), serde_json::Error> {
     let sidecar = serde_json::to_string_pretty(&StatementPairsSidecar {
-        schema_version: 1,
         statements: &output.statement_pairs,
     })?;
     Ok((output.source.clone(), sidecar))
@@ -455,9 +469,18 @@ fn publish_files(files: &[(&Path, &[u8])]) -> Result<(), String> {
     Ok(())
 }
 
+fn read_frozen_project(path: &Path) -> tools::FrozenProject {
+    let input = std::fs::read_to_string(path).unwrap_or_else(|error| fail("frozen_io", error));
+    tools::frozen_project_from_json(&input).unwrap_or_else(|error| replacement_failure(error))
+}
+
 fn main() {
     match Args::parse().command {
-        Command::MakeInitial { output, input } => {
+        Command::MakeInitial {
+            output,
+            input,
+            frozen,
+        } => {
             let source_path = input.join(
                 utils::find_lib_path(&input).unwrap_or_else(|error| fail("project_layout", error)),
             );
@@ -467,8 +490,17 @@ fn main() {
                 .unwrap_or_else(|error| fail("output_path_collision", error));
             let source = std::fs::read_to_string(&source_path)
                 .unwrap_or_else(|error| fail("source_io", error));
-            let initial = tools::make_initial_source(&source)
-                .unwrap_or_else(|error| replacement_failure(error));
+            let initial = if let Some(path) = frozen {
+                validate_output_input_paths(&[&output], &[&path])
+                    .unwrap_or_else(|error| fail("output_path_collision", error));
+                let frozen = read_frozen_project(&path);
+                tools::check_frozen_project_sources(&frozen, &source, None, true)
+                    .unwrap_or_else(|error| replacement_failure(error));
+                frozen.target_source
+            } else {
+                tools::make_initial_source(&source)
+                    .unwrap_or_else(|error| replacement_failure(error))
+            };
             prepare_publish_destinations(&[&output])
                 .unwrap_or_else(|error| fail("output_io", error));
             publish_files(&[(&output, initial.as_bytes())])
@@ -476,11 +508,16 @@ fn main() {
         }
         Command::MakeSkeleton {
             output,
+            frozen_output,
             rules,
             input,
         } => {
             if let Some(rules) = rules.as_deref() {
-                validate_output_input_paths(&[&output], &[rules])
+                let mut paths = vec![output.as_path()];
+                if let Some(path) = frozen_output.as_deref() {
+                    paths.push(path);
+                }
+                validate_output_input_paths(&paths, &[rules])
                     .unwrap_or_else(|error| fail("output_path_collision", error));
             }
             let lib_path = utils::find_lib_path(&input).unwrap_or_else(|error| {
@@ -495,19 +532,37 @@ fn main() {
                 tools::rule_document_from_json(&text)
                     .unwrap_or_else(|error| fail("invalid_rules", error))
             });
-            let records = run_compiler_on_path(&source_path, move |tcx| {
-                tools::make_skeletons_with_rules(&source, rules.as_ref(), tcx)
+            let freeze = frozen_output.is_some();
+            let (records, frozen) = run_compiler_on_path(&source_path, move |tcx| {
+                let records = tools::make_skeletons_with_rules(&source, rules.as_ref(), tcx)
+                    .map_err(|error| format!("{}: {}", error.function_path, error.message))?;
+                let frozen = if freeze {
+                    Some(
+                        tools::freeze_project(&source, &records, tcx)
+                            .map_err(|error| error.message)?,
+                    )
+                } else {
+                    None
+                };
+                Ok::<_, String>((records, frozen))
             })
-            .unwrap()
-            .unwrap_or_else(|error| {
-                eprintln!("{}: {}", error.function_path, error.message);
-                std::process::exit(1);
-            });
+            .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
+            .unwrap_or_else(|error| fail("skeleton_failure", error));
             let json = tools::skeletons_to_json(&records).unwrap();
-            prepare_publish_destinations(&[&output])
-                .unwrap_or_else(|error| fail("output_io", error));
-            publish_files(&[(&output, json.as_bytes())])
-                .unwrap_or_else(|error| fail("output_io", error));
+            let frozen_json = frozen
+                .as_ref()
+                .map(|value| serde_json::to_string_pretty(value).unwrap());
+            let mut files = vec![(&output as &Path, json.as_bytes())];
+            if let (Some(path), Some(json)) = (&frozen_output, &frozen_json) {
+                files.push((path, json.as_bytes()));
+            }
+            let paths = files.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+            validate_output_input_paths(&paths, &[&source_path])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            validate_outputs_outside_projects(&paths, &[&input])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            prepare_publish_destinations(&paths).unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&files).unwrap_or_else(|error| fail("output_io", error));
         }
         Command::Validate { input, output } => {
             let request = std::fs::read_to_string(input).unwrap();
@@ -523,6 +578,7 @@ fn main() {
             std::fs::write(output, normalized).unwrap();
         }
         Command::AddFunctions {
+            frozen,
             request,
             current_project,
             output,
@@ -573,15 +629,27 @@ fn main() {
                 .unwrap_or_else(|error| fail("source_io", error));
             let partial = std::fs::read_to_string(&partial_path)
                 .unwrap_or_else(|error| fail("source_io", error));
-            let addition = run_compiler_on_path(&analysis_path, move |tcx| {
-                tools::add_functions_with_observations(&source, &partial, &request, tcx)
-            })
-            .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
-            .unwrap_or_else(|error| replacement_failure(error));
+            validate_output_input_paths(
+                &[
+                    &output,
+                    &statement_pairs_output,
+                    &observation_source_output,
+                    &observation_metadata_output,
+                ],
+                &[&frozen],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            let frozen = read_frozen_project(&frozen);
+            tools::check_frozen_project_sources(&frozen, &source, Some(&partial), true)
+                .unwrap_or_else(|error| replacement_failure(error));
+            let (addition, dependencies) = tools::transform_frozen_scc(&frozen, &request)
+                .unwrap_or_else(|error| replacement_failure(error));
             let (candidate, pairs) = serialize_replacement_outputs(&addition.replacement).unwrap();
             let observation = &addition.observation_source;
-            let metadata = tools::ReplacementObservationMetadata::from_additive_output(
+            let metadata = tools::ReplacementObservationMetadata::from_frozen_output(
                 &addition,
+                dependencies,
+                &frozen,
                 candidate.as_bytes(),
                 pairs.as_bytes(),
                 observation.as_bytes(),
@@ -596,6 +664,7 @@ fn main() {
             .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::FinalizeProject {
+            frozen,
             manifest,
             current_project,
             output,
@@ -629,16 +698,45 @@ fn main() {
                 .unwrap_or_else(|error| fail("source_io", error));
             let partial = std::fs::read_to_string(&partial_path)
                 .unwrap_or_else(|error| fail("source_io", error));
-            let finalized = run_compiler_on_path(&analysis_path, move |tcx| {
-                tools::finalize_additive_source(&source, &partial, &target_kind, &api, tcx)
-            })
-            .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
-            .unwrap_or_else(|error| replacement_failure(error));
+            let finalized = if let Some(path) = frozen {
+                validate_output_input_paths(&[&output, &manifest_output], &[&path])
+                    .unwrap_or_else(|error| fail("output_path_collision", error));
+                let frozen = read_frozen_project(&path);
+                tools::check_frozen_project_sources(&frozen, &source, Some(&partial), false)
+                    .unwrap_or_else(|error| replacement_failure(error));
+                tools::finalize_frozen_project(&frozen, &partial, &target_kind, &api)
+                    .unwrap_or_else(|error| replacement_failure(error))
+            } else {
+                run_compiler_on_path(&analysis_path, move |tcx| {
+                    tools::finalize_additive_source(&source, &partial, &target_kind, &api, tcx)
+                })
+                .unwrap_or_else(|_| fail("compiler_failure", "analysis project failed to compile"))
+                .unwrap_or_else(|error| replacement_failure(error))
+            };
             publish_files(&[
                 (&output, finalized.source.as_bytes()),
                 (&manifest_output, manifest_text.as_bytes()),
             ])
             .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::AssembleProject {
+            frozen,
+            request,
+            output,
+        } => {
+            validate_output_input_paths(&[&output], &[&frozen, &request])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let accepted: Vec<tools::AcceptedScc> = serde_json::from_str(
+                &std::fs::read_to_string(request).unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let assembled =
+                tools::assemble_frozen_project(&read_frozen_project(&frozen), &accepted)
+                    .unwrap_or_else(|error| replacement_failure(error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, assembled.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::ExtractObservations {
             metadata,

@@ -32,33 +32,40 @@ pub const OBSERVATION_SCHEMA_VERSION: u64 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacementObservationMetadata {
-    pub schema_version: u64,
     pub candidate_sha256: String,
     pub statement_pairs_sha256: String,
     pub observation_source_sha256: String,
     pub accepted_correspondence: Vec<CallableCorrespondence>,
+    pub dependency_correspondence: Vec<CallableCorrespondence>,
+    pub frozen_project_sha256: String,
+    pub unfilled_stub_items: Vec<u64>,
     pub new_correspondence: Vec<CallableCorrespondence>,
     pub current_items: Vec<CurrentObservationItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_stubs: Option<Vec<SourceStub>>,
+    pub source_stubs: Vec<SourceStub>,
 }
 
 impl ReplacementObservationMetadata {
-    pub fn from_additive_output(
+    pub fn from_frozen_output(
         output: &ExtendedReplacementOutput,
+        dependencies: Vec<CallableCorrespondence>,
+        frozen: &crate::FrozenProject,
         candidate: &[u8],
         statement_pairs: &[u8],
         observation_source: &[u8],
     ) -> Self {
         Self {
-            schema_version: 2,
             candidate_sha256: sha256_hex(candidate),
             statement_pairs_sha256: sha256_hex(statement_pairs),
             observation_source_sha256: sha256_hex(observation_source),
             accepted_correspondence: output.accepted_correspondence.clone(),
+            dependency_correspondence: dependencies,
+            frozen_project_sha256: sha256_hex(
+                serde_json::to_string_pretty(frozen).unwrap().as_bytes(),
+            ),
+            unfilled_stub_items: output.unfilled_stub_items.clone(),
             new_correspondence: output.new_correspondence.clone(),
             current_items: output.current_items.clone(),
-            source_stubs: Some(output.source_stubs.clone()),
+            source_stubs: output.source_stubs.clone(),
         }
     }
 }
@@ -499,12 +506,6 @@ fn extract_observations_with_printf_recovery(
     metadata: &ReplacementObservationMetadata,
     printf_recovery_failure: PrintfRecoveryFailure,
 ) -> Result<ObservationDocument, ObservationError> {
-    if !matches!(metadata.schema_version, 1 | 2) {
-        return Err(ObservationError {
-            code: "unsupported_schema_version",
-            message: format!("unsupported schema_version {}", metadata.schema_version),
-        });
-    }
     validate_replacement_metadata(metadata)?;
     let source = match input {
         Input::File(path) => std::fs::read_to_string(path).map_err(|error| ObservationError {
@@ -1604,40 +1605,37 @@ fn callable_correspondence(
         Ok(())
     }
     let mut result = HashMap::new();
-    if metadata.schema_version == 2 {
-        let implementations = metadata
-            .accepted_correspondence
-            .iter()
-            .chain(&metadata.new_correspondence)
-            .map(|record| record.implementation_path.as_str())
-            .chain(
-                metadata
-                    .current_items
-                    .iter()
-                    .map(|item| item.source_copy_path.as_str()),
-            )
-            .collect::<HashSet<_>>();
-        let declared = metadata
-            .source_stubs
-            .iter()
-            .flatten()
-            .map(|stub| stub.path.as_str())
-            .collect::<HashSet<_>>();
-        for path in functions.keys().filter(|path| {
-            path.split("::")
-                .last()
-                .is_some_and(|name| name.starts_with("__proctor_source_stub_"))
-        }) {
-            if !implementations.contains(path.as_str()) && !declared.contains(path.as_str()) {
-                return Err(ObservationError {
-                    code: "dangling_correspondence",
-                    message: format!("source stub `{path}` has no correspondence"),
-                });
-            }
+    let implementations = metadata
+        .dependency_correspondence
+        .iter()
+        .chain(&metadata.new_correspondence)
+        .map(|record| record.implementation_path.as_str())
+        .chain(
+            metadata
+                .current_items
+                .iter()
+                .map(|item| item.source_copy_path.as_str()),
+        )
+        .collect::<HashSet<_>>();
+    let declared = metadata
+        .source_stubs
+        .iter()
+        .map(|stub| stub.path.as_str())
+        .collect::<HashSet<_>>();
+    for path in functions.keys().filter(|path| {
+        path.split("::")
+            .last()
+            .is_some_and(|name| name.starts_with("__proctor_source_stub_"))
+    }) {
+        if !implementations.contains(path.as_str()) && !declared.contains(path.as_str()) {
+            return Err(ObservationError {
+                code: "dangling_correspondence",
+                message: format!("source stub `{path}` has no correspondence"),
+            });
         }
     }
     for record in metadata
-        .accepted_correspondence
+        .dependency_correspondence
         .iter()
         .chain(&metadata.new_correspondence)
     {
@@ -1686,7 +1684,7 @@ fn callable_correspondence(
             &current.source_copy_path,
         )?;
     }
-    for stub in metadata.source_stubs.iter().flatten() {
+    for stub in &metadata.source_stubs {
         let function = functions.get(&stub.path).ok_or_else(|| ObservationError {
             code: "dangling_correspondence",
             message: format!("source stub `{}` is absent", stub.path),
@@ -4501,25 +4499,11 @@ pub fn replacement_metadata_from_json(
             code: "malformed_metadata",
             message: format!("replacement observation metadata is not valid JSON: {error}"),
         })?;
-    let raw: serde_json::Value = serde_json::from_str(input).expect("typed metadata parsed");
-    let source_stubs_present = raw.get("source_stubs").is_some();
-    if !matches!(value.schema_version, 1 | 2) {
-        return Err(ObservationError {
-            code: "unsupported_schema_version",
-            message: format!("unsupported schema_version {}", value.schema_version),
-        });
-    }
-    if (value.schema_version == 1 && source_stubs_present)
-        || (value.schema_version == 2 && value.source_stubs.is_none())
-    {
-        return Err(metadata_error(
-            "source_stubs must be present only in version 2 metadata",
-        ));
-    }
     for digest in [
         &value.candidate_sha256,
         &value.statement_pairs_sha256,
         &value.observation_source_sha256,
+        &value.frozen_project_sha256,
     ] {
         if digest.len() != 64
             || !digest
@@ -4582,14 +4566,19 @@ fn canonical_path_segment(segment: &str) -> bool {
 fn validate_replacement_metadata(
     value: &ReplacementObservationMetadata,
 ) -> Result<(), ObservationError> {
-    let accepted_and_new = value
-        .accepted_correspondence
+    if !value.accepted_correspondence.is_empty() {
+        return Err(metadata_error(
+            "independent metadata cannot contain accepted dependencies",
+        ));
+    }
+    let correspondence = value
+        .dependency_correspondence
         .iter()
         .chain(&value.new_correspondence)
         .collect::<Vec<_>>();
     let mut item_ids = HashSet::new();
     let mut categories: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
-    for record in &accepted_and_new {
+    for record in &correspondence {
         if !item_ids.insert(record.item_id) {
             return Err(metadata_error(format!(
                 "metadata has duplicate correspondence item_id {}",
@@ -4649,73 +4638,72 @@ fn validate_replacement_metadata(
             .or_default()
             .push((&current.source_copy_path, current.item_id));
     }
-    if let Some(stubs) = &value.source_stubs {
-        if value
-            .accepted_correspondence
+    if value
+        .dependency_correspondence
+        .iter()
+        .chain(&value.new_correspondence)
+        .any(|record| record.wrapper_path.is_some())
+        || value
+            .current_items
             .iter()
-            .chain(&value.new_correspondence)
-            .any(|record| record.wrapper_path.is_some())
-            || value
-                .current_items
-                .iter()
-                .any(|current| current.wrapper_path.is_some())
-        {
+            .any(|current| current.wrapper_path.is_some())
+    {
+        return Err(metadata_error(
+            "metadata with source stubs cannot contain wrapper paths",
+        ));
+    }
+    let callables = value
+        .dependency_correspondence
+        .iter()
+        .chain(&value.new_correspondence)
+        .map(|record| (record.item_id, record.logical_path.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut previous = None;
+    for stub in &value.source_stubs {
+        if previous.is_some_and(|id| id >= stub.item_id) {
             return Err(metadata_error(
-                "version 2 metadata cannot contain wrapper paths",
+                "metadata source_stubs are not strictly ordered by item_id",
             ));
         }
-        let accepted = value
-            .accepted_correspondence
-            .iter()
-            .map(|record| (record.item_id, record.logical_path.as_str()))
-            .collect::<HashMap<_, _>>();
-        let mut previous = None;
-        for stub in stubs {
-            if previous.is_some_and(|id| id >= stub.item_id) {
-                return Err(metadata_error(
-                    "metadata source_stubs are not strictly ordered by item_id",
-                ));
-            }
-            previous = Some(stub.item_id);
-            let logical_path = accepted.get(&stub.item_id).ok_or_else(|| {
-                metadata_error(format!(
-                    "metadata source stub has unknown accepted item_id {}",
-                    stub.item_id
-                ))
-            })?;
-            if !canonical_metadata_path(&stub.path) {
-                return Err(metadata_error(format!(
-                    "metadata source stub path `{}` is not canonical",
-                    stub.path
-                )));
-            }
-            let (module, name) = logical_path.rsplit_once("::").unwrap_or(("", logical_path));
-            let (stub_module, stub_name) = stub
-                .path
-                .rsplit_once("::")
-                .unwrap_or(("", stub.path.as_str()));
-            let base = format!(
-                "__proctor_source_stub_{}",
-                name.strip_prefix("r#").unwrap_or(name)
-            );
-            if stub_module != module
-                || (stub_name != base
-                    && !stub_name
-                        .strip_prefix(&format!("{base}_"))
-                        .is_some_and(|suffix| {
-                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                        }))
-            {
-                return Err(metadata_error(format!(
-                    "metadata source stub path `{}` does not match accepted function `{logical_path}`",
-                    stub.path
-                )));
-            }
-            categories
-                .entry("source_stub_path")
-                .or_default()
-                .push((&stub.path, stub.item_id));
+        previous = Some(stub.item_id);
+        let logical_path = callables.get(&stub.item_id).ok_or_else(|| {
+            metadata_error(format!(
+                "metadata source stub has unknown callable item_id {}",
+                stub.item_id
+            ))
+        })?;
+        if !canonical_metadata_path(&stub.path) {
+            return Err(metadata_error(format!(
+                "metadata source stub path `{}` is not canonical",
+                stub.path
+            )));
         }
+        let (module, name) = logical_path.rsplit_once("::").unwrap_or(("", logical_path));
+        let (stub_module, stub_name) = stub
+            .path
+            .rsplit_once("::")
+            .unwrap_or(("", stub.path.as_str()));
+        let base = format!(
+            "__proctor_source_stub_{}",
+            name.strip_prefix("r#").unwrap_or(name)
+        );
+        if stub_module != module
+            || (stub_name != base
+                && !stub_name
+                    .strip_prefix(&format!("{base}_"))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    }))
+        {
+            return Err(metadata_error(format!(
+                "metadata source stub path `{}` does not match callable `{logical_path}`",
+                stub.path
+            )));
+        }
+        categories
+            .entry("source_stub_path")
+            .or_default()
+            .push((&stub.path, stub.item_id));
     }
     if value.new_correspondence.len() != value.current_items.len() {
         return Err(metadata_error(
@@ -4737,6 +4725,19 @@ fn validate_replacement_metadata(
                 "metadata current_items[{index}] disagrees with new_correspondence[{index}]"
             )));
         }
+    }
+    if value
+        .unfilled_stub_items
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+        || value
+            .unfilled_stub_items
+            .iter()
+            .any(|id| !current_ids.contains(id))
+    {
+        return Err(metadata_error(
+            "unfilled_stub_items must be strictly ordered current item IDs",
+        ));
     }
     let mut path_roles: HashMap<&str, (&str, u64)> = HashMap::new();
     for category in [
@@ -4962,8 +4963,10 @@ mod tests {
         transform_labels: Vec<u32>,
     ) -> ReplacementObservationMetadata {
         ReplacementObservationMetadata {
-            schema_version: 1,
-            source_stubs: None,
+            dependency_correspondence: vec![],
+            frozen_project_sha256: sha256_hex(b""),
+            unfilled_stub_items: vec![],
+            source_stubs: vec![],
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(source.as_bytes()),
@@ -5936,8 +5939,10 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
     #[test]
     fn metadata_paths_use_canonical_rust_identifier_segments() {
         let mut metadata = ReplacementObservationMetadata {
-            schema_version: 1,
-            source_stubs: None,
+            dependency_correspondence: vec![],
+            frozen_project_sha256: sha256_hex(b""),
+            unfilled_stub_items: vec![],
+            source_stubs: vec![],
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(b""),
@@ -5977,7 +5982,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
                 item_id,
                 logical_path: path.into(),
                 implementation_path: path.into(),
-                wrapper_path: Some(format!("wrapper_{path}")),
+                wrapper_path: None,
             }
         }
         fn current(item_id: u64, path: &str) -> CurrentObservationItem {
@@ -5986,17 +5991,19 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
                 logical_path: path.into(),
                 source_copy_path: format!("source_{path}"),
                 implementation_path: path.into(),
-                wrapper_path: Some(format!("wrapper_{path}")),
+                wrapper_path: None,
                 transform_labels: vec![0],
             }
         }
         let base = ReplacementObservationMetadata {
-            schema_version: 1,
-            source_stubs: None,
+            dependency_correspondence: vec![correspondence(0, "dependency")],
+            frozen_project_sha256: sha256_hex(b""),
+            unfilled_stub_items: vec![],
+            source_stubs: vec![],
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(b""),
-            accepted_correspondence: vec![correspondence(0, "accepted")],
+            accepted_correspondence: vec![],
             new_correspondence: vec![correspondence(1, "first"), correspondence(2, "second")],
             current_items: vec![current(1, "first"), current(2, "second")],
         };
@@ -6020,7 +6027,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
                 .contains("duplicate current item_id")
         );
 
-        for category in ["logical", "implementation", "wrapper", "source"] {
+        for category in ["logical", "implementation", "source"] {
             let mut malformed = base.clone();
             match category {
                 "logical" => {
@@ -6030,10 +6037,6 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
                 "implementation" => {
                     malformed.new_correspondence[1].implementation_path = "first".into();
                     malformed.current_items[1].implementation_path = "first".into();
-                }
-                "wrapper" => {
-                    malformed.new_correspondence[1].wrapper_path = Some("wrapper_first".into());
-                    malformed.current_items[1].wrapper_path = Some("wrapper_first".into());
                 }
                 "source" => malformed.current_items[1].source_copy_path = "source_first".into(),
                 _ => unreachable!(),
@@ -6045,6 +6048,25 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
                     .contains("duplicate")
             );
         }
+
+        let mut malformed = base.clone();
+        malformed.new_correspondence[0].wrapper_path = Some("wrapper_first".into());
+        malformed.current_items[0].wrapper_path = Some("wrapper_first".into());
+        assert!(
+            validate_replacement_metadata(&malformed)
+                .unwrap_err()
+                .message
+                .contains("cannot contain wrapper paths")
+        );
+
+        let mut malformed = base.clone();
+        malformed.accepted_correspondence = malformed.dependency_correspondence.clone();
+        assert!(
+            validate_replacement_metadata(&malformed)
+                .unwrap_err()
+                .message
+                .contains("cannot contain accepted dependencies")
+        );
 
         let mut malformed = base.clone();
         malformed.current_items[0].logical_path = "different".into();
@@ -6099,8 +6121,10 @@ unsafe fn target(mut pointer: Option<&i32>) -> i32 {
 }
 "#;
         let metadata = ReplacementObservationMetadata {
-            schema_version: 1,
-            source_stubs: None,
+            dependency_correspondence: vec![],
+            frozen_project_sha256: sha256_hex(b""),
+            unfilled_stub_items: vec![],
+            source_stubs: vec![],
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: sha256_hex(source.as_bytes()),
@@ -9035,28 +9059,33 @@ unsafe fn target(mut good: &i32, mut rejected: *const [i32]) -> i32 {
     }
 
     #[test]
-    fn logical_callee_identity_aligns_wrapper_and_implementation() {
+    fn logical_callee_identity_aligns_source_stub_and_dependency() {
         let source = r#"
 unsafe fn index(mut value: i32) -> usize { value as usize }
-unsafe fn __proctor_wrapper_index(mut value: i32) -> usize { index(value) }
+unsafe fn __proctor_source_stub_index(mut value: i32) -> usize { todo!() }
 unsafe fn source_copy(mut pointer: *const i32) -> i32 {
-    #[proctor(0)] *pointer.add(__proctor_wrapper_index(1))
+    #[proctor(0)] *pointer.add(__proctor_source_stub_index(1))
 }
 unsafe fn target(mut pointer: &[i32]) -> i32 {
     #[proctor(0)] pointer[index(1)]
 }
 "#;
         let metadata = ReplacementObservationMetadata {
-            schema_version: 1,
-            source_stubs: None,
+            frozen_project_sha256: sha256_hex(b""),
+            unfilled_stub_items: vec![],
+            source_stubs: vec![SourceStub {
+                item_id: 6,
+                path: "__proctor_source_stub_index".into(),
+            }],
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
             observation_source_sha256: String::new(),
-            accepted_correspondence: vec![CallableCorrespondence {
+            accepted_correspondence: vec![],
+            dependency_correspondence: vec![CallableCorrespondence {
                 item_id: 6,
                 logical_path: "index".into(),
                 implementation_path: "index".into(),
-                wrapper_path: Some("__proctor_wrapper_index".into()),
+                wrapper_path: None,
             }],
             new_correspondence: vec![CallableCorrespondence {
                 item_id: 7,
@@ -9081,12 +9110,10 @@ unsafe fn target(mut pointer: &[i32]) -> i32 {
             1
         );
         let mut omitted = metadata;
-        omitted.accepted_correspondence.clear();
-        assert!(
-            extract_metadata(source, omitted)
-                .unwrap()
-                .observations
-                .is_empty()
+        omitted.dependency_correspondence.clear();
+        assert_eq!(
+            extract_metadata(source, omitted).unwrap_err().code,
+            "malformed_metadata"
         );
     }
 

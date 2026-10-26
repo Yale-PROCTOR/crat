@@ -115,12 +115,11 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
         extern \"C\" {{
             fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
         }}
-        {}
-        unsafe extern \"C\" fn {}({}) {{
-            {}
+        {types}
+        unsafe extern \"C\" fn {name}({params}) {{
+            {code}
         }}
-    ",
-        types, name, params, code
+    "
     );
     compilation::run_compiler_on_str(&code, |tcx| {
         let arena = Arena::new();

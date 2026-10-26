@@ -5,6 +5,26 @@ use crate::{
     PrintfTemplateMetadata, StatementDisposition, StatementDispositionKind, StatementPairMetadata,
 };
 
+fn observation_metadata(
+    output: &ExtendedReplacementOutput,
+    candidate: &[u8],
+    statement_pairs: &[u8],
+    observation_source: &[u8],
+) -> crate::ReplacementObservationMetadata {
+    crate::ReplacementObservationMetadata {
+        candidate_sha256: crate::sha256_hex(candidate),
+        statement_pairs_sha256: crate::sha256_hex(statement_pairs),
+        observation_source_sha256: crate::sha256_hex(observation_source),
+        frozen_project_sha256: crate::sha256_hex(b""),
+        accepted_correspondence: vec![],
+        dependency_correspondence: output.accepted_correspondence.clone(),
+        unfilled_stub_items: output.unfilled_stub_items.clone(),
+        new_correspondence: output.new_correspondence.clone(),
+        current_items: output.current_items.clone(),
+        source_stubs: output.source_stubs.clone(),
+    }
+}
+
 fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> SkeletonView {
     with_parse_session(|| {
         let krate = parse_crate(skeleton, ReplacementErrorKind::InvalidRequest)?;
@@ -127,7 +147,6 @@ fn request(path: &str, name: &str, transformation: &str) -> ReplacementRequest {
     }
     ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![item],
         transformation,
     }
@@ -192,7 +211,6 @@ fn request_with_items(mut items: Vec<ReplacementItem>, transformation: &str) -> 
     .unwrap();
     ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items,
         transformation,
     }
@@ -691,7 +709,7 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     );
     compile_checked(&second.replacement.source);
     compile(&second.observation_source);
-    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+    let metadata = observation_metadata(
         &second,
         second.replacement.source.as_bytes(),
         b"pairs",
@@ -699,26 +717,22 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
     );
     let parsed =
         crate::replacement_metadata_from_json(&serde_json::to_string(&metadata).unwrap()).unwrap();
-    assert_eq!(parsed.source_stubs.unwrap(), second.source_stubs);
-    let mut future = metadata.clone();
-    future.schema_version = 3;
-    assert_eq!(
-        crate::replacement_metadata_from_json(&serde_json::to_string(&future).unwrap())
-            .unwrap_err()
-            .code,
-        "unsupported_schema_version"
-    );
-    let duplicate_version = format!(
-        "{{\"schema_version\":999,{}",
+    assert_eq!(parsed.source_stubs, second.source_stubs);
+    let mut unknown = serde_json::to_value(&metadata).unwrap();
+    unknown["extra"] = serde_json::json!(true);
+    assert!(crate::replacement_metadata_from_json(&unknown.to_string()).is_err());
+    let duplicate_digest = format!(
+        "{{\"candidate_sha256\":\"{}\",{}",
+        metadata.candidate_sha256,
         &serde_json::to_string(&metadata).unwrap()[1..]
     );
-    let duplicate_error = crate::replacement_metadata_from_json(&duplicate_version).unwrap_err();
+    let duplicate_error = crate::replacement_metadata_from_json(&duplicate_digest).unwrap_err();
     assert_eq!(duplicate_error.code, "malformed_metadata");
     assert!(duplicate_error.message.contains("duplicate field"));
     crate::observation::extract_observations_from_source(&second.observation_source, &metadata)
         .unwrap();
     let mut missing = metadata.clone();
-    missing.source_stubs = Some(vec![]);
+    missing.source_stubs = vec![];
     assert_eq!(
         crate::observation::extract_observations_from_source(&second.observation_source, &missing)
             .unwrap_err()
@@ -726,8 +740,7 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
         "dangling_correspondence"
     );
     let mut wrong = metadata.clone();
-    wrong.source_stubs.as_mut().unwrap()[0].path =
-        "elsewhere::__proctor_source_stub_leaf".to_owned();
+    wrong.source_stubs[0].path = "elsewhere::__proctor_source_stub_leaf".to_owned();
     assert_eq!(
         crate::replacement_metadata_from_json(&serde_json::to_string(&wrong).unwrap())
             .unwrap_err()
@@ -735,7 +748,7 @@ fn additive_internal_signature_change_has_no_wrapper_and_uses_old_call_stub() {
         "malformed_metadata"
     );
     let mut unknown = metadata.clone();
-    unknown.source_stubs.as_mut().unwrap()[0].item_id = 8;
+    unknown.source_stubs[0].item_id = 8;
     assert_eq!(
         crate::replacement_metadata_from_json(&serde_json::to_string(&unknown).unwrap())
             .unwrap_err()
@@ -967,7 +980,7 @@ pub unsafe fn __proctor_source_stub_caller(p: i32) -> i32 { __proctor_source_stu
     next.accepted_correspondence = first.new_correspondence;
     let second = add(analysis, &first.replacement.source, &next).unwrap();
     assert!(second.source_stubs.is_empty());
-    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+    let metadata = observation_metadata(
         &second,
         second.replacement.source.as_bytes(),
         b"pairs",
@@ -1200,7 +1213,6 @@ fn print_arguments_are_defended_without_validator() {
         "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: format!(
                 r#"unsafe fn f() {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#
@@ -1213,7 +1225,6 @@ fn print_arguments_are_defended_without_validator() {
     }
 
     let valid = ReplacementRequest {
-        schema_version: 1,
         items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
         transformation:
             r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", value::<A, B>((a, b))); }"#
@@ -1223,8 +1234,7 @@ fn print_arguments_are_defended_without_validator() {
     assert!(add_source(source, &valid).is_ok());
 
     let local_temporary = ReplacementRequest {
-        schema_version: 1,
-        items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
+                items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
         transformation: r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }); }"#.to_owned(),
         accepted_correspondence: vec![],
     };
@@ -1236,7 +1246,6 @@ fn print_arguments_are_defended_without_validator() {
         "{ if true { let proctor_temp_var_0 = 1; } proctor_temp_var_0 }",
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: format!(
                 r#"unsafe fn f() {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#
@@ -1250,8 +1259,7 @@ fn print_arguments_are_defended_without_validator() {
 
     let two = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{} {}", todo!(), todo!()); }"#;
     let cross_argument = ReplacementRequest {
-        schema_version: 1,
-        items: vec![preservation_item(7, "f", "f", two, vec![0])],
+                items: vec![preservation_item(7, "f", "f", two, vec![0])],
         transformation: r#"unsafe fn f() { #[proctor(0)] ::std::print!("{} {}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }, proctor_temp_var_0); }"#.to_owned(),
         accepted_correspondence: vec![],
     };
@@ -1260,8 +1268,7 @@ fn print_arguments_are_defended_without_validator() {
     assert!(error.message.contains("lexical expansion scope"));
 
     let existing = ReplacementRequest {
-        schema_version: 1,
-        items: vec![preservation_item(
+                items: vec![preservation_item(
             7,
             "f",
             "f",
@@ -1294,7 +1301,6 @@ fn print_template_invariants_are_defended_without_validator() {
         r#"::std::print!("{}/{:08x}/{}", name = a, b, c);"#,
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: format!("unsafe fn f() {{ #[proctor(0)] {statement} }}"),
             accepted_correspondence: vec![],
@@ -1309,7 +1315,6 @@ fn print_template_invariants_are_defended_without_validator() {
         r#"::std::print!("{}/{:08x}/{}", helper!(a), b, c);"#,
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: format!("unsafe fn f() {{ #[proctor(0)] {statement} }}"),
             accepted_correspondence: vec![],
@@ -1322,7 +1327,6 @@ fn print_template_invariants_are_defended_without_validator() {
         r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}/{:08x}/{}", a, b, c); consume(); }"#,
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: transformation.to_owned(),
             accepted_correspondence: vec![],
@@ -1401,7 +1405,6 @@ fn expanded_printf_templates_restore_exact_literals() {
             r#"unsafe fn {name}({parameter}) {{ #[proctor(0)] ::std::print!("{format}", {argument}); }}"#
         );
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, name, name, &skeleton, vec![0])],
             transformation,
             accepted_correspondence: vec![],
@@ -1442,7 +1445,6 @@ unsafe fn show(flag: bool, pointer: &i32) -> i32 {
 }
 "#;
     let request = ReplacementRequest {
-        schema_version: 1,
         items: vec![preservation_item(7, "show", "show", skeleton, vec![0, 1])],
         transformation: transformation.to_owned(),
         accepted_correspondence: vec![],
@@ -1459,7 +1461,7 @@ unsafe fn show(flag: bool, pointer: &i32) -> i32 {
             .collect::<Vec<_>>(),
         [0, 1]
     );
-    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+    let metadata = observation_metadata(
         &output,
         output.replacement.source.as_bytes(),
         b"pairs",
@@ -1476,8 +1478,7 @@ fn replacer_rechecks_expanded_printf_literal_without_validator() {
     let skeleton =
         r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4x}", todo!()); }"#;
     let request = ReplacementRequest {
-        schema_version: 1,
-        items: vec![preservation_item(7, "lower_hex", "lower_hex", skeleton, vec![0])],
+                items: vec![preservation_item(7, "lower_hex", "lower_hex", skeleton, vec![0])],
         transformation: r#"unsafe fn lower_hex(value: u32) { #[proctor(0)] ::std::print!("{:#08.4X}", ::proctor_libc::printf::unsigned(value)); }"#.to_owned(),
         accepted_correspondence: vec![],
     };
@@ -1498,7 +1499,6 @@ fn aliased_printf_metadata_makes_corrupt_replacement_template_invalid_request() 
         argument_count: 1,
     });
     let request = ReplacementRequest {
-        schema_version: 1,
         items: vec![item],
         transformation: skeleton.to_owned(),
         accepted_correspondence: vec![],
@@ -1558,13 +1558,11 @@ pub fn main() { unsafe { ::std::process::exit(main_0() as i32) } }
 #[test]
 fn versioned_request_json_round_trip_preserves_rust() {
     let json = r#"{
-  "schema_version": 1,
-  "items": [{"id":7,"path":"f","name":"f","view":{"skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],
+    "items": [{"id":7,"path":"f","name":"f","view":{"skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],
   "transformation": "unsafe fn f(value: i32) -> i32 {\n #[proctor(0)]\n value + 1\n}",
   "accepted_correspondence": []
 }"#;
     let request = replacement_request_from_json(json).unwrap();
-    assert_eq!(request.schema_version, 1);
     assert!(request.transformation.contains("#[proctor(0)]"));
 }
 
@@ -1573,8 +1571,7 @@ fn replacement_discards_preserved_groups_without_validator() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
-        items: vec![preservation_item(
+                items: vec![preservation_item(
             7,
             "f",
             "f",
@@ -1595,8 +1592,7 @@ fn preserved_restricted_conditional_has_only_its_outer_label() {
         "pub unsafe fn f(value: i32) -> i32 { return value + (if value > 0 { -1 } else { 1 }); }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
-        items: vec![preservation_item(
+                items: vec![preservation_item(
             7,
             "f",
             "f",
@@ -1628,7 +1624,6 @@ pub unsafe fn f(pointer: *const i32, values: &mut [i32]) -> i32 {
 "#;
     let skeleton = "unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 { #[proctor(0)] todo!(); #[proctor(1)] todo!() }";
     let request = ReplacementRequest {
-        schema_version: 1,
         items: vec![preservation_item(7, "f", "f", skeleton, vec![0, 1])],
         transformation: r#"
 unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 {
@@ -1647,7 +1642,6 @@ unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 {
     };
     assert_eq!(
         crate::validate(&crate::ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![crate::ExpectedFunction {
                 id: 7,
                 name: "f".to_owned(),
@@ -1669,7 +1663,7 @@ unsafe fn f(pointer: &i32, values: &mut [i32]) -> i32 {
             .collect::<Vec<_>>(),
         [0, 1]
     );
-    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+    let metadata = observation_metadata(
         &output,
         output.replacement.source.as_bytes(),
         b"pairs",
@@ -1695,7 +1689,6 @@ pub unsafe fn f(value: i32) { printf(b"%d\0" as *const u8 as *const i8, value); 
         "(|| { let mut result = 0; while let Some(proctor_temp_var_0) = Some(value) && proctor_temp_var_0 > 0 { result += proctor_temp_var_0; break; } result })()",
     ] {
         let request = ReplacementRequest {
-            schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
             transformation: format!(
                 r#"unsafe fn f(value: i32) {{ #[proctor(0)] ::std::print!("{{}}", {expression}); }}"#
@@ -1720,7 +1713,6 @@ pub unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
 "#;
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "f",
@@ -1781,8 +1773,7 @@ pub unsafe fn f(mut state: State, value: i32) -> State {
 "#;
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
-        items: vec![preservation_item(
+                items: vec![preservation_item(
             7,
             "f",
             "f",
@@ -1851,7 +1842,6 @@ unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
 "#;
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "validate_me",
@@ -1905,7 +1895,6 @@ fn replacement_independently_restores_mixed_rule_applied_topologies() {
     for (skeleton, transformed, applied, transformation, expected) in cases {
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: vec![mixed_preservation_item(skeleton, &transformed, &applied)],
             transformation: transformation.to_owned(),
         };
@@ -1925,7 +1914,6 @@ fn replacement_restores_preserved_shell_and_keeps_transformed_child() {
     item.view.statement_dispositions[0].disposition = StatementDispositionKind::PreserveShell;
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![item],
         transformation: r#"unsafe fn f(flag: bool) {
 #[proctor(0)] if !flag { #[proctor(1)] consume(2); }
@@ -2014,7 +2002,6 @@ fn replacement_atomically_rejects_invalid_mixed_rule_applied_descendants() {
     for (skeleton, transformed, applied, transformation) in cases {
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: vec![mixed_preservation_item(skeleton, &transformed, &applied)],
             transformation: transformation.to_owned(),
         };
@@ -2031,7 +2018,6 @@ fn replacement_rejects_extra_outer_groups_without_validator() {
     ] {
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: vec![preservation_item(
                 7,
                 "f",
@@ -2051,7 +2037,6 @@ fn replacement_uses_immutable_skeleton_header() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "f",
@@ -2074,7 +2059,6 @@ fn fully_preserved_body_can_change_signature_directly() {
     let source = "pub unsafe fn f(pointer: *mut i32) -> bool { pointer.is_null() }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "f",
@@ -2101,7 +2085,6 @@ fn metadata_failure_is_atomic() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![ReplacementItem {
             id: 7,
             path: "f".to_owned(),
@@ -2164,7 +2147,6 @@ pub unsafe fn f(flag: bool, pointer: *mut i32) {
         }
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: vec![item],
             transformation: transformation.to_owned(),
         };
@@ -2203,43 +2185,49 @@ unsafe fn f(value: i32) -> i32 {
 }
 
 #[test]
-fn request_json_rejects_unknown_fields_and_non_u64_numbers() {
-    for input in [
-        r#"{"schema_version":1,"items":[{"id":7,"path":"f","name":"f"}],"transformation":"unsafe fn f() {}","extra":true}"#,
-        r#"{"schema_version":1.0,"items":[{"id":7,"path":"f","name":"f"}],"transformation":"unsafe fn f() {}"}"#,
-        r#"{"schema_version":1,"items":[{"id":-1,"path":"f","name":"f"}],"transformation":"unsafe fn f() {}"}"#,
-        r#"{"schema_version":1,"items":[{"id":18446744073709551616,"path":"f","name":"f"}],"transformation":"unsafe fn f() {}"}"#,
-    ] {
+fn request_json_rejects_unknown_missing_and_mistyped_fields() {
+    let request = request("f", "f", "unsafe fn f() {}");
+    let value = serde_json::to_value(request).unwrap();
+    let mut invalid = vec![];
+    let mut unknown = value.clone();
+    unknown["extra"] = serde_json::json!(true);
+    invalid.push(unknown);
+    for field in ["items", "transformation", "accepted_correspondence"] {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        invalid.push(missing);
+        let mut mistyped = value.clone();
+        mistyped[field] = serde_json::Value::Null;
+        invalid.push(mistyped);
+    }
+    for number in ["-1", "1.0", "18446744073709551616"] {
+        let mut mistyped = value.clone();
+        mistyped["items"][0]["id"] = serde_json::from_str(number).unwrap();
+        invalid.push(mistyped);
+    }
+    for value in invalid {
         assert_eq!(
-            replacement_request_from_json(input).unwrap_err().kind,
+            replacement_request_from_json(&value.to_string())
+                .unwrap_err()
+                .kind,
             ReplacementErrorKind::InvalidRequest
         );
     }
 }
 
 #[test]
-fn unsupported_version_and_empty_items_are_rejected() {
-    for request in [
-        ReplacementRequest {
-            accepted_correspondence: vec![],
-            schema_version: 2,
-            items: vec![replacement_item(7, "f".to_owned(), "f".to_owned())],
-            transformation: "unsafe fn f() {}".to_owned(),
-        },
-        ReplacementRequest {
-            accepted_correspondence: vec![],
-            schema_version: 1,
-            items: vec![],
-            transformation: String::new(),
-        },
-    ] {
-        assert_eq!(
-            add_source("pub unsafe fn f() {}", &request)
-                .unwrap_err()
-                .kind,
-            ReplacementErrorKind::InvalidRequest
-        );
-    }
+fn empty_items_are_rejected() {
+    let request = ReplacementRequest {
+        accepted_correspondence: vec![],
+        items: vec![],
+        transformation: String::new(),
+    };
+    assert_eq!(
+        add_source("pub unsafe fn f() {}", &request)
+            .unwrap_err()
+            .kind,
+        ReplacementErrorKind::InvalidRequest
+    );
 }
 
 #[test]
@@ -2252,7 +2240,6 @@ fn duplicate_ids_paths_and_names_are_rejected_deterministically() {
     ] {
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: items
                 .into_iter()
                 .map(|(id, path, name)| replacement_item(id, path, name))
@@ -2294,7 +2281,6 @@ fn transformation_must_be_exact_supported_requested_function_set() {
     ] {
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
-            schema_version: 1,
             items: items.clone(),
             transformation: transformation.to_owned(),
         };
@@ -2307,7 +2293,6 @@ fn transformation_must_be_exact_supported_requested_function_set() {
 
     let unexpected = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![items[0].clone()],
         transformation: "unsafe fn f() {} unsafe fn z() {} unsafe fn a() {}".to_owned(),
     };
@@ -2453,7 +2438,6 @@ fn adds_mechanical_function_with_wildcard_parameter() {
     assert!(!view.needs_transformation);
     let transformation = view.skeleton.clone();
     let request = ReplacementRequest {
-        schema_version: 1,
         items: vec![ReplacementItem {
             id: record.id,
             path: record.path,
@@ -2473,7 +2457,6 @@ fn wildcard_parameter_preserves_used_pointer_observations() {
     let source = "pub unsafe fn read(_: *const i32, pointer: *const i32) -> i32 { *pointer }";
     let skeleton = "unsafe fn read(_: *const i32, pointer: &i32) -> i32 { #[proctor(0)] todo!() }";
     let request = ReplacementRequest {
-        schema_version: 1,
         items: vec![preservation_item(7, "read", "read", skeleton, vec![0])],
         transformation:
             "unsafe fn read(_: *const i32, pointer: &i32) -> i32 { #[proctor(0)] *pointer }"
@@ -2482,7 +2465,6 @@ fn wildcard_parameter_preserves_used_pointer_observations() {
     };
     assert_eq!(
         crate::validate(&crate::ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![crate::ExpectedFunction {
                 id: 7,
                 name: "read".to_owned(),
@@ -2495,7 +2477,7 @@ fn wildcard_parameter_preserves_used_pointer_observations() {
     let initial = make_initial_source(source).unwrap();
     let output = add(source, &initial, &request).unwrap();
     compile_checked(&output.replacement.source);
-    let metadata = crate::ReplacementObservationMetadata::from_additive_output(
+    let metadata = observation_metadata(
         &output,
         output.replacement.source.as_bytes(),
         b"pairs",
@@ -2561,7 +2543,6 @@ fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
     let source = "pub unsafe fn first() {} pub unsafe fn second() {}";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![
             preservation_item(
                 9,
@@ -2609,7 +2590,6 @@ fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
 
     let preserved = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             1,
             "first",
@@ -2632,7 +2612,6 @@ fn one_source_statement_reports_the_complete_canonical_expansion_group() {
     let source = "pub unsafe fn expansion(mut pointer: *mut i32) -> i32 { *pointer }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "expansion",
@@ -2662,7 +2641,6 @@ fn canonical_after_restores_preserved_descendants_before_capture() {
     let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "choose",
@@ -2701,7 +2679,6 @@ fn overlapping_parent_and_descendant_labels_each_get_one_entry() {
     let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "choose",
@@ -2751,7 +2728,6 @@ fn sidecar_excludes_preserved_labels_and_generated_variable_type_rows() {
         "pub unsafe fn f(mut pointer: *mut i32) -> i32 { let value = 1; *pointer + value }";
     let request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![preservation_item(
             7,
             "f",
