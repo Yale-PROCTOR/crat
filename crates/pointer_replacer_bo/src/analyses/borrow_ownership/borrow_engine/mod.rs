@@ -48,6 +48,7 @@ pub(crate) use conflicts::{
     borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped,
     borrow_conflicts_replaying_witnessed_with_flows_and_parameter_overlap_and_escaped,
+    recording_edge_invalidators,
 };
 #[cfg(test)]
 pub(crate) use conflicts::{

@@ -24,7 +24,7 @@ use super::{
     coherence::{CopyLendPair, SelectedCopyLendLoans, selected_copy_lend_sites},
     crate_slots::CrateSlots,
     guarded_repair::{
-        ConflictObservation, DeclineReason as GuardedDeclineReason, Planner,
+        self, ConflictObservation, DeclineReason as GuardedDeclineReason, Planner,
         RoundPlan as GuardedRoundPlan, SolverDecline as GuardedSolverDecline,
         SolverOutcome as GuardedSolverOutcome, StableLoanKey,
     },
@@ -199,6 +199,10 @@ struct Revalidated<T> {
     conflicts: T,
     retirement: super::retirement::RetirementReview,
     reader_failures: Vec<super::licensing::reader_replay::Failure>,
+    /// era-5c L01¹¹ (R668-4): with the raw-cause ledger on, each conflict's
+    /// invalidating slots, in the order of `conflicts`' per-function lists (the
+    /// L2 capture's, mapped as the witnessed replay maps them). Empty otherwise.
+    edge_invalidators: FxHashMap<LocalDefId, Vec<Vec<SlotRef>>>,
 }
 
 fn finish_readers(
@@ -475,9 +479,36 @@ fn revalidate_replaying_reviewed(
         }
     };
 
-    let edges = replay();
+    // era-5c L01¹¹ (R668-4): the ledger records each Mode-A commit's clause, so
+    // the replay records each edge's invalidators (observation only).
+    let (edges, invalidators) = if super::raw_cause::records_invalidators() {
+        super::borrow_engine::recording_edge_invalidators(replay)
+    } else {
+        (replay(), FxHashMap::default())
+    };
+    let edge_invalidators = invalidators
+        .into_iter()
+        .map(|(fn_did, per_edge)| {
+            let per_edge = per_edge
+                .into_iter()
+                .map(|locals| {
+                    let mut invalidators = locals
+                        .into_iter()
+                        .filter_map(|local| {
+                            owner_to_slot(slots, fn_did, ProvenanceOwner::Local(local))
+                        })
+                        .collect::<Vec<_>>();
+                    invalidators.sort_by_key(slotref_key);
+                    invalidators.dedup();
+                    invalidators
+                })
+                .collect();
+            (fn_did, per_edge)
+        })
+        .collect();
     Revalidated {
         conflicts: map_edges_to_slots(slots, edges),
+        edge_invalidators,
         retirement: finish_retirement(retirement_scope),
         reader_failures: finish_readers(reader_scope),
     }
@@ -617,6 +648,7 @@ fn revalidate_replaying_witnessed(
         .collect();
     Revalidated {
         conflicts,
+        edge_invalidators: FxHashMap::default(),
         retirement: finish_retirement(retirement_scope),
         reader_failures: finish_readers(reader_scope),
     }
@@ -1156,6 +1188,11 @@ fn verify_rounds(
         return (None, stats);
     };
     record_dropped(&mut stats, selectors, &dropped);
+    // era-5c R607-1: the raw-cause ledger's inputs -- every Mode-A commit with
+    // its track, and the selectors the accepted round dropped.
+    let ledger = super::raw_cause::enabled();
+    let mut ledger_commits: Vec<super::raw_cause::Commit> = Vec::new();
+    let mut last_dropped = dropped;
     for _ in 0..cap {
         stats.rounds += 1;
         // Each round re-runs the oracle under a DIFFERENT candidacy
@@ -1267,6 +1304,7 @@ fn verify_rounds(
                     conflicts: plain,
                     retirement,
                     reader_failures,
+                    edge_invalidators: FxHashMap::default(),
                 },
                 Some(conflicts),
             )
@@ -1297,6 +1335,16 @@ fn verify_rounds(
             }
             for target in &raw_targets {
                 solver.assume(*target, SlotKind::Raw);
+                if ledger && let Some(track) = solver.last_track() {
+                    ledger_commits.push(super::raw_cause::Commit {
+                        track,
+                        slot: *target,
+                        round: stats.rounds,
+                        kind: super::raw_cause::CommitKind::RetirementRaw,
+                        issuer: None,
+                        clause: None,
+                    });
+                }
             }
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
@@ -1312,9 +1360,20 @@ fn verify_rounds(
             };
             model = next;
             record_dropped(&mut stats, selectors, &dropped);
+            last_dropped = dropped;
             continue;
         }
         let mut conflicts = reviewed.conflicts;
+        let retirement_targets: FxHashSet<SlotRef> = if ledger {
+            reviewed.retirement.targets().into_iter().collect()
+        } else {
+            FxHashSet::default()
+        };
+        let reader_targets: FxHashSet<SlotRef> = reviewed
+            .reader_failures
+            .iter()
+            .filter_map(|failure| failure.target)
+            .collect();
         for failure in &reviewed.reader_failures {
             let Some(target @ SlotRef::Local(function, _)) = failure.target else {
                 return (None, stats);
@@ -1371,6 +1430,7 @@ fn verify_rounds(
                 };
                 model = next;
                 record_dropped(&mut stats, selectors, &dropped);
+                last_dropped = dropped;
                 continue;
             }
             stats.field_conflict_decline = Some(field);
@@ -1397,18 +1457,52 @@ fn verify_rounds(
                 // conflicts with equal keys have equal issuer and requirers, so
                 // `representative` returns the same slot for both and they emit
                 // IDENTICAL assertions. Tie order cannot change the sequence.
-                let mut ordered: Vec<(LocalDefId, &SlotConflict)> = conflicts
+                // Each conflict keeps its index in its function's list, where the
+                // ledger finds its invalidators; the (stable) sort is unchanged.
+                let mut ordered: Vec<(LocalDefId, usize, &SlotConflict)> = conflicts
                     .iter()
-                    .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
+                    .flat_map(|(did, cs)| cs.iter().enumerate().map(move |(i, c)| (*did, i, c)))
                     .collect();
-                ordered.sort_by(|(da, ca), (db, cb)| {
+                ordered.sort_by(|(da, _, ca), (db, _, cb)| {
                     conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb))
                 });
-                for (_, conflict) in ordered {
+                for (did, index, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
                         // Name the conflict a plain-repair commit came from.
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
+                        if ledger && let Some(track) = solver.last_track() {
+                            use super::raw_cause::CommitKind;
+                            let bare = conflict.requirers.is_empty();
+                            let kind = match conflict.issuer {
+                                Some(issuer) if bare && retirement_targets.contains(&issuer) => {
+                                    CommitKind::RetirementConflict
+                                }
+                                Some(issuer) if bare && reader_targets.contains(&issuer) => {
+                                    CommitKind::ReaderObligation
+                                }
+                                _ => CommitKind::BorrowExclusion,
+                            };
+                            // R668-4: the clause the guarded planner would assert here.
+                            let invalidators = reviewed
+                                .edge_invalidators
+                                .get(&did)
+                                .and_then(|per_edge| per_edge.get(index))
+                                .map_or(&[][..], Vec::as_slice);
+                            ledger_commits.push(super::raw_cause::Commit {
+                                track,
+                                slot,
+                                round: stats.rounds,
+                                kind,
+                                issuer: conflict.issuer,
+                                clause: Some(super::raw_cause::Clause::witnessed(
+                                    slot,
+                                    conflict.issuer,
+                                    invalidators,
+                                    &model,
+                                )),
+                            });
+                        }
                         committed += 1;
                         stats.commits_conflict += 1;
                         // Commit-necessity audit capture (gated; `None` = off, zero cost). Record
@@ -1468,6 +1562,55 @@ fn verify_rounds(
                         );
                         for action in &actions {
                             solver.add_guarded_commit(action);
+                            if ledger && let Some(track) = solver.last_track() {
+                                use super::raw_cause::CommitKind;
+                                let kind = match action.kind {
+                                    guarded_repair::CommitActionKind::GuardedCommit => {
+                                        CommitKind::GuardedCommit
+                                    }
+                                    guarded_repair::CommitActionKind::RecurrenceEscalation => {
+                                        CommitKind::RecurrenceEscalation
+                                    }
+                                    guarded_repair::CommitActionKind::UnconditionalCommit
+                                        if retirement_targets.contains(&action.target) =>
+                                    {
+                                        CommitKind::RetirementConflict
+                                    }
+                                    guarded_repair::CommitActionKind::UnconditionalCommit
+                                        if reader_targets.contains(&action.target) =>
+                                    {
+                                        CommitKind::ReaderObligation
+                                    }
+                                    guarded_repair::CommitActionKind::UnconditionalCommit => {
+                                        CommitKind::BorrowExclusion
+                                    }
+                                };
+                                // R668-4: under the guarded repair the ledger names the clause
+                                // the planner asserted (its Ref peers and Raw invalidators).
+                                ledger_commits.push(super::raw_cause::Commit {
+                                    track,
+                                    slot: action.target,
+                                    round: stats.rounds,
+                                    kind,
+                                    issuer: None,
+                                    clause: Some(super::raw_cause::Clause {
+                                        shape: match action.kind {
+                                            guarded_repair::CommitActionKind::GuardedCommit => {
+                                                "guarded"
+                                            }
+                                            _ => "unconditional",
+                                        },
+                                        ref_peers: action
+                                            .clause
+                                            .negative_refs
+                                            .iter()
+                                            .copied()
+                                            .filter(|slot| *slot != action.target)
+                                            .collect(),
+                                        raw_invalidators: action.clause.positive_refs.clone(),
+                                    }),
+                                });
+                            }
                             committed += 1;
                             stats.commits_conflict += 1;
                         }
@@ -1509,6 +1652,18 @@ fn verify_rounds(
             // committed like any `Ref` slot and a non-`Ref` field residual already declined above, so
             // this path does not silently accept a dropped-`Field` residual.
             super::licensing::stack_export::accept(solver.ownership_facts());
+            if ledger {
+                super::raw_cause::publish(
+                    program.tcx,
+                    slots,
+                    solver,
+                    hard.as_ref(),
+                    selectors,
+                    &last_dropped,
+                    &model,
+                    &ledger_commits,
+                );
+            }
             return (Some(model), stats);
         }
         model = match solve_round(
@@ -1521,6 +1676,7 @@ fn verify_rounds(
         ) {
             Some((m, dropped)) => {
                 record_dropped(&mut stats, selectors, &dropped);
+                last_dropped = dropped;
                 m
             }
             None => return (None, stats),

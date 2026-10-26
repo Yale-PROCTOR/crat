@@ -320,10 +320,42 @@ pub(crate) fn prepare(
     let result = (|| -> Result<Prepared, String> {
         let inputs = semantic_inputs(program)?;
         let key = super::cache_contract::semantic_key(&inputs)?;
+        // The raw-cause ledger that explains the accepted model, taken whenever the ledger is on:
+        // beside the entry below when a cache directory is configured, and kept for the
+        // per-subject writer (`raw_cause::last`). Neither sink touches the entry.
+        let ledger = super::raw_cause::enabled()
+            .then(|| super::raw_cause::take_for(&verified.model))
+            .flatten();
         let entry = match dir() {
             None => None,
             Some(cache) => {
                 let directory = cache.join("bo-model-cache-v1");
+                if super::raw_cause::enabled() {
+                    let path = directory.join(format!("{}.raw-cause-ledger.tsv", inputs.program));
+                    match &ledger {
+                        Some(rows) => {
+                            let mut text = format!("{}\n", super::raw_cause::HEADER);
+                            for row in rows {
+                                text.push_str(&format!("{}\t{}\n", inputs.program, row.sidecar()));
+                            }
+                            // A failed sidecar never fails the entry.
+                            match std::fs::create_dir_all(&directory)
+                                .and_then(|()| std::fs::write(&path, text))
+                            {
+                                Ok(()) => {
+                                    eprintln!("E5C_LEDGER {} rows={}", path.display(), rows.len())
+                                }
+                                Err(error) => {
+                                    eprintln!("E5C_LEDGER {} error: {error}", path.display())
+                                }
+                            }
+                        }
+                        None => eprintln!(
+                            "E5C_LEDGER {} missing: no ledger explains the model",
+                            path.display()
+                        ),
+                    }
+                }
                 let portable = super::portable_export::stream::collect_to_path(
                     program, slots, captured, &directory,
                 )?;

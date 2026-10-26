@@ -196,6 +196,16 @@ impl CoreTracker {
             .collect()
     }
 
+    /// era-5c R607-1 (the raw-cause ledger): the track of the constraint
+    /// recorded last, and every track with its label.
+    fn last_track(&self) -> Option<Bool> {
+        self.entries.borrow().last().map(|(track, _)| track.clone())
+    }
+
+    fn labeled(&self) -> Vec<(Bool, String)> {
+        self.entries.borrow().clone()
+    }
+
     fn len(&self) -> usize {
         self.entries.borrow().len()
     }
@@ -714,6 +724,53 @@ impl KindSolver {
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
         self.tracker.as_ref()
+    }
+
+    /// era-5c R607-1: the production track of the hard constraint asserted
+    /// last, so a core literal names the commit it came from.
+    pub(crate) fn last_track(&self) -> Option<Bool> {
+        self.tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+            .and_then(CoreTracker::last_track)
+    }
+
+    /// era-5c R607-1: every production track with its label.
+    pub(crate) fn tracked_labels(&self) -> Vec<(Bool, String)> {
+        self.tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+            .map(CoreTracker::labeled)
+            .unwrap_or_default()
+    }
+
+    /// era-5c R607-1: can `slot` take `kind` under the hard system and the
+    /// selectors `kept`? `Ok(None)`: yes. `Ok(Some(core))`: no, and the tracked
+    /// core says why. `Err`: unknown. Asserts nothing and touches no counter
+    /// the entry records, so the accepted model and its entry are unchanged.
+    pub(crate) fn raw_cause_probe(
+        &self,
+        hard: &HardLoopSolver,
+        kept: &[Bool],
+        slot: SlotRef,
+        kind: SlotKind,
+    ) -> Result<Option<Vec<Bool>>, String> {
+        let vars = &self.vars[&slot];
+        let bit = match kind {
+            SlotKind::Raw => &vars.raw,
+            SlotKind::Ref => &vars.ref_,
+            SlotKind::Owning => &vars.own,
+        };
+        let mut bundle = self.assumption_bundle(kept);
+        bundle.push(bit.clone());
+        match hard.solver.check_assumptions(&bundle) {
+            SatResult::Sat => Ok(None),
+            SatResult::Unsat => Ok(Some(hard.solver.get_unsat_core())),
+            SatResult::Unknown => Err(hard
+                .solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())),
+        }
     }
 
     pub(crate) fn is_diagnostic_tracked(&self) -> bool {

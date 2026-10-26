@@ -137,6 +137,42 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends_and_parameter_overla
     (invalidates, accesses, conflicts)
 }
 
+/// era-5c L01¹¹ (R668-4): the raw-cause ledger's capture on Mode-A's own replay.
+/// The invalidation matrix and the parameter conflicts are computed exactly as
+/// the two entry points above compute them; every insertion's accessor is also
+/// recorded, write-only, as the L2 capture records it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_invalidates_recording<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &CopyLendLoans,
+    parameter_overlap: Option<&ParameterOverlap>,
+    accesses: &mut Vec<InvalidationAccess>,
+) -> (Invalidates, Vec<(Local, Local)>) {
+    let mut parameter_accesses = Vec::new();
+    let invalidates = compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        copy_lends,
+        parameter_overlap,
+        Some(accesses),
+        parameter_overlap.map(|_| &mut parameter_accesses),
+    );
+    let conflicts = match parameter_overlap {
+        Some(parameter_overlap) => {
+            parameter_conflict_pairs(tcx, body, &parameter_accesses, parameter_overlap)
+        }
+        None => Vec::new(),
+    };
+    (invalidates, conflicts)
+}
+
 fn parameter_conflict_pairs<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
