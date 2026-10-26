@@ -64,7 +64,6 @@ use super::{
 /// To extract the "imaginary" value at a specific field accessed via a pointer,
 /// use `g.get_absloc_as_int(n[&1].field(0).as_ptr())`, which returns the
 /// imaginary value pointed to by field `0` of `_1`.
-
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
 }
@@ -105,12 +104,11 @@ where F: FnOnce(Graph, AnalysisResult, TyCtxt<'_>) + Send {
         extern crate libc;
         #[macro_use]
         extern crate c2rust_bitfields;
-        {}
-        unsafe extern \"C\" fn {}({}) {{
-            {}
+        {types}
+        unsafe extern \"C\" fn {name}({params}) {{
+            {code}
         }}
-    ",
-        types, name, params, code
+    "
     );
     run_compiler(&code, |tcx| {
         let res = analyze(false, tcx);
@@ -128,7 +126,7 @@ where F: FnOnce(Graph, AnalysisResult, TyCtxt<'_>) + Send {
     analyze_fn_with("", "", code, f);
 }
 
-fn get_nodes<'a>(g: &'a Graph, i: impl Iterator<Item = usize>) -> FxHashMap<usize, &'a Node> {
+fn get_nodes(g: &Graph, i: impl Iterator<Item = usize>) -> FxHashMap<usize, &Node> {
     i.map(|n| (n, g.get_local_node(Local::from_usize(n))))
         .collect()
 }
@@ -523,8 +521,8 @@ fn test_eq_ref_deref() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=6);
             let i = get_ids(&g, 1..=6);
-            println!("{:?}", n);
-            println!("{:?}", i);
+            println!("{n:?}");
+            println!("{i:?}");
 
             assert_eq!(g.get_absloc_as_int(n[&2].field(0).as_ptr()), Some(0));
 
@@ -1633,8 +1631,8 @@ fn test_offset() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=3);
-            println!("{:?}", g);
-            println!("{:?}", n);
+            println!("{g:?}");
+            println!("{n:?}");
             assert_eq!(n[&1].as_ptr().root(), n[&2].as_ptr().root());
             assert_eq!(n[&1].as_ptr().projection()[0], AccElem::num_index(0));
             assert_eq!(n[&2].as_ptr().projection()[0], AccElem::num_index(1));
@@ -2398,7 +2396,7 @@ fn test_static_invalidate() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=4);
-            println!("{:?}", n);
+            println!("{n:?}");
             assert_ne!(g.get_local_as_int(Local::from_usize(4)), Some(1));
             assert_eq!(n[&1].as_ptr(), n[&4].as_ptr());
         },
