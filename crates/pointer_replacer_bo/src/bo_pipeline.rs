@@ -347,6 +347,59 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
     ] {
         write(name, text)?;
     }
+
+    // Last, so no file above depends on it: the raw-cause ledger, when it ran. One row
+    // per slot the model settles not Ref, led by `subjects.tsv`'s own `program` and
+    // `subject_key` so the two files join row for row on that pair (a ledger row's
+    // function, MIR local and depth are a subject's `owner_fn`, `mir_local` and
+    // `ptr_depth` less one; a slot that is no subject -- a temporary, a field -- has
+    // `subject_key` `-`).
+    if let Some(rows) = &capture.raw_boundary_artifacts.session_raw_cause_ledger {
+        let subject_keys = match (column("owner_fn"), column("mir_local"), column("ptr_depth")) {
+            (Some(owner_at), Some(local_at), Some(depth_at)) => capture
+                .subject_receipt
+                .lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let cells = line.split('\t').collect::<Vec<_>>();
+                    let depth = cells.get(depth_at)?.parse::<u8>().ok()?.checked_sub(1)?;
+                    Some((
+                        (
+                            *cells.get(owner_at)?,
+                            *cells.get(local_at)?,
+                            depth.to_string(),
+                        ),
+                        *cells.get(key_at)?,
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            _ => {
+                return Err(format!(
+                    "subject receipt header lacks owner_fn / mir_local / ptr_depth: {seed_header}"
+                ));
+            }
+        };
+        let mut ledger = format!(
+            "program\tsubject_key\t{}\n",
+            crate::analyses::borrow_ownership::raw_cause::HEADER
+                .split_once('\t')
+                .map_or("", |(_, rest)| rest)
+        );
+        for row in rows {
+            let mut cells = row.splitn(4, '\t');
+            let (function, local, depth) = (
+                cells.next().unwrap_or("-"),
+                cells.next().unwrap_or("-"),
+                cells.next().unwrap_or("-").to_owned(),
+            );
+            let subject_key = subject_keys
+                .get(&(function, local, depth))
+                .copied()
+                .unwrap_or("-");
+            ledger.push_str(&format!("{program}\t{subject_key}\t{row}\n"));
+        }
+        write("raw-cause-ledger.tsv", &ledger)?;
+    }
     Ok(())
 }
 

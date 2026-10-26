@@ -613,6 +613,10 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) session_graft_held_table: String,
     pub(crate) session_graft_refusals: usize,
     pub(crate) session_stale_replans: usize,
+    /// The raw-cause ledger of the accepted model, one row per slot it settles not
+    /// Ref (`raw_cause::HEADER`'s columns after `program`), when the ledger is on;
+    /// `None` when it is off. Read by the per-subject writer only.
+    pub(crate) session_raw_cause_ledger: Option<Vec<String>>,
     /// wave-6v2 (R442-4): one row per counted-void CALL plan, with the whole-call
     /// replacements that cover it. An A5 proof-site raw view, a PAIR raw view or a
     /// C-9 mark replaces the entire call expression, so an argument adapter planned
@@ -4005,6 +4009,8 @@ fn with_session_receipts(mut outcome: RewriteOutcome) -> RewriteOutcome {
     artifacts.session_graft_held_table = ast_transform::graft_held_table();
     artifacts.session_graft_refusals = ast_transform::graft_refusals();
     artifacts.session_stale_replans = decision::cursor_native::stale_replans();
+    artifacts.session_raw_cause_ledger = crate::analyses::borrow_ownership::raw_cause::take_last()
+        .map(|rows| rows.iter().map(|row| row.sidecar()).collect());
     outcome
 }
 
@@ -10218,6 +10224,7 @@ fn finish_decide<'tcx>(
             session_graft_held_table: String::new(),
             session_graft_refusals: 0,
             session_stale_replans: 0,
+            session_raw_cause_ledger: None,
         };
 
         // C.2: the in-process coverage gate is GONE. Its replacement is the

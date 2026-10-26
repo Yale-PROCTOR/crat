@@ -277,6 +277,12 @@ pub(crate) fn last() -> Option<Vec<Row>> {
     LAST.with(|last| last.borrow().clone())
 }
 
+/// The ledger the last `take_for` returned, taken: the per-subject writer's copy,
+/// so a later program on the same thread never reads an earlier one's rows.
+pub(crate) fn take_last() -> Option<Vec<Row>> {
+    LAST.with(|last| last.borrow_mut().take())
+}
+
 /// The family of one core label: its head, after the emission context and
 /// before the arguments (`ctx::own-assume[temporary-finalization](7=false)` is
 /// `own-assume[temporary-finalization]`).
