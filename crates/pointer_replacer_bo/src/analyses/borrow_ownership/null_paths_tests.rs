@@ -2265,6 +2265,20 @@ unsafe extern "C" fn get_var(mut c: *mut ctx_t) -> i32 { return (*c).n; }
 /// W67: small shapes for the raw-cause ledger's classes -- a pointer
 /// joined at a phi with null or with a borrowed pointer, and locals no rule
 /// reaches.
+/// W67a: a C variable-length array, translated to a `Vec`, in a callee. The `Vec`'s
+/// drop is a release whose effects are unresolved (its objects unknown); the call
+/// routes it to `vla_mid`, whose by-reference formal `ctx` it may retire.
+const W67_VLA: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+#[no_mangle] pub unsafe extern "C" fn vla_leaf(mut out: *mut u8, mut n: usize) {
+    let mut buf: Vec<u8> = ::std::vec::from_elem(0, n);
+    *out = *buf.as_ptr();
+}
+#[no_mangle] pub unsafe extern "C" fn vla_mid(mut ctx: *const u8, mut out: *mut u8) {
+    vla_leaf(out, *ctx as usize + 1);
+}
+"#;
+
 const W67_SHAPES: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
 extern "C" { fn malloc(_: u64) -> *mut core::ffi::c_void; fn free(_: *mut core::ffi::c_void); }
@@ -2354,6 +2368,7 @@ fn e5c_inner_w63() {
         Ok("callback") => W63_CALLBACK,
         Ok("w66-controls") => W66_CONTROLS,
         Ok("w67-shapes") => W67_SHAPES,
+        Ok("w67-vla") => W67_VLA,
         Ok("w68-shapes") => W68_SHAPES,
         Ok("w71-shapes") => W71_SHAPES,
         Ok("ctx-jail") => W71_CTX_JAIL,
@@ -2609,10 +2624,15 @@ fn e5c_inner_w63() {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |rows| rows.len().to_string())
         );
-        // W67: the raw-cause ledger of the accepted model.
+        // W67: the raw-cause ledger of the accepted model, and every slot's kind beside it.
         if super::raw_cause::enabled() {
             for row in super::raw_cause::last().unwrap_or_default() {
                 eprintln!("E5C_W63 ledger {}", row.tsv());
+            }
+            for (slot, kind) in &verified.model {
+                if let Some(key) = super::model_cache::render_key(program.tcx, &slots, *slot) {
+                    eprintln!("E5C_W63 kind {key}\t{kind:?}");
+                }
             }
         }
     })
@@ -3024,35 +3044,45 @@ fn w67_row<'a>(rows: &'a [Vec<String>], key: &str) -> &'a Vec<String> {
         .unwrap_or_else(|| panic!("no ledger row {key}: {rows:?}"))
 }
 
-/// W67a: ht's `ht_expand::_1` without the discharge is Raw by its own
-/// retirement conflict; with the discharge it is Ref and has no row.
+/// W67a: a retirement conflict. `vla_mid::ctx` (`_1`) is Ref-excluded by its own
+/// retirement conflict: the drop of `vla_leaf`'s `Vec` reaches it through the call.
+/// On ht (the corpus), `ht_expand::_1`, whose routed `free` a discharge clears, is
+/// Ref and has no row. With the ledger off there are no rows.
 #[test]
 fn e5c_w67_a_the_ledger_names_a_retirement_conflict() {
-    if !std::path::Path::new(W64_HT).is_file() {
-        eprintln!("corpus absent; skipping");
-        return;
-    }
-    let shape = format!("file:{W64_HT}");
-    let red = w67_rows(&shape, &[("CRAT_E5C_W66_FAULT", "no-discharge")]);
-    let row = w67_row(&red, "src::ht::ht_expand::_1@d0");
+    let rows = w67_rows("w67-vla", &[]);
+    let row = w67_row(&rows, "vla_mid::_1@d0");
     assert_eq!(
         (row[2].as_str(), row[3].as_str(), row[6].as_str()),
-        ("retirement-conflict", "src::ht::ht_expand::_1@d0", "direct"),
+        ("retirement-conflict", "vla_mid::_1@d0", "direct"),
         "{row:?}"
     );
-    let on = w67_rows(&shape, &[]);
-    assert!(
-        !on.iter().any(|row| row[0] == "src::ht::ht_expand::_1@d0"),
-        "{on:?}"
-    );
-    let off = w67_rows(
-        &shape,
-        &[
-            ("CRAT_E5C_W66_FAULT", "no-discharge"),
-            ("CRAT_ERA5C_RAW_CAUSE_LEDGER", "off"),
-        ],
-    );
+    if std::path::Path::new(W64_HT).is_file() {
+        let on = w67_rows(&format!("file:{W64_HT}"), &[]);
+        assert!(
+            !on.iter().any(|row| row[0] == "src::ht::ht_expand::_1@d0"),
+            "{on:?}"
+        );
+    }
+    let off = w67_rows("w67-vla", &[("CRAT_ERA5C_RAW_CAUSE_LEDGER", "off")]);
     assert!(off.is_empty(), "{off:?}");
+}
+
+/// W67b: the temporary finalization. `phi_join`'s `_3` (the allocation's result)
+/// is refused ownership with `own-assume[temporary-finalization]` in its core.
+#[test]
+fn e5c_w67_b_the_ledger_names_the_temporary_finalization() {
+    let rows = w67_rows("w67-shapes", &[]);
+    let row = w67_row(&rows, "phi_join::_3@d0");
+    assert_eq!(
+        (row[1].as_str(), row[12].as_str()),
+        ("both", "raw"),
+        "{row:?}"
+    );
+    assert!(
+        row[7].contains("own-assume[temporary-finalization]"),
+        "{row:?}"
+    );
 }
 
 /// W67c: a kind-equate partner. On buffer (the corpus), some Raw slot has no
@@ -3097,6 +3127,72 @@ fn e5c_w67_d_a_phi_with_null_names_its_real_cause() {
     assert!(
         rows.iter()
             .all(|row| !row[6].contains("null") && !row[8].contains("null")),
+        "{rows:?}"
+    );
+}
+
+/// W67e: the objective. `phi_null::_12` is Ref-excluded at its allocation source
+/// and could be Raw: nothing forces ownership, and the kind order (Ref > Owning >
+/// Raw) chose Owning, so `own_admitted` is `objective`.
+#[test]
+fn e5c_w67_e_the_ledger_names_the_objective() {
+    let rows = w67_rows("w67-shapes", &[]);
+    let row = w67_row(&rows, "phi_null::_12@d0");
+    assert_eq!(
+        (
+            row[1].as_str(),
+            row[2].as_str(),
+            row[12].as_str(),
+            row[13].as_str()
+        ),
+        (
+            "ref-excluded,own-admitted",
+            "eager:allocation-source",
+            "owning",
+            "objective"
+        ),
+        "{row:?}"
+    );
+}
+
+/// W67f: the population is every slot the model settles not Ref. Each Raw and each
+/// Owning slot has exactly one row, of its kind, and no Ref slot has one; an Owning
+/// row names why Ref is excluded and what admitted ownership -- a forcing family
+/// (`link-own`: `del`'s locals) or `objective`.
+#[test]
+fn e5c_w67_f_every_owning_slot_has_a_row_with_its_first_noref_and_admitting_family() {
+    for shape in ["w67-shapes", "w67-vla"] {
+        let lines = w63_lines(shape, &[("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on")]);
+        let kinds: std::collections::BTreeMap<String, String> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("kind "))
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(key, kind)| (key.to_owned(), kind.to_owned()))
+            .collect();
+        let rows = w67_rows(shape, &[]);
+        let settled: Vec<_> = kinds.iter().filter(|(_, kind)| *kind != "Ref").collect();
+        assert!(!settled.is_empty(), "{shape}: {kinds:?}");
+        assert_eq!(
+            rows.len(),
+            settled.len(),
+            "{shape}: {rows:?} vs {settled:?}"
+        );
+        for (key, kind) in settled {
+            let row = w67_row(&rows, key);
+            assert_eq!(row[12], kind.to_lowercase(), "{row:?}");
+            if kind == "Owning" {
+                assert_ne!(row[2], "none", "{row:?}");
+                assert_ne!(row[13], "-", "{row:?}");
+                assert!(row[1].ends_with("own-admitted"), "{row:?}");
+            } else {
+                assert_eq!(row[13], "-", "{row:?}");
+            }
+        }
+    }
+    let rows = w67_rows("w67-shapes", &[]);
+    assert!(
+        rows.iter()
+            .any(|row| row[0].starts_with("del::") && row[13] == "link-own"),
         "{rows:?}"
     );
 }
@@ -3436,21 +3532,27 @@ const W74_SHAPES: &str = r#"
 "#;
 
 /// W74: the ledger's clause columns (`tsv` 9–11: `noref_clause`,
-/// `noref_ref_peers`, `noref_raw_invalidators`). A plain-repair first cause names its
-/// commit's clause; any other names none. `CRAT_E5C_W74_FAULT=no-invalidators`
-/// (test builds) drops the recorded invalidators: RED.
+/// `noref_ref_peers`, `noref_raw_invalidators`), under the guarded repair the
+/// pass runs. A commit named as the first cause names the clause the planner
+/// asserted -- `guarded` with its Ref peers, or `unconditional` -- and any other
+/// cause names none. In `g`, `_7`'s guarded commit names `_6`, its Ref peer; in
+/// `h`, `_2`'s commit is unconditional, with no peer. (The plain repair's
+/// recorded invalidators, which `CRAT_E5C_W74_FAULT` drops, are read only on a
+/// guarded decline's fallback; this child cannot select it.)
 #[test]
 fn e5c_w74_the_ledger_names_each_commits_clause() {
     let rows = w67_rows("w74-shapes", &[]);
-    let mode_a = [
+    let commits = [
         "borrow-exclusion",
         "retirement-conflict",
         "reader-obligation",
+        "guarded-commit",
+        "recurrence-escalation",
     ];
     for row in &rows {
         let clause = row[9].as_str();
-        if mode_a.contains(&row[2].as_str()) {
-            assert!(clause == "guarded" || clause == "self-issued", "{row:?}");
+        if commits.contains(&row[2].as_str()) {
+            assert!(clause == "guarded" || clause == "unconditional", "{row:?}");
         } else {
             assert_eq!(
                 (clause, &row[10][..], &row[11][..]),
@@ -3459,30 +3561,21 @@ fn e5c_w74_the_ledger_names_each_commits_clause() {
             );
         }
     }
-    let guarded = rows
-        .iter()
-        .find(|row| row[3].starts_with("g::") && row[9] == "guarded")
-        .unwrap_or_else(|| panic!("no guarded commit in g: {rows:?}"));
+    let guarded = w67_row(&rows, "g::_7@d0");
     assert_eq!(
-        guarded[10], guarded[5],
-        "the Ref peer is the issuer: {guarded:?}"
+        (
+            guarded[2].as_str(),
+            guarded[9].as_str(),
+            guarded[10].as_str()
+        ),
+        ("guarded-commit", "guarded", "g::_6@d0"),
+        "{guarded:?}"
     );
-    // `r`'s write invalidates in round 1, while `r` is still Ref; the round-2
-    // commit lists the round-1 target as its Raw invalidator.
-    assert!(
-        rows.iter()
-            .any(|row| row[3].starts_with("g::") && row[11].starts_with("g::")),
-        "a Raw invalidator: {rows:?}"
-    );
-    let own = rows
-        .iter()
-        .find(|row| row[3].starts_with("h::") && row[9] == "self-issued")
-        .unwrap_or_else(|| panic!("no self-issued commit in h: {rows:?}"));
-    assert_eq!(own[10], "-", "{own:?}");
-    let fault = w67_rows("w74-shapes", &[("CRAT_E5C_W74_FAULT", "no-invalidators")]);
-    assert!(
-        fault.iter().all(|row| row[11] == "-"),
-        "the fault must be caught: {fault:?}"
+    let own = w67_row(&rows, "h::_2@d0");
+    assert_eq!(
+        (own[6].as_str(), own[9].as_str(), own[10].as_str()),
+        ("direct", "unconditional", "-"),
+        "{own:?}"
     );
 }
 

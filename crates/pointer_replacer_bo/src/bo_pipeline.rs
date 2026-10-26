@@ -725,4 +725,172 @@ pub unsafe fn caller() -> i32 {
         assert!(rows.iter().any(|r| r[outcome] == "held"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The ledger witness's fixture: a callee holding a C variable-length array as a
+    /// `Vec` (whose drop excludes Ref at its caller's by-reference formal), a raw cast,
+    /// and the writer fixture's lend.
+    const LEDGER_FIXTURE: &str =
+        "#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments)]
+pub unsafe fn leaf(mut out: *mut u8, mut n: usize) {
+    let mut buf: Vec<u8> = ::std::vec::from_elem(0, n);
+    *out = *buf.as_ptr();
+}
+pub unsafe fn mid(mut ctx: *const u8, mut out: *mut u8) { leaf(out, *ctx as usize + 1); }
+pub unsafe fn get(mut p: *mut i32) -> i32 { *p }
+pub unsafe fn addr(mut p: *mut i32) -> usize { p as usize }
+pub unsafe fn caller() -> i32 {
+    let mut y = 5;
+    let mut c = 3u8;
+    let mut o = 0u8;
+    mid(&mut c, &mut o);
+    get(&mut y) + addr(&mut y) as i32 + o as i32
+}
+";
+
+    /// The child of the ledger witness: the pass on `CRAT_E5C_LEDGER_TREE/lib.rs` with the
+    /// writer beside it, and the receipt's stable fields (every field but the solve's wall).
+    #[test]
+    #[ignore = "a child of e5c_w67_g_the_ledger_leaves_the_tree_and_the_receipts_unchanged"]
+    fn e5c_inner_ledger_tree() {
+        let dir = PathBuf::from(std::env::var("CRAT_E5C_LEDGER_TREE").unwrap());
+        let receipt =
+            super::rewrite_bo_with_artifacts(&dir.join("lib.rs"), [], Some(&dir.join("artifacts")))
+                .unwrap();
+        let model = receipt
+            .solve
+            .split("model_sha256: \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("-")
+            .to_owned();
+        let stable = format!(
+            "{} {} {} {} {} {}/{} {} {} {model}\n{}",
+            receipt.outcome,
+            receipt.status,
+            receipt.analysis_fingerprint,
+            receipt.input_tree_sha256,
+            receipt.emitted_tree_sha256,
+            receipt.files_changed,
+            receipt.files_total,
+            receipt.verify_rounds,
+            receipt.reverted_count,
+            receipt.file_rows,
+        );
+        std::fs::write(dir.join("receipt-stable.txt"), stable).unwrap();
+    }
+
+    /// W67g: the ledger observes and never decides. The pass with the ledger off and on:
+    /// the emitted tree, the receipt (model digest included) and every file the writer
+    /// writes are byte-identical; on, the writer adds `raw-cause-ledger.tsv`, whose rows
+    /// join `subjects.tsv` on (`program`, `subject_key`): each Raw and each Owning subject
+    /// has exactly one row, of its kind.
+    #[test]
+    fn e5c_w67_g_the_ledger_leaves_the_tree_and_the_receipts_unchanged() {
+        // One path for both runs (the writer's `program` is the tree's directory and its
+        // `site` column the file's path): each run's outputs are moved aside after it.
+        let base = std::env::temp_dir().join(format!("crat-e5c-w67g-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("program");
+        let run = |ledger: &str| -> PathBuf {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lib.rs"), LEDGER_FIXTURE).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "bo_pipeline::artifact_tests::e5c_inner_ledger_tree",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("CRAT_E5C_LEDGER_TREE", &dir)
+                .env("CRAT_ERA5C_RAW_CAUSE_LEDGER", ledger)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let kept = base.join(ledger);
+            std::fs::rename(&dir, &kept).unwrap();
+            kept
+        };
+        let (off, on) = (run("off"), run("on"));
+        let read = |dir: &Path, name: &str| std::fs::read(dir.join(name)).unwrap();
+        assert_eq!(
+            read(&off, "lib.rs"),
+            read(&on, "lib.rs"),
+            "the emitted tree"
+        );
+        assert_eq!(
+            read(&off, "receipt-stable.txt"),
+            read(&on, "receipt-stable.txt"),
+            "the receipt"
+        );
+        let (off_files, on_files) = (files(&off.join("artifacts")), files(&on.join("artifacts")));
+        assert!(
+            !off_files.iter().any(|f| f == "raw-cause-ledger.tsv"),
+            "{off_files:?}"
+        );
+        assert_eq!(
+            on_files
+                .iter()
+                .filter(|f| *f != "raw-cause-ledger.tsv")
+                .collect::<Vec<_>>(),
+            off_files.iter().collect::<Vec<_>>()
+        );
+        for name in &off_files {
+            assert_eq!(
+                read(&off.join("artifacts"), name),
+                read(&on.join("artifacts"), name),
+                "{name}"
+            );
+        }
+        let table = |name: &str| -> (Vec<String>, Vec<Vec<String>>) {
+            let text = std::fs::read_to_string(on.join("artifacts").join(name)).unwrap();
+            let mut lines = text.lines();
+            let header = lines
+                .next()
+                .unwrap()
+                .split('\t')
+                .map(str::to_owned)
+                .collect();
+            let rows = lines
+                .map(|l| l.split('\t').map(str::to_owned).collect())
+                .collect();
+            (header, rows)
+        };
+        let (subject_header, subjects) = table("subjects.tsv");
+        let (ledger_header, ledger) = table("raw-cause-ledger.tsv");
+        let at = |header: &[String], name: &str| header.iter().position(|h| h == name).unwrap();
+        let (s_program, s_key, s_kind) = (
+            at(&subject_header, "program"),
+            at(&subject_header, "subject_key"),
+            at(&subject_header, "model_kind"),
+        );
+        let (l_program, l_key, l_kind) = (
+            at(&ledger_header, "program"),
+            at(&ledger_header, "subject_key"),
+            at(&ledger_header, "model_kind"),
+        );
+        assert!(ledger.iter().all(|r| r.len() == ledger_header.len()));
+        let settled: Vec<_> = subjects
+            .iter()
+            .filter(|r| r[s_kind] == "raw" || r[s_kind] == "owning")
+            .collect();
+        assert!(
+            settled.iter().any(|r| r[s_kind] == "raw")
+                && settled.iter().any(|r| r[s_key].starts_with("mid::ctx")),
+            "{subjects:?}"
+        );
+        for subject in settled {
+            let joined: Vec<_> = ledger
+                .iter()
+                .filter(|r| r[l_program] == subject[s_program] && r[l_key] == subject[s_key])
+                .collect();
+            assert_eq!(joined.len(), 1, "{subject:?}: {ledger:?}");
+            assert_eq!(joined[0][l_kind], subject[s_kind], "{subject:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
