@@ -187,7 +187,8 @@ pub(crate) struct Row {
 }
 
 impl Row {
-    /// The row without the program column.
+    /// The row without the program column (the witnesses' child prints it).
+    #[cfg(test)]
     pub(crate) fn tsv(&self) -> String {
         [
             self.key.as_str(),
@@ -273,6 +274,8 @@ pub(crate) fn take_for(model: &FxHashMap<SlotRef, SlotKind>) -> Option<Vec<Row>>
     rows
 }
 
+/// The ledger the last `take_for` returned, kept (the witnesses' children read it).
+#[cfg(test)]
 pub(crate) fn last() -> Option<Vec<Row>> {
     LAST.with(|last| last.borrow().clone())
 }

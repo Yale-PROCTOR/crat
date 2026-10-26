@@ -105,7 +105,9 @@ fn edge_invalidators(
 /// The 3a fork seam. Run production `borrow_inference` for every fact, then REPLACE `invalidates`
 /// + `errors` with the BO engine's. At 3a the BO `invalidates` is a byte-identical copy, so the
 /// replacement is a no-op on behavior (the equivalence gate). At 3b `invalidates` becomes
-/// write-aware and this is where the engines diverge.
+/// write-aware and this is where the engines diverge. The replay outside tests calls
+/// [`overwrite_with_engine_facts_recording`] itself.
+#[cfg(test)]
 fn overwrite_with_engine_facts<'tcx>(
     tcx: TyCtxt<'tcx>,
     f: LocalDefId,
