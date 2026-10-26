@@ -398,8 +398,8 @@ impl ConversionSpec {
 fn test_helper(s: &str) -> ConversionSpec {
     let res = parse_format(s.as_bytes());
     let empty: &[u8] = &[];
-    assert_eq!(res.prefix, empty, "{:?}", s);
-    assert_eq!(res.remaining, Some(empty), "{:?}", s);
+    assert_eq!(res.prefix, empty, "{s:?}");
+    assert_eq!(res.remaining, Some(empty), "{s:?}");
     res.conversion_spec.expect(s)
 }
 

@@ -90,14 +90,14 @@ impl Universe {
     }
 
     #[cfg(test)]
-    pub(crate) fn evaluate(&self, expr: &Expr, tuple: &[usize]) -> bool {
+    pub(crate) fn evaluate(expr: &Expr, tuple: &[usize]) -> bool {
         match expr {
             Expr::True => true,
             Expr::False => false,
             Expr::Lit { coord, values } => values.contains(&tuple[*coord]),
-            Expr::Not(expr) => !self.evaluate(expr, tuple),
-            Expr::And(args) => args.iter().all(|arg| self.evaluate(arg, tuple)),
-            Expr::Or(args) => args.iter().any(|arg| self.evaluate(arg, tuple)),
+            Expr::Not(expr) => !Self::evaluate(expr, tuple),
+            Expr::And(args) => args.iter().all(|arg| Self::evaluate(arg, tuple)),
+            Expr::Or(args) => args.iter().any(|arg| Self::evaluate(arg, tuple)),
         }
     }
 
@@ -562,7 +562,7 @@ mod tests {
 
         for index in 0..domain_size {
             let tuple = decode_full_tuple(universe, index);
-            let actual = universe.evaluate(expr, &tuple);
+            let actual = Universe::evaluate(expr, &tuple);
             let wanted = expected.contains(&tuple.as_slice());
             assert_eq!(actual, wanted, "tuple {tuple:?}");
         }

@@ -83,7 +83,6 @@ fn preservation_request(
     transformation: &str,
 ) -> ValidationRequest {
     ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![ExpectedFunction {
             id: 7,
             name: "f".to_owned(),
@@ -129,7 +128,6 @@ fn mixed_preservation_request(
         },
     );
     ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![ExpectedFunction {
             id: 7,
             name: "f".to_owned(),
@@ -141,7 +139,6 @@ fn mixed_preservation_request(
 
 fn request(skeleton: &str, transformation: &str) -> ValidationRequest {
     ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected_function(7, "f", skeleton)],
         transformation: transformation.to_owned(),
     }
@@ -166,7 +163,6 @@ fn assert_valid(skeleton: &str, transformation: &str) {
 
 fn assert_valid_named(name: &str, skeleton: &str, transformation: &str) {
     let response = validate(&ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected_function(7, name, skeleton)],
         transformation: transformation.to_owned(),
     });
@@ -358,7 +354,6 @@ fn aliased_printf_metadata_makes_corrupt_template_a_setup_error() {
         argument_count: 1,
     });
     let response = validate(&ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected],
         transformation: skeleton.to_owned(),
     });
@@ -372,7 +367,6 @@ fn ordinary_call_shaped_metadata_never_confers_printf_provenance() {
     expected.view.statement_pair_metadata[0].before_statement =
         r#"foo(b"%d\0" as *const u8 as *const i8, value);"#.to_owned();
     let response = validate(&ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected],
         transformation:
             r#"unsafe fn f() { #[proctor(0)] foo(b"%d\0" as *const u8 as *const i8, value); }"#
@@ -601,7 +595,6 @@ fn expanded_printf_template_mutations_are_rejected_exactly() {
             .next()
             .unwrap();
         let response = validate(&ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![expected_function(7, name, skeleton)],
             transformation: transformation.to_owned(),
         });
@@ -672,7 +665,6 @@ fn preservation_forest_must_follow_depth_first_lexical_order() {
             _ => unreachable!(),
         }
         let response = validate(&ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![expected],
             transformation: skeleton.to_owned(),
         });
@@ -948,7 +940,6 @@ fn invalid_preservation_metadata_is_setup_error() {
         (true, vec![1], "invalid_expected_skeleton"),
     ] {
         let response = validate(&ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![ExpectedFunction {
                 id: 7,
                 name: "f".to_owned(),
@@ -1012,18 +1003,15 @@ fn preserved_outer_alignment_keeps_stable_label_errors() {
 #[test]
 fn valid_response_has_explicit_status() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+        r#"{"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
     );
-    assert_eq!(
-        response,
-        "{\n  \"schema_version\": 1,\n  \"status\": \"valid\"\n}"
-    );
+    assert_eq!(response, "{\n  \"status\": \"valid\"\n}");
 }
 
 #[test]
 fn statement_metadata_requires_explicit_null_printf_provenance() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+        r#"{"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
     );
     assert!(
         response.contains("missing field `printf_template`"),
@@ -1036,29 +1024,21 @@ fn invalid_response_matches_schema_and_key_order() {
     let response =
         validation_response_to_json(&validate(&request(UNIT_SKELETON, "unsafe fn f() {}")))
             .unwrap();
-    assert!(
-        response.starts_with(
-            "{\n  \"schema_version\": 1,\n  \"status\": \"invalid\",\n  \"failures\": ["
-        )
-    );
+    assert!(response.starts_with("{\n  \"status\": \"invalid\",\n  \"failures\": ["));
     assert!(!response.ends_with('\n'));
     assert!(response.contains("\"code\": \"missing_label\""));
 }
 
 #[test]
 fn setup_error_matches_schema_and_key_order() {
-    let response =
-        validate_json(r#"{"schema_version":2,"expected_functions":[],"transformation":""}"#);
-    assert!(response.starts_with(
-        "{\n  \"schema_version\": 1,\n  \"status\": \"setup_error\",\n  \"error\": {"
-    ));
-    assert!(response.contains("\"code\": \"unsupported_schema_version\""));
+    let response = validate_json(r#"{"expected_functions":[],"transformation":""}"#);
+    assert!(response.starts_with("{\n  \"status\": \"setup_error\",\n  \"error\": {"));
+    assert!(response.contains("\"code\": \"empty_expected_functions\""));
 }
 
 #[test]
 fn json_round_trip_preserves_embedded_rust() {
     let input = r#"{
-  "schema_version": 1,
   "expected_functions": [{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],
   "transformation":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n \"quote:\\\" slash:\\\\ line:\\n\"\n}"
 }"#;
@@ -1086,33 +1066,45 @@ fn response_serialization_is_byte_deterministic() {
 #[test]
 fn malformed_request_json_is_setup_error() {
     for input in [
-        r#"{"schema_version":1,"expected_functions":["#,
-        r#"{"schema_version":1.0,"expected_functions":[],"transformation":""}"#,
-        r#"{"schema_version":1,"expected_functions":[{"id":-1,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
-        r#"{"schema_version":1,"expected_functions":[{"id":1.0,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
-        r#"{"schema_version":1,"expected_functions":[{"id":18446744073709551616,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
+        r#"{"expected_functions":["#,
+        r#"{"expected_functions":1.0,"transformation":""}"#,
+        r#"{"expected_functions":[{"id":-1,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
+        r#"{"expected_functions":[{"id":1.0,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
+        r#"{"expected_functions":[{"id":18446744073709551616,"name":"f","skeleton":"unsafe fn f() {}"}],"transformation":""}"#,
     ] {
         let response = validate_json(input);
         assert!(
             response.contains("\"code\": \"invalid_request_json\""),
             "{response}"
         );
-        assert!(response.contains("\"schema_version\": 1"));
+        assert!(response.contains("\"status\": \"setup_error\""));
     }
 }
 
 #[test]
 fn unknown_request_field_is_setup_error() {
-    let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statements_requiring_transformation":[0]}],"transformation":"unsafe fn f() { #[proctor(0)] return; }","extra":true}"#,
-    );
-    assert!(response.contains("\"code\": \"unknown_request_field\""));
+    let value = serde_json::to_value(request(UNIT_SKELETON, "unsafe fn f() {}")).unwrap();
+    for nested in [false, true] {
+        let mut unknown = value.clone();
+        if nested {
+            unknown["expected_functions"][0]["extra"] = serde_json::json!(true);
+        } else {
+            unknown["extra"] = serde_json::json!(true);
+        }
+        let response = validate_json(&unknown.to_string());
+        assert!(response.contains("\"code\": \"unknown_request_field\""));
+    }
+    for field in ["expected_functions", "transformation"] {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        let response = validate_json(&missing.to_string());
+        assert!(response.contains("\"code\": \"invalid_request_json\""));
+    }
 }
 
 #[test]
 fn empty_expected_function_list_is_setup_error() {
     let response = validate(&ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![],
         transformation: String::new(),
     });
@@ -1255,7 +1247,6 @@ fn every_nonfunction_top_level_item_is_unexpected() {
 #[test]
 fn result_function_order_is_irrelevant() {
     let request = ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![
             expected_function(7, "f", UNIT_SKELETON),
             expected_function(
@@ -1308,7 +1299,6 @@ fn two_argument_main_0_accepts_matching_wildcard_parameters() {
         #[proctor(0)] todo!()
     }"#;
     let validation_request = ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected_function(7, "main_0", skeleton)],
         transformation: r#"unsafe fn main_0(_: i32, _: &mut [&mut [i8]]) -> i32 {
             #[proctor(0)] 0
@@ -1329,7 +1319,6 @@ fn ordinary_and_one_argument_main_0_accept_matching_wildcard_parameters() {
         ),
     ] {
         let validation_request = ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![expected_function(7, name, skeleton)],
             transformation: skeleton.to_owned(),
         };
@@ -1376,7 +1365,6 @@ fn main_0_wildcards_must_be_preserved_exactly() {
         }"#,
     ] {
         let validation_request = ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![expected_function(7, "main_0", skeleton)],
             transformation: transformation.to_owned(),
         };
@@ -1524,7 +1512,6 @@ fn attributes_bounds_type_const_and_where_generics_are_rejected() {
 #[test]
 fn generic_mismatch_aggregates_in_request_order() {
     let request = ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![
             expected_function(
                 7,
@@ -2528,7 +2515,6 @@ fn independent_errors_are_aggregated_in_stable_order() {
 #[test]
 fn deep_multi_function_request_reports_only_failing_items() {
     let request = ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![
             expected_function(
                 7,

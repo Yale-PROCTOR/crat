@@ -1,7 +1,7 @@
 use rustc_hash::FxHashSet;
 
 fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], excludes: &[&str]) {
-    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+    let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
         let config = super::Config {
             remove_unused,
             remove_no_mangle: false,
@@ -181,7 +181,7 @@ fn main() {
 }
 
 fn run_test(code: &str, unsafe_fns: &[&str]) {
-    utils::compilation::run_compiler_on_str(&code, |tcx| {
+    utils::compilation::run_compiler_on_str(code, |tcx| {
         let res: Vec<_> = super::find_unsafe_fns(tcx)
             .into_iter()
             .map(|def_id| utils::ir::def_id_to_symbol(def_id, tcx).unwrap())
@@ -404,7 +404,7 @@ fn main() {}
 
 fn run_exposed_test(code: &str, c_exposed_fns: &[&str], includes: &[&str], excludes: &[&str]) {
     let c_exposed_fns: FxHashSet<String> = c_exposed_fns.iter().map(|s| s.to_string()).collect();
-    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+    let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
         let config = super::Config {
             remove_unused: true,
             remove_no_mangle: false,
@@ -452,7 +452,7 @@ fn main() {
 }
 
 fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
-    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+    let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
         let config = super::Config {
             remove_unused: false,
             remove_no_mangle: false,

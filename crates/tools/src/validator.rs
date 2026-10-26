@@ -21,13 +21,11 @@ use crate::{
     printf::{parse_print_macro_statement, validate_print_macro_statement},
 };
 
-const SCHEMA_VERSION: u64 = 1;
 const TEMP_PREFIX: &str = "proctor_temp_var_";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationRequest {
-    pub schema_version: u64,
     pub expected_functions: Vec<ExpectedFunction>,
     pub transformation: String,
 }
@@ -66,21 +64,18 @@ impl Serialize for ValidationResponse {
     where S: serde::Serializer {
         match self {
             Self::Valid => {
-                let mut state = serializer.serialize_struct("ValidationResponse", 2)?;
-                state.serialize_field("schema_version", &SCHEMA_VERSION)?;
+                let mut state = serializer.serialize_struct("ValidationResponse", 1)?;
                 state.serialize_field("status", "valid")?;
                 state.end()
             }
             Self::Invalid { failures } => {
-                let mut state = serializer.serialize_struct("ValidationResponse", 3)?;
-                state.serialize_field("schema_version", &SCHEMA_VERSION)?;
+                let mut state = serializer.serialize_struct("ValidationResponse", 2)?;
                 state.serialize_field("status", "invalid")?;
                 state.serialize_field("failures", failures)?;
                 state.end()
             }
             Self::SetupError { error } => {
-                let mut state = serializer.serialize_struct("ValidationResponse", 3)?;
-                state.serialize_field("schema_version", &SCHEMA_VERSION)?;
+                let mut state = serializer.serialize_struct("ValidationResponse", 2)?;
                 state.serialize_field("status", "setup_error")?;
                 state.serialize_field("error", error)?;
                 state.end()
@@ -110,7 +105,7 @@ pub fn validate_json(input: &str) -> String {
             } else {
                 "invalid_request_json"
             },
-            format!("The validation request is not valid schema-version-1 JSON: {error}"),
+            format!("The validation request is not valid JSON: {error}"),
         ),
     };
     validation_response_to_json(&response).expect("validation response serialization cannot fail")
@@ -241,15 +236,6 @@ fn validate_inner(request: &ValidationRequest) -> ValidationResponse {
 fn parse_expected_functions(
     request: &ValidationRequest,
 ) -> Result<Vec<ParsedExpected>, ValidationResponse> {
-    if request.schema_version != SCHEMA_VERSION {
-        return Err(setup_error(
-            "unsupported_schema_version",
-            format!(
-                "Request schema version {} is unsupported; use schema version 1.",
-                request.schema_version
-            ),
-        ));
-    }
     if request.expected_functions.is_empty() {
         return Err(setup_error(
             "empty_expected_functions",

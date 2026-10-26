@@ -4961,14 +4961,19 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
         view: tree_function.baseline.clone(),
     };
     let validation_request = ValidationRequest {
-        schema_version: 1,
         expected_functions: vec![expected],
         transformation: tree_function.baseline.skeleton.clone(),
     };
     let validation_json = serde_json::to_string(&validation_request).unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&validation_json).unwrap()["schema_version"],
-        1
+        serde_json::from_str::<serde_json::Value>(&validation_json)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["expected_functions", "transformation"]
     );
     let validation = validate(&validation_request);
     assert!(validation.is_valid(), "{validation:?}");
@@ -4976,13 +4981,12 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
         serde_json::from_str::<serde_json::Value>(
             &crate::validation_response_to_json(&validation).unwrap()
         )
-        .unwrap()["schema_version"],
-        1
+        .unwrap()["status"],
+        "valid"
     );
 
     let replacement_request = ReplacementRequest {
         accepted_correspondence: vec![],
-        schema_version: 1,
         items: vec![ReplacementItem {
             id: tree_function.id,
             path: tree_function.path.clone(),
@@ -4997,8 +5001,14 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
         replacement_request
     );
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&replacement_json).unwrap()["schema_version"],
-        1
+        serde_json::from_str::<serde_json::Value>(&replacement_json)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["accepted_correspondence", "items", "transformation"]
     );
 }
 
@@ -5447,7 +5457,6 @@ fn generated_local_name_validates_adds_and_compiles_in_original_module() {
         .replace("__INIT_TAIL_LABEL__", &init_tail_label.to_string())
         .replace("__RESULT_TAIL_LABEL__", &result_tail_label.to_string());
         let validation = validate(&ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![ExpectedFunction {
                 id: record.id,
                 name: record.name.clone(),
@@ -5459,14 +5468,13 @@ fn generated_local_name_validates_adds_and_compiles_in_original_module() {
         assert!(
             crate::validation_response_to_json(&validation)
                 .unwrap()
-                .starts_with("{\n  \"schema_version\": 1,\n  \"status\": \"valid\"")
+                .starts_with("{\n  \"status\": \"valid\"")
         );
         let contrast = transformation.replace(
             "let mut init: cb_rgb",
             "let mut init: crate::src::lib::cb_rgb",
         );
         let contrast = validate(&ValidationRequest {
-            schema_version: 1,
             expected_functions: vec![ExpectedFunction {
                 id: record.id,
                 name: record.name.clone(),
@@ -5485,7 +5493,6 @@ fn generated_local_name_validates_adds_and_compiles_in_original_module() {
             &initial,
             &ReplacementRequest {
                 accepted_correspondence: vec![],
-                schema_version: 1,
                 items: vec![ReplacementItem {
                     id: record.id,
                     path: record.path.clone(),

@@ -17997,6 +17997,7 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         "other_initial_raw"
     }
 
+    #[allow(clippy::type_complexity)]
     fn simulate_transform_reasons<'tcx>(
         tcx: TyCtxt<'tcx>,
         input: &RustProgram<'tcx>,

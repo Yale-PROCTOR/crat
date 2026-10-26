@@ -36,13 +36,14 @@ use crate::{
     },
 };
 
-const REPLACEMENT_SCHEMA_VERSION: u64 = 1;
 type PreparedTransformations = (HashMap<String, P<Item>>, Vec<ReplacementStatementPair>);
+
+mod frozen;
+pub use frozen::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacementRequest {
-    pub schema_version: u64,
     pub items: Vec<ReplacementItem>,
     pub transformation: String,
     pub accepted_correspondence: Vec<CallableCorrespondence>,
@@ -80,6 +81,7 @@ pub struct ExtendedReplacementOutput {
     pub new_correspondence: Vec<CallableCorrespondence>,
     pub current_items: Vec<CurrentObservationItem>,
     pub source_stubs: Vec<SourceStub>,
+    pub unfilled_stub_items: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +135,7 @@ pub fn replacement_request_from_json(input: &str) -> Result<ReplacementRequest, 
     let request = serde_json::from_str(input).map_err(|error| ReplacementError {
         kind: ReplacementErrorKind::InvalidRequest,
         item: None,
-        message: format!("replacement request is not valid schema-version-1 JSON: {error}"),
+        message: format!("replacement request is not valid JSON: {error}"),
     })?;
     with_parse_session(|| {
         validate_request(&request)?;
@@ -535,6 +537,7 @@ pub fn add_functions_with_observations(
         })
         .collect();
     Ok(ExtendedReplacementOutput {
+        unfilled_stub_items: vec![],
         replacement: ReplacementOutput {
             source: pprust::crate_to_string_for_macros(&partial),
             statement_pairs,
@@ -863,15 +866,6 @@ struct ReplacementPlan {
 }
 
 fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError> {
-    if request.schema_version != REPLACEMENT_SCHEMA_VERSION {
-        return Err(global_error(
-            ReplacementErrorKind::InvalidRequest,
-            format!(
-                "replacement request schema version {} is unsupported; use version 1",
-                request.schema_version
-            ),
-        ));
-    }
     if request.items.is_empty() {
         return Err(global_error(
             ReplacementErrorKind::InvalidRequest,
