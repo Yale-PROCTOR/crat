@@ -344,6 +344,7 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
         ("entry_window_receipts.tsv", &receipts.entry_window_receipts),
         ("settled_hold_receipts.tsv", &receipts.settled_hold_receipts),
         ("exposure.tsv", &receipts.exposure),
+        ("class_collisions.tsv", &receipts.class_collisions),
     ] {
         write(name, text)?;
     }
