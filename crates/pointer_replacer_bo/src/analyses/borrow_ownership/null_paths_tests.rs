@@ -2279,6 +2279,103 @@ const W67_VLA: &str = r#"
 }
 "#;
 
+/// W-VLA: the drop of a `Vec` local against a formal `q` read before and after
+/// it. `p1`–`p4`: the body made the `Vec` fresh (a C variable-length array as
+/// c2rust lowers it, one re-made in a loop, `with_capacity`, and a caller of
+/// `p1`). `d1`–`d8`: drops that are not such a `Vec`'s -- a `Box::from_raw`, a
+/// `Vec` formal, a struct holding a `Vec`, `drop_in_place` through a pointer, a
+/// `Vec` lent to a local function that swaps it, `mem::swap`, a reassignment
+/// from a call, elements with drop glue, a write through a `&mut` handle, and a
+/// temporary, made fresh, that swaps buffers with a pointee before it is moved
+/// into the `Vec`.
+const WVLA_SHAPES: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
+#[no_mangle] pub unsafe extern "C" fn p1_vla(mut q: *const u8, mut n: usize) -> u8 {
+    let mut buf: Vec<u8> = ::std::vec::from_elem(0, n);
+    *buf.as_mut_ptr() = *q;
+    let r = *buf.as_ptr();
+    r + *q
+}
+#[no_mangle] pub unsafe extern "C" fn p2_loop(mut q: *const u8, mut n: usize) -> u8 {
+    let mut i = 0;
+    let mut s = 0u8;
+    while i < n {
+        let mut buf: Vec<u8> = ::std::vec::from_elem(0, n);
+        buf[0] = *q;
+        s = s.wrapping_add(buf[0]);
+        i += 1;
+    }
+    s
+}
+#[no_mangle] pub unsafe extern "C" fn p3_capacity(mut q: *const u8) -> u8 {
+    let mut v: Vec<u8> = Vec::with_capacity(4);
+    let p = v.as_mut_ptr();
+    *p = *q;
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn p4_callee(mut q: *const u8, mut n: usize) -> u8 {
+    p1_vla(q, n) + *q
+}
+#[no_mangle] pub unsafe extern "C" fn d1_box_from_raw(mut q: *const u8, mut p: *mut u8) -> u8 {
+    let x = *q;
+    {
+        let b: Box<u8> = Box::from_raw(p);
+    }
+    x + *q
+}
+pub unsafe fn d2_vec_formal(mut q: *const u8, mut v: Vec<u8>) -> u8 {
+    *q
+}
+pub struct S { pub v: Vec<u8> }
+#[no_mangle] pub unsafe extern "C" fn d3_field(mut q: *const u8, mut n: usize) -> u8 {
+    let s = S { v: ::std::vec::from_elem(0, n) };
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn d4_through_pointer(mut q: *const u8, mut p: *mut Vec<u8>) -> u8 {
+    let x = *q;
+    ::std::ptr::drop_in_place(p);
+    x + *q
+}
+pub fn swap_in(a: &mut Vec<u8>) {
+    let mut other: Vec<u8> = Vec::new();
+    ::std::mem::swap(a, &mut other);
+}
+#[no_mangle] pub unsafe extern "C" fn d5_local_callee(mut q: *const u8, mut n: usize) -> u8 {
+    let mut v: Vec<u8> = ::std::vec::from_elem(0, n);
+    swap_in(&mut v);
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn d6_swap(mut q: *const u8, mut n: usize) -> u8 {
+    let mut v: Vec<u8> = ::std::vec::from_elem(0, n);
+    let mut w: Vec<u8> = ::std::vec::from_elem(1, n);
+    ::std::mem::swap(&mut v, &mut w);
+    *q
+}
+pub fn make() -> Vec<u8> { ::std::vec::from_elem(0, 4) }
+#[no_mangle] pub unsafe extern "C" fn d7_reassigned(mut q: *const u8, mut n: usize) -> u8 {
+    let mut v: Vec<u8> = ::std::vec::from_elem(0, n);
+    v = make();
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn d8_boxed_elements(mut q: *const u8, mut p: *mut u8) -> u8 {
+    let mut v: Vec<Box<u8>> = Vec::new();
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn d9_through_handle(mut q: *const u8, mut n: usize) -> u8 {
+    let mut v: Vec<u8> = ::std::vec::from_elem(0, n);
+    let h = &mut v;
+    *h = make();
+    *q
+}
+#[no_mangle] pub unsafe extern "C" fn d10_temporary_swapped(mut q: *const u8, mut p: *mut Vec<u8>) -> u8 {
+    let x = *q;
+    let mut t: Vec<u8> = Vec::new();
+    ::std::mem::swap(&mut t, &mut *p);
+    let v = t;
+    x
+}
+"#;
+
 /// W67h: an allocation returned. `make`'s return place owns because the return-port
 /// row requires it, a row asserted only where the model is materialised.
 const W67_RET: &str = r#"
@@ -2390,6 +2487,7 @@ fn e5c_inner_w63() {
         Ok("w67-shapes") => W67_SHAPES,
         Ok("w67-vla") => W67_VLA,
         Ok("w67-ret") => W67_RET,
+        Ok("wvla-shapes") => WVLA_SHAPES,
         Ok("w68-shapes") => W68_SHAPES,
         Ok("w71-shapes") => W71_SHAPES,
         Ok("ctx-jail") => W71_CTX_JAIL,
@@ -2452,6 +2550,42 @@ fn e5c_inner_w63() {
             functions,
             structs,
         };
+        // W-VLA c: the inventory's drop events, and every call's site and callee.
+        if std::env::var_os("CRAT_E5C_WVLA_EVENTS").is_some() {
+            let events = super::source_events::collect(&program);
+            for event in events.retirements.values() {
+                if event.key.role == super::source_events::SourceRole::Drop {
+                    eprintln!(
+                        "E5C_W63 drop-event {} bb{}[{}] {:?} {:?}",
+                        event.key.function,
+                        event.key.block,
+                        event.key.statement,
+                        event.coverage,
+                        event.object
+                    );
+                }
+            }
+            for &function in &program.functions {
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                for (block, data) in body.basic_blocks.iter_enumerated() {
+                    if let rustc_middle::mir::TerminatorKind::Call { func, .. } =
+                        &data.terminator().kind
+                        && let Some((callee, _)) = func.const_fn_def()
+                    {
+                        eprintln!(
+                            "E5C_W63 call {} bb{}[{}] {}",
+                            tcx.def_path_str(function.to_def_id()),
+                            block.as_u32(),
+                            data.statements.len(),
+                            tcx.def_path_str(callee)
+                        );
+                    }
+                }
+            }
+            return;
+        }
         let plan = super::licensing::lend::collect(&program);
         for (function, formal) in &plan.lendable {
             eprintln!("E5C_W63 lendable {function}::_{formal}");
@@ -3066,17 +3200,18 @@ fn w67_row<'a>(rows: &'a [Vec<String>], key: &str) -> &'a Vec<String> {
         .unwrap_or_else(|| panic!("no ledger row {key}: {rows:?}"))
 }
 
-/// W67a: a retirement conflict. `vla_mid::ctx` (`_1`) is Ref-excluded by its own
-/// retirement conflict: the drop of `vla_leaf`'s `Vec` reaches it through the call.
-/// On ht (the corpus), `ht_expand::_1`, whose routed `free` a discharge clears, is
-/// Ref and has no row. With the ledger off there are no rows.
+/// W67a: a retirement conflict. `d1_box_from_raw::q` (`_1`) is Ref-excluded by its
+/// own retirement conflict: the drop of a `Box::from_raw` releases objects the
+/// analysis does not know, `q`'s referent among them. On ht (the corpus),
+/// `ht_expand::_1`, whose routed `free` a discharge clears, is Ref and has no row.
+/// With the ledger off there are no rows.
 #[test]
 fn e5c_w67_a_the_ledger_names_a_retirement_conflict() {
-    let rows = w67_rows("w67-vla", &[]);
-    let row = w67_row(&rows, "vla_mid::_1@d0");
+    let rows = w67_rows("wvla-shapes", &[]);
+    let row = w67_row(&rows, "d1_box_from_raw::_1@d0");
     assert_eq!(
         (row[2].as_str(), row[3].as_str(), row[6].as_str()),
-        ("retirement-conflict", "vla_mid::_1@d0", "direct"),
+        ("retirement-conflict", "d1_box_from_raw::_1@d0", "direct"),
         "{row:?}"
     );
     if std::path::Path::new(W64_HT).is_file() {
@@ -3086,8 +3221,117 @@ fn e5c_w67_a_the_ledger_names_a_retirement_conflict() {
             "{on:?}"
         );
     }
-    let off = w67_rows("w67-vla", &[("CRAT_ERA5C_RAW_CAUSE_LEDGER", "off")]);
+    let off = w67_rows("wvla-shapes", &[("CRAT_ERA5C_RAW_CAUSE_LEDGER", "off")]);
     assert!(off.is_empty(), "{off:?}");
+}
+
+/// W-VLA a: the drop of a `Vec` the body made fresh releases its own buffer and
+/// nothing else, so no formal conflicts with it: `p1`–`p4`'s `q` and `w67-vla`'s
+/// `vla_mid::ctx` (the drop routed up a call) are Ref, and the ledger writes no
+/// row for them.
+#[test]
+fn e5c_wvla_a_a_fresh_vec_drop_leaves_the_formals_ref() {
+    for (shape, keys) in [
+        (
+            "wvla-shapes",
+            &[
+                "p1_vla::_1@d0",
+                "p2_loop::_1@d0",
+                "p3_capacity::_1@d0",
+                "p4_callee::_1@d0",
+            ][..],
+        ),
+        ("w67-vla", &["vla_mid::_1@d0"][..]),
+    ] {
+        let lines = w63_lines(shape, &[("CRAT_ERA5C_RAW_CAUSE_LEDGER", "on")]);
+        for key in keys {
+            let kind = lines
+                .iter()
+                .find_map(|l| l.strip_prefix(&format!("kind {key}\t")));
+            assert_eq!(kind, Some("Ref"), "{shape}: {key}: {lines:?}");
+            assert!(
+                !lines.iter().any(|l| l
+                    .strip_prefix("ledger ")
+                    .is_some_and(|row| row.split('\t').next() == Some(key))),
+                "{shape}: {lines:?}"
+            );
+        }
+    }
+}
+
+/// W-VLA b: every other drop keeps its conflict. Each of `d1`–`d10`'s `q` has its
+/// `retirement-conflict` row.
+#[test]
+fn e5c_wvla_b_any_other_drop_keeps_its_retirement_conflict() {
+    let rows = w67_rows("wvla-shapes", &[]);
+    for function in [
+        "d1_box_from_raw",
+        "d2_vec_formal",
+        "d3_field",
+        "d4_through_pointer",
+        "d5_local_callee",
+        "d6_swap",
+        "d7_reassigned",
+        "d8_boxed_elements",
+        "d9_through_handle",
+        "d10_temporary_swapped",
+    ] {
+        let row = w67_row(&rows, &format!("{function}::_1@d0"));
+        assert_eq!(row[2], "retirement-conflict", "{row:?}");
+    }
+}
+
+/// W-VLA c: the event. `p1`'s drop is a `FreshBuffer` release, resolved, whose
+/// object is the buffer of its `from_elem` call; every drop in `d1`–`d10` stays
+/// `UnresolvedDropEffects` -- `d9`'s and `d10`'s last drop of `v` among them: its
+/// buffer is the one written through the handle, or the one the temporary swapped in.
+#[test]
+fn e5c_wvla_c_the_inventory_resolves_the_fresh_vec_drop_alone() {
+    let lines = w63_lines("wvla-shapes", &[("CRAT_E5C_WVLA_EVENTS", "1")]);
+    let drops = |prefix: &str| -> Vec<Vec<&str>> {
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("drop-event "))
+            .filter(|l| l.starts_with(prefix))
+            .map(|l| l.splitn(4, ' ').collect())
+            .collect()
+    };
+    let from_elem: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("call p1_vla "))
+        .filter(|l| l.ends_with("from_elem"))
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(from_elem.len(), 1, "{lines:?}");
+    let p1 = drops("p1_vla ");
+    assert!(!p1.is_empty(), "{lines:?}");
+    for drop in &p1 {
+        assert_eq!(drop[2], "ResolvedFreshBuffer", "{drop:?}");
+        assert!(
+            drop[3].starts_with("FreshBuffer {")
+                && drop[3].ends_with(&format!("sites: [{}] }}", from_elem[0])),
+            "{drop:?}"
+        );
+    }
+    for function in [
+        "d1_box_from_raw",
+        "d2_vec_formal",
+        "d3_field",
+        "d4_through_pointer",
+        "d5_local_callee",
+        "d6_swap",
+        "d7_reassigned",
+        "d8_boxed_elements",
+        "d9_through_handle",
+        "d10_temporary_swapped",
+    ] {
+        let drops = drops(&format!("{function} "));
+        assert!(!drops.is_empty(), "{function}: {lines:?}");
+        assert!(
+            drops.iter().all(|drop| drop[2] == "UnresolvedDropEffects"),
+            "{function}: {drops:?}"
+        );
+    }
 }
 
 /// W67b: the temporary finalization. `phi_join`'s `_3` (the allocation's result)

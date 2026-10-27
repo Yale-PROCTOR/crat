@@ -731,16 +731,16 @@ pub unsafe fn caller() -> i32 {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The ledger witness's fixture: a callee holding a C variable-length array as a
-    /// `Vec` (whose drop excludes Ref at its caller's by-reference formal), a raw cast,
-    /// and the writer fixture's lend.
+    /// The ledger witness's fixture: a callee dropping a `Box::from_raw` (a release
+    /// whose objects are unknown, so it excludes Ref at its caller's by-reference
+    /// formal), a raw cast, and the writer fixture's lend.
     const LEDGER_FIXTURE: &str =
         "#![allow(dead_code, unused_mut, unused_unsafe, unused_assignments)]
-pub unsafe fn leaf(mut out: *mut u8, mut n: usize) {
-    let mut buf: Vec<u8> = ::std::vec::from_elem(0, n);
-    *out = *buf.as_ptr();
+pub unsafe fn leaf(mut out: *mut u8, mut p: *mut u8) {
+    *out = *p;
+    let _b: Box<u8> = Box::from_raw(p);
 }
-pub unsafe fn mid(mut ctx: *const u8, mut out: *mut u8) { leaf(out, *ctx as usize + 1); }
+pub unsafe fn mid(mut ctx: *const u8, mut out: *mut u8) { leaf(out, Box::into_raw(Box::new(*ctx))); }
 pub unsafe fn get(mut p: *mut i32) -> i32 { *p }
 pub unsafe fn addr(mut p: *mut i32) -> usize { p as usize }
 pub unsafe fn caller() -> i32 {
