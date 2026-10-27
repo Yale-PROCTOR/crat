@@ -663,22 +663,6 @@ pub fn finalize_additive_source(
             ));
         }
     }
-    for api in api_functions {
-        let matched = functions.iter().any(|function| {
-            let ItemKind::Fn(box body) = &function.item.kind else { unreachable!() };
-            body.ident.name.as_str() == api
-                || function.item.attrs.iter().any(|attr| {
-                    attr.has_name(sym::export_name)
-                        && attr.value_str().is_some_and(|name| name.as_str() == api)
-                })
-        });
-        if !matched {
-            return Err(global_error(
-                ReplacementErrorKind::TargetResolution,
-                format!("API function `{api}` did not match any source function"),
-            ));
-        }
-    }
     for current in functions
         .iter()
         .filter(|function| function_named(function, "main"))

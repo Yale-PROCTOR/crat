@@ -1166,9 +1166,13 @@ mod b { pub unsafe fn work(p: *const i32) -> i32 { *p } }"#;
     assert_eq!(count(&final_result.source, "p: &i32"), 2);
     assert!(!final_result.source.contains("__proctor_wrapper"));
     compile(&final_result.source);
-    let error = finalize(analysis, &second.replacement.source, &["missing"]).unwrap_err();
-    assert_eq!(error.kind, ReplacementErrorKind::TargetResolution);
-    assert!(error.message.contains("missing"));
+    let declaration_only = finalize(
+        analysis,
+        &second.replacement.source,
+        &["work", "declared_only"],
+    )
+    .unwrap();
+    assert_eq!(declaration_only.source, final_result.source);
 }
 
 #[test]

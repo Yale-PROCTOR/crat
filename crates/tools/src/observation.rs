@@ -6258,6 +6258,32 @@ unsafe fn target(flag: bool) -> i32 {
     }
 
     #[test]
+    fn boxed_slice_vec_list_expansion_keeps_observation_mapping() {
+        let source = r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe fn source_copy(seconds: i32) -> *mut i32 {
+    #[proctor(0)] let mut value: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;
+    #[proctor(1)] if value.is_null() {
+        #[proctor(2)] return core::ptr::null_mut();
+    }
+    #[proctor(3)] *value = seconds;
+    #[proctor(4)] return value;
+}
+unsafe fn target(seconds: i32) -> *mut i32 {
+    #[proctor(0)] let mut value: Box<[i32]> = vec![0i32].into_boxed_slice();
+    #[proctor(1)] if value.as_ptr().is_null() {
+        #[proctor(2)] return core::ptr::null_mut();
+    }
+    #[proctor(3)] value[0] = seconds;
+    #[proctor(4)] return Box::into_raw(value) as *mut i32;
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", (0..5).collect()).unwrap();
+        assert_eq!(document.observations.len(), 3, "{document:?}");
+        assert!(document.printf_observations.is_empty());
+    }
+
+    #[test]
     fn macro_anywhere_in_selected_statement_skips_before_expansion() {
         let source = r#"
 macro_rules! one { () => { 1_i32 }; }

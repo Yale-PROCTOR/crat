@@ -674,6 +674,155 @@ fn test_qpath() {
 }
 
 #[test]
+fn test_qpath_explicit_self_types() {
+    run_test(
+        "
+        fn f(values: &[i32]) {
+            <[i32]>::len(values);
+            <[_]>::into_vec(Box::new([1i32, 2]));
+            <&[i32]>::clone(&values);
+            <[i32; 2]>::map([1, 2], |value| value + 1);
+            <i32>::abs(-1);
+            <Vec<i32>>::new();
+            Vec::<i32>::new();
+        }",
+    )
+}
+
+#[test]
+fn test_qpath_associated_type_prefixes() {
+    run_test(
+        "
+        trait Outer { type Inner: Default; }
+        fn f<T: Outer>() {
+            <T as Outer>::Inner::default();
+            T::Inner::default();
+            <T::Inner>::default();
+            <<T as Outer>::Inner>::default();
+        }",
+    )
+}
+
+#[test]
+fn test_qpath_vec_macro_expansion() {
+    run_test("fn f() -> Box<[i32]> { vec![0i32].into_boxed_slice() }")
+}
+
+#[test]
+fn qualified_paths_keep_self_type_and_associated_segment_identities() {
+    let source = "
+        trait Outer { type Inner: Default; }
+        fn f(values: &[i32]) {
+            <[i32]>::len(values);
+            <[_]>::into_vec(Box::new([0i32]));
+            <&[i32]>::clone(&values);
+            <i32>::abs(-1);
+            <Vec<i32>>::new();
+            Vec::<i32>::new();
+            <i32 as Default>::default();
+            vec![0i32].into_boxed_slice();
+        }
+        fn g<T: Outer>() {
+            <T as Outer>::Inner::default();
+            T::Inner::default();
+            <T::Inner>::default();
+        }";
+    compilation::run_compiler_on_str(source, |tcx| {
+        let expanded_crate = ast::expanded_ast(tcx);
+        for expanded in [false, true] {
+            let mut krate = if expanded {
+                expanded_crate.clone()
+            } else {
+                ast::parse_crate(source.to_owned())
+            };
+            let mut mapper = AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut krate, tcx.hir_root_module(), expanded);
+            struct Check<'a, 'tcx> {
+                mapping: &'a AstToHir,
+                tcx: rustc_middle::ty::TyCtxt<'tcx>,
+                explicit: usize,
+                implicit: usize,
+                projected: usize,
+                resolved: usize,
+            }
+            impl<'ast> Visitor<'ast> for Check<'_, '_> {
+                fn visit_expr(&mut self, expression: &'ast Expr) {
+                    if let ExprKind::Path(qself, path) = &expression.kind {
+                        let mapped = self.mapping.get_expr(expression.id, self.tcx).unwrap();
+                        let hir::ExprKind::Path(hqpath) = mapped.kind else { panic!() };
+                        let associated = match hqpath {
+                            hir::QPath::TypeRelative(ty, segment) => {
+                                assert!(!self.mapping.path_span_to_res.contains_key(&path.span));
+                                if let Some(qself) = qself {
+                                    let self_ty = if qself.position == 0 {
+                                        assert_eq!(path.segments.len(), 1);
+                                        self.explicit += 1;
+                                        ty
+                                    } else {
+                                        let hir::TyKind::Path(hir::QPath::Resolved(
+                                            Some(self_ty),
+                                            prefix,
+                                        )) = ty.kind
+                                        else {
+                                            panic!()
+                                        };
+                                        assert_eq!(path.segments.len(), prefix.segments.len() + 1);
+                                        self.projected += 1;
+                                        self_ty
+                                    };
+                                    assert_eq!(
+                                        self.mapping.local_map[&qself.ty.id],
+                                        self_ty.hir_id
+                                    );
+                                } else {
+                                    self.implicit += 1;
+                                }
+                                Some(segment)
+                            }
+                            hir::QPath::Resolved(Some(self_ty), hpath) => {
+                                let qself = qself.as_ref().unwrap();
+                                assert_eq!(self.mapping.local_map[&qself.ty.id], self_ty.hir_id);
+                                assert_eq!(self.mapping.path_span_to_res[&path.span], hpath.res);
+                                self.resolved += 1;
+                                hpath.segments.last()
+                            }
+                            _ => None,
+                        };
+                        if let Some(associated) = associated {
+                            let last = path.segments.last().unwrap();
+                            assert_eq!(self.mapping.local_map[&last.id], associated.hir_id);
+                            let rustc_hir::def::Res::Def(_, did) = self
+                                .tcx
+                                .typeck(mapped.hir_id.owner)
+                                .qpath_res(&hqpath, mapped.hir_id)
+                            else {
+                                panic!()
+                            };
+                            assert_eq!(last.ident.name, self.tcx.item_name(did));
+                        }
+                    }
+                    visit::walk_expr(self, expression);
+                }
+            }
+            let mut check = Check {
+                mapping: &mapper.ast_to_hir,
+                tcx,
+                explicit: 0,
+                implicit: 0,
+                projected: 0,
+                resolved: 0,
+            };
+            check.visit_crate(&krate);
+            assert!(check.explicit >= 6);
+            assert!(check.implicit >= 2);
+            assert!(check.projected >= 1);
+            assert!(check.resolved >= 1);
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_pat_binding() {
     run_test(
         "
