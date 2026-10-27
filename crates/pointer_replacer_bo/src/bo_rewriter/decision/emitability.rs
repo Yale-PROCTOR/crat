@@ -313,6 +313,9 @@ pub(crate) struct Arg {
     /// R866-1 (fan-out 083): the argument is a reborrow `&mut *x` / `&*x` of
     /// the local `x` (under casts): the same pointer as `x` itself.
     pub reborrow_of: Option<HirId>,
+    /// Relay 371 step 3: a `CastOfLocal` / `AddrOfCast` argument whose cast keeps
+    /// the pointee (`super::identity_cast`).
+    pub identity_cast: Option<super::identity_cast::IdentityCast>,
 }
 
 /// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
@@ -1772,6 +1775,17 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                                 arg,
                                             ),
                                             reborrow_of: reborrow_of(arg),
+                                            identity_cast: match shape {
+                                                ArgShape::CastOfLocal { .. }
+                                                | ArgShape::AddrOfCast { .. } => {
+                                                    super::identity_cast::of(
+                                                        self.tcx,
+                                                        self.fn_did,
+                                                        arg,
+                                                    )
+                                                }
+                                                _ => None,
+                                            },
                                         }
                                     })
                                     .collect(),

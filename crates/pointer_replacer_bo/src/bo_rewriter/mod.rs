@@ -746,6 +746,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// **R1313-2 (relay main/371 step 2):** the byte-view receipt, one row per cast-offset site of
     /// a subject decided `Slice` (`decision::cast_offset::receipts_tsv`).
     pub(crate) byte_view_receipts: String,
+    /// **Relay 371 step 3:** the identity-cast strip's receipt, one row per stripped argument
+    /// (`decision::identity_cast::receipts_tsv`).
+    pub(crate) cast_strip_receipts: String,
     /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
     /// their evidence, or HELD with what the root said and why.
     pub(crate) root_extents: String,
@@ -10207,6 +10210,7 @@ fn finish_decide<'tcx>(
                 &subjects,
             ),
             byte_view_receipts: decision::cast_offset::receipts_tsv(tcx, &table),
+            cast_strip_receipts: decision::identity_cast::receipts_tsv(tcx, &facts, &table),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
             sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
             interface_inventory: table.seams.interface_inventory_tsv(tcx),

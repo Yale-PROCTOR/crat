@@ -83,6 +83,7 @@ mod field_alloc_tests;
 pub(crate) mod field_reference;
 pub(crate) mod flexible_tail;
 pub(crate) mod global_or_integer;
+pub(crate) mod identity_cast;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
 #[cfg(test)]

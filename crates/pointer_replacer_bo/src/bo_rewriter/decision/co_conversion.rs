@@ -1426,6 +1426,15 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     .map(|b| (b.owner.def_id, b))
                     .filter(|key| decision_of.contains_key(key));
                 let caller_node = caller_subject.filter(|k| converts.contains(k));
+                // Relay 371 step 3: an identity cast is the argument itself (a
+                // strengthening one only into a formal its callee never writes).
+                let identity_strip = arg.identity_cast.as_ref().is_some_and(|cast| {
+                    super::identity_cast::admitted(
+                        cast,
+                        callee_subject
+                            .is_none_or(|key| param_written.get(&key).copied().unwrap_or(true)),
+                    )
+                });
                 if !via_borrow
                     && let (Some(source), Some(target)) = (caller_subject, callee_subject)
                 {
@@ -1468,7 +1477,9 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                             BlockReason::FlowsIntoRawParam
                         };
                         block(&mut node_block, caller, reason);
-                    } else if matches!(arg.shape, ArgShape::CastOfLocal { .. }) && !late_a5_raw_cast
+                    } else if matches!(arg.shape, ArgShape::CastOfLocal { .. })
+                        && !late_a5_raw_cast
+                        && !identity_strip
                     {
                         // The parameter converts, but the argument casts the
                         // binding on the way in — `q as *mut T` where `q` is
@@ -1494,6 +1505,20 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     // only `&T`. Both already coerce to the raw form today,
                     // which is why this arm needs no edit in either direction.
                     ArgShape::AddrOf { mutable, .. } => {
+                        if wants_mut[&callee_key] && !mutable {
+                            block(&mut node_block, callee_key, BlockReason::ArgSharedIntoMut);
+                        }
+                    }
+                    // Relay 371 step 3: the strip -- the bare argument's rule for
+                    // `q as *mut T`, the borrow's for `&mut e as *mut T`.
+                    ArgShape::CastOfLocal { .. } if identity_strip && !late_a5_raw_cast => {
+                        match caller_node {
+                            Some(caller) => pending_unions.push((callee_key, caller)),
+                            None if caller_subject.is_some() => {}
+                            None => block(&mut node_block, callee_key, BlockReason::ArgStaysRaw),
+                        }
+                    }
+                    ArgShape::AddrOfCast { mutable, .. } if identity_strip && !late_a5_raw_cast => {
                         if wants_mut[&callee_key] && !mutable {
                             block(&mut node_block, callee_key, BlockReason::ArgSharedIntoMut);
                         }
@@ -2488,6 +2513,7 @@ mod a5_cast_role_tests {
                         address_once_here: false,
                         array_decay: None,
                         reborrow_of: None,
+                        identity_cast: None,
                     }],
                 }],
             );

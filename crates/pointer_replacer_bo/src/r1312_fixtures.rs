@@ -661,7 +661,6 @@ fn r1312_w_a2_typedef_identity_cast_is_stripped() {
 /// cast form held. (The raw-binding twin is `a1-setters-cast`, a slice formal since step 2.)
 const STRIP: &str = "pub type uint32_t = core::ffi::c_uint;
 extern \"C\" {
-    fn get_word() -> *mut uint32_t;
     fn get_const() -> *const uint32_t;
     fn get_table() -> *mut *mut uint32_t;
 }
@@ -670,9 +669,11 @@ pub unsafe extern \"C\" fn set_word(mut w: *mut uint32_t, mut v: uint32_t) {
     *w = v;
 }
 #[no_mangle]
-pub unsafe extern \"C\" fn converting_twin(mut v: uint32_t) {
-    let mut p: *mut uint32_t = get_word();
+pub unsafe extern \"C\" fn converting_twin(mut v: uint32_t) -> uint32_t {
+    let mut x: uint32_t = 0 as core::ffi::c_int as uint32_t;
+    let mut p: *mut uint32_t = &mut x;
     set_word(p as *mut uint32_t, v);
+    return x;
 }
 #[no_mangle]
 pub unsafe extern \"C\" fn set_byte(mut b: *mut core::ffi::c_uchar) {
@@ -715,6 +716,7 @@ fn r1312_w_a1_strip_thin_twin_and_refusals() {
         assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
     }
     assert!(!text.contains("p as *mut uint32_t"), "{emitted}");
+    assert!(text.contains("set_word(p, v)"), "{emitted}");
     // The refusals keep the cast form held.
     for label in ["set_byte::b", "set_first::pp", "store_word::s"] {
         assert_eq!(r[label][1], "arg-cast-form-unbuilt", "{label}: {r:#?}");

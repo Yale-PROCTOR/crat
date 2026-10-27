@@ -5548,6 +5548,9 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// `&mut (*p).f`: the borrowed place is reached through a
                 /// deref of the root (wave-6r's shared-root bridge shape).
                 through_deref: bool,
+                /// Relay 371 step 3: the argument's cast keeps the pointee, so where
+                /// the forms already agree the edit is the operand alone.
+                identity_strip: bool,
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
@@ -5869,6 +5872,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             ..
                         }
                     ),
+                    identity_strip: arg.identity_cast.is_some(),
                 });
             }
 
@@ -6749,6 +6753,26 @@ pub(crate) fn synthesize_with_raw_boundary(
                         })
                     },
                 );
+                // Relay 371 step 3: where the forms agree (`&mut T` into `&mut T`),
+                // the identity cast is stripped — the edit is the operand alone.
+                if pos.identity_strip
+                    && let Some(current @ Ok(None)) = candidates.last_mut()
+                {
+                    let mutable = matches!(
+                        pos.expected,
+                        Form::Ref { mutable: true }
+                            | Form::Slice { mutable: true }
+                            | Form::Opt { mutable: true, .. }
+                    );
+                    *current = Ok(Some(Candidate {
+                        spec: GlueSpec::core(GlueCore::Bare, mutable),
+                        family: SeamFamily::Safe,
+                        replacement: text.to_owned(),
+                        len_arm: None,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                    }));
+                }
                 // wave-6l relay 077: every branch above that took the NUL-walk
                 // length (an owner view reads `len_text` too) names it in its
                 // receipt.
