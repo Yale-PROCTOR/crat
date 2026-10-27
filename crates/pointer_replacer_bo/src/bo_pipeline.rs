@@ -264,12 +264,36 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
         ));
     };
     let detail_at = column("reason_detail");
+    // R1314-1 (relay main/372): the subjects premise P12 decides carry `premise:P12` in
+    // their `reason_detail`, as their receipt row in `p12_receipts.tsv` does.
+    let p12_subjects = capture
+        .raw_boundary_artifacts
+        .p12_receipts
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with("subject_key\t"))
+        .filter_map(|line| line.split('\t').next())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut out = format!(
         "program\t{seed_header}\t{}\toutcome\tfirst_hold_reason\n",
         facts_header.split_once('\t').map_or("", |(_, rest)| rest)
     );
     for line in seed {
-        let cells = line.split('\t').collect::<Vec<_>>();
+        let marked;
+        let mut cells = line.split('\t').collect::<Vec<_>>();
+        if let Some(at) = detail_at
+            && cells
+                .get(key_at)
+                .is_some_and(|key| p12_subjects.contains(key))
+            && at < cells.len()
+        {
+            marked = match cells[at] {
+                "-" => "premise:P12".to_owned(),
+                detail => format!("{detail};premise:P12"),
+            };
+            cells[at] = &marked;
+        }
+        let line = cells.join("\t");
+        let line = line.as_str();
         let cell = |at: usize| cells.get(at).copied().unwrap_or("-");
         let key = cell(key_at);
         let (outcome, reason) = if cell(decision_at) == "excluded" {
@@ -345,6 +369,7 @@ fn write_artifacts(dir: &Path, input: &Path, capture: &E1Capture) -> Result<(), 
         ("settled_hold_receipts.tsv", &receipts.settled_hold_receipts),
         ("exposure.tsv", &receipts.exposure),
         ("class_collisions.tsv", &receipts.class_collisions),
+        ("p12_receipts.tsv", &receipts.p12_receipts),
     ] {
         write(name, text)?;
     }

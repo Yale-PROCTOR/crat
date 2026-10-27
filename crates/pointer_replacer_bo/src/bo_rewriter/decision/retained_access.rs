@@ -287,6 +287,12 @@ pub(crate) struct Options {
     /// ([`Rule::OneDerivation`], [`Rule::SccExtents`], [`Rule::FactSelfStores`],
     /// [`Rule::ExposedProvenance`]).
     pub(crate) facts: bool,
+    /// **R1314-1 (USER; relay main/372): premise P12 `FileBufferOwnership`.** The program
+    /// hands no buffer of its own to a `FILE` ([`FILE_BINDING_CALLS`], no write through a
+    /// `_IO_FILE` field): a `FILE`'s memory is libc's own, [`Obj::LibcFile`], meeting no
+    /// program object. Checked per program by [`file_binding_scan`]; a program the scan
+    /// finds a binding in keeps the hold (fail-closed).
+    pub(crate) file_buffers: bool,
 }
 
 impl Options {
@@ -299,6 +305,7 @@ impl Options {
             close_n1: true,
             close_n2: true,
             facts: true,
+            file_buffers: true,
             faults: 1u64 << Rule::RoundTrip as u64,
             ..Options::default()
         }
@@ -318,6 +325,7 @@ impl Default for Options {
             close_n1: false,
             close_n2: false,
             facts: false,
+            file_buffers: false,
         }
     }
 }
@@ -349,6 +357,12 @@ enum Obj {
     /// into [`Relation::subs`]. Two members of one object are disjoint (C: arithmetic
     /// from a member stays inside it on a UB-free input); memory keys are the root's.
     Sub(u32),
+    /// **P12 (R1314-1):** libc's `FILE` memory, `libc-file`: what the foreign `FILE`
+    /// statics (`stderr`, `stdout`, `stdin`) point to and everything a load through a
+    /// `FILE` reaches (`_IO_buf_base`, `_IO_read_ptr`, `_chain`, …: the whole pointee).
+    /// It overlaps no program object and no other outside class; only
+    /// [`Options::file_buffers`] under a clean [`file_binding_scan`] makes it.
+    LibcFile,
 }
 
 /// Where a pointer value is kept in memory.
@@ -670,6 +684,12 @@ fn local_of(op: &Operand<'_>) -> Option<Local> {
 struct Relation<'tcx> {
     tcx: TyCtxt<'tcx>,
     options: Options,
+    /// P12: the program's `FILE` bindings ([`file_binding_scan`]); empty is clean.
+    p12_scan: Vec<String>,
+    /// P12 in force: [`Options::file_buffers`] and a clean scan.
+    p12_active: bool,
+    /// P12 changed a load (a `FILE` static's or a load through a `FILE`).
+    p12_carved: bool,
     types: Vec<Ty<'tcx>>,
     type_ids: FxHashMap<Ty<'tcx>, TyId>,
     points: FxHashMap<(LocalDefId, Local), FxHashSet<Obj>>,
@@ -744,9 +764,13 @@ impl<'tcx> Relation<'tcx> {
     }
 
     fn new(program: &RustProgram<'tcx>, options: Options) -> Self {
+        let p12_scan = file_binding_scan(program);
         let mut this = Self {
             tcx: program.tcx,
             options,
+            p12_active: options.file_buffers && p12_scan.is_empty(),
+            p12_scan,
+            p12_carved: false,
             types: Vec::new(),
             type_ids: FxHashMap::default(),
             points: FxHashMap::default(),
@@ -1228,7 +1252,8 @@ impl<'tcx> Relation<'tcx> {
                     .collect();
                 !types.is_empty() && types.into_iter().all(is)
             }
-            Obj::Anon(_) | Obj::Top => false,
+            // P12: libc's `FILE` memory is no struct of the program's.
+            Obj::Anon(_) | Obj::Top | Obj::LibcFile => false,
         }
     }
 
@@ -1430,6 +1455,7 @@ impl<'tcx> Relation<'tcx> {
                 | Obj::Anon(_)
                 | Obj::External(_)
                 | Obj::Opaque(..)
+                | Obj::LibcFile
                 | Obj::Top
         )
     }
@@ -1950,7 +1976,7 @@ impl<'tcx> Relation<'tcx> {
                     .collect();
                 (types.len() == 1).then(|| types[0])
             }
-            Obj::Anon(_) | Obj::Top => None,
+            Obj::Anon(_) | Obj::Top | Obj::LibcFile => None,
         }
     }
 
@@ -2114,9 +2140,28 @@ impl<'tcx> Relation<'tcx> {
         let wild = self.wild();
         let union = self.on(Rule::UnionMembers) && self.under_union(body, place);
         for key in self.keys_of(f, body, place) {
+            let holder = key.holder();
+            // **P12 (R1314-1):** a load from a foreign `FILE` static, or through a `FILE`,
+            // yields libc's `FILE` memory (and what the program itself stored there),
+            // never `Top`'s stores: no program pointer reaches a `FILE` under the premise.
+            if self.p12_active && (holder == Obj::LibcFile || self.is_file_static(holder)) {
+                let mut objs = if holder == Obj::LibcFile {
+                    FxHashSet::default()
+                } else {
+                    self.contents.get(&key).cloned().unwrap_or_default()
+                };
+                objs.insert(Obj::LibcFile);
+                self.p12_carved = true;
+                value.objs.extend(objs);
+                value.vias.insert(match key {
+                    Key::Field(_, did, index) => Via::Field(did, index),
+                    Key::Cell(_, ty) => Via::Cell(ty),
+                    Key::Init(_) => Via::Unknown,
+                });
+                continue;
+            }
             let mut objs = self.contents.get(&key).cloned().unwrap_or_default();
             objs.extend(wild.iter().copied());
-            let holder = key.holder();
             if holder == Obj::Top {
                 value.join(self.top());
             }
@@ -2224,6 +2269,18 @@ impl<'tcx> Relation<'tcx> {
                 self.obj_types.entry(obj).or_default().insert(id);
             }
         }
+    }
+
+    /// P12: a foreign static of type `*mut FILE` (`stderr`, `stdout`, `stdin`).
+    fn is_file_static(&self, obj: Obj) -> bool {
+        let Obj::Global(def) = obj else { return false };
+        self.tcx.is_foreign_item(def)
+            && self
+                .tcx
+                .type_of(def)
+                .instantiate_identity()
+                .builtin_deref(true)
+                .is_some_and(|pointee| is_io_file(self.tcx, pointee))
     }
 
     /// The library's memory a contract returns, typed by its pointee.
@@ -4069,6 +4126,10 @@ impl<'tcx> Relation<'tcx> {
         if a == b || a == Obj::Top || b == Obj::Top {
             return true;
         }
+        // P12 (R1314-1): libc's `FILE` memory is its own class.
+        if a == Obj::LibcFile || b == Obj::LibcFile {
+            return false;
+        }
         // Members of one object overlap only along one path; an outside object meets a
         // member only as (a part of) the member's own type.
         if matches!(a, Obj::Sub(_)) || matches!(b, Obj::Sub(_)) {
@@ -5307,6 +5368,13 @@ pub(crate) struct RetainedAccessCheck {
     exposed_premised: FxHashMap<(LocalDefId, Local), &'static str>,
     /// The mode the verdicts were computed in (`Options::evident`): `after_deliveries` reads it.
     evident: bool,
+    /// P12 (R1314-1): the program's `FILE` bindings; empty is `p12_scan=clean`.
+    p12_scan: Vec<String>,
+    /// P12 changed a load in this computation.
+    p12_carved: bool,
+    /// P12: the declarations whose verdict the premise decides (it changes with the
+    /// premise taken away): `retained-access-cleared` (clear only with it).
+    file_premised: FxHashMap<(LocalDefId, Local), &'static str>,
 }
 
 impl RetainedAccessCheck {
@@ -5352,6 +5420,29 @@ impl RetainedAccessCheck {
                         "retained-access-cleared"
                     };
                     check.exposed_premised.insert(*key, kind);
+                }
+            }
+        }
+        // P12 (R1314-1): its receipts, where it changed a load: the check once more with
+        // the premise taken away.
+        if options.file_buffers && check.p12_carved {
+            let without = Self::compute_options(
+                program,
+                field_raw,
+                Options {
+                    file_buffers: false,
+                    ..options
+                },
+            );
+            for (key, verdict) in &check.verdicts {
+                let other = without.verdicts.get(key).is_some_and(|v| v.withdraws());
+                if verdict.withdraws() != other {
+                    let kind = if verdict.withdraws() {
+                        "retained-access-withdrawn"
+                    } else {
+                        "retained-access-cleared"
+                    };
+                    check.file_premised.insert(*key, kind);
                 }
             }
         }
@@ -6038,6 +6129,9 @@ impl RetainedAccessCheck {
             premised,
             exposed_premised: FxHashMap::default(),
             evident: options.evident,
+            p12_scan: relation.p12_scan.clone(),
+            p12_carved: relation.p12_carved,
+            file_premised: FxHashMap::default(),
         }
     }
 
@@ -6122,6 +6216,20 @@ impl RetainedAccessCheck {
         self.exposed_premised.get(&(f, local)).copied()
     }
 
+    /// P12: the verdict kind the premise decides for this declaration, if any.
+    pub(crate) fn file_premise(&self, f: LocalDefId, local: Local) -> Option<&'static str> {
+        self.file_premised.get(&(f, local)).copied()
+    }
+
+    /// P12: the program line, `p12_scan=clean` or `p12_scan=<bindings>`.
+    pub(crate) fn p12_scan_line(&self) -> String {
+        if self.p12_scan.is_empty() {
+            "p12_scan=clean".to_owned()
+        } else {
+            format!("p12_scan={}", self.p12_scan.join(","))
+        }
+    }
+
     pub(crate) fn container_of_sites(&self) -> &[(LocalDefId, Local)] {
         &self.container_of
     }
@@ -6151,4 +6259,160 @@ pub(crate) fn exposed_premise_receipts(
             })
         })
         .collect()
+}
+
+/// R1314-1 (USER): P12 `FileBufferOwnership`'s census receipts, one per subject whose
+/// decision the premise decides (`premise=file-buffer-ownership`, counted per program).
+pub(crate) fn file_buffer_premise_receipts(
+    tcx: TyCtxt<'_>,
+    check: &RetainedAccessCheck,
+    subjects: &[super::Subject],
+) -> Vec<super::call_result_option::PremiseReceipt> {
+    subjects
+        .iter()
+        .filter_map(|subject| {
+            let site_kind = check.file_premise(subject.fn_did, subject.local)?;
+            Some(super::call_result_option::PremiseReceipt {
+                owner: tcx.def_path_str(subject.fn_did.to_def_id()),
+                subject: subject.label.clone(),
+                site: format!(
+                    "{}..{}",
+                    subject.binding_span.lo().0,
+                    subject.binding_span.hi().0
+                ),
+                premise: "file-buffer-ownership",
+                site_kind,
+            })
+        })
+        .collect()
+}
+
+/// R1314-1: the per-subject writer's `p12_receipts.tsv`: the program line, then one row
+/// per subject P12 decides (`premise:P12`).
+pub(crate) fn p12_receipts_tsv(
+    tcx: TyCtxt<'_>,
+    check: &RetainedAccessCheck,
+    subjects: &[super::Subject],
+) -> String {
+    let mut out = format!(
+        "# {}\nsubject_key\tlabel\tpremise\tverdict\n",
+        check.p12_scan_line()
+    );
+    let mut rows = subjects
+        .iter()
+        .filter_map(|subject| {
+            let kind = check.file_premise(subject.fn_did, subject.local)?;
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            Some(format!(
+                "{}\t{}\tpremise:P12\t{kind}\n",
+                subject.identity_key(&owner),
+                subject.label
+            ))
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    out.extend(rows);
+    out
+}
+
+/// The calls that bind a `FILE` to memory the program supplies (R1314-1: the user named
+/// the first two; the others do the same).
+pub(crate) const FILE_BINDING_CALLS: &[&str] = &[
+    "setvbuf",
+    "setbuf",
+    "setbuffer",
+    "fmemopen",
+    "open_memstream",
+    "open_wmemstream",
+    "fopencookie",
+];
+
+/// A `_IO_FILE` field `place` names through a dereference, as `<what>:_IO_FILE.<field>`.
+fn file_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    place: &Place<'tcx>,
+    what: &str,
+    found: &mut std::collections::BTreeSet<String>,
+) {
+    for (base, elem) in place.iter_projections() {
+        if let ProjectionElem::Field(field, _) = elem
+            && base.projection.contains(&ProjectionElem::Deref)
+            && let TyKind::Adt(adt, _) = base.ty(body, tcx).ty.kind()
+            && tcx.item_name(adt.did()).as_str() == "_IO_FILE"
+        {
+            let name = adt
+                .all_fields()
+                .nth(field.index())
+                .map_or_else(|| field.index().to_string(), |f| f.name.to_string());
+            found.insert(format!("{what}:_IO_FILE.{name}"));
+        }
+    }
+}
+
+/// Is `ty` C's `FILE` (`struct _IO_FILE`, through any typedef)?
+fn is_io_file<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    matches!(ty.kind(), TyKind::Adt(adt, _) if tcx.item_name(adt.did()).as_str() == "_IO_FILE")
+}
+
+/// **P12's check (R1314-1), per program:** every function item a body or a static's
+/// initializer names (called or taken) among [`FILE_BINDING_CALLS`], and every write or
+/// mutable borrow through a `_IO_FILE` field (`write:_IO_FILE.<field>`), sorted. Empty is
+/// clean.
+pub(crate) fn file_binding_scan<'tcx>(program: &RustProgram<'tcx>) -> Vec<String> {
+    let tcx = program.tcx;
+    let mut found = std::collections::BTreeSet::new();
+    let mut scan = |body: &Body<'tcx>| -> std::collections::BTreeSet<String> {
+        let mut name_of = |op: &Operand<'tcx>| {
+            if let Some(c) = op.constant()
+                && let TyKind::FnDef(target, _) = c.ty().kind()
+            {
+                let name = tcx.item_name(*target);
+                if FILE_BINDING_CALLS.contains(&name.as_str()) {
+                    found.insert(name.to_string());
+                }
+            }
+        };
+        let mut fields = std::collections::BTreeSet::new();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                if let StatementKind::Assign(box (place, rvalue)) = &statement.kind {
+                    file_field(tcx, body, place, "write", &mut fields);
+                    match rvalue {
+                        Rvalue::Ref(_, rustc_middle::mir::BorrowKind::Mut { .. }, borrowed)
+                        | Rvalue::RawPtr(rustc_middle::mir::RawPtrKind::Mut, borrowed) => {
+                            file_field(tcx, body, borrowed, "borrow", &mut fields)
+                        }
+                        Rvalue::Use(op) | Rvalue::Cast(_, op, _) => name_of(op),
+                        Rvalue::Aggregate(_, ops) => ops.iter().for_each(&mut name_of),
+                        _ => {}
+                    }
+                }
+            }
+            if let TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } = &data.terminator().kind
+            {
+                name_of(func);
+                for arg in args.iter() {
+                    name_of(&arg.node);
+                }
+            }
+        }
+        fields
+    };
+    let mut fields = std::collections::BTreeSet::new();
+    for &f in &program.functions {
+        // The body the relation reads.
+        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        fields.extend(scan(&body));
+    }
+    for def in tcx.hir_crate_items(()).definitions() {
+        if matches!(tcx.def_kind(def), rustc_hir::def::DefKind::Static { .. })
+            && !tcx.is_foreign_item(def.to_def_id())
+        {
+            fields.extend(scan(tcx.mir_for_ctfe(def.to_def_id())));
+        }
+    }
+    found.extend(fields);
+    found.into_iter().collect()
 }

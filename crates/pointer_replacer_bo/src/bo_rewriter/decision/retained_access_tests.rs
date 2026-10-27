@@ -678,6 +678,7 @@ fn e5c_hold_corpus_rows() {
             close_n2: std::env::var("CRAT_E5C_HOLD_CLOSE").is_ok_and(|v| v.contains("n2")),
             evident: std::env::var("CRAT_E5C_HOLD_MODE").as_deref() == Ok("evident"),
             facts: std::env::var("CRAT_E5C_HOLD_FACTS").as_deref() == Ok("on"),
+            file_buffers: false,
         };
         let check = RetainedAccessCheck::compute_options(&program, &raw, options);
         eprintln!(

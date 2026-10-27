@@ -740,6 +740,9 @@ pub(crate) struct RawBoundaryArtifacts {
     /// rides a stated premise (`premise=…`, site kind), so the census counts
     /// them per program.
     pub(crate) premise_receipts: String,
+    /// **R1314-1 (relay main/372):** premise P12's per-subject writer file: the program
+    /// line `p12_scan=clean` / `p12_scan=<bindings>`, then one row per subject P12 decides.
+    pub(crate) p12_receipts: String,
     /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
     /// their evidence, or HELD with what the root said and why.
     pub(crate) root_extents: String,
@@ -10187,7 +10190,18 @@ fn finish_decide<'tcx>(
                         &retained_access,
                         &subjects,
                     ))
+                    // R1314-1: P12's receipts.
+                    .chain(decision::retained_access::file_buffer_premise_receipts(
+                        tcx,
+                        &retained_access,
+                        &subjects,
+                    ))
                     .collect::<Vec<_>>(),
+            ),
+            p12_receipts: decision::retained_access::p12_receipts_tsv(
+                tcx,
+                &retained_access,
+                &subjects,
             ),
             root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
             sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
