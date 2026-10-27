@@ -2265,9 +2265,9 @@ unsafe extern "C" fn get_var(mut c: *mut ctx_t) -> i32 { return (*c).n; }
 /// W67: small shapes for the raw-cause ledger's classes -- a pointer
 /// joined at a phi with null or with a borrowed pointer, and locals no rule
 /// reaches.
-/// W67a: a C variable-length array, translated to a `Vec`, in a callee. The `Vec`'s
-/// drop is a release whose effects are unresolved (its objects unknown); the call
-/// routes it to `vla_mid`, whose by-reference formal `ctx` it may retire.
+/// W67 and W-VLA a: a C variable-length array, translated to a `Vec`, in a callee.
+/// The `Vec`'s drop releases the buffer `vla_leaf` made fresh and nothing else; the
+/// call routes it to `vla_mid`, where it cannot retire the by-reference formal `ctx`.
 const W67_VLA: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
 #[no_mangle] pub unsafe extern "C" fn vla_leaf(mut out: *mut u8, mut n: usize) {

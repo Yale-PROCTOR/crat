@@ -344,6 +344,14 @@ pub(crate) fn expand(
                     unknown: false,
                 },
                 SourceObject::UnknownOperand => ObjectSet::default(),
+                // The buffer this frame made fresh at its constructor calls.
+                SourceObject::FreshBuffer { sites, .. } => ObjectSet {
+                    roots: sites
+                        .iter()
+                        .map(|&site| ObjectRoot::Fresh { frame, site })
+                        .collect(),
+                    unknown: false,
+                },
             }
         };
         let uncertainty = if drop_effects {

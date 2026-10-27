@@ -7,7 +7,10 @@ use std::{
 };
 
 use rustc_middle::{
-    mir::{Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind},
+    mir::{
+        Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+    },
     ty::TyCtxt,
 };
 
@@ -82,6 +85,13 @@ pub(crate) enum SourceObject {
     Storage(PlaceKey),
     Null,
     UnknownOperand,
+    /// The buffer of a whole `Vec` local the body itself made fresh (a C
+    /// variable-length array as c2rust lowers it), at these constructor calls
+    /// ([`fresh_vec_local`]). Its drop releases that buffer and nothing else.
+    FreshBuffer {
+        local: u32,
+        sites: Vec<rustc_middle::mir::Location>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +103,9 @@ pub(crate) enum Coverage {
     UnresolvedWholeObject,
     UnresolvedStorage,
     UnresolvedDropEffects,
+    /// The drop of a [`SourceObject::FreshBuffer`]: its objects are the fresh
+    /// allocations its constructor calls made in this frame.
+    ResolvedFreshBuffer,
     /// A callee whose body this analysis never scans, so its retirement effects
     /// are unknown. Today that is every `CallKind::Impl` target, because
     /// `program.functions` holds only free-standing items; the emission site
@@ -435,6 +448,319 @@ pub(super) fn addressed_locals(body: &Body<'_>) -> BTreeSet<Local> {
                 .then_some(place.local)
             })
             .collect()
+}
+
+/// A C variable-length array as c2rust lowers it (`::std::vec::from_elem(0, n)`):
+/// a whole local of type `Vec<T>` -- `T` without drop glue, the global allocator --,
+/// not the return place and not a formal, whose
+/// every definition in this body is a fresh constructor call -- std's `from_elem`,
+/// `Vec::new`, `Vec::with_capacity` -- into the local itself or into a temporary
+/// moved whole into it (a temporary nothing else mentions but a drop); that is
+/// never moved out, never has its address taken raw, and is mutably borrowed only
+/// into a std call that cannot replace its buffer (`as_mut_ptr`, `as_mut_slice`,
+/// `deref_mut`, `index_mut`), directly or through reborrows, never written through.
+/// Its drop releases the buffer those calls made and nothing else. The constructor
+/// call sites, or `None`.
+pub(crate) fn fresh_vec_local<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    place: Place<'tcx>,
+) -> Option<Vec<rustc_middle::mir::Location>> {
+    use rustc_middle::mir::{BorrowKind, Location};
+    if !place.projection.is_empty() {
+        return None;
+    }
+    let local = place.local;
+    if local.as_usize() == 0 || local.as_usize() <= body.arg_count {
+        return None;
+    }
+    let rustc_middle::ty::TyKind::Adt(adt, args) = body.local_decls[local].ty.kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(rustc_span::sym::Vec, adt.did()) {
+        return None;
+    }
+    // The drop releases the buffer alone only when the elements have no drop glue
+    // (a `Vec<Box<_>>` would free what its elements own) and the allocator is the
+    // global one (a custom allocator's deallocation is a body of its own).
+    let element = args.type_at(0);
+    if element.needs_drop(tcx, body.typing_env(tcx)) {
+        return None;
+    }
+    let global = args.type_at(1).ty_adt_def().is_some_and(|allocator| {
+        !allocator.did().is_local()
+            && matches!(
+                tcx.def_path_str(allocator.did()).as_str(),
+                "std::alloc::Global" | "alloc::alloc::Global"
+            )
+    });
+    if !global {
+        return None;
+    }
+    let callee = |func: &Operand<'tcx>| func.const_fn_def().map(|(def_id, _)| def_id);
+    let std_item = |def_id: rustc_span::def_id::DefId| {
+        matches!(
+            tcx.crate_name(def_id.krate).as_str(),
+            "alloc" | "std" | "core"
+        )
+    };
+    let fresh = |def_id: rustc_span::def_id::DefId| {
+        std_item(def_id)
+            && (tcx.is_diagnostic_item(rustc_span::Symbol::intern("vec_from_elem"), def_id)
+                || (matches!(tcx.item_name(def_id).as_str(), "new" | "with_capacity")
+                    && tcx.impl_of_method(def_id).is_some_and(|impl_did| {
+                        tcx.trait_id_of_impl(impl_did).is_none()
+                            && tcx
+                                .type_of(impl_did)
+                                .skip_binder()
+                                .ty_adt_def()
+                                .is_some_and(|adt| {
+                                    tcx.is_diagnostic_item(rustc_span::sym::Vec, adt.did())
+                                })
+                    })))
+    };
+    let keeps_buffer = |def_id: rustc_span::def_id::DefId| {
+        std_item(def_id)
+            && matches!(
+                tcx.item_name(def_id).as_str(),
+                "as_mut_ptr" | "as_mut_slice" | "deref_mut" | "index_mut"
+            )
+    };
+    let is_move_of = |operand: &Operand<'tcx>, target: Local| matches!(operand, Operand::Move(moved) if moved.local == target);
+    // The locals holding a `&mut` to the Vec, closed under reborrows and moves.
+    let mut handles: BTreeSet<Local> = BTreeSet::new();
+    loop {
+        let before = handles.len();
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let from = match rvalue {
+                    Rvalue::Ref(_, BorrowKind::Mut { .. }, borrowed) => {
+                        (borrowed.local == local && borrowed.projection.is_empty())
+                            || (handles.contains(&borrowed.local)
+                                && borrowed.projection.as_slice() == [ProjectionElem::Deref])
+                    }
+                    Rvalue::Use(Operand::Move(moved) | Operand::Copy(moved)) => {
+                        handles.contains(&moved.local) && moved.projection.is_empty()
+                    }
+                    _ => false,
+                };
+                if from {
+                    if !destination.projection.is_empty() {
+                        return None;
+                    }
+                    handles.insert(destination.local);
+                }
+            }
+        }
+        if handles.len() == before {
+            break;
+        }
+    }
+    let mut sites = Vec::new();
+    let mut temporaries = BTreeSet::new();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for statement in &data.statements {
+            let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+                if let StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) =
+                    &statement.kind
+                    && (place.local == local || handles.contains(&place.local))
+                {
+                    return None;
+                }
+                continue;
+            };
+            // A store through a handle can put another buffer in the Vec.
+            if handles.contains(&destination.local) && !destination.projection.is_empty() {
+                return None;
+            }
+            if destination.local == local {
+                match rvalue {
+                    Rvalue::Use(Operand::Move(moved))
+                        if destination.projection.is_empty() && moved.projection.is_empty() =>
+                    {
+                        temporaries.insert(moved.local);
+                    }
+                    _ => return None,
+                }
+            }
+            match rvalue {
+                Rvalue::CopyForDeref(read)
+                    if read.local == local || handles.contains(&read.local) =>
+                {
+                    return None;
+                }
+                Rvalue::RawPtr(_, raw) if raw.local == local || handles.contains(&raw.local) => {
+                    return None;
+                }
+                // A shared borrow of the Vec cannot replace its buffer; a mutable
+                // one must be a handle.
+                Rvalue::Ref(_, kind, borrowed) if borrowed.local == local => {
+                    if matches!(kind, BorrowKind::Mut { .. })
+                        && !handles.contains(&destination.local)
+                    {
+                        return None;
+                    }
+                }
+                // Through a handle, only a mutable reborrow into another handle.
+                Rvalue::Ref(_, kind, borrowed) if handles.contains(&borrowed.local) => {
+                    if !(matches!(kind, BorrowKind::Mut { .. })
+                        && borrowed.projection.as_slice() == [ProjectionElem::Deref]
+                        && handles.contains(&destination.local))
+                    {
+                        return None;
+                    }
+                }
+                Rvalue::Use(Operand::Move(moved) | Operand::Copy(moved))
+                    if handles.contains(&moved.local) && !handles.contains(&destination.local) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            // Any other operand that moves the Vec (or a handle) moves it out.
+            let mut moved_out = false;
+            rvalue_operands(rvalue, &mut |operand| {
+                if let Operand::Move(moved) = operand
+                    && (moved.local == local
+                        || (handles.contains(&moved.local) && !matches!(rvalue, Rvalue::Use(_))))
+                {
+                    moved_out = true;
+                }
+            });
+            if moved_out {
+                return None;
+            }
+        }
+        let terminator = data.terminator();
+        let at = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        match &terminator.kind {
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } => {
+                let target = callee(func);
+                if destination.local == local {
+                    if !destination.projection.is_empty() || !target.is_some_and(fresh) {
+                        return None;
+                    }
+                    sites.push(at);
+                }
+                if handles.contains(&destination.local) {
+                    return None;
+                }
+                for argument in args.iter() {
+                    if is_move_of(&argument.node, local) {
+                        return None;
+                    }
+                    if let Operand::Move(moved) | Operand::Copy(moved) = &argument.node
+                        && handles.contains(&moved.local)
+                        && !target.is_some_and(keeps_buffer)
+                    {
+                        return None;
+                    }
+                }
+            }
+            TerminatorKind::Drop { .. }
+            | TerminatorKind::Goto { .. }
+            | TerminatorKind::SwitchInt { .. }
+            | TerminatorKind::Return
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Assert { .. }
+            | TerminatorKind::FalseEdge { .. }
+            | TerminatorKind::FalseUnwind { .. } => {}
+            _ => return None,
+        }
+    }
+    // A temporary moved whole into the Vec counts only if it, too, holds a fresh
+    // buffer when it is moved: nothing mentions it but its fresh constructor
+    // calls, that move, a drop, or its storage markers.
+    for temporary in temporaries {
+        if temporary.as_usize() == 0 || temporary.as_usize() <= body.arg_count {
+            return None;
+        }
+        let mut mentions = Mentions {
+            local: temporary,
+            found: Vec::new(),
+        };
+        mentions.visit_body(body);
+        for (at, context) in mentions.found {
+            let data = &body.basic_blocks[at.block];
+            match context {
+                PlaceContext::NonUse(_) | PlaceContext::MutatingUse(MutatingUseContext::Drop) => {}
+                PlaceContext::MutatingUse(MutatingUseContext::Call) => {
+                    let TerminatorKind::Call {
+                        func, destination, ..
+                    } = &data.terminator().kind
+                    else {
+                        return None;
+                    };
+                    if !destination.projection.is_empty() || !callee(func).is_some_and(fresh) {
+                        return None;
+                    }
+                    sites.push(at);
+                }
+                PlaceContext::NonMutatingUse(NonMutatingUseContext::Move)
+                    if data.statements.get(at.statement_index).is_some_and(|statement| {
+                        matches!(&statement.kind,
+                            StatementKind::Assign(box (destination, Rvalue::Use(Operand::Move(moved))))
+                                if destination.local == local
+                                    && destination.projection.is_empty()
+                                    && moved.local == temporary
+                                    && moved.projection.is_empty())
+                    }) => {}
+                _ => return None,
+            }
+        }
+    }
+    sites.sort();
+    sites.dedup();
+    (!sites.is_empty()).then_some(sites)
+}
+
+/// Every mention of one local in a body, with its context.
+struct Mentions {
+    local: Local,
+    found: Vec<(rustc_middle::mir::Location, PlaceContext)>,
+}
+
+impl<'tcx> Visitor<'tcx> for Mentions {
+    fn visit_local(
+        &mut self,
+        local: Local,
+        context: PlaceContext,
+        location: rustc_middle::mir::Location,
+    ) {
+        if local == self.local {
+            self.found.push((location, context));
+        }
+    }
+}
+
+/// Every operand of `rvalue`, in order.
+fn rvalue_operands<'tcx>(rvalue: &Rvalue<'tcx>, visit: &mut impl FnMut(&Operand<'tcx>)) {
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Repeat(operand, _)
+        | Rvalue::Cast(_, operand, _)
+        | Rvalue::UnaryOp(_, operand)
+        | Rvalue::ShallowInitBox(operand, _) => visit(operand),
+        Rvalue::BinaryOp(_, box (left, right)) => {
+            visit(left);
+            visit(right);
+        }
+        Rvalue::Aggregate(_, operands) => operands.iter().for_each(|operand| visit(operand)),
+        _ => {}
+    }
 }
 
 /// Exact compiler contracts for explicit source destruction. Dropping a raw
@@ -783,11 +1109,26 @@ pub(crate) fn collect(program: &RustProgram<'_>) -> SourceEvents {
                         &body,
                         &addressed,
                     );
-                    // A destructor can retire a pointee or execute a local body;
-                    // dropping its value is not proof of stack-storage death.
-                    event.coverage = Coverage::UnresolvedDropEffects;
-                    event.region = SourceRegion::Missing;
-                    event.generation = SourceGeneration::Missing;
+                    match fresh_vec_local(tcx, &body, place) {
+                        // The drop of a buffer the body made fresh releases that
+                        // buffer: its objects are known, and no entry reaches them.
+                        Some(sites) => {
+                            event.object = SourceObject::FreshBuffer {
+                                local: place.local.as_u32(),
+                                sites,
+                            };
+                            event.coverage = Coverage::ResolvedFreshBuffer;
+                            event.region = SourceRegion::WholeAllocation;
+                            event.generation = SourceGeneration::UnresolvedHeapEpoch;
+                        }
+                        // A destructor can retire a pointee or execute a local body;
+                        // dropping its value is not proof of stack-storage death.
+                        None => {
+                            event.coverage = Coverage::UnresolvedDropEffects;
+                            event.region = SourceRegion::Missing;
+                            event.generation = SourceGeneration::Missing;
+                        }
+                    }
                     insert(&mut events, event);
                 }
                 TerminatorKind::Return | TerminatorKind::UnwindResume => {

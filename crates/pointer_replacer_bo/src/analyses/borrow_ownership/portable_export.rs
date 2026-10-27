@@ -287,6 +287,10 @@ fn source_event(event: &se::SourceRetirement) -> Value {
         se::SourceObject::Storage(p) => json!({"kind":"storage","place":place(p)}),
         se::SourceObject::Null => json!({"kind":"null"}),
         se::SourceObject::UnknownOperand => json!({"kind":"unknown-operand"}),
+        se::SourceObject::FreshBuffer { local, sites } => {
+            json!({"kind":"fresh-buffer","local":local,
+            "sites":sites.iter().map(|site| location(*site)).collect::<Vec<_>>()})
+        }
     };
     json!({"key":source_key(&event.key),"object":object,"coverage":tag(event.coverage),
         "generation":tag(event.generation),"region":tag(event.region)})
