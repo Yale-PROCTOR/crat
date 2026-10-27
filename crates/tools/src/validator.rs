@@ -708,6 +708,20 @@ fn item_kind_name(item: &Item) -> &'static str {
     }
 }
 
+pub(crate) fn validate_function_with_view(
+    expected: &Item,
+    result: &Item,
+    metadata: ExpectedFunction,
+) -> Vec<ValidationError> {
+    validate_function(
+        &ParsedExpected {
+            metadata,
+            item: P(expected.clone()),
+        },
+        result,
+    )
+}
+
 fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<ValidationError> {
     let signature_errors = validate_signature(expected, result);
     let ItemKind::Fn(box expected_fn) = &expected.item.kind else { unreachable!() };

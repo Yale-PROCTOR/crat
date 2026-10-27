@@ -404,6 +404,23 @@ fn frozen_finalization_restores_main_and_validates_original_api_exports() {
 }
 
 #[test]
+fn frozen_views_reject_a_child_moved_between_branches() {
+    let frozen = freeze(
+        "pub unsafe fn choose(flag: bool) { if flag { consume(); } else {} } unsafe fn consume() {}",
+    );
+    let mut changed = frozen.clone();
+    let choose = changed
+        .functions
+        .iter_mut()
+        .find(|function| function.record.name == "choose")
+        .unwrap();
+    choose.record.applied.skeleton = "pub unsafe fn choose(mut flag: bool) { #[proctor(0)] if flag {} else { #[proctor(1)] consume(); } }".to_owned();
+    let error = frozen_project_from_json(&serde_json::to_string(&changed).unwrap()).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::InvalidRequest);
+    assert!(error.message.contains("topology"), "{error:?}");
+}
+
+#[test]
 fn malformed_frozen_bundles_return_errors_without_compiler_analysis_or_panics() {
     let frozen = freeze("pub mod nested { pub unsafe fn read(p: *const i32) -> i32 { *p } }");
     for mutation in [

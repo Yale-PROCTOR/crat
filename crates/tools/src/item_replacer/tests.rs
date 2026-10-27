@@ -3,6 +3,7 @@ use utils::compilation::run_compiler_on_str;
 use super::*;
 use crate::{
     PrintfTemplateMetadata, StatementDisposition, StatementDispositionKind, StatementPairMetadata,
+    printf::parse_print_macro_statement,
 };
 
 fn observation_metadata(
@@ -1205,12 +1206,19 @@ fn finalization_deduplicates_rust_and_export_names_for_one_function() {
 fn print_arguments_are_defended_without_validator() {
     let source = "unsafe fn f() {}";
     let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#;
-    for argument in [
-        "{ fn hidden() {} 1 }",
-        "unsafe { 1 }",
-        "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
-        "{ let invented = 1; invented }",
-        "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
+    for (argument, code) in [
+        ("{ fn hidden() {} 1 }", "unexpected_nested_item"),
+        ("unsafe { 1 }", "explicit_unsafe_block"),
+        (
+            "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
+            "unexpected_body_attribute",
+        ),
+        ("{ return; }", "escaping_opaque_control"),
+        (
+            "match 1 { invented => invented }",
+            "invalid_generated_binding_name",
+        ),
+        ("helper!(proctor_temp_var_0)", "temporary_in_macro"),
     ] {
         let request = ReplacementRequest {
             items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
@@ -1219,9 +1227,27 @@ fn print_arguments_are_defended_without_validator() {
             ),
             accepted_correspondence: vec![],
         };
+        let validation = crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: 7,
+                name: "f".to_owned(),
+                view: request.items[0].view.clone(),
+            }],
+            transformation: request.transformation.clone(),
+        });
+        let crate::ValidationResponse::Invalid { failures } = validation else {
+            panic!("expected rejection for {argument}: {validation:?}");
+        };
+        assert!(
+            failures
+                .iter()
+                .flat_map(|failure| &failure.errors)
+                .any(|error| error.code == code),
+            "{failures:?}"
+        );
         let error = add_source(source, &request).unwrap_err();
         assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
-        assert!(error.message.contains("print argument"), "{error:?}");
+        assert!(error.message.contains(code), "{error:?}");
     }
 
     let valid = ReplacementRequest {
@@ -1233,12 +1259,20 @@ fn print_arguments_are_defended_without_validator() {
     };
     assert!(add_source(source, &valid).is_ok());
 
-    let local_temporary = ReplacementRequest {
-                items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
-        transformation: r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }); }"#.to_owned(),
-        accepted_correspondence: vec![],
-    };
-    assert!(add_source(source, &local_temporary).is_ok());
+    for argument in [
+        "{ let local = 1; local }",
+        "{ let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
+        "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
+    ] {
+        let request = ReplacementRequest {
+            items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
+            transformation: format!(
+                r#"unsafe fn f() {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#
+            ),
+            accepted_correspondence: vec![],
+        };
+        assert!(add_source(source, &request).is_ok(), "{argument}");
+    }
 
     for argument in [
         "{ proctor_temp_var_0 + { let proctor_temp_var_0 = 1; proctor_temp_var_0 } }",
@@ -1254,7 +1288,7 @@ fn print_arguments_are_defended_without_validator() {
         };
         let error = add_source(source, &request).unwrap_err();
         assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
-        assert!(error.message.contains("lexical expansion scope"));
+        assert!(error.message.contains("unresolved_generated_temporary"));
     }
 
     let two = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{} {}", todo!(), todo!()); }"#;
@@ -1265,7 +1299,7 @@ fn print_arguments_are_defended_without_validator() {
     };
     let error = add_source(source, &cross_argument).unwrap_err();
     assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
-    assert!(error.message.contains("lexical expansion scope"));
+    assert!(error.message.contains("unresolved_generated_temporary"));
 
     let existing = ReplacementRequest {
                 items: vec![preservation_item(
@@ -1279,6 +1313,103 @@ fn print_arguments_are_defended_without_validator() {
         accepted_correspondence: vec![],
     };
     assert!(add_source("unsafe fn f(proctor_temp_var_0: i32) {}", &existing).is_ok());
+
+    let labeled_argument = ReplacementRequest {
+        items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
+        transformation:
+            r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { #[proctor(9)] 1 }); }"#
+                .to_owned(),
+        accepted_correspondence: vec![],
+    };
+    assert_eq!(
+        add_source(source, &labeled_argument).unwrap_err().kind,
+        ReplacementErrorKind::InvalidTransformation
+    );
+}
+
+#[test]
+fn print_argument_variants_and_opaque_bindings_agree_with_validation() {
+    let source = r#"
+enum Token { TOKEN_EOF, TOKEN_WORD }
+use Token::{TOKEN_EOF, TOKEN_WORD};
+unsafe fn f(token: Token, proctor_temp_var_0: i32) {}
+"#;
+    let skeleton = r#"unsafe fn f(token: Token, proctor_temp_var_0: i32) { #[proctor(0)] ::std::print!("{}", todo!()); }"#;
+    for argument in [
+        "match token { TOKEN_EOF => 0, TOKEN_WORD => 1 }",
+        "match token { Token::TOKEN_EOF => 0, Token::TOKEN_WORD => 1 }",
+        "{ let local = 1; local }",
+        "if true { let local = 1; local } else { 0 }",
+        "(|| proctor_temp_var_0)()",
+    ] {
+        let item = preservation_item(7, "f", "f", skeleton, vec![0]);
+        let transformation = format!(
+            r#"unsafe fn f(token: Token, proctor_temp_var_0: i32) {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#
+        );
+        assert_eq!(
+            crate::validate(&crate::ValidationRequest {
+                expected_functions: vec![crate::ExpectedFunction {
+                    id: item.id,
+                    name: item.name.clone(),
+                    view: item.view.clone(),
+                }],
+                transformation: transformation.clone(),
+            }),
+            crate::ValidationResponse::Valid,
+            "{argument}"
+        );
+        let request = ReplacementRequest {
+            items: vec![item],
+            transformation,
+            accepted_correspondence: vec![],
+        };
+        let output = add_source(source, &request).unwrap();
+        compile_checked(&output);
+    }
+}
+
+#[test]
+fn shared_print_validation_retains_fixed_statement_restoration() {
+    let skeleton = r#"unsafe fn f() {
+        #[proctor(0)] ::std::print!("fixed");
+        #[proctor(1)] ::std::print!("{}", todo!());
+    }"#;
+    for disposition in [
+        StatementDispositionKind::Preserve,
+        StatementDispositionKind::RuleApplied,
+        StatementDispositionKind::Mechanical,
+    ] {
+        let mut item = preservation_item(7, "f", "f", skeleton, vec![1]);
+        item.view.statement_dispositions[0].disposition = disposition;
+        if disposition == StatementDispositionKind::Mechanical {
+            item.view.statement_pair_metadata.insert(
+                0,
+                StatementPairMetadata {
+                    label: 0,
+                    before_statement: "test".to_owned(),
+                    printf_template: Some(PrintfTemplateMetadata {
+                        rust_format: "fixed".to_owned(),
+                        argument_count: 0,
+                    }),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![],
+                },
+            );
+        }
+        let request = ReplacementRequest {
+            items: vec![item],
+            transformation: r#"unsafe fn f() {
+                #[proctor(0)] ::std::print!("changed");
+                #[proctor(1)] ::std::print!("{}", { let local = 1; local });
+            }"#
+            .to_owned(),
+            accepted_correspondence: vec![],
+        };
+        let output = add_source("unsafe fn f() {}", &request).unwrap();
+        assert!(output.contains(r#"::std::print!("fixed")"#));
+        assert!(!output.contains("changed"));
+        compile_checked(&output);
+    }
 }
 
 #[test]
@@ -1486,7 +1617,7 @@ fn replacer_rechecks_expanded_printf_literal_without_validator() {
     assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
     assert_eq!(
         error.message,
-        "printf_format_literal: print format literal differs from the expected converted format"
+        "printf_format_literal: Function `lower_hex` (item 7): print format literal differs from the expected converted format."
     );
 }
 

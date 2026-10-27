@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use rustc_ast::{
-    AttrKind, Attribute, Expr, ExprKind, Item, ItemKind, Local, LocalKind, Stmt, StmtKind,
+    AttrKind, Attribute, Expr, ExprKind, Item, ItemKind, Local, LocalKind, MacStmtStyle, Stmt,
+    StmtKind,
+    mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
+use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
 use crate::{
@@ -209,6 +212,14 @@ pub(crate) fn validate_skeleton_view(
             .iter()
             .find(|metadata| metadata.label == *label)
             .expect("metadata labels were validated above");
+        if *disposition == StatementDispositionKind::Mechanical
+            && metadata.printf_template.is_none()
+        {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!("mechanical label {label} requires trusted printf metadata"),
+            ));
+        }
         let Some(group) = canonical_statement_group(item, *label) else {
             if metadata.printf_template.is_none() {
                 continue;
@@ -280,7 +291,7 @@ pub(crate) fn validate_cross_view_topology(
     let baseline_data = collect_label_data(baseline)?;
     let applied_data = collect_label_data(applied)?;
     if baseline_data.topology != applied_data.topology
-        || baseline_data.shells != applied_data.shells
+        || skeleton_shell(baseline) != skeleton_shell(applied)
     {
         return Err(metadata_error(
             "cross_view_topology_mismatch",
@@ -313,6 +324,119 @@ pub(crate) fn validate_cross_view_topology(
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_skeleton_views(
+    baseline: &SkeletonView,
+    applied: &SkeletonView,
+) -> Result<(), PreservationError> {
+    fn parse(view: &SkeletonView) -> Result<P<Item>, PreservationError> {
+        let mut krate = utils::ast::try_parse_crate(view.skeleton.clone())
+            .map_err(|message| metadata_error("invalid_expected_skeleton", message))?;
+        if !krate.attrs.is_empty()
+            || krate.items.len() != 1
+            || !matches!(&krate.items[0].kind, ItemKind::Fn(function) if function.body.is_some())
+        {
+            return Err(metadata_error(
+                "invalid_expected_skeleton",
+                "a skeleton must contain exactly one complete function without crate attributes",
+            ));
+        }
+        Ok(krate.items.remove(0))
+    }
+
+    let baseline_item = parse(baseline)?;
+    let applied_item = parse(applied)?;
+    validate_skeleton_view(&baseline_item, baseline)?;
+    validate_skeleton_view(&applied_item, applied)?;
+    validate_cross_view_topology(&baseline_item, &applied_item)
+}
+
+fn skeleton_shell(item: &Item) -> String {
+    struct Shell;
+
+    fn erase(expression: &mut Expr) {
+        expression.kind = ExprKind::Tup(ThinVec::new());
+    }
+
+    impl Shell {
+        fn condition(&mut self, expression: &mut Expr) {
+            if let ExprKind::Let(_, value, ..) = &mut expression.kind {
+                erase(value);
+            } else {
+                erase(expression);
+            }
+        }
+    }
+
+    impl MutVisitor for Shell {
+        fn visit_ty(&mut self, _ty: &mut rustc_ast::Ty) {}
+
+        fn visit_pat(&mut self, _pattern: &mut rustc_ast::Pat) {}
+
+        fn flat_map_stmt(&mut self, mut statement: Stmt) -> SmallVec<[Stmt; 1]> {
+            if let StmtKind::MacCall(mac) = &mut statement.kind
+                && mac.style == MacStmtStyle::Braces
+            {
+                mac.mac.path = rustc_ast::Path::from_ident(rustc_span::Ident::from_str("todo"));
+                mac.mac.args.tokens = Default::default();
+                return smallvec![statement];
+            }
+            if let StmtKind::MacCall(mac) = &statement.kind {
+                let mut expression = P(utils::ast::parse_expr("()".to_owned()));
+                expression.attrs = mac.attrs.clone();
+                statement.kind = match mac.style {
+                    MacStmtStyle::Semicolon => StmtKind::Semi(expression),
+                    MacStmtStyle::NoBraces => StmtKind::Expr(expression),
+                    MacStmtStyle::Braces => unreachable!(),
+                };
+            }
+            mut_visit::walk_flat_map_stmt(self, statement)
+        }
+
+        fn visit_expr(&mut self, expression: &mut Expr) {
+            match &mut expression.kind {
+                ExprKind::If(condition, then_block, else_expression) => {
+                    self.condition(condition);
+                    self.visit_block(then_block);
+                    if let Some(else_expression) = else_expression {
+                        self.visit_expr(else_expression);
+                    }
+                }
+                ExprKind::While(condition, body, _) => {
+                    self.condition(condition);
+                    self.visit_block(body);
+                }
+                ExprKind::ForLoop { iter, body, .. } => {
+                    erase(iter);
+                    self.visit_block(body);
+                }
+                ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => self.visit_block(body),
+                ExprKind::Match(value, arms, _) => {
+                    erase(value);
+                    for arm in arms {
+                        if let Some(guard) = &mut arm.guard {
+                            erase(guard);
+                        }
+                        if let Some(body) = &mut arm.body {
+                            self.visit_expr(body);
+                        }
+                    }
+                }
+                ExprKind::Ret(value) | ExprKind::Break(_, value) => {
+                    if let Some(value) = value {
+                        self.visit_expr(value);
+                    }
+                }
+                ExprKind::Continue(_) | ExprKind::Yield(_) => {}
+                _ => erase(expression),
+            }
+        }
+    }
+
+    let mut item = item.clone();
+    Shell.visit_item(&mut item);
+    pprust::item_to_string(&item)
 }
 
 pub(crate) fn canonicalize_function_with_view(
@@ -446,7 +570,6 @@ fn collect_label_topology(item: &Item) -> Result<Vec<(u32, Option<u32>)>, Preser
 
 struct LabelData {
     topology: Vec<(u32, Option<u32>)>,
-    shells: Vec<(u32, String)>,
 }
 
 fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
@@ -468,7 +591,6 @@ fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
     let mut collector = LabelTreeCollector {
         parents: HashMap::new(),
         topology: vec![],
-        shells: vec![],
         parent: None,
         error: None,
     };
@@ -482,7 +604,6 @@ fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
         Some(error) => Err(error),
         None => Ok(LabelData {
             topology: collector.topology,
-            shells: collector.shells,
         }),
     }
 }
@@ -490,7 +611,6 @@ fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
 struct LabelTreeCollector {
     parents: HashMap<u32, Option<u32>>,
     topology: Vec<(u32, Option<u32>)>,
-    shells: Vec<(u32, String)>,
     parent: Option<u32>,
     error: Option<PreservationError>,
 }
@@ -521,23 +641,6 @@ impl LabelTreeCollector {
             return;
         }
         self.topology.push((label, self.parent));
-        let statement_kind = match &statement.kind {
-            StmtKind::Let(local) => match local.kind {
-                LocalKind::Decl => "let_declaration",
-                LocalKind::Init(_) => "let_initializer",
-                LocalKind::InitElse(..) => "let_else",
-            },
-            StmtKind::Expr(_) => "tail_expression",
-            StmtKind::Semi(_) => "semicolon_expression",
-            StmtKind::Item(_) => "item",
-            StmtKind::Empty => "empty",
-            StmtKind::MacCall(_) => "macro",
-        };
-        let control = control_root(statement, false)
-            .map(|root| format!("{:?}:{:?}", root.kind, root.role))
-            .unwrap_or_else(|| "payload".to_owned());
-        self.shells
-            .push((label, format!("{statement_kind}:{control}")));
         if non_control_payload(statement).is_some_and(contains_statement_label) {
             self.error = Some(metadata_error(
                 "invalid_expected_skeleton",
@@ -1635,6 +1738,261 @@ mod tests {
 
     fn parse_item(source: &str) -> P<Item> {
         P(utils::ast::parse_item(source.to_owned()))
+    }
+
+    fn view(source: &str) -> SkeletonView {
+        let item = parse_item(source);
+        let labels = collect_label_topology(&item).unwrap();
+        let mut transformed = HashSet::new();
+        let mut mechanical = HashSet::new();
+        let mut metadata = vec![];
+        for (label, _) in labels {
+            let group = canonical_statement_group(&item, label).unwrap();
+            let template = parse_print_macro_statement(&group[0]).ok().map(|parsed| {
+                crate::PrintfTemplateMetadata {
+                    rust_format: parsed.format,
+                    argument_count: parsed.arguments.len() as u32,
+                }
+            });
+            if template
+                .as_ref()
+                .is_some_and(|value| value.argument_count == 0)
+            {
+                mechanical.insert(label);
+            } else {
+                transformed.insert(label);
+            }
+            metadata.push(StatementPairMetadata {
+                label,
+                before_statement: pprust::stmt_to_string(&group[0]),
+                printf_template: template,
+                pointer_variables_complete: true,
+                pointer_variables: vec![],
+            });
+        }
+        SkeletonView {
+            skeleton: source.to_owned(),
+            needs_transformation: !transformed.is_empty(),
+            statement_dispositions: make_disposition_forest(
+                &item,
+                &transformed,
+                &HashSet::new(),
+                &HashSet::new(),
+                &mechanical,
+            )
+            .unwrap(),
+            statement_pair_metadata: metadata,
+        }
+    }
+
+    #[test]
+    fn rendered_views_allow_nested_conditions_characters_lifetimes_and_labeled_loops() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for source in [
+                    "unsafe fn f(d: f64) { #[proctor(0)] if if d.is_infinite() { if d.is_sign_positive() { 1 } else { -1 } } else { 0 } != 0 { #[proctor(1)] return; } #[proctor(2)] consume(); }",
+                    r#"unsafe fn f<'a, 'b>(left: &'a str, right: &'b str) { #[proctor(0)] consume('{', '}', ';', 'é', '\n', '\r', '\t', '\0', '\\', '\'', '\"', '\x7b', '\u{1F_980}', b'\xff'); }"#,
+                    "unsafe fn f() { #[proctor(0)] 'retry: loop { #[proctor(1)] break 'retry; } #[proctor(2)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] 'retry: while true { #[proctor(1)] break 'retry; }; #[proctor(2)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] 'retry: while let Some(value) = Some(1) { #[proctor(1)] break 'retry; } #[proctor(2)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] 'retry: for value in 0..1 { #[proctor(1)] break 'retry; } #[proctor(2)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] 'retry: { #[proctor(1)] break 'retry; } #[proctor(2)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] let pointer: *mut i32; #[proctor(1)] let value: i32; }",
+                    "unsafe fn f() { #[proctor(0)] crate::tokens! { #[proctor(99)] anything } #[proctor(1)] consume(); }",
+                    "unsafe fn f(input: Option<i32>) { #[proctor(0)] let Some(value) = input else { #[proctor(1)] return; }; #[proctor(2)] consume(value); }",
+                    r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); #[proctor(1)] ::std::print!("fixed"); }"#,
+                ] {
+                    let baseline = view(source);
+                    let applied = SkeletonView {
+                        skeleton: source
+                            .replace("consume", "changed")
+                            .replace("unsafe fn", "unsafe /* comment */ fn"),
+                        ..baseline.clone()
+                    };
+                    validate_skeleton_views(&baseline, &applied)
+                        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn rendered_views_reject_changed_signatures_declarations_and_control_slots() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for (source, old, new) in [
+                    (
+                        "unsafe fn f<'a, 'b>(p: &'a str) -> &'a str { #[proctor(0)] p }",
+                        "&'a str",
+                        "&'b str",
+                    ),
+                    (
+                        "unsafe fn f(p: i32) { #[proctor(0)] consume(p); }",
+                        "fn f",
+                        "fn renamed",
+                    ),
+                    (
+                        "unsafe fn f(p: [i32; 3]) { #[proctor(0)] consume(p); }",
+                        "[i32; 3]",
+                        "[i32; 4]",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] let value: i32; }",
+                        "let value",
+                        "let mut value",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] let value: [i32; 3] = todo!(); }",
+                        "[i32; 3]",
+                        "[i32; 4]",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] let value: i32; }",
+                        "let value: i32;",
+                        "let value: i32 = todo!();",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] if ready() { #[proctor(1)] consume(); } else {} }",
+                        "if ready()",
+                        "while ready()",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] if ready() { #[proctor(1)] consume(); } else {} }",
+                        "{ #[proctor(1)] consume(); } else {}",
+                        "{} else { #[proctor(1)] consume(); }",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] if ready() { #[proctor(1)] consume(); } else {} }",
+                        " else {}",
+                        "",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] if let Some(value) = input { #[proctor(1)] consume(); } }",
+                        "Some(value)",
+                        "Some(other)",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] while let Some(value) = input { #[proctor(1)] consume(); } }",
+                        "Some(value)",
+                        "Some(other)",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] for value in input { #[proctor(1)] consume(); } }",
+                        "for value",
+                        "for other",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] 'retry: loop { #[proctor(1)] break 'retry; } }",
+                        "'retry",
+                        "'other",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume(); } }",
+                        "consume();",
+                        "return;",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume(); } }",
+                        "consume();",
+                        "break;",
+                    ),
+                    ("unsafe fn f() -> i32 { #[proctor(0)] 1 }", "1 }", "1; }"),
+                    (
+                        "unsafe fn f() { #[proctor(0)] match input { Some(value) => { #[proctor(1)] consume(); }, None => {} } }",
+                        "Some(value)",
+                        "Some(other)",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] match input { Some(value) if ready() => { #[proctor(1)] consume(); }, None => {} } }",
+                        " if ready()",
+                        "",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] match input { Some(value) => { #[proctor(1)] consume(); }, None => {} } }",
+                        ", None => {}",
+                        "",
+                    ),
+                    (
+                        "unsafe fn f() { #[proctor(0)] let Some(value) = input else { #[proctor(1)] return; }; }",
+                        "input else { #[proctor(1)] return; }",
+                        "{ #[proctor(1)] input } else {}",
+                    ),
+                ] {
+                    let baseline = view(source);
+                    let applied = SkeletonView {
+                        skeleton: source.replace(old, new),
+                        ..baseline.clone()
+                    };
+                    assert!(
+                        validate_skeleton_views(&baseline, &applied).is_err(),
+                        "{source}: {old} -> {new}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn rendered_views_reject_malformed_source_labels_and_print_metadata() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let baseline =
+                    view("unsafe fn f() { #[proctor(0)] if ready() { #[proctor(1)] consume(); } }");
+                for source in [
+                    "unsafe fn f() {",
+                    "unsafe fn f() {} unsafe fn other() {}",
+                    "#![allow(unused)] unsafe fn f() { #[proctor(0)] if ready() { #[proctor(1)] consume(); } }",
+                    "unsafe fn f() { #[proctor(0)] if ready() { consume(); } }",
+                    "unsafe fn f() { #[proctor(0)] if ready() {} #[proctor(1)] consume(); }",
+                    "unsafe fn f() { #[proctor(0)] if ready() { #[proctor(0)] consume(); } }",
+                ] {
+                    let applied = SkeletonView {
+                        skeleton: source.to_owned(),
+                        ..baseline.clone()
+                    };
+                    assert!(
+                        validate_skeleton_views(&baseline, &applied).is_err(),
+                        "{source}"
+                    );
+                }
+                let baseline =
+                    view(r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#);
+                for mutation in ["format", "count", "missing", "payload", "ordinary_marker"] {
+                    let mut changed = baseline.clone();
+                    match mutation {
+                        "format" => {
+                            changed.statement_pair_metadata[0]
+                                .printf_template
+                                .as_mut()
+                                .unwrap()
+                                .rust_format = "{:x}".to_owned()
+                        }
+                        "count" => {
+                            changed.statement_pair_metadata[0]
+                                .printf_template
+                                .as_mut()
+                                .unwrap()
+                                .argument_count = 2
+                        }
+                        "missing" => changed.statement_pair_metadata[0].printf_template = None,
+                        "payload" => {
+                            changed.skeleton = changed.skeleton.replace("todo!()", "value")
+                        }
+                        "ordinary_marker" => {
+                            changed.skeleton = changed.skeleton.replace("::std::print!", "ordinary")
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        validate_skeleton_views(&baseline, &changed).is_err(),
+                        "{mutation}"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
