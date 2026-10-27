@@ -1299,7 +1299,7 @@ impl MutVisitor for Labeler<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        // A closure body belongs to its enclosing payload, not its statement-label tree.
+        // Opaque expression bodies belong to their enclosing payload's label.
         if self.opaque_expressions.contains(&expr.id) || matches!(expr.kind, ExprKind::Closure(..))
         {
             return;
@@ -4481,84 +4481,73 @@ fn raw_decision_matches_inferred_type(kind: PtrKind, ty: ty::Ty<'_>) -> bool {
     target_mutability == source_mutability.is_mut()
 }
 
-fn contains_control_expression(expr: &Expr) -> bool {
-    struct Finder {
-        found: bool,
+pub(crate) fn is_opaque_value_expression(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::If(..) => {}
+        ExprKind::Block(block, _) if matches!(block.rules, rustc_ast::BlockCheckMode::Default) => {}
+        _ => return false,
     }
 
-    impl<'ast> visit::Visitor<'ast> for Finder {
+    struct EscapeFinder {
+        targets: Vec<(Option<Symbol>, bool)>,
+        escaping: bool,
+    }
+
+    impl<'ast> visit::Visitor<'ast> for EscapeFinder {
         fn visit_expr(&mut self, expr: &'ast Expr) {
-            if matches!(expr.kind, ExprKind::Closure(..)) {
+            if self.escaping || matches!(expr.kind, ExprKind::Closure(..)) {
                 return;
             }
-            if is_preserved_expression(expr) {
-                self.found = true;
+            match &expr.kind {
+                ExprKind::Ret(_) => self.escaping = true,
+                ExprKind::Break(label, _) | ExprKind::Continue(label) => {
+                    let needs_loop = matches!(expr.kind, ExprKind::Continue(_));
+                    self.escaping = if let Some(label) = label {
+                        !self
+                            .targets
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| *name == Some(label.ident.name))
+                            .is_some_and(|(_, is_loop)| !needs_loop || *is_loop)
+                    } else {
+                        !self.targets.iter().any(|(_, is_loop)| *is_loop)
+                    };
+                }
+                _ => {}
+            }
+            if self.escaping {
                 return;
+            }
+            let target = match &expr.kind {
+                ExprKind::While(_, _, label)
+                | ExprKind::ForLoop { label, .. }
+                | ExprKind::Loop(_, label, _) => {
+                    Some((label.as_ref().map(|label| label.ident.name), true))
+                }
+                ExprKind::Block(_, Some(label)) => Some((Some(label.ident.name), false)),
+                _ => None,
+            };
+            if let Some(target) = target {
+                self.targets.push(target);
             }
             visit::walk_expr(self, expr);
-        }
-    }
-
-    let mut finder = Finder { found: false };
-    finder.visit_expr(expr);
-    finder.found
-}
-
-fn contains_let_expression(expr: &Expr) -> bool {
-    struct Finder {
-        found: bool,
-    }
-
-    impl<'ast> visit::Visitor<'ast> for Finder {
-        fn visit_expr(&mut self, expr: &'ast Expr) {
-            if matches!(expr.kind, ExprKind::Closure(..)) {
-                return;
+            if target.is_some() {
+                self.targets.pop();
             }
-            if matches!(expr.kind, ExprKind::Let(..)) {
-                self.found = true;
-                return;
-            }
-            visit::walk_expr(self, expr);
         }
     }
 
-    let mut finder = Finder { found: false };
+    let mut finder = EscapeFinder {
+        targets: vec![],
+        escaping: false,
+    };
     finder.visit_expr(expr);
-    finder.found
+    !finder.escaping
 }
 
-pub(crate) fn is_restricted_conditional(expr: &Expr) -> bool {
-    let ExprKind::If(condition, then_block, Some(else_expr)) = &expr.kind else {
-        return false;
-    };
-    if contains_let_expression(condition) || contains_control_expression(condition) {
-        return false;
-    }
-    restricted_branch(then_block)
-        && match &else_expr.kind {
-            ExprKind::If(..) => is_restricted_conditional(else_expr),
-            ExprKind::Block(block, _) => restricted_branch(block),
-            _ => false,
-        }
-}
-
-fn restricted_branch(block: &rustc_ast::Block) -> bool {
-    let [statement] = &block.stmts[..] else {
-        return false;
-    };
-    let StmtKind::Expr(tail) = &statement.kind else {
-        return false;
-    };
-    if is_preserved_expression(tail) {
-        is_restricted_conditional(tail)
-    } else {
-        !contains_control_expression(tail)
-    }
-}
-
-fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) -> bool {
+fn inspect_nested_control(expr: &Expr, mut on_opaque: impl FnMut(NodeId)) -> bool {
     struct Finder<'a, F> {
-        on_restricted: &'a mut F,
+        on_opaque: &'a mut F,
         invalid: bool,
     }
 
@@ -4568,8 +4557,8 @@ fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) ->
                 return;
             }
             if is_preserved_expression(expr) {
-                if is_restricted_conditional(expr) {
-                    (self.on_restricted)(expr.id);
+                if is_opaque_value_expression(expr) {
+                    (self.on_opaque)(expr.id);
                 } else {
                     self.invalid = true;
                 }
@@ -4580,21 +4569,21 @@ fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) ->
     }
 
     let mut finder = Finder {
-        on_restricted: &mut on_restricted,
+        on_opaque: &mut on_opaque,
         invalid: false,
     };
     finder.visit_expr(expr);
     finder.invalid
 }
 
-struct OpaqueNestedIfCollector<'a> {
+struct OpaqueNestedExpressionCollector<'a> {
     function_path: &'a str,
     opaque_payloads: &'a FxHashSet<NodeId>,
-    opaque_nested_ifs: FxHashSet<NodeId>,
+    opaque_expressions: FxHashSet<NodeId>,
     error: Option<GenerationError>,
 }
 
-impl OpaqueNestedIfCollector<'_> {
+impl OpaqueNestedExpressionCollector<'_> {
     fn inspect_block(&mut self, block: &rustc_ast::Block) {
         for statement in &block.stmts {
             self.inspect_statement(statement);
@@ -4648,7 +4637,7 @@ impl OpaqueNestedIfCollector<'_> {
             return;
         }
         if inspect_nested_control(expr, |id| {
-            self.opaque_nested_ifs.insert(id);
+            self.opaque_expressions.insert(id);
         }) {
             self.error.get_or_insert_with(|| GenerationError {
                 kind: GenerationErrorKind::NestedControlPayload,
@@ -4697,34 +4686,34 @@ pub(crate) fn collect_opaque_expressions(
     tcx: TyCtxt<'_>,
 ) -> Result<FxHashSet<NodeId>, GenerationError> {
     let mut opaque = supported_printf_expression_ids(item, ast_to_hir, tcx);
-    let nested_ifs = collect_opaque_nested_ifs_with_skips(item, path, &opaque)?;
-    opaque.extend(nested_ifs);
+    let nested = collect_opaque_nested_expressions_with_skips(item, path, &opaque)?;
+    opaque.extend(nested);
     Ok(opaque)
 }
 
-pub(crate) fn collect_opaque_nested_ifs(
+pub(crate) fn collect_opaque_nested_expressions(
     item: &Item,
     path: &str,
 ) -> Result<FxHashSet<NodeId>, GenerationError> {
-    collect_opaque_nested_ifs_with_skips(item, path, &FxHashSet::default())
+    collect_opaque_nested_expressions_with_skips(item, path, &FxHashSet::default())
 }
 
-fn collect_opaque_nested_ifs_with_skips(
+fn collect_opaque_nested_expressions_with_skips(
     item: &Item,
     path: &str,
     opaque_payloads: &FxHashSet<NodeId>,
 ) -> Result<FxHashSet<NodeId>, GenerationError> {
-    let mut collector = OpaqueNestedIfCollector {
+    let mut collector = OpaqueNestedExpressionCollector {
         function_path: path,
         opaque_payloads,
-        opaque_nested_ifs: FxHashSet::default(),
+        opaque_expressions: FxHashSet::default(),
         error: None,
     };
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     collector.inspect_block(function.body.as_ref().unwrap());
     match collector.error {
         Some(error) => Err(error),
-        None => Ok(collector.opaque_nested_ifs),
+        None => Ok(collector.opaque_expressions),
     }
 }
 
