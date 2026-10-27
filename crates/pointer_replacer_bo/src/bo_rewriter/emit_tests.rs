@@ -4735,6 +4735,10 @@ mod coconv_witnesses {
         // and `via::x` — whose own argument is unobjectionable — is blocked
         // with it.
         //
+        // Restated for relay main/371 step 3: an identity cast is now the
+        // argument itself (the strip), so the blocker is a cast through another
+        // pointee, which the strip refuses.
+        //
         // Migrated under R217-2(a) by wave-6o (relay 009): the null literal
         // that used to play the blocker now makes the parameter OPTIONAL (a
         // caller's null literal is the parameter's construction-site null), so
@@ -4746,7 +4750,7 @@ mod coconv_witnesses {
         let rows = census(&format!(
             "{PRE}pub unsafe fn t(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn via(x: *mut i32) {{ t(x); }}\n\
-             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; t((&mut y) as *mut i32); }}\n"
+             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; t((&mut y) as *mut i32 as *mut u32 as *mut i32); }}\n"
         ));
         let p = row(&rows, "t", 1);
         let x = row(&rows, "via", 1);
@@ -4785,11 +4789,12 @@ mod coconv_witnesses {
     fn d4_w1_production_keeps_clean_sibling_safe() {
         // Migrated under R217-2(a) by wave-6o (relay 009): the null-literal
         // caller no longer blocks `target::p` (it makes it optional), so the
-        // blocked member is the cast-of-address caller.
+        // blocked member is the cast-of-address caller. Restated for relay
+        // main/371 step 3: through another pointee, which the strip refuses.
         let source = format!(
             "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn via(x: *mut i32) {{ target(x); }}\n\
-             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; target((&mut y) as *mut i32); }}\n"
+             pub unsafe fn casts() {{ let mut y: i32 = 0; let _ = &mut y; target((&mut y) as *mut i32 as *mut u32 as *mut i32); }}\n"
         );
         let super::super::RewriteOutcome::Emitted { source, .. } =
             super::super::rewrite_m1(&source)
@@ -4869,7 +4874,13 @@ mod coconv_witnesses {
             "-",
             "a null-literal argument makes the parameter optional; it is not a block"
         );
-        assert_eq!(case("(&mut x) as *mut i32"), "arg-cast-form-unbuilt");
+        // Relay main/371 step 3: an identity cast is the argument itself (the
+        // strip); a cast through another pointee keeps the cast form's block.
+        assert_eq!(case("(&mut x) as *mut i32"), "-");
+        assert_eq!(
+            case("(&mut x) as *mut i32 as *mut u32 as *mut i32"),
+            "arg-cast-form-unbuilt"
+        );
         assert_eq!(
             case("1usize as *mut i32"),
             "-",

@@ -8,8 +8,13 @@
 //!
 //! Refused here, and so still held by the cast form: a retyping cast (the pointee changes: A4's
 //! one-type `void *` view, or a byte view); a depth-2 cast (`*mut *mut T`, the out-parameter form);
-//! and `*const T as *mut T` into a formal its callee writes. The prefix / layout rule (a different
-//! `repr(C)` type with the same leading fields) is not built: 0 of the 224 A2 rows needed it.
+//! and every `*const T as *mut T`. Relay 371 refuses the strengthening cast into a formal its callee
+//! writes; into one it only reads, admitting it moves the two end-to-end witnesses of the raw
+//! boundary's shared-to-mut bridge (`slu_w1_shared_to_mut_view_requires_negative_write_evidence`,
+//! `opt_w1_shared_to_mut_outbound_view_keeps_its_negative_write_evidence`: their read-only formal
+//! would convert), so that case is held here too and named in main 255c. The prefix / layout rule
+//! (a different `repr(C)` type with the same leading fields) is not built: 0 of the 224 A2 rows
+//! needed it.
 
 use rustc_hir::{Expr, ExprKind, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind};
@@ -17,7 +22,7 @@ use rustc_middle::ty::{TyCtxt, TyKind};
 /// The fact, read where the argument is collected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IdentityCast {
-    /// `*const T as *mut T` (or `&e as *mut T`): admitted only into a formal its callee never writes.
+    /// `*const T as *mut T` (or `&e as *mut T`): refused.
     pub(crate) strengthens: bool,
     /// The operand's type and the cast's, as rendered, for the receipt.
     pub(crate) from: String,
@@ -66,10 +71,9 @@ pub(crate) fn of<'tcx>(
     })
 }
 
-/// The gate's rule: an identity cast is the argument itself, except a strengthening one into a
-/// written formal.
-pub(crate) fn admitted(cast: &IdentityCast, formal_written: bool) -> bool {
-    !cast.strengthens || !formal_written
+/// The gate's rule: an identity cast is the argument itself, except a strengthening one.
+pub(crate) fn admitted(cast: &IdentityCast) -> bool {
+    !cast.strengthens
 }
 
 /// **The strip's receipt** (relay 371 step 3): one row per identity-cast argument whose callee
@@ -108,7 +112,9 @@ pub(crate) fn receipts_tsv(
     for (callee, sites) in &facts.call_args {
         for site in sites {
             for arg in &site.args {
-                let Some(cast) = &arg.identity_cast else { continue };
+                let Some(cast) = arg.identity_cast.as_ref().filter(|cast| admitted(cast)) else {
+                    continue;
+                };
                 let Some((_, formal_decision)) = formal(*callee, arg.index) else {
                     continue;
                 };

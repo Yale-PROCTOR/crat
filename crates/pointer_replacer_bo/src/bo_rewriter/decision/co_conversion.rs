@@ -1427,14 +1427,11 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
                     .filter(|key| decision_of.contains_key(key));
                 let caller_node = caller_subject.filter(|k| converts.contains(k));
                 // Relay 371 step 3: an identity cast is the argument itself (a
-                // strengthening one only into a formal its callee never writes).
-                let identity_strip = arg.identity_cast.as_ref().is_some_and(|cast| {
-                    super::identity_cast::admitted(
-                        cast,
-                        callee_subject
-                            .is_none_or(|key| param_written.get(&key).copied().unwrap_or(true)),
-                    )
-                });
+                // strengthening one stays the cast form's).
+                let identity_strip = arg
+                    .identity_cast
+                    .as_ref()
+                    .is_some_and(super::identity_cast::admitted);
                 if !via_borrow
                     && let (Some(source), Some(target)) = (caller_subject, callee_subject)
                 {

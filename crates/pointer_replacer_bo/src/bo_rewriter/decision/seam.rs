@@ -5872,7 +5872,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                             ..
                         }
                     ),
-                    identity_strip: arg.identity_cast.is_some(),
+                    identity_strip: arg
+                        .identity_cast
+                        .as_ref()
+                        .is_some_and(super::identity_cast::admitted),
                 });
             }
 
@@ -6755,7 +6758,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                 );
                 // Relay 371 step 3: where the forms agree (`&mut T` into `&mut T`),
                 // the identity cast is stripped — the edit is the operand alone.
+                // Only between two safe forms: a raw formal's argument is the
+                // raw-boundary arm's, whose bridge renders the operand itself.
                 if pos.identity_strip
+                    && pos.expected != Form::Raw
+                    && pos.found != Form::Raw
                     && let Some(current @ Ok(None)) = candidates.last_mut()
                 {
                     let mutable = matches!(
