@@ -1705,6 +1705,110 @@ impl Drop for RestoreHoldRelease {
     }
 }
 
+/// The op of [`one_element_holds`]' receipt (R1313-3).
+pub(crate) const ONE_ELEMENT_HOLD_OP: &str = "one-element-into-slice-formal";
+
+/// **R1313-3 (relay main/371 step B; main 254 §7 B2) — a one-element view never
+/// reaches a slice-decided formal.** R761-1 cut the seam's `(Slice, Ref)`
+/// refusal to element addresses and left shape (i), a thin subject handed bare
+/// or through a cast, "until 55's thin-into-fat rule delivers it as a slice".
+/// Where the rule does not (no `Arr` licence, a withdrawn slice stage, an entry
+/// it stands aside at), the thin form renders `core::slice::from_ref` /
+/// `from_mut` into a formal its callee accesses past one element: a panic on a
+/// UB-free input (`underhanded_c_nuke_lib`'s `spectral_contrast`, main 250).
+/// The subject is held raw here, on the settled table: its caller's pointer,
+/// which carries the caller's whole extent, then reaches the slice formal
+/// through the seam's `(Slice, Raw)` C arm with the evidence-backed or §77
+/// extent. Never the fallback view over the one-element reference: a
+/// FALLBACK-length slice built from a pointer derived from a one-element
+/// reference re-widens that reference (g25's class; §77 waives a length over a
+/// real allocation, not that).
+fn one_element_holds(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+    wide: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+) -> Vec<(usize, DegradeReason)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (subject, decision))| {
+            if !matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) {
+                return None;
+            }
+            // The lowest `(callee, index)` the subject is handed to bare or
+            // through a cast, whose formal settled a slice and is accessed past
+            // one element: a stable receipt.
+            let (callee, index, formal) = ctx
+                .facts
+                .call_args
+                .iter()
+                .flat_map(|(&callee, calls)| {
+                    calls
+                        .iter()
+                        .filter(|call| call.caller == subject.fn_did)
+                        .flat_map(|call| &call.args)
+                        .filter(|arg| match arg.shape {
+                            emitability::ArgShape::BareLocal(binding)
+                            | emitability::ArgShape::CastOfLocal { binding, .. } => {
+                                binding == subject.hir_id
+                            }
+                            _ => false,
+                        })
+                        .map(move |arg| (callee, arg.index))
+                })
+                .filter(|(callee, index)| wide.contains(&(*callee, *index)))
+                .filter_map(|(callee, index)| {
+                    entries
+                        .iter()
+                        .find(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                        .map(|(formal, _)| (callee, index, formal))
+                })
+                .min_by_key(|(callee, index, _)| (callee.local_def_index.as_u32(), *index))?;
+            let parameter_index = match formal.kind {
+                SubjectKind::Param { hir_index } => hir_index,
+                SubjectKind::Local => index,
+            };
+            Some((
+                at,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(local_callee_extent::LocalCalleeAccess {
+                        callee_id: callee,
+                        parameter_index,
+                        callee: ctx.tcx.def_path_str(callee.to_def_id()),
+                        parameter: formal
+                            .param_name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_owned()),
+                        access: if subject.mutable { "write" } else { "read" },
+                        reason: local_callee_extent::AccessReason::PointerArithmetic {
+                            op: ONE_ELEMENT_HOLD_OP.to_owned(),
+                        },
+                        footprint_bytes: None,
+                    }),
+                    count: None,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Emission-only fallback requests. The accepted model and its facts remain
 /// unchanged; every dependent form is decided again with these subjects raw.
 pub(crate) fn decide_with_raw_fallbacks(
@@ -1786,6 +1890,19 @@ pub(crate) fn decide_with_raw_fallbacks(
         }
     }
     for (at, reason) in evidence_decline_holds(ctx, &entries) {
+        let (subject, decision) = &mut entries[at];
+        if !fallbacks.contains_key(&(subject.fn_did, subject.hir_id)) {
+            *decision = degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                reason,
+            );
+        }
+    }
+    // R1313-3 (relay main/371 step B): B2's hold, after the settled table's every
+    // promotion (the formal's final form).
+    let wide = local_callee_extent::accessed_past_one_element(ctx.tcx, subjects, ctx.facts);
+    for (at, reason) in one_element_holds(ctx, &entries, &wide) {
         let (subject, decision) = &mut entries[at];
         if !fallbacks.contains_key(&(subject.fn_did, subject.hir_id)) {
             *decision = degrade(

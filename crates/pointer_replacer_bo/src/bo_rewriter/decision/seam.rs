@@ -4305,9 +4305,25 @@ pub(crate) fn optional_into_raw_formal_for_tests(
 /// 54, so shape (i) keeps its `from_ref` until 55's thin-into-fat rule delivers it
 /// as a slice. Refusing an element address of a raw base (shape (ii),
 /// `from_ref(&*p.offset(k))`) needs no hold: no delivered reference is left behind.
-fn one_element_into_wide(wide: bool, source_shape: &str, element_address: bool) -> bool {
+///
+/// **R1313-3 (relay main/371 step B) amends R761-1's cut:** shape (i), a bare or
+/// cast thin subject, is refused too. The decision layer holds such a subject
+/// first (`decision::one_element_holds`, op `one-element-into-slice-formal`),
+/// so its caller's raw pointer reaches the slice formal through the C arm; this
+/// row is the backstop, and no delivered thin reference is left behind.
+fn one_element_into_wide(
+    wide: bool,
+    source_shape: &str,
+    element_address: bool,
+    expected: Form,
+) -> bool {
     wide && match source_shape {
         "addr-of" | "addr-of-mut" | "addr-of-cast" | "addr-of-mut-cast" => element_address,
+        // R1313-3: a formal decided a slice only; a cursor formal's caller is
+        // the cursor family's own adaptation.
+        "bare-local" | "cast-of-local" => {
+            matches!(expected, Form::Slice { .. } | Form::Opt { slice: true, .. })
+        }
         _ => false,
     }
 }
@@ -6546,6 +6562,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     table.wide_access_parameters.contains(&(*callee, pos.index)),
                     pos.source_shape,
                     element_address,
+                    pos.expected,
                 ) && !cursor_element
                     && matches!(pos.expected, Form::Slice { .. }))
                 .then(|| {
@@ -6584,6 +6601,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         table.wide_access_parameters.contains(&(*callee, pos.index)),
                         pos.source_shape,
                         element_address,
+                        pos.expected,
                     );
                 let owner_view = pos
                     .root
@@ -6698,6 +6716,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 table.wide_access_parameters.contains(&(*callee, pos.index)),
                                 pos.source_shape,
                                 element_address,
+                                pos.expected,
                             ) && !cursor_element,
                             return_tied,
                             counted,
@@ -6830,6 +6849,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 table.wide_access_parameters.contains(&(*callee, pos.index)),
                                 pos.source_shape,
                                 element_address,
+                                pos.expected,
                             ) && !cursor_element,
                             return_tied,
                             counted,
