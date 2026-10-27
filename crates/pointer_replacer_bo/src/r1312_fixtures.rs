@@ -576,6 +576,32 @@ fn r1312_w_a1_byte_offset_formal_is_a_slice() {
     );
 }
 
+/// A1 (byte view), the dependency: a crate whose emitted tree names `bytemuck` declares it in its
+/// `Cargo.toml`, as the lab's passes do (`deps_crate`'s 1.24.0); a crate whose tree does not is left
+/// as it was.
+#[test]
+fn r1312_w_a1_the_byte_view_declares_bytemuck() {
+    let manifest = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\nlibc = \"0.2\"\n";
+    let crate_of = |tag: &str, source: &str| {
+        let root = std::env::temp_dir().join(format!("crat-r1312-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        crate::bo_pipeline::rewrite_bo_with_artifacts(&root.join("src/lib.rs"), [], None).unwrap();
+        let emitted = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let declared = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        (emitted, declared)
+    };
+    let (emitted, declared) = crate_of("w-a1-dep", &setters("leaf_addr"));
+    assert!(emitted.contains("bytemuck::cast_slice_mut"), "{emitted}");
+    assert!(declared.contains("bytemuck = \"1.24.0\""), "{declared}");
+    let (emitted, declared) = crate_of("w-a1-nodep", &format!("{PRE}{BC5}"));
+    assert!(!emitted.contains("bytemuck::"), "{emitted}");
+    assert_eq!(declared, manifest);
+}
+
 /// A1 (byte view), the other side of the rule: a constant byte range inside `size_of::<T>()` is not
 /// arithmetic past the referent, so P01's `SPX_set_layer_addr` (byte 3 of a `u32`) keeps its thin form.
 #[test]
