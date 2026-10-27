@@ -40,7 +40,7 @@ use crate::{
         local_c_foreign_function_symbol, printf_rule_argument, select_rule_regions,
         semantic_type_tree,
     },
-    preservation::{make_disposition_forest, validate_cross_view_topology},
+    preservation::{make_disposition_forest, validate_skeleton_views},
     printf::{eligible_printf_statement, supported_printf_call},
     validator::validate_rule_application_shape,
 };
@@ -541,13 +541,6 @@ fn make_function_record<'tcx>(
             ),
         });
     }
-    validate_cross_view_topology(&baseline_skeleton, &applied_skeleton).map_err(|error| {
-        GenerationError {
-            kind: GenerationErrorKind::AstHirMismatch,
-            function_path: surface.path.clone(),
-            message: error.message,
-        }
-    })?;
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&baseline_skeleton);
     let baseline_reportable = statements_requiring_transformation
@@ -647,6 +640,11 @@ fn make_function_record<'tcx>(
         statement_dispositions: applied_dispositions,
         statement_pair_metadata: applied_statement_pair_metadata,
     };
+    validate_skeleton_views(&baseline, &applied).map_err(|error| GenerationError {
+        kind: GenerationErrorKind::AstHirMismatch,
+        function_path: surface.path.clone(),
+        message: error.message,
+    })?;
     let name = surface.item.kind.ident().unwrap().to_string();
     Ok(ItemRecord::Function(Box::new(FunctionRecord {
         id: surface.id,
