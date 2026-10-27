@@ -64,6 +64,8 @@ mod box_census_schema;
 #[cfg(test)]
 mod r1312_fixtures;
 #[cfg(test)]
+mod r1314_p12_tests;
+#[cfg(test)]
 mod recon_fixtures;
 #[cfg(test)]
 mod tests;
