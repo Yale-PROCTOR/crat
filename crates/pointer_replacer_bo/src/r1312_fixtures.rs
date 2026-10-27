@@ -509,7 +509,6 @@ fn r1312_probe_all() {
 
 /// A1 (cast strip): the leaf caller's identity cast no longer holds the setter's formal.
 #[test]
-#[ignore = "relay 371 step 3 (the strip): RED until that step"]
 fn r1312_w_a1_identity_cast_does_not_hold_the_formal() {
     let (emitted, subjects, _) = run("w-a1", &setters("leaf_addr as *mut uint32_t"));
     let r = rows(&subjects);
@@ -636,14 +635,89 @@ pub unsafe extern \"C\" fn SPX_set_chain_addr(",
     );
 }
 
-/// A2: a typedef-identity cast of a converting binding into a converting formal is stripped.
+/// A2: a typedef-identity cast of a converting binding into a converting formal is stripped. Relay 371
+/// step 3: both ends of `blake256_init(ctx as *mut blakestate256)` (`kat_tr_ctx = blakestate256`)
+/// deliver thin, the cast stripped; `SPX_gen_message_random::R` (a slice binding into a slice formal) is
+/// A4's strip on a slice, step 5.
 #[test]
-#[ignore = "relay 371 step 3 (the strip): RED until that step"]
 fn r1312_w_a2_typedef_identity_cast_is_stripped() {
-    let (_, subjects, _) = run("w-a2", &format!("{PRE}{A2}"));
+    let (emitted, subjects, _) = run("w-a2", &format!("{PRE}{A2}"));
     let r = rows(&subjects);
     for label in ["kat_tr_init::ctx", "SPX_gen_message_random::R"] {
         assert_ne!(r[label][1], "cast-of-converting-local", "{label}: {r:#?}");
+    }
+    for label in ["kat_tr_init::ctx", "blake256_init::S"] {
+        assert_eq!(r[label][0], "ref", "{label}: {r:#?}");
+        assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
+    }
+    let text = flat(&emitted);
+    assert!(!text.contains("ctx as *mut blakestate256"), "{emitted}");
+    assert!(text.contains("blake256_init(ctx)"), "{emitted}");
+}
+
+/// Relay 371 step 3 (A1 (a)): the identity strip on thin formals, beside A2's typedef twin: a converting
+/// binding cast to its own type into a converting formal (the cast stripped, one class); and the
+/// refusals — a retyping cast, a depth-2 cast and `*const T as *mut T` into a written formal keep the
+/// cast form held. (The raw-binding twin is `a1-setters-cast`, a slice formal since step 2.)
+const STRIP: &str = "pub type uint32_t = core::ffi::c_uint;
+extern \"C\" {
+    fn get_word() -> *mut uint32_t;
+    fn get_const() -> *const uint32_t;
+    fn get_table() -> *mut *mut uint32_t;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn set_word(mut w: *mut uint32_t, mut v: uint32_t) {
+    *w = v;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn converting_twin(mut v: uint32_t) {
+    let mut p: *mut uint32_t = get_word();
+    set_word(p as *mut uint32_t, v);
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn set_byte(mut b: *mut core::ffi::c_uchar) {
+    *b = 1 as core::ffi::c_int as core::ffi::c_uchar;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn retype(mut x: uint32_t) -> uint32_t {
+    let mut q: *mut uint32_t = &mut x;
+    set_byte(q as *mut core::ffi::c_uchar);
+    return x;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn set_first(mut pp: *mut *mut uint32_t) {
+    *pp = 0 as *mut uint32_t;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn depth_two() {
+    let mut t: *mut *mut uint32_t = get_table();
+    set_first(t as *mut *mut uint32_t);
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn store_word(mut s: *mut uint32_t, mut v: uint32_t) {
+    *s = v;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn strengthen(mut v: uint32_t) {
+    let mut c: *const uint32_t = get_const();
+    store_word(c as *mut uint32_t, v);
+}
+";
+
+#[test]
+fn r1312_w_a1_strip_thin_twin_and_refusals() {
+    let (emitted, subjects, _) = run("w-a1-strip", &format!("{PRE}{STRIP}"));
+    let r = rows(&subjects);
+    let text = flat(&emitted);
+    // The converting twin: both ends deliver thin, the cast stripped.
+    for label in ["converting_twin::p", "set_word::w"] {
+        assert_eq!(r[label][0], "ref", "{label}: {r:#?}");
+        assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
+    }
+    assert!(!text.contains("p as *mut uint32_t"), "{emitted}");
+    // The refusals keep the cast form held.
+    for label in ["set_byte::b", "set_first::pp", "store_word::s"] {
+        assert_eq!(r[label][1], "arg-cast-form-unbuilt", "{label}: {r:#?}");
     }
 }
 
