@@ -3159,12 +3159,20 @@ fn collect_slice_uses_with_family(
                 // wave-6s: a computed sub-view that is itself a boundary
                 // argument keeps the boundary's own disposition; only the
                 // rendering changes, to the suffix view of the delivered base.
+                // Relay 371 step 4 (A3): a delta is forward when its spelling is
+                // (wave-6s's rule) or when the subject's own sign verdict is
+                // non-negative (`advance_ok` carries it): C's `x.offset(i as isize)`
+                // over a signed counter the analysis proves never negative.
                 if self.expanded
-                    && let Some((site, view)) = super::slice_forms::computed_argument_view(
+                    && let Some((site, view)) = super::slice_forms::computed_argument_view_with(
                         self.tcx,
                         expr,
                         key,
                         self.raw_boundary_arguments,
+                        |delta| {
+                            super::slice_forms::forward_delta(self.tcx, delta)
+                                || self.advance_ok.contains(&key)
+                        },
                     )
                 {
                     let entry = self.out.entry(key).or_default();
@@ -3688,11 +3696,26 @@ fn collect_slice_uses_with_family(
             // witnessed against the scope — positive controls for both
             // authorised positions, a negative control for each known
             // neighbour (borrow-of-deref, rebind, self-advance).
-            if matches!(
-                self.tcx.parent_hir_node(deref.hir_id),
-                rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
-            ) {
-                return None;
+            if let rustc_hir::Node::Expr(borrow) = self.tcx.parent_hir_node(deref.hir_id)
+                && let ExprKind::AddrOf(_, mutability, _) = borrow.kind
+            {
+                // Relay 371 step 4 (A3): a borrow that is dereferenced at once,
+                // `*(&mut *p.offset(e))`, names the element place itself, `p[e]`.
+                // Any other borrow of the element stays refused.
+                let rustc_hir::Node::Expr(place) = self.tcx.parent_hir_node(borrow.hir_id) else {
+                    return None;
+                };
+                if !matches!(place.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                    || (mutability == Mutability::Mut && !self.mutable_of.contains(&key))
+                {
+                    return None;
+                }
+                let index = self.index_text(arg)?;
+                return Some(Some(UseEdit {
+                    span: place.span,
+                    replacement: format!("{name}[{index}]"),
+                    bridge_kind: "subject-use",
+                }));
             }
             let index = self.index_text(arg)?;
             Some(Some(UseEdit {
