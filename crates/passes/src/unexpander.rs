@@ -10,7 +10,11 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    self as hir, QPath, def::Res, def_id::LocalDefId, intravisit, intravisit::Visitor as _,
+    self as hir, QPath,
+    def::Res,
+    def_id::{DefId, LocalDefId},
+    intravisit,
+    intravisit::Visitor as _,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{DUMMY_SP, Symbol, kw, sym};
@@ -242,16 +246,20 @@ impl MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        if let Some(mut panic) = self.unexpanded_panic(expr) {
+            panic.attrs = expr.attrs.clone();
+            panic.span = expr.span;
+            *expr = panic;
+            return;
+        }
         if let ExprKind::Call(callee, args) = &expr.kind
             && let ExprKind::Path(None, callee) = &callee.kind
             && let [.., md, func] = &callee.segments[..]
         {
             let md = md.ident.name;
             let func = func.ident.name;
-            if md == sym::panicking {
-                if func.as_str() == "panic_explicit" || func.as_str() == "panic_fmt" {
-                    *expr = expr!("panic!()");
-                } else if func == sym::panic
+            if md == sym::panicking && self.core_panicking_call(expr).is_some() {
+                if func == sym::panic
                     && let [arg] = &args[..]
                 {
                     if let ExprKind::Lit(lit) = &arg.kind
@@ -339,6 +347,133 @@ impl MutVisitor for AstVisitor<'_> {
         }
         mut_visit::walk_expr(self, expr);
     }
+}
+
+impl AstVisitor<'_> {
+    fn resolved_call<'a>(&self, expression: &'a Expr) -> Option<(DefId, &'a [P<Expr>])> {
+        let ExprKind::Call(callee, arguments) = &unwrap_paren(expression).kind else {
+            return None;
+        };
+        let ExprKind::Path(None, path) = &callee.kind else { return None };
+        let Res::Def(_, def_id) = self.ast_to_hir.path_span_to_res.get(&path.span)? else {
+            return None;
+        };
+        Some((*def_id, arguments))
+    }
+
+    fn core_panicking_call<'a>(&self, expression: &'a Expr) -> Option<(Symbol, &'a [P<Expr>])> {
+        let (def_id, arguments) = self.resolved_call(expression)?;
+        if def_id.is_local() || self.tcx.def_path_str(self.tcx.parent(def_id)) != "core::panicking"
+        {
+            return None;
+        }
+        Some((self.tcx.item_name(def_id), arguments))
+    }
+
+    fn unexpanded_panic(&mut self, expression: &Expr) -> Option<Expr> {
+        if let ExprKind::Block(block, None) = &expression.kind
+            && matches!(block.rules, BlockCheckMode::Default)
+        {
+            match block.stmts.as_slice() {
+                [statement] => {
+                    if let StmtKind::Expr(inner) | StmtKind::Semi(inner) = &statement.kind
+                        && inner.attrs.is_empty()
+                        && self.core_panicking_call(inner).is_some()
+                    {
+                        return self.unexpanded_panic(inner);
+                    }
+                }
+                [declaration, invocation] => {
+                    let StmtKind::Item(item) = &declaration.kind else { return None };
+                    let ItemKind::Fn(function) = &item.kind else { return None };
+                    let StmtKind::Semi(call) = &invocation.kind else { return None };
+                    let (callee, arguments) = self.resolved_call(call)?;
+                    if Some(callee.as_local()?) != self.ast_to_hir.global_map.get(&item.id).copied()
+                        || !call.attrs.is_empty()
+                    {
+                        return None;
+                    }
+                    let body = function.body.as_ref()?;
+                    if !matches!(body.rules, BlockCheckMode::Default) {
+                        return None;
+                    }
+                    let [body] = body.stmts.as_slice() else { return None };
+                    let StmtKind::Expr(body) = &body.kind else { return None };
+                    if !body.attrs.is_empty() {
+                        return None;
+                    }
+                    let (name, body_arguments) = self.core_panicking_call(body)?;
+                    if name.as_str() == "panic_explicit"
+                        && panic_helper_has_signature(
+                            item,
+                            item!(
+                                "#[cold] #[track_caller] #[inline(never)] const fn panic_cold_explicit() -> ! {{}}"
+                            ),
+                        )
+                        && arguments.is_empty()
+                        && body_arguments.is_empty()
+                    {
+                        return Some(expr!("::core::panic!(\"explicit panic\")"));
+                    }
+                    if name.as_str() == "panic_display"
+                        && panic_helper_has_signature(
+                            item,
+                            item!(
+                                "#[cold] #[track_caller] #[inline(never)] #[rustc_const_panic_str] #[rustc_do_not_const_check] const fn panic_cold_display<T: ::core::fmt::Display>(arg: &T) -> ! {{}}"
+                            ),
+                        )
+                        && let [parameter] = function.sig.decl.inputs.as_slice()
+                        && let [body_argument] = body_arguments
+                        && let ExprKind::Path(None, path) = &body_argument.kind
+                        && let Some(pattern) = self.ast_to_hir.get_pat(parameter.pat.id, self.tcx)
+                        && let hir::PatKind::Binding(_, binding, _, _) = pattern.kind
+                        && self.ast_to_hir.path_span_to_res.get(&path.span)
+                            == Some(&Res::Local(binding))
+                        && let [argument] = arguments
+                        && let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, argument) =
+                            &argument.kind
+                    {
+                        let mut argument = argument.clone();
+                        self.visit_expr(&mut argument);
+                        let argument = pprust::expr_to_string(&argument);
+                        return Some(expr!("::core::panic!(\"{{}}\", {argument})"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (name, arguments) = self.core_panicking_call(expression)?;
+        if name.as_str() == "panic_explicit" && arguments.is_empty() {
+            return Some(expr!("::core::panic!(\"explicit panic\")"));
+        }
+        if name.as_str() == "panic_display"
+            && let [argument] = arguments
+        {
+            let mut argument = argument.clone();
+            self.visit_expr(&mut argument);
+            let argument = pprust::expr_to_string(&argument);
+            return Some(expr!("::core::panic!(\"{{}}\", *({argument}))"));
+        }
+        if name == sym::panic_fmt
+            && let [format] = arguments
+            && matches!(format.kind, ExprKind::FormatArgs(_))
+        {
+            let mut format = format.clone();
+            self.visit_expr(&mut format);
+            let format = pprust::expr_to_string(&format);
+            let arguments = format.strip_prefix("format_args!(")?.strip_suffix(')')?;
+            return Some(expr!("::core::panic!({arguments})"));
+        }
+        None
+    }
+}
+
+fn panic_helper_has_signature(item: &Item, expected: Item) -> bool {
+    let mut header = item.clone();
+    let ItemKind::Fn(function) = &mut header.kind else { unreachable!() };
+    let ItemKind::Fn(expected_function) = &expected.kind else { unreachable!() };
+    function.body = expected_function.body.clone();
+    pprust::item_to_string(&header) == pprust::item_to_string(&expected)
 }
 
 fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
@@ -499,11 +634,7 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
                     .or_default()
                     .push(of_trait);
             } else {
-                self.ctx
-                    .derived_traits
-                    .entry(def_id)
-                    .or_default()
-                    .push(Symbol::intern("BitfieldStruct"));
+                let mut recovered_bitfields = false;
                 let source_map = self.tcx.sess.source_map();
                 for item in imp.items {
                     let impl_item = self.tcx.hir_impl_item(item.id);
@@ -529,6 +660,14 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
                         .entry(field)
                         .or_default()
                         .push(bit_field);
+                    recovered_bitfields = true;
+                }
+                if recovered_bitfields {
+                    self.ctx
+                        .derived_traits
+                        .entry(def_id)
+                        .or_default()
+                        .push(Symbol::intern("BitfieldStruct"));
                 }
             }
         }
@@ -624,6 +763,140 @@ mod tests {
         }
     }
 
+    fn normalize_panic_source(code: &str) -> String {
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config { keep_allows: true }, tcx)
+        })
+        .unwrap();
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        normalized
+    }
+
+    fn assert_stable_panic_source(code: &str) -> String {
+        let first = normalize_panic_source(code);
+        let second = normalize_panic_source(&first);
+        assert_eq!(first, second);
+        assert!(!second.contains("panic_cold_"), "{second}");
+        assert!(!second.contains("panicking::"), "{second}");
+        second
+    }
+
+    #[test]
+    fn panic_messages_and_arguments_survive_repeated_normalization() {
+        let source = assert_stable_panic_source(
+            r#"
+fn literal() -> ! { panic!("Reached end of non-void function without returning") }
+fn explicit() -> ! { panic!() }
+fn next_value() -> i32 { 7 }
+fn formatted() -> ! { panic!("Invalid value: {}", next_value()) }
+fn named(value: i32) -> ! { panic!("{captured} {named}", named = value, captured = next_value()) }
+fn captured(value: i32) -> ! { panic!("Invalid value: {value}") }
+"#,
+        );
+        assert!(source.contains("Reached end of non-void function without returning"));
+        assert!(source.contains("::core::panic!(\"explicit panic\")"));
+        assert!(source.contains("Invalid value: {0}"));
+        assert_eq!(source.matches("next_value()").count(), 3);
+        assert!(
+            source.contains("\"{1} {0}\", value, next_value()"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn panic_format_arguments_are_normalized_before_reconstruction() {
+        let source = normalize_panic_source(
+            r#"
+#[repr(C)] struct Pair { left: i32, right: i32 }
+fn f(flag: bool) -> ! {
+    panic!("offset: {}", if flag {
+        core::mem::offset_of!(Pair, right)
+    } else {
+        panic!("inner panic")
+    })
+}
+"#,
+        );
+        assert!(source.contains("offset_of!"));
+        assert!(source.contains("inner panic"));
+        assert!(!source.contains("builtin # offset_of"));
+    }
+
+    #[test]
+    fn panic_reconstruction_uses_resolved_core_identity() {
+        let source = normalize_panic_source(
+            r#"
+mod panicking { pub fn panic_fmt(value: i32) -> i32 { value + 1 } }
+macro_rules! panic { ($($argument:tt)*) => { 7 }; }
+fn f() -> ! { ::core::panic!("real panic") }
+fn lookalike() -> i32 { panicking::panic_fmt(3) }
+fn helper() -> ! {
+    #[cold]
+    #[track_caller]
+    #[inline(never)]
+    const fn panic_cold_explicit() -> ! { ::core::panic!("custom helper") }
+    panic_cold_explicit();
+}
+fn attributed_helper() -> ! {
+    #[cold]
+    #[track_caller]
+    #[inline(never)]
+    #[export_name = "user_panic_helper"]
+    const fn panic_cold_explicit() -> ! { ::core::panic!() }
+    panic_cold_explicit();
+}
+"#,
+        );
+        assert!(source.contains("::core::panic!(\"real panic\")"));
+        assert!(source.contains("panicking::panic_fmt(3)"));
+        assert!(source.contains("const fn panic_cold_explicit()"));
+        assert!(source.contains("custom helper"));
+        assert!(source.contains("#[export_name = \"user_panic_helper\"]"));
+    }
+
+    #[test]
+    fn display_panic_helpers_are_reconstructed_without_changing_const_support() {
+        let code = r#"
+const fn f() -> ! { panic!("{}", "message") }
+fn g(value: i32) -> ! { panic!("{}", value) }
+"#;
+        let normalize = |code: &str| {
+            utils::compilation::run_compiler_on_str(code, |tcx| {
+                super::unexpand(super::Config::default(), tcx)
+            })
+            .unwrap()
+        };
+        let first = normalize(code);
+        let second = normalize(&first);
+        assert_eq!(first, second);
+        assert!(!second.contains("panic_cold_"));
+        utils::compilation::run_compiler_on_str(&second, utils::type_check).expect(&second);
+    }
+
+    #[test]
+    fn handwritten_display_helper_keeps_its_argument_type() {
+        let code = r#"
+#![feature(panic_internals)]
+fn f(value: &str) -> ! {
+    #[cold]
+    #[track_caller]
+    #[inline(never)]
+    const fn panic_cold_display(arg: &&str) -> ! {
+        ::core::panicking::panic_display(arg)
+    }
+    panic_cold_display(&value);
+}
+"#;
+        let source = normalize_panic_source(code);
+        assert!(source.contains("const fn panic_cold_display(arg: &&str)"));
+        assert!(source.contains("panic_cold_display(&value)"));
+        assert!(source.contains("::core::panic!(\"{}\", *(arg))"));
+    }
+
     #[test]
     fn test_offset_of() {
         run_test(
@@ -699,6 +972,64 @@ fn f() {
             &["write!"],
             &["write_fmt", "format_args"],
         )
+    }
+
+    #[test]
+    fn empty_generated_impl_does_not_restore_bitfield_derive() {
+        run_test(
+            r#"
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Flags {
+    pub ready_busy: [u8; 1],
+    pub c2rust_padding: [u8; 7],
+}
+#[automatically_derived]
+impl Flags {}
+pub fn keep(value: Flags) -> Flags { value }
+"#,
+            &[
+                "pub struct Flags",
+                "ready_busy: [u8; 1]",
+                "c2rust_padding: [u8; 7]",
+                "#[derive(Clone)]",
+                "#[derive(Copy)]",
+            ],
+            &["BitfieldStruct", "bitfield(", "impl Flags"],
+        );
+    }
+
+    #[test]
+    fn populated_bitfields_restore_derive_and_field_metadata() {
+        let source = r#"
+use c2rust_bitfields::BitfieldStruct;
+#[repr(C)]
+#[derive(BitfieldStruct)]
+pub struct Flags {
+    #[bitfield(name = "ready", ty = "u8", bits = "0..=0")]
+    #[bitfield(name = "busy", ty = "u8", bits = "1..=1")]
+    pub ready_busy: [u8; 1],
+    pub c2rust_padding: [u8; 7],
+}
+pub fn read(value: Flags) -> u8 { value.ready() }
+"#;
+        let expanded = utils::compilation::run_compiler_on_str(source, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        run_test(
+            &expanded,
+            &[
+                "#[derive(BitfieldStruct)]",
+                "name = \"ready\"",
+                "name = \"busy\"",
+                "bits = \"0..=0\"",
+                "bits = \"1..=1\"",
+                "ready_busy: [u8; 1]",
+                "c2rust_padding: [u8; 7]",
+            ],
+            &["impl Flags", "automatically_derived"],
+        );
     }
 
     // bytemuck tests skip type checking
