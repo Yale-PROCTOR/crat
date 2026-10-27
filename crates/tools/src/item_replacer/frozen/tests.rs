@@ -380,7 +380,7 @@ fn frozen_views_are_checked_before_canonical_replacement() {
 }
 
 #[test]
-fn frozen_finalization_restores_main_and_validates_original_api_exports() {
+fn frozen_finalization_restores_main_and_preserves_original_api_exports() {
     let frozen = freeze(
         "#[export_name = \"public_entry\"] pub unsafe extern \"C\" fn entry() -> i32 { 7 } fn main() { unsafe { entry(); } }",
     );
@@ -397,10 +397,26 @@ fn frozen_finalization_restores_main_and_validates_original_api_exports() {
         !final_project.source.contains("todo!") && !final_project.source.contains("__proctor_")
     );
     run_compiler_on_str(&final_project.source, |_| ()).unwrap();
-    finalize_frozen_project(&frozen, &assembled, "library", &["public_entry".to_owned()]).unwrap();
-    assert!(
-        finalize_frozen_project(&frozen, &assembled, "library", &["missing".to_owned()]).is_err()
-    );
+    let library =
+        finalize_frozen_project(&frozen, &assembled, "library", &["public_entry".to_owned()])
+            .unwrap();
+    let declaration_only = finalize_frozen_project(
+        &frozen,
+        &assembled,
+        "library",
+        &["public_entry".to_owned(), "declared_only".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(declaration_only.source, library.source);
+    assert!(library.source.contains("export_name = \"public_entry\""));
+    for (kind, api) in [
+        ("unknown", vec![]),
+        ("executable", vec!["public_entry".to_owned()]),
+        ("library", vec!["main".to_owned()]),
+    ] {
+        let error = finalize_frozen_project(&frozen, &assembled, kind, &api).unwrap_err();
+        assert_eq!(error.kind, ReplacementErrorKind::InvalidRequest);
+    }
 }
 
 #[test]
