@@ -3165,10 +3165,12 @@ fn collect_slice_uses_with_family(
                 // argument keeps the boundary's own disposition; only the
                 // rendering changes, to the suffix view of the delivered base.
                 // Relay 371 step 4 (A3): a delta is forward when its spelling is
-                // (wave-6s's rule), or when it is a plain signed counter and the
-                // subject's own sign verdict is non-negative (`advance_ok` carries
-                // it): C's `x.offset(i as isize)` over a counter the analysis proves
-                // never negative. Other spellings keep R394-2.
+                // (wave-6s's rule), when it is a constant that evaluates
+                // non-negative (`sk.offset(SPX_N as isize)`, a `const` path), or
+                // when it is a plain signed counter and the subject's own sign
+                // verdict is non-negative (`advance_ok` carries it): C's
+                // `x.offset(i as isize)` over a counter the analysis proves never
+                // negative. Other spellings keep R394-2.
                 if self.expanded
                     && let Some((site, view)) = super::slice_forms::computed_argument_view_with(
                         self.tcx,
@@ -3176,7 +3178,7 @@ fn collect_slice_uses_with_family(
                         key,
                         self.raw_boundary_arguments,
                         |delta| {
-                            super::slice_forms::forward_delta(self.tcx, delta)
+                            super::cast_offset::forward(self.tcx, delta)
                                 || (super::slice_forms::signed_counter(self.tcx, delta)
                                     && self.advance_ok.contains(&key))
                         },
