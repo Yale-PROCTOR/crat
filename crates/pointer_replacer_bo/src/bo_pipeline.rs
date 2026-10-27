@@ -192,6 +192,7 @@ pub(crate) fn rewrite_bo_with_artifacts(
     };
     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
     let receipt = persist_in_place(input, &capture, analysis_fingerprint)?;
+    declare_bytemuck(input, &capture);
     if let Some(dir) = artifact_dir
         && let Err(error) = write_artifacts(dir, input, &capture)
     {
@@ -201,6 +202,33 @@ pub(crate) fn rewrite_bo_with_artifacts(
         );
     }
     Ok(receipt)
+}
+
+/// **R1313-2 (relay main/371 step 2) — the byte view's dependency.** A tree the byte view reaches
+/// names `bytemuck`; its crate declares it as the lab's passes do (`bytemuck = "1.24.0"`, the
+/// version `deps_crate` carries), unless it already does. The manifest is the input's own directory's
+/// or its parent's (`<crate>/lib.rs`, `<crate>/src/lib.rs`), and only one with a `[dependencies]`
+/// table is edited; anything else (a bare file, as in the unit fixtures) is left as it is.
+fn declare_bytemuck(input: &Path, capture: &E1Capture) {
+    let Some(files) = capture.emitted_files.as_ref() else {
+        return;
+    };
+    if !files.values().any(|text| text.contains("bytemuck::")) {
+        return;
+    }
+    let Some(root) = input
+        .ancestors()
+        .skip(1)
+        .take(2)
+        .find(|dir| dir.join("Cargo.toml").is_file())
+    else {
+        return;
+    };
+    let declares_dependencies = std::fs::read_to_string(root.join("Cargo.toml"))
+        .is_ok_and(|text| text.lines().any(|line| line.trim() == "[dependencies]"));
+    if declares_dependencies && !utils::has_dependency(root, "bytemuck") {
+        utils::add_dependency(root, "bytemuck", "1.24.0");
+    }
 }
 
 /// **R1305-1 (relay main/367) — the per-subject writer.** Writes into `dir`, from the capture
