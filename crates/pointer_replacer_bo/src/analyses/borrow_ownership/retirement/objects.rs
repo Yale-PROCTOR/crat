@@ -204,6 +204,19 @@ fn clobber_own_storage(state: &mut State, place: Place<'_>) {
     }
 }
 
+/// A direct write to a local whose address escaped: a depth >= 1 cell may be a
+/// copy of that local's old value (`px = &raw mut x` copies `x`'s cell into
+/// `px`'s depth-1 cell), so every depth >= 1 cell ends here. Other locals'
+/// depth-0 cells hold their own values and stay. The copy went stale before N
+/// too; a projected store or a `Drop` after the stale read used to hide that,
+/// and N keeps the read's local, so the write itself ends the copy (relay
+/// era-5c/264, the review's N6).
+fn clobber_copies(state: &mut State) {
+    for objects in state.iter_mut().flat_map(|row| row.iter_mut().skip(1)) {
+        objects.unknown = true;
+    }
+}
+
 fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State, escapes: &EscapeFacts) {
     let Some(local) = place.as_local() else {
         // N: a projected store writes memory behind a pointer -- a depth >= 1
@@ -212,6 +225,9 @@ fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State, escapes: &
         clobber_own_storage(state, place);
         return;
     };
+    if escapes.escapes(local) {
+        clobber_copies(state);
+    }
     let row = &mut state[local.as_usize()];
     row.fill(ObjectSet::default());
     for (cell, value) in row.iter_mut().zip(values) {
