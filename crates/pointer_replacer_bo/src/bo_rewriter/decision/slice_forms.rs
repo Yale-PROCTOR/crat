@@ -344,6 +344,44 @@ pub(crate) fn forward_delta<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) ->
     true
 }
 
+/// **Relay 371 step 4 (A3): a C counter.** The delta is a local of a signed integer type under casts
+/// that only widen it (`i as isize` with `i: c_int`), so its sign is the offset-sign analysis's to
+/// decide, not the spelling's. A sum, a negation, a literal, or a cast through another signedness or
+/// to a narrower type is not one: those keep [`forward_delta`]'s rule (R394-2).
+pub(crate) fn signed_counter<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) -> bool {
+    use rustc_middle::ty::{IntTy, TyKind};
+    let owner = delta.hir_id.owner.def_id;
+    let typeck = tcx.typeck(owner);
+    let pointer_bits = tcx.data_layout.pointer_size.bits();
+    let signed_bits = |ty: rustc_middle::ty::Ty<'tcx>| match ty.kind() {
+        TyKind::Int(IntTy::Isize) => Some(pointer_bits),
+        TyKind::Int(i) => i.bit_width(),
+        _ => None,
+    };
+    let mut casts = Vec::new();
+    let mut inner = delta;
+    while let ExprKind::Cast(operand, _) = inner.kind {
+        casts.push(inner);
+        inner = operand;
+    }
+    if super::emitability::resolved_local_of(inner).is_none() {
+        return false;
+    }
+    let Some(mut bits) = typeck.expr_ty_opt(inner).and_then(signed_bits) else {
+        return false;
+    };
+    for cast in casts.into_iter().rev() {
+        let Some(target) = typeck.expr_ty_opt(cast).and_then(signed_bits) else {
+            return false;
+        };
+        if target < bits {
+            return false;
+        }
+        bits = target;
+    }
+    true
+}
+
 pub(crate) fn computed_argument_view<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx Expr<'tcx>,

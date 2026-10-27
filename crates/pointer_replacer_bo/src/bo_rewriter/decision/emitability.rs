@@ -1235,6 +1235,17 @@ pub(crate) struct EmitabilityFacts {
     pub outside_entry_formals: FxHashMap<LocalDefId, super::outside_byte_view::EntryFormals>,
 }
 
+/// The local binding a path expression names, if it names one.
+pub(crate) fn resolved_local_of(expr: &Expr<'_>) -> Option<HirId> {
+    let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind else {
+        return None;
+    };
+    match path.res {
+        Res::Local(hir_id) => Some(hir_id),
+        _ => None,
+    }
+}
+
 /// Gather A1 facts for the whole crate in one HIR pass per function body.
 pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityFacts {
     let mut facts = EmitabilityFacts::default();
@@ -1283,13 +1294,7 @@ impl BodyFacts<'_, '_> {
     /// local. That is how a use is attributed to a specific parameter rather
     /// than to a name that might be shadowed.
     fn resolved_local(expr: &Expr<'_>) -> Option<HirId> {
-        let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind else {
-            return None;
-        };
-        match path.res {
-            Res::Local(hir_id) => Some(hir_id),
-            _ => None,
-        }
+        resolved_local_of(expr)
     }
 
     fn address_operand(&self, expr: &Expr<'_>) -> Option<AddressOperand> {
@@ -3160,9 +3165,10 @@ fn collect_slice_uses_with_family(
                 // argument keeps the boundary's own disposition; only the
                 // rendering changes, to the suffix view of the delivered base.
                 // Relay 371 step 4 (A3): a delta is forward when its spelling is
-                // (wave-6s's rule) or when the subject's own sign verdict is
-                // non-negative (`advance_ok` carries it): C's `x.offset(i as isize)`
-                // over a signed counter the analysis proves never negative.
+                // (wave-6s's rule), or when it is a plain signed counter and the
+                // subject's own sign verdict is non-negative (`advance_ok` carries
+                // it): C's `x.offset(i as isize)` over a counter the analysis proves
+                // never negative. Other spellings keep R394-2.
                 if self.expanded
                     && let Some((site, view)) = super::slice_forms::computed_argument_view_with(
                         self.tcx,
@@ -3171,7 +3177,8 @@ fn collect_slice_uses_with_family(
                         self.raw_boundary_arguments,
                         |delta| {
                             super::slice_forms::forward_delta(self.tcx, delta)
-                                || self.advance_ok.contains(&key)
+                                || (super::slice_forms::signed_counter(self.tcx, delta)
+                                    && self.advance_ok.contains(&key))
                         },
                     )
                 {
