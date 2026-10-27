@@ -176,8 +176,9 @@ pub unsafe fn deep(pp: *mut *mut u8) -> *mut u8 {
 /// than a concession. A fault that preserves depth >= 1 cells too leaves this fixture green,
 /// so an assertion here would witness nothing. The representation is why:
 ///   * a projected store (`*pp = ...`) is not `place.as_local()`, so `write`
-///     falls to the whole-state `clobber` -- a depth >= 1 cell is therefore
-///     never refined to a distinct known root;
+///     clobbers every depth >= 1 cell (relay era-5c/264 narrows only its
+///     depth-0 scope) -- a depth >= 1 cell is therefore never refined to a
+///     distinct known root;
 ///   * the only known depth >= 1 roots are a parameter's `Input` cells, and
 ///     `(Input, Input)` pairs to `PossibleInputAlias`, so preserving such a cell
 ///     instead of clobbering it does not change any overlap verdict.
@@ -469,10 +470,10 @@ fn a_w05_the_unwind_successor_carries_the_same_narrowed_clobber() {
 }
 
 /// A pointer stored into a global is reachable from every callee. The
-/// narrowing preserves nothing about it, because a store through a static's
-/// address is a projected store and projected stores keep the whole-state
-/// clobber. The anchor is the discriminating sibling: this fixture is the
-/// anchor plus the one global store.
+/// narrowing preserves nothing about it: a static is not a cell of the object
+/// state, and a store through its address is a projected store, which clobbers
+/// every cell a callee could reach. The anchor is the discriminating sibling:
+/// this fixture is the anchor plus the one global store.
 ///
 /// Under the fresh-in-route discharge, `keep` is accepted. The
 /// freed operand is identified by `protocol`'s own single definition, the fresh

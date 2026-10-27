@@ -11,8 +11,9 @@
 //! The root names the object that was in that cell AT THE LOAD, so every write
 //! that may reach the cell must kill it. Two writers exist:
 //!
-//!   * a store to a projected place, which already raises `unknown` on the
-//!     whole state (`objects::write`), covering every field store; and
+//!   * a store to a projected place, and a `Drop`, which run the callee-scoped
+//!     clobber below (`objects::write`, relay era-5c/264), covering every field
+//!     store; and
 //!   * a callee-scoped clobber, where there is no reachability relation
 //!     between a callee and a base object and therefore kills every field root
 //!     (`names_field` below). The call clobber's own preservation is unaffected: the

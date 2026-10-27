@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{
-    Body, CastKind, Local, Location, Operand, Place, Rvalue, START_BLOCK, StatementKind,
-    TerminatorKind,
+    Body, CastKind, Local, Location, Operand, Place, ProjectionElem, Rvalue, START_BLOCK,
+    StatementKind, TerminatorKind,
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -161,12 +161,15 @@ fn clobber(state: &mut State) {
     }
 }
 
-/// The clobber a non-allocator local call actually needs.
+/// The clobber a non-allocator local call actually needs, and the one a
+/// projected store and a `Drop` need (relay era-5c/264, N).
 ///
 /// Every depth >= 1 cell describes memory behind a pointer, which a callee may
 /// write, and is clobbered exactly as before. A depth-0 cell holds the pointer
 /// value in the caller's own MIR local; a callee cannot name it unless the
 /// local's address escaped, so a non-escaping local's depth-0 cell survives.
+/// A store through memory and drop glue are bounded the same way: they change
+/// a MIR local's own value only if that local's address was taken.
 /// Statics are not cells of this state at all, so nothing about them is
 /// preserved here.
 fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
@@ -184,9 +187,29 @@ fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
     }
 }
 
-fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State) {
+/// A place with no `Deref` is `place.local`'s own storage (`_5.f`, `_5[i]`, or
+/// `_5` itself when dropped), so a store or a drop there changes that local.
+/// Only raw-pointer and reference locals have cells (`CrateSlots::build`) and
+/// those take no projection but `Deref`, so this row is empty for every
+/// projected store; clobbering it keeps N sound without relying on that.
+fn clobber_own_storage(state: &mut State, place: Place<'_>) {
+    if place
+        .projection
+        .iter()
+        .all(|projection| !matches!(projection, ProjectionElem::Deref))
+    {
+        for objects in &mut state[place.local.as_usize()] {
+            objects.unknown = true;
+        }
+    }
+}
+
+fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State, escapes: &EscapeFacts) {
     let Some(local) = place.as_local() else {
-        clobber(state);
+        // N: a projected store writes memory behind a pointer -- a depth >= 1
+        // cell, an escaped local or a static -- or the local's own storage.
+        clobber_callee_reachable(state, escapes);
+        clobber_own_storage(state, place);
         return;
     };
     let row = &mut state[local.as_usize()];
@@ -218,6 +241,7 @@ fn statement_effect(
     statement: &StatementKind<'_>,
     state: &mut State,
     tcx: rustc_middle::ty::TyCtxt<'_>,
+    escapes: &EscapeFacts,
 ) {
     match statement {
         StatementKind::Assign(box (destination, value)) => {
@@ -246,13 +270,13 @@ fn statement_effect(
                     _ => ObjectSet::default(),
                 })
                 .collect();
-            write(*destination, values, state);
+            write(*destination, values, state, escapes);
         }
         StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
             state[local.as_usize()].fill(ObjectSet::default());
         }
         StatementKind::Deinit(place) | StatementKind::SetDiscriminant { place, .. } => {
-            write(**place, Vec::new(), state);
+            write(**place, Vec::new(), state, escapes);
         }
         StatementKind::Intrinsic(
             box rustc_middle::mir::NonDivergingIntrinsic::CopyNonOverlapping(_),
@@ -280,11 +304,15 @@ fn call_effect<'tcx>(
     };
     let terminator = body.basic_blocks[location.block].terminator();
     let Some(call) = terminator.as_call(program.tcx) else {
-        if matches!(
-            terminator.kind,
-            TerminatorKind::Drop { .. } | TerminatorKind::InlineAsm { .. }
-        ) {
-            clobber(state);
+        match terminator.kind {
+            // N: drop glue reaches what the dropped value reaches and what any
+            // callee could, and changes the dropped place's own storage.
+            TerminatorKind::Drop { place, .. } => {
+                clobber_callee_reachable(state, escapes);
+                clobber_own_storage(state, place);
+            }
+            TerminatorKind::InlineAsm { .. } => clobber(state),
+            _ => {}
         }
         return;
     };
@@ -298,6 +326,22 @@ fn call_effect<'tcx>(
     let null = core_pointer
         && matches!(call.func, CallKind::RustLib(did)
         if matches!(program.tcx.item_name(did).as_str(), "null" | "null_mut"));
+    // O: an `offset` / `add` / `sub` of `core::ptr` that leaves its allocation
+    // (one past the end allowed) is UB in Rust and in C, so under §28 the result
+    // points into the receiver's objects. Keyed on the `::ptr::` path, never on
+    // the name alone (`core::ops::Add::add` is not arithmetic); `wrapping_*` and
+    // `byte_*` stay Unknown. The receiver is read as the call reads it, before
+    // any clobber.
+    let receiver = matches!(call.func, CallKind::RustLib(did)
+        if program.tcx.crate_name(did.krate).as_str() == "core"
+            && program.tcx.def_path_str(did).contains("::ptr::")
+            && matches!(program.tcx.item_name(did).as_str(), "offset" | "add" | "sub"))
+    .then(|| {
+        call.args
+            .first()
+            .map(|receiver| operand_value(&receiver.node, 0, state, program.tcx))
+    })
+    .flatten();
     let local_candidate = !allocator && !free && !core_pointer;
     let mut certificate = if !normal {
         Err(Rejection::NoNormalReturn)
@@ -344,7 +388,8 @@ fn call_effect<'tcx>(
     // Return identity is not an effect summary. The clobber keeps its exact
     // position -- after any admitted actual-value snapshot, before the
     // destination write -- and `clobber_callee_reachable` narrows only its SCOPE, to the cells a
-    // callee can reach. Every other clobber site in this file is unchanged.
+    // callee can reach. A projected store and a `Drop` take the same scope (N);
+    // `CopyNonOverlapping` and inline assembly keep the whole-state clobber.
     if local_candidate {
         clobber_callee_reachable(state, escapes);
     }
@@ -356,6 +401,8 @@ fn call_effect<'tcx>(
             })
         } else if null {
             ObjectSet::null()
+        } else if let Some(receiver) = receiver {
+            receiver
         } else {
             match certificate {
                 Ok(proof) => match proof.origin {
@@ -373,7 +420,7 @@ fn call_effect<'tcx>(
             // certificate/receipt; this union never clears an actual's Unknown.
             value.union(&ObjectSet::null());
         }
-        write(call.destination, vec![value], state);
+        write(call.destination, vec![value], state, escapes);
     }
     #[cfg(test)]
     if local_candidate {
@@ -461,7 +508,7 @@ impl ObjectFacts {
                     .clone()
                     .expect("reachable object state");
                 for statement in &data.statements {
-                    statement_effect(function, &statement.kind, &mut state, program.tcx);
+                    statement_effect(function, &statement.kind, &mut state, program.tcx, &escapes);
                 }
                 let location = Location {
                     block,
@@ -537,7 +584,7 @@ impl ObjectFacts {
                         ),
                         snapshot(&state),
                     );
-                    statement_effect(function, &statement.kind, &mut state, program.tcx);
+                    statement_effect(function, &statement.kind, &mut state, program.tcx, &escapes);
                 }
                 facts.snapshots.insert(
                     (
