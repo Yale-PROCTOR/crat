@@ -120,6 +120,8 @@ struct Args {
         help = "Enable verbose ownership solver output for the pointer pass"
     )]
     pointer_verbose: bool,
+    #[arg(long, help = "Skip the pointer pass's preprocessing rewrites")]
+    pointer_skip_preprocessing: bool,
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -168,6 +170,18 @@ enum Pass {
     Enum,
     Io,
     Pointer,
+    #[value(name = "pointer-struct-arrays")]
+    #[serde(rename = "pointer-struct-arrays")]
+    PointerStructArrays,
+    #[value(name = "pointer-struct-param-fields")]
+    #[serde(rename = "pointer-struct-param-fields")]
+    PointerStructParamFields,
+    #[value(name = "pointer-epoch-split")]
+    #[serde(rename = "pointer-epoch-split")]
+    PointerEpochSplit,
+    #[value(name = "pointer-array-local-provenance")]
+    #[serde(rename = "pointer-array-local-provenance")]
+    PointerArrayLocalProvenance,
     Static,
     Simpl,
 }
@@ -576,51 +590,23 @@ fn main() {
                     utils::add_dependency(&dir, "num-traits", "0.2.19");
                 }
             }
+            Pass::PointerStructArrays
+            | Pass::PointerStructParamFields
+            | Pass::PointerEpochSplit
+            | Pass::PointerArrayLocalProvenance => {
+                run_pointer_preprocessing(pass, &file, &dir, &config.pointer);
+            }
             Pass::Pointer => {
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
+                if !args.pointer_skip_preprocessing {
+                    for preprocessing in [
+                        Pass::PointerStructArrays,
+                        Pass::PointerStructParamFields,
+                        Pass::PointerEpochSplit,
+                        Pass::PointerArrayLocalProvenance,
+                    ] {
+                        run_pointer_preprocessing(preprocessing, &file, &dir, &config.pointer);
+                    }
                 }
-
-                let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
-                })
-                .unwrap();
-                if !field_specs.is_empty() {
-                    // the sidecar persists across reruns on purpose: a rerun over
-                    // already-specialized output finds nothing to specialize (empty map)
-                    // but the existing records are still what the interface pass needs;
-                    // genuinely stale entries fail closed there (no {name}_field fn)
-                    let field_spec_path = dir.join("field_spec_map.json");
-                    std::fs::write(
-                        &field_spec_path,
-                        serde_json::to_string_pretty(&field_specs).unwrap(),
-                    )
-                    .unwrap();
-                }
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::replace_local_borrows(&config.pointer, tcx)
                 })
@@ -685,6 +671,47 @@ fn main() {
                 .unwrap();
             }
         }
+    }
+}
+
+fn run_pointer_preprocessing(
+    pass: Pass,
+    file: &Path,
+    dir: &Path,
+    config: &pointer_replacer::Config,
+) {
+    let (source, changed) = match pass {
+        Pass::PointerStructArrays => run_compiler_on_path(file, |tcx| {
+            pointer_replacer::rewrite_struct_arrays(config, tcx)
+        })
+        .unwrap(),
+        Pass::PointerStructParamFields => {
+            let (source, changed, field_specs) = run_compiler_on_path(file, |tcx| {
+                pointer_replacer::rewrite_struct_param_fields(config, tcx)
+            })
+            .unwrap();
+            if !field_specs.is_empty() {
+                // Preserve earlier specialization records when a rerun finds no new fields.
+                std::fs::write(
+                    dir.join("field_spec_map.json"),
+                    serde_json::to_string_pretty(&field_specs).unwrap(),
+                )
+                .unwrap();
+            }
+            (source, changed)
+        }
+        Pass::PointerEpochSplit => run_compiler_on_path(file, |tcx| {
+            pointer_replacer::rewrite_epoch_split(config, tcx)
+        })
+        .unwrap(),
+        Pass::PointerArrayLocalProvenance => run_compiler_on_path(file, |tcx| {
+            pointer_replacer::rewrite_array_local_provenance(config, tcx)
+        })
+        .unwrap(),
+        _ => unreachable!("expected a pointer preprocessing pass"),
+    };
+    if changed {
+        std::fs::write(file, source).unwrap();
     }
 }
 
