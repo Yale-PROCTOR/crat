@@ -185,6 +185,152 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
 
 #[test]
+fn nested_value_blocks_have_no_independent_binding_obligations() {
+    assert_valid(
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] Some({ let init: i32 = value; init }).unwrap() }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] Some({ let renamed: i64 = value as i64; renamed as i32 }).unwrap() }",
+    );
+    assert_valid(
+        "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] 1 + if flag { let init: i32 = 2; init } else { 3 } }",
+        "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] 1 + if flag { let renamed: i64 = 2; renamed as i32 } else { 3 } }",
+    );
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume({ let local = || { return 1; }; loop { break; } local() }); }",
+    );
+}
+
+#[test]
+fn rule_applied_views_accept_opaque_value_payloads() {
+    let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some({ let init = value; init }).unwrap(); #[proctor(1)] result }";
+    assert_eq!(
+        validate(&mixed_preservation_request(skeleton, &[1], &[0], skeleton)),
+        ValidationResponse::Valid,
+    );
+    rustc_span::create_session_if_not_set_then(rustc_span::edition::Edition::Edition2021, |_| {
+        let parsed = parse_crate(skeleton).unwrap();
+        assert_eq!(validate_rule_application_shape(&parsed.items[0]), Ok(()));
+    });
+}
+
+#[test]
+fn direct_initializer_blocks_keep_binding_obligations() {
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] let value: i32 = { #[proctor(1)] let existing: i32 = 1; #[proctor(2)] existing }; }",
+        "unsafe fn f() { #[proctor(0)] let value: i32 = { #[proctor(1)] let existing: i64 = 1; #[proctor(2)] existing as i32 }; }",
+        "local_type_mismatch",
+    );
+}
+
+#[test]
+fn opaque_value_locals_do_not_mask_outer_temporary_capture_checks() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] todo!(); #[proctor(1)] todo!(); }";
+    assert_valid(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] consume({ let proctor_temp_var_0 = 1; consume!(proctor_temp_var_0); proctor_temp_var_0 }); #[proctor(1)] consume({ let proctor_temp_var_0 = 2; proctor_temp_var_0 }); }",
+    );
+    assert_valid(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(0)] consume({ let result = proctor_temp_var_0; result }); #[proctor(1)] consume(0); }",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] consume({ let result = proctor_temp_var_0; result }); }",
+        "temporary_outside_expansion_group",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] consume({ let proctor_temp_var_0 = proctor_temp_var_0; proctor_temp_var_0 }); }",
+        "temporary_outside_expansion_group",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] consume({ let proctor_temp_var_0 = 1; proctor_temp_var_0 }); #[proctor(1)] consume(proctor_temp_var_0); }",
+        "unresolved_generated_temporary",
+    );
+    assert_code(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(0)] consume({ consume!(proctor_temp_var_0); }); #[proctor(1)] consume(0); }",
+        "temporary_in_macro",
+    );
+}
+
+#[test]
+fn opaque_value_let_chains_keep_bindings_in_their_condition_scope() {
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(if let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { proctor_temp_var_0 } else { 0 }); }",
+    );
+    assert_code(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(if let Some(proctor_temp_var_0) = Some(1) && proctor_temp_var_0 > 0 { proctor_temp_var_0 } else { proctor_temp_var_0 }); }",
+        "unresolved_generated_temporary",
+    );
+}
+
+#[test]
+fn value_opacity_retains_item_attribute_label_and_unsafe_restrictions() {
+    for (body, code) in [
+        ("fn hidden() {}", "unexpected_nested_item"),
+        ("unsafe { 1 };", "explicit_unsafe_block"),
+        (
+            "#[allow(unused)] let local = 1;",
+            "unexpected_body_attribute",
+        ),
+        ("#[proctor(9)] let local = 1;", "unexpected_label"),
+    ] {
+        assert_code(
+            UNIT_SKELETON,
+            &format!("unsafe fn f() {{ #[proctor(0)] consume({{ {body} }}); }}"),
+            code,
+        );
+    }
+}
+
+#[test]
+fn opaque_values_reject_control_transfers_to_outer_scopes() {
+    for source in [
+        "unsafe fn f() { #[proctor(0)] consume({ return; }); }",
+        "unsafe fn f() { #[proctor(0)] consume(if true { return; } else { () }); }",
+        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ break; }); } }",
+        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ continue; }); } }",
+        "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] consume({ loop { break 'outer; } }); } }",
+    ] {
+        assert_eq!(
+            codes(&validate(&request(source, source))),
+            ["invalid_expected_skeleton"]
+        );
+    }
+    assert_code(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume({ return; }); }",
+        "escaping_opaque_control",
+    );
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] todo!(); } }",
+        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ break; }); } }",
+        "escaping_opaque_control",
+    );
+}
+
+#[test]
+fn opaque_source_values_retain_body_supportedness_checks() {
+    for source in [
+        "unsafe fn f() { #[proctor(0)] consume({ ; 1 }); }",
+        "unsafe fn f() { #[proctor(0)] consume({ match 1 { _ => 1 } }); }",
+    ] {
+        assert_eq!(
+            codes(&validate(&request(source, source))),
+            ["invalid_expected_skeleton"]
+        );
+    }
+    assert_valid(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume({ ; match 1 { _ => 1 } }); }",
+    );
+}
+
+#[test]
 fn closure_parameters_and_bodies_have_no_independent_alignment_obligations() {
     assert_valid(
         "unsafe fn f(values: &mut [i32]) { #[proctor(0)] todo!(); }",
@@ -302,6 +448,14 @@ fn print_arguments_receive_normal_structural_validation() {
         skeleton,
         r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }); }"#,
     );
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let local = 1; local }); }"#,
+    );
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }); }"#,
+    );
     for (argument, code) in [
         ("{ fn hidden() {} 1 }", "unexpected_nested_item"),
         ("unsafe { 1 }", "explicit_unsafe_block"),
@@ -309,14 +463,7 @@ fn print_arguments_receive_normal_structural_validation() {
             "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
             "unexpected_body_attribute",
         ),
-        (
-            "{ let invented = 1; invented }",
-            "invalid_generated_binding_name",
-        ),
-        (
-            "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
-            "temporary_in_macro",
-        ),
+        ("{ return; }", "escaping_opaque_control"),
     ] {
         assert_code(
             skeleton,
@@ -838,16 +985,9 @@ unsafe fn f(flag: bool, pointer: *mut i32, value: i32) -> i32 {
 }
 
 #[test]
-fn transformed_label_does_not_relax_nested_control_validation() {
+fn transformed_labels_accept_opaque_value_conditionals() {
     let skeleton = "unsafe fn f(flag: bool, value: i32) -> i32 { #[proctor(0)] value + (if flag { -1 } else { 1 }) }";
-    assert_eq!(
-        codes(&validate(&preservation_request(
-            skeleton,
-            vec![0],
-            skeleton
-        ))),
-        ["invalid_expected_skeleton"]
-    );
+    assert_valid(skeleton, skeleton);
 }
 
 #[test]
@@ -1179,7 +1319,7 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe extern \"C\" fn f(x: i32, mut args: ...) { #[proctor(0)] return; }",
         "unsafe fn f() { return; }",
         "unsafe fn f() { #[proctor(0)] #[allow(unused_variables)] let x = 1; }",
-        "unsafe fn f() { #[proctor(0)] consume(if true { 1 } else { 0 }); }",
+        "unsafe fn f() { #[proctor(0)] consume(loop { break 1; }); }",
         "unsafe fn f(x: i32) { #[proctor(0)] match x { _ => return } }",
     ] {
         assert_eq!(

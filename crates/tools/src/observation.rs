@@ -6459,6 +6459,81 @@ unsafe fn target(mut pointer: &i32) -> i32 {
     }
 
     #[test]
+    fn unlabeled_value_locals_do_not_require_observation_correspondence() {
+        for (original, replacement) in [
+            (
+                "1 + { let mut init: *const i32 = pointer; *init }",
+                "1 + { let selected = pointer; *selected }",
+            ),
+            (
+                "1 + (if flag { let mut init: *const i32 = pointer; *init } else { 0 })",
+                "1 + (if flag { let selected = pointer; *selected } else { 0 })",
+            ),
+        ] {
+            let source = format!(
+                r#"
+unsafe fn source_copy(mut pointer: *const i32, flag: bool) -> i32 {{
+    #[proctor(0)] let mut value: i32 = {original};
+    #[proctor(1)] *pointer + value
+}}
+unsafe fn target(mut pointer: &i32, flag: bool) -> i32 {{
+    #[proctor(0)] let mut value: i32 = {replacement};
+    #[proctor(1)] *pointer + value
+}}
+"#
+            );
+            let document = extract_case(&source, "source_copy", "target", vec![0, 1]).unwrap();
+            let [observation] = document.observations.as_slice() else {
+                panic!("only the independent dereference should be observed: {document:?}");
+            };
+            let dereference = Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand: Box::new(binding("<id0>")),
+            };
+            assert_eq!(observation.source_expression, dereference);
+            assert_eq!(observation.target_expression, dereference);
+            assert_eq!(
+                observation.pointer_anchors,
+                [pointer_anchor(
+                    "<id0>",
+                    raw_pointer("i32", RawMutability::Const),
+                    shared_reference(primitive("i32")),
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_value_statement_counts_do_not_shift_outer_observations() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] if *pointer > 0 {
+        #[proctor(1)] Some({ let mut init: *const i32 = pointer; *init }).unwrap()
+    } else {
+        #[proctor(2)] 0
+    }
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] if *pointer > 0 {
+        #[proctor(1)] Some({ let selected = pointer; let result = *selected; result }).unwrap()
+    } else {
+        #[proctor(2)] 0
+    }
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1, 2]).unwrap();
+        let [observation] = document.observations.as_slice() else {
+            panic!("the outer condition should remain observable: {document:?}");
+        };
+        let dereference = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(binding("<id0>")),
+        };
+        assert_eq!(observation.source_expression, dereference);
+        assert_eq!(observation.target_expression, dereference);
+    }
+
+    #[test]
     fn referenced_preserved_local_still_requires_target_annotation() {
         let source = r#"
 unsafe fn source_copy(mut pointer: *const i32) -> i32 {

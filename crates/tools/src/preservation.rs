@@ -456,7 +456,7 @@ fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
             "preservation metadata requires one function skeleton",
         ));
     };
-    crate::skeleton::collect_opaque_nested_ifs(item, "").map_err(|error| {
+    crate::skeleton::collect_opaque_nested_expressions(item, "").map_err(|error| {
         metadata_error(
             "invalid_expected_skeleton",
             format!(
@@ -542,7 +542,7 @@ impl LabelTreeCollector {
             self.error = Some(metadata_error(
                 "invalid_expected_skeleton",
                 format!(
-                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                    "opaque value expression beneath label {label} must not contain statement labels"
                 ),
             ));
             return;
@@ -616,7 +616,7 @@ impl LabelTreeCollector {
             self.error = Some(metadata_error(
                 "invalid_expected_skeleton",
                 format!(
-                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                    "opaque value expression beneath label {label} must not contain statement labels"
                 ),
             ));
             true
