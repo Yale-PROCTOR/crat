@@ -2285,9 +2285,10 @@ const W67_VLA: &str = r#"
 /// `p1`). `d1`–`d8`: drops that are not such a `Vec`'s -- a `Box::from_raw`, a
 /// `Vec` formal, a struct holding a `Vec`, `drop_in_place` through a pointer, a
 /// `Vec` lent to a local function that swaps it, `mem::swap`, a reassignment
-/// from a call, elements with drop glue, a write through a `&mut` handle, and a
+/// from a call, elements with drop glue, a write through a `&mut` handle, a
 /// temporary, made fresh, that swaps buffers with a pointee before it is moved
-/// into the `Vec`.
+/// into the `Vec`, and a handle passed to a user `IndexMut` impl (std's trait
+/// method by name, a local body) that swaps in a pointee's buffer.
 const WVLA_SHAPES: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_variables, non_camel_case_types, non_snake_case, unused_mut, unused_assignments)]
 #[no_mangle] pub unsafe extern "C" fn p1_vla(mut q: *const u8, mut n: usize) -> u8 {
@@ -2372,6 +2373,23 @@ pub fn make() -> Vec<u8> { ::std::vec::from_elem(0, 4) }
     let mut t: Vec<u8> = Vec::new();
     ::std::mem::swap(&mut t, &mut *p);
     let v = t;
+    x
+}
+pub struct Sw(pub *mut Vec<u8>);
+impl<'a> ::std::ops::Index<&'a mut Vec<u8>> for Sw {
+    type Output = u8;
+    fn index(&self, _: &'a mut Vec<u8>) -> &u8 { unreachable!() }
+}
+impl<'a> ::std::ops::IndexMut<&'a mut Vec<u8>> for Sw {
+    fn index_mut(&mut self, v: &'a mut Vec<u8>) -> &mut u8 {
+        unsafe { ::std::mem::swap(v, &mut *self.0); &mut *v.as_mut_ptr() }
+    }
+}
+#[no_mangle] pub unsafe extern "C" fn d11_user_index_mut(mut q: *const u8, mut p: *mut Vec<u8>) -> u8 {
+    let x = *q;
+    let mut v: Vec<u8> = ::std::vec::from_elem(0, 1);
+    let mut s = Sw(p);
+    s[&mut v] = x;
     x
 }
 "#;
@@ -3259,7 +3277,7 @@ fn e5c_wvla_a_a_fresh_vec_drop_leaves_the_formals_ref() {
     }
 }
 
-/// W-VLA b: every other drop keeps its conflict. Each of `d1`–`d10`'s `q` has its
+/// W-VLA b: every other drop keeps its conflict. Each of `d1`–`d11`'s `q` has its
 /// `retirement-conflict` row.
 #[test]
 fn e5c_wvla_b_any_other_drop_keeps_its_retirement_conflict() {
@@ -3275,6 +3293,7 @@ fn e5c_wvla_b_any_other_drop_keeps_its_retirement_conflict() {
         "d8_boxed_elements",
         "d9_through_handle",
         "d10_temporary_swapped",
+        "d11_user_index_mut",
     ] {
         let row = w67_row(&rows, &format!("{function}::_1@d0"));
         assert_eq!(row[2], "retirement-conflict", "{row:?}");
@@ -3282,9 +3301,10 @@ fn e5c_wvla_b_any_other_drop_keeps_its_retirement_conflict() {
 }
 
 /// W-VLA c: the event. `p1`'s drop is a `FreshBuffer` release, resolved, whose
-/// object is the buffer of its `from_elem` call; every drop in `d1`–`d10` stays
-/// `UnresolvedDropEffects` -- `d9`'s and `d10`'s last drop of `v` among them: its
-/// buffer is the one written through the handle, or the one the temporary swapped in.
+/// object is the buffer of its `from_elem` call; every drop in `d1`–`d11` stays
+/// `UnresolvedDropEffects` -- `d9`'s, `d10`'s and `d11`'s last drop of `v` among them:
+/// its buffer is the one written through the handle, the one the temporary swapped
+/// in, or the one the user `index_mut` swapped in.
 #[test]
 fn e5c_wvla_c_the_inventory_resolves_the_fresh_vec_drop_alone() {
     let lines = w63_lines("wvla-shapes", &[("CRAT_E5C_WVLA_EVENTS", "1")]);
@@ -3324,6 +3344,7 @@ fn e5c_wvla_c_the_inventory_resolves_the_fresh_vec_drop_alone() {
         "d8_boxed_elements",
         "d9_through_handle",
         "d10_temporary_swapped",
+        "d11_user_index_mut",
     ] {
         let drops = drops(&format!("{function} "));
         assert!(!drops.is_empty(), "{function}: {lines:?}");
