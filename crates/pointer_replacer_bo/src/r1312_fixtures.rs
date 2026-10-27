@@ -397,6 +397,12 @@ fn nuke() -> String {
 
 /// One step-7 run of `source` with the writer on: (emitted lib.rs, subjects.tsv, class_collisions.tsv).
 fn run(tag: &str, source: &str) -> (String, String, String) {
+    let (emitted, subjects, collisions, _) = run_with_byte_views(tag, source);
+    (emitted, subjects, collisions)
+}
+
+/// [`run`], with the writer's `byte_view_receipts.tsv` (relay 371 step 2).
+fn run_with_byte_views(tag: &str, source: &str) -> (String, String, String, String) {
     let dir = std::env::temp_dir().join(format!("crat-r1312-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -406,7 +412,11 @@ fn run(tag: &str, source: &str) -> (String, String, String) {
         crate::bo_pipeline::rewrite_bo_with_artifacts(&dir.join("lib.rs"), [], Some(&artifacts));
     let emitted = std::fs::read_to_string(dir.join("lib.rs")).unwrap();
     let read = |name: &str| std::fs::read_to_string(artifacts.join(name)).unwrap_or_default();
-    let (subjects, collisions) = (read("subjects.tsv"), read("class_collisions.tsv"));
+    let (subjects, collisions, byte_views) = (
+        read("subjects.tsv"),
+        read("class_collisions.tsv"),
+        read("byte_view_receipts.tsv"),
+    );
     if let Some(out) = std::env::var_os("R370_OUT") {
         let out = PathBuf::from(out).join(tag);
         let _ = std::fs::remove_dir_all(&out);
@@ -438,7 +448,7 @@ fn run(tag: &str, source: &str) -> (String, String, String) {
         }
     }
     std::fs::remove_dir_all(&dir).unwrap();
-    (emitted, subjects, collisions)
+    (emitted, subjects, collisions, byte_views)
 }
 
 /// `label → (decision, reason, exclusion, outcome, first_hold_reason)` from subjects.tsv.
@@ -514,18 +524,88 @@ fn r1312_w_a1_identity_cast_does_not_hold_the_formal() {
 }
 
 /// A1 (byte view): the setter's formal reaches byte 27 of the caller's `[u32; 8]`; it must carry the
-/// caller's extent (a slice), never a thin `&mut u32` whose four bytes the write leaves.
+/// caller's extent (a slice), never a thin `&mut u32` whose four bytes the write leaves. Relay 371 step
+/// 2 (R1313-2): the formal is `&mut [uint32_t]`, the byte write goes through bytemuck's byte view, and
+/// `crypto_sign_signature` hands on its own array (8).
 #[test]
-#[ignore = "relay 371 step 2 (the cast-offset need): RED until that step"]
 fn r1312_w_a1_byte_offset_formal_is_a_slice() {
-    let (emitted, _, _) = run("w-a1b", &setters("leaf_addr"));
+    let (emitted, subjects, _, byte_views) = run_with_byte_views("w-a1b", &setters("leaf_addr"));
     let text = flat(&emitted);
+    let r = rows(&subjects);
     assert!(
         !text.contains("fn SPX_set_chain_addr(mut addr: &mut uint32_t"),
         "{emitted}"
     );
     assert!(
         !text.contains("fn __crat_safe_SPX_set_chain_addr(mut addr: &mut uint32_t"),
+        "{emitted}"
+    );
+    assert_eq!(r["SPX_set_chain_addr::addr"][0], "slice", "{r:#?}");
+    assert_eq!(r["SPX_set_chain_addr::addr"][3], "delivered", "{r:#?}");
+    assert!(
+        text.contains("fn SPX_set_chain_addr(mut addr: &mut [uint32_t]")
+            || text.contains("fn __crat_safe_SPX_set_chain_addr(mut addr: &mut [uint32_t]"),
+        "{emitted}"
+    );
+    assert!(
+        text.contains(
+            "bytemuck::cast_slice_mut::<u32, u8>(addr)[(SPX_OFFSET_CHAIN_ADDR) as usize] ="
+        ),
+        "{emitted}"
+    );
+    assert!(
+        !text.contains("SPX_set_chain_addr(tree_addr.as_mut_ptr().as_mut().unwrap()"),
+        "{emitted}"
+    );
+    // The byte-view receipt: the formal, its constant offset in bytes (27), the unit (1), the
+    // largest constant offset and the bytes it needs (28).
+    let row = byte_views
+        .lines()
+        .find(|line| line.starts_with("SPX_set_chain_addr::addr#"))
+        .unwrap_or_else(|| panic!("{byte_views}"));
+    assert!(
+        row.ends_with("\tu32-bytes\tplace\t27\t1\t27\t28"),
+        "{byte_views}"
+    );
+    assert!(
+        byte_views
+            .lines()
+            .any(|line| line.starts_with("SPX_set_tree_addr::addr#")
+                && line.ends_with("\tu32-bytes\tsuffix\t8\t1\t8\t9")),
+        "{byte_views}"
+    );
+}
+
+/// A1 (byte view), the other side of the rule: a constant byte range inside `size_of::<T>()` is not
+/// arithmetic past the referent, so P01's `SPX_set_layer_addr` (byte 3 of a `u32`) keeps its thin form.
+#[test]
+fn r1312_c_a1_inside_byte_range_keeps_thin() {
+    let source = setters("leaf_addr").replace(
+        "#[no_mangle]\npub unsafe extern \"C\" fn SPX_set_chain_addr(",
+        "pub const SPX_OFFSET_LAYER: core::ffi::c_int = 3 as core::ffi::c_int;
+#[no_mangle]
+pub unsafe extern \"C\" fn SPX_set_layer_addr(mut addr: *mut uint32_t, mut layer: uint32_t) {
+    *(addr as *mut core::ffi::c_uchar).offset(SPX_OFFSET_LAYER as isize) = layer as core::ffi::c_uchar;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn layer_only(mut l: uint32_t) -> uint32_t {
+    let mut word: uint32_t = 0 as core::ffi::c_int as uint32_t;
+    SPX_set_layer_addr(&mut word, l);
+    return word;
+}
+#[no_mangle]
+pub unsafe extern \"C\" fn SPX_set_chain_addr(",
+    );
+    assert!(
+        source.contains("fn SPX_set_layer_addr"),
+        "the fixture edit applied"
+    );
+    let (emitted, subjects, _) = run("c-a1-inside", &source);
+    let r = rows(&subjects);
+    assert_eq!(r["SPX_set_layer_addr::addr"][0], "ref", "{r:#?}");
+    assert_eq!(r["SPX_set_layer_addr::addr"][3], "delivered", "{r:#?}");
+    assert!(
+        flat(&emitted).contains("fn SPX_set_layer_addr(mut addr: &mut uint32_t"),
         "{emitted}"
     );
 }
@@ -541,18 +621,27 @@ fn r1312_w_a2_typedef_identity_cast_is_stripped() {
     }
 }
 
-/// A5: the two classes of one argument interval compose; neither is held for the collision.
+/// A5: the two classes of one argument interval compose; neither is held for the collision. Relay 371
+/// step 2: `addr` is a slice, its argument the byte view's suffix at `SPX_OFFSET_TREE`, and both
+/// subjects deliver.
 #[test]
-#[ignore = "relay 371 step 2 (the cast-offset need): RED until that step"]
 fn r1312_w_a5_collision_composes() {
-    let (_, subjects, _) = run("w-a5", &setters("leaf_addr"));
+    let (emitted, subjects, _) = run("w-a5", &setters("leaf_addr"));
     let r = rows(&subjects);
     for label in ["SPX_set_tree_addr::addr", "SPX_ull_to_bytes::out"] {
         assert!(
             !r[label][2].contains("cross-class-interval-collision"),
             "{label}: {r:#?}"
         );
+        assert_eq!(r[label][0], "slice", "{label}: {r:#?}");
+        assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
     }
+    assert!(
+        flat(&emitted).contains(
+            "SPX_ull_to_bytes((&mut bytemuck::cast_slice_mut::<u32, u8>(addr)[(SPX_OFFSET_TREE) as usize..])"
+        ),
+        "{emitted}"
+    );
 }
 
 /// B2: no one-element view (`core::slice::from_mut` / `from_ref`) reaches a slice-decided formal.
