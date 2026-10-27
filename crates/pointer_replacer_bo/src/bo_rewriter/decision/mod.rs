@@ -3901,7 +3901,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                         // emitted, because an unreachable arm that falls
                         // through is how a subject escapes its own gate once
                         // the premise stops holding.
-                        None => DegradeReason::CallSiteNotAdapted,
+                        None => {
+                            // Relay main/371 step 5 (A4): say why it is reached.
+                            if std::env::var("CRAT_BO_CSNA_DEBUG").as_deref() == Ok("on") {
+                                eprintln!(
+                                    "[call-site-not-adapted] {}: not a co-conversion node (no class, no node block); the hypothetical decided {}",
+                                    subject.label,
+                                    cc.hypothetical_form(key)
+                                );
+                            }
+                            DegradeReason::CallSiteNotAdapted
+                        }
                     },
                 };
                 return degrade(subject, decl_site, reason);

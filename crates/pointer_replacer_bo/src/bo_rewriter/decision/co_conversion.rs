@@ -509,9 +509,20 @@ pub(crate) struct CoConv {
     node_block: FxHashMap<NodeKey, BlockReason>,
     edges: Vec<EdgeObligation>,
     pair_sites: Vec<PairSiteDecision>,
+    /// Relay main/371 step 5 (A4): the hypothetical's form of every subject (with the reason when
+    /// it degraded), so the class gate's fall-through can say why a subject production takes thin is
+    /// not a node.
+    hypothetical_form: FxHashMap<NodeKey, String>,
 }
 
 impl CoConv {
+    /// The hypothetical's form of `key` (`absent` when the hypothetical has no row for it).
+    pub(crate) fn hypothetical_form(&self, key: NodeKey) -> &str {
+        self.hypothetical_form
+            .get(&key)
+            .map_or("absent", String::as_str)
+    }
+
     /// Would this subject convert, given its class? **Task 3's entry point.**
     ///
     /// A subject that is not a node at all answers `false`: it did not reach
@@ -896,6 +907,23 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
         .entries
         .iter()
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let hypothetical_form = decision_of
+        .iter()
+        .map(|(key, decision)| {
+            let form = match decision {
+                Decision::Ref { .. } | Decision::InferredRef { .. } => "ref".to_owned(),
+                Decision::Slice { .. } => "slice".to_owned(),
+                Decision::NestedSlice { .. } => "nested-slice".to_owned(),
+                Decision::Opt { .. } => "opt".to_owned(),
+                Decision::Box(_) => "box".to_owned(),
+                Decision::Cursor { .. } => "cursor".to_owned(),
+                Decision::Degraded(degradation) => {
+                    format!("degraded:{}", degradation.reason.key())
+                }
+            };
+            (*key, form)
+        })
         .collect::<FxHashMap<_, _>>();
     let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let converts: FxHashSet<NodeKey> = order.iter().copied().collect();
@@ -1786,6 +1814,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_role
         node_block,
         edges,
         pair_sites,
+        hypothetical_form,
     }
 }
 
