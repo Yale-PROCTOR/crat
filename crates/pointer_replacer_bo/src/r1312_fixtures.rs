@@ -353,6 +353,14 @@ pub unsafe extern \"C\" fn blake_absorb(mut data: *const core::ffi::c_uchar, mut
     }
     return acc;
 }
+#[no_mangle]
+pub unsafe extern \"C\" fn interleave_constant(mut out: *mut core::ffi::c_ulonglong, mut n: core::ffi::c_int) {
+    let mut i: core::ffi::c_int = 0 as core::ffi::c_int;
+    while i < n {
+        *(&mut *out.offset(i as isize)) = 0 as core::ffi::c_int as core::ffi::c_ulonglong;
+        i += 1;
+    }
+}
 unsafe extern \"C\" fn cp_make32(mut b: *const core::ffi::c_uchar) -> core::ffi::c_uint {
     return (*b.offset(0 as core::ffi::c_int as isize) as core::ffi::c_uint) << 24 as core::ffi::c_int
         | *b.offset(3 as core::ffi::c_int as isize) as core::ffi::c_uint;
@@ -793,18 +801,35 @@ fn r1312_w_b_test_vector_runs() {
     );
 }
 
-/// A3: an offset argument takes the element / sub-slice form, the negative offset a cursor. None of the three
-/// is held `slice-cursor-use`.
+/// A3, the slice forms (relay 371 step 4): an offset argument whose subject's sign verdict is non-negative
+/// takes the suffix view (`memcpy((&mut (x)[(i) as usize..]).as_mut_ptr()…)`), and the element place
+/// `*(&mut *out.offset(i)) = v` is `out[i] = v`.
 #[test]
-#[ignore = "relay 371 step 4 (A3): RED until that step"]
 fn r1312_w_a3_offset_arguments_deliver() {
-    let (_, subjects, _) = run("w-a3", &format!("{PRE}{A3}"));
+    let (emitted, subjects, _) = run("w-a3", &format!("{PRE}{A3}"));
     let r = rows(&subjects);
-    for label in [
-        "randombytes::x",
-        "merge_sort_iteration::a",
-        "cp_get_chunk_byte_length::chunk",
-    ] {
+    let text = flat(&emitted);
+    for label in ["randombytes::x", "interleave_constant::out"] {
+        assert_eq!(r[label][0], "slice", "{label}: {r:#?}");
+        assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
+    }
+    assert!(
+        text.contains("memcpy((&mut (x)[(i) as usize..])"),
+        "{emitted}"
+    );
+    assert!(text.contains("out[(i) as usize] ="), "{emitted}");
+}
+
+/// A3, the cursor family's two (relay 371 step 4): `merge_sort_iteration::a` hands `a.offset(j)` with
+/// `j = n - 1` (a `Top` index) to a thin formal, an arm the parameter cursor does not have; and
+/// `cp_get_chunk_byte_length::chunk`'s `chunk.offset(-8)` is a `Neg` index at a parameter cursor, which
+/// `wrapper::build` holds (R608-1 / SC-2). Neither is built in step 4.
+#[test]
+#[ignore = "relay 371 step 4: the cursor family's (a Top-index argument arm; a Neg index at a parameter cursor, R608-1 / SC-2) -- the seat's"]
+fn r1312_w_a3_cursor_offset_arguments_deliver() {
+    let (_, subjects, _) = run("w-a3c", &format!("{PRE}{A3}"));
+    let r = rows(&subjects);
+    for label in ["merge_sort_iteration::a", "cp_get_chunk_byte_length::chunk"] {
         assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
     }
 }
