@@ -1875,6 +1875,86 @@ impl MutVisitor for TypeParenRemover {
 struct ProctorLabelRemover;
 
 impl MutVisitor for ProctorLabelRemover {
+    fn visit_expr_field(&mut self, field: &mut rustc_ast::ExprField) {
+        field
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_expr_field(self, field);
+    }
+
+    fn visit_pat_field(&mut self, field: &mut rustc_ast::PatField) {
+        field
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_pat_field(self, field);
+    }
+
+    fn visit_field_def(&mut self, field: &mut rustc_ast::FieldDef) {
+        field
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_field_def(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &mut rustc_ast::Variant) {
+        variant
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_variant(self, variant);
+    }
+
+    fn visit_where_predicate(&mut self, predicate: &mut rustc_ast::WherePredicate) {
+        predicate
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_where_predicate(self, predicate);
+    }
+
+    fn visit_foreign_item(&mut self, item: &mut rustc_ast::ForeignItem) {
+        item.attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_item(self, item);
+    }
+
+    fn visit_assoc_item(&mut self, item: &mut rustc_ast::AssocItem, ctxt: visit::AssocCtxt) {
+        item.attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_assoc_item(self, item, ctxt);
+    }
+
+    fn visit_crate(&mut self, krate: &mut Crate) {
+        krate
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_crate(self, krate);
+    }
+
+    fn visit_item(&mut self, item: &mut Item) {
+        item.attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_item(self, item);
+    }
+
+    fn visit_param(&mut self, param: &mut rustc_ast::Param) {
+        param
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_param(self, param);
+    }
+
+    fn visit_generic_param(&mut self, param: &mut rustc_ast::GenericParam) {
+        param
+            .attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_generic_param(self, param);
+    }
+
+    fn visit_arm(&mut self, arm: &mut rustc_ast::Arm) {
+        arm.attrs
+            .retain(|attribute| !is_proctor_attribute(attribute));
+        mut_visit::walk_arm(self, arm);
+    }
+
     fn flat_map_stmt(&mut self, mut statement: Stmt) -> SmallVec<[Stmt; 1]> {
         if !matches!(statement.kind, StmtKind::Empty) {
             statement_attrs_mut(&mut statement)

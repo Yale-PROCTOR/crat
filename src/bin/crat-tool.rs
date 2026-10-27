@@ -48,6 +48,25 @@ enum Command {
         output: PathBuf,
         input: PathBuf,
     },
+    PrepareUnstructuredRepair {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    ReplaceUnstructuredScc {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        current_project: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        input: PathBuf,
+    },
     AddFunctions {
         #[arg(long)]
         frozen: PathBuf,
@@ -576,6 +595,93 @@ fn main() {
                 std::process::exit(1);
             });
             std::fs::write(output, normalized).unwrap();
+        }
+        Command::PrepareUnstructuredRepair {
+            frozen,
+            request,
+            output,
+        } => {
+            validate_output_input_paths(&[&output], &[&frozen, &request])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::UnstructuredPreparationRequest = serde_json::from_str(
+                &std::fs::read_to_string(&request)
+                    .unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let prepared =
+                tools::prepare_unstructured_repair(&read_frozen_project(&frozen), &request)
+                    .unwrap_or_else(|error| replacement_failure(error));
+            let json = serde_json::to_string_pretty(&prepared).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::ReplaceUnstructuredScc {
+            frozen,
+            request,
+            current_project,
+            output,
+            input,
+        } => {
+            let analysis_path = input.join(
+                utils::find_lib_path(&input).unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            let partial_path = current_project.join(
+                utils::find_lib_path(&current_project)
+                    .unwrap_or_else(|error| fail("project_layout", error)),
+            );
+            validate_output_input_paths(
+                &[&output],
+                &[&frozen, &request, &analysis_path, &partial_path],
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            validate_outputs_outside_projects(&[&output], &[&input, &current_project])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::UnstructuredReplacementRequest = serde_json::from_str(
+                &std::fs::read_to_string(&request)
+                    .unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let frozen_bytes =
+                std::fs::read(&frozen).unwrap_or_else(|error| fail("frozen_io", error));
+            let frozen = tools::frozen_project_from_json(
+                std::str::from_utf8(&frozen_bytes).unwrap_or_else(|error| fail("frozen_io", error)),
+            )
+            .unwrap_or_else(|error| replacement_failure(error));
+            let source = std::fs::read_to_string(&analysis_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            let partial = std::fs::read_to_string(&partial_path)
+                .unwrap_or_else(|error| fail("source_io", error));
+            tools::check_frozen_project_sources(&frozen, &source, Some(&partial), true)
+                .unwrap_or_else(|error| replacement_failure(error));
+            let response = match tools::replace_unstructured_scc(&frozen, &request) {
+                Ok(replacement) => serde_json::json!({
+                    "status": "valid",
+                    "candidate_sha256": tools::sha256_hex(replacement.source.as_bytes()),
+                    "frozen_project_sha256": tools::sha256_hex(&frozen_bytes),
+                    "source": replacement.source,
+                    "new_correspondence": replacement.new_correspondence,
+                }),
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        tools::ReplacementErrorKind::InvalidTransformation
+                    ) =>
+                {
+                    serde_json::json!({
+                        "status": "invalid",
+                        "diagnostics": error.message,
+                        "failed_transformation": tools::strip_proctor_labels(&request.transformation).ok(),
+                    })
+                }
+                Err(error) => replacement_failure(error),
+            };
+            let json = serde_json::to_string_pretty(&response).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::AddFunctions {
             frozen,

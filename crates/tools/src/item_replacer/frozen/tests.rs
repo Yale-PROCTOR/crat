@@ -470,3 +470,248 @@ fn unfilled_stub_metadata_identifies_only_exact_current_whole_function_stubs() {
     let (_, repaired) = metadata(&frozen, &mixed);
     assert!(repaired.unfilled_stub_items.is_empty());
 }
+
+#[test]
+fn unstructured_preparation_strips_labels_and_selects_latest_parseable_candidate() {
+    let frozen = freeze("pub unsafe fn target(x: i32) -> i32 { x + 1 }");
+    let request = UnstructuredPreparationRequest {
+        members: vec![frozen.functions[0].record.id],
+        transformations: vec![
+            "unsafe fn target(mut x: i32) -> i32 { #[proctor(0)] x }".to_owned(),
+            "unsafe fn target(mut x: i32) -> i32 { #[proctor(0)] let text = \"#[proctor(99)]\"; #[proctor(1)] x + 1 }".to_owned(),
+            "unsafe fn target(".to_owned(),
+        ],
+    };
+    let prepared = prepare_unstructured_repair(&frozen, &request).unwrap();
+    let candidate = prepared.candidate.unwrap();
+    assert!(!candidate.contains("#[proctor(0)]") && !candidate.contains("#[proctor(1)]"));
+    assert!(candidate.contains("\"#[proctor(99)]\""));
+    assert!(candidate.contains("x + 1"));
+    assert!(!prepared.targets[0].source.contains("#[proctor("));
+    assert_eq!(
+        prepared.targets[0].signature,
+        frozen.functions[0].record.target_signature
+    );
+    for transformations in [vec![], vec!["unsafe fn target(".to_owned()]] {
+        let prepared = prepare_unstructured_repair(
+            &frozen,
+            &UnstructuredPreparationRequest {
+                members: request.members.clone(),
+                transformations,
+            },
+        )
+        .unwrap();
+        assert!(prepared.candidate.is_none());
+    }
+}
+
+#[test]
+fn unstructured_stripping_handles_misplaced_labels_in_failed_function_output() {
+    let stripped = strip_proctor_labels("#![proctor(0)] #[allow(dead_code)] #[proctor(1)] unsafe fn target<#[proctor(2)] 'a>(#[proctor(3)] x: &'a i32) -> i32 { match *x { #[proctor(4)] _ => 1 } }").unwrap();
+    assert!(!stripped.contains("proctor"));
+    assert!(stripped.contains("allow(dead_code)"));
+    assert!(stripped.contains("match *x"));
+    for source in [
+        "unsafe fn target() { let S { #[proctor(7)] x } = S { #[proctor(8)] x: 1 }; }",
+        "struct S { #[proctor(1)] x: i32 } enum E { #[proctor(2)] A } extern \"C\" { #[proctor(3)] fn external(); } impl S { #[proctor(4)] fn helper() {} }",
+        "unsafe fn target<T>() where #[proctor(5)] T: Copy {}",
+    ] {
+        let stripped = strip_proctor_labels(source).unwrap();
+        assert!(!stripped.contains("proctor"), "{stripped}");
+    }
+}
+
+#[test]
+fn unstructured_rewrites_use_frozen_headers_and_assemble_after_free_body_changes() {
+    let frozen = freeze("#[no_mangle] pub unsafe extern \"C\" fn target(x: i32) -> i32 { x + 1 }");
+    let signature = frozen.functions[0]
+        .record
+        .target_signature
+        .replace(": i32", ": (i32)");
+    let replacement = replace_unstructured_scc(&frozen, &UnstructuredReplacementRequest {
+        members: vec![frozen.functions[0].record.id],
+        transformation: format!("{signature} {{ let new_name = x + 1; for value in 0..0 {{ let _ = value; }} new_name }}"),
+    }).unwrap();
+    assert!(!replacement.source.contains("#[proctor("));
+    assert!(replacement.source.contains("extern \"C\""));
+    assert!(replacement.source.contains("no_mangle"));
+    assert_eq!(
+        replacement.new_correspondence,
+        vec![correspondence(&frozen.functions[0].record)]
+    );
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![frozen.functions[0].record.id],
+            source: replacement.source,
+        }],
+    )
+    .unwrap();
+    assert!(assembled.contains("new_name"));
+    run_compiler_on_str(&assembled, |_| ()).unwrap();
+}
+
+#[test]
+fn unstructured_rejects_wrong_signatures_labels_unsafe_items_and_whole_function_stubs() {
+    let frozen = freeze("pub unsafe fn target(x: i32) -> i32 { x + 1 }");
+    for transformation in [
+        "unsafe fn target(mut x: i64) -> i32 { 0 }",
+        "unsafe fn target(mut x: i32) -> i64 { 0 }",
+        "unsafe fn target<'a>(mut x: i32) -> i32 { 0 }",
+        "unsafe fn target(mut y: i32) -> i32 { 0 }",
+        "fn target(mut x: i32) -> i32 { 0 }",
+        "const unsafe fn target(mut x: i32) -> i32 { 0 }",
+        "unsafe fn target(mut x: i32) -> i32 { #[proctor(0)] x }",
+        "unsafe fn target(mut x: i32) -> i32 { #[allow(unused)] let z = x; z }",
+        "unsafe fn target(mut x: i32) -> i32 { unsafe { x } }",
+        "unsafe fn target(mut x: i32) -> i32 { (|| unsafe { x })() }",
+        "unsafe fn target(mut x: i32) -> i32 { fn extra() {} x }",
+        "unsafe fn target(mut x: i32) -> i32 { (|| { use std::mem; x })() }",
+        "unsafe fn target(mut x: i32) -> i32 { todo!() }",
+        "unsafe fn target(mut x: i32) -> i32;",
+        "unsafe fn target(mut x: i32) -> i32 { x } fn extra() {}",
+        "unsafe fn other(mut x: i32) -> i32 { x }",
+        "unsafe fn target(",
+    ] {
+        let error = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![frozen.functions[0].record.id],
+                transformation: transformation.to_owned(),
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("admitted {transformation}"));
+        assert!(
+            matches!(error.kind, ReplacementErrorKind::InvalidTransformation),
+            "{transformation}: {}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn unstructured_preserves_other_scc_stubs_and_rejects_invalid_members() {
+    let frozen = freeze(
+        "pub unsafe fn first(x: i32) -> i32 { x } pub unsafe fn second(x: i32) -> i32 { x }",
+    );
+    let mut accepted = vec![];
+    for function in &frozen.functions {
+        let replacement = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation: format!("{} {{ x }}", function.record.target_signature),
+            },
+        )
+        .unwrap();
+        assert_eq!(replacement.source.matches("todo!()").count(), 1);
+        accepted.push(AcceptedScc {
+            members: vec![function.record.id],
+            source: replacement.source,
+        });
+    }
+    let assembled = assemble_frozen_project(&frozen, &accepted).unwrap();
+    assert!(!assembled.contains("todo!()"));
+    run_compiler_on_str(&assembled, |_| ()).unwrap();
+    for members in [vec![], vec![u64::MAX], vec![0, 0], vec![1, 0]] {
+        let error = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members,
+                transformation: String::new(),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error.kind, ReplacementErrorKind::InvalidRequest));
+    }
+}
+
+#[test]
+fn unstructured_preserves_frozen_lifetimes_and_pointer_target_types() {
+    let source = "pub unsafe fn read(p: *const i32) -> i32 { *p.add(1) }";
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let mut records = crate::make_skeletons(source, tcx).unwrap();
+        for item in &mut records {
+            let crate::ItemRecord::Function(record) = item else { continue };
+            record.baseline = pointer_view("read", "*p.add(1)");
+            record.applied = record.baseline.clone();
+            record.target_signature = "unsafe fn read<'a>(mut p: &'a [i32]) -> i32".to_owned();
+        }
+        freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    let signature = &frozen.functions[0].record.target_signature;
+    assert!(signature.contains("<'") && signature.contains("[i32]"));
+    let replacement = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![frozen.functions[0].record.id],
+            transformation: format!("{signature} {{ p[1] }}"),
+        },
+    )
+    .unwrap();
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![frozen.functions[0].record.id],
+            source: replacement.source,
+        }],
+    )
+    .unwrap();
+    run_compiler_on_str(&assembled, |_| ()).unwrap();
+    let changed = signature.replacen('<', "<'unused, ", 1);
+    assert!(
+        replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![frozen.functions[0].record.id],
+                transformation: format!("{changed} {{ p[1] }}"),
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unstructured_rewrites_every_member_of_a_recursive_scc_together() {
+    let frozen = freeze(
+        "pub unsafe fn even(x: u32) -> bool { if x == 0 { true } else { odd(x - 1) } } pub unsafe fn odd(x: u32) -> bool { if x == 0 { false } else { even(x - 1) } }",
+    );
+    let members = frozen
+        .functions
+        .iter()
+        .map(|function| function.record.id)
+        .collect::<Vec<_>>();
+    let transformation = frozen
+        .functions
+        .iter()
+        .map(|function| {
+            format!(
+                "{} {{ x % 2 == {} }}",
+                function.record.target_signature,
+                if function.record.name == "even" { 0 } else { 1 }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let replacement = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: members.clone(),
+            transformation,
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement.new_correspondence.len(), 2);
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members,
+            source: replacement.source,
+        }],
+    )
+    .unwrap();
+    run_compiler_on_str(&assembled, |_| ()).unwrap();
+}
