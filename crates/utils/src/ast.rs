@@ -1,8 +1,17 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use etrace::some_or;
 use rustc_ast::{ptr::P, *};
 use rustc_ast_pretty::pprust;
+use rustc_errors::{
+    DiagInner,
+    emitter::Emitter,
+    registry::Registry,
+    translation::{Translator, to_fluent_args},
+};
 use rustc_middle::ty::TyCtxt;
 use rustc_parse::parser::{AttemptLocalParseRecovery, ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
@@ -272,7 +281,10 @@ pub fn transform_ast<F: std::ops::FnMut(&mut Crate) -> bool>(
 
 #[inline]
 pub fn new_parse_sess() -> ParseSess {
-    ParseSess::with_fatal_emitter(vec![], "".to_string())
+    ParseSess::with_fatal_emitter(
+        rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+        String::new(),
+    )
 }
 
 #[inline]
@@ -286,6 +298,82 @@ pub fn parse_crate(krate: String) -> Crate {
     let parse_sess = new_parse_sess();
     let mut parser = new_parser_from_str(&parse_sess, krate);
     parser.parse_crate_mod().unwrap()
+}
+
+struct ParseEmitter {
+    translator: Translator,
+    diagnostics: Arc<Mutex<Vec<String>>>,
+}
+
+impl Emitter for ParseEmitter {
+    fn source_map(&self) -> Option<&rustc_span::source_map::SourceMap> {
+        None
+    }
+
+    fn translator(&self) -> &Translator {
+        &self.translator
+    }
+
+    fn emit_diagnostic(&mut self, diagnostic: DiagInner, _: &Registry) {
+        if !diagnostic.is_error() {
+            return;
+        }
+        let arguments = to_fluent_args(diagnostic.args.iter());
+        let mut messages = vec![
+            self.translator
+                .translate_messages(&diagnostic.messages, &arguments)
+                .into_owned(),
+        ];
+        messages.extend(diagnostic.children.iter().map(|child| {
+            self.translator
+                .translate_messages(&child.messages, &arguments)
+                .into_owned()
+        }));
+        messages.extend(
+            diagnostic
+                .suggestions
+                .unwrap_tag()
+                .iter()
+                .map(|suggestion| {
+                    self.translator
+                        .translate_message(&suggestion.msg, &arguments)
+                        .unwrap()
+                        .into_owned()
+                }),
+        );
+        self.diagnostics.lock().unwrap().push(messages.join("\n"));
+    }
+}
+
+pub fn try_parse_crate(krate: String) -> Result<Crate, String> {
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let parse_sess = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    parse_sess.dcx().set_emitter(Box::new(ParseEmitter {
+        translator: rustc_driver::default_translator(),
+        diagnostics: Arc::clone(&diagnostics),
+    }));
+    let parsed = rustc_driver::catch_fatal_errors(|| {
+        let mut parser = rustc_parse::new_parser_from_source_str(
+            &parse_sess,
+            FileName::Custom("main.rs".to_owned()),
+            krate,
+        )
+        .map_err(|errors| {
+            for error in errors {
+                error.emit();
+            }
+        })?;
+        parser.parse_crate_mod().map_err(|error| {
+            error.emit();
+        })
+    });
+    parse_sess.dcx().emit_stashed_diagnostics();
+    let has_errors = parse_sess.dcx().has_errors_or_delayed_bugs().is_some();
+    drop(parse_sess);
+    match parsed {
+        Ok(Ok(krate)) if !has_errors => Ok(krate),
+        _ => Err(diagnostics.lock().unwrap().join("\n")),
+    }
 }
 
 #[macro_export]
@@ -465,4 +553,50 @@ macro_rules! attr {
     ($($arg:tt)*) => {{
         $crate::ast::parse_attr(format!($($arg)*))
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_parser_rejects_recovered_errors_and_returns_diagnostics() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for (source, expected) in [
+                    (
+                        "fn f(x: i8) -> bool { x as u8 as i32 < 0xa0 }",
+                        "not a comparison",
+                    ),
+                    (
+                        "fn f(x: i32) -> bool { 0 < x < 10 }",
+                        "comparison operators cannot be chained",
+                    ),
+                ] {
+                    let diagnostic = try_parse_crate(source.to_owned()).unwrap_err();
+                    assert!(diagnostic.contains(expected), "{diagnostic}");
+                }
+                let diagnostic = try_parse_crate("fn f( {".to_owned()).unwrap_err();
+                assert!(!diagnostic.is_empty());
+                let diagnostic = try_parse_crate("fn f() { let _ = \"".to_owned()).unwrap_err();
+                assert!(diagnostic.contains("unterminated"), "{diagnostic}");
+            },
+        );
+    }
+
+    #[test]
+    fn crate_parser_accepts_corrected_input_after_errors() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                assert!(try_parse_crate("fn f( {".to_owned()).is_err());
+                let krate =
+                    try_parse_crate("fn f(x: i8) -> bool { (x as u8 as i32) < 0xa0 }".to_owned())
+                        .unwrap();
+                assert_eq!(krate.items.len(), 1);
+                assert!(try_parse_crate(String::new()).unwrap().items.is_empty());
+            },
+        );
+    }
 }

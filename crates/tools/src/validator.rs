@@ -656,9 +656,10 @@ fn validate_no_nested_control(expression: &Expr, role: &str) -> Result<(), Strin
 fn parse_crate(source: &str) -> Result<Crate, String> {
     rustc_span::create_session_if_not_set_then(rustc_span::edition::Edition::Edition2021, |_| {
         catch_unwind(AssertUnwindSafe(|| {
-            utils::ast::parse_crate(source.to_owned())
+            utils::ast::try_parse_crate(source.to_owned())
         }))
         .map_err(|_| "the Rust parser rejected the snippet".to_owned())
+        .and_then(|parsed| parsed)
     })
 }
 

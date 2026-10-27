@@ -1332,10 +1332,63 @@ fn invalid_expected_skeleton_is_setup_error() {
 
 #[test]
 fn result_parse_error_is_global() {
-    assert_eq!(
-        codes(&validate(&request(UNIT_SKELETON, "unsafe fn f( {"))),
-        ["result_parse_error"]
+    for (source, expected) in [
+        ("unsafe fn f( {", "unclosed delimiter"),
+        ("unsafe fn f() { let _ = \"", "unterminated"),
+    ] {
+        let response = validate(&request(UNIT_SKELETON, source));
+        assert_eq!(codes(&response), ["result_parse_error"]);
+        let ValidationResponse::Invalid { failures } = response else { panic!() };
+        assert_eq!(failures[0].id, None);
+        assert!(failures[0].errors[0].message.contains(expected));
+    }
+}
+
+#[test]
+fn recovered_parse_errors_are_global_and_informative() {
+    let skeleton = "unsafe fn f(string: &[i8]) -> bool { #[proctor(0)] todo!() }";
+    for (transformation, expected) in [
+        (
+            "unsafe fn f(string: &[i8]) -> bool { #[proctor(0)] string[1] as u8 as i32 < 0xa0 }",
+            "not a comparison",
+        ),
+        (
+            "unsafe fn f(string: &[i8]) -> bool { #[proctor(0)] 0 < string[1] < 10 }",
+            "comparison operators cannot be chained",
+        ),
+    ] {
+        let response = validate(&request(skeleton, transformation));
+        assert_eq!(codes(&response), ["result_parse_error"]);
+        let ValidationResponse::Invalid { failures } = response else { panic!() };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].id, None);
+        assert!(failures[0].errors[0].message.contains(expected));
+        if expected == "not a comparison" {
+            assert!(
+                failures[0].errors[0]
+                    .message
+                    .contains("try comparing the cast value")
+            );
+        }
+        let json =
+            validate_json(&serde_json::to_string(&request(skeleton, transformation)).unwrap());
+        assert!(json.contains("\"status\": \"invalid\""));
+        assert!(json.contains("\"code\": \"result_parse_error\""));
+    }
+    assert_valid(
+        skeleton,
+        "unsafe fn f(string: &[i8]) -> bool { #[proctor(0)] (string[1] as u8 as i32) < 0xa0 }",
     );
+}
+
+#[test]
+fn recovered_expected_parse_error_is_setup_error() {
+    let malformed =
+        "unsafe fn f(string: &[i8]) -> bool { #[proctor(0)] string[1] as u8 as i32 < 0xa0 }";
+    let response = validate(&request(malformed, "unsafe fn f() {}"));
+    assert_eq!(codes(&response), ["expected_skeleton_parse_error"]);
+    let ValidationResponse::SetupError { error } = response else { panic!() };
+    assert!(error.message.contains("not a comparison"));
 }
 
 #[test]

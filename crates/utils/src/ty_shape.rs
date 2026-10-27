@@ -85,7 +85,9 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
                 };
                 let Res::Def(_, def_id) = path.res else { unreachable!() };
                 let local_def_id = def_id.expect_local();
-                if tcx.is_automatically_derived(item_id.owner_id.def_id.to_def_id()) {
+                if !imp.items.is_empty()
+                    && tcx.is_automatically_derived(item_id.owner_id.def_id.to_def_id())
+                {
                     let fields: Vec<_> = imp
                         .items
                         .chunks(2)
@@ -305,5 +307,86 @@ impl TyShape<'_, '_> {
             Self::Array(t, _) | Self::Slice(t) => t.len(),
             Self::Struct(len, _, _) => *len,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags_type(tcx: TyCtxt<'_>) -> Ty<'_> {
+        let flags = tcx
+            .hir_free_items()
+            .find(|item_id| {
+                tcx.hir_item(*item_id)
+                    .kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "Flags")
+            })
+            .unwrap();
+        tcx.type_of(flags.owner_id.def_id).instantiate_identity()
+    }
+
+    #[test]
+    fn empty_generated_impl_retains_only_physical_fields() {
+        crate::compilation::run_compiler_on_str(
+            r#"
+#[repr(C)]
+pub struct Flags {
+    pub ready_busy: [u8; 1],
+    pub c2rust_padding: [u8; 7],
+}
+#[automatically_derived]
+impl Flags {}
+pub fn keep(value: Flags) -> Flags { value }
+"#,
+            |tcx| {
+                let arena = Arena::new();
+                let shapes = get_ty_shapes(&arena, tcx, false);
+                assert!(shapes.bitfields.is_empty());
+                let TyShape::Struct(len, fields, false) = shapes.tys[&flags_type(tcx)] else {
+                    panic!("expected physical struct fields");
+                };
+                assert_eq!(*len, 2);
+                assert_eq!(fields.len(), 2);
+                assert!(matches!(fields[0].1, TyShape::Array(_, 1)));
+                assert!(matches!(fields[1].1, TyShape::Array(_, 7)));
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn populated_bitfields_retain_logical_fields() {
+        crate::compilation::run_compiler_on_str(
+            r#"
+use c2rust_bitfields::BitfieldStruct;
+#[repr(C)]
+#[derive(BitfieldStruct)]
+pub struct Flags {
+    #[bitfield(name = "ready", ty = "u8", bits = "0..=0")]
+    #[bitfield(name = "busy", ty = "u8", bits = "1..=1")]
+    pub ready_busy: [u8; 1],
+    pub c2rust_padding: [u8; 7],
+}
+pub fn read(value: Flags) -> u8 { value.ready() }
+"#,
+            |tcx| {
+                let arena = Arena::new();
+                let shapes = get_ty_shapes(&arena, tcx, false);
+                let flags = flags_type(tcx);
+                let bitfields = shapes.bitfields.values().next().unwrap();
+                assert_eq!(bitfields.len(), 2);
+                assert_eq!(bitfields.name_to_idx["ready"], FieldIdx::from_usize(2));
+                assert_eq!(bitfields.name_to_idx["busy"], FieldIdx::from_usize(3));
+                assert_eq!(bitfields.fields[&FieldIdx::from_usize(2)].1, "u8");
+                let TyShape::Struct(len, fields, false) = shapes.tys[&flags] else {
+                    panic!("expected physical and logical struct fields");
+                };
+                assert_eq!(*len, 4);
+                assert_eq!(fields.len(), 4);
+            },
+        )
+        .unwrap();
     }
 }
