@@ -422,7 +422,39 @@ fn e5c_w264_n4_a_formal_survives_a_drop() {
             );
         });
     });
+    with_program(DROP_BEHIND, |program| {
+        with_body(program, "drop_behind", |function, body, facts| {
+            let pp = named_local(body, "pp");
+            let (at, after) = drop_of(body, named_local(body, "noisy"));
+            assert_eq!(
+                cell(facts, function, at, pp, 1),
+                input(function, pp, 1),
+                "`pp`'s depth-1 cell is exact before the drop, or this half is vacuous"
+            );
+            assert_eq!(cell(facts, function, after, pp, 0), input(function, pp, 0));
+            let behind = cell(facts, function, after, pp, 1);
+            assert!(
+                behind.unknown,
+                "drop glue may write memory behind a pointer: {behind:?}"
+            );
+        });
+    });
 }
+
+/// N4's second shape: a guard with a user `Drop` and no call before it, so a
+/// `**` formal's depth-1 cell is exact up to the drop.
+const DROP_BEHIND: &str = r#"
+pub struct Noisy(u8);
+impl Drop for Noisy {
+    fn drop(&mut self) {}
+}
+pub unsafe fn drop_behind(pp: *mut *mut u8) -> *mut u8 {
+    {
+        let noisy = Noisy(0);
+    }
+    *pp
+}
+"#;
 
 /// N4b: end to end, the same survival across the body's own `Vec` drop clears
 /// the routed drop's conflict.
@@ -494,6 +526,10 @@ pub unsafe fn walk(p: *mut u8, n: isize) -> u8 {
     let d = (p as *const u8).add(1);
     *c + *d
 }
+pub unsafe fn walk_deep(pp: *mut *mut u8) -> *mut u8 {
+    let q = pp.add(1);
+    *q
+}
 "#;
 
 /// O1: `offset` / `add` / `sub` of `core::ptr` keep the receiver's objects.
@@ -510,6 +546,15 @@ fn e5c_w264_o1_offset_add_sub_keep_the_receiver_s_objects() {
                     "`{name}` points into `p`'s object"
                 );
             }
+        });
+        // Only depth 0 is carried: `*q` is another element than `*pp`.
+        with_body(program, "walk_deep", |function, body, facts| {
+            let pp = named_local(body, "pp");
+            let q = named_local(body, "q");
+            let at = after_call_into(body, q);
+            assert_eq!(cell(facts, function, at, q, 0), input(function, pp, 0));
+            let behind = cell(facts, function, at, q, 1);
+            assert!(behind.unknown, "`*q` is not `*pp`: {behind:?}");
         });
     });
 }
@@ -573,4 +618,52 @@ fn e5c_w264_o2_a_name_match_is_not_pointer_arithmetic() {
             }
         });
     });
+}
+
+/// N6's shape (the adversarial review of `4a79ab406`): `x`'s address is copied
+/// into `px`, `x` is then written directly, and its value is read back through
+/// `px` and freed. The free releases `sig`'s object. `stale_store` adds a store
+/// through another formal after the read, which before N clobbered `y`.
+const STALE_THROUGH_ADDRESS: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn free(p: *mut core::ffi::c_void); }
+pub unsafe fn stale(sig: *mut u8) {
+    let mut x = malloc(8);
+    let px = &raw mut x;
+    x = sig;
+    let y = *px;
+    free(y as *mut core::ffi::c_void);
+}
+pub unsafe fn stale_store(sig: *mut u8, other: *mut u8) {
+    let mut x = malloc(8);
+    let px = &raw mut x;
+    x = sig;
+    let y = *px;
+    *other = 0;
+    free(y as *mut core::ffi::c_void);
+}
+"#;
+
+/// N6: a direct write to an address-taken local ends every depth >= 1 copy of
+/// its old value. `px`'s depth-1 cell held `x`'s malloc root; after `x = sig` the
+/// read `y = *px` is not that root, and the free of `y` conflicts with `sig`.
+#[test]
+fn e5c_w264_n6_a_direct_write_to_an_escaped_local_ends_its_copies() {
+    with_program(STALE_THROUGH_ADDRESS, |program| {
+        for function in ["stale", "stale_store"] {
+            with_body(program, function, |function, body, facts| {
+                let y = named_local(body, "y");
+                let value = cell(facts, function, after_assign(body, y), y, 0);
+                assert!(
+                    value.unknown,
+                    "`y` is read through `px` after `x = sig`: {value:?}"
+                );
+            });
+        }
+    });
+    for function in ["stale", "stale_store"] {
+        assert!(
+            !super::tests::accepts(STALE_THROUGH_ADDRESS, &[(function, 1, 0)]),
+            "{function} frees `sig`'s object through `px`"
+        );
+    }
 }
