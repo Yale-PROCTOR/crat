@@ -254,6 +254,7 @@ fn wave6o_the_unwrap_opens_the_base_before_the_view_shifts_it() {
         index_name: "(4 as isize) as usize".to_owned(),
         mutable: true,
         root: None,
+        byte_view: None,
     });
     assert_eq!(
         spec.render("data").expect("a bare view renders"),
@@ -265,6 +266,7 @@ fn wave6o_the_unwrap_opens_the_base_before_the_view_shifts_it() {
             index_name: "e".to_owned(),
             mutable: false,
             root: None,
+            byte_view: None,
         });
         spec.render("p").expect("a shared view renders")
     };

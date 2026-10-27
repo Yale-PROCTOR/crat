@@ -44,6 +44,7 @@ pub(crate) mod callee_bound;
 pub(crate) mod callee_parameter_input;
 #[cfg(test)]
 mod carried_nullability_indexed_tests;
+pub(crate) mod cast_offset;
 pub(crate) mod co_conversion;
 pub(crate) mod compare_only_offset;
 #[cfg(test)]

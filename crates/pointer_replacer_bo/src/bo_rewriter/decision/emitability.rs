@@ -1513,6 +1513,21 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                         .entry((self.fn_did, hir_id))
                         .or_default()
                         .push((method, expr.span));
+                } else if let Some(hir_id) = super::cast_offset::arithmetic_of(
+                    self.tcx,
+                    self.fn_did,
+                    &method,
+                    receiver,
+                    args,
+                ) {
+                    // R1313-2 (relay main/371 step 2): arithmetic through the
+                    // subject's own cast is the subject's arithmetic, unless it
+                    // is a constant range inside its pointee.
+                    self.facts
+                        .raw_only_uses
+                        .entry((self.fn_did, hir_id))
+                        .or_default()
+                        .push((method, expr.span));
                 }
             }
             // (2) ANY reference to a local fn — call, address-taken, or the
@@ -3107,6 +3122,26 @@ fn collect_slice_uses_with_family(
                     intravisit::walk_expr(self, expr);
                     return;
                 }
+                // R1313-2 (relay main/371 step 2): a place reached through the
+                // subject's own cast is the byte view's element.
+                if let Some(edit) = self.cast_offset_place(expr, key) {
+                    let entry = self.out.entry(key).or_default();
+                    entry.other_rewrites += 1;
+                    entry.rewrites.push(edit);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // R1313-2: the same spine as a boundary argument is the byte
+                // view's computed suffix (A5's collision closes on it).
+                if self.expanded
+                    && let Some((site, view)) = self.cast_offset_argument(expr, key)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 // wave-6s: a computed sub-view that is itself a boundary
                 // argument keeps the boundary's own disposition; only the
                 // rendering changes, to the suffix view of the delivered base.
@@ -3191,7 +3226,71 @@ fn collect_slice_uses_with_family(
             intravisit::walk_expr(self, expr);
         }
     }
-    impl V<'_, '_> {
+    impl<'tcx> V<'_, 'tcx> {
+        /// R1313-2: `*(x as *mut U).offset(e)` read or written, on a slice
+        /// subject — `bytemuck::cast_slice{_mut}::<u32, u8>(x)[e]`, or `x[e]`
+        /// for an identity cast. A borrowed place is the argument form's; a
+        /// write needs a mutable subject; a delta that may be negative has no
+        /// index.
+        fn cast_offset_place(
+            &self,
+            use_expr: &'tcx Expr<'tcx>,
+            key: (LocalDefId, HirId),
+        ) -> Option<UseEdit> {
+            let name = self.name_of.get(&key)?;
+            let spine = super::cast_offset::spine(self.tcx, key.0, use_expr)?;
+            let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(spine.call.hir_id) else {
+                return None;
+            };
+            if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                || !super::cast_offset::forward(self.tcx, spine.delta)
+            {
+                return None;
+            }
+            let written = match self.tcx.parent_hir_node(deref.hir_id) {
+                rustc_hir::Node::Expr(parent) => match parent.kind {
+                    ExprKind::AddrOf(..) => return None,
+                    ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
+                        lhs.hir_id == deref.hir_id
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if written && !self.mutable_of.contains(&key) {
+                return None;
+            }
+            let index = index_text(self.tcx, spine.delta)?;
+            Some(UseEdit {
+                span: deref.span,
+                replacement: format!("{}[{index}]", spine.view.base(name, written)),
+                bridge_kind: "subject-use",
+            })
+        }
+
+        /// R1313-2: `&mut *(x as *mut U).offset(e)` (or the bare arithmetic)
+        /// as a registered boundary argument — wave-6s's computed suffix, read
+        /// through the byte view. The view's root stays the subject's own path.
+        fn cast_offset_argument(
+            &self,
+            use_expr: &'tcx Expr<'tcx>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(SliceRawUse, super::slice_forms::ComputedArgumentView)> {
+            let spine = super::cast_offset::spine(self.tcx, key.0, use_expr)?;
+            let (mut site, mut view) = super::slice_forms::computed_argument_view_with(
+                self.tcx,
+                spine.cast,
+                key,
+                self.raw_boundary_arguments,
+                |delta| super::cast_offset::forward(self.tcx, delta),
+            )?;
+            site.hir_id = use_expr.hir_id;
+            site.span = use_expr.span;
+            view.use_span = use_expr.span;
+            view.byte_view = Some(spine.view);
+            Some((site, view))
+        }
+
         fn cursor_use(
             &self,
             expression: &Expr<'_>,

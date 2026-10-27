@@ -116,12 +116,22 @@ pub(crate) struct ForwardView {
     /// use); `Some` shifts only that subtree and discards the arithmetic
     /// around it, so the seam's `arg_span` and its revert twin stay whole.
     pub(crate) root: Option<Span>,
+    /// R1313-2 (relay main/371 step 2): the suffix is taken over the base's
+    /// byte view (`bytemuck::cast_slice_mut::<u32, u8>(base)[e..]`).
+    pub(crate) byte_view: Option<super::cast_offset::ByteView>,
 }
 
 impl ForwardView {
     pub(crate) fn render(&self, argument: &str) -> String {
         let borrow = if self.mutable { "&mut " } else { "&" };
-        format!("({borrow}({argument})[{}..])", self.index_name)
+        match self.byte_view {
+            Some(view) => format!(
+                "({borrow}{}[{}..])",
+                view.base(argument, self.mutable),
+                self.index_name
+            ),
+            None => format!("({borrow}({argument})[{}..])", self.index_name),
+        }
     }
 }
 
@@ -176,6 +186,8 @@ pub(crate) struct ComputedArgumentView {
     /// A call argument (rendered on its seam by `lower`) rather than a body
     /// copy (rendered by the slice-use receipt planner).
     pub(crate) argument: bool,
+    /// R1313-2: the view is taken through the subject's own cast.
+    pub(crate) byte_view: Option<super::cast_offset::ByteView>,
 }
 
 /// Recognise a computed sub-view argument rooted at `expr` (the subject's
@@ -256,6 +268,7 @@ pub(crate) fn computed_body_copy_view<'tcx>(
             borrow_span: borrowed.map(|(_, span)| span),
             mutable: borrowed.is_some_and(|(mutable, _)| mutable),
             argument: false,
+            byte_view: None,
         },
     ))
 }
@@ -272,7 +285,7 @@ pub(crate) fn computed_body_copy_view<'tcx>(
 /// as c_int as isize` with `length: u32`), is the bidirectional family's
 /// (R394-2) and stays with the cursor verdict. Conditional on a UB-free
 /// input, a non-negative C index added to a pointer never moves it backwards.
-fn forward_delta<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) -> bool {
+pub(crate) fn forward_delta<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) -> bool {
     use rustc_middle::ty::{IntTy, TyKind, UintTy};
     let owner = delta.hir_id.owner.def_id;
     let typeck = tcx.typeck(owner);
@@ -337,13 +350,28 @@ pub(crate) fn computed_argument_view<'tcx>(
     key: (LocalDefId, HirId),
     raw_boundary_arguments: &FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> Option<(SliceRawUse, ComputedArgumentView)> {
+    let view = computed_argument_view_with(tcx, expr, key, raw_boundary_arguments, |delta| {
+        forward_delta(tcx, delta)
+    });
+    debug_assert!(view.is_none() || computed_view_spine(tcx, expr).is_some());
+    view
+}
+
+/// [`computed_argument_view`] under a caller's forward test (R1313-2: the cast-offset arm also
+/// admits a constant whose value is non-negative).
+pub(crate) fn computed_argument_view_with<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    key: (LocalDefId, HirId),
+    raw_boundary_arguments: &FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    forward: impl Fn(&'tcx Expr<'tcx>) -> bool,
+) -> Option<(SliceRawUse, ComputedArgumentView)> {
     let (operand, borrowed, delta) = spine(tcx, expr)?;
     if !raw_boundary_arguments.contains(&(key.0, key.1, operand.span.lo().0, operand.span.hi().0))
-        || !forward_delta(tcx, delta)
+        || !forward(delta)
     {
         return None;
     }
-    debug_assert!(computed_view_spine(tcx, expr).is_some());
     let typeck = tcx.typeck(key.0);
     let target = raw_target_type(tcx, typeck.expr_ty_adjusted(operand))?;
     let index = index_text(tcx, delta)?;
@@ -368,6 +396,7 @@ pub(crate) fn computed_argument_view<'tcx>(
             borrow_span: borrowed.map(|(_, span)| span),
             mutable: borrowed.is_some_and(|(mutable, _)| mutable),
             argument: true,
+            byte_view: None,
         },
     ))
 }
@@ -868,6 +897,7 @@ fn lower_computed_argument_views(
                 index_name: index_text.clone(),
                 mutable: view_mutable,
                 root: Some(view.use_span),
+                byte_view: view.byte_view,
             };
             let index = match carriers.as_slice() {
                 // No seam: a borrowed element handed to a converted THIN
@@ -875,9 +905,13 @@ fn lower_computed_argument_views(
                 // checked element `&mut p[e]`, a use edit of the subject.
                 [] if view.borrowed && (!view.mutable || mutable) => {
                     let amp = if view.mutable { "&mut " } else { "&" };
+                    let base = match view.byte_view {
+                        Some(byte_view) => byte_view.base(&name, view.mutable),
+                        None => format!("({name})"),
+                    };
                     element_uses.push(UseEdit {
                         span: view.argument_span,
-                        replacement: format!("{amp}({name})[{index_text}]"),
+                        replacement: format!("{amp}{base}[{index_text}]"),
                         bridge_kind: "subject-use",
                     });
                     continue;
@@ -1192,6 +1226,7 @@ fn lower_forward_parameters(
             index_name: index_name.clone(),
             mutable: false,
             root: None,
+            byte_view: None,
         };
         let mut replacements = Vec::new();
         let mut complete = true;
