@@ -1247,30 +1247,42 @@ impl<'tcx> AstToHirMapper<'tcx> {
         path: &mut Path,
         hqpath: &hir::QPath<'tcx>,
     ) {
+        self.map_path_segments_to_qpath(qself, &mut path.segments, hqpath);
+        if let hir::QPath::Resolved(_, hpath) = hqpath {
+            self.ast_to_hir
+                .path_span_to_res
+                .insert(path.span, hpath.res);
+        }
+    }
+
+    fn map_path_segments_to_qpath<Q: AsMut<QSelf>>(
+        &mut self,
+        qself: &mut Option<Q>,
+        segments: &mut [PathSegment],
+        hqpath: &hir::QPath<'tcx>,
+    ) {
         match hqpath {
             hir::QPath::Resolved(hqself, hpath) => {
                 assert_eq!(qself.is_some(), hqself.is_some());
-                assert_eq!(path.segments.len(), hpath.segments.len());
+                assert_eq!(segments.len(), hpath.segments.len());
                 if let (Some(qself), Some(hqself)) = (qself, hqself) {
                     self.map_ty_to_ty(&mut qself.as_mut().ty, hqself);
                 }
-                for (seg, hseg) in path.segments.iter_mut().zip(hpath.segments) {
+                for (seg, hseg) in segments.iter_mut().zip(hpath.segments) {
                     self.map_path_segment_to_path_segment(seg, hseg);
                 }
-                self.ast_to_hir
-                    .path_span_to_res
-                    .insert(path.span, hpath.res);
             }
             hir::QPath::TypeRelative(hty, hseg) => {
-                assert!(qself.is_none());
-                let hir::TyKind::Path(hir::QPath::Resolved(None, hpath)) = hty.kind else {
-                    panic!()
-                };
-                assert_eq!(path.segments.len(), hpath.segments.len() + 1);
-                for (seg, hseg) in path.segments.iter_mut().zip(hpath.segments) {
-                    self.map_path_segment_to_path_segment(seg, hseg);
+                let (segment, prefix) = segments.split_last_mut().unwrap();
+                if prefix.is_empty() {
+                    let qself = qself.as_mut().unwrap().as_mut();
+                    assert_eq!(qself.position, 0);
+                    self.map_ty_to_ty(&mut qself.ty, hty);
+                } else {
+                    let hir::TyKind::Path(hqpath) = hty.kind else { panic!() };
+                    self.map_path_segments_to_qpath(qself, prefix, &hqpath);
                 }
-                self.map_path_segment_to_path_segment(path.segments.last_mut().unwrap(), hseg);
+                self.map_path_segment_to_path_segment(segment, hseg);
             }
             _ => panic!(),
         }

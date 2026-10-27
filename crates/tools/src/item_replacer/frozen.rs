@@ -689,21 +689,6 @@ fn finalize_source_functions(
     }
     let mut functions = vec![];
     collect(&analysis.items, &mut vec![], &mut functions);
-    for name in api {
-        if !functions.iter().any(|(_, item)| {
-            let ItemKind::Fn(function) = &item.kind else { unreachable!() };
-            function.ident.name.as_str() == name
-                || item.attrs.iter().any(|attr| {
-                    attr.has_name(sym::export_name)
-                        && attr.value_str().is_some_and(|value| value.as_str() == name)
-                })
-        }) {
-            return Err(global_error(
-                ReplacementErrorKind::TargetResolution,
-                format!("API function `{name}` did not match any source function"),
-            ));
-        }
-    }
     for (module, item) in &functions {
         let ItemKind::Fn(function) = &item.kind else { unreachable!() };
         if is_supported_two_argument_main_0(function) && functions.iter().filter(|(path, item)| path == module && matches!(&item.kind, ItemKind::Fn(function) if function.ident.name == sym::main)).count() != 1 {
