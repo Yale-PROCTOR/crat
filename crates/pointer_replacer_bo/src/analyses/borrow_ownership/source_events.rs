@@ -457,10 +457,11 @@ pub(super) fn addressed_locals(body: &Body<'_>) -> BTreeSet<Local> {
 /// `Vec::new`, `Vec::with_capacity` -- into the local itself or into a temporary
 /// moved whole into it (a temporary nothing else mentions but a drop); that is
 /// never moved out, never has its address taken raw, and is mutably borrowed only
-/// into a std call that cannot replace its buffer (`as_mut_ptr`, `as_mut_slice`,
-/// `deref_mut`, `index_mut`), directly or through reborrows, never written through.
-/// Its drop releases the buffer those calls made and nothing else. The constructor
-/// call sites, or `None`.
+/// as the receiver of a std call that cannot replace its buffer (`as_mut_ptr`,
+/// `as_mut_slice`, `deref_mut`, `index_mut`, the instance resolved to std's own
+/// body), directly or through reborrows, never written through; and no
+/// `#[global_allocator]` is declared. Its drop releases the buffer those calls made
+/// and nothing else. The constructor call sites, or `None`.
 pub(crate) fn fresh_vec_local<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -494,7 +495,13 @@ pub(crate) fn fresh_vec_local<'tcx>(
                 "std::alloc::Global" | "alloc::alloc::Global"
             )
     });
-    if !global {
+    // A `#[global_allocator]` anywhere in the crate graph makes `Global`'s
+    // deallocation a body of its own.
+    if !global
+        || std::iter::once(rustc_span::def_id::LOCAL_CRATE)
+            .chain(tcx.crates(()).iter().copied())
+            .any(|krate| tcx.has_global_allocator(krate))
+    {
         return None;
     }
     let callee = |func: &Operand<'tcx>| func.const_fn_def().map(|(def_id, _)| def_id);
@@ -519,12 +526,22 @@ pub(crate) fn fresh_vec_local<'tcx>(
                                 })
                     })))
     };
-    let keeps_buffer = |def_id: rustc_span::def_id::DefId| {
-        std_item(def_id)
-            && matches!(
-                tcx.item_name(def_id).as_str(),
-                "as_mut_ptr" | "as_mut_slice" | "deref_mut" | "index_mut"
-            )
+    // A call that leaves the buffer the Vec's own: std's own body of one of these
+    // methods. A trait method names the trait's item, so the instance is resolved
+    // first: a user impl of a std trait is a body of its own.
+    let keeps_buffer = |func: &Operand<'tcx>| {
+        func.const_fn_def().is_some_and(|(def_id, args)| {
+            rustc_middle::ty::Instance::try_resolve(tcx, body.typing_env(tcx), def_id, args)
+                .ok()
+                .flatten()
+                .is_some_and(|instance| {
+                    std_item(instance.def_id())
+                        && matches!(
+                            tcx.item_name(instance.def_id()).as_str(),
+                            "as_mut_ptr" | "as_mut_slice" | "deref_mut" | "index_mut"
+                        )
+                })
+        })
     };
     let is_move_of = |operand: &Operand<'tcx>, target: Local| matches!(operand, Operand::Move(moved) if moved.local == target);
     // The locals holding a `&mut` to the Vec, closed under reborrows and moves.
@@ -620,10 +637,11 @@ pub(crate) fn fresh_vec_local<'tcx>(
                 }
                 _ => {}
             }
-            // Any other operand that moves the Vec (or a handle) moves it out.
+            // Any other operand that moves the Vec, or moves or copies a handle,
+            // takes it out.
             let mut moved_out = false;
             rvalue_operands(rvalue, &mut |operand| {
-                if let Operand::Move(moved) = operand
+                if let Operand::Move(moved) | Operand::Copy(moved) = operand
                     && (moved.local == local
                         || (handles.contains(&moved.local) && !matches!(rvalue, Rvalue::Use(_))))
                 {
@@ -656,13 +674,14 @@ pub(crate) fn fresh_vec_local<'tcx>(
                 if handles.contains(&destination.local) {
                     return None;
                 }
-                for argument in args.iter() {
+                // A handle goes only to the receiver of a call that keeps the buffer.
+                for (index, argument) in args.iter().enumerate() {
                     if is_move_of(&argument.node, local) {
                         return None;
                     }
                     if let Operand::Move(moved) | Operand::Copy(moved) = &argument.node
                         && handles.contains(&moved.local)
-                        && !target.is_some_and(keeps_buffer)
+                        && !(index == 0 && keeps_buffer(func))
                     {
                         return None;
                     }
