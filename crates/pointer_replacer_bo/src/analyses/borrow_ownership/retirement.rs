@@ -1422,3 +1422,6 @@ mod tests_library_drop;
 
 #[cfg(test)]
 mod tests_owner_guards;
+
+#[cfg(test)]
+mod tests_object_scope;
