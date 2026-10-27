@@ -281,6 +281,56 @@ fn cross_module_observations_use_original_and_target_signature_stubs_with_one_id
 }
 
 #[test]
+fn opaque_value_locals_survive_frozen_replacement_and_preservation() {
+    let frozen = freeze(
+        r#"
+pub unsafe fn value(p: *const i32) -> i32 {
+    let preserved = Some({ let init: i32 = 7; init }).unwrap();
+    let changed = Some({ let original = p; *original }).unwrap();
+    preserved + changed
+}
+"#,
+    );
+    let function = &frozen.functions[0];
+    assert_eq!(function.record.baseline.transform_labels(), [1]);
+    let transformation = format!(
+        r#"{} {{
+    #[proctor(0)]
+    let preserved: i32 = Some({{ let renamed_preserved: i64 = 99; renamed_preserved as i32 }}).unwrap();
+    #[proctor(1)]
+    let changed: i32 = Some({{ let renamed: &i32 = p; *renamed }}).unwrap();
+    #[proctor(2)]
+    preserved + changed
+}}"#,
+        function.record.target_signature,
+    );
+    let request = request(function, Some(&transformation));
+    let (output, metadata) = metadata(&frozen, &request);
+    let candidate = &output.replacement.source;
+    assert!(candidate.contains("init: i32 = 7"), "{candidate}");
+    assert!(!candidate.contains("renamed_preserved") && !candidate.contains("99"));
+    assert!(candidate.contains("renamed: &i32"), "{candidate}");
+    assert_eq!(output.replacement.statement_pairs.len(), 1);
+    assert_eq!(output.replacement.statement_pairs[0].label, 1);
+    assert!(metadata.unfilled_stub_items.is_empty());
+    run_compiler_on_str(candidate, |_| ()).unwrap();
+    crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+        .unwrap();
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![function.record.id],
+            source: candidate.clone(),
+        }],
+    )
+    .unwrap();
+    assert!(assembled.contains("init: i32 = 7"));
+    assert!(assembled.contains("renamed: &i32"));
+    assert!(!assembled.contains("todo!()") && !assembled.contains("#[proctor"));
+    run_compiler_on_str(&assembled, |_| ()).unwrap();
+}
+
+#[test]
 fn recursive_source_copies_use_original_stubs_and_preserve_callable_identity() {
     let source = "pub unsafe fn recurse(p: *const i32) -> usize { *p.add(recurse(p)) as usize }";
     let frozen = run_compiler_on_str(source, |tcx| {

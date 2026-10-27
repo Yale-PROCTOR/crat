@@ -4321,16 +4321,125 @@ fn opaque_conditional_label_suppression_does_not_skip_body_validation() {
 }
 
 #[test]
-fn rejects_non_restricted_control_beneath_non_control_payloads() {
-    for source in [
+fn allows_nested_blocks_and_conditionals_as_opaque_values() {
+    for (index, source) in [
         "pub unsafe fn f(mut value: i32, flag: bool) { value = 1 + if flag { value += 1; 2 } else { 3 }; }",
         "pub unsafe fn f(mut value: i32, c1: bool, c2: bool) { value = 1 + if c1 { if c2 { value += 1; 2 } else { 3 } } else { 4 }; }",
         "pub unsafe fn f(flag: bool) { let value = Some(if flag { () }); let _ = value; }",
         "pub unsafe fn f(value: Option<i32>) { let result = Some(if let Some(value) = value { value } else { 0 }); let _ = result; }",
         "#![feature(let_chains)] pub unsafe fn f(value: Option<i32>) { let result = Some(if let Some(value) = value && value > 0 { value } else { 0 }); let _ = result; }",
-        "pub unsafe fn f() { let value = Some(loop { break 1; }); let _ = value; }",
         "pub unsafe fn f(c1: bool, c2: bool) { let value = Some(if c1 { 1 + if c2 { 2 } else { 3 } } else { 4 }); let _ = value; }",
         "pub unsafe fn f(flag: bool) { let value = Some(if flag { 1; } else { 2; }); let _ = value; }",
+    ].into_iter().enumerate() {
+        let records = generate(source);
+        let f = function(&records, "f");
+        let expected: Vec<_> = (0..if index < 2 { 1 } else { 2 }).collect();
+        assert_eq!(labels(&f.annotated_source), expected);
+        assert_eq!(labels(&f.baseline.skeleton), expected);
+    }
+}
+
+#[test]
+fn preserves_scalar_and_aggregate_initializers_without_labeling_their_nested_blocks() {
+    let source = r#"
+pub struct Point { pub x: i32, pub y: i32 }
+pub struct Circle { pub p: Point, pub r: usize }
+pub unsafe fn initializers(x: i32, y: i32, slot_count: usize) -> Circle {
+    let amount = slot_count >> ({ 3 });
+    let values = [{ let mut init = Point { x, y }; init }];
+    let circle = Circle {
+        p: { let mut init = Point { x: values[0].x, y }; init },
+        r: amount,
+    };
+    circle
+}
+"#;
+    let records = generate(source);
+    let f = function(&records, "initializers");
+    assert_eq!(labels(&f.annotated_source), [0, 1, 2, 3]);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2, 3]);
+    assert!(!f.baseline.needs_transformation);
+    assert!(f.baseline.skeleton.contains("let mut init = Point"));
+    assert!(!f.baseline.skeleton.contains("init:"));
+    assert!(compact(&f.baseline.skeleton).contains("slot_count >> ({ 3 })"));
+}
+
+#[test]
+fn opaque_blocks_requiring_transformation_keep_outer_pointer_and_dependency_information() {
+    let source = r#"
+unsafe fn dependency(p: *const i32) -> i32 { *p }
+pub unsafe fn f(p: *const i32) -> i32 {
+    dependency({ let copy = p; copy })
+}
+extern "C" { fn foreign_value() -> i32; }
+pub unsafe fn foreign() -> i32 {
+    1 + { let value = foreign_value(); value }
+}
+"#;
+    let records = generate(source);
+    let f = function(&records, "f");
+    assert_eq!(labels(&f.annotated_source), [0]);
+    assert_eq!(f.baseline.transform_labels(), [0]);
+    assert!(
+        f.dependencies
+            .contains(&record(&records, "dependency").id())
+    );
+    assert!(f.target_signature.contains("p: &i32"));
+    let foreign = function(&records, "foreign");
+    assert_eq!(labels(&foreign.annotated_source), [0]);
+    assert_eq!(foreign.baseline.transform_labels(), [0]);
+    assert_eq!(foreign.foreign_function_names, ["foreign_value"]);
+}
+
+#[test]
+fn nested_ray_conditionals_stay_opaque_but_direct_branches_keep_their_labels() {
+    let source = r#"
+pub unsafe fn ray(x: f32, y: f32, radius: f32) -> i32 {
+    if x * y < 0.0 || (if (if x < 0.0 { -x } else { x })
+        < (if y < 0.0 { -y } else { y }) {
+            if x < 0.0 { -x } else { x }
+        } else {
+            if y < 0.0 { -y } else { y }
+        }) < radius {
+        1
+    } else {
+        0
+    }
+}
+"#;
+    let records = generate(source);
+    let f = function(&records, "ray");
+    assert_eq!(labels(&f.annotated_source), [0, 1, 2]);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2]);
+    assert_eq!(f.baseline.statement_dispositions[0].children.len(), 2);
+    assert!(!f.baseline.needs_transformation);
+    run_compiler_on_str(&f.baseline.skeleton, |_| ()).unwrap();
+}
+
+#[test]
+fn opaque_blocks_admit_internal_loop_transfers_and_closure_returns() {
+    for source in [
+        "pub unsafe fn f() -> Option<i32> { Some({ loop { break 1; } }) }",
+        "pub unsafe fn f() -> Option<i32> { Some('inner: { break 'inner 2; }) }",
+        "pub unsafe fn f() -> Option<i32> { Some({ let mut count = 0; 'inner: loop { count += 1; if count < 2 { continue 'inner; } break 'inner count; } }) }",
+        "pub unsafe fn f() -> Option<i32> { Some({ let compute = || { return 3; }; compute() }) }",
+    ] {
+        let records = generate(source);
+        let f = function(&records, "f");
+        assert_eq!(labels(&f.annotated_source), [0]);
+        assert_eq!(labels(&f.baseline.skeleton), [0]);
+    }
+}
+
+#[test]
+fn rejects_unsupported_nested_control_and_escaping_opaque_values() {
+    for source in [
+        "pub unsafe fn f() { let value = Some(loop { break 1; }); let _ = value; }",
+        "pub unsafe fn f(flag: bool) -> Option<i32> { Some(if flag { return None; } else { 1 }) }",
+        "pub unsafe fn f() -> Option<i32> { Some({ return None; }) }",
+        "pub unsafe fn f() { loop { let value = Some({ break; }); let _ = value; } }",
+        "pub unsafe fn f() { 'outer: loop { let value = Some({ continue 'outer; }); let _ = value; } }",
+        "pub unsafe fn f() { 'outer: loop { let value = Some({ loop { break 'outer; } }); let _ = value; } }",
     ] {
         let error = generate_error(source);
         assert_eq!(error.kind, GenerationErrorKind::NestedControlPayload);
@@ -8935,7 +9044,7 @@ pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
             })
             .unwrap()
             .clone();
-        let opaque_nested_ifs = collect_opaque_nested_ifs(&item, "mixed").unwrap();
+        let opaque_nested_ifs = collect_opaque_nested_expressions(&item, "mixed").unwrap();
         annotate_function(&mut item, &opaque_nested_ifs);
         let classification = classify_function_statements(
             &item,

@@ -318,16 +318,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
         )
     })?;
     let body = function.body.as_ref().unwrap();
-    let transformed = entry
-        .view
-        .transform_labels()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let preserved = statement_labels(body)
-        .into_iter()
-        .filter(|label| !transformed.contains(label))
-        .collect();
-    let mut scan = BodyScanner::new_with_preserved_labels(true, preserved);
+    let mut scan = BodyScanner::new(true);
     scan.visit_block(body);
     if let Some(problem) = scan.syntax_errors.first() {
         return Err(format!(
@@ -382,7 +373,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id, error.message
         )
     })?;
-    validate_expected_block(body, &transformed).map_err(|detail| {
+    validate_expected_block(body).map_err(|detail| {
         format!(
             "Expected skeleton for `{}` (item {}) has an invalid control/statement tree: {detail}",
             entry.name, entry.id
@@ -456,9 +447,7 @@ pub(crate) fn validate_rule_application_shape(item: &Item) -> Result<(), String>
         .as_ref()
         .ok_or_else(|| "an applied function has no body".to_owned())?;
     let labels = statement_labels(body);
-    // Rule application runs before transformed payloads are skeletonized, so
-    // every source-shaped restricted conditional is still opaque here.
-    let mut scan = BodyScanner::new_with_preserved_labels(true, labels.clone());
+    let mut scan = BodyScanner::new(true);
     scan.visit_block(body);
     if let Some(problem) = scan.syntax_errors.first() {
         return Err(problem.message.clone());
@@ -500,7 +489,7 @@ pub(crate) fn validate_rule_application_shape(item: &Item) -> Result<(), String>
     if seen != labels.into_iter().collect() {
         return Err("an applied skeleton label scan is inconsistent".to_owned());
     }
-    validate_expected_block(body, &HashSet::new())
+    validate_expected_block(body)
 }
 
 fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &'static str> {
@@ -551,28 +540,22 @@ fn is_supported_parameter_pattern(pattern: &Pat) -> bool {
     )
 }
 
-fn validate_expected_block(
-    block: &rustc_ast::Block,
-    transformed: &HashSet<u32>,
-) -> Result<(), String> {
+fn validate_expected_block(block: &rustc_ast::Block) -> Result<(), String> {
     for statement in &block.stmts {
-        validate_expected_statement(statement, transformed)?;
+        validate_expected_statement(statement)?;
     }
     Ok(())
 }
 
-fn validate_expected_statement(statement: &Stmt, transformed: &HashSet<u32>) -> Result<(), String> {
-    let allow_restricted = stmt_label(statement).is_some_and(|label| !transformed.contains(&label));
+fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
     match &statement.kind {
         StmtKind::Let(local) => {
             match &local.kind {
                 LocalKind::Decl => {}
-                LocalKind::Init(initializer) => {
-                    validate_expected_payload(initializer, transformed, allow_restricted)?
-                }
+                LocalKind::Init(initializer) => validate_expected_payload(initializer)?,
                 LocalKind::InitElse(initializer, else_block) => {
-                    validate_expected_payload(initializer, transformed, allow_restricted)?;
-                    validate_expected_block(else_block, transformed)?;
+                    validate_expected_payload(initializer)?;
+                    validate_expected_block(else_block)?;
                 }
             }
             Ok(())
@@ -583,30 +566,24 @@ fn validate_expected_statement(statement: &Stmt, transformed: &HashSet<u32>) -> 
         )),
         StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
             ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => {
-                validate_expected_payload(value, transformed, allow_restricted)
+                validate_expected_payload(value)
             }
-            _ => validate_expected_payload(expression, transformed, allow_restricted),
+            _ => validate_expected_payload(expression),
         },
         StmtKind::MacCall(_) => Ok(()),
         StmtKind::Empty => Err("empty statements are unsupported".to_owned()),
     }
 }
 
-fn validate_expected_payload(
-    expression: &Expr,
-    transformed: &HashSet<u32>,
-    allow_restricted: bool,
-) -> Result<(), String> {
+fn validate_expected_payload(expression: &Expr) -> Result<(), String> {
     match &expression.kind {
         ExprKind::If(condition, then_block, else_expression) => {
-            validate_no_nested_control(condition, "an if condition", allow_restricted)?;
-            validate_expected_block(then_block, transformed)?;
+            validate_no_nested_control(condition, "an if condition")?;
+            validate_expected_block(then_block)?;
             if let Some(else_expression) = else_expression {
                 match &else_expression.kind {
-                    ExprKind::If(..) => {
-                        validate_expected_payload(else_expression, transformed, allow_restricted)?
-                    }
-                    ExprKind::Block(block, _) => validate_expected_block(block, transformed)?,
+                    ExprKind::If(..) => validate_expected_payload(else_expression)?,
+                    ExprKind::Block(block, _) => validate_expected_block(block)?,
                     _ => {
                         return Err(
                             "an if else branch must be a block or recursive else-if".to_owned()
@@ -617,21 +594,19 @@ fn validate_expected_payload(
             Ok(())
         }
         ExprKind::While(condition, body, _) => {
-            validate_no_nested_control(condition, "a while condition", allow_restricted)?;
-            validate_expected_block(body, transformed)
+            validate_no_nested_control(condition, "a while condition")?;
+            validate_expected_block(body)
         }
         ExprKind::ForLoop { iter, body, .. } => {
-            validate_no_nested_control(iter, "a for iterator", allow_restricted)?;
-            validate_expected_block(body, transformed)
+            validate_no_nested_control(iter, "a for iterator")?;
+            validate_expected_block(body)
         }
-        ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => {
-            validate_expected_block(body, transformed)
-        }
+        ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => validate_expected_block(body),
         ExprKind::Match(scrutinee, arms, _) => {
-            validate_no_nested_control(scrutinee, "a match scrutinee", allow_restricted)?;
+            validate_no_nested_control(scrutinee, "a match scrutinee")?;
             for (index, arm) in arms.iter().enumerate() {
                 if let Some(guard) = &arm.guard {
-                    validate_no_nested_control(guard, "a match guard", allow_restricted)?;
+                    validate_no_nested_control(guard, "a match guard")?;
                 }
                 let Some(body) = &arm.body else {
                     return Err(format!("match arm {index} has no body"));
@@ -639,22 +614,17 @@ fn validate_expected_payload(
                 let ExprKind::Block(block, _) = &body.kind else {
                     return Err(format!("match arm {index} must have a block body"));
                 };
-                validate_expected_block(block, transformed)?;
+                validate_expected_block(block)?;
             }
             Ok(())
         }
-        _ => validate_no_nested_control(expression, "a non-control payload", allow_restricted),
+        _ => validate_no_nested_control(expression, "a non-control payload"),
     }
 }
 
-fn validate_no_nested_control(
-    expression: &Expr,
-    role: &str,
-    allow_restricted: bool,
-) -> Result<(), String> {
+fn validate_no_nested_control(expression: &Expr, role: &str) -> Result<(), String> {
     struct ControlFinder {
         found: bool,
-        allow_restricted: bool,
     }
 
     impl<'ast> Visitor<'ast> for ControlFinder {
@@ -663,8 +633,7 @@ fn validate_no_nested_control(
                 return;
             }
             if control_expr(expression, ControlRole::Statement).is_some() {
-                if !self.allow_restricted || !crate::skeleton::is_restricted_conditional(expression)
-                {
+                if !crate::skeleton::is_opaque_value_expression(expression) {
                     self.found = true;
                 }
                 return;
@@ -673,14 +642,11 @@ fn validate_no_nested_control(
         }
     }
 
-    let mut finder = ControlFinder {
-        found: false,
-        allow_restricted,
-    };
+    let mut finder = ControlFinder { found: false };
     finder.visit_expr(expression);
     if finder.found {
         Err(format!(
-            "a control expression is nested beneath {role}; controls must remain roots of supported statement payloads"
+            "an unsupported control expression is nested beneath {role}; only opaque value blocks and conditionals without escaping control are allowed"
         ))
     } else {
         Ok(())
@@ -767,17 +733,7 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     let expected_body = expected_fn.body.as_ref().unwrap();
     let result_body = result_fn.body.as_ref().unwrap();
 
-    let transformed = expected
-        .metadata
-        .view
-        .transform_labels()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let preserved = statement_labels(expected_body)
-        .into_iter()
-        .filter(|label| !transformed.contains(label))
-        .collect();
-    let mut expected_scan = BodyScanner::new_with_preserved_labels(true, preserved);
+    let mut expected_scan = BodyScanner::new(true);
     expected_scan.visit_block(expected_body);
     let mut result_scan = BodyScanner::new(false);
     result_scan.visit_block(result_body);
@@ -872,13 +828,15 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
 
     let mut label_errors = vec![];
     for problem in &result_scan.syntax_errors {
-        label_errors.push(error(
-            &problem.code,
-            function_message(
-                expected,
-                format!("{}. Correct the attribute and preserve only canonical `#[proctor(N)]` statement labels.", problem.message),
-            ),
-        ));
+        let detail = if problem.code == "escaping_opaque_control" {
+            format!("{}.", problem.message)
+        } else {
+            format!(
+                "{}. Correct the attribute and preserve only canonical `#[proctor(N)]` statement labels.",
+                problem.message
+            )
+        };
+        label_errors.push(error(&problem.code, function_message(expected, detail)));
     }
 
     let mut control_errors = vec![];
@@ -1318,10 +1276,10 @@ struct BodyScanner {
     skip_expr_attrs: bool,
     root_attribute_spans: HashSet<(u32, u32)>,
     next_declaration_order: usize,
-    preserved_labels: HashSet<u32>,
     non_control_payload: bool,
     suppress_unlabeled: usize,
     closure_depth: usize,
+    opaque_depth: usize,
 }
 
 impl BodyScanner {
@@ -1341,17 +1299,10 @@ impl BodyScanner {
             skip_expr_attrs: false,
             root_attribute_spans: HashSet::new(),
             next_declaration_order: 0,
-            preserved_labels: HashSet::new(),
             non_control_payload: false,
             suppress_unlabeled: 0,
             closure_depth: 0,
-        }
-    }
-
-    fn new_with_preserved_labels(expected: bool, preserved_labels: HashSet<u32>) -> Self {
-        Self {
-            preserved_labels,
-            ..Self::new(expected)
+            opaque_depth: 0,
         }
     }
 
@@ -1366,7 +1317,7 @@ impl BodyScanner {
     }
 
     fn collect_pattern(&mut self, pat: &Pat, role: &str, explicit_type: Option<&Ty>) {
-        if self.closure_depth != 0 {
+        if self.closure_depth != 0 || self.opaque_depth != 0 {
             return;
         }
         let mut raw = vec![];
@@ -1465,11 +1416,13 @@ impl BodyScanner {
 
     fn visit_print_arguments(&mut self, label: u32, arguments: &[P<Expr>]) {
         let previous_label = self.current_label.replace(label);
+        let previous_payload = std::mem::replace(&mut self.non_control_payload, true);
         for (index, argument) in arguments.iter().enumerate() {
             self.with_path(format!("print argument {index}"), |this| {
-                this.visit_payload(argument)
+                this.visit_expr(argument)
             });
         }
+        self.non_control_payload = previous_payload;
         self.current_label = previous_label;
     }
 }
@@ -1477,6 +1430,16 @@ impl BodyScanner {
 impl<'ast> Visitor<'ast> for BodyScanner {
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         let previous_label = self.current_label;
+        if self.expected
+            && self.opaque_depth != 0
+            && self.closure_depth == 0
+            && matches!(stmt.kind, StmtKind::Empty)
+        {
+            self.syntax_errors.push(SyntaxProblem {
+                code: "empty_statement".to_owned(),
+                message: "empty statements are unsupported in source value expressions".to_owned(),
+            });
+        }
         let root_attrs = effective_stmt_attrs(stmt);
         self.root_attribute_spans.extend(
             root_attrs
@@ -1575,13 +1538,25 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 }
             }
         }
-        let opaque_restricted = self.non_control_payload
-            && self
-                .current_label
-                .is_some_and(|label| self.preserved_labels.contains(&label))
-            && crate::skeleton::is_restricted_conditional(expr);
-        if opaque_restricted {
+        let opaque_value = self.non_control_payload
+            && self.closure_depth == 0
+            && self.opaque_depth == 0
+            && crate::skeleton::is_opaque_value_expression(expr);
+        if opaque_value {
             self.suppress_unlabeled += 1;
+            self.opaque_depth += 1;
+        } else if self.non_control_payload
+            && self.closure_depth == 0
+            && self.opaque_depth == 0
+            && matches!(expr.kind, ExprKind::If(..) | ExprKind::Block(..))
+            && !matches!(&expr.kind, ExprKind::Block(block, _) if matches!(block.rules, BlockCheckMode::Unsafe(..)))
+        {
+            self.syntax_errors.push(SyntaxProblem {
+                code: "escaping_opaque_control".to_owned(),
+                message:
+                    "a nested value expression contains control that escapes its opaque region"
+                        .to_owned(),
+            });
         }
         match &expr.kind {
             ExprKind::If(condition, then_block, else_expr) => {
@@ -1635,6 +1610,19 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             ExprKind::Match(scrutinee, arms, _) => {
                 self.visit_payload(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
+                    if self.expected
+                        && self.opaque_depth != 0
+                        && self.closure_depth == 0
+                        && !arm
+                            .body
+                            .as_ref()
+                            .is_some_and(|body| matches!(body.kind, ExprKind::Block(..)))
+                    {
+                        self.syntax_errors.push(SyntaxProblem {
+                            code: "non_block_match_arm".to_owned(),
+                            message: "source match arms must have block bodies".to_owned(),
+                        });
+                    }
                     self.with_path(format!("match arm {index}"), |this| {
                         this.collect_pattern(&arm.pat, &format!("match-arm-{index} pattern"), None);
                         if let Some(guard) = &arm.guard {
@@ -1661,13 +1649,14 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             ExprKind::MacCall(mac) => self.visit_mac_call(mac),
             _ => visit::walk_expr(self, expr),
         }
-        if opaque_restricted {
+        if opaque_value {
             self.suppress_unlabeled -= 1;
+            self.opaque_depth -= 1;
         }
     }
 
     fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
-        if self.closure_depth != 0 {
+        if self.closure_depth != 0 || self.opaque_depth != 0 {
             return;
         }
         collect_temp_symbols(&mac.args.tokens, &mut |name| {
@@ -3100,8 +3089,9 @@ struct LexicalTempScanner<'a> {
     current_label: Option<u32>,
     unresolved: Vec<ScopedTempProblem>,
     outside_group: Vec<ScopedTempProblem>,
-    // Bindings at or beneath this scope belong to an opaque closure body.
-    closure_scope: Option<usize>,
+    // Bindings at or beneath this scope belong to an opaque expression body.
+    opaque_scope: Option<usize>,
+    non_control_payload: bool,
     macro_temporaries: Vec<TempReference>,
 }
 
@@ -3164,7 +3154,8 @@ fn validate_print_argument_temporaries(
             current_label: Some(label),
             unresolved: vec![],
             outside_group: vec![],
-            closure_scope: None,
+            opaque_scope: None,
+            non_control_payload: true,
             macro_temporaries: vec![],
         };
         scanner.visit_expr(argument);
@@ -3196,12 +3187,21 @@ fn validate_print_argument_temporaries(
 }
 
 impl LexicalTempScanner<'_> {
+    fn visit_payload(&mut self, expression: &Expr) {
+        let previous = std::mem::replace(
+            &mut self.non_control_payload,
+            control_expr(expression, ControlRole::Statement).is_none(),
+        );
+        self.visit_expr(expression);
+        self.non_control_payload = previous;
+    }
+
     fn activate_pattern(&mut self, pat: &Pat) {
         let mut bindings = vec![];
         collect_pattern_bindings(pat, "root", &mut bindings);
         for binding in bindings {
             if !binding.constructor_like
-                && (self.closure_scope.is_some()
+                && (self.opaque_scope.is_some()
                     || self
                         .reliable_declarations
                         .contains_key(binding.name.as_str())
@@ -3227,8 +3227,8 @@ impl LexicalTempScanner<'_> {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 
-    fn is_closure_local(&self, name: &str) -> bool {
-        self.closure_scope.is_some_and(|start| {
+    fn is_opaque_local(&self, name: &str) -> bool {
+        self.opaque_scope.is_some_and(|start| {
             self.scopes[start..]
                 .iter()
                 .any(|scope| scope.contains(name))
@@ -3250,16 +3250,16 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             StmtKind::Let(local) => {
                 match &local.kind {
                     LocalKind::Decl => {}
-                    LocalKind::Init(initializer) => self.visit_expr(initializer),
+                    LocalKind::Init(initializer) => self.visit_payload(initializer),
                     LocalKind::InitElse(initializer, else_block) => {
-                        self.visit_expr(initializer);
+                        self.visit_payload(initializer);
                         self.visit_block(else_block);
                     }
                 }
                 self.activate_pattern(&local.pat);
             }
             StmtKind::Item(_) => {}
-            StmtKind::Expr(expr) | StmtKind::Semi(expr) => self.visit_expr(expr),
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => self.visit_payload(expr),
             StmtKind::MacCall(mac) => self.visit_mac_call(&mac.mac),
             StmtKind::Empty => {}
         }
@@ -3267,8 +3267,15 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        let opaque_value = self.opaque_scope.is_none()
+            && self.non_control_payload
+            && crate::skeleton::is_opaque_value_expression(expr);
+        if opaque_value {
+            self.opaque_scope = Some(self.scopes.len());
+            self.scopes.push(HashSet::new());
+        }
         match &expr.kind {
-            ExprKind::If(condition, then_block, else_expr) if self.closure_scope.is_some() => {
+            ExprKind::If(condition, then_block, else_expr) if self.opaque_scope.is_some() => {
                 self.scopes.push(HashSet::new());
                 self.visit_expr(condition);
                 self.visit_block(then_block);
@@ -3277,22 +3284,22 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
                     self.visit_expr(else_expr);
                 }
             }
-            ExprKind::While(condition, body, _) if self.closure_scope.is_some() => {
+            ExprKind::While(condition, body, _) if self.opaque_scope.is_some() => {
                 self.scopes.push(HashSet::new());
                 self.visit_expr(condition);
                 self.visit_block(body);
                 self.scopes.pop();
             }
-            ExprKind::Let(pattern, value, ..) if self.closure_scope.is_some() => {
+            ExprKind::Let(pattern, value, ..) if self.opaque_scope.is_some() => {
                 self.visit_expr(value);
                 self.activate_pattern(pattern);
             }
             ExprKind::If(condition, then_block, else_expr) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
-                    self.visit_expr(value);
+                    self.visit_payload(value);
                     self.visit_scoped_block(then_block, Some(pat));
                 } else {
-                    self.visit_expr(condition);
+                    self.visit_payload(condition);
                     self.visit_block(then_block);
                 }
                 if let Some(else_expr) = else_expr {
@@ -3301,26 +3308,26 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             }
             ExprKind::While(condition, body, _) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
-                    self.visit_expr(value);
+                    self.visit_payload(value);
                     self.visit_scoped_block(body, Some(pat));
                 } else {
-                    self.visit_expr(condition);
+                    self.visit_payload(condition);
                     self.visit_block(body);
                 }
             }
             ExprKind::ForLoop {
                 pat, iter, body, ..
             } => {
-                self.visit_expr(iter);
+                self.visit_payload(iter);
                 self.visit_scoped_block(body, Some(pat));
             }
             ExprKind::Match(scrutinee, arms, _) => {
-                self.visit_expr(scrutinee);
+                self.visit_payload(scrutinee);
                 for arm in arms {
                     self.scopes.push(HashSet::new());
                     self.activate_pattern(&arm.pat);
                     if let Some(guard) = &arm.guard {
-                        self.visit_expr(guard);
+                        self.visit_payload(guard);
                     }
                     if let Some(body) = &arm.body {
                         self.visit_expr(body);
@@ -3329,20 +3336,23 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
                 }
             }
             ExprKind::Closure(closure) => {
-                let previous_closure_scope = self.closure_scope;
-                self.closure_scope.get_or_insert(self.scopes.len());
+                let previous_opaque_scope = self.opaque_scope;
+                self.opaque_scope.get_or_insert(self.scopes.len());
                 self.scopes.push(HashSet::new());
                 for parameter in &closure.fn_decl.inputs {
                     self.activate_pattern(&parameter.pat);
                 }
                 self.visit_expr(&closure.body);
                 self.scopes.pop();
-                self.closure_scope = previous_closure_scope;
+                self.opaque_scope = previous_opaque_scope;
+            }
+            ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => {
+                self.visit_payload(value);
             }
             ExprKind::Path(None, path) if path.segments.len() == 1 => {
                 let name = path.segments[0].ident.to_string();
                 if !is_temp_name(&name)
-                    || self.is_closure_local(&name)
+                    || self.is_opaque_local(&name)
                     || self.unreliable_names.contains(name.as_str())
                 {
                     return;
@@ -3381,14 +3391,18 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             ExprKind::MacCall(mac) => self.visit_mac_call(mac),
             _ => visit::walk_expr(self, expr),
         }
+        if opaque_value {
+            self.scopes.pop();
+            self.opaque_scope = None;
+        }
     }
 
     fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
-        if self.closure_scope.is_none() {
+        if self.opaque_scope.is_none() {
             return;
         }
         collect_temp_symbols(&mac.args.tokens, &mut |name| {
-            if !self.is_closure_local(&name) && !self.existing_names.contains(name.as_str()) {
+            if !self.is_opaque_local(&name) && !self.existing_names.contains(name.as_str()) {
                 self.macro_temporaries.push(TempReference {
                     name,
                     label: self.current_label,
@@ -3474,7 +3488,8 @@ fn validate_temporaries(
         current_label: None,
         unresolved: vec![],
         outside_group: vec![],
-        closure_scope: None,
+        opaque_scope: None,
+        non_control_payload: false,
         macro_temporaries: vec![],
     };
     scanner.scopes.push(HashSet::new());
