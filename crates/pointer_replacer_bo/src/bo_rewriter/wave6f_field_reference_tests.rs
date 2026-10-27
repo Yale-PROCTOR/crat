@@ -316,7 +316,10 @@ fn w6f_lodepng_slice_field_with_size_delivers() {
     // class (D5 (c)), so `inflatev`'s `out` and `settings` deliver beside the raw `in_0`.
     assert!(emitted_count >= 8, "{emitted_count}\n{source}");
     for needle in [
-        "fn inflatev(mut out: &mut u8, mut in_0: *const u8,",
+        // R1315-1 (relay main/373; step B's restatement): `out` is handed bare to an array
+        // formal, so the thin-into-fat rule gives it the fat twin (it was the one-element
+        // view `&mut u8` the rule cures).
+        "fn inflatev(mut out: &mut [u8], mut in_0: *const u8,",
         "pub struct LodePNGBitReader<'a> {",
         "pub data: Option<&'a [u8]>,",
         "impl<'a> ::core::marker::Copy for LodePNGBitReader<'a> { }",

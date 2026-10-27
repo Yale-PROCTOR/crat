@@ -135,9 +135,19 @@ fn slicecursor_parameter_local_call() {
     let source = emitted(
         "unsafe fn walk(p: *const i32, k: isize) -> i32 { *p.offset(k) } pub unsafe fn caller(p: *const i32, k: isize) -> i32 { walk(p, k) }",
     );
+    // R1315-1 (relay main/373; step B's restatement): the held form. The base delivered a
+    // parameter cursor over `walk(core::slice::from_ref(p), k)`, a one-element view read at
+    // `k` (B's own hazard, at a cursor formal). Under the thin-into-fat rule `caller::p` is a
+    // slice; `walk` keeps its raw formal and receives the slice's own pointer.
+    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        source.contains("slice_cursor::SliceCursor"),
-        "parameter cursor absent: {source}"
+        !source.contains("core::slice::from_ref(p)")
+            && !source.contains("core::slice::from_mut(p)"),
+        "no one-element view reaches walk: {source}"
+    );
+    assert!(
+        flat.contains("fn caller(p: &[i32], k: isize)") && flat.contains("walk(p.as_ptr(), k)"),
+        "the held form: {source}"
     );
 }
 

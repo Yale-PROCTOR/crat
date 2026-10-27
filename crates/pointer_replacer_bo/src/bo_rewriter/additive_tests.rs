@@ -16,15 +16,32 @@ pub unsafe fn slice(slice_values: *const i32) -> i32 { *slice_values.offset(1) }
 pub unsafe fn caller(caller_value: *const i32) -> i32 { earlier_callee(caller_value) }
 "#;
 
+/// R1315-1 (relay main/373; step B's restatement): `BASELINE` with the caller handing the
+/// callee an address (`&*caller_value`) rather than its bare binding. Under the thin-into-fat
+/// rule (55's line, step B) a bare hand-on to a slice formal makes the caller a slice of the
+/// callee's class, so `BASELINE`'s two classes and their bare call-adapter edge are one class;
+/// the address keeps the thin caller, the slice callee and the adapter edge between them,
+/// which is what the two R220 dependency controls below are about.
+const BASELINE_ADAPTER_EDGE: &str = r#"
+unsafe fn earlier_callee(callee_value: *const i32) -> i32 { *callee_value.offset(0) }
+pub unsafe fn reference(reference_value: *const i32) -> i32 { *reference_value }
+pub unsafe fn slice(slice_values: *const i32) -> i32 { *slice_values.offset(1) }
+pub unsafe fn caller(caller_value: *const i32) -> i32 { earlier_callee(&*caller_value) }
+"#;
+
 fn with_baseline(test: impl FnOnce(StageSnapshot) + Send) {
-    let rendered = super::emit_tests::ast_emitted_source_of(BASELINE).expect("prior rendering");
+    with_baseline_of(BASELINE, test)
+}
+
+fn with_baseline_of(baseline: &'static str, test: impl FnOnce(StageSnapshot) + Send) {
+    let rendered = super::emit_tests::ast_emitted_source_of(baseline).expect("prior rendering");
     assert!(rendered.contains("reference_value: &i32"), "{rendered}");
     assert!(rendered.contains("slice_values: &[i32]"), "{rendered}");
     assert!(
         super::verify::type_checks_str(&rendered),
         "prior rendering must type/borrow-check"
     );
-    ::utils::compilation::run_compiler_on_str(BASELINE, |tcx| {
+    ::utils::compilation::run_compiler_on_str(baseline, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx(tcx).expect("prior decisions");
         let emission = super::emit_files(
             tcx,
@@ -222,7 +239,7 @@ fn r220_option_failure_preserves_prior_ref_and_slice() {
 
 #[test]
 fn r220_previously_safe_callee_does_not_make_a_new_receipt_required() {
-    with_baseline(|prior| {
+    with_baseline_of(BASELINE_ADAPTER_EDGE, |prior| {
         let caller = owner(&prior, "caller_value");
         let callee = owner(&prior, "callee_value");
         let mut inputs = class_inputs(&prior);
@@ -325,7 +342,7 @@ fn r220_collision_yields_the_new_site_independently_of_order_and_class_ids() {
 
 #[test]
 fn r220_unwitnessed_new_refusal_rolls_back_its_root_not_the_delivered_dependent() {
-    with_baseline(|prior| {
+    with_baseline_of(BASELINE_ADAPTER_EDGE, |prior| {
         let root = owner(&prior, "callee_value");
         let dependent = owner(&prior, "caller_value");
         let mut inputs = class_inputs(&prior);
