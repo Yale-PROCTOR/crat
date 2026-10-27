@@ -27,7 +27,7 @@ fn r815_7_a_caller_only_retraction_reverts_the_callee_and_type_checks() {
         let (table, _) = bo::decide_table_with_ctx_config(
             tcx,
             Some((
-                bo::A5Mode::PreciseReplay,
+                bo::OverlapMode::PreciseReplay,
                 Some(bo::WholeProgramAttestation::FrozenBenchmarkGraph),
             )),
         )
