@@ -129,6 +129,17 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
     let mut helpers = originals.keys().cloned().collect::<HashSet<_>>();
     for function in &frozen.functions {
         let record = &function.record;
+        crate::preservation::validate_skeleton_views(&record.baseline, &record.applied).map_err(
+            |error| {
+                global_error(
+                    ReplacementErrorKind::InvalidRequest,
+                    format!(
+                        "frozen skeletons for `{}` are invalid: {}",
+                        record.path, error.message
+                    ),
+                )
+            },
+        )?;
         let original = one_item(&function.original_item)?;
         let original_fn = frozen_function(&original)?;
         if record.kind != crate::ItemKindName::Fn

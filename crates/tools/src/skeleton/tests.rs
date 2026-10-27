@@ -4321,6 +4321,36 @@ fn opaque_conditional_label_suppression_does_not_skip_body_validation() {
 }
 
 #[test]
+fn nested_condition_keeps_outer_branch_labels_in_rendered_views() {
+    let source = r#"
+pub fn safe_double_to_int(d: f64) -> i32 {
+    if d.is_nan() as i32 != 0 { return 0; }
+    if if d.is_infinite() {
+        if d.is_sign_positive() { 1 } else { -1 }
+    } else { 0 } != 0 {
+        return if d > 0.0 { i32::MAX } else { i32::MIN };
+    }
+    if d >= i32::MAX as f64 { return i32::MAX; }
+    if d <= i32::MIN as f64 { return i32::MIN; }
+    return d as i32;
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "safe_double_to_int");
+    assert_eq!(
+        labels(&function.baseline.skeleton),
+        (0..11).collect::<Vec<_>>()
+    );
+    assert_eq!(function.baseline.statement_dispositions[1].label, 2);
+    assert_eq!(
+        function.baseline.statement_dispositions[1].children[0].label,
+        3
+    );
+    assert!(!function.baseline.needs_transformation);
+    assert_eq!(function.baseline, function.applied);
+}
+
+#[test]
 fn allows_nested_blocks_and_conditionals_as_opaque_values() {
     for (index, source) in [
         "pub unsafe fn f(mut value: i32, flag: bool) { value = 1 + if flag { value += 1; 2 } else { 3 }; }",
