@@ -39,6 +39,9 @@ impl FrozenTransport {
     /// Relay main/375: each step is a phase mark (`freeze:<step>`, `CRAT_BO_PHASE_LOG`) and an
     /// analysis-budget boundary, the recursive certificates with a tick per construction.
     pub(crate) fn build(facts: &Facts) -> anyhow::Result<Self> {
+        // Relay main/378 (d): `validate_returns` reads one index and is computed once per
+        // (construction, function) for the whole freeze.
+        let _returns = super::coverage::index_returns(facts);
         let step = |name: &str| -> anyhow::Result<()> {
             crate::phase_log::mark(name, "start", "");
             crate::analysis_budget::check(name)

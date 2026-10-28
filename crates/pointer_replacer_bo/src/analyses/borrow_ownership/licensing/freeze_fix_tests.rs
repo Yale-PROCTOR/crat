@@ -166,6 +166,8 @@ fn r378_d_validate_returns_is_computed_once_per_function() {
             computed.values().all(|&count| count <= 1),
             "validate_returns recomputed: {computed:?}"
         );
+        // The indexed form (the freeze's) against the scan, function by function.
+        let _index = coverage::index_returns(facts);
         for function in facts.source_occurrences.keys() {
             assert_eq!(
                 coverage::validate_returns(facts, 0, function),

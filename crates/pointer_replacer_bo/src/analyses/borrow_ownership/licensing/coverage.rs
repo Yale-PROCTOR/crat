@@ -1,5 +1,7 @@
 //! Independent MIR/SSA coverage observations. None is a licensing proof.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::super::ownership_evidence::Point;
@@ -261,7 +263,30 @@ pub(crate) fn validate_returns(
     construction: u32,
     function: &str,
 ) -> Result<(), Vec<CoverageError>> {
-    validate_returns_scan(facts, construction, function)
+    let index = RETURNS_INDEX.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .filter(|index| std::ptr::eq(index.facts, facts))
+            .cloned()
+    });
+    let Some(index) = index else {
+        return validate_returns_scan(facts, construction, function);
+    };
+    let key = (construction, function.to_owned());
+    if let Some(result) = index.memo.borrow().get(&key) {
+        return result.clone();
+    }
+    let rows = ReturnRows {
+        rosters: index.pick(&index.rosters, &key, &facts.body_rosters),
+        terminals: index.pick(&index.terminals, &key, &facts.terminals),
+        selections: index.pick(&index.selections, &key, &facts.return_selections),
+        phi_edges: index.pick(&index.phi_edges, &key, &facts.phi_edges),
+        phi_equations: index.pick(&index.phi_equations, &key, &facts.equations),
+    };
+    let result = validate_returns_rows(construction, function, rows);
+    index.memo.borrow_mut().insert(key, result.clone());
+    result
 }
 
 /// [`validate_returns`] computed from the whole-program vectors.
@@ -269,6 +294,144 @@ pub(crate) fn validate_returns_scan(
     facts: &super::facts::Facts,
     construction: u32,
     function: &str,
+) -> Result<(), Vec<CoverageError>> {
+    validate_returns_rows(
+        construction,
+        function,
+        ReturnRows {
+            rosters: facts.body_rosters.iter().collect(),
+            terminals: facts.terminals.iter().collect(),
+            selections: facts.return_selections.iter().collect(),
+            phi_edges: facts.phi_edges.iter().collect(),
+            phi_equations: facts.equations.iter().collect(),
+        },
+    )
+}
+
+/// **Relay main/378 (d), R1324-1.** The rows [`validate_returns`] reads from the whole program,
+/// grouped by (construction, function) in their original order, once for one `Facts`; and its
+/// results, memoized. While a freeze holds it ([`index_returns`]), a function's validation reads
+/// its own rows instead of scanning every vector, and is computed once.
+pub(crate) struct ReturnsIndex {
+    facts: *const super::facts::Facts,
+    rosters: BTreeMap<(u32, String), Vec<usize>>,
+    terminals: BTreeMap<(u32, String), Vec<usize>>,
+    selections: BTreeMap<(u32, String), Vec<usize>>,
+    phi_edges: BTreeMap<(u32, String), Vec<usize>>,
+    /// The `phi` phase's `equal` / `null-join` equations, the only ones the check reads.
+    phi_equations: BTreeMap<(u32, String), Vec<usize>>,
+    memo: std::cell::RefCell<BTreeMap<(u32, String), Result<(), Vec<CoverageError>>>>,
+}
+
+impl ReturnsIndex {
+    fn pick<'f, T>(
+        &self,
+        bucket: &BTreeMap<(u32, String), Vec<usize>>,
+        key: &(u32, String),
+        rows: &'f [T],
+    ) -> Vec<&'f T> {
+        bucket
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&at| &rows[at])
+            .collect()
+    }
+}
+
+thread_local! {
+    static RETURNS_INDEX: std::cell::RefCell<Option<std::rc::Rc<ReturnsIndex>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While this lives, [`validate_returns`] on `facts` reads the index (the freeze's scope).
+pub(crate) struct ReturnsIndexScope {
+    previous: Option<std::rc::Rc<ReturnsIndex>>,
+}
+
+impl Drop for ReturnsIndexScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RETURNS_INDEX.with(|active| *active.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn index_returns(facts: &super::facts::Facts) -> ReturnsIndexScope {
+    fn group<'f>(
+        points: impl Iterator<Item = (usize, &'f Point)>,
+    ) -> BTreeMap<(u32, String), Vec<usize>> {
+        let mut out: BTreeMap<(u32, String), Vec<usize>> = BTreeMap::new();
+        for (at, point) in points {
+            if let Some(function) = &point.function {
+                out.entry((point.construction, function.clone()))
+                    .or_default()
+                    .push(at);
+            }
+        }
+        out
+    }
+    let index = ReturnsIndex {
+        facts,
+        rosters: group(
+            facts
+                .body_rosters
+                .iter()
+                .enumerate()
+                .map(|(at, row)| (at, &row.point)),
+        ),
+        terminals: group(
+            facts
+                .terminals
+                .iter()
+                .enumerate()
+                .map(|(at, row)| (at, &row.point)),
+        ),
+        selections: group(
+            facts
+                .return_selections
+                .iter()
+                .enumerate()
+                .map(|(at, row)| (at, &row.point)),
+        ),
+        phi_edges: group(
+            facts
+                .phi_edges
+                .iter()
+                .enumerate()
+                .map(|(at, row)| (at, &row.point)),
+        ),
+        phi_equations: group(
+            facts
+                .equations
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.point.phase == "phi"
+                        && matches!(row.operation.as_str(), "equal" | "null-join")
+                })
+                .map(|(at, row)| (at, &row.point)),
+        ),
+        memo: std::cell::RefCell::new(BTreeMap::new()),
+    };
+    ReturnsIndexScope {
+        previous: RETURNS_INDEX.with(|active| active.replace(Some(std::rc::Rc::new(index)))),
+    }
+}
+
+/// The rows one validation reads: every row of each vector (the scan) or the function's own
+/// (the index). The checks below apply their full predicates to either, so both agree.
+struct ReturnRows<'f> {
+    rosters: Vec<&'f BodyRoster>,
+    terminals: Vec<&'f super::super::ownership_occurrence::Terminal>,
+    selections: Vec<&'f ReturnSelection>,
+    phi_edges: Vec<&'f PhiEdge>,
+    phi_equations: Vec<&'f super::super::ownership_evidence::Equation>,
+}
+
+fn validate_returns_rows(
+    construction: u32,
+    function: &str,
+    rows: ReturnRows<'_>,
 ) -> Result<(), Vec<CoverageError>> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -278,9 +441,10 @@ pub(crate) fn validate_returns_scan(
     let scope = |point: &Point| {
         point.construction == construction && point.function.as_deref() == Some(function)
     };
-    let rosters: Vec<_> = facts
-        .body_rosters
+    let rosters: Vec<_> = rows
+        .rosters
         .iter()
+        .copied()
         .filter(|row| scope(&row.point))
         .collect();
     if rosters.len() != 1 {
@@ -306,9 +470,10 @@ pub(crate) fn validate_returns_scan(
                 .map(|statement| (block.block, statement))
         })
         .collect();
-    let terminals: Vec<_> = facts
+    let terminals: Vec<_> = rows
         .terminals
         .iter()
+        .copied()
         .filter(|row| scope(&row.point) && row.local == 0)
         .collect();
     for &(block, statement) in &returns {
@@ -325,9 +490,10 @@ pub(crate) fn validate_returns_scan(
             errors.push(CoverageError::MissingReturn);
             continue;
         }
-        let selected: Vec<_> = facts
-            .return_selections
+        let selected: Vec<_> = rows
+            .selections
             .iter()
+            .copied()
             .filter(|row| {
                 scope(&row.point)
                     && row.point.block == Some(block)
@@ -395,7 +561,12 @@ pub(crate) fn validate_returns_scan(
     if phi_keys.len() != roster.phis.len() {
         errors.push(CoverageError::PhiInput);
     }
-    for edge in facts.phi_edges.iter().filter(|edge| scope(&edge.point)) {
+    for edge in rows
+        .phi_edges
+        .iter()
+        .copied()
+        .filter(|edge| scope(&edge.point))
+    {
         if !phi_keys.contains(&(edge.to, edge.local)) {
             errors.push(CoverageError::PhiInput);
         }
@@ -434,9 +605,10 @@ pub(crate) fn validate_returns_scan(
                     })
             })
             .collect();
-        let edges: Vec<_> = facts
+        let edges: Vec<_> = rows
             .phi_edges
             .iter()
+            .copied()
             .filter(|edge| scope(&edge.point) && edge.to == phi.block && edge.local == phi.local)
             .collect();
         let actual_edges: BTreeSet<_> = edges
@@ -467,7 +639,7 @@ pub(crate) fn validate_returns_scan(
                 continue;
             }
             for (&left, &right) in lhs.iter().zip(rhs.iter()) {
-                if !facts.equations.iter().any(|row| {
+                if !rows.phi_equations.iter().any(|row| {
                     scope(&row.point)
                         && row.point.phase == "phi"
                         && row.point.block == Some(phi.block)
