@@ -192,7 +192,19 @@ pub(crate) fn rewrite_bo_with_artifacts(
         configured_exposure,
         analysis_budget: crate::analysis_budget::Budget::from_env()?,
     };
-    let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
+    let capture = match bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config) {
+        Ok(capture) => capture,
+        // Relay main/375 §3: the analysis budget ended the solve. The program is degraded with
+        // the typed reason and the tree is left as the input; the pass succeeds, so the chain's
+        // later arms run.
+        Err(error) => match crate::analysis_budget::reason_in(&error) {
+            Some(reason) => {
+                eprintln!("pointer: degraded: {reason}");
+                return budget_receipt(input, reason, analysis_fingerprint);
+            }
+            None => return Err(error),
+        },
+    };
     crate::phase_log::mark("census", "end", "");
     let receipt = persist_in_place(input, &capture, analysis_fingerprint)?;
     crate::phase_log::mark("persist", "end", "");
@@ -548,6 +560,44 @@ fn emitted_relative_path(program_root: &Path, key: &FileKey) -> Result<PathBuf, 
         })
 }
 
+/// Relay main/375 §3: the receipt of a program the analysis budget degraded -- nothing
+/// written, `status=analysis-budget`, the verdict in `solve`.
+fn budget_receipt(
+    input: &Path,
+    reason: &str,
+    analysis_fingerprint: String,
+) -> Result<BoReceipt, String> {
+    let program_root = input
+        .parent()
+        .ok_or_else(|| format!("{} has no program root", input.display()))?;
+    let relative_files = rust_files(program_root)?;
+    let input_files = relative_files
+        .iter()
+        .map(|relative| {
+            std::fs::read(program_root.join(relative))
+                .map(|bytes| (relative.clone(), bytes))
+                .map_err(|error| format!("read {}: {error}", program_root.join(relative).display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_tree_sha256 = tree_digest(&input_files);
+    Ok(BoReceipt {
+        outcome: "degraded",
+        status: "analysis-budget",
+        analysis_fingerprint,
+        emitted_tree_sha256: input_tree_sha256.clone(),
+        input_tree_sha256,
+        files_changed: 0,
+        files_total: relative_files.len(),
+        verify_rounds: 0,
+        reverted_count: 0,
+        solve: format!("AnalysisBudget({reason:?})"),
+        file_rows: "file\tinput_sha256\temitted_sha256\tstate\n".to_owned(),
+        configured_unmatched: Vec::new(),
+        configured_ambiguous: Vec::new(),
+        inbound_wrapper_unplaceable: Vec::new(),
+    })
+}
+
 fn persist_in_place(
     input: &Path,
     capture: &E1Capture,
@@ -738,6 +788,31 @@ pub unsafe fn caller() -> i32 {
         }
         let _ = std::fs::remove_dir_all(&unset);
         let _ = std::fs::remove_dir_all(&set);
+    }
+
+    /// Relay main/375 §3: the session's error read back as the budget's verdict, and the
+    /// receipt of the program it degraded -- nothing written, the input's tree.
+    #[test]
+    fn r375_a_budget_error_is_a_degraded_receipt_with_the_input_tree() {
+        let error = "E1 capture has no observed root: degraded: analysis budget (0 s, 0.1 GB, bc:source_events)";
+        let reason = crate::analysis_budget::reason_in(error).unwrap();
+        assert_eq!(reason, "analysis budget (0 s, 0.1 GB, bc:source_events)");
+        assert!(crate::analysis_budget::reason_in("BO declined — no accepted model").is_none());
+        let root = fixture("budget");
+        let before = std::fs::read(root.join("lib.rs")).unwrap();
+        let receipt = super::budget_receipt(&root.join("lib.rs"), reason, "fp".to_owned()).unwrap();
+        assert_eq!(
+            (receipt.outcome, receipt.status),
+            ("degraded", "analysis-budget")
+        );
+        assert_eq!(receipt.input_tree_sha256, receipt.emitted_tree_sha256);
+        assert_eq!(receipt.files_changed, 0);
+        assert!(
+            receipt
+                .summary()
+                .contains("solve=AnalysisBudget(\"analysis budget (0 s")
+        );
+        assert_eq!(std::fs::read(root.join("lib.rs")).unwrap(), before);
     }
 
     #[test]

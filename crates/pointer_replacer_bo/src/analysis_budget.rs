@@ -54,14 +54,23 @@ pub(crate) struct Exceeded {
     pub(crate) boundary: String,
 }
 
+/// The head of [`Exceeded::reason`]: the pass reads the verdict back from the session's
+/// error by it (the session's thread, and its record, are gone by then).
+pub(crate) const REASON_HEAD: &str = "analysis budget (";
+
 impl Exceeded {
     /// The degraded program's reason.
     pub(crate) fn reason(&self) -> String {
         format!(
-            "analysis budget ({:.0} s, {:.1} GB, {})",
+            "{REASON_HEAD}{:.0} s, {:.1} GB, {})",
             self.wall_s, self.rss_gb, self.boundary
         )
     }
+}
+
+/// The budget's verdict inside a session error, if that is what ended it.
+pub(crate) fn reason_in(error: &str) -> Option<&str> {
+    error.find(REASON_HEAD).map(|at| &error[at..])
 }
 
 struct Active {
