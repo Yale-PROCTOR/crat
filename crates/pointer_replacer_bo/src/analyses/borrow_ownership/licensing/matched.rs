@@ -478,7 +478,9 @@ fn normalize(guards: &Guards, aliases: &BTreeMap<EquationId, EquationId>) -> Opt
 }
 
 /// Relay main/379 (R1328-1 §1): a fixpoint round's sizes for its `matched:round end` mark: the
-/// rows it added (with repeats, distinct, and their proofs' steps), and over the relations and
+/// rows it added (with repeats -- since relay main/382 (b) a row is pushed once a round, so
+/// `added` reads the distinct count unless the reference switch is on --, distinct, and their
+/// proofs' steps), and over the relations and
 /// the added rows the Exact lineages (the distinct call paths, the longest) and the recursive ones.
 fn round_sizes(
     round: usize,
@@ -533,6 +535,20 @@ fn relations_by_scope(
             .push(relation);
     }
     by_scope
+}
+
+/// Relay main/382 (b): whether a round pushes `relation` -- the first time it is reached in the
+/// round. A repeat is not pushed (the first proof is the one `or_insert` keeps); the reference
+/// switch pushes it, as the sweep did before.
+fn first_in_round(pushed: &mut BTreeSet<Relation>, relation: &Relation, scan: bool) -> bool {
+    if pushed.insert(relation.clone()) {
+        return true;
+    }
+    #[cfg(test)]
+    if scan {
+        super::freeze_counts::relation_repeated();
+    }
+    scan
 }
 
 /// Relay main/379 (`matched`, step 1): each callee scope's callers.
@@ -2003,7 +2019,8 @@ impl MatchedTransport {
                 )
             });
             let mut added = Vec::new();
-            #[cfg(test)]
+            // Relay main/382 (b): the relations this round pushed, so a repeat is not pushed
+            // again (or_insert kept the first proof); its proof is not cloned either.
             let mut pushed = BTreeSet::new();
             let sweep: Box<dyn Iterator<Item = (&Scope, &Function)>> = match incremental {
                 Some(set) => Box::new(
@@ -2038,29 +2055,25 @@ impl MatchedTransport {
                                 output: Destination::Port(output),
                                 guards: guards.clone(),
                             };
-                            if !relations.contains_key(&relation) {
-                                #[cfg(test)]
-                                if !pushed.insert(relation.clone()) {
-                                    super::freeze_counts::relation_repeated();
-                                }
+                            if !relations.contains_key(&relation)
+                                && first_in_round(&mut pushed, &relation, scan)
+                            {
                                 added.push((relation, proof.clone()));
                             }
                         }
                         for terminal in function.terminals.iter().filter(|end| end.node == output) {
                             let Some(guards) = combine(&guards, &terminal.guards) else { continue };
-                            let mut proof = proof.clone();
-                            proof.extend(terminal.suffix.iter().cloned());
                             let relation = Relation {
                                 scope: scope.clone(),
                                 seed: seed.clone(),
                                 output: Destination::Terminal(terminal.terminal.clone()),
                                 guards,
                             };
-                            if !relations.contains_key(&relation) {
-                                #[cfg(test)]
-                                if !pushed.insert(relation.clone()) {
-                                    super::freeze_counts::relation_repeated();
-                                }
+                            if !relations.contains_key(&relation)
+                                && first_in_round(&mut pushed, &relation, scan)
+                            {
+                                let mut proof = proof.clone();
+                                proof.extend(terminal.suffix.iter().cloned());
                                 added.push((relation, proof));
                             }
                         }
