@@ -276,6 +276,7 @@ fn w5c_thin_count_configured_private_entry_stays_held() {
     for name in ["BitsEntropy", "ShannonEntropy"] {
         let input = fixture(18, "run");
         let config = crate::bo_rewriter::EmissionRunConfig {
+            analysis_budget: Default::default(),
             configured_exposure: super::exposure::ConfiguredExposureInput::checked(
                 "counted-private-entry",
                 [name.to_owned()],

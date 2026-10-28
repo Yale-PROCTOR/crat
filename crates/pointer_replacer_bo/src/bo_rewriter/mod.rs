@@ -884,6 +884,8 @@ impl AttributionHits {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EmissionRunConfig {
     pub(crate) configured_exposure: decision::exposure::ConfiguredExposureInput,
+    /// Relay main/375 §3: the analysis budget (off by default).
+    pub(crate) analysis_budget: crate::analysis_budget::Budget,
 }
 
 impl Default for EmissionRunConfig {
@@ -892,6 +894,7 @@ impl Default for EmissionRunConfig {
             configured_exposure: decision::exposure::ConfiguredExposureInput::explicit_empty(
                 "bo-rewriter-default-explicit-empty",
             ),
+            analysis_budget: crate::analysis_budget::Budget::default(),
         }
     }
 }
@@ -7688,6 +7691,8 @@ fn decide_table_perturbed_config<'tcx>(
     a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
     run_config: &EmissionRunConfig,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    // Relay main/375 §3: on the compiler thread, for the whole decide.
+    let _budget = crate::analysis_budget::enter(run_config.analysis_budget);
     crate::phase_log::mark("decide:program", "start", "");
     let program = collect_program(tcx);
     crate::phase_log::mark(
@@ -7801,6 +7806,10 @@ fn decide_table_perturbed_config<'tcx>(
     });
     crate::phase_log::mark("decide:solve", "end", "");
     let Some(verified) = verified else {
+        // Relay main/375 §3: a solve the budget ended is that, typed.
+        if let Some(exceeded) = crate::analysis_budget::exceeded() {
+            return Err(format!("degraded: {}", exceeded.reason()));
+        }
         return Err("BO declined — no accepted model".to_owned());
     };
     let solve_secs = solve_t0.elapsed().as_secs_f64();

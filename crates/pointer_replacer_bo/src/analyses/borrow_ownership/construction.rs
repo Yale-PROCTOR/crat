@@ -1100,15 +1100,18 @@ fn construct_bo_into_with_esc(
     enable_esc_minimal: bool,
 ) -> anyhow::Result<BoConstruction> {
     crate::phase_log::mark("bc:source_events", "start", "");
+    crate::analysis_budget::check("bc:source_events")?;
     let source_events = super::source_events::for_construction(program);
     crate::phase_log::mark("bc:source_events", "end", "");
     #[cfg(test)]
     let source_events = super::wrapper_fault_tests::inventory(source_events);
     super::export::record(|export| export.source_events = Some(source_events.clone()));
     crate::phase_log::mark("bc:record_sites", "start", "");
+    crate::analysis_budget::check("bc:record_sites")?;
     super::comparison::record_sites(program, slots);
     crate::phase_log::mark("bc:record_sites", "end", "");
     crate::phase_log::mark("bc:crate_ctxt", "start", "");
+    crate::analysis_budget::check("bc:crate_ctxt")?;
     let crate_ctxt = CrateCtxt::new(program);
     crate::phase_log::mark(
         "bc:crate_ctxt",
@@ -1120,6 +1123,7 @@ fn construct_bo_into_with_esc(
         "start",
         &format!("enabled={enable_esc_minimal}"),
     );
+    crate::analysis_budget::check("bc:esc_minimal")?;
     let esc_minimal = if enable_esc_minimal {
         super::esc_minimal::select(program, slots)
     } else {
@@ -1131,6 +1135,7 @@ fn construct_bo_into_with_esc(
         "start",
         &format!("mode={mode:?}"),
     );
+    crate::analysis_budget::check("bc:copy_lend_eligibility")?;
     #[cfg(test)]
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
@@ -1146,6 +1151,7 @@ fn construct_bo_into_with_esc(
     #[cfg(test)]
     let eligibility_elapsed = t.elapsed();
     crate::phase_log::mark("bc:ownership_constraints", "start", "");
+    crate::analysis_budget::check("bc:ownership_constraints")?;
     #[cfg(test)]
     let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
@@ -1183,8 +1189,10 @@ fn construct_bo_into_with_esc(
         tracker.set_context("coherence");
     }
     crate::phase_log::mark("bc:coherence", "start", "");
+    crate::analysis_budget::check("bc:coherence")?;
     let total = program.functions.len();
     for (index, &fn_did) in program.functions.iter().enumerate() {
+        crate::analysis_budget::check("bc:coherence")?;
         let probe = crate::phase_log::Probe::begin();
         let body = program
             .tcx
@@ -1207,9 +1215,11 @@ fn construct_bo_into_with_esc(
     }
     crate::phase_log::mark("bc:coherence", "end", "");
     crate::phase_log::mark("bc:nullability", "start", "");
+    crate::analysis_budget::check("bc:nullability")?;
     let mut nullability = super::nullability::analyze(program.tcx, &program.functions, slots);
     crate::phase_log::mark("bc:nullability", "end", "");
     crate::phase_log::mark("bc:field_ref_worthiness", "start", "");
+    crate::analysis_budget::check("bc:field_ref_worthiness")?;
     let field_ref_plan = constrain_field_ref_worthiness(
         solver,
         slots,
@@ -1219,15 +1229,18 @@ fn construct_bo_into_with_esc(
     );
     crate::phase_log::mark("bc:field_ref_worthiness", "end", "");
     crate::phase_log::mark("bc:array_fields", "start", "");
+    crate::analysis_budget::check("bc:array_fields")?;
     let array_fields = super::array_fields::constrain(program, slots, solver, &mut nullability);
     crate::phase_log::mark("bc:array_fields", "end", "");
     super::export::record(|export| export.array_fields = Some(array_fields.clone()));
     #[cfg(test)]
     let coherence_elapsed = t.elapsed();
     crate::phase_log::mark("bc:qualifier_facts", "start", "");
+    crate::analysis_budget::check("bc:qualifier_facts")?;
     let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
     crate::phase_log::mark("bc:qualifier_facts", "end", "");
     crate::phase_log::mark("bc:selectors_demand_capture", "start", "");
+    crate::analysis_budget::check("bc:selectors_demand_capture")?;
     super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
     solver.set_demand_capture(super::demand_evidence::begin_construction(
         program,
@@ -2006,6 +2019,12 @@ fn solve_bo_overlap_config_with_source_events(
     }
 
     crate::phase_log::mark("solve:overlap_plan", "start", "");
+    crate::analysis_budget::check("solve:overlap_plan").map_err(|error| {
+        OverlapPreledgerDecline::from_error(
+            OverlapPreledgerDeclineReason::OverlapPlanProduction,
+            error,
+        )
+    })?;
     let plan = produce_overlap_plan(
         program,
         slots,

@@ -190,6 +190,7 @@ pub(crate) fn rewrite_bo_with_artifacts(
             .map_err(|failure| format!("exposed function names: {failure:?}"))?;
     let run_config = EmissionRunConfig {
         configured_exposure,
+        analysis_budget: crate::analysis_budget::Budget::from_env()?,
     };
     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
     crate::phase_log::mark("census", "end", "");
@@ -750,6 +751,7 @@ pub unsafe fn caller() -> i32 {
                     std::iter::empty::<String>(),
                 )
                 .unwrap(),
+            analysis_budget: crate::analysis_budget::Budget::default(),
         };
         // The table the pass decides, from the program before it is rewritten in place.
         let entries = ::utils::compilation::run_compiler_on_path(&root.join("lib.rs"), |tcx| {

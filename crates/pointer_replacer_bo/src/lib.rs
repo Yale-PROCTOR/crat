@@ -47,6 +47,7 @@ pub mod analyses {
     }
     pub use pointer_replacer::analyses::*;
 }
+mod analysis_budget;
 mod bo_pipeline;
 mod bo_rewriter;
 mod coverage_recon;

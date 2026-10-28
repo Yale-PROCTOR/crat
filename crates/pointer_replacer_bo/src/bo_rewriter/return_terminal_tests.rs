@@ -106,7 +106,7 @@ fn emit(input: &str, functions: &[Function], exposed: &str, hold_exposed: bool) 
         let (table, ctx) = super::decide_table_with_emission_config(
             tcx,
             Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
-            &super::EmissionRunConfig { configured_exposure: configured_exposure(exposed) },
+            &super::EmissionRunConfig { analysis_budget: Default::default(), configured_exposure: configured_exposure(exposed) },
         ).expect("one real return-fixture decision pipeline");
         let solve = super::model_cache::solve_receipt();
         println!("J13 return fixture exposed={exposed}, hold={hold_exposed}: solve={solve:#?}");

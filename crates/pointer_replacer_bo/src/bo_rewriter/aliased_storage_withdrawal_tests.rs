@@ -95,6 +95,7 @@ fn frame_of(var: &str) -> super::E1Capture {
     );
     // The census's configured exposure row for brotli (explicit-empty).
     let config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
             "standing-raw-boundary-launch:Config::default.c_exposed_fns",
             Vec::new(),

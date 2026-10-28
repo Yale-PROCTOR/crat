@@ -3700,6 +3700,7 @@ pub unsafe extern "C" fn ht_length(mut table: *mut ht) -> usize { return (*table
     let root = dir.join("lib.rs");
     std::fs::write(&root, format!("{PRELUDE}{SOURCE}")).unwrap();
     let run_config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::from_names(
             "fixture-config",
             ["ht_destroy".to_owned()],

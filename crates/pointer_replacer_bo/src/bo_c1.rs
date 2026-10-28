@@ -12044,6 +12044,7 @@ mod run {
         )
         .expect("configured exposure input row");
         let emission_config = crate::bo_rewriter::EmissionRunConfig {
+            analysis_budget: Default::default(),
             configured_exposure: exposure_input,
         };
         let fingerprint = match raw_boundary_cache_fingerprint(input) {

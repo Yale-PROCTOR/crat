@@ -9159,6 +9159,7 @@ fn br_w13_surface_safe_return_to_raw_has_class_receipt() {
             crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
         ),
         &super::EmissionRunConfig {
+            analysis_budget: Default::default(),
             configured_exposure: configured_exposure_input("api"),
         },
     );
@@ -12282,6 +12283,7 @@ fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
          pub unsafe extern \"C\" fn helper(p: *const i32) -> *const i32 { p }\n",
     )]);
     let run_config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: configured_exposure_input("api"),
     };
     let outcome = super::rewrite_m1_path_with_emission_config(
@@ -12388,6 +12390,7 @@ fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
          slice signature"
     );
     let run_config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: configured_exposure_input("api"),
     };
     let outcome = super::rewrite_m1_path_with_emission_config(

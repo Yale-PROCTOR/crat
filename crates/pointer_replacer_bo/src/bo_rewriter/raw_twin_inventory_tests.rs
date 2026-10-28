@@ -248,6 +248,7 @@ fn r761_2_a_raw_twin_position_with_nothing_to_bridge_issues_no_a5_receipt() {
     let root = dir.join("lib.rs");
     std::fs::write(&root, HEMAN_TWIN).unwrap();
     let config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
             "standing-raw-boundary-launch:Config::default.c_exposed_fns",
             Vec::new(),

@@ -1194,6 +1194,10 @@ fn verify_rounds(
     let mut ledger_commits: Vec<super::raw_cause::Commit> = Vec::new();
     let mut last_dropped = dropped;
     for _ in 0..cap {
+        // Relay main/375 §3: the analysis budget ends the solve at a round's start.
+        if crate::analysis_budget::over("solve:round") {
+            return (None, stats);
+        }
         stats.rounds += 1;
         crate::phase_log::mark(
             "solve:round",

@@ -666,6 +666,7 @@ mod tests {
                 )
                 .expect("configured input");
                 let run_config = super::super::super::EmissionRunConfig {
+                    analysis_budget: Default::default(),
                     configured_exposure: configured,
                 };
                 let (_, ctx) = super::super::super::decide_table_with_emission_config(
@@ -705,6 +706,7 @@ mod tests {
                 )
                 .expect("configured input");
                 let run_config = super::super::super::EmissionRunConfig {
+                    analysis_budget: Default::default(),
                     configured_exposure: configured,
                 };
                 let (_, ctx) = super::super::super::decide_table_with_emission_config(

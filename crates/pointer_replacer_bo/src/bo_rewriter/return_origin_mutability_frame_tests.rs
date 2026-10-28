@@ -21,6 +21,7 @@ fn frame_of(var: &str) -> super::E1Capture {
         "the frame is read from its accepted cache, never solved"
     );
     let config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
             "standing-raw-boundary-launch:Config::default.c_exposed_fns",
             Vec::new(),

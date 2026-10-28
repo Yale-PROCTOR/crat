@@ -370,6 +370,7 @@ fn r697_2_quadtree_insert_hoists_on_the_frame() {
     );
     // The census's configured exposure row for quadtree (explicit-empty).
     let config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
             "standing-raw-boundary-launch:Config::default.c_exposed_fns",
             Vec::new(),
@@ -483,6 +484,7 @@ fn r697_2_the_hoist_by_program_on_the_frame() {
         "the frame is read from its accepted cache, never solved"
     );
     let config = super::EmissionRunConfig {
+        analysis_budget: Default::default(),
         configured_exposure: super::decision::exposure::ConfiguredExposureInput::checked(
             "standing-raw-boundary-launch:Config::default.c_exposed_fns",
             Vec::new(),

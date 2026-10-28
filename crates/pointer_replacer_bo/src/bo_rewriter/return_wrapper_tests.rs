@@ -85,7 +85,7 @@ fn emit_source(source: &str, family: Family, hold_owner: bool) -> Output {
             format!("{:x}", Sha256::digest(b"target"))).expect("existing checked exposure mechanism");
         let (table, ctx) = super::decide_table_with_emission_config(tcx,
             Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
-            &super::EmissionRunConfig { configured_exposure }).expect("one actual wrapper decision invocation");
+            &super::EmissionRunConfig { analysis_budget: Default::default(), configured_exposure }).expect("one actual wrapper decision invocation");
         let solve = super::model_cache::solve_receipt();
         println!("J18 wrapper {family:?} hold={hold_owner}: solve={solve:#?}");
         assert!(solve.is_some(), "actual fixture solve receipt");
@@ -405,7 +405,7 @@ fn check_nonreturn_parameter_atom(check_missing_receipt: bool) {
                 format!("{:x}", Sha256::digest(b"target"))).expect("checked target exposure");
             let (table, ctx) = super::decide_table_with_emission_config(tcx,
                 Some((super::OverlapMode::PreciseReplay, Some(super::WholeProgramAttestation::FrozenBenchmarkGraph))),
-                &super::EmissionRunConfig { configured_exposure }).expect("one actual nonreturn decision call");
+                &super::EmissionRunConfig { analysis_budget: Default::default(), configured_exposure }).expect("one actual nonreturn decision call");
             let solve = super::model_cache::solve_receipt();
             println!("J18 nonreturn parameter-atom solve={solve:#?}");
             assert!(solve.is_some(), "actual fixture solve receipt");

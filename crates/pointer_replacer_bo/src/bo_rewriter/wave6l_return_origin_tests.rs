@@ -165,6 +165,7 @@ fn emitted(name: &str, source: &str, exposed: &[&str]) -> RewriteOutcome {
         OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         &super::EmissionRunConfig {
+            analysis_budget: Default::default(),
             configured_exposure,
         },
     );
