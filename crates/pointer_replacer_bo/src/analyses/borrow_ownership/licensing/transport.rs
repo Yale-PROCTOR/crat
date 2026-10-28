@@ -187,6 +187,8 @@ impl CandidateGraph {
                             || consume.point.function != equation.point.function
                             || consume.point.block != equation.point.block
                         {
+                            #[cfg(test)]
+                            super::freeze_counts::consume_wasted();
                             return false;
                         }
                         let Present(base) = &consume.base else {

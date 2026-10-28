@@ -520,6 +520,19 @@ fn round_sizes(
     )
 }
 
+/// **Relay main/379 (`matched`, step 1).** In tests, the old whole-collection scans the indexes
+/// replaced, for an equality witness; always `false` outside tests.
+pub(crate) fn reference_scans() -> bool {
+    #[cfg(test)]
+    {
+        super::freeze_counts::reference_scans()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 impl Function {
     fn normalize_guards(&mut self, aliases: &BTreeMap<EquationId, EquationId>) {
         self.edges.retain_mut(|edge| {
@@ -552,7 +565,13 @@ impl Function {
                 continue;
             }
             result.insert((node, guards.clone()), proof.clone());
-            for edge in self.edges.iter().filter(|edge| edge.from == node) {
+            for edge in self.edges.iter().filter(|edge| {
+                #[cfg(test)]
+                if edge.from != node {
+                    super::freeze_counts::edge_wasted();
+                }
+                edge.from == node
+            }) {
                 let Some(next) = combine(&guards, &edge.guards) else { continue };
                 let mut witness = proof.clone();
                 witness.push(edge.step.clone());
@@ -1954,10 +1973,13 @@ impl MatchedTransport {
             let caller = functions
                 .entry((key.construction, key.caller.clone()))
                 .or_default();
-            for relation in relations
-                .keys()
-                .filter(|row| row.scope == (key.construction, key.callee.clone()))
-            {
+            for relation in relations.keys().filter(|row| {
+                #[cfg(test)]
+                if row.scope != (key.construction, key.callee.clone()) {
+                    super::freeze_counts::relation_wasted();
+                }
+                row.scope == (key.construction, key.callee.clone())
+            }) {
                 match &relation.output {
                     Destination::Port(formal_output) => {
                         for output in call

@@ -203,3 +203,28 @@ fn r378_d_validate_returns_is_computed_once_per_function() {
         }
     });
 }
+
+/// Relay main/379 (`matched`, step 1): the consumes found per `equal` equation, the edges `paths`
+/// follows and the relations `apply` reads come from indexes, so nothing outside the row's own
+/// (construction, function, block), node or callee scope is examined; the old scans (the
+/// reference switch) examine such rows on this fixture, and the transport is the same either way.
+#[test]
+fn r379_matched_reads_only_its_own_rows_and_equals_the_scans() {
+    with_freeze(|facts, transport| {
+        assert_eq!(
+            freeze_counts::wasted(),
+            (0, 0, 0),
+            "consumes / edges / relations examined outside their scope"
+        );
+        freeze_counts::reset();
+        freeze_counts::set_reference_scans(true);
+        let reference = FrozenTransport::build(facts).expect("no budget");
+        let wasted = freeze_counts::wasted();
+        freeze_counts::set_reference_scans(false);
+        assert!(
+            wasted.0 > 0 && wasted.1 > 0 && wasted.2 > 0,
+            "the fixture exercises every scan: {wasted:?}"
+        );
+        assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
+    });
+}
