@@ -273,7 +273,9 @@ fn statement_effect(
                     // An unsizing coercion (`&mut [T; N]` -> `&mut [T]`) adds the
                     // length, or a vtable, and keeps the address (relay
                     // era-5c/265). Its destination's pointee is unsized, so only
-                    // depth 0 is a cell.
+                    // depth 0 is a cell (`ptr_chain_depth` stops at a pointee
+                    // that is not a pointer); a coerced `Box` or `NonNull` has
+                    // no cell at all.
                     Rvalue::Use(operand)
                     | Rvalue::Cast(
                         CastKind::PtrToPtr | CastKind::PointerCoercion(PointerCoercion::Unsize, _),
@@ -365,7 +367,8 @@ fn call_effect<'tcx>(
     // `as_ptr` are `self as *mut [T] as *mut T` (`*const` for `as_ptr`), so by
     // core's contract and body the result is the slice's own buffer, the
     // receiver's referent. Not a §28 argument and not a premise. The instance is
-    // resolved first and keyed on core's inherent impl for `[T]`, never on the
+    // resolved first and keyed on core's inherent impls on a slice type (of
+    // those, only `impl<T> [T]` defines `as_ptr` / `as_mut_ptr`), never on the
     // name: a local function, a user type's method and a user trait's impl for
     // a slice are bodies of their own.
     let slice_buffer = match &terminator.kind {
