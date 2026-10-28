@@ -520,6 +520,21 @@ fn round_sizes(
     )
 }
 
+/// Relay main/379 (`matched`, step 1): the relations by scope, each scope's in their order, so a
+/// call reads its callee's relations instead of filtering all of them.
+fn relations_by_scope(
+    relations: &BTreeMap<Relation, Vec<Step>>,
+) -> BTreeMap<(u32, &str), Vec<&Relation>> {
+    let mut by_scope: BTreeMap<(u32, &str), Vec<&Relation>> = BTreeMap::new();
+    for relation in relations.keys() {
+        by_scope
+            .entry((relation.scope.0, relation.scope.1.as_str()))
+            .or_default()
+            .push(relation);
+    }
+    by_scope
+}
+
 /// Relay main/379 (`matched`, step 1): each callee scope's callers.
 fn callers_of(calls: &BTreeMap<CallKey, Call>) -> BTreeMap<Scope, BTreeSet<Scope>> {
     let mut callers: BTreeMap<Scope, BTreeSet<Scope>> = BTreeMap::new();
@@ -1928,9 +1943,22 @@ impl MatchedTransport {
             )
         });
         let mut relations = BTreeMap::new();
-        #[cfg(test)]
+        // Relay main/379 (`matched`, step 1): the semi-naive fixpoint. After the first round, a
+        // round re-applies and re-sweeps only the callers of the scopes the round before added
+        // relations to (`affected`); every other function is the one an earlier round built and
+        // swept, its candidates recorded already, so it would add nothing. The rows added, their
+        // order and first proofs, the rounds and the final functions are the full fixpoint's, and
+        // `base` is cloned whole once. The reference switch keeps the full rounds.
+        let scan = reference_scans();
         let callers_of = callers_of(&calls);
-        #[cfg(test)]
+        let mut calls_by_caller: BTreeMap<Scope, Vec<(&CallKey, &Call)>> = BTreeMap::new();
+        for (key, call) in &calls {
+            calls_by_caller
+                .entry((key.construction, key.caller.clone()))
+                .or_default()
+                .push((key, call));
+        }
+        let mut functions: BTreeMap<Scope, Function> = BTreeMap::new();
         let mut affected: Option<BTreeSet<Scope>> = None;
         let mut round = 0usize;
         loop {
@@ -1938,21 +1966,51 @@ impl MatchedTransport {
             crate::phase_log::sub("matched:round", "start", || {
                 format!("round={round} relations={}", relations.len())
             });
-            let functions = Self::apply(&base, &calls, &relations);
-            #[cfg(test)]
-            if affected.is_some() {
-                super::freeze_counts::base_recloned();
+            let incremental = affected.as_ref().filter(|_| !scan);
+            if let Some(set) = incremental {
+                let by_scope = relations_by_scope(&relations);
+                for caller in set {
+                    let mut function = base.get(caller).cloned().unwrap_or_default();
+                    for (key, call) in calls_by_caller.get(caller).into_iter().flatten() {
+                        Self::apply_call(
+                            &mut function,
+                            key,
+                            call,
+                            by_scope
+                                .get(&(key.construction, key.callee.as_str()))
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        );
+                    }
+                    functions.insert(caller.clone(), function);
+                }
+            } else {
+                #[cfg(test)]
+                if affected.is_some() {
+                    super::freeze_counts::base_recloned();
+                }
+                functions = Self::apply(&base, &calls, &relations);
             }
             crate::phase_log::sub("matched:apply", "end", || {
                 format!(
-                    "round={round} base_cloned=1 edges={} sources={} terminals={}",
+                    "round={round} base_cloned={} rebuilt={} edges={} sources={} terminals={}",
+                    u8::from(incremental.is_none()),
+                    incremental.map_or(functions.len(), BTreeSet::len),
                     functions.values().map(|f| f.edges.len()).sum::<usize>(),
                     functions.values().map(|f| f.sources.len()).sum::<usize>(),
                     functions.values().map(|f| f.terminals.len()).sum::<usize>()
                 )
             });
             let mut added = Vec::new();
-            for (scope, function) in &functions {
+            let sweep: Box<dyn Iterator<Item = (&Scope, &Function)>> = match incremental {
+                Some(set) => Box::new(
+                    set.iter()
+                        .filter_map(|scope| functions.get_key_value(scope)),
+                ),
+                None => Box::new(functions.iter()),
+            };
+            for (scope, function) in sweep {
                 #[cfg(test)]
                 if affected.as_ref().is_some_and(|set| !set.contains(scope)) {
                     super::freeze_counts::function_reswept();
@@ -2010,10 +2068,7 @@ impl MatchedTransport {
                     denials,
                 };
             }
-            #[cfg(test)]
-            {
-                affected = Some(affected_by(&callers_of, &added));
-            }
+            affected = Some(affected_by(&callers_of, &added));
             for (relation, proof) in added {
                 relations.entry(relation).or_insert(proof);
             }
@@ -2029,15 +2084,11 @@ impl MatchedTransport {
         // Relay main/379 (`matched`, step 1): the relations by scope, in their order, so a call
         // reads its callee's relations instead of filtering all of them.
         let scan = reference_scans();
-        let mut by_scope: BTreeMap<(u32, &str), Vec<&Relation>> = BTreeMap::new();
-        if !scan {
-            for relation in relations.keys() {
-                by_scope
-                    .entry((relation.scope.0, relation.scope.1.as_str()))
-                    .or_default()
-                    .push(relation);
-            }
-        }
+        let by_scope = if scan {
+            BTreeMap::new()
+        } else {
+            relations_by_scope(relations)
+        };
         for (key, call) in calls {
             let caller = functions
                 .entry((key.construction, key.caller.clone()))
@@ -2059,85 +2110,95 @@ impl MatchedTransport {
                         .copied(),
                 )
             };
-            for relation in scoped {
-                match &relation.output {
-                    Destination::Port(formal_output) => {
-                        for output in call
-                            .outputs
-                            .iter()
-                            .filter(|part| part.formal == *formal_output)
-                        {
-                            match &relation.seed {
-                                Seed::Input(formal) => {
-                                    for input in
-                                        call.inputs.iter().filter(|part| part.formal == *formal)
-                                    {
-                                        let Some(guards) = combine(&relation.guards, &input.guards)
-                                            .and_then(|guards| combine(&guards, &output.guards))
-                                        else {
-                                            continue;
-                                        };
-                                        caller.edges.push(Arc {
-                                            from: input.actual,
-                                            to: output.actual,
-                                            guards,
-                                            step: Step::Apply {
-                                                call: key.clone(),
-                                                relation: relation.clone(),
-                                                input: Some(input.clone()),
-                                                output: output.clone(),
-                                            },
-                                        });
-                                    }
-                                }
-                                Seed::Source(source) => {
-                                    let Some(guards) = combine(&relation.guards, &output.guards)
+            Self::apply_call(caller, key, call, scoped);
+        }
+        functions
+    }
+
+    /// One call's application to its caller's function: the callee's relations (`scoped`, in
+    /// their order) as edges, sources and terminals.
+    fn apply_call<'r>(
+        caller: &mut Function,
+        key: &CallKey,
+        call: &Call,
+        scoped: impl Iterator<Item = &'r Relation>,
+    ) {
+        for relation in scoped {
+            match &relation.output {
+                Destination::Port(formal_output) => {
+                    for output in call
+                        .outputs
+                        .iter()
+                        .filter(|part| part.formal == *formal_output)
+                    {
+                        match &relation.seed {
+                            Seed::Input(formal) => {
+                                for input in
+                                    call.inputs.iter().filter(|part| part.formal == *formal)
+                                {
+                                    let Some(guards) = combine(&relation.guards, &input.guards)
+                                        .and_then(|guards| combine(&guards, &output.guards))
                                     else {
                                         continue;
                                     };
-                                    caller.sources.push(Source {
-                                        node: output.actual,
-                                        instance: source.through(key),
+                                    caller.edges.push(Arc {
+                                        from: input.actual,
+                                        to: output.actual,
                                         guards,
-                                        proof: vec![Step::Apply {
+                                        step: Step::Apply {
                                             call: key.clone(),
                                             relation: relation.clone(),
-                                            input: None,
+                                            input: Some(input.clone()),
                                             output: output.clone(),
-                                        }],
+                                        },
                                     });
                                 }
                             }
-                        }
-                    }
-                    Destination::Terminal(terminal) => {
-                        if let Seed::Input(formal) = &relation.seed {
-                            for input in call.inputs.iter().filter(|part| part.formal == *formal) {
-                                let Some(guards) = combine(&relation.guards, &input.guards) else {
+                            Seed::Source(source) => {
+                                let Some(guards) = combine(&relation.guards, &output.guards) else {
                                     continue;
                                 };
-                                caller.terminals.push(EndAt {
-                                    node: input.actual,
-                                    terminal: TerminalInstance {
-                                        target: terminal.target.clone(),
-                                        lineage: terminal.lineage.through(key),
-                                    },
+                                caller.sources.push(Source {
+                                    node: output.actual,
+                                    instance: source.through(key),
                                     guards,
-                                    suffix: vec![Step::EndApply {
+                                    proof: vec![Step::Apply {
                                         call: key.clone(),
                                         relation: relation.clone(),
-                                        input: input.clone(),
+                                        input: None,
+                                        output: output.clone(),
                                     }],
                                 });
                             }
                         }
-                        // A callee-local source/terminal relation remains in
-                        // that function's record. It creates no caller carrier.
                     }
+                }
+                Destination::Terminal(terminal) => {
+                    if let Seed::Input(formal) = &relation.seed {
+                        for input in call.inputs.iter().filter(|part| part.formal == *formal) {
+                            let Some(guards) = combine(&relation.guards, &input.guards) else {
+                                continue;
+                            };
+                            caller.terminals.push(EndAt {
+                                node: input.actual,
+                                terminal: TerminalInstance {
+                                    target: terminal.target.clone(),
+                                    lineage: terminal.lineage.through(key),
+                                },
+                                guards,
+                                suffix: vec![Step::EndApply {
+                                    call: key.clone(),
+                                    relation: relation.clone(),
+                                    input: input.clone(),
+                                }],
+                            });
+                        }
+                    }
+                    // A callee-local source/terminal relation remains in
+                    // that function's record. It creates no caller carrier.
                 }
             }
         }
-        functions
     }
 
     /// Candidate existence with compatible guards; this does not select a model
