@@ -9,6 +9,10 @@
 //! O: an `offset` / `add` / `sub` of `core::ptr` that leaves its allocation (one
 //! past the end allowed) is UB in Rust and in C, so under §28 the result points
 //! into the receiver's objects. `wrapping_*` and `byte_*` stay Unknown.
+//!
+//! An array's `as_mut_ptr` / `as_ptr` (relay era-5c/265, R1320-3): an unsizing
+//! coercion keeps the reference's objects, and core's slice `as_mut_ptr` /
+//! `as_ptr` return the receiver's referent, by core's contract and body.
 
 use rustc_hash::FxHashSet;
 use rustc_middle::mir::{Body, Local, Location, TerminatorKind};
@@ -666,4 +670,275 @@ fn e5c_w264_n6_a_direct_write_to_an_escaped_local_ends_its_copies() {
             "{function} frees `sig`'s object through `px`"
         );
     }
+}
+
+// Relay era-5c/265 (R1320-3): an array's `as_mut_ptr` / `as_ptr` (216 §6). An
+// unsizing coercion keeps the reference's objects, and core's slice
+// `as_mut_ptr` / `as_ptr` -- body `self as *mut [T] as *mut T` -- return the
+// slice's own buffer, the receiver's referent. The destination's depth >= 1
+// cells stay Unknown.
+
+fn stack(function: LocalDefId, local: Local) -> ObjectSet {
+    ObjectSet::root(ObjectRoot::Stack { function, local })
+}
+
+/// The one call to `callee` in `body`: its location and its first argument's
+/// local.
+fn call_to(program: &RustProgram<'_>, body: &Body<'_>, callee: &str) -> (Location, Local) {
+    let callee = named_function(program, callee).to_def_id();
+    let found: Vec<_> = body
+        .basic_blocks
+        .iter_enumerated()
+        .filter_map(|(block, data)| {
+            let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
+                return None;
+            };
+            (func.const_fn_def().map(|(def_id, _)| def_id) == Some(callee)).then(|| {
+                (
+                    Location {
+                        block,
+                        statement_index: data.statements.len(),
+                    },
+                    args[0]
+                        .node
+                        .place()
+                        .and_then(|place| place.as_local())
+                        .expect("a bare local argument"),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one call to {callee:?}: {found:?}");
+    found[0]
+}
+
+/// S1 / S2's shapes (216 §6's `005` rows): copies of an array's `as_mut_ptr()`
+/// handed to a callee whose own `Vec` drop is routed up the call. `stack_copy`
+/// is `SPX_wots_gen_leafx1::buffer` / `SPX_hash_message::bufp` (a local array,
+/// then `offset`); `field_copy` is `leaf_addr` / `pk_addr` (an array field
+/// behind a formal). The functions are `extern "C"`, as the inputs' are, so a
+/// call in their bodies has no unwind edge out of the frame.
+const ARRAY_BUFFER: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+#[repr(C)]
+pub struct Info { pub leaf_addr: [u32; 8], pub steps: u32 }
+pub unsafe extern "C" fn leaf(out: *mut u32, n: usize) {
+    let mut buf: Vec<u32> = ::std::vec::from_elem(0, n);
+    *buf.as_mut_ptr() = 1;
+    *out = *buf.as_ptr();
+}
+pub unsafe extern "C" fn stack_copy(n: usize, k: isize) -> u32 {
+    let mut pk_buffer: [u32; 16] = [0; 16];
+    let p = pk_buffer.as_mut_ptr();
+    let q = p.offset(k);
+    leaf(q, n);
+    let r = pk_buffer.as_ptr();
+    *r
+}
+pub unsafe extern "C" fn field_copy(info: *mut Info, n: usize) {
+    let leaf_addr = ((*info).leaf_addr).as_mut_ptr();
+    leaf(leaf_addr, n);
+}
+"#;
+
+/// S1: a local array's `as_mut_ptr()` / `as_ptr()` is `Stack{buf}`, and O
+/// carries it through `offset`.
+#[test]
+fn e5c_w265_s1_a_local_array_s_as_mut_ptr_is_the_array() {
+    with_program(ARRAY_BUFFER, |program| {
+        with_body(program, "stack_copy", |function, body, facts| {
+            let buffer = stack(function, named_local(body, "pk_buffer"));
+            for name in ["p", "q", "r"] {
+                let local = named_local(body, name);
+                assert_eq!(
+                    cell(facts, function, after_call_into(body, local), local, 0),
+                    buffer,
+                    "`{name}` points into `pk_buffer`"
+                );
+            }
+        });
+    });
+}
+
+/// S1b: end to end, the copy handed to `leaf` is `pk_buffer`, which `leaf`'s
+/// routed fresh buffer is not; without the fact it was Unknown.
+#[test]
+fn e5c_w265_s1b_a_stack_array_copy_clears_a_routed_drop() {
+    let q = local_index(ARRAY_BUFFER, "stack_copy", "q");
+    let argument = first_argument_local(ARRAY_BUFFER, "stack_copy", "leaf");
+    assert!(
+        super::tests::accepts(
+            ARRAY_BUFFER,
+            &[("stack_copy", q, 0), ("stack_copy", argument, 0)]
+        ),
+        "`q` points into `pk_buffer`, which `leaf`'s fresh buffer is not"
+    );
+}
+
+/// S2: an array field behind a formal: `((*info).leaf_addr).as_mut_ptr()` is in
+/// `info`'s object, as the facts name the field's storage (`Input{info}`).
+#[test]
+fn e5c_w265_s2_an_array_field_s_as_mut_ptr_is_the_formal_s_object() {
+    with_program(ARRAY_BUFFER, |program| {
+        with_body(program, "field_copy", |function, body, facts| {
+            let info = named_local(body, "info");
+            let leaf_addr = named_local(body, "leaf_addr");
+            assert_eq!(
+                cell(
+                    facts,
+                    function,
+                    after_call_into(body, leaf_addr),
+                    leaf_addr,
+                    0
+                ),
+                input(function, info, 0),
+                "`leaf_addr` points into `*info`"
+            );
+        });
+    });
+}
+
+/// S2b: end to end, the 005 shape: the field copy handed to `leaf` is not
+/// `leaf`'s buffer.
+#[test]
+fn e5c_w265_s2b_an_array_field_copy_clears_a_routed_drop() {
+    let leaf_addr = local_index(ARRAY_BUFFER, "field_copy", "leaf_addr");
+    let argument = first_argument_local(ARRAY_BUFFER, "field_copy", "leaf");
+    assert!(
+        super::tests::accepts(
+            ARRAY_BUFFER,
+            &[("field_copy", leaf_addr, 0), ("field_copy", argument, 0)]
+        ),
+        "`leaf_addr` points into `*info`, which `leaf`'s fresh buffer is not"
+    );
+}
+
+/// S3's shape: what a name match on `as_mut_ptr` / `as_ptr` would take. A local
+/// function, a user type's inherent method and a user trait's impl for `[u8]`,
+/// each returning a fresh block; a `Vec`'s own `as_ptr` (alloc's body, not
+/// core's slice); `wrapping_add` on the fact's result; and a slice of pointers,
+/// whose element cells are not the receiver's.
+const NOT_THE_SLICE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+unsafe extern "C" { fn malloc(n: usize) -> *mut u8; }
+pub struct Bytes([u8; 8]);
+impl Bytes {
+    pub fn as_mut_ptr(&mut self) -> *mut u8 { unsafe { malloc(8) } }
+}
+pub trait RawBuf { fn as_mut_ptr(&mut self) -> *mut u8; }
+impl RawBuf for [u8] {
+    fn as_mut_ptr(&mut self) -> *mut u8 { unsafe { malloc(8) } }
+}
+fn as_mut_ptr(s: &mut [u8]) -> *mut u8 { unsafe { malloc(8) } }
+pub unsafe fn ctl(n: usize) -> u8 {
+    let mut buf: [u8; 8] = [0; 8];
+    let mut bytes = Bytes([0; 8]);
+    let v: Vec<u8> = ::std::vec::from_elem(0, n);
+    let a = as_mut_ptr(&mut buf);
+    let b = bytes.as_mut_ptr();
+    let c = <[u8] as RawBuf>::as_mut_ptr(&mut buf);
+    let d = v.as_ptr();
+    let p = buf.as_mut_ptr();
+    let e = p.wrapping_add(1);
+    *a + *b + *c + *d + *e
+}
+pub unsafe fn deep(table: &mut [*mut u8]) -> *mut u8 {
+    let q = table.as_mut_ptr();
+    *q
+}
+"#;
+
+/// S3: only core's slice `as_mut_ptr` / `as_ptr` are the receiver's buffer.
+/// The local function's, the inherent method's and the trait impl's results
+/// never name the receiver's object; the `Vec`'s and `wrapping_add`'s stay
+/// Unknown; a slice of pointers carries depth 0 only.
+#[test]
+fn e5c_w265_s3_a_name_match_is_not_the_slice_s_buffer() {
+    with_program(NOT_THE_SLICE, |program| {
+        with_body(program, "ctl", |function, body, facts| {
+            let buf_root = ObjectRoot::Stack {
+                function,
+                local: named_local(body, "buf"),
+            };
+            let buf = ObjectSet::root(buf_root);
+            let bytes = ObjectRoot::Stack {
+                function,
+                local: named_local(body, "bytes"),
+            };
+            let p = named_local(body, "p");
+            assert_eq!(
+                cell(facts, function, after_call_into(body, p), p, 0),
+                buf,
+                "`p` is core's slice `as_mut_ptr` of `buf`, or `e`'s control is vacuous"
+            );
+            for (name, receiver) in [("a", buf_root), ("b", bytes), ("c", buf_root)] {
+                let local = named_local(body, name);
+                let value = cell(facts, function, after_call_into(body, local), local, 0);
+                assert!(
+                    !value.roots.contains(&receiver),
+                    "`{name}` is not core's slice `as_mut_ptr`: {value:?}"
+                );
+            }
+            for name in ["d", "e"] {
+                let local = named_local(body, name);
+                let value = cell(facts, function, after_call_into(body, local), local, 0);
+                assert!(value.unknown, "`{name}` stays Unknown: {value:?}");
+            }
+        });
+        with_body(program, "deep", |function, body, facts| {
+            let table = named_local(body, "table");
+            let q = named_local(body, "q");
+            let at = after_call_into(body, q);
+            assert_eq!(cell(facts, function, at, q, 0), input(function, table, 0));
+            let behind = cell(facts, function, at, q, 1);
+            assert!(
+                behind.unknown,
+                "`*q` is an element, not `table`: {behind:?}"
+            );
+        });
+    });
+}
+
+/// S4's shape: the unsizing coercion alone, and a coercion into a slice formal
+/// of a local callee.
+const COERCION: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+fn fill(s: &mut [u8]) { s[0] = 1; }
+pub unsafe fn coerce() -> u8 {
+    let mut buf: [u8; 16] = [0; 16];
+    let s: &mut [u8] = &mut buf;
+    let p = s.as_mut_ptr();
+    fill(&mut buf);
+    *p
+}
+"#;
+
+/// S4: `&mut [T; N]` -> `&mut [T]` keeps the reference's objects, both into a
+/// local and into a local callee's slice formal; the slice's `as_mut_ptr`
+/// then carries them.
+#[test]
+fn e5c_w265_s4_an_unsizing_coercion_keeps_the_objects() {
+    with_program(COERCION, |program| {
+        with_body(program, "coerce", |function, body, facts| {
+            let buf = stack(function, named_local(body, "buf"));
+            let s = named_local(body, "s");
+            assert_eq!(
+                cell(facts, function, after_assign(body, s), s, 0),
+                buf,
+                "`s` is `buf` unsized"
+            );
+            let p = named_local(body, "p");
+            assert_eq!(
+                cell(facts, function, after_call_into(body, p), p, 0),
+                buf,
+                "`p` is `s`'s buffer"
+            );
+            let (at, argument) = call_to(program, body, "fill");
+            assert_eq!(
+                cell(facts, function, at, argument, 0),
+                buf,
+                "the argument to `fill` is `buf` unsized"
+            );
+        });
+    });
 }
