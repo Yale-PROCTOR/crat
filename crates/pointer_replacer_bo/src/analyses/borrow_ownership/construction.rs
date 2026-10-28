@@ -1099,17 +1099,38 @@ fn construct_bo_into_with_esc(
     mode: CopyLendMode,
     enable_esc_minimal: bool,
 ) -> anyhow::Result<BoConstruction> {
+    crate::phase_log::mark("bc:source_events", "start", "");
     let source_events = super::source_events::for_construction(program);
+    crate::phase_log::mark("bc:source_events", "end", "");
     #[cfg(test)]
     let source_events = super::wrapper_fault_tests::inventory(source_events);
     super::export::record(|export| export.source_events = Some(source_events.clone()));
+    crate::phase_log::mark("bc:record_sites", "start", "");
     super::comparison::record_sites(program, slots);
+    crate::phase_log::mark("bc:record_sites", "end", "");
+    crate::phase_log::mark("bc:crate_ctxt", "start", "");
     let crate_ctxt = CrateCtxt::new(program);
+    crate::phase_log::mark(
+        "bc:crate_ctxt",
+        "end",
+        &format!("functions={}", program.functions.len()),
+    );
+    crate::phase_log::mark(
+        "bc:esc_minimal",
+        "start",
+        &format!("enabled={enable_esc_minimal}"),
+    );
     let esc_minimal = if enable_esc_minimal {
         super::esc_minimal::select(program, slots)
     } else {
         super::esc_minimal::EscMinimalSelection::default()
     };
+    crate::phase_log::mark("bc:esc_minimal", "end", "");
+    crate::phase_log::mark(
+        "bc:copy_lend_eligibility",
+        "start",
+        &format!("mode={mode:?}"),
+    );
     #[cfg(test)]
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
@@ -1117,8 +1138,14 @@ fn construct_bo_into_with_esc(
     } else {
         CopyLendEligibility::default()
     };
+    crate::phase_log::mark(
+        "bc:copy_lend_eligibility",
+        "end",
+        &format!("pairs={}", eligibility.pairs.len()),
+    );
     #[cfg(test)]
     let eligibility_elapsed = t.elapsed();
+    crate::phase_log::mark("bc:ownership_constraints", "start", "");
     #[cfg(test)]
     let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
@@ -1133,6 +1160,19 @@ fn construct_bo_into_with_esc(
             emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)
         }
     })?;
+    crate::phase_log::mark(
+        "bc:ownership_constraints",
+        "end",
+        &format!(
+            "z3_ast_len={} hard_assertions={}",
+            stats.z3_ast_len,
+            if crate::phase_log::on() {
+                solver.hard_assertion_count()
+            } else {
+                0
+            }
+        ),
+    );
     #[cfg(not(test))]
     let _ = stats;
     #[cfg(test)]
@@ -1142,7 +1182,10 @@ fn construct_bo_into_with_esc(
     if let Some(tracker) = solver.tracker() {
         tracker.set_context("coherence");
     }
-    for &fn_did in &program.functions {
+    crate::phase_log::mark("bc:coherence", "start", "");
+    let total = program.functions.len();
+    for (index, &fn_did) in program.functions.iter().enumerate() {
+        let probe = crate::phase_log::Probe::begin();
         let body = program
             .tcx
             .mir_drops_elaborated_and_const_checked(fn_did)
@@ -1154,8 +1197,19 @@ fn construct_bo_into_with_esc(
                 add_coherence_with_copy_lends(solver, slots, fn_did, &body, &eligibility.pairs)
             }
         }
+        crate::phase_log::Probe::end(probe, "bc:coherence", index, total, || {
+            format!(
+                "{} {}",
+                program.tcx.def_path_str(fn_did),
+                crate::phase_log::body_size(&body)
+            )
+        });
     }
+    crate::phase_log::mark("bc:coherence", "end", "");
+    crate::phase_log::mark("bc:nullability", "start", "");
     let mut nullability = super::nullability::analyze(program.tcx, &program.functions, slots);
+    crate::phase_log::mark("bc:nullability", "end", "");
+    crate::phase_log::mark("bc:field_ref_worthiness", "start", "");
     let field_ref_plan = constrain_field_ref_worthiness(
         solver,
         slots,
@@ -1163,17 +1217,35 @@ fn construct_bo_into_with_esc(
         origins.try_native_flows(),
         &nullability,
     );
+    crate::phase_log::mark("bc:field_ref_worthiness", "end", "");
+    crate::phase_log::mark("bc:array_fields", "start", "");
     let array_fields = super::array_fields::constrain(program, slots, solver, &mut nullability);
+    crate::phase_log::mark("bc:array_fields", "end", "");
     super::export::record(|export| export.array_fields = Some(array_fields.clone()));
     #[cfg(test)]
     let coherence_elapsed = t.elapsed();
+    crate::phase_log::mark("bc:qualifier_facts", "start", "");
     let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
+    crate::phase_log::mark("bc:qualifier_facts", "end", "");
+    crate::phase_log::mark("bc:selectors_demand_capture", "start", "");
     super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
     solver.set_demand_capture(super::demand_evidence::begin_construction(
         program,
         slots,
         selectors.keys(),
     ));
+    crate::phase_log::mark(
+        "bc:selectors_demand_capture",
+        "end",
+        &format!(
+            "hard_assertions={}",
+            if crate::phase_log::on() {
+                solver.hard_assertion_count()
+            } else {
+                0
+            }
+        ),
+    );
     Ok(BoConstruction {
         source_events,
         #[cfg(test)]

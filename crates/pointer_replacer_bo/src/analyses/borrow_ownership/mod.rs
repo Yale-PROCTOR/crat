@@ -237,6 +237,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         std::sync::Arc::new(source_events::collect(&program))
     });
     let _source_scope = source_events::enter_inventory(&inventory);
+    crate::phase_log::mark("own:licensing_facts", "start", "");
     let mut var_gen = Gen::new();
     // Hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
@@ -261,19 +262,34 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
                 origin_evidence::occurrences(&program, slots, function),
             );
         }
+        crate::phase_log::mark("own:reader_inputs", "start", "");
         facts.reader_inputs = licensing::readers::Inputs::collect(&program, slots);
+        crate::phase_log::mark("own:reader_inputs", "end", "");
+        crate::phase_log::mark("own:reader_plan", "start", "");
         facts.reader_plan = licensing::readers::Plan::build(&facts.reader_inputs);
+        crate::phase_log::mark("own:reader_plan", "end", "");
+        crate::phase_log::mark("own:lend_plan", "start", "");
         facts.lend_plan = licensing::lend::collect(&program);
+        crate::phase_log::mark("own:lend_plan", "end", "");
+        crate::phase_log::mark("own:traversal_native", "start", "");
         facts.traversal_native = Some(licensing::traversal_native::collect(
             &program,
             slots,
             origins,
             &facts.reader_plan,
         ));
+        crate::phase_log::mark("own:traversal_native", "end", "");
+        crate::phase_log::mark("own:field_support_inputs", "start", "");
         facts.field_support_inputs = licensing::field_support::Inputs::collect(&program, slots);
+        crate::phase_log::mark("own:field_support_inputs", "end", "");
+        crate::phase_log::mark("own:fold_types", "start", "");
         facts.fold_types = Some(licensing::fold_types::Inputs::collect(&program));
+        crate::phase_log::mark("own:fold_types", "end", "");
         facts.fold_declarations = Some(Vec::new());
+        crate::phase_log::mark("own:caller_coverage", "start", "");
         facts.caller_coverage = Some(licensing::caller_coverage::Coverage::collect(&program));
+        crate::phase_log::mark("own:caller_coverage", "end", "");
+        crate::phase_log::mark("own:slot_refs", "start", "");
         facts.frame_attested = licensing::stack_entry::current_world()
             == licensing::stack_entry::CallWorld::ClosedProgram;
         for (&function, universe) in &slots.fn_local_slots {
@@ -326,20 +342,29 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
                 slot_key::field_key(program.tcx, field.struct_did, field.field_index, slot.depth);
             assert!(facts.slot_refs.insert(key, SlotRef::Field(id)).is_none());
         }
+        crate::phase_log::mark("own:slot_refs", "end", "");
     });
+    crate::phase_log::mark("own:licensing_facts", "end", "");
+    crate::phase_log::mark("own:global_assumptions", "start", "");
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("global-assumptions");
     }
     let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
+    crate::phase_log::mark("own:global_assumptions", "end", "");
+    crate::phase_log::mark("own:inter_ctxt", "start", "");
 
     // The full InterCtxt must be built (all signature vars allocated) before any
     // body is emitted, so a local call's `inter_ctxt[&callee]` resolves.
     let inter_ctxt = initial_crate_inter_ctxt(crate_ctxt, &mut var_gen, &mut database);
+    crate::phase_log::mark("own:inter_ctxt", "end", "");
+    crate::phase_log::mark("own:bodies", "start", "");
+    let total = crate_ctxt.fns().len();
 
     // Emission order is irrelevant: bodies share the InterCtxt signature vars, so
     // z3 resolves cross-function (and recursive) flow when the joint system is
     // solved. No SCC iteration is needed at fixed precision 1.
-    for &did in crate_ctxt.fns() {
+    for (index, &did) in crate_ctxt.fns().iter().enumerate() {
+        let probe = crate::phase_log::Probe::begin();
         if let Some(tracker) = kind_solver.tracker() {
             tracker.set_context(&crate_ctxt.tcx.def_path_str(did));
         }
@@ -354,7 +379,25 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             did.expect_local(),
             copy_lends,
         )?;
+        crate::phase_log::Probe::end(probe, "own:bodies", index, total, || {
+            let body = crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .borrow();
+            format!(
+                "{} {} z3_ast_len={}",
+                crate_ctxt.tcx.def_path_str(did),
+                crate::phase_log::body_size(&body),
+                database.z3_ast_len()
+            )
+        });
     }
+    crate::phase_log::mark(
+        "own:bodies",
+        "end",
+        &format!("z3_ast_len={}", database.z3_ast_len()),
+    );
+    crate::phase_log::mark("own:malloc_sources", "start", "");
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("nb0-eager-source");
     }
@@ -401,10 +444,14 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // uniform `¬own` over-demoted the owned transfers (9 tests). The may-overwrite `¬own` is
     // un-targetable from this set (the overwrite is not in `summary.unknown`) and DEFERS to the
     // effect-row/opaque-interaction work.
+    crate::phase_log::mark("own:malloc_sources", "end", "");
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("nb4-4c-may-supply-demotion");
     }
+    crate::phase_log::mark("own:nullability", "start", "");
     let nullability = nullability::analyze(crate_ctxt.tcx, &fns, slots);
+    crate::phase_log::mark("own:nullability", "end", "");
+    crate::phase_log::mark("own:no_borrow_origin", "start", "");
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
         if !nullability.contains(&slot) {
             kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
@@ -419,8 +466,13 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     }
 
     // Snapshot the Var -> Bool map before the database is dropped.
+    crate::phase_log::mark("own:no_borrow_origin", "end", "");
+    crate::phase_log::mark("own:reference_effect_obligations", "start", "");
     database.emit_reference_effect_obligations()?;
+    crate::phase_log::mark("own:reference_effect_obligations", "end", "");
+    crate::phase_log::mark("own:snapshot_version_asts", "start", "");
     database.snapshot_version_asts();
+    crate::phase_log::mark("own:snapshot_version_asts", "end", "");
 
     let selectors = Selectors::new_with_keys(
         database.source_selectors().to_vec(),
@@ -436,7 +488,10 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     drop(boundary_scope);
     drop(transfer_scope);
     drop(facts_scope);
+    crate::phase_log::mark("own:freeze_facts", "start", "");
     let facts = database.freeze_facts();
+    crate::phase_log::mark("own:freeze_facts", "end", "");
+    crate::phase_log::mark("own:return_port", "start", "");
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("licensing-origin-admissibility");
     }
@@ -465,6 +520,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
             }
         }
     }
+    crate::phase_log::mark("own:return_port", "end", "");
     for carrier in &facts
         .licensing
         .as_ref()
@@ -477,14 +533,30 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
         raw_cause::note_eager(&kind_solver, "no-ref-carrier");
     }
+    crate::phase_log::mark("own:licensing_grants", "start", "");
     kind_solver.apply_licensing_grants(&facts)?;
+    crate::phase_log::mark("own:licensing_grants", "end", "");
+    crate::phase_log::mark("own:block_incomplete_transfers", "start", "");
     licensing::readers::block_incomplete_transfers(&facts, kind_solver);
+    crate::phase_log::mark("own:block_incomplete_transfers", "end", "");
+    crate::phase_log::mark("own:reader_field_support", "start", "");
     kind_solver.constrain_reader_field_support(&facts)?;
+    crate::phase_log::mark("own:reader_field_support", "end", "");
+    crate::phase_log::mark("own:reference_field_effects", "start", "");
     kind_solver.constrain_reference_field_effects(&facts)?;
+    crate::phase_log::mark("own:reference_field_effects", "end", "");
+    crate::phase_log::mark("own:first_permissions", "start", "");
     kind_solver.constrain_first_permissions(&facts)?;
+    crate::phase_log::mark("own:first_permissions", "end", "");
+    crate::phase_log::mark("own:traversal_calls", "start", "");
     kind_solver.constrain_traversal_calls(&facts)?;
+    crate::phase_log::mark("own:traversal_calls", "end", "");
+    crate::phase_log::mark("own:fold_callers", "start", "");
     kind_solver.constrain_fold_callers(&facts)?;
+    crate::phase_log::mark("own:fold_callers", "end", "");
+    crate::phase_log::mark("own:record_ownership_facts", "start", "");
     export::record_ownership_facts(&facts);
+    crate::phase_log::mark("own:record_ownership_facts", "end", "");
     kind_solver.set_ownership_facts(facts);
     Ok((stats, selectors))
 }
