@@ -9,7 +9,7 @@ use super::{
     super::{
         ownership_boundary::{Role, Variables},
         ownership_evidence::Endpoint,
-        ownership_occurrence::PathStep,
+        ownership_occurrence::{Consumption, PathStep},
     },
     facts::{EquationId, Facts},
 };
@@ -122,6 +122,19 @@ impl CandidateGraph {
 
     fn build_with_keys(facts: &Facts, guards: &BTreeMap<EquationId, EquationId>) -> Self {
         let mut graph = Self::default();
+        // Relay main/379 (`matched`, step 1): the consumes by (construction, function, block), in
+        // their order, so an `equal` equation's frame is looked for among its own block's.
+        let mut consumes_by: BTreeMap<(u32, Option<&str>, Option<u32>), Vec<_>> = BTreeMap::new();
+        for consume in &facts.consumes {
+            consumes_by
+                .entry((
+                    consume.point.construction,
+                    consume.point.function.as_deref(),
+                    consume.point.block,
+                ))
+                .or_default()
+                .push(consume);
+        }
         for equation in &facts.equations {
             let id = EquationId {
                 construction: equation.point.construction,
@@ -182,7 +195,7 @@ impl CandidateGraph {
                     // (local, version, slot), so the pair names one consume.
                     // Blocks still have to agree, which keeps an unrelated
                     // same-shaped equate elsewhere in the body out.
-                    let framed = facts.consumes.iter().find(|consume| {
+                    let frames = |consume: &&Consumption| {
                         if consume.point.construction != equation.point.construction
                             || consume.point.function != equation.point.function
                             || consume.point.block != equation.point.block
@@ -199,7 +212,21 @@ impl CandidateGraph {
                             && right >= base.def_start
                             && right < base.def_end
                             && left - base.use_start == right - base.def_start
-                    });
+                    };
+                    let framed = if super::matched::reference_scans() {
+                        facts.consumes.iter().find(frames)
+                    } else {
+                        consumes_by
+                            .get(&(
+                                equation.point.construction,
+                                equation.point.function.as_deref(),
+                                equation.point.block,
+                            ))
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .find(frames)
+                    };
                     if let Some(consume) = framed {
                         graph.edges.push(Edge {
                             from: node(left),

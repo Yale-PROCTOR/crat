@@ -559,19 +559,33 @@ impl Function {
         proof: Vec<Step>,
     ) -> BTreeMap<(Node, Guards), Vec<Step>> {
         let mut result = BTreeMap::new();
+        // Relay main/379 (`matched`, step 1): each node's out-edges, in the edges' order, so a pop
+        // follows its own edges instead of filtering all of them.
+        let scan = reference_scans();
+        let mut out_edges: BTreeMap<Node, Vec<&Arc>> = BTreeMap::new();
+        if !scan {
+            for edge in &self.edges {
+                out_edges.entry(edge.from).or_default().push(edge);
+            }
+        }
         let mut pending = VecDeque::from([(start, guards, proof)]);
         while let Some((node, guards, proof)) = pending.pop_front() {
             if result.contains_key(&(node, guards.clone())) {
                 continue;
             }
             result.insert((node, guards.clone()), proof.clone());
-            for edge in self.edges.iter().filter(|edge| {
-                #[cfg(test)]
-                if edge.from != node {
-                    super::freeze_counts::edge_wasted();
-                }
-                edge.from == node
-            }) {
+            let edges: Box<dyn Iterator<Item = &Arc>> = if scan {
+                Box::new(self.edges.iter().filter(move |edge| {
+                    #[cfg(test)]
+                    if edge.from != node {
+                        super::freeze_counts::edge_wasted();
+                    }
+                    edge.from == node
+                }))
+            } else {
+                Box::new(out_edges.get(&node).into_iter().flatten().copied())
+            };
+            for edge in edges {
                 let Some(next) = combine(&guards, &edge.guards) else { continue };
                 let mut witness = proof.clone();
                 witness.push(edge.step.clone());
@@ -1969,17 +1983,40 @@ impl MatchedTransport {
         relations: &BTreeMap<Relation, Vec<Step>>,
     ) -> BTreeMap<Scope, Function> {
         let mut functions = base.clone();
+        // Relay main/379 (`matched`, step 1): the relations by scope, in their order, so a call
+        // reads its callee's relations instead of filtering all of them.
+        let scan = reference_scans();
+        let mut by_scope: BTreeMap<(u32, &str), Vec<&Relation>> = BTreeMap::new();
+        if !scan {
+            for relation in relations.keys() {
+                by_scope
+                    .entry((relation.scope.0, relation.scope.1.as_str()))
+                    .or_default()
+                    .push(relation);
+            }
+        }
         for (key, call) in calls {
             let caller = functions
                 .entry((key.construction, key.caller.clone()))
                 .or_default();
-            for relation in relations.keys().filter(|row| {
-                #[cfg(test)]
-                if row.scope != (key.construction, key.callee.clone()) {
-                    super::freeze_counts::relation_wasted();
-                }
-                row.scope == (key.construction, key.callee.clone())
-            }) {
+            let scoped: Box<dyn Iterator<Item = &Relation>> = if scan {
+                Box::new(relations.keys().filter(|row| {
+                    #[cfg(test)]
+                    if row.scope != (key.construction, key.callee.clone()) {
+                        super::freeze_counts::relation_wasted();
+                    }
+                    row.scope == (key.construction, key.callee.clone())
+                }))
+            } else {
+                Box::new(
+                    by_scope
+                        .get(&(key.construction, key.callee.as_str()))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )
+            };
+            for relation in scoped {
                 match &relation.output {
                     Destination::Port(formal_output) => {
                         for output in call
