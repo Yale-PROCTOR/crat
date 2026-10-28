@@ -840,7 +840,7 @@ pub unsafe fn ctl(n: usize) -> u8 {
     let d = v.as_ptr();
     let p = buf.as_mut_ptr();
     let e = p.wrapping_add(1);
-    *a + *b + *c + *d + *e
+    *e
 }
 pub unsafe fn deep(table: &mut [*mut u8]) -> *mut u8 {
     let q = table.as_mut_ptr();
@@ -908,8 +908,9 @@ pub unsafe fn coerce() -> u8 {
     let mut buf: [u8; 16] = [0; 16];
     let s: &mut [u8] = &mut buf;
     let p = s.as_mut_ptr();
+    let v = *p;
     fill(&mut buf);
-    *p
+    v
 }
 "#;
 
@@ -941,4 +942,38 @@ fn e5c_w265_s4_an_unsizing_coercion_keeps_the_objects() {
             );
         });
     });
+}
+
+/// S5's shape (the adversarial review's SHOULD-2): a callee frees the struct
+/// whose array field a live copy points into. The copy's object, `Input{info}`,
+/// must still meet the routed free.
+const FREE_THE_OWNER: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+#[repr(C)]
+pub struct Info { pub leaf_addr: [u32; 8], pub steps: u32 }
+pub unsafe extern "C" fn release(addr: *mut u32, info: *mut Info) {
+    *addr = 1;
+    free(info as *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn field_free(info: *mut Info) {
+    let leaf_addr = ((*info).leaf_addr).as_mut_ptr();
+    release(leaf_addr, info);
+}
+"#;
+
+/// S5 (control): the precise label still catches its own object. The field
+/// copy handed to `release` is in `*info`, which `release` frees while the
+/// copy's loan is live at the call.
+#[test]
+fn e5c_w265_s5_a_field_copy_still_meets_a_free_of_its_struct() {
+    let leaf_addr = local_index(FREE_THE_OWNER, "field_free", "leaf_addr");
+    let argument = first_argument_local(FREE_THE_OWNER, "field_free", "release");
+    assert!(
+        !super::tests::accepts(
+            FREE_THE_OWNER,
+            &[("field_free", leaf_addr, 0), ("field_free", argument, 0)]
+        ),
+        "`release` frees `*info`, which `leaf_addr` points into"
+    );
 }
