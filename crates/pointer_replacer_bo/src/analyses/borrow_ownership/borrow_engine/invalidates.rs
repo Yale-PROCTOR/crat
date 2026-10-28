@@ -517,6 +517,10 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
             parameter_accesses.push(ParameterAccess { place, kind });
         }
         let point_index = self.location_map.point_from_location(location);
+        // Index-range disjointness (relay era-5c/267) reads the access where it
+        // is written: a deferred argument read is checked at the call, but its
+        // place is the statement's (the review's M3).
+        let source = self.deferring_from.unwrap_or(location);
 
         // DIRECT check: ordinary loans are keyed under the accessed local. Effective parameter
         // overlap additionally opens the paired parameter rows for pointee accesses; otherwise the
@@ -598,7 +602,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                             crate::analyses::borrow_ownership::index_ranges::discharge(
                                 self.tcx,
                                 self.body,
-                                location,
+                                source,
                                 place,
                                 kind == AccessKind::Write,
                                 borrow_data,
@@ -718,7 +722,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                                 crate::analyses::borrow_ownership::index_ranges::discharge(
                                     self.tcx,
                                     self.body,
-                                    location,
+                                    source,
                                     place,
                                     true,
                                     borrow_data,

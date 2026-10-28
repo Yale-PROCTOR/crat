@@ -17,8 +17,10 @@
 //!   that local's own footprint, already relative to `B`;
 //! - an argument to a local callee: the callee's per-formal extent `Ext(g, k)`,
 //!   instantiated at the call (below);
-//! - an argument to `memcpy` / `memmove` / `memset` with a constant length:
-//!   `[0, n)` from the argument;
+//! - the destination of `memcpy` / `memmove` / `memset` with a constant
+//!   length: `[0, n)` written from the argument; a `memcpy` / `memmove`
+//!   *source* is Unknown (the bytes copied out may be a pointer to the base,
+//!   used after through the copy);
 //! - a comparison or `is_null`: nothing;
 //! - anything else is Unknown: a store into memory, a return, an aggregate, a
 //!   cast to an integer, a foreign callee without a row, a local with two
@@ -28,10 +30,21 @@
 //!   reached through it is not the base's bytes, and two such pointers may
 //!   meet outside them.
 //!
+//! **A base that escapes discharges nothing.** A taint walk follows the
+//! base's value through every local it reaches, bounded or not; when any of
+//! those uses stores, returns, aggregates or casts it to an integer, takes its
+//! address, hands it to a foreign or recursive callee or to a local one whose
+//! formal escapes, copies bytes out of it or reads a pointer out of it, a
+//! retained copy may reach the base behind every footprint's back, and the
+//! discharge refuses.
+//!
 //! **What no footprint covers:** an access through a pointer to the base that
-//! was retained before the value existed (a global or a heap cell holding the
-//! base's pointer, used by a callee). That is the retained-alias class every
-//! `Ref` formal already meets (the retention rules), not this rung's.
+//! was retained before the function ran (a global or a heap cell holding the
+//! base's pointer, set by a caller, used by a callee). That is the
+//! retained-alias class every `Ref` formal already meets (the retention
+//! rules), not this rung's. Nor a pointer rebuilt byte by byte out of the base
+//! through character reads (C11's effective-type rules, the stated premise of
+//! R542, leave those to a character copy).
 //!
 //! **`Ext(g, k)`** is the footprint of `g`'s pointer formal `k` in `g`, relative
 //! to the formal; its bounds are constants or `a + b·n` in ONE integer formal
@@ -451,8 +464,9 @@ thread_local! {
     static TABLE: RefCell<Option<(Rc<IndexRanges>, usize)>> = const { RefCell::new(None) };
 }
 
-/// One holder of the installed table; the last one to drop clears it.
-pub(crate) struct Scope(());
+/// One holder of the installed table; the last one to drop clears it. Not
+/// `Send`: it must drop on the thread whose table it holds.
+pub(crate) struct Scope(std::marker::PhantomData<*const ()>);
 
 impl Drop for Scope {
     fn drop(&mut self) {
@@ -481,10 +495,12 @@ pub(crate) fn ensure(program: &RustProgram<'_>) -> Scope {
         }
     });
     if !installed {
+        crate::phase_log::mark("index_ranges:build", "start", "");
         let table = Rc::new(IndexRanges::build(program));
+        crate::phase_log::mark("index_ranges:build", "end", "");
         TABLE.with(|slot| *slot.borrow_mut() = Some((table, 1)));
     }
-    Scope(())
+    Scope(std::marker::PhantomData)
 }
 
 /// The discharge (the module doc), against the installed table; `None` when
@@ -505,6 +521,9 @@ pub(crate) fn discharge<'tcx>(
 pub(crate) struct IndexRanges {
     functions: FxHashMap<LocalDefId, FnFacts>,
     summaries: FxHashMap<(LocalDefId, u32), Footprint>,
+    /// The `(g, k)` whose formal escapes `g`: stored, returned, handed where
+    /// the walk cannot follow, or read out as a pointer.
+    escapes: FxHashSet<(LocalDefId, u32)>,
     scc: FxHashMap<LocalDefId, usize>,
 }
 
@@ -515,6 +534,12 @@ struct FnFacts {
     derivs: FxHashMap<Local, Deriv>,
     /// Complete once built: every local of `derivs` has its family.
     families: RefCell<FxHashMap<Local, Footprint>>,
+    /// The bases some use of which escapes the body: stored, returned,
+    /// handed where the walk cannot follow, or a pointer read out of it. A
+    /// copy so retained may reach the base behind every footprint's back, so
+    /// such a base discharges nothing (the reviewer's same-body retention
+    /// guard).
+    escaped: FxHashSet<Local>,
 }
 
 impl IndexRanges {
@@ -543,6 +568,7 @@ impl IndexRanges {
         let mut table = IndexRanges {
             functions: FxHashMap::default(),
             summaries: FxHashMap::default(),
+            escapes: FxHashSet::default(),
             scc: FxHashMap::default(),
         };
         for (index, component) in petgraph::algo::tarjan_scc(&graph).into_iter().enumerate() {
@@ -568,6 +594,9 @@ impl IndexRanges {
                         None => Footprint::Unknown("formal-written"),
                     };
                     table.summaries.insert((f, k as u32), extent);
+                    if facts.escaped.contains(&formal) {
+                        table.escapes.insert((f, k as u32));
+                    }
                 }
                 table.functions.insert(f, facts);
             }
@@ -613,6 +642,9 @@ impl IndexRanges {
             return None;
         }
         let loan_root = facts.derivs.get(&issuer)?.root;
+        if facts.escaped.contains(&loan_root) {
+            return None;
+        }
         let loan_fp = facts.families.borrow().get(&issuer)?.clone();
         // The access: a write to a whole local never; otherwise the modeled
         // uses of exactly this place at this point.
@@ -1064,6 +1096,11 @@ impl IntFacts {
 struct Ints<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
+    /// Locals whose address is taken: never a condition (a write through the
+    /// address would leave it stale: the reviewer's B1).
+    address_taken: &'a FxHashSet<Local>,
+    /// Locals used only as the count of core's `offset` / `add` / `sub`.
+    offset_only: FxHashSet<Local>,
     consts: FxHashMap<Local, i64>,
     vars: FxHashMap<Local, usize>,
     var_locals: Vec<Local>,
@@ -1090,6 +1127,8 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
         let ints = Ints {
             tcx,
             body,
+            address_taken: &shape.address_taken,
+            offset_only: offset_only_locals(tcx, body),
             consts,
             vars,
             var_locals,
@@ -1452,48 +1491,62 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
         }
     }
 
-    /// Is `x := term + c` exact? A signed step is (`§28:index-step-no-wrap`);
-    /// an unsigned one only when it provably does not wrap.
-    fn step_exact(&self, state: &mut IState, x: Local, term: Term, c: i64) -> bool {
+    /// Is `x := term + c` exact? A signed `+` / `-` is when it cannot leave
+    /// the type, and otherwise under `§28:index-step-no-wrap` (C's signed
+    /// overflow is UB); an unsigned one, and any `wrapping_*` (`proven`), only
+    /// when it provably stays in the type.
+    fn step_exact(&self, state: &mut IState, x: Local, term: Term, c: i64, proven: bool) -> bool {
         let Some((bits, signed)) = int_shape(self.body.local_decls[x].ty) else {
             return false;
         };
-        if signed {
-            if c != 0 {
-                state.premises.insert(Premise::IndexStepNoWrap);
-            }
-            return true;
-        }
-        let max: i128 = if bits >= 64 {
-            u64::MAX as i128
-        } else {
-            (1i128 << bits) - 1
-        };
+        let (min, max) = type_range(bits, signed);
         match term {
-            Term::Const(k) => (k as i128 + c as i128) >= 0 && (k as i128 + c as i128) <= max,
+            Term::Const(k) => {
+                let v = k as i128 + c as i128;
+                if (min..=max).contains(&v) {
+                    true
+                } else if signed && !proven {
+                    state.premises.insert(Premise::IndexStepNoWrap);
+                    true
+                } else {
+                    false
+                }
+            }
             Term::Var(_) if c == 0 => true,
-            Term::Var(y) if c < 0 => state.dbm.get(0, y) <= c,
+            Term::Var(_) if signed && !proven => {
+                state.premises.insert(Premise::IndexStepNoWrap);
+                true
+            }
+            Term::Var(y) if c < 0 => {
+                let lower = state.dbm.get(0, y);
+                lower < INF && -(lower as i128) + c as i128 >= min
+            }
             Term::Var(y) => {
                 let upper = state.dbm.get(y, 0);
                 (upper < INF && upper as i128 + c as i128 <= max)
-                    || self.var_locals.iter().enumerate().any(|(index, local)| {
-                        let z = index + 1;
-                        z != y
-                            && state.dbm.get(y, z) <= -c
-                            && int_shape(self.body.local_decls[*local].ty)
-                                .is_some_and(|(width, _)| width <= bits)
-                    })
+                    || (!signed
+                        && self.var_locals.iter().enumerate().any(|(index, local)| {
+                            let z = index + 1;
+                            z != y
+                                && state.dbm.get(y, z) <= -c
+                                && int_shape(self.body.local_decls[*local].ty)
+                                    .is_some_and(|(width, sign)| width <= bits && !sign)
+                        }))
             }
         }
     }
 
     /// Does the cast keep the value? Widening within a signedness; unsigned
-    /// into a wider signed type; `usize` into `isize` (`§28:usize-as-isize`);
-    /// signed into unsigned when non-negative; a narrowing whose constant
-    /// bounds fit.
+    /// into a wider signed type; signed into unsigned when non-negative; a cast
+    /// whose constant bounds fit; and `usize` into `isize` when every use of
+    /// the result is the count of `offset` / `add` / `sub` (C's `p + n`: an `n`
+    /// past `isize::MAX` would leave the object, UB under §28 —
+    /// `§28:usize-as-isize`). Elsewhere `(ssize_t)n` is implementation-defined,
+    /// not UB, so it is not assumed (the reviewer's M2).
     fn value_preserving(
         &self,
         state: &mut IState,
+        x: Local,
         term: Term,
         from: (u64, bool),
         to: (u64, bool),
@@ -1506,24 +1559,19 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             ),
         };
         let fits = |bits: u64, signed: bool| {
-            let (min, max): (i128, i128) = if signed {
-                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-            } else {
-                (0, (1i128 << bits.min(127)) - 1)
-            };
+            let (min, max) = type_range(bits, signed);
             lo.is_some_and(|lo| lo as i128 >= min) && hi.is_some_and(|hi| hi as i128 <= max)
         };
         match (from.1, to.1) {
             (false, false) | (true, true) if to.0 >= from.0 => true,
             (false, true) if to.0 > from.0 => true,
-            (false, true) if to.0 == from.0 && to.0 == 64 => {
-                if !fits(64, true) {
-                    state.premises.insert(Premise::UsizeAsIsize);
-                }
+            (true, false) if to.0 >= from.0 && lo.is_some_and(|lo| lo >= 0) => true,
+            _ if fits(to.0, to.1) => true,
+            (false, true) if to.0 == from.0 && to.0 == 64 && self.offset_only.contains(&x) => {
+                state.premises.insert(Premise::UsizeAsIsize);
                 true
             }
-            (true, false) if to.0 >= from.0 && lo.is_some_and(|lo| lo >= 0) => true,
-            _ => fits(to.0, to.1),
+            _ => false,
         }
     }
 
@@ -1532,8 +1580,12 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             return;
         };
         let Some(x_var) = self.var(x) else {
-            // A comparison into a boolean local is a condition.
+            // A comparison into a boolean local is a condition, unless the
+            // local's address is taken.
             self.kill(state, x);
+            if self.address_taken.contains(&x) {
+                return;
+            }
             if let Rvalue::BinaryOp(
                 op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne),
                 box (left, right),
@@ -1567,7 +1619,7 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                 let from = int_shape(operand.ty(&self.body.local_decls, self.tcx));
                 match (self.term(&probe, operand), from, int_shape(*target)) {
                     (Some(term), Some(from), Some(to))
-                        if self.value_preserving(&mut probe, term, from, to) =>
+                        if self.value_preserving(&mut probe, x, term, from, to) =>
                     {
                         New::Term(term, 0)
                     }
@@ -1626,7 +1678,7 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             _ => New::Unknown,
         };
         let new = match new {
-            New::Term(term, c) if !self.step_exact(&mut probe, x, term, c) => New::Unknown,
+            New::Term(term, c) if !self.step_exact(&mut probe, x, term, c, false) => New::Unknown,
             New::Range(lo, hi) => {
                 // A product is exact under §28 when signed, and provably in
                 // range when unsigned.
@@ -1635,7 +1687,7 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                         probe.premises.insert(Premise::IndexStepNoWrap);
                         New::Range(lo, hi)
                     }
-                    Some((bits, false)) if bits >= 64 || (hi as i128) < (1i128 << bits) => {
+                    Some((bits, false)) if (hi as i128) <= type_range(bits, false).1 => {
                         New::Range(lo, hi)
                     }
                     _ => New::Unknown,
@@ -1707,8 +1759,11 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                         _ => return None,
                     };
                     let mut probe = state.clone();
-                    self.step_exact(&mut probe, dest, term, c)
-                        .then_some((term, c, probe.premises))
+                    self.step_exact(&mut probe, dest, term, c, true).then_some((
+                        term,
+                        c,
+                        probe.premises,
+                    ))
                 })
             }
             _ => None,
@@ -1737,6 +1792,48 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
     }
 }
 
+/// Locals whose every use is the count of a core `offset` / `add` / `sub`.
+fn offset_only_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<Local> {
+    use rustc_middle::mir::visit::{PlaceContext, Visitor};
+    struct Uses(FxHashMap<Local, usize>);
+    impl<'tcx> Visitor<'tcx> for Uses {
+        fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
+            if context.is_use() && !context.is_mutating_use() && !context.is_storage_marker() {
+                *self.0.entry(local).or_default() += 1;
+            }
+        }
+    }
+    let mut uses = Uses(FxHashMap::default());
+    uses.visit_body(body);
+    let mut counts: FxHashMap<Local, usize> = FxHashMap::default();
+    for data in body.basic_blocks.iter() {
+        let terminator = data.terminator();
+        if let TerminatorKind::Call { args, .. } = &terminator.kind
+            && let Some(call) = terminator.as_call(tcx)
+            && core_pointer_step(tcx, &call.func).is_some()
+            && let Some(count) = args.get(1).and_then(|arg| operand_local(&arg.node))
+        {
+            *counts.entry(count).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(local, n)| uses.0.get(local) == Some(n))
+        .map(|(local, _)| local)
+        .collect()
+}
+
+/// The values an integer type holds, `[min, max]` (128-bit types clipped to
+/// `i128`).
+fn type_range(bits: u64, signed: bool) -> (i128, i128) {
+    match (bits >= 128, signed) {
+        (true, true) => (i128::MIN, i128::MAX),
+        (true, false) => (0, i128::MAX),
+        (false, true) => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        (false, false) => (0, (1i128 << bits) - 1),
+    }
+}
+
 /// An integer constant operand's value.
 fn constant_value<'tcx>(tcx: TyCtxt<'tcx>, operand: &Operand<'tcx>) -> Option<i64> {
     let Operand::Constant(constant) = operand else {
@@ -1746,7 +1843,9 @@ fn constant_value<'tcx>(tcx: TyCtxt<'tcx>, operand: &Operand<'tcx>) -> Option<i6
     let raw = constant
         .const_
         .try_eval_bits(tcx, ty::TypingEnv::fully_monomorphized())?;
-    let value: i128 = if signed && bits < 128 && (raw >> (bits - 1)) & 1 == 1 {
+    let value: i128 = if !signed {
+        i128::try_from(raw).ok()?
+    } else if bits < 128 && (raw >> (bits - 1)) & 1 == 1 {
         raw as i128 - (1i128 << bits)
     } else {
         raw as i128
@@ -1783,11 +1882,7 @@ fn constant_locals<'tcx>(
             };
             let fits = |v: i64| {
                 let (bits, signed) = int_shape(decl.ty).expect("an integer local");
-                let (min, max): (i128, i128) = if signed {
-                    (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-                } else {
-                    (0, (1i128 << bits.min(127)) - 1)
-                };
+                let (min, max) = type_range(bits, signed);
                 (min..=max).contains(&(v as i128))
             };
             let new = match rvalue {
@@ -2100,6 +2195,11 @@ fn occurrences<'tcx>(body: &Body<'tcx>, location: Location) -> Vec<Occ<'tcx>> {
             StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) => {
                 write(place, &mut out)
             }
+            StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(operand)) => {
+                if let Operand::Copy(p) | Operand::Move(p) = operand {
+                    read(p, Use::Inert, &mut out);
+                }
+            }
             StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(copy)) => {
                 for operand in [&copy.src, &copy.dst, &copy.count] {
                     if let Operand::Copy(p) | Operand::Move(p) = operand {
@@ -2111,8 +2211,15 @@ fn occurrences<'tcx>(body: &Body<'tcx>, location: Location) -> Vec<Occ<'tcx>> {
         },
         At::Terminator(terminator) => match &terminator.kind {
             TerminatorKind::Call {
-                args, destination, ..
+                func,
+                args,
+                destination,
+                ..
             } => {
+                // A function pointer read out of the base is a pointer read.
+                if let Operand::Copy(p) | Operand::Move(p) = func {
+                    read(p, Use::Escape("called-pointer"), &mut out);
+                }
                 for (k, arg) in args.iter().enumerate() {
                     if let Operand::Copy(p) | Operand::Move(p) = &arg.node {
                         read(p, Use::Arg { k }, &mut out);
@@ -2514,12 +2621,11 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                     BTreeSet::new(),
                 )
             } else if Some(k) == read {
-                Footprint::bytes(
-                    Bound::constant(0),
-                    Bound::constant(n),
-                    false,
-                    BTreeSet::new(),
-                )
+                // The bytes copied out may be a pointer to the base, used after
+                // through the copy (the reviewer's M1): a pointer read out of
+                // the base, as `loads-a-pointer`. Types cannot rule it out: the
+                // object behind a byte pointer may hold pointers.
+                return Footprint::Unknown("copies-bytes-out");
             } else {
                 return Footprint::Unknown("libc-argument");
             };
@@ -2550,6 +2656,100 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             other => other,
         };
         extent.shift(deriv.lo, deriv.hi, &deriv.premises)
+    }
+
+    /// The bases whose value escapes the body, by a taint walk over value
+    /// flows from each pointer formal that is never written: every local the
+    /// value reaches (copies, address-keeping casts, `&(*p).f`, core's steps,
+    /// slice `as_ptr`, `memcpy`'s return) carries the base, whether its range
+    /// is known or not. A carried use escapes when it stores, returns,
+    /// aggregates or casts the value to an integer, takes its address, hands
+    /// it to a foreign or recursive callee or to a local one whose formal
+    /// escapes, copies bytes out of it, or reads a pointer out of it.
+    fn escaped_roots(&self) -> FxHashSet<Local> {
+        let Some(uses) = self.uses else {
+            return FxHashSet::default();
+        };
+        let mut carried: FxHashMap<Local, FxHashSet<Local>> = FxHashMap::default();
+        let mut work = Vec::new();
+        for local in self.body.local_decls.indices() {
+            if self.shape.fixed_formal(local) && is_pointer(self.body, local) {
+                carried.entry(local).or_default().insert(local);
+                work.push(local);
+            }
+        }
+        let mut escaped = FxHashSet::default();
+        while let Some(local) = work.pop() {
+            let roots = carried[&local].clone();
+            let mut into =
+                |dest: &Place<'tcx>, work: &mut Vec<Local>, escaped: &mut FxHashSet<Local>| {
+                    match dest.as_local() {
+                        Some(RETURN_PLACE) | None => escaped.extend(roots.iter().copied()),
+                        Some(dest) => {
+                            let set = carried.entry(dest).or_default();
+                            let before = set.len();
+                            set.extend(roots.iter().copied());
+                            if set.len() != before {
+                                work.push(dest);
+                            }
+                        }
+                    }
+                };
+            for (location, occ) in uses.get(&local).into_iter().flatten() {
+                match &occ.what {
+                    Use::Inert => {}
+                    Use::Escape(_) => escaped.extend(roots.iter().copied()),
+                    Use::Flow { dest } => into(dest, &mut work, &mut escaped),
+                    Use::Bytes { place, write } => {
+                        let through = place.projection[1..].contains(&PlaceElem::Deref);
+                        if through
+                            || (!*write && self.holds_pointer(place.ty(self.body, self.tcx).ty, 4))
+                        {
+                            escaped.extend(roots.iter().copied());
+                        }
+                    }
+                    Use::Arg { k } => {
+                        let terminator = self.body.basic_blocks[location.block].terminator();
+                        let (
+                            TerminatorKind::Call {
+                                func, destination, ..
+                            },
+                            Some(call),
+                        ) = (&terminator.kind, terminator.as_call(self.tcx))
+                        else {
+                            escaped.extend(roots.iter().copied());
+                            continue;
+                        };
+                        if *k == 0
+                            && (core_pointer_step(self.tcx, &call.func).is_some()
+                                || core_slice_buffer(self.tcx, self.body, func))
+                        {
+                            into(destination, &mut work, &mut escaped);
+                        } else if *k == 0 && core_is_null(self.tcx, &call.func) {
+                        } else if let Some((written, _, _)) = libc_row(&call.func) {
+                            if *k == written {
+                                into(destination, &mut work, &mut escaped);
+                            } else {
+                                escaped.extend(roots.iter().copied());
+                            }
+                        } else {
+                            let callee = func
+                                .const_fn_def()
+                                .and_then(|(def, _)| def.as_local())
+                                .filter(|callee| self.table.scc.contains_key(callee));
+                            let follows = callee.is_some_and(|callee| {
+                                self.table.scc.get(&callee) != self.table.scc.get(&self.function)
+                                    && !self.table.escapes.contains(&(callee, *k as u32))
+                            });
+                            if !follows {
+                                escaped.extend(roots.iter().copied());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        escaped
     }
 
     /// Everything reached through `local` and what derives from it.
@@ -2586,6 +2786,7 @@ impl FnFacts {
         let shape = Shape::new(body);
         let ints = Ints::compute(tcx, body, &shape);
         let families = RefCell::new(FxHashMap::default());
+        let escaped: FxHashSet<Local>;
         let none = FxHashMap::default();
         let derivs: FxHashMap<Local, Deriv> = {
             let ctx = Ctx {
@@ -2639,15 +2840,17 @@ impl FnFacts {
             };
             let mut locals: Vec<Local> = derivs.keys().copied().collect();
             locals.sort();
-            for local in locals {
-                ctx.family(local);
+            for local in &locals {
+                ctx.family(*local);
             }
+            escaped = ctx.escaped_roots();
         }
         FnFacts {
             shape,
             ints,
             derivs,
             families,
+            escaped,
         }
     }
 }

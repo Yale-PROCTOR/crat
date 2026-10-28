@@ -181,6 +181,15 @@ fn has_receipt(receipts: &[RangeDisjoint], loan: (i64, i64), access: (i64, i64))
     })
 }
 
+/// A control: the edge is there, the function is not accepted, and no
+/// invalidation in the program was skipped.
+fn control(code: &str, name: &str) {
+    assert!(edges(code, name) > 0, "the control's edge is there");
+    let (accepted, receipts) = accepts(code, name);
+    assert!(!accepted, "the control is not accepted");
+    assert!(receipts.is_empty(), "no discharge: {receipts:?}");
+}
+
 /// The `lengths` shape (005's `SPX_chain_lengths`, `wots_checksum`, `base_w`):
 /// `check` reads `head[i]` for `i < LEN1` (`wrapping_add`), and hands `tail` to
 /// `fill`, which writes `out[j]` for `k < n` with `j` and `k` stepping together.
@@ -237,8 +246,7 @@ fn e5c_w267_x2_overlapping_ranges_keep_the_edge() {
         "check(v.offset(LEN1 as isize), v);",
         "check(v.offset(31), v);",
     );
-    assert!(edges(&code, "split") > 0, "the overlap keeps the edge");
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X3: a delta that is a formal is no constant: Unknown, the edge stays.
@@ -249,8 +257,7 @@ fn e5c_w267_x3_non_constant_delta_is_unknown() {
         "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, k: core::ffi::c_int) {\n    check(v.offset(k as isize), v);",
     );
     assert!(code.contains("k as isize"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X4: a foreign callee without a row is Unknown: the edge stays.
@@ -266,14 +273,30 @@ pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
     check_elsewhere(v.offset(32), v);
 }
 "#;
-    assert!(edges(CODE, "split") > 0);
-    assert!(!accepts(CODE, "split").0);
+    control(CODE, "split");
 }
 
-/// X4b: `memcpy` with a constant length is its row: `[128, 140)` written
-/// against `[0, 12)` read, the edge is gone.
+/// X4b: `memset` with a constant length is its row: `check` clears `tail[0, 3)`
+/// and reads `head[0, 32)`: `[128, 140)` written against `[0, 128)` read, the
+/// edge is gone.
 #[test]
-fn e5c_w267_x4b_memcpy_row_with_a_constant_length() {
+fn e5c_w267_x4b_memset_row_with_a_constant_length() {
+    let code = X1.replace(
+        "    fill(tail, LEN2);",
+        "    memset(tail as *mut core::ffi::c_void, 0, 12 as core::ffi::c_ulong);",
+    ) + "unsafe extern \"C\" {\n    fn memset(s: *mut core::ffi::c_void, c: core::ffi::c_int, n: core::ffi::c_ulong) -> *mut core::ffi::c_void;\n}\n";
+    assert!(code.contains("memset(tail"));
+    assert_eq!(edges(&code, "split"), 0);
+    let (accepted, receipts) = accepts(&code, "split");
+    assert!(accepted);
+    assert!(has_receipt(&receipts, (128, 140), (0, 128)));
+}
+
+/// X4c (the review's M1): bytes copied out of the base by `memcpy` may be a
+/// pointer to it, used after through the copy: the source row is Unknown and
+/// the edge stays.
+#[test]
+fn e5c_w267_x4c_memcpy_source_is_unknown() {
     const CODE: &str = r#"
 #![allow(dead_code, unused_mut, unused_variables)]
 unsafe extern "C" {
@@ -292,10 +315,40 @@ pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
     );
 }
 "#;
-    assert_eq!(edges(CODE, "split"), 0);
-    let (accepted, receipts) = accepts(CODE, "split");
+    control(CODE, "split");
+}
+
+/// X1b (the review's M3): `head` is `*mut`, so `v` reaches the call by a copy
+/// the engine checks at the call (a deferred argument read): the discharge
+/// reads it at its statement, and the edge is gone.
+#[test]
+fn e5c_w267_x1b_a_deferred_argument_read() {
+    let code = X1.replace(
+        "unsafe extern \"C\" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint) {",
+        "unsafe extern \"C\" fn check(mut tail: *mut core::ffi::c_uint, mut head: *mut core::ffi::c_uint) {",
+    );
+    assert!(code.contains("mut head: *mut"));
+    assert_eq!(edges(&code, "split"), 0);
+    let (accepted, receipts) = accepts(&code, "split");
     assert!(accepted);
-    assert!(has_receipt(&receipts, (128, 140), (0, 12)));
+    assert!(has_receipt(&receipts, (128, 140), (0, 128)));
+}
+
+/// X1c: the head first, `check_rev(v, v.offset(32))`: the loan is the read
+/// view's, the access the written one's; the edge is gone.
+#[test]
+fn e5c_w267_x1c_the_read_view_first() {
+    let code = X1
+        .replace(
+            "unsafe extern \"C\" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint) {",
+            "unsafe extern \"C\" fn check(mut head: *const core::ffi::c_uint, mut tail: *mut core::ffi::c_uint) {",
+        )
+        .replace("check(v.offset(LEN1 as isize), v);", "check(v, v.offset(LEN1 as isize));");
+    assert!(code.contains("check(v, v.offset"));
+    assert_eq!(edges(&code, "split"), 0);
+    let (accepted, receipts) = accepts(&code, "split");
+    assert!(accepted);
+    assert!(has_receipt(&receipts, (0, 128), (128, 140)));
 }
 
 /// X5: `fill`'s bound is `check`'s own formal `m`, and `split` passes the
@@ -340,8 +393,7 @@ pub unsafe extern "C" fn split2(mut v: *mut core::ffi::c_uint, n: core::ffi::c_i
     check2(v.offset(32), v, n);
 }
 "#;
-    assert!(edges(CODE, "split2") > 0);
-    assert!(!accepts(CODE, "split2").0);
+    control(CODE, "split2");
 }
 
 /// X7a: a pointer with two definitions has no base: the edge stays.
@@ -352,8 +404,7 @@ fn e5c_w267_x7a_two_definitions_never_discharge() {
         "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, mut w: *mut core::ffi::c_uint, c: core::ffi::c_int) {\n    let mut p: *mut core::ffi::c_uint = if c != 0 { v } else { w };\n    check(p.offset(LEN1 as isize), v);",
     );
     assert!(code.contains("if c != 0"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X7b: two formals are two bases, whatever their ranges: the table roots the
@@ -394,8 +445,7 @@ fn e5c_w267_x8_recursion_is_unknown() {
         "    if n > 0 {\n        *out = 7 as core::ffi::c_uint;\n        fill(out.offset(1), n - 1);\n    }",
     );
     assert!(code.contains("fill(out.offset(1), n - 1)"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X9: the issuer's value is stored into a struct before the call: it escapes,
@@ -407,8 +457,7 @@ fn e5c_w267_x9_escape_is_unknown() {
         "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, mut keep: *mut Keep) {\n    let mut t: *mut core::ffi::c_uint = v.offset(LEN1 as isize);\n    (*keep).p = t;\n    check(t, v);",
     ) + "#[repr(C)]\npub struct Keep { pub p: *mut core::ffi::c_uint }\n";
     assert!(code.contains("(*keep).p = t"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X10: `fill`'s `k += 1` under an `if`: `j − k` grows without bound at the loop
@@ -428,8 +477,7 @@ fn e5c_w267_x10_conditional_counter_is_unknown() {
         )
         .replace("fill(tail, LEN2);", "fill(tail, LEN2, 1);");
     assert!(code.contains("if c != 0 {\n            k += 1;"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X11: `fill` also writes `out[-1]`: `[124, 140)` meets `[0, 128)`, the lower
@@ -441,8 +489,7 @@ fn e5c_w267_x11_negative_reach_meets() {
         "    k = 0 as core::ffi::c_int;\n    *out.offset(-1 as isize) = 0 as core::ffi::c_uint;\n",
     );
     assert!(code.contains("out.offset(-1 as isize)"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X12 (R2): a pointer loaded from memory is Unknown as a base: the edge stays.
@@ -453,8 +500,7 @@ fn e5c_w267_x12_a_loaded_pointer_is_no_base() {
         "pub unsafe extern \"C\" fn split(mut h: *mut Holder) {\n    let mut v: *mut core::ffi::c_uint = (*h).p;\n    check(v.offset(LEN1 as isize), v);",
     ) + "#[repr(C)]\npub struct Holder { pub p: *mut core::ffi::c_uint }\n";
     assert!(code.contains("(*h).p"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X13 (R1): `keep` stores its formal into a global, and the caller reads
@@ -471,8 +517,7 @@ fn e5c_w267_x13_a_formal_stored_into_a_global_escapes() {
            unsafe extern \"C\" fn keep(mut t: *mut core::ffi::c_uint, n: core::ffi::c_int) {\n    \
            G = t;\n    *t = 0 as core::ffi::c_uint;\n}\n";
     assert!(code.contains("keep(tail, LEN2)") && code.contains("G = t;"));
-    assert!(edges(&code, "split") > 0);
-    assert!(!accepts(&code, "split").0);
+    control(&code, "split");
 }
 
 /// X14: a pointer read out of the base reaches memory the base's ranges do not
@@ -498,8 +543,7 @@ pub unsafe extern "C" fn pair(mut s: *mut Two) {
     twice(s.offset(0), s);
 }
 "#;
-    assert!(edges(CODE, "pair") > 0);
-    assert!(!accepts(CODE, "pair").0);
+    control(CODE, "pair");
 }
 
 /// R3: a copy-lend loan over the same disjoint ranges keeps its edge: X1 with
@@ -545,6 +589,119 @@ fn e5c_w267_r3_a_copy_lend_loan_is_never_discharged() {
     });
 }
 
+/// R3's companion: the same model without the lend (`v` still `Owning`, its
+/// first copy an ordinary loan) is accepted, the copy's loan discharged.
+#[test]
+fn e5c_w267_r3b_the_same_model_without_the_lend_is_accepted() {
+    with_program(X1, |program| {
+        let slots = CrateSlots::build(program);
+        let split = function(program, "split");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(split)
+            .borrow();
+        let v = Local::from_u32(1);
+        let copy = copies_of(&body, v)[0];
+        let model = model(program, &slots, "split", &[v]);
+        let flows = super::origin_flow::analyze_program_origin_flow(program);
+        let inventory = std::sync::Arc::new(source_events::collect(program));
+        let _ = index_ranges::take_receipts();
+        let accepted = source_events::with_inventory(&inventory, || {
+            borrow_verify::model_accepts_with_flows_and_copy_lends(
+                program,
+                &slots,
+                &flows,
+                &model,
+                true,
+                &FxHashSet::default(),
+            )
+        });
+        assert!(accepted, "without the lend the model is accepted");
+        assert!(
+            index_ranges::take_receipts()
+                .iter()
+                .any(|receipt| receipt.issuer == copy),
+            "the copy's ordinary loan is discharged"
+        );
+    });
+}
+
+/// X15 (the review's M2): `n as isize` used other than as an `offset` count is
+/// not assumed to keep its value (`(ssize_t)n` is implementation-defined in
+/// C, not UB): the extent is Unknown, the edge stays.
+#[test]
+fn e5c_w267_x15_usize_as_isize_outside_an_offset_is_unknown() {
+    let code = X1
+        .replace(
+            "unsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {",
+            "unsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, n: usize) {\n    let mut q: isize = n as isize;\n    if q > 2 {\n        return;\n    }\n    *out.offset(q) = 7 as core::ffi::c_uint;\n}\nunsafe extern \"C\" fn unused_fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {",
+        )
+        .replace("fill(tail, LEN2);", "fill(tail, 3 as usize);");
+    assert!(code.contains("n as isize") && code.contains("fill(tail, 3 as usize)"));
+    control(&code, "split");
+}
+
+/// X16 (the review's B1): a condition on a boolean whose address is taken
+/// goes stale when a callee writes it; none is kept, so `i`'s lower bound is
+/// unknown and the edge stays.
+#[test]
+fn e5c_w267_x16_a_condition_on_an_addressed_boolean_is_dropped() {
+    let code = X1
+        .replace(
+            "unsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {",
+            "unsafe extern \"C\" fn set(mut b: *mut bool) {\n    *b = true;\n}\nunsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, i: isize) {\n    let mut ok: bool = i >= 0;\n    set(&mut ok);\n    if ok && i < 3 {\n        *out.offset(i) = 0 as core::ffi::c_uint;\n    }\n}\nunsafe extern \"C\" fn unused_fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {",
+        )
+        .replace("fill(tail, LEN2);", "fill(tail, -1);");
+    assert!(code.contains("set(&mut ok)") && code.contains("fill(tail, -1)"));
+    control(&code, "split");
+}
+
+/// X17: a write through another copy of the base while the view is live is a
+/// routed write; it reaches `[0, 4)` against the view's `[128, 140)`, so it is
+/// discharged too.
+#[test]
+fn e5c_w267_x17_a_routed_write_is_discharged() {
+    let code = X1.replace(
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    let mut t: *mut core::ffi::c_uint = v.offset(LEN1 as isize);\n    let mut w: *mut core::ffi::c_uint = v;\n    *w = 9 as core::ffi::c_uint;\n    fill(t, LEN2);",
+    );
+    assert!(code.contains("*w = 9"));
+    assert_eq!(edges(&code, "split"), 0);
+    let (accepted, receipts) = accepts(&code, "split");
+    assert!(accepted);
+    with_program(&code, |program| {
+        let split = function(program, "split");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(split)
+            .borrow();
+        let write = body
+            .basic_blocks
+            .iter_enumerated()
+            .flat_map(|(block, data)| {
+                data.statements.iter().enumerate().filter_map(
+                    move |(statement_index, statement)| {
+                        let (place, _) = statement.kind.as_assign()?;
+                        (place.projection.first() == Some(&rustc_middle::mir::PlaceElem::Deref))
+                            .then_some(rustc_middle::mir::Location {
+                                block,
+                                statement_index,
+                            })
+                    },
+                )
+            })
+            .next()
+            .expect("the write through `w`");
+        assert!(
+            receipts.iter().any(|receipt| receipt.access == write
+                && receipt.loan_bytes == Some((128, 140))
+                && receipt.access_bytes == Some((0, 4))
+                && receipt.access_writes),
+            "the routed write's receipt: {receipts:?}"
+        );
+    });
+}
+
 /// The blake `*_update` shape: `compress(s, (*s).buf.as_ptr())`, with `compress`
 /// touching `h` / `t` of `*s` and reading `block` at constant offsets.
 const S1: &str = r#"
@@ -584,8 +741,7 @@ fn e5c_w267_s2_struct_fields_meet() {
         "    (*s).t[1] = (*s).h[2];\n    (*s).buf[3] = 0;\n",
     );
     assert!(code.contains("(*s).buf[3] = 0"));
-    assert!(edges(&code, "update") > 0);
-    assert!(!accepts(&code, "update").0);
+    control(&code, "update");
 }
 
 // ---------------------------------------------------------------------------
