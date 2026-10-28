@@ -41,6 +41,9 @@ pub(crate) mod copy_relax;
 mod copy_relax_tests;
 pub(crate) mod field_moves;
 pub(crate) mod guarded_repair;
+pub(crate) mod index_ranges;
+#[cfg(test)]
+mod index_ranges_tests;
 #[cfg(test)]
 mod kind_order_tests;
 pub(crate) mod licensing;

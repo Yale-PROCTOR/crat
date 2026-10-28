@@ -1,0 +1,706 @@
+//! Witnesses of the index-range discharge (relay era-5c/267 §2, report 218 §4
+//! with the seat's riders R1–R5). Every fixture function is `unsafe extern "C"`,
+//! as C2Rust's are: in a Rust-ABI body the retirement review rejects every
+//! stack-local loan live across an `unwind continue` call (report 217 §2), which
+//! would mask the edge under test.
+//!
+//! The end-to-end assertion is the guarded repair's own: `model_accepts` on a
+//! model whose named slots are `Ref` and every other slot `Raw`, the conflict
+//! edges of the function (`borrow_conflicts`, every pointer local of the
+//! function a candidate), and, on the positives, the `range-disjoint` receipt.
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{ItemKind, OwnerNode};
+use rustc_middle::mir::{Body, Local, Operand, Rvalue, StatementKind};
+use rustc_span::def_id::LocalDefId;
+
+use super::{
+    SlotKind, borrow_engine, borrow_verify,
+    coherence::CopyLendPair,
+    crate_slots::CrateSlots,
+    index_ranges::{self, Bound, Footprint, IndexRanges, RangeDisjoint},
+    slots::SlotId,
+    solver::SlotRef,
+    source_events,
+};
+use crate::utils::rustc::RustProgram;
+
+fn with_program<R: Send>(code: &str, f: impl FnOnce(&RustProgram<'_>) -> R + Send) -> R {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        let program = RustProgram {
+            tcx,
+            functions,
+            structs,
+        };
+        f(&program)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+fn function(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+    let found: Vec<_> = program
+        .functions
+        .iter()
+        .copied()
+        .filter(|f| program.tcx.item_name(f.to_def_id()).as_str() == name)
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one function {name}");
+    found[0]
+}
+
+/// The pointer locals of a body, the return place excepted.
+fn pointer_locals(body: &Body<'_>) -> Vec<Local> {
+    body.local_decls
+        .iter_enumerated()
+        .filter(|(local, decl)| local.as_u32() != 0 && decl.ty.is_any_ptr())
+        .map(|(local, _)| local)
+        .collect()
+}
+
+/// The locals assigned `copy source` (or `move source`), in order.
+fn copies_of(body: &Body<'_>, source: Local) -> Vec<Local> {
+    let mut out = Vec::new();
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            if let StatementKind::Assign(box (
+                place,
+                Rvalue::Use(Operand::Copy(p) | Operand::Move(p)),
+            )) = &statement.kind
+                && p.as_local() == Some(source)
+                && let Some(local) = place.as_local()
+            {
+                out.push(local);
+            }
+        }
+    }
+    out
+}
+
+/// The model: every slot `Raw`, then every depth-0 slot of `name`'s pointer
+/// locals `Ref`, except the `owning` ones, `Owning`.
+fn model(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    name: &str,
+    owning: &[Local],
+) -> FxHashMap<SlotRef, SlotKind> {
+    let mut model = FxHashMap::default();
+    for index in 0..slots.field_slots.len() {
+        model.insert(SlotRef::Field(SlotId::from_usize(index)), SlotKind::Raw);
+    }
+    for (&f, universe) in &slots.fn_local_slots {
+        for index in 0..universe.len() {
+            model.insert(SlotRef::Local(f, SlotId::from_usize(index)), SlotKind::Raw);
+        }
+    }
+    let f = function(program, name);
+    let body = program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(f)
+        .borrow();
+    for local in pointer_locals(&body) {
+        let Some(slot) = slots.fn_local_slots[&f].slot_for_local_depth(local, 0) else {
+            continue;
+        };
+        let kind = if owning.contains(&local) {
+            SlotKind::Owning
+        } else {
+            SlotKind::Ref
+        };
+        model.insert(SlotRef::Local(f, slot), kind);
+    }
+    model
+}
+
+/// Does the guarded repair accept `name`'s pointer locals as `Ref`? The
+/// receipts recorded on the way are returned with the verdict.
+fn accepts(code: &str, name: &str) -> (bool, Vec<RangeDisjoint>) {
+    with_program(code, |program| {
+        let slots = CrateSlots::build(program);
+        let model = model(program, &slots, name, &[]);
+        let inventory = std::sync::Arc::new(source_events::collect(program));
+        let _ = index_ranges::take_receipts();
+        let accepted = source_events::with_inventory(&inventory, || {
+            borrow_verify::model_accepts(program, &slots, &model, true)
+        });
+        (accepted, index_ranges::take_receipts())
+    })
+}
+
+/// The conflict edges in `name`, every pointer local of `name` a candidate.
+fn edges(code: &str, name: &str) -> usize {
+    with_program(code, |program| {
+        let target = function(program, name);
+        let candidates: FxHashMap<LocalDefId, FxHashSet<Local>> = program
+            .functions
+            .iter()
+            .map(|&f| {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(f)
+                    .borrow();
+                let locals = if f == target {
+                    pointer_locals(&body).into_iter().collect()
+                } else {
+                    FxHashSet::default()
+                };
+                (f, locals)
+            })
+            .collect();
+        let conflicts = borrow_engine::borrow_conflicts(
+            program,
+            |f: LocalDefId| {
+                let set = candidates[&f].clone();
+                move |local: Local| set.contains(&local)
+            },
+            |_: LocalDefId| |_: Local| true,
+        );
+        conflicts.get(&target).map_or(0, Vec::len)
+    })
+}
+
+/// `name`'s receipt on its first formal: `(loan bytes, access bytes)`.
+fn receipt_on_first_formal(
+    receipts: &[RangeDisjoint],
+) -> Option<(Option<(i64, i64)>, Option<(i64, i64)>)> {
+    receipts
+        .iter()
+        .find(|receipt| receipt.base.as_u32() == 1)
+        .map(|receipt| (receipt.loan_bytes, receipt.access_bytes))
+}
+
+/// The `lengths` shape (005's `SPX_chain_lengths`, `wots_checksum`, `base_w`):
+/// `check` reads `head[i]` for `i < LEN1` (`wrapping_add`), and hands `tail` to
+/// `fill`, which writes `out[j]` for `k < n` with `j` and `k` stepping together.
+const X1: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_upper_case_globals)]
+pub const SPX_N: core::ffi::c_int = 16 as core::ffi::c_int;
+pub const LOGW: core::ffi::c_int = 4 as core::ffi::c_int;
+pub const LEN1: core::ffi::c_int = 8 as core::ffi::c_int * SPX_N / LOGW;
+pub const LEN2: core::ffi::c_int = 3 as core::ffi::c_int;
+unsafe extern "C" fn fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {
+    let mut j: core::ffi::c_int = 0 as core::ffi::c_int;
+    let mut k: core::ffi::c_int = 0;
+    k = 0 as core::ffi::c_int;
+    while k < n {
+        *out.offset(j as isize) = 7 as core::ffi::c_uint;
+        j += 1;
+        k += 1;
+    }
+}
+unsafe extern "C" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint) {
+    let mut s: core::ffi::c_uint = 0 as core::ffi::c_uint;
+    let mut i: core::ffi::c_uint = 0;
+    i = 0 as core::ffi::c_uint;
+    while i < LEN1 as core::ffi::c_uint {
+        s = s.wrapping_add(*head.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    fill(tail, LEN2);
+}
+#[no_mangle]
+pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
+    check(v.offset(LEN1 as isize), v);
+}
+"#;
+
+/// X1: the two views reach `[128, 140)` (written) and `[0, 128)` (read) of `v`:
+/// the edge is gone, the function's pointers are `Ref`, and the receipt names
+/// both ranges.
+#[test]
+fn e5c_w267_x1_two_views_disjoint_constant_ranges_both_ref() {
+    assert_eq!(edges(X1, "split"), 0, "the disjoint pair leaves no edge");
+    let (accepted, receipts) = accepts(X1, "split");
+    assert!(accepted, "`split`'s pointers are Ref");
+    assert_eq!(
+        receipt_on_first_formal(&receipts),
+        Some((Some((128, 140)), Some((0, 128)))),
+        "the receipt: base `v`, the loan's [128, 140), the access's [0, 128)"
+    );
+}
+
+/// X2: one element further in, `[124, 136)` meets `[0, 128)`: the edge stays.
+#[test]
+fn e5c_w267_x2_overlapping_ranges_keep_the_edge() {
+    let code = X1.replace(
+        "check(v.offset(LEN1 as isize), v);",
+        "check(v.offset(31), v);",
+    );
+    assert!(edges(&code, "split") > 0, "the overlap keeps the edge");
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X3: a delta that is a formal is no constant: Unknown, the edge stays.
+#[test]
+fn e5c_w267_x3_non_constant_delta_is_unknown() {
+    let code = X1.replace(
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, k: core::ffi::c_int) {\n    check(v.offset(k as isize), v);",
+    );
+    assert!(code.contains("k as isize"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X4: a foreign callee without a row is Unknown: the edge stays.
+#[test]
+fn e5c_w267_x4_foreign_callee_is_unknown() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+unsafe extern "C" {
+    fn check_elsewhere(tail: *mut core::ffi::c_uint, head: *const core::ffi::c_uint);
+}
+#[no_mangle]
+pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
+    check_elsewhere(v.offset(32), v);
+}
+"#;
+    assert!(edges(CODE, "split") > 0);
+    assert!(!accepts(CODE, "split").0);
+}
+
+/// X4b: `memcpy` with a constant length is its row: `[128, 140)` written
+/// against `[0, 12)` read, the edge is gone.
+#[test]
+fn e5c_w267_x4b_memcpy_row_with_a_constant_length() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+unsafe extern "C" {
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: core::ffi::c_ulong,
+    ) -> *mut core::ffi::c_void;
+}
+#[no_mangle]
+pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
+    memcpy(
+        v.offset(32) as *mut core::ffi::c_void,
+        v as *const core::ffi::c_void,
+        12 as core::ffi::c_ulong,
+    );
+}
+"#;
+    assert_eq!(edges(CODE, "split"), 0);
+    let (accepted, receipts) = accepts(CODE, "split");
+    assert!(accepted);
+    assert_eq!(
+        receipt_on_first_formal(&receipts),
+        Some((Some((128, 140)), Some((0, 12))))
+    );
+}
+
+/// X5: `fill`'s bound is `check`'s own formal `m`, and `split` passes the
+/// constant 3: instantiated two levels up, the edge is gone.
+#[test]
+fn e5c_w267_x5_extent_through_a_nested_local_callee() {
+    let code = X1
+        .replace(
+            "unsafe extern \"C\" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint) {",
+            "unsafe extern \"C\" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint, m: core::ffi::c_int) {",
+        )
+        .replace("fill(tail, LEN2);", "fill(tail, m);")
+        .replace("check(v.offset(LEN1 as isize), v);", "check(v.offset(LEN1 as isize), v, 3);");
+    assert!(code.contains("fill(tail, m)") && code.contains("v, 3)"));
+    assert_eq!(edges(&code, "split"), 0);
+    let (accepted, receipts) = accepts(&code, "split");
+    assert!(accepted);
+    assert_eq!(
+        receipt_on_first_formal(&receipts),
+        Some((Some((128, 140)), Some((0, 128))))
+    );
+}
+
+/// X6: the read bound is `split2`'s own formal: `[0, 4n)` is symbolic at the
+/// conflict, so Unknown, and the edge stays.
+#[test]
+fn e5c_w267_x6_loop_bound_from_a_non_constant_actual_is_unknown() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments)]
+unsafe extern "C" fn check2(
+    mut tail: *mut core::ffi::c_uint,
+    mut head: *const core::ffi::c_uint,
+    n: core::ffi::c_int,
+) {
+    let mut s: core::ffi::c_uint = 0;
+    let mut i: core::ffi::c_int = 0;
+    while i < n {
+        s = s.wrapping_add(*head.offset(i as isize));
+        i += 1;
+    }
+    *tail = s;
+}
+#[no_mangle]
+pub unsafe extern "C" fn split2(mut v: *mut core::ffi::c_uint, n: core::ffi::c_int) {
+    check2(v.offset(32), v, n);
+}
+"#;
+    assert!(edges(CODE, "split2") > 0);
+    assert!(!accepts(CODE, "split2").0);
+}
+
+/// X7a: a pointer with two definitions has no base: the edge stays.
+#[test]
+fn e5c_w267_x7a_two_definitions_never_discharge() {
+    let code = X1.replace(
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, mut w: *mut core::ffi::c_uint, c: core::ffi::c_int) {\n    let mut p: *mut core::ffi::c_uint = if c != 0 { v } else { w };\n    check(p.offset(LEN1 as isize), v);",
+    );
+    assert!(code.contains("if c != 0"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X7b: two formals are two bases, whatever their ranges: the table roots the
+/// two values at different formals, and the discharge compares only one base.
+#[test]
+fn e5c_w267_x7b_two_bases_never_discharge() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+unsafe extern "C" fn check(mut tail: *mut core::ffi::c_uint, mut head: *const core::ffi::c_uint) {
+    *tail = *head;
+}
+#[no_mangle]
+pub unsafe extern "C" fn g(mut a: *mut core::ffi::c_uint, mut b: *mut core::ffi::c_uint) {
+    check(a.offset(32), b);
+}
+"#;
+    with_program(CODE, |program| {
+        let table = IndexRanges::build(program);
+        let g = function(program, "g");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(g)
+            .borrow();
+        let a = Local::from_u32(1);
+        let b = Local::from_u32(2);
+        let from_a = copies_of(&body, a)[0];
+        let from_b = copies_of(&body, b)[0];
+        assert_eq!(table.family(g, from_a).map(|(root, _)| root), Some(a));
+        assert_eq!(table.family(g, from_b).map(|(root, _)| root), Some(b));
+    });
+}
+
+/// X8: `fill` recurses: a recursive callee's extent is Unknown, the edge stays.
+#[test]
+fn e5c_w267_x8_recursion_is_unknown() {
+    let code = X1.replace(
+        "    k = 0 as core::ffi::c_int;\n    while k < n {\n        *out.offset(j as isize) = 7 as core::ffi::c_uint;\n        j += 1;\n        k += 1;\n    }",
+        "    if n > 0 {\n        *out = 7 as core::ffi::c_uint;\n        fill(out.offset(1), n - 1);\n    }",
+    );
+    assert!(code.contains("fill(out.offset(1), n - 1)"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X9: the issuer's value is stored into a struct before the call: it escapes,
+/// Unknown, the edge stays.
+#[test]
+fn e5c_w267_x9_escape_is_unknown() {
+    let code = X1.replace(
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint, mut keep: *mut Keep) {\n    let mut t: *mut core::ffi::c_uint = v.offset(LEN1 as isize);\n    (*keep).p = t;\n    check(t, v);",
+    ) + "#[repr(C)]\npub struct Keep { pub p: *mut core::ffi::c_uint }\n";
+    assert!(code.contains("(*keep).p = t"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X10: `fill`'s `k += 1` under an `if`: `j − k` grows without bound at the loop
+/// head, so `j` is unbounded: Unknown, the edge stays. (Report 218's wording put
+/// the `if` on `j`; there `j ≤ k ≤ n − 1` still holds and the extent is sound
+/// and bounded, so the control is the counter that bounds, not the index.)
+#[test]
+fn e5c_w267_x10_conditional_counter_is_unknown() {
+    let code = X1
+        .replace(
+            "unsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int) {",
+            "unsafe extern \"C\" fn fill(mut out: *mut core::ffi::c_uint, n: core::ffi::c_int, c: core::ffi::c_int) {",
+        )
+        .replace(
+            "        j += 1;\n        k += 1;\n",
+            "        j += 1;\n        if c != 0 {\n            k += 1;\n        }\n",
+        )
+        .replace("fill(tail, LEN2);", "fill(tail, LEN2, 1);");
+    assert!(code.contains("if c != 0 {\n            k += 1;"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X11: `fill` also writes `out[-1]`: `[124, 140)` meets `[0, 128)`, the lower
+/// bound is checked, the edge stays.
+#[test]
+fn e5c_w267_x11_negative_reach_meets() {
+    let code = X1.replace(
+        "    k = 0 as core::ffi::c_int;\n",
+        "    k = 0 as core::ffi::c_int;\n    *out.offset(-1 as isize) = 0 as core::ffi::c_uint;\n",
+    );
+    assert!(code.contains("out.offset(-1 as isize)"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X12 (R2): a pointer loaded from memory is Unknown as a base: the edge stays.
+#[test]
+fn e5c_w267_x12_a_loaded_pointer_is_no_base() {
+    let code = X1.replace(
+        "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+        "pub unsafe extern \"C\" fn split(mut h: *mut Holder) {\n    let mut v: *mut core::ffi::c_uint = (*h).p;\n    check(v.offset(LEN1 as isize), v);",
+    ) + "#[repr(C)]\npub struct Holder { pub p: *mut core::ffi::c_uint }\n";
+    assert!(code.contains("(*h).p"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X13 (R1): `keep` stores its formal into a global, and the caller reads
+/// through the global afterwards: `keep`'s extent is Unknown, the edge stays.
+#[test]
+fn e5c_w267_x13_a_formal_stored_into_a_global_escapes() {
+    let code = X1
+        .replace("fill(tail, LEN2);", "keep(tail, LEN2);")
+        .replace(
+            "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);",
+            "pub unsafe extern \"C\" fn split(mut v: *mut core::ffi::c_uint) {\n    check(v.offset(LEN1 as isize), v);\n    *G = 1 as core::ffi::c_uint;",
+        )
+        + "pub static mut G: *mut core::ffi::c_uint = 0 as *mut core::ffi::c_uint;\n\
+           unsafe extern \"C\" fn keep(mut t: *mut core::ffi::c_uint, n: core::ffi::c_int) {\n    \
+           G = t;\n    *t = 0 as core::ffi::c_uint;\n}\n";
+    assert!(code.contains("keep(tail, LEN2)") && code.contains("G = t;"));
+    assert!(edges(&code, "split") > 0);
+    assert!(!accepts(&code, "split").0);
+}
+
+/// X14: a pointer read out of the base reaches memory the base's ranges do not
+/// describe: `twice` reads `(*x).p` and writes through it, `(*y).data` is a
+/// disjoint field, and still the edge stays. (`s.offset(0)`, as in X1, so the
+/// issuer reaches the call through a derivation: a copy handed to the call
+/// directly is the argument-order rule's.)
+#[test]
+fn e5c_w267_x14_a_pointer_read_out_of_the_base_ends_the_footprint() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+#[repr(C)]
+pub struct Two {
+    pub p: *mut u32,
+    pub data: [u32; 4],
+}
+unsafe extern "C" fn twice(mut x: *mut Two, mut y: *mut Two) {
+    *(*x).p = 1;
+    (*y).data[0] = 2;
+}
+#[no_mangle]
+pub unsafe extern "C" fn pair(mut s: *mut Two) {
+    twice(s.offset(0), s);
+}
+"#;
+    assert!(edges(CODE, "pair") > 0);
+    assert!(!accepts(CODE, "pair").0);
+}
+
+/// R3: a copy-lend loan over the same disjoint ranges keeps its edge: X1 with
+/// `v` the Owning lender of a mutable copy-lend to its first copy.
+#[test]
+fn e5c_w267_r3_a_copy_lend_loan_is_never_discharged() {
+    with_program(X1, |program| {
+        let slots = CrateSlots::build(program);
+        let split = function(program, "split");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(split)
+            .borrow();
+        let v = Local::from_u32(1);
+        let copy = copies_of(&body, v)[0];
+        let slot = |local: Local| {
+            SlotRef::Local(
+                split,
+                slots.fn_local_slots[&split]
+                    .slot_for_local_depth(local, 0)
+                    .expect("a depth-0 slot"),
+            )
+        };
+        let model = model(program, &slots, "split", &[v]);
+        let mut pair = CopyLendPair::new(slot(copy), slot(v));
+        pair.mutable = true;
+        let lends: FxHashSet<CopyLendPair> = [pair].into_iter().collect();
+        let flows = super::origin_flow::analyze_program_origin_flow(program);
+        let inventory = std::sync::Arc::new(source_events::collect(program));
+        let _ = index_ranges::take_receipts();
+        let accepted = source_events::with_inventory(&inventory, || {
+            borrow_verify::model_accepts_with_flows_and_copy_lends(
+                program, &slots, &flows, &model, true, &lends,
+            )
+        });
+        assert!(!accepted, "a copy-lend loan keeps its edge");
+        assert!(
+            index_ranges::take_receipts()
+                .iter()
+                .all(|receipt| receipt.issuer != copy),
+            "no receipt discharges the copy-lend loan"
+        );
+    });
+}
+
+/// The blake `*_update` shape: `compress(s, (*s).buf.as_ptr())`, with `compress`
+/// touching `h` / `t` of `*s` and reading `block` at constant offsets.
+const S1: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+#[repr(C)]
+pub struct State {
+    pub h: [u32; 8],
+    pub t: [u32; 2],
+    pub buf: [u8; 64],
+}
+unsafe extern "C" fn compress(mut s: *mut State, mut block: *const u8) {
+    (*s).h[0] = *block.offset(3) as u32;
+    (*s).t[1] = (*s).h[2];
+}
+#[no_mangle]
+pub unsafe extern "C" fn update(mut s: *mut State) {
+    compress(s, ((*s).buf).as_ptr());
+}
+"#;
+
+/// S1: `compress` reaches `[0, 40)` of `*s` through `s` and `buf`'s `[43, 44)`
+/// through `block`: disjoint, the edge is gone.
+#[test]
+fn e5c_w267_s1_struct_fields_disjoint() {
+    assert_eq!(edges(S1, "update"), 0);
+    let (accepted, receipts) = accepts(S1, "update");
+    assert!(accepted);
+    assert_eq!(
+        receipt_on_first_formal(&receipts),
+        Some((Some((0, 40)), Some((43, 44))))
+    );
+}
+
+/// S2: `compress` also writes `buf[3]` through `s`: the ranges meet, the edge
+/// stays.
+#[test]
+fn e5c_w267_s2_struct_fields_meet() {
+    let code = S1.replace(
+        "    (*s).t[1] = (*s).h[2];\n",
+        "    (*s).t[1] = (*s).h[2];\n    (*s).buf[3] = 0;\n",
+    );
+    assert!(code.contains("(*s).buf[3] = 0"));
+    assert!(edges(&code, "update") > 0);
+    assert!(!accepts(&code, "update").0);
+}
+
+// ---------------------------------------------------------------------------
+// The domain.
+// ---------------------------------------------------------------------------
+
+fn bytes(fp: &Footprint) -> Option<(Bound, Bound, bool)> {
+    match fp {
+        Footprint::Bytes(bytes) => Some((bytes.lo, bytes.hi, bytes.writes)),
+        _ => None,
+    }
+}
+
+/// `fill`'s index is bounded by its companion counter: `Ext(fill, out)` is
+/// `[0, 4·n)` written, affine in `n`.
+#[test]
+fn e5c_w267_d1_co_incremented_counters_bound_the_index_by_the_formal() {
+    with_program(X1, |program| {
+        let table = IndexRanges::build(program);
+        let fill = function(program, "fill");
+        assert_eq!(
+            bytes(&table.ext(fill, 0)),
+            Some((
+                Bound::constant(0),
+                Bound {
+                    formal: Some(1),
+                    coef: 4,
+                    add: 0
+                },
+                true
+            ))
+        );
+    });
+}
+
+/// `check`'s `head` is read over `[0, 128)` (an unsigned `wrapping_add` below a
+/// `const` item's bound), and `tail` over `fill`'s extent at `n = 3`.
+#[test]
+fn e5c_w267_d2_wrapping_add_and_const_items_and_instantiation() {
+    with_program(X1, |program| {
+        let table = IndexRanges::build(program);
+        let check = function(program, "check");
+        let fill = function(program, "fill");
+        assert_eq!(
+            bytes(&table.ext(check, 1)),
+            Some((Bound::constant(0), Bound::constant(128), false))
+        );
+        let tail = table.ext(check, 0);
+        assert_eq!(
+            bytes(&tail),
+            Some((Bound::constant(0), Bound::constant(12), true))
+        );
+        let Footprint::Bytes(tail) = tail else { unreachable!() };
+        assert!(tail.summaries.contains(&(fill, 0)));
+    });
+}
+
+/// A formal the callee returns has no extent this rung (R1).
+#[test]
+fn e5c_w267_d3_a_returned_formal_is_unknown() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut)]
+unsafe extern "C" fn pass(mut p: *mut u32) -> *mut u32 {
+    *p = 1;
+    p
+}
+"#;
+    with_program(CODE, |program| {
+        let table = IndexRanges::build(program);
+        let pass = function(program, "pass");
+        assert!(matches!(table.ext(pass, 0), Footprint::Unknown(_)));
+    });
+}
+
+/// The bound arithmetic: a constant joins any bound, one formal joins itself,
+/// two formals do not; a hull compares only like bounds.
+#[test]
+fn e5c_w267_d4_bounds() {
+    let n = Bound {
+        formal: Some(0),
+        coef: 4,
+        add: 0,
+    };
+    let m = Bound {
+        formal: Some(1),
+        coef: 4,
+        add: 0,
+    };
+    assert_eq!(
+        index_ranges::test_plus(n, Bound::constant(8)),
+        Some(Bound {
+            formal: Some(0),
+            coef: 4,
+            add: 8
+        })
+    );
+    assert_eq!(index_ranges::test_plus(n, m), None);
+    assert_eq!(
+        index_ranges::test_plus(
+            n,
+            Bound {
+                formal: Some(0),
+                coef: -4,
+                add: 2
+            }
+        ),
+        Some(Bound::constant(2))
+    );
+}
