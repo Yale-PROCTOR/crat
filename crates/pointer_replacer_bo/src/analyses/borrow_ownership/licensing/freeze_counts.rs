@@ -28,6 +28,8 @@ pub(crate) fn reader_plan_built() {
     READER_PLAN_BUILDS.with(|c| c.set(c.get() + 1));
 }
 
+/// The whole-terminal scan per exit this counted is gone since 378 (c); the witness reads 0.
+#[allow(dead_code)]
 pub(crate) fn grant_terminal_scanned() {
     GRANT_TERMINAL_SCANS.with(|c| c.set(c.get() + 1));
 }

@@ -211,6 +211,32 @@ pub(crate) fn plan(
     let mut grants = Vec::new();
     let mut holds = Vec::new();
     let carriers = origins.no_ref_carriers(facts);
+    // Relay main/378 (c), R1324-1: an exit belongs to the functions whose terminal carries its
+    // (construction, ordinal); the graph's exits grouped by those functions once, in their order,
+    // instead of every terminal scanned for every exit of every function.
+    let mut terminal_owners: BTreeMap<(u32, usize), BTreeSet<&str>> = BTreeMap::new();
+    for row in &facts.terminals {
+        if let Some(function) = row.point.function.as_deref() {
+            terminal_owners
+                .entry((row.point.construction, row.ordinal))
+                .or_default()
+                .insert(function);
+        }
+    }
+    let mut exits_of: BTreeMap<(u32, &str), Vec<&super::transport::ExitCandidate>> =
+        BTreeMap::new();
+    for exit in &graph.exits {
+        for owner in terminal_owners
+            .get(&(exit.node.construction, exit.terminal_ordinal))
+            .into_iter()
+            .flatten()
+        {
+            exits_of
+                .entry((exit.node.construction, owner))
+                .or_default()
+                .push(exit);
+        }
+    }
     for roster in &facts.body_rosters {
         let Some(function) = &roster.point.function else { continue };
         let construction = roster.point.construction;
@@ -370,20 +396,10 @@ pub(crate) fn plan(
                 row.node.construction == construction && &row.endpoint.function == function
             })
             .collect();
-        let exits: Vec<_> = graph
-            .exits
-            .iter()
-            .filter(|exit| {
-                exit.node.construction == construction && {
-                    #[cfg(test)]
-                    super::freeze_counts::grant_terminal_scanned();
-                    facts
-                        .terminals
-                        .iter()
-                        .any(|row| scope(&row.point) && row.ordinal == exit.terminal_ordinal)
-                }
-            })
-            .collect();
+        let exits: Vec<_> = exits_of
+            .get(&(construction, function.as_str()))
+            .cloned()
+            .unwrap_or_default();
         if sources.len() != 1 || sinks.len() + exits.len() != 1 {
             reasons.insert(HoldReason::TerminalDisposition);
         }
