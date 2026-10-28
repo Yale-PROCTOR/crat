@@ -1127,6 +1127,10 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         return (model, guarded);
     }
     solver.pop_scope();
+    // Relay main/375 §3: a solve the analysis budget ended is not retried in the plain repair.
+    if crate::analysis_budget::exceeded().is_some() {
+        return (None, guarded);
+    }
     let fallback = GuardedFallback::of(&guarded);
     let (model, mut stats) = rounds(RepairMode::Plain);
     stats.repair = RepairMode::Guarded;
@@ -1167,6 +1171,16 @@ fn verify_rounds(
         Some(planner) => planner.validation_cap().saturating_add(1),
         None => round_cap(slots),
     };
+    // Relay main/375 §3: the analysis budget, before the first solve.
+    if crate::analysis_budget::over("solve:round") {
+        return (
+            None,
+            RoundStats {
+                repair,
+                ..RoundStats::default()
+            },
+        );
+    }
     // Constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
