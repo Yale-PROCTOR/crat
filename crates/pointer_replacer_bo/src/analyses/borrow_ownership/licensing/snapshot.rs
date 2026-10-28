@@ -89,11 +89,8 @@ impl FrozenTransport {
         step("freeze:fold_members")?;
         let fold_members = super::fold_eligibility::member_plan(facts);
         step("freeze:traversal_returns")?;
-        let traversal_returns = facts
-            .source_occurrences
-            .keys()
-            .filter_map(|function| super::traversal_return::classify(facts, function))
-            .collect();
+        // Relay main/378 (b): the reader plan, the aliases and the graph once for every function.
+        let traversal_returns = super::traversal_return::classify_all(facts);
         step("freeze:caller_coverage")?;
         let caller_coverage = super::caller_coverage::assess(facts);
         step("freeze:reference_effects")?;

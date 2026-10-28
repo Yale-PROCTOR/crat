@@ -53,11 +53,44 @@ pub(crate) fn classify_report(
     function: &str,
     aliases: &std::collections::BTreeMap<EquationId, EquationId>,
 ) -> Result<Proof, Rejection> {
+    classify_report_with(facts, function, aliases, &Hoisted::default())
+}
+
+/// **Relay main/378 (b), R1324-1.** What a classification reads from the whole program rather
+/// than from its function: whether the reader plan rebuilt from the inputs is the recorded one,
+/// the candidate graph and the reader transfers. Each is a function of (facts, aliases) alone, so
+/// one value serves every function of a freeze; each is filled at its first use, where the
+/// per-function form computed it, so the early returns are the same.
+#[derive(Default)]
+pub(crate) struct Hoisted {
+    plan_matches: std::cell::OnceCell<bool>,
+    graph: std::cell::OnceCell<Option<super::transport::CandidateGraph>>,
+    readers: std::cell::OnceCell<Vec<super::readers::TransferProof>>,
+}
+
+/// Every function's proof, in `source_occurrences`' order: [`classify`] per function with the
+/// aliases and [`Hoisted`] computed once.
+pub(crate) fn classify_all(facts: &Facts) -> Vec<Proof> {
+    let aliases = super::matched::guard_aliases(&facts.guards);
+    let hoisted = Hoisted::default();
+    facts
+        .source_occurrences
+        .keys()
+        .filter_map(|function| classify_report_with(facts, function, &aliases, &hoisted).ok())
+        .collect()
+}
+
+fn classify_report_with(
+    facts: &Facts,
+    function: &str,
+    aliases: &std::collections::BTreeMap<EquationId, EquationId>,
+    hoisted: &Hoisted,
+) -> Result<Proof, Rejection> {
     if facts.constructions != 1 {
         return Err(Rejection::Unclassified);
     }
     super::coverage::validate_returns(facts, 0, function).map_err(Rejection::Coverage)?;
-    classify_covered_metadata(facts, function, aliases).ok_or(Rejection::Unclassified)
+    classify_covered_metadata(facts, function, aliases, hoisted).ok_or(Rejection::Unclassified)
 }
 
 // Called only after coverage validation. Tests inspect the remaining obligations
@@ -66,6 +99,7 @@ fn classify_covered_metadata(
     facts: &Facts,
     function: &str,
     aliases: &std::collections::BTreeMap<EquationId, EquationId>,
+    hoisted: &Hoisted,
 ) -> Option<Proof> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,10 +117,14 @@ fn classify_covered_metadata(
     }
     let construction = 0;
     let inputs = &facts.reader_inputs;
-    let plan = readers::Plan::build(inputs);
-    if plan != facts.reader_plan {
+    if !*hoisted
+        .plan_matches
+        .get_or_init(|| readers::Plan::build(inputs) == facts.reader_plan)
+    {
         return None;
     }
+    // Equal to the plan rebuilt from the inputs.
+    let plan = &facts.reader_plan;
     let reader = one(plan.functions.iter().filter(|r| r.function == function))?;
     let [parameter] = reader.returned_parameters.as_slice() else { return None };
     let parameter = *parameter;
@@ -158,8 +196,13 @@ fn classify_covered_metadata(
         return None;
     }
 
-    let graph = CandidateGraph::build_metadata(facts, aliases).ok()?;
-    let readers = readers::audit_transfers(facts, aliases);
+    let graph = hoisted
+        .graph
+        .get_or_init(|| CandidateGraph::build_metadata(facts, aliases).ok())
+        .as_ref()?;
+    let readers = hoisted
+        .readers
+        .get_or_init(|| readers::audit_transfers(facts, aliases));
     let terminals: Vec<_> = facts
         .terminals
         .iter()
@@ -724,7 +767,7 @@ pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
                 .unwrap();
             assert_eq!(damaged.inputs.iter().filter(|&&i| i == removed).count(), 1);
             damaged.inputs.retain(|&i| i != removed);
-            let remaining=classify_covered_metadata(&missing,"minimum",&aliases).expect("coverage omission must retain all other obligations, parameter anchor and return-reaching reader");
+            let remaining=classify_covered_metadata(&missing,"minimum",&aliases,&Hoisted::default()).expect("coverage omission must retain all other obligations, parameter anchor and return-reaching reader");
             assert!(!remaining.readers.is_empty());
             assert_eq!(remaining.return_versions, proof.return_versions);
             let expected =
