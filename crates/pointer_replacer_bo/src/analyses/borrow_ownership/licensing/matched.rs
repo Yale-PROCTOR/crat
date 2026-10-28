@@ -515,11 +515,60 @@ fn round_sizes(
         .collect::<BTreeSet<_>>()
         .len();
     let steps: usize = added.iter().map(|(_, proof)| proof.len()).sum();
+    let keys: BTreeSet<_> = relations.keys().map(key_without_lineage).collect();
+    let added_keys: BTreeSet<_> = added
+        .iter()
+        .map(|(row, _)| key_without_lineage(row))
+        .collect();
+    let new_keys = added_keys.iter().filter(|key| !keys.contains(*key)).count();
     format!(
-        "round={round} added={} distinct={distinct} proof_steps={steps} exact_paths={} longest_path={longest} recursive={recursive}",
+        "round={round} added={} distinct={distinct} proof_steps={steps} exact_paths={} longest_path={longest} recursive={recursive} keys={} added_keys={} new_keys={new_keys}",
         added.len(),
-        paths.len()
+        paths.len(),
+        keys.len(),
+        added_keys.len()
     )
+}
+
+/// Relay main/382 (a) 5: a relation's key without its lineages -- (scope, the seed's input node or
+/// source endpoint, the destination's port or terminal target, guards) -- for the `keys` marks.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SeedKey {
+    Input(Node),
+    Source(EquationId),
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DestinationKey<'a> {
+    Port(Node),
+    Terminal(&'a TerminalTarget),
+}
+
+fn key_without_lineage(row: &Relation) -> (&Scope, SeedKey, DestinationKey<'_>, &Guards) {
+    let seed = match &row.seed {
+        Seed::Input(node) => SeedKey::Input(*node),
+        Seed::Source(source) => SeedKey::Source(source.endpoint),
+    };
+    let output = match &row.output {
+        Destination::Port(node) => DestinationKey::Port(*node),
+        Destination::Terminal(terminal) => DestinationKey::Terminal(&terminal.target),
+    };
+    (&row.scope, seed, output, &row.guards)
+}
+
+/// Relay main/382 (a) 5: the terminals applied into the functions, counted by (scope, node,
+/// target, guards), their lineages left out, for the `matched:apply end` mark.
+fn terminal_keys(functions: &BTreeMap<Scope, Function>) -> usize {
+    functions
+        .iter()
+        .flat_map(|(scope, function)| {
+            function
+                .terminals
+                .iter()
+                .map(move |end| (scope, end.node, &end.terminal.target, &end.guards))
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// Relay main/379 (`matched`, step 1): the relations by scope, each scope's in their order, so a
@@ -2010,12 +2059,13 @@ impl MatchedTransport {
             }
             crate::phase_log::sub("matched:apply", "end", || {
                 format!(
-                    "round={round} base_cloned={} rebuilt={} edges={} sources={} terminals={}",
+                    "round={round} base_cloned={} rebuilt={} edges={} sources={} terminals={} terminal_keys={}",
                     u8::from(incremental.is_none()),
                     incremental.map_or(functions.len(), BTreeSet::len),
                     functions.values().map(|f| f.edges.len()).sum::<usize>(),
                     functions.values().map(|f| f.sources.len()).sum::<usize>(),
-                    functions.values().map(|f| f.terminals.len()).sum::<usize>()
+                    functions.values().map(|f| f.terminals.len()).sum::<usize>(),
+                    terminal_keys(&functions)
                 )
             });
             let mut added = Vec::new();
