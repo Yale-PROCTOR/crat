@@ -520,6 +520,33 @@ fn round_sizes(
     )
 }
 
+/// Relay main/379 (`matched`, step 1): each callee scope's callers.
+fn callers_of(calls: &BTreeMap<CallKey, Call>) -> BTreeMap<Scope, BTreeSet<Scope>> {
+    let mut callers: BTreeMap<Scope, BTreeSet<Scope>> = BTreeMap::new();
+    for key in calls.keys() {
+        callers
+            .entry((key.construction, key.callee.clone()))
+            .or_default()
+            .insert((key.construction, key.caller.clone()));
+    }
+    callers
+}
+
+/// Relay main/379 (`matched`, step 1): the callers of the scopes a round added relations to, the
+/// functions whose applied calls the next round changes.
+fn affected_by(
+    callers_of: &BTreeMap<Scope, BTreeSet<Scope>>,
+    added: &[(Relation, Vec<Step>)],
+) -> BTreeSet<Scope> {
+    let scopes: BTreeSet<&Scope> = added.iter().map(|(relation, _)| &relation.scope).collect();
+    scopes
+        .into_iter()
+        .filter_map(|scope| callers_of.get(scope))
+        .flatten()
+        .cloned()
+        .collect()
+}
+
 /// **Relay main/379 (`matched`, step 1).** In tests, the old whole-collection scans the indexes
 /// replaced, for an equality witness; always `false` outside tests.
 pub(crate) fn reference_scans() -> bool {
@@ -1901,6 +1928,10 @@ impl MatchedTransport {
             )
         });
         let mut relations = BTreeMap::new();
+        #[cfg(test)]
+        let callers_of = callers_of(&calls);
+        #[cfg(test)]
+        let mut affected: Option<BTreeSet<Scope>> = None;
         let mut round = 0usize;
         loop {
             round += 1;
@@ -1908,6 +1939,10 @@ impl MatchedTransport {
                 format!("round={round} relations={}", relations.len())
             });
             let functions = Self::apply(&base, &calls, &relations);
+            #[cfg(test)]
+            if affected.is_some() {
+                super::freeze_counts::base_recloned();
+            }
             crate::phase_log::sub("matched:apply", "end", || {
                 format!(
                     "round={round} base_cloned=1 edges={} sources={} terminals={}",
@@ -1918,6 +1953,10 @@ impl MatchedTransport {
             });
             let mut added = Vec::new();
             for (scope, function) in &functions {
+                #[cfg(test)]
+                if affected.as_ref().is_some_and(|set| !set.contains(scope)) {
+                    super::freeze_counts::function_reswept();
+                }
                 let inputs = function
                     .inputs
                     .iter()
@@ -1970,6 +2009,10 @@ impl MatchedTransport {
                     guard_aliases,
                     denials,
                 };
+            }
+            #[cfg(test)]
+            {
+                affected = Some(affected_by(&callers_of, &added));
             }
             for (relation, proof) in added {
                 relations.entry(relation).or_insert(proof);

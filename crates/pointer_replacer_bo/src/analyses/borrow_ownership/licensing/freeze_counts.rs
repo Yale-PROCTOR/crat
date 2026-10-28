@@ -14,6 +14,8 @@ thread_local! {
     static WASTED_CONSUMES: Cell<usize> = const { Cell::new(0) };
     static WASTED_EDGES: Cell<usize> = const { Cell::new(0) };
     static WASTED_RELATIONS: Cell<usize> = const { Cell::new(0) };
+    static RESWEPT: Cell<usize> = const { Cell::new(0) };
+    static RECLONED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Relay main/379 (matched, step 1): the old whole-collection scans, selected for an equality
@@ -49,6 +51,21 @@ pub(crate) fn wasted() -> (usize, usize, usize) {
     )
 }
 
+/// A function swept again by the relation fixpoint although none of its callees gained a
+/// relation in the round before.
+pub(crate) fn function_reswept() {
+    RESWEPT.with(|c| c.set(c.get() + 1));
+}
+
+/// `base` cloned whole by the relation fixpoint after its first round.
+pub(crate) fn base_recloned() {
+    RECLONED.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) fn fixpoint_wasted() -> (usize, usize) {
+    (RESWEPT.with(Cell::get), RECLONED.with(Cell::get))
+}
+
 pub(crate) fn reset() {
     CALL_GRAPH_BUILDS.with(|c| c.set(0));
     READER_PLAN_BUILDS.with(|c| c.set(0));
@@ -56,6 +73,8 @@ pub(crate) fn reset() {
     WASTED_CONSUMES.with(|c| c.set(0));
     WASTED_EDGES.with(|c| c.set(0));
     WASTED_RELATIONS.with(|c| c.set(0));
+    RESWEPT.with(|c| c.set(0));
+    RECLONED.with(|c| c.set(0));
 }
 
 pub(crate) fn call_graph_built() {

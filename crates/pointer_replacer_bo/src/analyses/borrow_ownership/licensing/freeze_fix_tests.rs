@@ -228,3 +228,28 @@ fn r379_matched_reads_only_its_own_rows_and_equals_the_scans() {
         assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
     });
 }
+
+/// Relay main/379 (`matched`, step 1): the relation fixpoint re-applies and re-sweeps only the
+/// callers of the scopes that gained relations in the round before, and clones `base` once; the
+/// full fixpoint (the reference switch) re-sweeps unchanged functions and re-clones `base` on this
+/// fixture, and the transport is the same either way.
+#[test]
+fn r379_b_the_fixpoint_reapplies_only_changed_callers_and_equals_the_full_one() {
+    with_freeze(|facts, transport| {
+        assert_eq!(
+            freeze_counts::fixpoint_wasted(),
+            (0, 0),
+            "unchanged functions re-swept / base re-cloned"
+        );
+        freeze_counts::reset();
+        freeze_counts::set_reference_scans(true);
+        let reference = FrozenTransport::build(facts).expect("no budget");
+        let wasted = freeze_counts::fixpoint_wasted();
+        freeze_counts::set_reference_scans(false);
+        assert!(
+            wasted.0 > 0 && wasted.1 > 0,
+            "the fixture exercises the full fixpoint: {wasted:?}"
+        );
+        assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
+    });
+}
