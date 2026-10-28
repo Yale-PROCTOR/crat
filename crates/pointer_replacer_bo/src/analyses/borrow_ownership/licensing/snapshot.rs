@@ -130,18 +130,17 @@ impl FrozenTransport {
         for construction in 0..facts.constructions {
             let probe = crate::phase_log::Probe::begin();
             crate::analysis_budget::check("freeze:certificates")?;
-            for function in facts.source_occurrences.keys() {
-                out.push((
+            // Relay main/378 (a): the call graph and its SCCs once per construction.
+            out.extend(
+                super::recursive::certify_all(
+                    facts,
                     construction,
-                    function.clone(),
-                    super::recursive::certify_with_transport(
-                        facts,
-                        construction,
-                        function,
-                        matched,
-                    ),
-                ));
-            }
+                    facts.source_occurrences.keys(),
+                    matched,
+                )
+                .into_iter()
+                .map(|(function, certificate)| (construction, function, certificate)),
+            );
             crate::phase_log::Probe::end(
                 probe,
                 "freeze:certificates",

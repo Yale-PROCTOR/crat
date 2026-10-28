@@ -96,82 +96,209 @@ pub(crate) fn certify_with_transport(
     function: &str,
     transport: &MatchedTransport,
 ) -> Availability<RecursiveCertificate> {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-    use super::super::origin_evidence::SourceCallee;
-    let known: BTreeSet<_> = facts
-        .body_rosters
-        .iter()
-        .filter(|row| row.point.construction == construction)
-        .filter_map(|row| row.point.function.clone())
-        .collect();
-    #[cfg(test)]
-    super::freeze_counts::call_graph_built();
-    if !known.contains(function) {
+    let graph = CallGraph::build(facts, construction);
+    if !graph.known.contains(function) {
         return Availability::Missing("function coverage roster unavailable".into());
     }
-    let mut calls = BTreeSet::new();
-    let mut forward: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (caller, occurrences) in &facts.source_occurrences {
-        if !known.contains(caller) {
-            continue;
-        }
-        let Some(roster) = facts.body_rosters.iter().find(|row| {
-            row.point.construction == construction && row.point.function.as_ref() == Some(caller)
-        }) else {
-            continue;
-        };
-        for occurrence in occurrences {
-            let Some(SourceCallee::Local(callee)) = &occurrence.callee else { continue };
-            if !known.contains(callee)
-                || !roster
-                    .blocks
-                    .iter()
-                    .any(|block| block.reachable && block.block == occurrence.site.block)
-            {
+    let scc = graph.reach_scc(function);
+    certify_scc(facts, construction, &graph, &scc, transport)
+}
+
+/// **Relay main/378 (a), R1324-1.** One construction's call graph: the functions with a roster,
+/// and each reachable local call between two of them. Built once per construction, not once per
+/// function: it does not depend on the function being certified.
+pub(crate) struct CallGraph {
+    known: std::collections::BTreeSet<String>,
+    calls: std::collections::BTreeSet<CallKey>,
+    forward: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    reverse: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl CallGraph {
+    pub(crate) fn build(facts: &Facts, construction: u32) -> Self {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use super::super::origin_evidence::SourceCallee;
+        let known: BTreeSet<_> = facts
+            .body_rosters
+            .iter()
+            .filter(|row| row.point.construction == construction)
+            .filter_map(|row| row.point.function.clone())
+            .collect();
+        #[cfg(test)]
+        super::freeze_counts::call_graph_built();
+        let rosters: BTreeMap<&str, &super::coverage::BodyRoster> = facts
+            .body_rosters
+            .iter()
+            .filter(|row| row.point.construction == construction)
+            .rev()
+            .filter_map(|row| row.point.function.as_deref().map(|name| (name, row)))
+            .collect();
+        let mut calls = BTreeSet::new();
+        let mut forward: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (caller, occurrences) in &facts.source_occurrences {
+            if !known.contains(caller) {
                 continue;
             }
-            let call = CallKey {
-                construction,
-                caller: caller.clone(),
-                block: occurrence.site.block,
-                statement: occurrence.site.statement,
-                callee: callee.clone(),
+            // The first roster of the caller, as `body_rosters.iter().find(..)` took it.
+            let Some(roster) = rosters.get(caller.as_str()) else {
+                continue;
             };
-            forward
-                .entry(caller.clone())
-                .or_default()
-                .insert(callee.clone());
-            reverse
-                .entry(callee.clone())
-                .or_default()
-                .insert(caller.clone());
-            calls.insert(call);
-        }
-    }
-    let reach = |graph: &BTreeMap<String, BTreeSet<String>>| {
-        let mut seen = BTreeSet::new();
-        let mut pending = VecDeque::from([function.to_owned()]);
-        while let Some(node) = pending.pop_front() {
-            if seen.insert(node.clone()) {
-                pending.extend(graph.get(&node).into_iter().flatten().cloned());
+            for occurrence in occurrences {
+                let Some(SourceCallee::Local(callee)) = &occurrence.callee else { continue };
+                if !known.contains(callee)
+                    || !roster
+                        .blocks
+                        .iter()
+                        .any(|block| block.reachable && block.block == occurrence.site.block)
+                {
+                    continue;
+                }
+                let call = CallKey {
+                    construction,
+                    caller: caller.clone(),
+                    block: occurrence.site.block,
+                    statement: occurrence.site.statement,
+                    callee: callee.clone(),
+                };
+                forward
+                    .entry(caller.clone())
+                    .or_default()
+                    .insert(callee.clone());
+                reverse
+                    .entry(callee.clone())
+                    .or_default()
+                    .insert(caller.clone());
+                calls.insert(call);
             }
         }
-        seen
-    };
-    let scc: BTreeSet<_> = reach(&forward)
-        .intersection(&reach(&reverse))
-        .cloned()
-        .collect();
-    let applications: Vec<_> = calls
-        .into_iter()
+        Self {
+            known,
+            calls,
+            forward,
+            reverse,
+        }
+    }
+
+    /// The function's strongly connected component: what it reaches and what reaches it.
+    fn reach_scc(&self, function: &str) -> std::collections::BTreeSet<String> {
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+        let reach = |graph: &BTreeMap<String, BTreeSet<String>>| {
+            let mut seen = BTreeSet::new();
+            let mut pending = VecDeque::from([function.to_owned()]);
+            while let Some(node) = pending.pop_front() {
+                if seen.insert(node.clone()) {
+                    pending.extend(graph.get(&node).into_iter().flatten().cloned());
+                }
+            }
+            seen
+        };
+        reach(&self.forward)
+            .intersection(&reach(&self.reverse))
+            .cloned()
+            .collect()
+    }
+
+    /// Every known function's SCC at once (Kosaraju, iterative): the same sets as
+    /// [`Self::reach_scc`], each computed once instead of two reaches per function.
+    fn sccs(&self) -> std::collections::BTreeMap<String, usize> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let empty = BTreeSet::new();
+        let next = |graph: &BTreeMap<String, BTreeSet<String>>, node: &str| -> Vec<String> {
+            graph.get(node).unwrap_or(&empty).iter().cloned().collect()
+        };
+        let mut order = Vec::new();
+        let mut seen = BTreeSet::new();
+        for root in &self.known {
+            if !seen.insert(root.clone()) {
+                continue;
+            }
+            let mut stack = vec![(root.clone(), next(&self.forward, root), 0usize)];
+            while let Some((node, children, at)) = stack.last_mut() {
+                if *at < children.len() {
+                    let child = children[*at].clone();
+                    *at += 1;
+                    if seen.insert(child.clone()) {
+                        let grandchildren = next(&self.forward, &child);
+                        stack.push((child, grandchildren, 0));
+                    }
+                } else {
+                    order.push(node.clone());
+                    stack.pop();
+                }
+            }
+        }
+        let mut component = BTreeMap::new();
+        for (id, root) in order.iter().rev().enumerate() {
+            if component.contains_key(root) {
+                continue;
+            }
+            let mut stack = vec![root.clone()];
+            component.insert(root.clone(), id);
+            while let Some(node) = stack.pop() {
+                for parent in next(&self.reverse, &node) {
+                    if !component.contains_key(&parent) {
+                        component.insert(parent.clone(), id);
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+        component
+    }
+}
+
+/// **Relay main/378 (a).** Every function's certificate for one construction, in `functions`'
+/// order: the call graph and its SCCs once, one certificate per SCC, shared by its members.
+pub(crate) fn certify_all<'f>(
+    facts: &Facts,
+    construction: u32,
+    functions: impl Iterator<Item = &'f String>,
+    transport: &MatchedTransport,
+) -> Vec<(String, Availability<RecursiveCertificate>)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let graph = CallGraph::build(facts, construction);
+    let component = graph.sccs();
+    let mut members: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    for (function, id) in &component {
+        members.entry(*id).or_default().insert(function.clone());
+    }
+    let mut certified: BTreeMap<usize, Availability<RecursiveCertificate>> = BTreeMap::new();
+    functions
+        .map(|function| {
+            let certificate = match component.get(function) {
+                Some(id) if graph.known.contains(function) => certified
+                    .entry(*id)
+                    .or_insert_with(|| {
+                        certify_scc(facts, construction, &graph, &members[id], transport)
+                    })
+                    .clone(),
+                _ => Availability::Missing("function coverage roster unavailable".into()),
+            };
+            (function.clone(), certificate)
+        })
+        .collect()
+}
+
+fn certify_scc(
+    facts: &Facts,
+    construction: u32,
+    graph: &CallGraph,
+    scc: &std::collections::BTreeSet<String>,
+    transport: &MatchedTransport,
+) -> Availability<RecursiveCertificate> {
+    use std::collections::BTreeSet;
+    let applications: Vec<_> = graph
+        .calls
+        .iter()
         .filter(|call| scc.contains(&call.caller) && scc.contains(&call.callee))
+        .cloned()
         .collect();
     if applications.is_empty() {
         return Availability::Missing("no recursive application in this function's SCC".into());
     }
-    for member in &scc {
+    for member in scc {
         if let Err(errors) = super::coverage::validate_returns(facts, construction, member) {
             return Availability::Missing(format!(
                 "incomplete return coverage for {member}: {errors:?}"
