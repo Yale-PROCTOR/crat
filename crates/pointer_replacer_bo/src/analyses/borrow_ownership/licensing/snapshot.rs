@@ -47,7 +47,8 @@ impl FrozenTransport {
             crate::analysis_budget::check(name)
         };
         step("freeze:matched")?;
-        let matched = MatchedTransport::build(facts);
+        // Relay main/379 (R1328-1 §1): `matched:<sub>` marks inside this build only.
+        let matched = crate::phase_log::with_sub_marks(|| MatchedTransport::build(facts));
         step("freeze:certificates")?;
         let recursive = Self::certificates(facts, &matched)?;
         step("freeze:reader_transfers")?;

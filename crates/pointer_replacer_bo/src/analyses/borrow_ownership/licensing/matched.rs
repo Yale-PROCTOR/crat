@@ -477,6 +477,49 @@ fn normalize(guards: &Guards, aliases: &BTreeMap<EquationId, EquationId>) -> Opt
     Some(normalized)
 }
 
+/// Relay main/379 (R1328-1 §1): a fixpoint round's sizes for its `matched:round end` mark: the
+/// rows it added (with repeats, distinct, and their proofs' steps), and over the relations and
+/// the added rows the Exact lineages (the distinct call paths, the longest) and the recursive ones.
+fn round_sizes(
+    round: usize,
+    relations: &BTreeMap<Relation, Vec<Step>>,
+    added: &[(Relation, Vec<Step>)],
+) -> String {
+    let rows = relations.keys().chain(added.iter().map(|(row, _)| row));
+    let mut paths = BTreeSet::new();
+    let mut recursive = 0usize;
+    for row in rows {
+        let seed = match &row.seed {
+            Seed::Source(source) => Some(&source.lineage),
+            Seed::Input(_) => None,
+        };
+        let output = match &row.output {
+            Destination::Terminal(terminal) => Some(&terminal.lineage),
+            Destination::Port(_) => None,
+        };
+        for lineage in seed.into_iter().chain(output) {
+            match lineage {
+                SourceLineage::Exact(calls) => {
+                    paths.insert(calls);
+                }
+                SourceLineage::Recursive { .. } => recursive += 1,
+            }
+        }
+    }
+    let longest = paths.iter().map(|calls| calls.len()).max().unwrap_or(0);
+    let distinct = added
+        .iter()
+        .map(|(row, _)| row)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let steps: usize = added.iter().map(|(_, proof)| proof.len()).sum();
+    format!(
+        "round={round} added={} distinct={distinct} proof_steps={steps} exact_paths={} longest_path={longest} recursive={recursive}",
+        added.len(),
+        paths.len()
+    )
+}
+
 impl Function {
     fn normalize_guards(&mut self, aliases: &BTreeMap<EquationId, EquationId>) {
         self.edges.retain_mut(|edge| {
@@ -1386,13 +1429,20 @@ impl MatchedTransport {
     }
 
     pub(crate) fn build(facts: &Facts) -> Self {
-        Self::build_using(
-            facts,
-            guard_aliases(&facts.guards),
-            CandidateGraph::build(facts),
-            &BTreeMap::new(),
-            &[],
-        )
+        let guard_aliases = guard_aliases(&facts.guards);
+        crate::phase_log::sub("matched:graph", "start", String::new);
+        let graph = CandidateGraph::build(facts);
+        crate::phase_log::sub("matched:graph", "end", || {
+            format!(
+                "equations={} consumes={} edges={} sources={} sinks={}",
+                facts.equations.len(),
+                facts.consumes.len(),
+                graph.edges.len(),
+                graph.sources.len(),
+                graph.sinks.len()
+            )
+        });
+        Self::build_using(facts, guard_aliases, graph, &BTreeMap::new(), &[])
     }
 
     fn build_using(
@@ -1496,6 +1546,10 @@ impl MatchedTransport {
                     .map(move |function| (construction, function))
             }))
             .collect();
+        let scope_count = scopes.len();
+        crate::phase_log::sub("matched:validate_returns", "start", || {
+            format!("scopes={scope_count}")
+        });
         for (construction, function) in scopes {
             if super::coverage::validate_returns(facts, construction, &function).is_err() {
                 blocked_scopes.insert((construction, function.clone()));
@@ -1508,6 +1562,10 @@ impl MatchedTransport {
                 });
             }
         }
+        crate::phase_log::sub("matched:validate_returns", "end", || {
+            format!("blocked={}", blocked_scopes.len())
+        });
+        crate::phase_log::sub("matched:base", "start", String::new);
         graph
             .sources
             .retain(|source| !blocked_equations.contains(&source.equation));
@@ -1801,9 +1859,30 @@ impl MatchedTransport {
         for function in base.values_mut() {
             function.normalize_guards(&guard_aliases);
         }
+        crate::phase_log::sub("matched:base", "end", || {
+            format!(
+                "functions={} edges={} calls={}",
+                base.len(),
+                base.values().map(|f| f.edges.len()).sum::<usize>(),
+                calls.len()
+            )
+        });
         let mut relations = BTreeMap::new();
+        let mut round = 0usize;
         loop {
+            round += 1;
+            crate::phase_log::sub("matched:round", "start", || {
+                format!("round={round} relations={}", relations.len())
+            });
             let functions = Self::apply(&base, &calls, &relations);
+            crate::phase_log::sub("matched:apply", "end", || {
+                format!(
+                    "round={round} base_cloned=1 edges={} sources={} terminals={}",
+                    functions.values().map(|f| f.edges.len()).sum::<usize>(),
+                    functions.values().map(|f| f.sources.len()).sum::<usize>(),
+                    functions.values().map(|f| f.terminals.len()).sum::<usize>()
+                )
+            });
             let mut added = Vec::new();
             for (scope, function) in &functions {
                 let inputs = function
@@ -1848,6 +1927,9 @@ impl MatchedTransport {
                     }
                 }
             }
+            crate::phase_log::sub("matched:round", "end", || {
+                round_sizes(round, &relations, &added)
+            });
             if added.is_empty() {
                 return Self {
                     functions,

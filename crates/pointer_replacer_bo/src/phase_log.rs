@@ -44,6 +44,29 @@ unsafe extern "C" {
     fn Z3_get_estimated_alloc_size() -> u64;
 }
 
+thread_local! {
+    static SUB_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Relay main/379 (R1328-1 §1): a step's sub-marks ([`sub`]) are written only while `f` runs, so
+/// the freeze's own `matched` is marked and the other builds of the same code stay silent.
+pub(crate) fn with_sub_marks<T>(f: impl FnOnce() -> T) -> T {
+    if !on() {
+        return f();
+    }
+    let previous = SUB_MARKS.replace(true);
+    let result = f();
+    SUB_MARKS.set(previous);
+    result
+}
+
+/// One sub-mark inside [`with_sub_marks`]; `detail` is called only when the line is written.
+pub(crate) fn sub(phase: &str, edge: &str, detail: impl FnOnce() -> String) {
+    if on() && SUB_MARKS.get() {
+        mark(phase, edge, &detail());
+    }
+}
+
 /// Relay main/375: inside a per-function loop, a `tick` line every [`TICK`] functions (the
 /// running count, so a quadratic step shows as a slope), and a `slow` line for one function
 /// whose own step took at least [`SLOW_S`] seconds or grew RSS by [`SLOW_MB`] MB, with its
