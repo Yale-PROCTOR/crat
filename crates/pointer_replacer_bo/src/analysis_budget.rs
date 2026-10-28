@@ -233,6 +233,79 @@ pub unsafe fn entry() -> i32 {
         assert!(super::check("bc:source_events").is_ok());
     }
 
+    /// The adversarial review's finding 2: a budget the guarded rounds spend must not hand
+    /// the program to the plain repair, whose first round is a whole solve. The construction is
+    /// built before the budget is entered, so the first boundary is the round.
+    #[test]
+    fn r375_a_budget_spent_in_the_guarded_rounds_runs_no_plain_fallback() {
+        use crate::{
+            analyses::borrow_ownership::{
+                construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
+                crate_slots::CrateSlots,
+                mutability_facts::MutFacts,
+                origins::compute_origins,
+                solver::KindSolver,
+            },
+            utils::rustc::RustProgram,
+        };
+        ::utils::compilation::run_compiler_on_str(FIXTURE, |tcx| {
+            let functions = tcx
+                .hir_crate_items(())
+                .definitions()
+                .filter(|did| matches!(tcx.def_kind(*did), rustc_hir::def::DefKind::Fn))
+                .collect();
+            let program = RustProgram {
+                tcx,
+                functions,
+                structs: Vec::new(),
+            };
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("the construction, before the budget");
+            let _scope = super::enter(Budget {
+                wall_ms: Some(0),
+                rss_mb: None,
+            });
+            let (model, stats) = verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            );
+            assert!(model.is_none());
+            assert_eq!(super::exceeded().unwrap().boundary, "solve:round");
+            assert!(
+                stats.guarded_fallback.is_none(),
+                "the plain repair ran after the budget: {:?}",
+                stats.guarded_fallback
+            );
+        })
+        .unwrap();
+    }
+
+    /// The RSS limit: 0 MB is past at the first boundary.
+    #[test]
+    fn r375_a_zero_rss_limit_ends_at_the_first_boundary() {
+        let _scope = super::enter(Budget {
+            wall_ms: None,
+            rss_mb: Some(0),
+        });
+        assert!(super::over("bc:source_events"));
+        assert_eq!(super::exceeded().unwrap().boundary, "bc:source_events");
+    }
+
     /// The witness (relay main/375 §3): under `_S=0` the program degrades with the
     /// typed reason and the input untouched; without the budget the same fixture
     /// delivers as before.
