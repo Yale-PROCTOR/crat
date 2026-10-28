@@ -172,6 +172,7 @@ pub(crate) fn rewrite_bo_with_artifacts(
 ) -> Result<BoReceipt, String> {
     // The per-program worker pinned both seeds before its first z3 call; the driver states the
     // pin rather than relying on the library's default.
+    crate::phase_log::begin();
     z3::set_global_param("smt.random_seed", "0");
     z3::set_global_param("sat.random_seed", "0");
 
@@ -191,7 +192,9 @@ pub(crate) fn rewrite_bo_with_artifacts(
         configured_exposure,
     };
     let capture = bo_rewriter::diagnose_raw_boundary_census_with_config(input, &run_config)?;
+    crate::phase_log::mark("census", "end", "");
     let receipt = persist_in_place(input, &capture, analysis_fingerprint)?;
+    crate::phase_log::mark("persist", "end", "");
     declare_bytemuck(input, &capture);
     if let Some(dir) = artifact_dir
         && let Err(error) = write_artifacts(dir, input, &capture)

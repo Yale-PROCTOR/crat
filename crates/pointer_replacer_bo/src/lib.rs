@@ -50,6 +50,7 @@ pub mod analyses {
 mod bo_pipeline;
 mod bo_rewriter;
 mod coverage_recon;
+mod phase_log;
 mod raw_boundary_census_schema;
 pub use bo_pipeline::{BoReceipt, Config, env_from_file as bo_env_from_file, rewrite_bo};
 // The legacy crate's root items the moved measurement tests name as `crate::…`.

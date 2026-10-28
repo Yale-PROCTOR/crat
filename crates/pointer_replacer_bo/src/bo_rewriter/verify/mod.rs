@@ -705,7 +705,13 @@ pub(crate) fn crate_relative(path: &str, crate_root: &Path) -> String {
 /// Multiset of baseline diagnostic identities for an UNMODIFIED crate.
 pub(crate) fn baseline_of(root: &Path) -> Baseline {
     let crate_root = root.parent().unwrap_or(root).to_path_buf();
+    crate::phase_log::mark("verify:baseline", "start", "");
     let diagnosis = diagnose_crate(root);
+    crate::phase_log::mark(
+        "verify:baseline",
+        "end",
+        &format!("errors={}", diagnosis.errors),
+    );
     let mut keys = std::collections::BTreeMap::new();
     let root_text = crate_root.display().to_string();
     let mut messages_embedding_root = 0usize;
@@ -970,9 +976,15 @@ fn diagnose_input(input: rustc_session::config::Input) -> Diagnosis {
         }));
     }));
 
+    // Relay main/374: one line per nested rustc session, numbered.
+    let session = crate::phase_log::session();
+    crate::phase_log::mark("rustc-session", "start", &format!("n={session}"));
     let ran = ::utils::compilation::run_compiler(config, |tcx| {
+        crate::phase_log::mark("rustc-session:typecheck", "start", &format!("n={session}"));
         ::utils::type_check(tcx);
+        crate::phase_log::mark("rustc-session:typecheck", "end", &format!("n={session}"));
     });
+    crate::phase_log::mark("rustc-session", "end", &format!("n={session}"));
     let mut errors = *errors.lock().unwrap();
     // A fatal abort that emitted nothing still means the crate failed.
     if ran.is_err() && errors == 0 {

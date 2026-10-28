@@ -1477,9 +1477,12 @@ fn rewrite_core_injected_with_config(
         // not asserted.
         //
         // ⚠ Nothing may run a query ahead of this line.
+        crate::phase_log::mark("session:analysis", "start", "");
         let capture = ast_transform::capture_ast(tcx)?;
+        crate::phase_log::mark("capture_ast", "end", "");
         let (mut table, mut decide_ctx) =
             decide_table_with_emission_config(tcx, a5_override, run_config)?;
+        crate::phase_log::mark("decide", "end", "");
         let retained_copy_plans = decide_ctx.retained_copy_plans.clone();
         let overlap_receipt = decide_ctx.overlap_receipt.clone();
         inject(&mut table);
@@ -1509,12 +1512,22 @@ fn rewrite_core_injected_with_config(
                 .or_else(|| tree_base.and_then(|root| std::fs::read_to_string(root).ok()))
                 .unwrap_or_default()
         });
+        crate::phase_log::mark("emit", "start", "");
         let emission = emit_files(
             tcx,
             &table,
             &rustc_hash::FxHashSet::default(),
             &retained_copy_plans,
         )?;
+        crate::phase_log::mark(
+            "emit",
+            "end",
+            &format!(
+                "files={} bytes={}",
+                emission.files.len(),
+                emission.files.values().map(String::len).sum::<usize>()
+            ),
+        );
         let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
@@ -1698,6 +1711,7 @@ fn rewrite_core_injected_with_config(
                     .or_else(|| sf.src.as_ref().map(|src| src.to_string()))
             })
             .unwrap_or_default();
+        crate::phase_log::mark("verify", "start", "");
         // **THE LOOP RUNS HERE NOW** (M-2/A) — inside the session, so `tcx` is
         // live for every revert round. `emitted_subjects.len()` is NOT a count
         // of `Ref` decisions (which is what the deleted `emitted_count()`
@@ -2516,7 +2530,17 @@ fn verify_and_revert(
         };
         let probe_started = std::time::Instant::now();
         facts.verify_rounds += 1;
+        crate::phase_log::mark(
+            "verify:round",
+            "start",
+            &format!("round={} reverted={}", facts.verify_rounds, reverted.len()),
+        );
         let diagnosis = verify::diagnose_crate(staged.root());
+        crate::phase_log::mark(
+            "verify:round",
+            "end",
+            &format!("round={} errors={}", facts.verify_rounds, diagnosis.errors),
+        );
         // **R459-3 (wave-6b 019 STOP 2)** — the bytes the verify stage actually
         // compiled, captured at the FIRST failing round and never overwritten.
         // The post-revert tree the census publishes no longer contains the class
@@ -3238,7 +3262,13 @@ fn verify_and_revert(
         let Ok(staged) = materialized else {
             return false;
         };
+        crate::phase_log::mark("verify:bisect-probe", "start", "");
         let probe = verify::diagnose_crate(staged.root());
+        crate::phase_log::mark(
+            "verify:bisect-probe",
+            "end",
+            &format!("errors={}", probe.errors),
+        );
         let probe_root = staged.root().parent().unwrap_or(staged.root());
         baseline.novel(&probe.diags, probe_root).is_empty()
             && probe.errors.saturating_sub(baseline.errors) == 0
@@ -3350,7 +3380,9 @@ fn verify_and_revert(
         Ok(staged)
             if rollbacks.is_empty() && {
                 facts.verify_rounds += 1;
+                crate::phase_log::mark("verify:final", "start", "");
                 let final_diag = verify::diagnose_crate(staged.root());
+                crate::phase_log::mark("verify:final", "end", "");
                 let final_root = staged.root().parent().unwrap_or(staged.root());
                 baseline.novel(&final_diag.diags, final_root).is_empty()
                     && final_diag.errors.saturating_sub(baseline.errors) == 0
@@ -7656,9 +7688,21 @@ fn decide_table_perturbed_config<'tcx>(
     a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
     run_config: &EmissionRunConfig,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    crate::phase_log::mark("decide:program", "start", "");
     let program = collect_program(tcx);
+    crate::phase_log::mark(
+        "decide:program",
+        "end",
+        &format!(
+            "functions={} structs={}",
+            program.functions.len(),
+            program.structs.len()
+        ),
+    );
     let slots = CrateSlots::build(&program);
+    crate::phase_log::mark("decide:slots", "end", "");
     let mut_facts = MutFacts::from_program(&program);
+    crate::phase_log::mark("decide:mut_facts", "end", "");
     let (a5_mode, attestation) = a5_override.unwrap_or((
         OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
@@ -7747,11 +7791,15 @@ fn decide_table_perturbed_config<'tcx>(
     }
     let solve_t0 = std::time::Instant::now();
     let origin_started = std::time::Instant::now();
+    crate::phase_log::mark("decide:origins", "start", "");
     let origins = compute_origins(&program);
     let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
+    crate::phase_log::mark("decide:origins", "end", "");
+    crate::phase_log::mark("decide:solve", "start", "");
     let (verified, _export) = with_bo_export(|| {
         solve_bo_overlap_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
     });
+    crate::phase_log::mark("decide:solve", "end", "");
     let Some(verified) = verified else {
         return Err("BO declined — no accepted model".to_owned());
     };
@@ -7785,6 +7833,7 @@ fn decide_table_perturbed_config<'tcx>(
         solve_secs,
     });
 
+    crate::phase_log::mark("decide:store", "end", "");
     finish_decide(
         tcx,
         program,
@@ -7906,6 +7955,7 @@ fn finish_decide<'tcx>(
             decision::Decision::Degraded(_) => false,
         }
     }
+    crate::phase_log::mark("finish_decide", "start", "");
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     // S3.1: the second universe. Appended rather than merged into
     // `collect_subjects` so the parameter census keeps measuring the parameter
@@ -8529,7 +8579,19 @@ fn finish_decide<'tcx>(
         .flatten()
         .map(|site| site.args.len())
         .sum::<usize>();
+    crate::phase_log::mark(
+        "finish_decide:facts",
+        "end",
+        &format!("subjects={}", subjects.len()),
+    );
+    let mut phase_round = 0usize;
     loop {
+        phase_round += 1;
+        crate::phase_log::mark(
+            "finish_decide:round",
+            "start",
+            &format!("round={phase_round}"),
+        );
         let profile = (
             family_policy.stage,
             family_policy.withdrawn.clone(),
@@ -8655,6 +8717,7 @@ fn finish_decide<'tcx>(
             };
         }
 
+        crate::phase_log::mark("finish_decide:hypothetical", "start", "");
         let hypothetical = decision::decide(
             &ctx_of!(
                 decision::RefGate::LiftAdaptable,
@@ -9781,6 +9844,7 @@ fn finish_decide<'tcx>(
                 &table.seams.outbound_expressions,
             );
         }
+        crate::phase_log::mark("finish_decide:plan", "start", "");
         let prepared = prepare_plan_files(
             tcx,
             &table,
@@ -10081,6 +10145,7 @@ fn finish_decide<'tcx>(
         if let Err(why) = table.is_self_consistent_over(&subjects) {
             return Err(format!("decision table self-consistency: {why}"));
         }
+        crate::phase_log::mark("finish_decide:receipts", "start", "");
         let receipt_started = std::time::Instant::now();
         let mut e2_artifacts =
             e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
@@ -10292,6 +10357,7 @@ fn finish_decide<'tcx>(
             );
         decision::overlapping_pairs::publish(tcx, &table, &context)?;
         decision::nested_slice::observe(tcx, &table);
+        crate::phase_log::mark("finish_decide", "end", &format!("rounds={phase_round}"));
         return Ok((table, context));
     }
 }
