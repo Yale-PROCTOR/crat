@@ -100,15 +100,36 @@ impl Drop for Scope {
 /// One boundary: `Err` with the typed reason once the budget is exceeded, here or at an
 /// earlier boundary; `Ok` with no budget in force.
 pub(crate) fn check(boundary: &str) -> anyhow::Result<()> {
-    let _ = boundary;
-    let _ = (Exceeded::reason, vm_rss_gb);
     ACTIVE.with(|cell| {
-        let _ = cell
-            .borrow()
-            .as_ref()
-            .map(|active| (active.budget, active.started));
-    });
-    Ok(())
+        let mut cell = cell.borrow_mut();
+        let Some(active) = cell.as_mut() else {
+            return Ok(());
+        };
+        if let Some(exceeded) = &active.exceeded {
+            return Err(anyhow::anyhow!(exceeded.reason()));
+        }
+        let wall_s = active.started.elapsed().as_secs_f64();
+        let rss_gb = vm_rss_gb();
+        if active
+            .budget
+            .wall_ms
+            .is_some_and(|limit| wall_s * 1000.0 >= limit as f64)
+            || active
+                .budget
+                .rss_mb
+                .is_some_and(|limit| rss_gb * 1024.0 >= limit as f64)
+        {
+            let exceeded = Exceeded {
+                wall_s,
+                rss_gb,
+                boundary: boundary.to_owned(),
+            };
+            let reason = exceeded.reason();
+            active.exceeded = Some(exceeded);
+            return Err(anyhow::anyhow!(reason));
+        }
+        Ok(())
+    })
 }
 
 /// [`check`] where the boundary cannot return an error: `true` = stop.
