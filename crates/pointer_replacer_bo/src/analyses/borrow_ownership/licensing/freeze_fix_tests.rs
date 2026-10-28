@@ -24,7 +24,8 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
-/// Two mutually recursive functions (one SCC), a non-member, and a return in every one.
+/// Two mutually recursive functions (one SCC) with a callee (`leaf`) and a caller (`top`) outside
+/// it, a self-recursive function (`selfie`), and returns in every one.
 const FIXTURE: &str = r#"
 unsafe extern "C" { fn malloc(n: usize) -> *mut i32; }
 pub unsafe fn ping(n: usize) -> *mut i32 {
@@ -33,11 +34,19 @@ pub unsafe fn ping(n: usize) -> *mut i32 {
 }
 pub unsafe fn pong(n: usize) -> *mut i32 {
     if n == 0 { return 0 as *mut i32; }
+    if n == 1 { return leaf(n); }
     ping(n - 1)
 }
 pub unsafe fn leaf(n: usize) -> *mut i32 {
     if n == 0 { return 0 as *mut i32; }
     malloc(4)
+}
+pub unsafe fn top(n: usize) -> *mut i32 {
+    ping(n)
+}
+pub unsafe fn selfie(n: usize) -> *mut i32 {
+    if n == 0 { return malloc(4); }
+    selfie(n - 1)
 }
 "#;
 
@@ -110,6 +119,8 @@ fn r378_a_the_call_graph_is_built_once_and_an_scc_certified_once() {
         );
         assert_eq!(row("ping"), row("pong"));
         assert!(matches!(row("leaf"), Availability::Missing(_)));
+        assert!(matches!(row("top"), Availability::Missing(_)));
+        assert_ne!(row("selfie"), row("ping"));
         for (construction, function, certificate) in &transport.recursive {
             assert_eq!(
                 certificate,
@@ -144,15 +155,30 @@ fn r378_b_the_reader_plan_is_built_once_in_traversal_returns() {
     });
 }
 
-/// (c): an exit reads only its own function's terminals (no whole-terminal scan per exit).
+/// (c): the exits grouped by function once equal, for every roster, the old filter of the graph's
+/// exits by a whole-terminal scan (the same exits, in the same order).
 #[test]
-fn r378_c_an_exit_reads_only_its_own_functions_terminals() {
-    with_freeze(|_, _| {
-        assert_eq!(
-            freeze_counts::grant_terminal_scans(),
-            0,
-            "grants scans every terminal for every exit"
-        );
+fn r378_c_exits_grouped_by_function_equal_the_scan() {
+    with_freeze(|facts, _| {
+        let graph = super::transport::CandidateGraph::build(facts);
+        let grouped = super::grants::exits_by_function(facts, &graph);
+        let mut exits = 0;
+        for roster in &facts.body_rosters {
+            let Some(function) = roster.point.function.as_deref() else { continue };
+            let construction = roster.point.construction;
+            let new = grouped
+                .get(&(construction, function))
+                .cloned()
+                .unwrap_or_default();
+            let old = super::grants::exits_by_scan(facts, &graph, construction, function);
+            assert_eq!(new.len(), old.len(), "{function}");
+            assert!(
+                new.iter().zip(&old).all(|(a, b)| std::ptr::eq(*a, *b)),
+                "{function}"
+            );
+            exits += old.len();
+        }
+        assert!(exits >= 2, "the fixture's exits: {exits}");
     });
 }
 

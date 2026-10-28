@@ -90,6 +90,8 @@ pub(crate) fn certify_invocations(
     certify_with_transport(facts, construction, function, &transport)
 }
 
+/// The per-function form (378 (a)'s reference; the freeze uses [`certify_all`]).
+#[cfg(test)]
 pub(crate) fn certify_with_transport(
     facts: &Facts,
     construction: u32,
@@ -182,6 +184,7 @@ impl CallGraph {
     }
 
     /// The function's strongly connected component: what it reaches and what reaches it.
+    #[cfg(test)]
     fn reach_scc(&self, function: &str) -> std::collections::BTreeSet<String> {
         use std::collections::{BTreeMap, BTreeSet, VecDeque};
         let reach = |graph: &BTreeMap<String, BTreeSet<String>>| {

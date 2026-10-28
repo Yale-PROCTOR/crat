@@ -202,18 +202,13 @@ fn free_proxies(facts: &Facts, construction: u32, function: &str) -> BTreeMap<u3
     result
 }
 
-pub(crate) fn plan(
-    facts: &Facts,
-    graph: &CandidateGraph,
-    matched: &MatchedTransport,
-    origins: &ValueOrigins,
-) -> (Vec<Grant>, Vec<Hold>) {
-    let mut grants = Vec::new();
-    let mut holds = Vec::new();
-    let carriers = origins.no_ref_carriers(facts);
-    // Relay main/378 (c), R1324-1: an exit belongs to the functions whose terminal carries its
-    // (construction, ordinal); the graph's exits grouped by those functions once, in their order,
-    // instead of every terminal scanned for every exit of every function.
+/// **Relay main/378 (c), R1324-1.** An exit belongs to the functions whose terminal carries its
+/// (construction, ordinal): the graph's exits grouped by those functions once, in the graph's
+/// order, instead of every terminal scanned for every exit of every function.
+pub(crate) fn exits_by_function<'g>(
+    facts: &'g Facts,
+    graph: &'g CandidateGraph,
+) -> BTreeMap<(u32, &'g str), Vec<&'g super::transport::ExitCandidate>> {
     let mut terminal_owners: BTreeMap<(u32, usize), BTreeSet<&str>> = BTreeMap::new();
     for row in &facts.terminals {
         if let Some(function) = row.point.function.as_deref() {
@@ -237,6 +232,41 @@ pub(crate) fn plan(
                 .push(exit);
         }
     }
+    exits_of
+}
+
+/// The scan [`exits_by_function`] replaced (378 (c)'s reference): one function's exits.
+#[cfg(test)]
+pub(crate) fn exits_by_scan<'g>(
+    facts: &'g Facts,
+    graph: &'g CandidateGraph,
+    construction: u32,
+    function: &str,
+) -> Vec<&'g super::transport::ExitCandidate> {
+    graph
+        .exits
+        .iter()
+        .filter(|exit| {
+            exit.node.construction == construction
+                && facts.terminals.iter().any(|row| {
+                    row.point.construction == construction
+                        && row.point.function.as_deref() == Some(function)
+                        && row.ordinal == exit.terminal_ordinal
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn plan(
+    facts: &Facts,
+    graph: &CandidateGraph,
+    matched: &MatchedTransport,
+    origins: &ValueOrigins,
+) -> (Vec<Grant>, Vec<Hold>) {
+    let mut grants = Vec::new();
+    let mut holds = Vec::new();
+    let carriers = origins.no_ref_carriers(facts);
+    let exits_of = exits_by_function(facts, graph);
     for roster in &facts.body_rosters {
         let Some(function) = &roster.point.function else { continue };
         let construction = roster.point.construction;

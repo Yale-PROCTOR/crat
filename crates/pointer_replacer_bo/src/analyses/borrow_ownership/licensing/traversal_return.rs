@@ -27,6 +27,8 @@ fn one<T>(items: impl IntoIterator<Item = T>) -> Option<T> {
 
 /// Exhaustive value-origin dependencies over actual local SSA versions. This
 /// certifies a readonly traversal candidate, not its call or lifetime contract.
+/// The per-function form (378 (b)'s reference; the freeze uses [`classify_all`]).
+#[cfg(test)]
 pub(crate) fn classify(facts: &Facts, function: &str) -> Option<Proof> {
     classify_metadata(
         facts,
