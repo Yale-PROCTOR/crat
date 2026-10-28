@@ -298,3 +298,16 @@ fn r382_b_a_relation_is_pushed_once_a_round_and_equals_the_old_sweep() {
         assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
     });
 }
+
+/// Relay main/383: the `matched:callgraph` mark's numbers on the fixture -- `top` -> the ping / pong
+/// SCC -> `leaf` is three levels; ping / pong and the self-recursive `selfie` are the non-trivial
+/// SCCs; the largest has two functions; five functions.
+#[test]
+fn r383_the_call_graph_depth_mark_reads_the_fixture() {
+    with_freeze(|facts, _| {
+        let shapes: Vec<_> = (0..facts.constructions)
+            .map(|construction| recursive::CallGraph::build(facts, construction).scc_depth())
+            .collect();
+        assert!(shapes.contains(&(3, 2, 2, 5)), "{shapes:?}");
+    });
+}

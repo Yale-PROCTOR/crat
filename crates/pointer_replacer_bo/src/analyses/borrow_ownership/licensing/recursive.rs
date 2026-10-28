@@ -250,6 +250,63 @@ impl CallGraph {
         }
         component
     }
+
+    /// Relay main/383 (R1333-1): the SCC DAG's shape for the `matched:callgraph` mark -- its
+    /// longest path in SCC levels, the non-trivial SCCs (more than one function, or one calling
+    /// itself), the largest SCC's size, and the functions.
+    pub(crate) fn scc_depth(&self) -> (usize, usize, usize, usize) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let component = self.sccs();
+        let mut members: BTreeMap<usize, usize> = BTreeMap::new();
+        for id in component.values() {
+            *members.entry(*id).or_default() += 1;
+        }
+        let mut dag: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        let mut self_calls = BTreeSet::new();
+        for (caller, callees) in &self.forward {
+            let Some(&from) = component.get(caller) else { continue };
+            for callee in callees {
+                let Some(&to) = component.get(callee) else { continue };
+                if from == to {
+                    self_calls.insert(from);
+                } else {
+                    dag.entry(from).or_default().insert(to);
+                }
+            }
+        }
+        // The longest path down from each SCC, by an iterative post-order over the DAG.
+        let mut depth: BTreeMap<usize, usize> = BTreeMap::new();
+        for &start in members.keys() {
+            let mut stack = vec![(start, false)];
+            while let Some((node, expanded)) = stack.pop() {
+                if depth.contains_key(&node) {
+                    continue;
+                }
+                let below = dag.get(&node).into_iter().flatten();
+                if expanded {
+                    let longest = below.map(|next| depth[next]).max().unwrap_or(0);
+                    depth.insert(node, longest + 1);
+                } else {
+                    stack.push((node, true));
+                    stack.extend(
+                        below
+                            .filter(|next| !depth.contains_key(*next))
+                            .map(|next| (*next, false)),
+                    );
+                }
+            }
+        }
+        let nontrivial = members
+            .iter()
+            .filter(|(id, size)| **size > 1 || self_calls.contains(*id))
+            .count();
+        (
+            depth.values().copied().max().unwrap_or(0),
+            nontrivial,
+            members.values().copied().max().unwrap_or(0),
+            component.len(),
+        )
+    }
 }
 
 /// **Relay main/378 (a).** Every function's certificate for one construction, in `functions`'

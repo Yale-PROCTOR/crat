@@ -1582,6 +1582,19 @@ impl MatchedTransport {
                 graph.sinks.len()
             )
         });
+        // Relay main/383 (R1333-1): the call graph's SCC depth, the rounds' bound by call level.
+        crate::phase_log::sub("matched:callgraph", "end", || {
+            (0..facts.constructions)
+                .map(|construction| {
+                    let (levels, nontrivial, largest, functions) =
+                        super::recursive::CallGraph::build(facts, construction).scc_depth();
+                    format!(
+                        "construction={construction} levels={levels} nontrivial={nontrivial} largest={largest} functions={functions}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         Self::build_using(facts, guard_aliases, graph, &BTreeMap::new(), &[])
     }
 
