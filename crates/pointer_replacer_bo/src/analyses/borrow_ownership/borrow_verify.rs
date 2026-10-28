@@ -1195,6 +1195,11 @@ fn verify_rounds(
     let mut last_dropped = dropped;
     for _ in 0..cap {
         stats.rounds += 1;
+        crate::phase_log::mark(
+            "solve:round",
+            "start",
+            &format!("round={} repair={repair:?}", stats.rounds),
+        );
         // Each round re-runs the oracle under a DIFFERENT candidacy
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
@@ -1324,6 +1329,15 @@ fn verify_rounds(
                 None,
             )
         };
+        crate::phase_log::mark(
+            "solve:round:replay",
+            "end",
+            &format!(
+                "round={} conflict_fns={}",
+                stats.rounds,
+                reviewed.conflicts.len()
+            ),
+        );
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved;
             return (None, stats);

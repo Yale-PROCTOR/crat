@@ -1755,7 +1755,9 @@ fn solve_bo_overlap_config_inner(
 ) -> Result<(VerifiedBo, usize), OverlapPreledgerDecline> {
     let _call_world = super::licensing::stack_entry::enter_world(attestation);
     super::execution_guard::enter_model();
+    crate::phase_log::mark("solve:source_events", "start", "");
     let inventory = std::sync::Arc::new(super::source_events::collect(program));
+    crate::phase_log::mark("solve:source_events", "end", "");
     super::source_events::with_inventory(&inventory, || {
         solve_bo_overlap_config_with_source_events(
             program,
@@ -1790,10 +1792,13 @@ fn solve_bo_overlap_config_with_source_events(
         "the overlap solve runs the baseline or the lend-arm copy-lend mode, never removal-only"
     );
     // The copies the depth-0 relaxation may take, for this solve.
+    crate::phase_log::mark("solve:copy_relax", "start", "");
     let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());
+    crate::phase_log::mark("solve:copy_relax", "end", "");
     super::copy_relax::install(eligible);
 
     let baseline_solver = KindSolver::new(slots);
+    crate::phase_log::mark("solve:baseline_construction", "start", "");
     let baseline_construction =
         construct_bo_overlap_reference(program, slots, origins, mut_facts, &baseline_solver)
             .map_err(|error| {
@@ -1802,6 +1807,8 @@ fn solve_bo_overlap_config_with_source_events(
                     error,
                 )
             })?;
+    crate::phase_log::mark("solve:baseline_construction", "end", "");
+    crate::phase_log::mark("solve:baseline_verify", "start", "");
     let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,
@@ -1809,6 +1816,11 @@ fn solve_bo_overlap_config_with_source_events(
         &baseline_solver,
         &baseline_construction,
         mut_facts,
+    );
+    crate::phase_log::mark(
+        "solve:baseline_verify",
+        "end",
+        &format!("rounds={}", baseline_round_stats.rounds),
     );
     let baseline_model = baseline_model.ok_or_else(|| {
         let first = baseline_solver
@@ -1921,6 +1933,7 @@ fn solve_bo_overlap_config_with_source_events(
         ));
     }
 
+    crate::phase_log::mark("solve:overlap_plan", "start", "");
     let plan = produce_overlap_plan(
         program,
         slots,
@@ -1936,6 +1949,7 @@ fn solve_bo_overlap_config_with_source_events(
             error,
         )
     })?;
+    crate::phase_log::mark("solve:overlap_plan", "end", "");
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         if refined {
             // Refusing overlap promotion must not also disable the independently
@@ -2132,6 +2146,7 @@ fn solve_bo_overlap_config_with_source_events(
     }
 
     let solver = KindSolver::new(slots);
+    crate::phase_log::mark("solve:precise_construction", "start", "");
     let (construction, refined_links) = if refined {
         construct_bo_into_a16_refined_with_esc(
             program,
@@ -2170,9 +2185,11 @@ fn solve_bo_overlap_config_with_source_events(
             0,
         )
     };
+    crate::phase_log::mark("solve:precise_construction", "end", "");
     let (model, round_stats) = match mode {
         OverlapMode::Baseline => unreachable!(),
         OverlapMode::PreciseReplay => {
+            crate::phase_log::mark("solve:precise_verify", "start", "");
             let (model, stats) = verify_bo_construction_with_parameter_overlaps(
                 program,
                 slots,
@@ -2181,6 +2198,11 @@ fn solve_bo_overlap_config_with_source_events(
                 &construction,
                 mut_facts,
                 &plan.effective_overlaps,
+            );
+            crate::phase_log::mark(
+                "solve:precise_verify",
+                "end",
+                &format!("rounds={}", stats.rounds),
             );
             // The verification loop has seven `None` exits, each recorded in
             // `RoundStats`; without the detail a decline could not say which one
