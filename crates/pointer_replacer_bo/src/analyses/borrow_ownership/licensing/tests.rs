@@ -458,7 +458,7 @@ fn with_fact_recording<T>(run: impl FnOnce() -> T) -> (T, BoExport) {
         let scope = facts::activate(&builder);
         let output = run();
         drop(scope);
-        let facts = facts::freeze(builder, Default::default());
+        let facts = facts::freeze(builder, Default::default()).unwrap();
         export::record_ownership_facts(&facts);
         output
     })

@@ -190,12 +190,18 @@ pub(crate) fn read<T>(f: impl FnOnce(&Facts) -> T) -> Option<T> {
 /// End the active scope before freezing. Moving the builder ensures no mutable
 /// alias survives into the solver's immutable facts. An optional exporter can
 /// copy the resulting DTO vectors without consulting or changing this state.
-pub(crate) fn freeze(builder: Builder, ownership_asts: IndexVec<Var, Bool>) -> Rc<Facts> {
+pub(crate) fn freeze(
+    builder: Builder,
+    ownership_asts: IndexVec<Var, Bool>,
+) -> anyhow::Result<Rc<Facts>> {
     let mut facts = Rc::try_unwrap(builder)
         .unwrap_or_else(|_| panic!("licensing facts still have an active builder alias"))
         .into_inner();
     facts.ownership_asts = ownership_asts;
-    facts.licensing = Some(Rc::new(super::snapshot::FrozenTransport::build(&facts)));
+    facts.licensing = Some(Rc::new(super::snapshot::FrozenTransport::build(&facts)?));
+    crate::phase_log::mark("freeze:licensing_inputs_digest", "start", "");
+    crate::analysis_budget::check("freeze:licensing_inputs_digest")?;
     facts.licensing_inputs = Some(licensing_inputs_digest(&facts));
-    Rc::new(facts)
+    crate::phase_log::mark("freeze:licensing_inputs_digest", "end", "");
+    Ok(Rc::new(facts))
 }

@@ -4061,7 +4061,7 @@ impl<'opt> BoOwnDatabase<'opt> {
     }
 
     /// Call after ending the scope and collecting the existing stats/selectors.
-    pub(crate) fn freeze_facts(self) -> Rc<super::licensing::facts::Facts> {
+    pub(crate) fn freeze_facts(self) -> anyhow::Result<Rc<super::licensing::facts::Facts>> {
         super::licensing::facts::freeze(self.ownership_facts, self.z3_ast)
     }
 

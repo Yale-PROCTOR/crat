@@ -36,50 +36,78 @@ pub(crate) struct FrozenTransport {
 }
 
 impl FrozenTransport {
-    pub(crate) fn build(facts: &Facts) -> Self {
+    /// Relay main/375: each step is a phase mark (`freeze:<step>`, `CRAT_BO_PHASE_LOG`) and an
+    /// analysis-budget boundary, the recursive certificates with a tick per construction.
+    pub(crate) fn build(facts: &Facts) -> anyhow::Result<Self> {
+        let step = |name: &str| -> anyhow::Result<()> {
+            crate::phase_log::mark(name, "start", "");
+            crate::analysis_budget::check(name)
+        };
+        step("freeze:matched")?;
         let matched = MatchedTransport::build(facts);
-        let recursive = Self::certificates(facts, &matched);
+        step("freeze:certificates")?;
+        let recursive = Self::certificates(facts, &matched)?;
+        step("freeze:reader_transfers")?;
         let reader_transfers = super::readers::audit_transfers(facts, matched.guard_aliases());
+        step("freeze:value_origins")?;
         let value_origins = super::value_origins::ValueOrigins::build(facts);
+        step("freeze:no_ref_carriers")?;
         let no_ref_carriers = value_origins.no_ref_carriers(facts);
+        step("freeze:field_support")?;
         let mut field_support = super::field_support::audit(
             facts,
             &facts.field_support_inputs,
             &matched,
             &value_origins,
         );
+        step("freeze:first_permissions")?;
         let first_permissions =
             super::first_permission::plan(facts, &mut field_support, matched.guard_aliases());
+        step("freeze:complete_chains")?;
         let complete_chains = field_support
             .iter()
             .filter_map(|field| {
                 super::chain_permission::certify(facts, field, matched.guard_aliases())
             })
             .collect();
+        step("freeze:traversal_calls")?;
         let traversal_calls = super::traversal_call::discover(facts);
+        step("freeze:traversal_correspondences")?;
         let traversal_correspondences = traversal_calls
             .iter()
             .map(|call| super::traversal_correspondence::certify(facts, call))
             .collect();
+        step("freeze:grants")?;
         let (objective_grants, grant_holds) = super::grants::plan(
             facts,
             &super::transport::CandidateGraph::build(facts),
             &matched,
             &value_origins,
         );
-        Self {
-            fold_callers: super::fold_eligibility::plan(facts),
-            fold_members: super::fold_eligibility::member_plan(facts),
+        step("freeze:fold_callers")?;
+        let fold_callers = super::fold_eligibility::plan(facts);
+        step("freeze:fold_members")?;
+        let fold_members = super::fold_eligibility::member_plan(facts);
+        step("freeze:traversal_returns")?;
+        let traversal_returns = facts
+            .source_occurrences
+            .keys()
+            .filter_map(|function| super::traversal_return::classify(facts, function))
+            .collect();
+        step("freeze:caller_coverage")?;
+        let caller_coverage = super::caller_coverage::assess(facts);
+        step("freeze:reference_effects")?;
+        let reference_effects = super::ref_effects::Plan::build(facts);
+        crate::phase_log::mark("freeze:reference_effects", "end", "");
+        Ok(Self {
+            fold_callers,
+            fold_members,
             first_permissions,
             complete_chains,
             traversal_calls,
             traversal_correspondences,
-            traversal_returns: facts
-                .source_occurrences
-                .keys()
-                .filter_map(|function| super::traversal_return::classify(facts, function))
-                .collect(),
-            caller_coverage: super::caller_coverage::assess(facts),
+            traversal_returns,
+            caller_coverage,
             matched,
             recursive,
             value_origins,
@@ -90,30 +118,39 @@ impl FrozenTransport {
             reader_candidates: facts.reader_plan.candidates.clone(),
             reader_transfers,
             field_support,
-            reference_effects: super::ref_effects::Plan::build(facts),
-        }
+            reference_effects,
+        })
     }
 
     fn certificates(
         facts: &Facts,
         matched: &MatchedTransport,
-    ) -> Vec<(u32, String, Availability<RecursiveCertificate>)> {
-        (0..facts.constructions)
-            .flat_map(|construction| {
-                facts.source_occurrences.keys().map(move |function| {
-                    (
+    ) -> anyhow::Result<Vec<(u32, String, Availability<RecursiveCertificate>)>> {
+        let mut out = Vec::new();
+        for construction in 0..facts.constructions {
+            let probe = crate::phase_log::Probe::begin();
+            crate::analysis_budget::check("freeze:certificates")?;
+            for function in facts.source_occurrences.keys() {
+                out.push((
+                    construction,
+                    function.clone(),
+                    super::recursive::certify_with_transport(
+                        facts,
                         construction,
-                        function.clone(),
-                        super::recursive::certify_with_transport(
-                            facts,
-                            construction,
-                            function,
-                            matched,
-                        ),
-                    )
-                })
-            })
-            .collect()
+                        function,
+                        matched,
+                    ),
+                ));
+            }
+            crate::phase_log::Probe::end(
+                probe,
+                "freeze:certificates",
+                construction as usize,
+                facts.constructions as usize,
+                || format!("functions={}", facts.source_occurrences.len()),
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -592,8 +629,10 @@ impl Snapshot {
         if rebuilt != self.matched {
             return Err("transport differs from recorded evidence".into());
         }
-        if FrozenTransport::certificates(&facts, &rebuilt) != self.recursive {
-            return Err("recursive certificate differs from recorded evidence".into());
+        match FrozenTransport::certificates(&facts, &rebuilt) {
+            Ok(recursive) if recursive == self.recursive => {}
+            Ok(_) => return Err("recursive certificate differs from recorded evidence".into()),
+            Err(error) => return Err(error.to_string().into()),
         }
         let origins = super::value_origins::ValueOrigins::build_metadata(&facts, &aliases)?;
         let mut fields =

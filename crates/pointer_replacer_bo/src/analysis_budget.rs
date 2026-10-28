@@ -295,6 +295,22 @@ pub unsafe fn entry() -> i32 {
         .unwrap();
     }
 
+    /// Relay main/375: the licensing freeze (P02's 75-minute step in main 257 / 259) is read
+    /// at each of its steps, so a wall budget ends it from inside.
+    #[test]
+    fn r375_the_budget_is_read_inside_the_licensing_freeze() {
+        use crate::analyses::borrow_ownership::licensing::facts;
+        let builder = std::rc::Rc::new(std::cell::RefCell::new(facts::Facts::default()));
+        let _scope = super::enter(Budget {
+            wall_ms: Some(0),
+            rss_mb: None,
+        });
+        let error = facts::freeze(builder, Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with(", freeze:matched)"), "{error}");
+    }
+
     /// The RSS limit: 0 MB is past at the first boundary.
     #[test]
     fn r375_a_zero_rss_limit_ends_at_the_first_boundary() {

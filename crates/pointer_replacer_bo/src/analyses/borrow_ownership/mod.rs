@@ -500,7 +500,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     drop(facts_scope);
     crate::phase_log::mark("own:freeze_facts", "start", "");
     crate::analysis_budget::check("own:freeze_facts")?;
-    let facts = database.freeze_facts();
+    let facts = database.freeze_facts()?;
     crate::phase_log::mark("own:freeze_facts", "end", "");
     crate::phase_log::mark("own:return_port", "start", "");
     crate::analysis_budget::check("own:return_port")?;
