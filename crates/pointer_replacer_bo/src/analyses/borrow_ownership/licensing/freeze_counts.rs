@@ -16,6 +16,7 @@ thread_local! {
     static WASTED_RELATIONS: Cell<usize> = const { Cell::new(0) };
     static RESWEPT: Cell<usize> = const { Cell::new(0) };
     static RECLONED: Cell<usize> = const { Cell::new(0) };
+    static REPEATED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Relay main/379 (matched, step 1): the old whole-collection scans, selected for an equality
@@ -62,6 +63,15 @@ pub(crate) fn base_recloned() {
     RECLONED.with(|c| c.set(c.get() + 1));
 }
 
+/// Relay main/382 (b): a relation pushed a second time in one round of the relation fixpoint.
+pub(crate) fn relation_repeated() {
+    REPEATED.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) fn repeats() -> usize {
+    REPEATED.with(Cell::get)
+}
+
 pub(crate) fn fixpoint_wasted() -> (usize, usize) {
     (RESWEPT.with(Cell::get), RECLONED.with(Cell::get))
 }
@@ -75,6 +85,7 @@ pub(crate) fn reset() {
     WASTED_RELATIONS.with(|c| c.set(0));
     RESWEPT.with(|c| c.set(0));
     RECLONED.with(|c| c.set(0));
+    REPEATED.with(|c| c.set(0));
 }
 
 pub(crate) fn call_graph_built() {

@@ -2003,6 +2003,8 @@ impl MatchedTransport {
                 )
             });
             let mut added = Vec::new();
+            #[cfg(test)]
+            let mut pushed = BTreeSet::new();
             let sweep: Box<dyn Iterator<Item = (&Scope, &Function)>> = match incremental {
                 Some(set) => Box::new(
                     set.iter()
@@ -2037,6 +2039,10 @@ impl MatchedTransport {
                                 guards: guards.clone(),
                             };
                             if !relations.contains_key(&relation) {
+                                #[cfg(test)]
+                                if !pushed.insert(relation.clone()) {
+                                    super::freeze_counts::relation_repeated();
+                                }
                                 added.push((relation, proof.clone()));
                             }
                         }
@@ -2051,6 +2057,10 @@ impl MatchedTransport {
                                 guards,
                             };
                             if !relations.contains_key(&relation) {
+                                #[cfg(test)]
+                                if !pushed.insert(relation.clone()) {
+                                    super::freeze_counts::relation_repeated();
+                                }
                                 added.push((relation, proof));
                             }
                         }

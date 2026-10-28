@@ -50,9 +50,35 @@ pub unsafe fn selfie(n: usize) -> *mut i32 {
 }
 "#;
 
+/// Relay main/382 (b): one pointer passed for two formals that reach one free site, so the
+/// caller's source reaches two terminals of one instance at one node in the same round.
+const REPEATS_FIXTURE: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
+pub unsafe fn sink(a: *mut i32, b: *mut i32, c: bool) {
+    let p = if c { a } else { b };
+    free(p);
+}
+pub unsafe fn twice(c: bool) {
+    let q = malloc(4);
+    sink(q, q, c);
+}
+"#;
+
 /// The fixture's frozen facts, then ONE more `FrozenTransport::build` with the counters reset.
 fn with_freeze(check: impl FnOnce(&Facts, &FrozenTransport) + Send) {
-    ::utils::compilation::run_compiler_on_str(FIXTURE, |tcx| {
+    with_freeze_of(FIXTURE, |facts, transport| {
+        assert!(
+            facts.source_occurrences.len() >= 3,
+            "{:?}",
+            facts.source_occurrences.keys()
+        );
+        check(facts, transport)
+    })
+}
+
+/// [`with_freeze`] for another fixture.
+fn with_freeze_of(source: &str, check: impl FnOnce(&Facts, &FrozenTransport) + Send) {
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
         let functions = tcx
             .hir_crate(())
             .owners
@@ -82,11 +108,6 @@ fn with_freeze(check: impl FnOnce(&Facts, &FrozenTransport) + Send) {
         )
         .unwrap();
         let facts = solver.ownership_facts().expect("the construction's facts");
-        assert!(
-            facts.source_occurrences.len() >= 3,
-            "{:?}",
-            facts.source_occurrences.keys()
-        );
         freeze_counts::reset();
         let transport = FrozenTransport::build(&facts).expect("no budget");
         check(&facts, &transport);
@@ -249,6 +270,30 @@ fn r379_b_the_fixpoint_reapplies_only_changed_callers_and_equals_the_full_one() 
         assert!(
             wasted.0 > 0 && wasted.1 > 0,
             "the fixture exercises the full fixpoint: {wasted:?}"
+        );
+        assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
+    });
+}
+
+/// Relay main/382 (b): a relation is pushed once a round (264's repeats: 41 % of P02's round 6);
+/// the old sweep (the reference switch) pushes repeats on this fixture, each with its own cloned
+/// proof, and the transport is the same either way (`or_insert` kept the first).
+#[test]
+fn r382_b_a_relation_is_pushed_once_a_round_and_equals_the_old_sweep() {
+    with_freeze_of(REPEATS_FIXTURE, |facts, transport| {
+        assert_eq!(
+            freeze_counts::repeats(),
+            0,
+            "relations pushed twice in a round"
+        );
+        freeze_counts::reset();
+        freeze_counts::set_reference_scans(true);
+        let reference = FrozenTransport::build(facts).expect("no budget");
+        let repeats = freeze_counts::repeats();
+        freeze_counts::set_reference_scans(false);
+        assert!(
+            repeats > 0,
+            "the fixture repeats a relation in a round: {repeats}"
         );
         assert_eq!(format!("{transport:?}"), format!("{reference:?}"));
     });
