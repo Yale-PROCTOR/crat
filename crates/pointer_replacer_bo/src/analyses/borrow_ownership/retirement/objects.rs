@@ -3,9 +3,12 @@
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_middle::mir::{
-    Body, CastKind, Local, Location, Operand, Place, ProjectionElem, Rvalue, START_BLOCK,
-    StatementKind, TerminatorKind,
+use rustc_middle::{
+    mir::{
+        Body, CastKind, Local, Location, Operand, Place, ProjectionElem, Rvalue, START_BLOCK,
+        StatementKind, TerminatorKind,
+    },
+    ty::adjustment::PointerCoercion,
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -267,9 +270,16 @@ fn statement_effect(
                 .unwrap_or(0);
             let values = (0..width)
                 .map(|depth| match value {
-                    Rvalue::Use(operand) | Rvalue::Cast(CastKind::PtrToPtr, operand, _) => {
-                        operand_value(operand, depth as u8, state, tcx)
-                    }
+                    // An unsizing coercion (`&mut [T; N]` -> `&mut [T]`) adds the
+                    // length, or a vtable, and keeps the address (relay
+                    // era-5c/265). Its destination's pointee is unsized, so only
+                    // depth 0 is a cell.
+                    Rvalue::Use(operand)
+                    | Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                        operand,
+                        _,
+                    ) => operand_value(operand, depth as u8, state, tcx),
                     Rvalue::Cast(_, operand @ Operand::Constant(_), _)
                         if source_events::operand_is_null(operand, &[], tcx) =>
                     {
@@ -346,18 +356,57 @@ fn call_effect<'tcx>(
     // (one past the end allowed) is UB in Rust and in C, so under §28 the result
     // points into the receiver's objects. Keyed on the `::ptr::` path, never on
     // the name alone (`core::ops::Add::add` is not arithmetic); `wrapping_*` and
-    // `byte_*` stay Unknown. The receiver is read as the call reads it, before
-    // any clobber.
-    let receiver = matches!(call.func, CallKind::RustLib(did)
+    // `byte_*` stay Unknown.
+    let arithmetic = matches!(call.func, CallKind::RustLib(did)
         if program.tcx.crate_name(did.krate).as_str() == "core"
             && program.tcx.def_path_str(did).contains("::ptr::")
-            && matches!(program.tcx.item_name(did).as_str(), "offset" | "add" | "sub"))
-    .then(|| {
-        call.args
-            .first()
-            .map(|receiver| operand_value(&receiver.node, 0, state, program.tcx))
-    })
-    .flatten();
+            && matches!(program.tcx.item_name(did).as_str(), "offset" | "add" | "sub"));
+    // An array's `as_mut_ptr` (relay era-5c/265): core's slice `as_mut_ptr` /
+    // `as_ptr` are `self as *mut [T] as *mut T` (`*const` for `as_ptr`), so by
+    // core's contract and body the result is the slice's own buffer, the
+    // receiver's referent. Not a §28 argument and not a premise. The instance is
+    // resolved first and keyed on core's inherent impl for `[T]`, never on the
+    // name: a local function, a user type's method and a user trait's impl for
+    // a slice are bodies of their own.
+    let slice_buffer = match &terminator.kind {
+        TerminatorKind::Call { func, .. } => func.const_fn_def().is_some_and(|(def_id, args)| {
+            rustc_middle::ty::Instance::try_resolve(
+                program.tcx,
+                body.typing_env(program.tcx),
+                def_id,
+                args,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|instance| {
+                let item = instance.def_id();
+                matches!(instance.def, rustc_middle::ty::InstanceKind::Item(_))
+                    && program.tcx.crate_name(item.krate).as_str() == "core"
+                    && matches!(
+                        program.tcx.item_name(item).as_str(),
+                        "as_mut_ptr" | "as_ptr"
+                    )
+                    && program.tcx.impl_of_method(item).is_some_and(|impl_did| {
+                        program.tcx.trait_id_of_impl(impl_did).is_none()
+                            && matches!(
+                                program.tcx.type_of(impl_did).skip_binder().kind(),
+                                rustc_middle::ty::TyKind::Slice(_)
+                            )
+                    })
+            })
+        }),
+        _ => false,
+    };
+    // Both keep the receiver's depth-0 objects; the destination's depth >= 1
+    // cells stay Unknown. The receiver is read as the call reads it, before any
+    // clobber.
+    let receiver = (arithmetic || slice_buffer)
+        .then(|| {
+            call.args
+                .first()
+                .map(|receiver| operand_value(&receiver.node, 0, state, program.tcx))
+        })
+        .flatten();
     let local_candidate = !allocator && !free && !core_pointer;
     let mut certificate = if !normal {
         Err(Rejection::NoNormalReturn)
