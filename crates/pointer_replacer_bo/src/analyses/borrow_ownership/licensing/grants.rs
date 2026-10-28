@@ -374,11 +374,14 @@ pub(crate) fn plan(
             .exits
             .iter()
             .filter(|exit| {
-                exit.node.construction == construction
-                    && facts
+                exit.node.construction == construction && {
+                    #[cfg(test)]
+                    super::freeze_counts::grant_terminal_scanned();
+                    facts
                         .terminals
                         .iter()
                         .any(|row| scope(&row.point) && row.ordinal == exit.terminal_ordinal)
+                }
             })
             .collect();
         if sources.len() != 1 || sinks.len() + exits.len() != 1 {

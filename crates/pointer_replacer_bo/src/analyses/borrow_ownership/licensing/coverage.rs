@@ -261,9 +261,20 @@ pub(crate) fn validate_returns(
     construction: u32,
     function: &str,
 ) -> Result<(), Vec<CoverageError>> {
+    validate_returns_scan(facts, construction, function)
+}
+
+/// [`validate_returns`] computed from the whole-program vectors.
+pub(crate) fn validate_returns_scan(
+    facts: &super::facts::Facts,
+    construction: u32,
+    function: &str,
+) -> Result<(), Vec<CoverageError>> {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::super::ownership_occurrence::Availability;
+    #[cfg(test)]
+    super::freeze_counts::validate_returns_computed(construction, function);
     let scope = |point: &Point| {
         point.construction == construction && point.function.as_deref() == Some(function)
     };

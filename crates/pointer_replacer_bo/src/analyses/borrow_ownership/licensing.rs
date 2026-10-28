@@ -88,6 +88,10 @@ mod objective_tests;
 mod objective_grant_tests;
 
 #[cfg(test)]
+pub(crate) mod freeze_counts;
+#[cfg(test)]
+mod freeze_fix_tests;
+#[cfg(test)]
 mod recursive_tests;
 
 #[cfg(test)]

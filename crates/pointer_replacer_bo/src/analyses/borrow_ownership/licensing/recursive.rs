@@ -105,6 +105,8 @@ pub(crate) fn certify_with_transport(
         .filter(|row| row.point.construction == construction)
         .filter_map(|row| row.point.function.clone())
         .collect();
+    #[cfg(test)]
+    super::freeze_counts::call_graph_built();
     if !known.contains(function) {
         return Availability::Missing("function coverage roster unavailable".into());
     }

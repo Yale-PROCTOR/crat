@@ -447,6 +447,8 @@ fn origin(
 
 impl Plan {
     pub(crate) fn build(inputs: &Inputs) -> Self {
+        #[cfg(test)]
+        super::freeze_counts::reader_plan_built();
         let mut returns: BTreeMap<String, Origins> = inputs
             .bodies
             .iter()
