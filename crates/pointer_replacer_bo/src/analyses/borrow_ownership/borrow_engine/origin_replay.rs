@@ -36,6 +36,9 @@ pub(super) struct NativeBorrowContext<'a> {
     /// For merged liveness: the locals the replay demoted (provenance
     /// disabled, unioned with their base), per function.
     pub(super) demoted: FxHashMap<LocalDefId, FxHashSet<Local>>,
+    /// Holds the program's index-range table (relay era-5c/267) while the
+    /// context replays: the solve's, or one built here when none is installed.
+    _index_ranges: crate::analyses::borrow_ownership::index_ranges::Scope,
 }
 
 pub(super) struct NativeInference<'tcx> {
@@ -121,6 +124,7 @@ impl<'a> NativeBorrowContext<'a> {
             },
             flows,
             demoted: FxHashMap::default(),
+            _index_ranges: crate::analyses::borrow_ownership::index_ranges::ensure(program),
         }
     }
 

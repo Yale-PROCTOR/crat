@@ -170,14 +170,15 @@ fn edges(code: &str, name: &str) -> usize {
     })
 }
 
-/// `name`'s receipt on its first formal: `(loan bytes, access bytes)`.
-fn receipt_on_first_formal(
-    receipts: &[RangeDisjoint],
-) -> Option<(Option<(i64, i64)>, Option<(i64, i64)>)> {
-    receipts
-        .iter()
-        .find(|receipt| receipt.base.as_u32() == 1)
-        .map(|receipt| (receipt.loan_bytes, receipt.access_bytes))
+/// Is there a receipt on the first formal with these byte ranges? (One
+/// invalidation is skipped per (access, loan) the engine checks, live there or
+/// not; a disjoint pair is skipped both ways.)
+fn has_receipt(receipts: &[RangeDisjoint], loan: (i64, i64), access: (i64, i64)) -> bool {
+    receipts.iter().any(|receipt| {
+        receipt.base.as_u32() == 1
+            && receipt.loan_bytes == Some(loan)
+            && receipt.access_bytes == Some(access)
+    })
 }
 
 /// The `lengths` shape (005's `SPX_chain_lengths`, `wots_checksum`, `base_w`):
@@ -223,9 +224,8 @@ fn e5c_w267_x1_two_views_disjoint_constant_ranges_both_ref() {
     assert_eq!(edges(X1, "split"), 0, "the disjoint pair leaves no edge");
     let (accepted, receipts) = accepts(X1, "split");
     assert!(accepted, "`split`'s pointers are Ref");
-    assert_eq!(
-        receipt_on_first_formal(&receipts),
-        Some((Some((128, 140)), Some((0, 128)))),
+    assert!(
+        has_receipt(&receipts, (128, 140), (0, 128)),
         "the receipt: base `v`, the loan's [128, 140), the access's [0, 128)"
     );
 }
@@ -295,10 +295,7 @@ pub unsafe extern "C" fn split(mut v: *mut core::ffi::c_uint) {
     assert_eq!(edges(CODE, "split"), 0);
     let (accepted, receipts) = accepts(CODE, "split");
     assert!(accepted);
-    assert_eq!(
-        receipt_on_first_formal(&receipts),
-        Some((Some((128, 140)), Some((0, 12))))
-    );
+    assert!(has_receipt(&receipts, (128, 140), (0, 12)));
 }
 
 /// X5: `fill`'s bound is `check`'s own formal `m`, and `split` passes the
@@ -316,10 +313,7 @@ fn e5c_w267_x5_extent_through_a_nested_local_callee() {
     assert_eq!(edges(&code, "split"), 0);
     let (accepted, receipts) = accepts(&code, "split");
     assert!(accepted);
-    assert_eq!(
-        receipt_on_first_formal(&receipts),
-        Some((Some((128, 140)), Some((0, 128))))
-    );
+    assert!(has_receipt(&receipts, (128, 140), (0, 128)));
 }
 
 /// X6: the read bound is `split2`'s own formal: `[0, 4n)` is symbolic at the
@@ -578,10 +572,7 @@ fn e5c_w267_s1_struct_fields_disjoint() {
     assert_eq!(edges(S1, "update"), 0);
     let (accepted, receipts) = accepts(S1, "update");
     assert!(accepted);
-    assert_eq!(
-        receipt_on_first_formal(&receipts),
-        Some((Some((0, 40)), Some((43, 44))))
-    );
+    assert!(has_receipt(&receipts, (0, 40), (43, 44)));
 }
 
 /// S2: `compress` also writes `buf[3]` through `s`: the ranges meet, the edge

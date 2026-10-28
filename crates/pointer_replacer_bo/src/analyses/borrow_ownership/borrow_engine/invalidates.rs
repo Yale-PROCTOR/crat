@@ -587,6 +587,26 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     PlaceConflictBias::Overlap,
                     self.parameter_overlap,
                 ) {
+                    // Index-range disjointness (relay era-5c/267): the loan and the access
+                    // reach disjoint bytes of one pointer formal, each bounded by a
+                    // UB-free execution (§28's three uses, `index_ranges`). Never through
+                    // a parameter-overlap partner (two bases) and never a copy-lend loan;
+                    // the receipt names both ranges, which the emission owes.
+                    if candidate_base == place.local
+                        && !self.copy_lends.contains(loan)
+                        && let Some(receipt) =
+                            crate::analyses::borrow_ownership::index_ranges::discharge(
+                                self.tcx,
+                                self.body,
+                                location,
+                                place,
+                                kind == AccessKind::Write,
+                                borrow_data,
+                            )
+                    {
+                        crate::analyses::borrow_ownership::index_ranges::record(receipt);
+                        continue;
+                    }
                     self.insert_invalidation(
                         point_index,
                         loan,
@@ -691,6 +711,22 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         PlaceConflictBias::Overlap,
                         self.parameter_overlap,
                     ) {
+                        // Index-range disjointness (relay era-5c/267): the routed write's
+                        // own place `*x…` against the loan, as in the direct check.
+                        if !self.copy_lends.contains(loan)
+                            && let Some(receipt) =
+                                crate::analyses::borrow_ownership::index_ranges::discharge(
+                                    self.tcx,
+                                    self.body,
+                                    location,
+                                    place,
+                                    true,
+                                    borrow_data,
+                                )
+                        {
+                            crate::analyses::borrow_ownership::index_ranges::record(receipt);
+                            continue;
+                        }
                         let accessor = if copy_lends_only { base } else { place.local };
                         self.insert_invalidation(point_index, loan, accessor, false);
                     }

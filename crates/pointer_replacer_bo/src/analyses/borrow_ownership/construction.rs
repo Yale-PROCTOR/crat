@@ -1881,6 +1881,11 @@ fn solve_bo_overlap_config_with_source_events(
     let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());
     crate::phase_log::mark("solve:copy_relax", "end", "");
     super::copy_relax::install(eligible);
+    // The index-range table (relay era-5c/267): model-independent, built once
+    // for the whole solve; every replay below reads it.
+    crate::phase_log::mark("solve:index_ranges", "start", "");
+    let _index_ranges = super::index_ranges::ensure(program);
+    crate::phase_log::mark("solve:index_ranges", "end", "");
 
     let baseline_solver = KindSolver::new(slots);
     crate::phase_log::mark("solve:baseline_construction", "start", "");

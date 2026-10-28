@@ -768,6 +768,11 @@ impl<'de> Visitor<'de> for Family<'_> {
             {
                 self.summary.arg_order_not_recorded = Some(reason);
             }
+            CaptureAvailability::NotRecorded { reason }
+                if self.family == ExportFamily::RangeDisjoint
+                    && !reason.is_empty()
+                    && source_rows == 0
+                    && records == 0 => {}
             _ => return Err(de::Error::custom("required capture unavailable")),
         }
         if source_rows != records {

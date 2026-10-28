@@ -40,9 +40,12 @@ pub(crate) enum ExportFamily {
     /// One row per argument-order application (the call and the lent
     /// pointer).
     ArgOrderApplied,
+    /// One row per index-range discharge (relay era-5c/267): the access, the
+    /// loan, the base and both byte ranges.
+    RangeDisjoint,
 }
 
-pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 22] = [
+pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 23] = [
     ExportFamily::OwnershipVersions,
     ExportFamily::OwnershipValues,
     ExportFamily::SourceSelectors,
@@ -65,6 +68,7 @@ pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 22] = [
     ExportFamily::ProofEvidence,
     ExportFamily::MoveStoreObligations,
     ExportFamily::ArgOrderApplied,
+    ExportFamily::RangeDisjoint,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -171,6 +175,7 @@ impl PortableExport {
                         ExportFamily::ResidualConflicts
                             | ExportFamily::MoveStoreObligations
                             | ExportFamily::ArgOrderApplied
+                            | ExportFamily::RangeDisjoint
                     ) && !reason.is_empty()
                         && payload.source_rows == 0
                         && payload.records.is_empty() => {}
@@ -672,6 +677,7 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         F::RetirementFinal | F::DemandEvidence | F::ProofEvidence => vec![],
         F::MoveStoreObligations => vec!["function", "store"],
         F::ArgOrderApplied => vec!["function", "call", "lent"],
+        F::RangeDisjoint => vec!["function", "access", "loan", "issuer"],
         _ => fields.keys().map(String::as_str).collect(),
     };
     let identity = selected
@@ -789,6 +795,89 @@ impl PortableExport {
         let records: Vec<_> = family.records.iter().map(|r| r.fields.clone()).collect();
         decode_arg_order(&family.availability, &records)
     }
+}
+
+/// The typed row of the `range-disjoint` family (relay era-5c/267): at
+/// `access` in `function`, the access did not invalidate the loan issued at
+/// `loan` to `issuer`, because both reach only their own bytes of the pointer
+/// formal `base` (`[lo, hi)`, `None` when nothing is reached). The emission owes
+/// both ranges. `summaries` are the `callee#formal` extents used, `premises` the
+/// §28 operations the bounds rest on.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RangeDisjointRow {
+    pub(crate) function: String,
+    pub(crate) access: MoveStoreLocation,
+    pub(crate) loan: MoveStoreLocation,
+    pub(crate) issuer: u32,
+    pub(crate) base: u32,
+    pub(crate) loan_bytes: Option<[i64; 2]>,
+    pub(crate) loan_writes: bool,
+    pub(crate) access_bytes: Option<[i64; 2]>,
+    pub(crate) access_writes: bool,
+    pub(crate) summaries: Vec<String>,
+    pub(crate) premises: Vec<String>,
+}
+
+/// Why the family is `NotRecorded`: no round was recorded.
+pub(crate) const RANGE_DISJOINT_NOT_RECORDED: &str =
+    "range-disjoint receipts not recorded: no round was recorded";
+
+/// The rows a producer recorded, in the portable form; `None` = not recorded.
+pub(crate) fn range_disjoint_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<RangeDisjointRow>>, String> {
+    let Some(rows) = &export.range_disjoint else {
+        return Ok(None);
+    };
+    let resolver = Resolver { program, slots };
+    let location = |l: rustc_middle::mir::Location| MoveStoreLocation {
+        block: l.block.as_u32(),
+        statement: l.statement_index,
+    };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(RangeDisjointRow {
+                function: resolver.function(row.function)?,
+                access: location(row.access),
+                loan: location(row.loan),
+                issuer: row.issuer.as_u32(),
+                base: row.base.as_u32(),
+                loan_bytes: row.loan_bytes.map(|(lo, hi)| [lo, hi]),
+                loan_writes: row.loan_writes,
+                access_bytes: row.access_bytes.map(|(lo, hi)| [lo, hi]),
+                access_writes: row.access_writes,
+                summaries: row
+                    .summaries
+                    .iter()
+                    .map(|(callee, formal)| Ok(format!("{}#{formal}", resolver.function(*callee)?)))
+                    .collect::<Result<Vec<_>, String>>()?,
+                premises: row.premises.iter().map(|p| (*p).to_owned()).collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(|a, b| {
+        (
+            &a.function,
+            a.access.block,
+            a.access.statement,
+            a.loan.block,
+            a.loan.statement,
+            a.issuer,
+        )
+            .cmp(&(
+                &b.function,
+                b.access.block,
+                b.access.statement,
+                b.loan.block,
+                b.loan.statement,
+                b.issuer,
+            ))
+    });
+    Ok(Some(out))
 }
 
 /// The typed row of the `move-store-obligations` family. The
@@ -1137,6 +1226,22 @@ pub(crate) fn collect(
                 .unwrap()
                 .availability = CaptureAvailability::NotRecorded {
                 reason: ARG_ORDER_NOT_RECORDED.into(),
+            };
+        }
+    }
+    match range_disjoint_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::RangeDisjoint, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::RangeDisjoint)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: RANGE_DISJOINT_NOT_RECORDED.into(),
             };
         }
     }

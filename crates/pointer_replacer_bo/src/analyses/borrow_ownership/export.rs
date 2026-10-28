@@ -506,6 +506,9 @@ pub(crate) struct BoExport {
     /// (call, lent pointer); `None` when the argument-order arm is off. The rewriter's hoist
     /// (`arg_order_hoists`) keys them by the call's span, caller and lent local.
     pub(crate) arg_order_applied: Option<Vec<ArgOrderApplied>>,
+    /// The final round's index-range discharges (relay era-5c/267), one per
+    /// (access, loan); `None` when no round was recorded.
+    pub(crate) range_disjoint: Option<Vec<super::index_ranges::RangeDisjoint>>,
     /// Selector provenance, index-aligned with `Selectors`.
     pub source_sites: Vec<SelectorSite>,
     pub sink_sites: Vec<SelectorSite>,
@@ -982,6 +985,7 @@ pub(crate) fn begin_round() {
         export.residual_conflicts = None;
         export.move_store_obligations = None;
         export.arg_order_applied = Some(Vec::new());
+        export.range_disjoint = Some(Vec::new());
     });
 }
 
@@ -1002,6 +1006,17 @@ pub(crate) struct ArgOrderApplied {
 pub(crate) fn record_arg_order_applied(row: ArgOrderApplied) {
     record(|export| {
         if let Some(rows) = export.arg_order_applied.as_mut()
+            && !rows.contains(&row)
+        {
+            rows.push(row);
+        }
+    });
+}
+
+/// Record an index-range discharge in the current round, once.
+pub(crate) fn record_range_disjoint(row: super::index_ranges::RangeDisjoint) {
+    record(|export| {
+        if let Some(rows) = export.range_disjoint.as_mut()
             && !rows.contains(&row)
         {
             rows.push(row);
