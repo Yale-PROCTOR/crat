@@ -847,8 +847,9 @@ fn r1312_c_a3_self_advance_already_delivers() {
 }
 
 /// A4: the identity cast of a delivered slice into a slice formal is stripped (the NUL-walked label).
+/// R1321-1 (seat relay 376 §1): R1320-1 withdrawn -- `p` is built over the thin `label` with the
+/// §77 extent like every fallback construction (not UB under Tree Borrows, the model of record).
 #[test]
-#[ignore = "relay 371 step 5 (A4): RED until that step"]
 fn r1312_w_a4_identity_cast_of_a_slice_into_a_slice_formal_delivers() {
     let (_, subjects, _) = run("w-a4", &format!("{PRE}{A4}"));
     let r = rows(&subjects);
