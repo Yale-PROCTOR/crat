@@ -112,7 +112,7 @@ use rustc_middle::{
 
 use crate::{
     analyses::{
-        borrow::{BorrowData, Borrower, ProvenanceOwner},
+        borrow::{Borrower, ProvenanceOwner},
         mir::{CallKind, TerminatorExt},
     },
     utils::rustc::RustProgram,
@@ -174,7 +174,7 @@ impl Bound {
     }
 
     fn checked(self) -> Option<Self> {
-        if self.add.abs() >= LIMIT || self.coef.abs() >= LIMIT {
+        if self.add.unsigned_abs() >= LIMIT as u64 || self.coef.unsigned_abs() >= LIMIT as u64 {
             return None;
         }
         Some(if self.coef == 0 {
@@ -511,10 +511,19 @@ pub(crate) fn discharge<'tcx>(
     location: Location,
     place: Place<'tcx>,
     write: bool,
-    loan: &BorrowData<'tcx>,
+    loan: Loan<'tcx>,
 ) -> Option<RangeDisjoint> {
     let table = TABLE.with(|slot| slot.borrow().as_ref().map(|(table, _)| table.clone()))?;
     table.discharge(tcx, body, location, place, write, loan)
+}
+
+/// The loan as the discharge reads it: its borrowed place, its borrower and
+/// the statement that issues it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Loan<'tcx> {
+    pub(crate) borrowed: Place<'tcx>,
+    pub(crate) assigned: Borrower,
+    pub(crate) location: Location,
 }
 
 /// Per program: each function's facts and the per-formal summaries.
@@ -627,7 +636,7 @@ impl IndexRanges {
         location: Location,
         place: Place<'tcx>,
         write: bool,
-        loan: &BorrowData<'tcx>,
+        loan: Loan<'tcx>,
     ) -> Option<RangeDisjoint> {
         let function = body.source.def_id().as_local()?;
         let facts = self.functions.get(&function)?;
@@ -638,7 +647,7 @@ impl IndexRanges {
         let Borrower::Assign(ProvenanceOwner::Local(issuer)) = loan.assigned else {
             return None;
         };
-        if facts.shape.only_def(issuer) != Some(loan.location()) {
+        if facts.shape.only_def(issuer) != Some(loan.location) {
             return None;
         }
         let loan_root = facts.derivs.get(&issuer)?.root;
@@ -688,7 +697,7 @@ impl IndexRanges {
         Some(RangeDisjoint {
             function,
             access: location,
-            loan: loan.location(),
+            loan: loan.location,
             issuer,
             base: loan_root,
             loan_bytes,
@@ -1850,7 +1859,9 @@ fn constant_value<'tcx>(tcx: TyCtxt<'tcx>, operand: &Operand<'tcx>) -> Option<i6
     } else {
         raw as i128
     };
-    i64::try_from(value).ok().filter(|v| v.abs() < LIMIT)
+    i64::try_from(value)
+        .ok()
+        .filter(|v| v.unsigned_abs() < LIMIT as u64)
 }
 
 /// Integer locals with one definition, a constant one: a literal, a `const`
@@ -1902,7 +1913,7 @@ fn constant_locals<'tcx>(
                 },
                 _ => None,
             };
-            if let Some(v) = new.filter(|v| fits(*v) && v.abs() < LIMIT) {
+            if let Some(v) = new.filter(|v| fits(*v) && v.unsigned_abs() < LIMIT as u64) {
                 consts.insert(local, v);
                 changed = true;
             }

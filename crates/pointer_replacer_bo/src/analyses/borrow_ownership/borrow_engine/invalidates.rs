@@ -605,7 +605,11 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                                 source,
                                 place,
                                 kind == AccessKind::Write,
-                                borrow_data,
+                                crate::analyses::borrow_ownership::index_ranges::Loan {
+                                    borrowed: borrow_data.borrowed,
+                                    assigned: borrow_data.assigned,
+                                    location: borrow_data.location(),
+                                },
                             )
                     {
                         crate::analyses::borrow_ownership::index_ranges::record(receipt);
@@ -725,7 +729,11 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                                     source,
                                     place,
                                     true,
-                                    borrow_data,
+                                    crate::analyses::borrow_ownership::index_ranges::Loan {
+                                        borrowed: borrow_data.borrowed,
+                                        assigned: borrow_data.assigned,
+                                        location: borrow_data.location(),
+                                    },
                                 )
                         {
                             crate::analyses::borrow_ownership::index_ranges::record(receipt);
