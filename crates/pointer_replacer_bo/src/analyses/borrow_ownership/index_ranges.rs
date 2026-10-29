@@ -51,8 +51,11 @@
 //! holder then *carries* the base: the value kept in it is reached wherever
 //! the holder goes (a call handed `&holder`, a load out of it), and the
 //! engine checks none of those points against the base's loans. So a loan
-//! is discharged only when the reach of every carried value that is not of
-//! its own issuer's chain stays off the loan's bytes (whatever the access).
+//! is discharged only when the reach of every carried value stays off the
+//! loan's bytes (whatever the access), but for a value of its own issuer's
+//! chain when the issuer is defined once per call (in a loop, the holder may
+//! keep an earlier instance's value). A projected borrow `&(*x).f` stored
+//! straight into a field is Unknown (its offset is not `x`'s).
 //! Neither a loaded value nor a holder is ever a base: the discharge takes
 //! only a pointer formal.
 //!
@@ -716,6 +719,8 @@ struct FnFacts {
     /// with the stored value's footprint relative to the base (its flow), the
     /// reach of the holder wherever it goes.
     carriers: FxHashMap<Local, Vec<(Local, Footprint)>>,
+    /// The blocks on a cycle of the body's control flow.
+    cyclic: FxHashSet<BasicBlock>,
     /// The bases some use of which escapes the body: stored, returned,
     /// handed where the walk cannot follow, or a pointer read out of it. A
     /// copy so retained may reach the base behind every footprint's back, so
@@ -866,10 +871,13 @@ impl IndexRanges {
         // E1: a value of the base kept in a holder is reached wherever the
         // holder goes (a call handed `&holder`, a load out of it), points the
         // engine never checks against the base's loans (the reviewer's
-        // blocker). The loan is clear only when every such value not of its
-        // own issuer's chain stays off its bytes.
+        // blocker). The loan is clear only when every such value stays off
+        // its bytes, but for one of its own issuer's chain when the issuer is
+        // defined once per call (a block on no cycle: an issue in a loop
+        // leaves earlier instances' values in the holder, the second review).
+        let once = !facts.cyclic.contains(&loan.location.block);
         for (stored, carried) in facts.carriers.get(&loan_root).into_iter().flatten() {
-            if descends(body, &facts.shape, *stored, issuer) {
+            if once && descends(body, &facts.shape, *stored, issuer) {
                 continue;
             }
             match (carried.constant(), loan_bytes) {
@@ -3079,6 +3087,13 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                 all.extend(premises);
                 Footprint::bytes(lo, hi, *write && !through, all)
             }
+            // `&(*x).proj` stored into a holder's field: the projection's
+            // offset is not the value's (the second review).
+            Use::Flow { dest }
+                if dest.as_local().is_none() && !occ.accessed.projection.is_empty() =>
+            {
+                Footprint::Unknown("stored")
+            }
             Use::Flow { dest } => self.flow(deriv, dest),
             Use::Arg { k } => self.argument(deriv, *k, location),
             Use::Inert => Footprint::Empty,
@@ -3551,6 +3566,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                     // reaches, and its footprint carries the path.
                     Use::Flow { dest }
                         if self.holder_field(dest).is_some()
+                            && occ.accessed.projection.is_empty()
                             && self.derivs.get(&local).is_some_and(|deriv| {
                                 !matches!(self.flow(deriv, dest), Footprint::Unknown(_))
                             }) => {}
@@ -3731,10 +3747,15 @@ impl FnFacts {
                     if let Use::Flow { dest } = &occ.what
                         && ctx.holder_field(dest).is_some()
                     {
+                        let reach = if occ.accessed.projection.is_empty() {
+                            ctx.flow(deriv, dest)
+                        } else {
+                            Footprint::Unknown("stored")
+                        };
                         carriers
                             .entry(deriv.root)
                             .or_default()
-                            .push((*local, ctx.flow(deriv, dest)));
+                            .push((*local, reach));
                     }
                 }
             }
@@ -3760,9 +3781,36 @@ impl FnFacts {
             holder_paths,
             paths,
             carriers,
+            cyclic: cyclic_blocks(body),
             escaped,
         }
     }
+}
+
+/// The blocks on a cycle of the control flow: in a strongly connected
+/// component of more than one block, or with an edge to themselves.
+fn cyclic_blocks(body: &Body<'_>) -> FxHashSet<BasicBlock> {
+    let mut graph = petgraph::graph::DiGraph::<BasicBlock, ()>::new();
+    let nodes: Vec<_> = body
+        .basic_blocks
+        .indices()
+        .map(|block| graph.add_node(block))
+        .collect();
+    let mut cyclic = FxHashSet::default();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for target in data.terminator().successors() {
+            graph.add_edge(nodes[block.index()], nodes[target.index()], ());
+            if target == block {
+                cyclic.insert(block);
+            }
+        }
+    }
+    for component in petgraph::algo::tarjan_scc(&graph) {
+        if component.len() > 1 {
+            cyclic.extend(component.into_iter().map(|node| graph[node]));
+        }
+    }
+    cyclic
 }
 
 /// Does `x`'s value derive from `issuer`'s, along the one-definition chain

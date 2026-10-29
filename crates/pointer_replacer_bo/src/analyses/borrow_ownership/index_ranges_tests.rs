@@ -1113,6 +1113,112 @@ fn e5c_w267_b1k_a_stored_value_at_a_formal_offset_is_unknown() {
     control(&code, "sign");
 }
 
+/// B1l (the second review): the loan is issued in a loop, and the holder keeps
+/// the first iteration's copy of it; the second iteration's call writes
+/// `sig[100]` through that copy while the new `lo` lives. The issuer's chain
+/// is not skipped in a loop: `lo`'s loan is never discharged.
+#[test]
+fn e5c_w267_b1l_a_loan_issued_in_a_loop_meets_its_earlier_copy() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info {
+    pub sig: *mut u8,
+    pub leaf: u32,
+}
+unsafe extern "C" fn first(mut p: *mut u8, mut info: *mut Info) {
+    *p.offset(3) = 1 as u8;
+    *((*info).sig).offset(0) = 2 as u8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn sign(mut sig: *mut u8) {
+    let mut info: Info = Info {
+        sig: 0 as *mut u8,
+        leaf: 0 as u32,
+    };
+    let mut i: i32 = 0;
+    while i < 2 as i32 {
+        let mut lo: *mut u8 = sig.offset(100 as isize);
+        if i == 0 as i32 {
+            info.sig = lo;
+        }
+        first(sig, &mut info);
+        *lo = 1 as u8;
+        i += 1;
+    }
+}
+"#;
+    assert!(edges(CODE, "sign") > 0, "the edge is there");
+    let (_, receipts) = accepts(CODE, "sign");
+    with_program(CODE, |program| {
+        let sign = function(program, "sign");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(sign)
+            .borrow();
+        // `sig`'s copies: `lo`'s, then the argument.
+        let copies = copies_of(&body, Local::from_u32(1));
+        assert!(!copies.is_empty());
+        assert!(
+            receipts.iter().all(|receipt| receipt.issuer != copies[0]),
+            "`lo`'s loan is never discharged: {receipts:?}"
+        );
+    });
+}
+
+/// B1m (the second review): `&raw mut (*s).buf` stored straight into a
+/// holder's field reaches `s + 100`, not `s + 0`: Unknown, and `lo`'s loan
+/// (`s + 100`) is never discharged.
+#[test]
+fn e5c_w267_b1m_a_projected_borrow_stored_into_a_field_is_unknown() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables)]
+#[repr(C)]
+pub struct Big {
+    pub hdr: [u8; 100],
+    pub buf: [u8; 100],
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info {
+    pub p: *mut [u8; 100],
+    pub leaf: u32,
+}
+unsafe extern "C" fn touch(mut s: *mut Big, mut k: *mut Info) {
+    (*s).hdr[0] = 1 as u8;
+    (*(*k).p)[0] = 2 as u8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn f(mut s: *mut Big) {
+    let mut info: Info = Info {
+        p: 0 as *mut [u8; 100],
+        leaf: 0 as u32,
+    };
+    info.p = &raw mut (*s).buf;
+    let mut lo: *mut u8 = (s as *mut u8).offset(100 as isize);
+    touch(s, &mut info);
+    *lo = 3 as u8;
+}
+"#;
+    assert!(edges(CODE, "f") > 0, "the edge is there");
+    let (_, receipts) = accepts(CODE, "f");
+    with_program(CODE, |program| {
+        let f = function(program, "f");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(f)
+            .borrow();
+        // `s`'s copies: `lo`'s, then the argument.
+        let copies = copies_of(&body, Local::from_u32(1));
+        assert!(!copies.is_empty());
+        assert!(
+            receipts.iter().all(|receipt| receipt.issuer != copies[0]),
+            "`lo`'s loan is never discharged: {receipts:?}"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The domain.
 // ---------------------------------------------------------------------------
