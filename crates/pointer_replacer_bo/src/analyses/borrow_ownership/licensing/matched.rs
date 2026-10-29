@@ -36,8 +36,12 @@ pub(crate) struct SourceInstance {
     pub(crate) lineage: SourceLineage,
 }
 
+/// Relay main/385 (R1335-1), 3b': the longest `Exact` lineage kept; a deeper one becomes the
+/// `Recursive` marker of the call being prepended (the scope's own call). Set in the GREEN commit.
+pub(crate) const LINEAGE_DEPTH: usize = 7;
+
 impl SourceLineage {
-    fn through(&self, call: &CallKey) -> Self {
+    pub(crate) fn through(&self, call: &CallKey) -> Self {
         match self {
             Self::Exact(calls) if !calls.contains(call) => {
                 let mut applications = vec![call.clone()];

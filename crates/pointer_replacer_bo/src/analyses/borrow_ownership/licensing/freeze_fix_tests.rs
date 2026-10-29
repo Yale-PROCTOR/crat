@@ -311,3 +311,33 @@ fn r383_the_call_graph_depth_mark_reads_the_fixture() {
         assert!(shapes.contains(&(3, 2, 2, 5)), "{shapes:?}");
     });
 }
+
+/// Relay main/385 (R1335-1), 3b': a lineage that would pass `LINEAGE_DEPTH` calls becomes
+/// `Recursive { application: the call being prepended }` -- the scope's own call, the form a
+/// repeated call already takes -- while one of exactly `LINEAGE_DEPTH` stays `Exact`.
+#[test]
+fn r385_a_a_lineage_deeper_than_k_becomes_the_scope_call_marker() {
+    use super::matched::{CallKey, LINEAGE_DEPTH, SourceLineage};
+    let call = |i: usize| CallKey {
+        construction: 0,
+        caller: format!("f{i}"),
+        block: 0,
+        statement: 0,
+        callee: format!("f{}", i + 1),
+    };
+    let mut lineage = SourceLineage::Exact(Vec::new());
+    for i in (1..=LINEAGE_DEPTH).rev() {
+        lineage = lineage.through(&call(i));
+    }
+    assert!(
+        matches!(&lineage, SourceLineage::Exact(path) if path.len() == LINEAGE_DEPTH),
+        "{lineage:?}"
+    );
+    assert_eq!(
+        lineage.through(&call(0)),
+        SourceLineage::Recursive {
+            application: call(0)
+        },
+        "one call deeper than LINEAGE_DEPTH"
+    );
+}
