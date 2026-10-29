@@ -255,12 +255,37 @@ impl CallGraph {
     /// longest path in SCC levels, the non-trivial SCCs (more than one function, or one calling
     /// itself), the largest SCC's size, and the functions.
     pub(crate) fn scc_depth(&self) -> (usize, usize, usize, usize) {
-        use std::collections::{BTreeMap, BTreeSet};
-        let component = self.sccs();
+        use std::collections::BTreeMap;
+        let (component, dag, self_calls) = self.condensation();
         let mut members: BTreeMap<usize, usize> = BTreeMap::new();
         for id in component.values() {
             *members.entry(*id).or_default() += 1;
         }
+        let depth = Self::heights(&members, &dag);
+        let nontrivial = members
+            .iter()
+            .filter(|(id, size)| **size > 1 || self_calls.contains(*id))
+            .count();
+        (
+            depth.values().copied().max().unwrap_or(0),
+            nontrivial,
+            members.values().copied().max().unwrap_or(0),
+            component.len(),
+        )
+    }
+
+    /// Relay main/384 (R1334-1): the SCCs (each known function's component), the condensation's
+    /// edges between components, and the components with a call to themselves.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn condensation(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+        std::collections::BTreeSet<usize>,
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let component = self.sccs();
         let mut dag: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
         let mut self_calls = BTreeSet::new();
         for (caller, callees) in &self.forward {
@@ -274,7 +299,16 @@ impl CallGraph {
                 }
             }
         }
-        // The longest path down from each SCC, by an iterative post-order over the DAG.
+        (component, dag, self_calls)
+    }
+
+    /// Relay main/384: each component's longest path down the condensation, in SCC levels
+    /// (a leaf is 1), by an iterative post-order.
+    pub(crate) fn heights(
+        members: &std::collections::BTreeMap<usize, usize>,
+        dag: &std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    ) -> std::collections::BTreeMap<usize, usize> {
+        use std::collections::BTreeMap;
         let mut depth: BTreeMap<usize, usize> = BTreeMap::new();
         for &start in members.keys() {
             let mut stack = vec![(start, false)];
@@ -296,16 +330,7 @@ impl CallGraph {
                 }
             }
         }
-        let nontrivial = members
-            .iter()
-            .filter(|(id, size)| **size > 1 || self_calls.contains(*id))
-            .count();
-        (
-            depth.values().copied().max().unwrap_or(0),
-            nontrivial,
-            members.values().copied().max().unwrap_or(0),
-            component.len(),
-        )
+        depth
     }
 }
 

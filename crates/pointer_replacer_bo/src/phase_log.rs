@@ -60,6 +60,11 @@ pub(crate) fn with_sub_marks<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Relay main/384: whether a sub-mark would be written now (log on, inside [`with_sub_marks`]).
+pub(crate) fn sub_marks_on() -> bool {
+    on() && SUB_MARKS.get()
+}
+
 /// One sub-mark inside [`with_sub_marks`]; `detail` is called only when the line is written.
 pub(crate) fn sub(phase: &str, edge: &str, detail: impl FnOnce() -> String) {
     if on() && SUB_MARKS.get() {

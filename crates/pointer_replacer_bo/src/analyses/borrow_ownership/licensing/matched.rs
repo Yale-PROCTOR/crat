@@ -530,6 +530,126 @@ fn round_sizes(
     )
 }
 
+/// Relay main/384 (R1334-1): the static, flow- and guard-blind bound on the relation fixpoint's
+/// lineage-free keys, for the `matched:closure` marks (empty unless the sub-marks are on). Per
+/// construction, over `recursive::CallGraph`'s SCC DAG (an SCC's members share one set): `R_d` = the
+/// terminal targets of the scope's SCC and of the SCCs within <= d calls below it, as bitsets over
+/// the targets in `base`; `B_d` = sum over scopes of seeds x |R_d| (seeds = the scope's inputs and
+/// its own sources' endpoints), `T_d` = sum of |R_d|, the largest |R_d|, and the scopes with |R_d|
+/// >= 1,000 / >= 10,000; for d = 0..=10, 16, 24, 32, 48 and the last level, and where the sets stop
+/// growing (`inf`); the Port side (sum of seeds x outputs, local), and the scopes per SCC height.
+fn closure_lines(facts: &Facts, base: &BTreeMap<Scope, Function>) -> Vec<String> {
+    if !crate::phase_log::sub_marks_on() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for construction in 0..facts.constructions {
+        let graph = super::recursive::CallGraph::build(facts, construction);
+        let (mut component, dag, _) = graph.condensation();
+        let scopes: Vec<(&Scope, &Function)> = base
+            .iter()
+            .filter(|(scope, _)| scope.0 == construction)
+            .collect();
+        // A scope the call graph does not know is its own component, with no callees.
+        let mut next_id = component.values().copied().max().map_or(0, |m| m + 1);
+        for (scope, _) in &scopes {
+            component.entry(scope.1.clone()).or_insert_with(|| {
+                next_id += 1;
+                next_id - 1
+            });
+        }
+        let mut targets: BTreeMap<&TerminalTarget, usize> = BTreeMap::new();
+        for (_, function) in &scopes {
+            for end in &function.terminals {
+                let next = targets.len();
+                targets.entry(&end.terminal.target).or_insert(next);
+            }
+        }
+        let words = targets.len().div_ceil(64).max(1);
+        let components = next_id;
+        let mut local = vec![vec![0u64; words]; components];
+        for (scope, function) in &scopes {
+            let id = component[&scope.1];
+            for end in &function.terminals {
+                let bit = targets[&end.terminal.target];
+                local[id][bit / 64] |= 1 << (bit % 64);
+            }
+        }
+        let seeds: Vec<(usize, usize, usize)> = scopes
+            .iter()
+            .map(|(scope, function)| {
+                let sources: BTreeSet<_> = function
+                    .sources
+                    .iter()
+                    .map(|source| source.instance.endpoint)
+                    .collect();
+                (
+                    component[&scope.1],
+                    function.inputs.len() + sources.len(),
+                    function.outputs.len(),
+                )
+            })
+            .collect();
+        let mut members: BTreeMap<usize, usize> = BTreeMap::new();
+        for (id, _, _) in &seeds {
+            *members.entry(*id).or_default() += 1;
+        }
+        let heights = super::recursive::CallGraph::heights(&members, &dag);
+        let levels = heights.values().copied().max().unwrap_or(0);
+        let ports: usize = seeds.iter().map(|(_, s, o)| s * o).sum();
+        let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
+        for (id, _, _) in &seeds {
+            *histogram.entry(heights[id]).or_default() += 1;
+        }
+        lines.push(format!(
+            "construction={construction} scopes={} components={} targets={} levels={levels} port_bound={ports} scopes_by_height={}",
+            scopes.len(),
+            members.len(),
+            targets.len(),
+            histogram
+                .iter()
+                .map(|(h, n)| format!("{h}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let count = |set: &[u64]| set.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        let wanted: BTreeSet<usize> = (0..=10).chain([16, 24, 32, 48, levels]).collect();
+        let mut reach = local.clone();
+        let mut d = 0;
+        loop {
+            let sizes: Vec<usize> = reach.iter().map(|set| count(set)).collect();
+            let bound: usize = seeds.iter().map(|(id, s, _)| s * sizes[*id]).sum();
+            let blind: usize = seeds.iter().map(|(id, _, _)| sizes[*id]).sum();
+            let largest = seeds.iter().map(|(id, _, _)| sizes[*id]).max().unwrap_or(0);
+            let ge = |n: usize| seeds.iter().filter(|(id, _, _)| sizes[*id] >= n).count();
+            let mut next = local.clone();
+            for (from, below) in &dag {
+                for to in below {
+                    for (w, word) in reach[*to].iter().enumerate() {
+                        next[*from][w] |= word;
+                    }
+                }
+            }
+            let stable = next == reach;
+            if wanted.contains(&d) || stable {
+                lines.push(format!(
+                    "construction={construction} d={}{} B={bound} T={blind} max={largest} ge1000={} ge10000={}",
+                    d,
+                    if stable { " (inf)" } else { "" },
+                    ge(1_000),
+                    ge(10_000)
+                ));
+            }
+            if stable {
+                break;
+            }
+            reach = next;
+            d += 1;
+        }
+    }
+    lines
+}
+
 /// Relay main/382 (a) 5: a relation's key without its lineages -- (scope, the seed's input node or
 /// source endpoint, the destination's port or terminal target, guards) -- for the `keys` marks.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -2020,6 +2140,10 @@ impl MatchedTransport {
                 calls.len()
             )
         });
+        // Relay main/384 (R1334-1): the static bound on the fixpoint's lineage-free keys by depth.
+        for line in closure_lines(facts, &base) {
+            crate::phase_log::sub("matched:closure", "end", || line);
+        }
         let mut relations = BTreeMap::new();
         // Relay main/379 (`matched`, step 1): the semi-naive fixpoint. After the first round, a
         // round re-applies and re-sweeps only the callers of the scopes the round before added
