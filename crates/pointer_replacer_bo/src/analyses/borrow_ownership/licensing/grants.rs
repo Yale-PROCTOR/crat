@@ -656,7 +656,8 @@ pub(crate) fn plan(
                     meet.source.endpoint == source.equation && meet.terminal.target == target
                     && matches!(&meet.source.lineage, SourceLineage::Exact(calls) if calls.is_empty())
                     && matches!(&meet.terminal.lineage, SourceLineage::Exact(calls) if calls.is_empty())).collect();
-                if meets.len() != 1 {
+                // Relay main/387: a count-based grant -- a marker meet counts as more than one.
+                if meets.len() != 1 || meets[0].guards.is_summarized() {
                     reasons.insert(HoldReason::UniqueRoute);
                     continue;
                 }

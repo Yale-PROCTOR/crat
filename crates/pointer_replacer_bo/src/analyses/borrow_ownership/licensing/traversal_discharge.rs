@@ -41,9 +41,12 @@ pub(crate) fn certify(
         return None;
     }
     let proof = traversal_correspondence::certify_metadata(facts, candidate, aliases).ok()?;
+    // Relay main/387: exact support -- a marker on either meet discharges nothing.
+    let free_guards = chosen_free.guards.exact()?;
+    let output_guards = output.guards.exact()?;
     if !proof.traversal.returned.contains(&node)
-        || chosen_free.guards.permissive().get(&candidate.guard) != Some(&true)
-        || output.guards.permissive().get(&candidate.guard) != Some(&false)
+        || free_guards.get(&candidate.guard) != Some(&true)
+        || output_guards.get(&candidate.guard) != Some(&false)
     {
         return None;
     }
@@ -60,13 +63,8 @@ pub(crate) fn certify(
     });
     terminals.next()?;
     if terminals.next().is_some()
-        || output.guards.permissive().iter().any(|(guard, value)| {
-            *guard != candidate.guard
-                && chosen_free
-                    .guards
-                    .permissive()
-                    .get(guard)
-                    .is_some_and(|other| other != value)
+        || output_guards.iter().any(|(guard, value)| {
+            *guard != candidate.guard && free_guards.get(guard).is_some_and(|other| other != value)
         })
     {
         return None;

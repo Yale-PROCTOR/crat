@@ -406,9 +406,14 @@ pub(crate) fn certify_metadata(
     };
     let transport =
         MatchedTransport::build_metadata(facts, aliases).map_err(|_| Hold::Coverage(line!()))?;
+    // Relay main/387: "the source reaching here is this one" is two readers -- nothing else
+    // reaches (absence: `sources_for`, a marker's source present) and this one reaches (exact
+    // support: `sources_for_exact`); the member path is exact support (`reaches`).
     if !transport.reaches(node(child.destination_def), member_before)
         || transport.sources_for(member_before) != BTreeSet::from([member.clone()])
+        || transport.sources_for_exact(member_before) != BTreeSet::from([member.clone()])
         || transport.sources_for(node(narrow.source_use)) != BTreeSet::from([parent.clone()])
+        || transport.sources_for_exact(node(narrow.source_use)) != BTreeSet::from([parent.clone()])
     {
         return Err(Hold::MemberPath);
     }

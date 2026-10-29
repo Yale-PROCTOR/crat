@@ -672,6 +672,11 @@ impl OutputDischarge {
         free: &Meet,
         certificate: &super::ref_effects::ConsumedOutput,
     ) -> Option<Self> {
+        // Relay main/387: exact support -- a marker on either meet certifies nothing.
+        let (Some(free_guards), Some(output_guards)) = (free.guards.exact(), output.guards.exact())
+        else {
+            return None;
+        };
         if !matches!(output.terminal.target, TerminalTarget::Output { .. })
             || !matches!(free.terminal.target, TerminalTarget::Free(_))
             || output.terminal != certificate.output
@@ -682,17 +687,10 @@ impl OutputDischarge {
             || certificate.output.lineage != certificate.free.lineage
             || !certificate.required_free.required
             || certificate.required_free.binding.construction != certificate.call.construction
-            || free
-                .guards
-                .permissive()
-                .get(&certificate.required_free.binding)
-                != Some(&true)
-            || output.guards.permissive().iter().any(|(key, required)| {
-                free.guards
-                    .permissive()
-                    .get(key)
-                    .is_some_and(|value| value != required)
-            })
+            || free_guards.get(&certificate.required_free.binding) != Some(&true)
+            || output_guards
+                .iter()
+                .any(|(key, required)| free_guards.get(key).is_some_and(|value| value != required))
         {
             return None;
         }
@@ -752,6 +750,10 @@ fn select_terminal(
             .collect()
     };
     for chosen in choices {
+        // Relay main/387: the responsibility is exact support -- a marker is never chosen.
+        if chosen.guards.is_summarized() {
+            continue;
+        }
         let mut discharged = Vec::new();
         let mut traversal_outputs = Vec::new();
         let mut covered = true;
@@ -929,15 +931,17 @@ fn input_alternative(
     let outputs: Vec<_> = route.source_terminals.iter().filter(|meet| meet.terminal.lineage == SourceLineage::Exact(vec![application.call.clone()])
         && matches!(meet.terminal.target, TerminalTarget::Output {node, ..} if node == destination)).collect();
     let output = outputs.first().ok_or(Pending::TerminalRoleC)?;
+    // Relay main/387: exact support -- a marker free or output is no alternative.
+    let (Some(free_guards), Some(output_guards)) = (free.guards.exact(), output.guards.exact())
+    else {
+        return Err(Pending::TerminalRoleC);
+    };
     if outputs
         .iter()
         .any(|other| other.terminal != output.terminal)
-        || output.guards.permissive().iter().any(|(key, required)| {
-            free.guards
-                .permissive()
-                .get(key)
-                .is_some_and(|value| value != required)
-        })
+        || output_guards
+            .iter()
+            .any(|(key, required)| free_guards.get(key).is_some_and(|value| value != required))
     {
         return Err(Pending::TerminalRoleC);
     }

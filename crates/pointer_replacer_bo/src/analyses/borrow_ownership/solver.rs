@@ -1473,7 +1473,11 @@ impl KindSolver {
         for store in &field.stores {
             support.push(own(store.destination_def)?);
             support.push(!own(store.source_def)?);
-            support.extend(guards(store.meet.guards.permissive())?);
+            // Relay main/387: exact support -- a marker meet supports nothing.
+            match store.meet.guards.exact() {
+                Some(exact) => support.extend(guards(exact)?),
+                None => support.push(Bool::from_bool(false)),
+            }
         }
         for store in &field.input_stores {
             support.push(own(store.destination_def)?);
@@ -1484,8 +1488,13 @@ impl KindSolver {
                 for alternative in &application.alternatives {
                     let mut required = vec![own(alternative.route.actual_input)?];
                     required.extend(guards(&alternative.route.guards)?);
-                    required.extend(guards(alternative.free.guards.permissive())?);
-                    required.extend(guards(alternative.forwarded.output.guards.permissive())?);
+                    // Relay main/387: exact support -- a marker meet supports nothing.
+                    for meet in [&alternative.free, &alternative.forwarded.output] {
+                        match meet.guards.exact() {
+                            Some(exact) => required.extend(guards(exact)?),
+                            None => required.push(Bool::from_bool(false)),
+                        }
+                    }
                     for forwarded in &alternative.forwarded_returns {
                         required.extend(guards(&forwarded.guards)?);
                     }
@@ -2342,13 +2351,16 @@ impl KindSolver {
                 .ownership_asts
                 .get(Var::from_u32(grant.carrier.var))
                 .ok_or_else(|| anyhow::anyhow!("missing grant responsibility AST"))?;
+            // Relay main/387: exact support -- a grant on a marker meet grants nothing (the
+            // count-based plan never selects one; grants.rs).
+            let Some(meet_guards) = grant.meet.guards.exact() else { continue };
             let source = frozen
                 .matched
                 .guard_aliases()
                 .get(&grant.meet.source.endpoint)
                 .ok_or_else(|| anyhow::anyhow!("missing grant source dependency"))?;
             anyhow::ensure!(
-                grant.meet.guards.permissive().get(source) == Some(&true),
+                meet_guards.get(source) == Some(&true),
                 "grant lost source dependency"
             );
             if let super::licensing::matched::TerminalTarget::Free(endpoint) =
@@ -2360,12 +2372,12 @@ impl KindSolver {
                     .get(&endpoint)
                     .ok_or_else(|| anyhow::anyhow!("missing grant sink dependency"))?;
                 anyhow::ensure!(
-                    grant.meet.guards.permissive().get(sink) == Some(&true),
+                    meet_guards.get(sink) == Some(&true),
                     "grant lost sink dependency"
                 );
             }
             let mut dependencies = Vec::new();
-            for (key, required) in grant.meet.guards.permissive() {
+            for (key, required) in meet_guards {
                 let predicate = &facts
                     .guards
                     .iter()

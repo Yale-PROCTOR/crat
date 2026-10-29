@@ -306,11 +306,12 @@ pub(crate) fn collect_known_stack_entries(
         }))?;
         if store.meet.terminal != certificate.free
             || !matches!(store.meet.source.lineage, SourceLineage::Exact(_))
+            // Relay main/387: exact support -- a marker meet carries no binding.
             || store
                 .meet
                 .guards
-                .permissive()
-                .get(&certificate.required_free.binding)
+                .exact()
+                .and_then(|guards| guards.get(&certificate.required_free.binding))
                 != Some(&true)
             || !store
                 .discharged_outputs

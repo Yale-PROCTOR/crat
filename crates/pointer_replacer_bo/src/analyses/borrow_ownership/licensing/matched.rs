@@ -57,12 +57,8 @@ pub(crate) fn probe() -> bool {
 pub(crate) const GUARD_BUDGET: usize = 14;
 
 /// The budget in force: `CRAT_BO_GUARD_BUDGET` when set -- for measurement runs only, never in a
-/// gate, never on the 17 or the 376 -- else [`GUARD_BUDGET`]; a test may set its own.
+/// gate, never on the 17 or the 376 -- else [`GUARD_BUDGET`].
 fn guard_budget() -> usize {
-    #[cfg(test)]
-    if let Some(budget) = TEST_GUARD_BUDGET.with(std::cell::Cell::get) {
-        return budget;
-    }
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("CRAT_BO_GUARD_BUDGET")
@@ -70,20 +66,6 @@ fn guard_budget() -> usize {
             .and_then(|value| value.parse().ok())
             .unwrap_or(GUARD_BUDGET)
     })
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_GUARD_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// Test-only: run `f` with the guard budget set to `budget` on this thread.
-#[cfg(test)]
-pub(crate) fn with_guard_budget<T>(budget: usize, f: impl FnOnce() -> T) -> T {
-    let previous = TEST_GUARD_BUDGET.with(|cell| cell.replace(Some(budget)));
-    let result = f();
-    TEST_GUARD_BUDGET.with(|cell| cell.set(previous));
-    result
 }
 
 /// The depth in force: `CRAT_BO_LINEAGE_DEPTH` when set -- for measurement runs only, never in a
@@ -241,6 +223,7 @@ pub(crate) enum GuardSet {
     Summarized,
 }
 
+#[cfg(test)]
 static NO_GUARDS: Guards = BTreeMap::new();
 
 impl GuardSet {
@@ -255,8 +238,10 @@ impl GuardSet {
         matches!(self, Self::Summarized)
     }
 
-    /// Relay main/387, step 1 only: the readers' view before they are taught the marker -- a
-    /// marker read as no guards at all. The reader fixtures are RED against it.
+    /// Test-only: a fixture's view of the guards, a marker read as none. No reader uses it: an
+    /// absence check counts a marker as present, a count-based grant as more than one, exact
+    /// support as nothing (relay main/387 section 1.4).
+    #[cfg(test)]
     pub(crate) fn permissive(&self) -> &Guards {
         self.exact().unwrap_or(&NO_GUARDS)
     }
@@ -1190,7 +1175,11 @@ impl MatchedTransport {
         .ok()
         .as_ref()
             != Some(fold)
-            || continuation.guards.permissive().get(&guard) != Some(&true)
+            || continuation
+                .guards
+                .exact()
+                .and_then(|guards| guards.get(&guard))
+                != Some(&true)
         {
             return None;
         }
@@ -1306,7 +1295,9 @@ impl MatchedTransport {
         {
             return None;
         }
-        let guards = combine(output.guards.permissive(), continuation.guards.permissive())?;
+        // Relay main/387: exact support -- a marker on either meet forwards nothing.
+        let continuation_guards = continuation.guards.exact()?;
+        let guards = combine(output.guards.exact()?, continuation_guards)?;
         // These are actual retained meets, not caller-supplied endpoint labels.
         let observed: Vec<_> = self
             .source_nodes(call.construction, &path.first()?.caller, &output.source)
@@ -1413,11 +1404,11 @@ impl MatchedTransport {
         }
         if relation
             .guards
-            .permissive()
+            .exact()?
             .iter()
             .chain(receiver_part.guards.iter())
             .chain(input.iter().flat_map(|part| part.guards.iter()))
-            .any(|(key, value)| continuation.guards.permissive().get(key) != Some(value))
+            .any(|(key, value)| continuation_guards.get(key) != Some(value))
         {
             return None;
         }
@@ -1671,14 +1662,18 @@ impl MatchedTransport {
                     if !witness.contains(&Step::Local(Evidence::Transfer(store))) {
                         continue;
                     }
-                    let Some(guards) = combine(relation.guards.permissive(), &input.guards)
+                    // Relay main/387: a route is exact support -- a marker anywhere on it (the
+                    // relation, an anchor, a meet) yields no route.
+                    let Some(relation_guards) = relation.guards.exact() else { continue };
+                    let Some(guards) = combine(relation_guards, &input.guards)
                         .and_then(|guards| combine(&guards, &output.guards))
                     else {
                         continue;
                     };
-                    if &guards != arc.guards.permissive() {
+                    if Some(&guards) != arc.guards.exact() {
                         continue;
                     }
+                    let mut through_marker = false;
                     let mut route = InputStoreRoute {
                         formal_input: input.formal,
                         formal_output: output.formal,
@@ -1705,9 +1700,13 @@ impl MatchedTransport {
                             };
                             let mut proof = prefix;
                             proof.push(arc.step.clone());
+                            let Some(anchor_guards) = joined.exact() else {
+                                through_marker = true;
+                                continue;
+                            };
                             let anchor = InputStoreAnchor {
                                 source: source.instance.clone(),
-                                guards: joined.permissive().clone(),
+                                guards: anchor_guards.clone(),
                                 proof: proof.clone(),
                             };
                             if !route.anchors.contains(&anchor) {
@@ -1721,6 +1720,7 @@ impl MatchedTransport {
                                     let Some(guards) = join(&suffix_guards, &end.guards) else {
                                         continue;
                                     };
+                                    through_marker |= guards.is_summarized();
                                     let mut proof = suffix.clone();
                                     proof.extend(end.suffix.iter().cloned());
                                     let meet = Meet {
@@ -1750,11 +1750,15 @@ impl MatchedTransport {
                                 .into_iter()
                                 .filter(|meet| meet.source == source)
                             {
+                                through_marker |= meet.guards.is_summarized();
                                 if !route.source_terminals.contains(&meet) {
                                     route.source_terminals.push(meet);
                                 }
                             }
                         }
+                    }
+                    if through_marker {
+                        continue;
                     }
                     if !application.routes.contains(&route) {
                         application.routes.push(route);
@@ -1983,36 +1987,6 @@ impl MatchedTransport {
     /// Read-only canonical predicate identity metadata from the ordinary build.
     pub(crate) fn guard_aliases(&self) -> &BTreeMap<EquationId, EquationId> {
         &self.guard_aliases
-    }
-
-    /// Relay main/387 (test-only): the distinct guard sets per lineage-free (scope, seed,
-    /// destination) triple over the relations, and the guard sets of the largest.
-    #[cfg(test)]
-    pub(crate) fn guard_sets_per_triple(&self) -> Vec<(String, usize, Vec<String>)> {
-        let mut sets: BTreeMap<String, BTreeSet<&GuardSet>> = BTreeMap::new();
-        for relation in self.relations.keys() {
-            let (scope, seed, output, guards) = key_without_lineage(relation);
-            let seed = match seed {
-                SeedKey::Input(node) => format!("in {node:?}"),
-                SeedKey::Source(endpoint) => format!("src {endpoint:?}"),
-            };
-            let output = match output {
-                DestinationKey::Port(node) => format!("port {node:?}"),
-                DestinationKey::Terminal(target) => format!("term {target:?}"),
-            };
-            sets.entry(format!("{}::{} | {seed} | {output}", scope.0, scope.1))
-                .or_default()
-                .insert(guards);
-        }
-        let mut rows: Vec<_> = sets
-            .into_iter()
-            .map(|(key, guards)| {
-                let shown = guards.iter().map(|g| format!("{g:?}")).collect();
-                (key, guards.len(), shown)
-            })
-            .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        rows
     }
 
     /// Metadata reconstruction performs no Bool/solver operation.
@@ -2812,6 +2786,8 @@ impl MatchedTransport {
         &self.denials
     }
 
+    /// Relay main/387: a reach is exact support (a fold's required member path) -- a path only
+    /// through a marker is no reach.
     pub(crate) fn reaches(&self, from: Node, to: Node) -> bool {
         self.functions.values().any(|function| {
             function.contains(from)
@@ -2819,7 +2795,7 @@ impl MatchedTransport {
                 && function
                     .paths(from, GuardSet::Exact(Guards::new()), Vec::new())
                     .keys()
-                    .any(|(node, _)| *node == to)
+                    .any(|(node, guards)| *node == to && !guards.is_summarized())
         })
     }
 
@@ -2900,15 +2876,28 @@ impl MatchedTransport {
         self.meets_for(node)
             .into_iter()
             .filter(|meet| {
-                meet.guards
-                    .permissive()
-                    .iter()
-                    .all(|(&guard, &required)| value(guard) == Some(required))
+                meet.guards.exact().is_some_and(|guards| {
+                    guards
+                        .iter()
+                        .all(|(&guard, &required)| value(guard) == Some(required))
+                })
             })
             .collect()
     }
 
+    /// The sources reaching `node`, a marker's included -- an absence check's set ("another
+    /// source here?"; relay main/387).
     pub(crate) fn sources_for(&self, node: Node) -> BTreeSet<SourceInstance> {
+        self.sources_reaching(node, false)
+    }
+
+    /// Relay main/387: the sources reaching `node` by an exact path -- exact support ("this source
+    /// reaches here"); a source reaching only through a marker is not among them.
+    pub(crate) fn sources_for_exact(&self, node: Node) -> BTreeSet<SourceInstance> {
+        self.sources_reaching(node, true)
+    }
+
+    fn sources_reaching(&self, node: Node, exact: bool) -> BTreeSet<SourceInstance> {
         self.functions
             .values()
             .filter(|function| function.contains(node))
@@ -2917,7 +2906,9 @@ impl MatchedTransport {
                     function
                         .paths(source.node, source.guards.clone(), source.proof.clone())
                         .keys()
-                        .any(|(reached, _)| *reached == node)
+                        .any(|(reached, guards)| {
+                            *reached == node && !(exact && guards.is_summarized())
+                        })
                         .then(|| source.instance.clone())
                 })
             })

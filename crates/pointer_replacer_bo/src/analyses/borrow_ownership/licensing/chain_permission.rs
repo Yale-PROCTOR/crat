@@ -82,7 +82,8 @@ pub(crate) fn certify(
         || put_arm.guard == release_arm.guard
         || [put_arm.guard, release_arm.guard]
             .iter()
-            .any(|g| alt.free.guards.permissive().get(g) != Some(&true))
+            // Relay main/387: exact support -- a marker free carries no arm.
+            .any(|g| alt.free.guards.exact().and_then(|guards| guards.get(g)) != Some(&true))
     {
         return None;
     }

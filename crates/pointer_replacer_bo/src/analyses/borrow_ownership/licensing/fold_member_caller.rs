@@ -148,6 +148,13 @@ pub(crate) fn certify_metadata(
             .filter(|m| matches!(m.terminal.target, TerminalTarget::Free(_))),
         Hold::Forwarding,
     )?;
+    // Relay main/387: count-based -- a marker meet counts as more than one.
+    if [output, projected, free]
+        .iter()
+        .any(|meet| meet.guards.is_summarized())
+    {
+        return Err(Hold::Forwarding);
+    }
     let forwarding = transport
         .forward_member_return_metadata(facts, output, free, &member, slots)
         .ok_or(Hold::Forwarding)?;

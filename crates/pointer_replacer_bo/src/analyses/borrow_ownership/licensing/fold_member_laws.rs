@@ -43,6 +43,10 @@ pub(crate) fn single_free(frees: &[Meet]) -> Result<&Meet, Hold> {
     let [meet] = frees else {
         return Err(Hold::CompetingResponsibility);
     };
+    // Relay main/387: a count-based grant -- a marker meet counts as more than one.
+    if meet.guards.is_summarized() {
+        return Err(Hold::CompetingResponsibility);
+    }
     if !matches!(meet.terminal.lineage, SourceLineage::Exact(_)) {
         return Err(Hold::CompetingResponsibility);
     }

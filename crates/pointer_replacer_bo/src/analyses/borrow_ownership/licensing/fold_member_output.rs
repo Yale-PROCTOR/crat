@@ -68,15 +68,17 @@ pub(crate) fn certify_metadata(
         return Err(Hold::NotProjectedOutput);
     }
     let call = &member.fold.call;
+    // Relay main/387: exact support -- a marker output carries no declaration guard.
+    let Some(output_guards) = output.guards.exact() else { return Err(Hold::Identity) };
     if output.source != member.member
         || output.terminal.lineage != SourceLineage::Exact(vec![call.clone()])
         || node.construction != call.construction
-        || output.guards.permissive().get(&member.declaration.guard) != Some(&true)
+        || output_guards.get(&member.declaration.guard) != Some(&true)
         || member
             .requirements
             .guards
             .iter()
-            .any(|(key, value)| output.guards.permissive().get(key) != Some(value))
+            .any(|(key, value)| output_guards.get(key) != Some(value))
     {
         return Err(Hold::Identity);
     }
