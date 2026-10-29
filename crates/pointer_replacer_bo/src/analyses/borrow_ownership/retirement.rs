@@ -733,10 +733,13 @@ impl Context {
                     continue;
                 }
                 let disposition = match owner {
-                    Some((_, local)) => {
-                        self.inner_loans
-                            .disposition(function, local, depth, event.location)
-                    }
+                    Some((_, local)) => self.inner_loans.disposition_at(
+                        function,
+                        local,
+                        depth,
+                        event.location,
+                        event.phase == SourcePhase::Unwind,
+                    ),
                     None => {
                         inner_loan::Disposition::Unrepresented(inner_loan::Missing::NoObligation)
                     }

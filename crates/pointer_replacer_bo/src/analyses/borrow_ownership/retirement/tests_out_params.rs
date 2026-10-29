@@ -91,6 +91,62 @@ pub unsafe extern "C" fn through_pointer(mut s: *mut c_char) -> c_long {
 }
 "#;
 
+/// 270 row 4, as c2rust writes `main_0` (a Rust-ABI function): after `strtol`, the later Rust-ABI
+/// call's unwind exit releases the end pointer's storage while the end pointer is still used on the
+/// normal path. The negatives: the holder escapes into a local callee that keeps it, and the holder
+/// sits inside a local with drop glue.
+const UNWIND: &str = r#"
+use core::ffi::{c_char, c_int, c_long};
+unsafe extern "C" {
+    fn strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long;
+}
+static mut KEPT: *mut *mut c_char = 0 as *mut *mut c_char;
+unsafe fn keep(s: *const c_char, endptr: *mut *mut c_char) -> c_long {
+    KEPT = endptr;
+    *endptr = s as *mut c_char;
+    0
+}
+unsafe fn report(value: c_long) -> c_long {
+    value + 1
+}
+pub struct Guard {
+    pub p: *mut *mut c_char,
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe { *self.p = 0 as *mut c_char; }
+    }
+}
+pub unsafe fn main_0(mut s: *mut c_char) -> c_long {
+    let mut end: *mut c_char = 0 as *mut c_char;
+    let mut value: c_long = strtol(s, &mut end, 10 as c_int);
+    value = report(value);
+    if end == s {
+        return 0 as c_long;
+    }
+    return value;
+}
+pub unsafe fn escaped(mut s: *mut c_char) -> c_long {
+    let mut end: *mut c_char = 0 as *mut c_char;
+    let mut value: c_long = keep(s, &mut end);
+    value = report(value);
+    if end == s {
+        return 0 as c_long;
+    }
+    return value;
+}
+pub unsafe fn guarded(mut s: *mut c_char) -> c_long {
+    let mut end: *mut c_char = 0 as *mut c_char;
+    let guard = Guard { p: &mut end };
+    let mut value: c_long = strtol(s, guard.p, 10 as c_int);
+    value = report(value);
+    if *guard.p == s {
+        return 0 as c_long;
+    }
+    return value;
+}
+"#;
+
 /// The location of the one call to the item named `name`, or with `None` the one call through a
 /// function pointer.
 fn call_to<'tcx>(
@@ -235,14 +291,50 @@ fn r388_a_an_extern_c_call_has_no_unwind_release() {
     );
 }
 
-/// (b), the Rust ABI keeps it: `report` may unwind, so its call edge still releases the frame's
-/// storage -- the end pointer's among it (270 row 4's events).
+/// (b), the Rust ABI keeps it: in the Rust-ABI `main_0`, `report` may unwind, so its call edge
+/// still releases the frame's storage -- the end pointer's among it (270 row 4's events).
 #[test]
 fn r388_a_a_rust_abi_call_keeps_its_unwind_release() {
     assert!(
-        unwind_events_at(STRTOL, "parse", Some("report")) > 0,
+        unwind_events_at(UNWIND, "main_0", Some("report")) > 0,
         "a Rust-ABI callee may unwind: its edge still releases the frame's storage"
     );
+}
+
+/// Row 4 at the disposition (R1349-1): at `report`'s unwind exit the end pointer's holder is Live
+/// on the normal path -- the comparison after the call -- and Dead on the unwind edge, where the
+/// frame ends.
+#[test]
+fn r388_a_the_holder_is_live_on_the_normal_path_and_dead_on_the_unwind_edge() {
+    with_program(UNWIND, |program| {
+        let slots = CrateSlots::build(program);
+        let loans = inner_loan::analyze(program, &slots, |_| true);
+        let wanted = named_function(program, "main_0");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(wanted)
+            .borrow();
+        let exit = call_to(program.tcx, &body, Some("report"));
+        let mut normal = Vec::new();
+        let mut unwind = Vec::new();
+        for row in inner_loan::obligations(program, &slots, |_| true)
+            .into_iter()
+            .filter(|row| row.key.function == wanted)
+        {
+            normal.push(loans.disposition_at(wanted, row.key.local, row.key.depth, exit, false));
+            unwind.push(loans.disposition_at(wanted, row.key.local, row.key.depth, exit, true));
+        }
+        assert!(
+            normal.contains(&inner_loan::Disposition::Live),
+            "the normal path uses the end pointer after the call: {normal:?}"
+        );
+        assert!(
+            unwind
+                .iter()
+                .all(|disposition| *disposition == inner_loan::Disposition::Dead),
+            "the unwind edge leaves the frame: {unwind:?}"
+        );
+    });
 }
 
 /// The fixtures' settled kinds, solved in a child with every `CRAT_` switch unset -- the defaults
@@ -281,6 +373,7 @@ fn r388_child_kinds() {
     let code = match std::env::var("R388_SHAPE").as_deref() {
         Ok("STRTOL") => STRTOL,
         Ok("NEGATIVES") => NEGATIVES,
+        Ok("UNWIND") => UNWIND,
         other => panic!("unknown shape {other:?}"),
     };
     for (key, kind) in super::super::copy_relax_tests::kinds(code) {
@@ -307,6 +400,26 @@ fn r388_a_the_end_pointer_is_a_reference_and_the_negatives_stay_raw() {
                 .map(String::as_str),
             Some("raw"),
             "{function}: {negatives:?}"
+        );
+    }
+}
+
+/// 270 row 4 (R1349-1): a release on an unwind exit takes the holder's disposition on the unwind
+/// edge, where the frame ends -- the end pointer's use on the normal path does not count there. An
+/// escaped holder and a holder inside a local with drop glue stay raw.
+#[test]
+fn r388_a_an_unwind_exit_is_judged_on_its_own_edge() {
+    let kinds = kinds_by_default("UNWIND");
+    assert_eq!(
+        kinds.get("main_0::end").map(String::as_str),
+        Some("ref"),
+        "{kinds:?}"
+    );
+    for function in ["escaped", "guarded"] {
+        assert_eq!(
+            kinds.get(&format!("{function}::end")).map(String::as_str),
+            Some("raw"),
+            "{function}: {kinds:?}"
         );
     }
 }

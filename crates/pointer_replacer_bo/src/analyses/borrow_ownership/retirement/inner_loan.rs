@@ -23,7 +23,7 @@ use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         BasicBlock, Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue,
-        StatementKind, TerminatorKind,
+        StatementKind, TerminatorKind, UnwindAction,
     },
     ty::TyCtxt,
 };
@@ -503,12 +503,17 @@ pub(crate) enum Missing {
 #[derive(Debug, Default)]
 pub(crate) struct InnerLoans {
     rows: FxHashMap<(LocalDefId, Local, u8), Row>,
+    /// Relay main/388 (R1349-1): each frame's unwind exits -- the terminators whose unwind edge
+    /// leaves the frame with no cleanup block (`UnwindAction::Continue`).
+    unwind_exits: FxHashMap<LocalDefId, FxHashSet<Location>>,
 }
 
 #[derive(Debug)]
 struct Row {
     escaped: bool,
     liveness: ClosureLiveness,
+    /// A member of the holder's copy closure has drop glue.
+    droppable: bool,
 }
 
 /// Build the obligations and their facts once per model.
@@ -525,6 +530,7 @@ pub(crate) fn analyze(
     let graph = super::local_outcome::copy_graph(program, slots);
     let mut rows = FxHashMap::default();
     let mut escapes: FxHashMap<LocalDefId, ValueEscapes> = FxHashMap::default();
+    let mut unwind_exits: FxHashMap<LocalDefId, FxHashSet<Location>> = FxHashMap::default();
     for loan in obligations(program, slots, is_ref) {
         let body = program
             .tcx
@@ -537,13 +543,33 @@ pub(crate) fn analyze(
                 .or_insert_with(|| ValueEscapes::of_body(program.tcx, &body));
             members.iter().any(|&local| direct.escapes(local))
         };
+        let typing_env = body.typing_env(program.tcx);
+        let droppable = members.iter().any(|&local| {
+            body.local_decls[local]
+                .ty
+                .needs_drop(program.tcx, typing_env)
+        });
+        unwind_exits.entry(loan.key.function).or_insert_with(|| {
+            body.basic_blocks
+                .iter_enumerated()
+                .filter(|(_, data)| data.terminator().unwind() == Some(&UnwindAction::Continue))
+                .map(|(block, data)| Location {
+                    block,
+                    statement_index: data.statements.len(),
+                })
+                .collect()
+        });
         let liveness = ClosureLiveness::of_body(&body, members);
         rows.insert(
             (loan.key.function, loan.key.local, loan.key.depth),
-            Row { escaped, liveness },
+            Row {
+                escaped,
+                liveness,
+                droppable,
+            },
         );
     }
-    InnerLoans { rows }
+    InnerLoans { rows, unwind_exits }
 }
 
 /// The owner locals of the holder's copy-graph component, in its own frame.
@@ -610,6 +636,40 @@ impl InnerLoans {
             return Disposition::Unrepresented(Missing::Escaped);
         }
         if row.liveness.live_after(location) {
+            Disposition::Live
+        } else {
+            Disposition::Dead
+        }
+    }
+
+    /// Relay main/388 (R1349-1), 270 row 4: the disposition at a release. A release on an unwind
+    /// exit -- an `Unwind`-phase event at a terminator whose unwind edge leaves the frame -- is judged
+    /// on that edge, where the frame ends: a holder that has not escaped has no later use there, so it
+    /// is Dead, whatever the normal path does next. Fail closed: a holder whose copy closure reaches
+    /// a local with drop glue stays Live there (the edge's landing-pad drops are uses on it), an
+    /// escaped holder stays unrepresented, and every other release keeps [`Self::disposition`].
+    pub(crate) fn disposition_at(
+        &self,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+        location: Location,
+        on_unwind_edge: bool,
+    ) -> Disposition {
+        let exit = on_unwind_edge
+            && self
+                .unwind_exits
+                .get(&function)
+                .is_some_and(|exits| exits.contains(&location));
+        if !exit {
+            return self.disposition(function, local, depth, location);
+        }
+        let Some(row) = self.rows.get(&(function, local, depth)) else {
+            return Disposition::Unrepresented(Missing::NoObligation);
+        };
+        if row.escaped {
+            Disposition::Unrepresented(Missing::Escaped)
+        } else if row.droppable {
             Disposition::Live
         } else {
             Disposition::Dead
