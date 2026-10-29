@@ -1113,7 +1113,7 @@ pub(crate) fn core_pointer_step(tcx: TyCtxt<'_>, call: &CallKind) -> Option<bool
 }
 
 /// Core's raw-pointer `is_null`: reads nothing through the pointer.
-fn core_is_null(tcx: TyCtxt<'_>, call: &CallKind) -> bool {
+pub(crate) fn core_is_null(tcx: TyCtxt<'_>, call: &CallKind) -> bool {
     matches!(call, CallKind::RustLib(did)
         if tcx.crate_name(did.krate).as_str() == "core"
             && tcx.def_path_str(*did).contains("::ptr::")

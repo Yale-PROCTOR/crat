@@ -16,20 +16,30 @@
 //! outlives the call. The edge between two such copies
 //! lent to one call stays (it is real for references); only the source's drag to its copy goes.
 //!
-//! **The two-views hazard and the emission's obligation** (the seat's condition, relay
-//! era-5c/269 §1.3). When two or more arguments of one call are views of one `Ref` subject
-//! (`f(out, out)`), the subject's `Ref` is sound only if **every view of the subject passed to
-//! the call derives from ONE raw pointer** (`let p = out.as_mut_ptr(); f(p, p, …)`), and the
-//! callee's formals at those positions stay raw (R833's pair rule, which the rewriter already
-//! applies: two references into one object at one call are UB under the callee's protectors,
-//! whatever pointer they come from). Spelled as separate reborrows (`out.as_mut_ptr()` twice),
-//! the views are sibling nodes under Tree Borrows: a callee that writes through one view and
-//! then reads through another reads a Disabled tag (030's `fma_array(out, out, out, out, n)`;
-//! `thash`, `haraka512_perm` and `memmove` read before they write). Every call an admitted copy
-//! reaches with two or more views of its subject (`construction::copy_relax_views`) is exported
-//! as a `multi-view` row (`MultiView`, the `multi-view` export family), one per admission,
-//! whatever the subject's kind settles to (a Raw subject owes nothing); the spelling is the
-//! rewriter's. A `NotRecorded` family means unknown, not none.
+//! **The emission's two obligations** (the seat's condition, relay era-5c/269 §1.3, and the
+//! second review). Both are the rewriter's; this module exports what they need.
+//!
+//! - **A relaxed view carries its source's tag.** A raw copy of a `Ref` source is sound only
+//!   when the emission creates it without a retag (`&raw mut *y`, `y as *mut T`, the
+//!   coercion), never through a reborrow (`ptr::from_mut(&mut *y)`, a slice's
+//!   `as_mut_ptr()`) while `y` is accessed before the view's last use: under Tree Borrows a
+//!   reborrowed view is a child that the next write through `y` disables. S39's in-function
+//!   relaxation already rests on this; the call arm extends it to a call's arguments.
+//! - **The views of one subject at one call are not siblings.** When two or more arguments
+//!   of one call are views of one `Ref` subject (`f(out, out)`), the subject's `Ref` is sound
+//!   only if the emission introduces no sibling reborrow among them: every view it creates
+//!   for the call derives from ONE raw pointer (`let p = out.as_mut_ptr(); f(p, p, …)`; a
+//!   reborrow the input already has, `&(*ctx).pub_seed`, stays as it is), and the callee's
+//!   formals at those positions stay raw (R833's pair rule, which the rewriter already
+//!   applies: two references into one object at one call are UB under the callee's
+//!   protectors, whatever pointer they come from). Spelled as separate reborrows
+//!   (`out.as_mut_ptr()` twice), the views are siblings: a callee that writes through one
+//!   view and then reads through another reads a Disabled tag (030's
+//!   `fma_array(out, out, out, out, n)`; `thash`, `haraka512_perm` and `memmove` read before
+//!   they write). Every call an admitted copy reaches with two or more views of its subject
+//!   (`construction::copy_relax_views`) is exported as a `multi-view` row (`MultiView`, the
+//!   `multi-view` export family), one per admission, whatever the subject's kind settles to (a
+//!   Raw subject owes nothing). A `NotRecorded` family means unknown, not none.
 
 use std::cell::RefCell;
 

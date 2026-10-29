@@ -2588,9 +2588,10 @@ fn copy_relax_multi_views<'tcx>(
 
 /// The views of `subject`'s bytes in `body` (relay era-5c/269 §1.3): the subject and, to a
 /// fixpoint, every local assigned a copy or a cast of a view, an address under one
-/// (`&(*v).f`, `&raw (*v)[i]`, no further dereference), core's pointer step or slice
-/// `as_ptr` / `as_mut_ptr` on one, or the destination `memcpy` / `memmove` / `memset` return
-/// when one is their first argument. A pointer loaded through a view and the address of a
+/// (`&(*v).f`, `&raw (*v)[i]`, no further dereference), the pointer a core call returns on one
+/// (a step, `wrapping_add`, slice `as_ptr` / `as_mut_ptr`; over-approximated: any core call
+/// with a view first and a pointer result), or the destination `memcpy` / `memmove` /
+/// `memset` return when one is their first argument. A pointer loaded through a view and the address of a
 /// view's own storage are not views.
 fn copy_relax_views<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
@@ -2633,15 +2634,14 @@ fn copy_relax_views<'tcx>(
                 }
             }
             if let Some(terminator) = data.terminator.as_ref()
-                && let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind
                 && let Some(call) = terminator.as_call(tcx)
                 && let Some(dest) = call.destination.as_local()
                 && call
                     .args
                     .first()
                     .is_some_and(|arg| whole(&arg.node, &views))
-                && (super::index_ranges::core_pointer_step(tcx, &call.func).is_some()
-                    || super::index_ranges::core_slice_buffer(tcx, body, func)
+                && ((matches!(call.func, CallKind::RustLib(_))
+                    && body.local_decls[dest].ty.is_any_ptr())
                     || super::index_ranges::libc_row(&call.func)
                         .is_some_and(|(written, _, _)| written == 0))
             {
@@ -2719,6 +2719,8 @@ fn copy_relax_escape<'tcx>(
         return Some(CopyLendEligibilityDrop::C3Return);
     }
     // Relay era-5c/269: is the storage of a member itself addressed (`&x`, `&raw const x`)?
+    // And was a member lent to a call through the arm below?
+    let mut lent = false;
     let addressed = body.basic_blocks.iter().any(|data| {
         data.statements.iter().any(|statement| {
             matches!(
@@ -2802,11 +2804,15 @@ fn copy_relax_escape<'tcx>(
                     _ => false,
                 }
         };
-        if call.args.iter().enumerate().any(|(j, arg)| {
-            arg.node.place().is_some_and(|place| {
-                closure.contains(&SlotOwner::Local(place.local)) && !kept(j, place)
-            })
-        }) {
+        let mut members = call.args.iter().enumerate().filter(|(_, arg)| {
+            arg.node
+                .place()
+                .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
+        });
+        if members
+            .clone()
+            .any(|(j, arg)| !kept(j, arg.node.place().unwrap()))
+        {
             return Some(match call.func {
                 CallKind::FreeStanding(_) | CallKind::Impl(_) => {
                     CopyLendEligibilityDrop::C3OrdinaryCall
@@ -2814,8 +2820,53 @@ fn copy_relax_escape<'tcx>(
                 _ => CopyLendEligibilityDrop::C3OutwardUnknownCall,
             });
         }
+        lent |= members.next().is_some();
+    }
+    // Relay era-5c/269, the second review: a copy lent through the call arm is admitted only
+    // when nothing else lets its value out behind the summaries' back. The relaxation's escape
+    // takes every core call and every non-pointer rvalue as staying in the function; a copy
+    // that reaches no call keeps that rule (S39's), one lent to a call does not.
+    if lent && copy_relax_lent_escape(program.tcx, body, closure) {
+        return Some(CopyLendEligibilityDrop::C3OutwardUnknownCall);
     }
     None
+}
+
+/// Relay era-5c/269, the second review: does a member of a lent copy's closure reach a core
+/// call other than a pointer step, slice `as_ptr` / `as_mut_ptr` or `is_null`
+/// (`ptr::write_volatile(&raw mut g, x)`, C2Rust's volatile store), or a cast to a non-pointer
+/// (`x as usize`, a transmute)?
+fn copy_relax_lent_escape<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    closure: &FxHashSet<SlotOwner>,
+) -> bool {
+    let member = |place: Place<'tcx>| closure.contains(&SlotOwner::Local(place.local));
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            if let StatementKind::Assign(box (_, Rvalue::Cast(_, operand, ty))) = &statement.kind
+                && !ty.is_any_ptr()
+                && operand.place().is_some_and(member)
+            {
+                return true;
+            }
+        }
+        if let Some(terminator) = data.terminator.as_ref()
+            && let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind
+            && let Some(call) = terminator.as_call(tcx)
+            && matches!(call.func, CallKind::RustLib(_))
+            && call
+                .args
+                .iter()
+                .any(|arg| arg.node.place().is_some_and(member))
+            && super::index_ranges::core_pointer_step(tcx, &call.func).is_none()
+            && !super::index_ranges::core_slice_buffer(tcx, body, func)
+            && !super::index_ranges::core_is_null(tcx, &call.func)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn analyze_copy_lend_candidates(
