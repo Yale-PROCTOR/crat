@@ -41,6 +41,16 @@ pub(crate) struct SourceInstance {
 /// any of the 376 reads (main 267), so the 376 carries no marker at this depth.
 pub(crate) const LINEAGE_DEPTH: usize = 7;
 
+/// Relay main/385 (R1335-1) (3): the measurement-only probe (`CRAT_BO_MATCHED_PROBE=keys`; never
+/// in a gate, never on the 17 or the 376): an applied row's proof and an applied terminal's suffix
+/// are an empty placeholder, and `paths` carries no witness, so a row costs its key alone. The
+/// keys, guards and markers derive as in the real form; the run is stopped at the fixpoint's end
+/// mark and its model is never read. Unset, nothing changes.
+pub(crate) fn probe() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| std::env::var("CRAT_BO_MATCHED_PROBE").as_deref() == Ok("keys"))
+}
+
 /// The depth in force: `CRAT_BO_LINEAGE_DEPTH` when set -- for measurement runs only, never in a
 /// gate, never on the 17 or the 376 -- else [`LINEAGE_DEPTH`].
 fn lineage_depth() -> usize {
@@ -542,12 +552,35 @@ fn round_sizes(
         .map(|(row, _)| key_without_lineage(row))
         .collect();
     let new_keys = added_keys.iter().filter(|key| !keys.contains(*key)).count();
+    // Relay main/385 (4): the same keys with their guards left out -- (scope, seed, destination)
+    // triples -- and the most guard sets one triple carries, over the keys at the round's end.
+    fn triple<'r>(
+        key: &(&'r Scope, SeedKey, DestinationKey<'r>, &'r Guards),
+    ) -> (&'r Scope, SeedKey, DestinationKey<'r>) {
+        (key.0, key.1, key.2)
+    }
+    let triples: BTreeSet<_> = keys.iter().map(triple).collect();
+    let new_triples = added_keys
+        .iter()
+        .map(triple)
+        .filter(|key| !triples.contains(key))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut guard_sets: BTreeMap<_, usize> = BTreeMap::new();
+    for key in keys
+        .iter()
+        .chain(added_keys.iter().filter(|key| !keys.contains(*key)))
+    {
+        *guard_sets.entry(triple(key)).or_default() += 1;
+    }
+    let max_guard_sets = guard_sets.values().copied().max().unwrap_or(0);
     format!(
-        "round={round} added={} distinct={distinct} proof_steps={steps} exact_paths={} longest_path={longest} recursive={recursive} keys={} added_keys={} new_keys={new_keys}",
+        "round={round} added={} distinct={distinct} proof_steps={steps} exact_paths={} longest_path={longest} recursive={recursive} keys={} added_keys={} new_keys={new_keys} keys_noguard={} new_keys_noguard={new_triples} max_guard_sets={max_guard_sets}",
         added.len(),
         paths.len(),
         keys.len(),
-        added_keys.len()
+        added_keys.len(),
+        triples.len()
     )
 }
 
@@ -673,13 +706,13 @@ fn closure_lines(facts: &Facts, base: &BTreeMap<Scope, Function>) -> Vec<String>
 
 /// Relay main/382 (a) 5: a relation's key without its lineages -- (scope, the seed's input node or
 /// source endpoint, the destination's port or terminal target, guards) -- for the `keys` marks.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SeedKey {
     Input(Node),
     Source(EquationId),
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DestinationKey<'a> {
     Port(Node),
     Terminal(&'a TerminalTarget),
@@ -835,8 +868,13 @@ impl Function {
             };
             for edge in edges {
                 let Some(next) = combine(&guards, &edge.guards) else { continue };
-                let mut witness = proof.clone();
-                witness.push(edge.step.clone());
+                let witness = if probe() {
+                    Vec::new()
+                } else {
+                    let mut witness = proof.clone();
+                    witness.push(edge.step.clone());
+                    witness
+                };
                 pending.push_back((edge.to, next, witness));
             }
         }
@@ -2266,7 +2304,10 @@ impl MatchedTransport {
                             if !relations.contains_key(&relation)
                                 && first_in_round(&mut pushed, &relation, scan)
                             {
-                                added.push((relation, proof.clone()));
+                                added.push((
+                                    relation,
+                                    if probe() { Vec::new() } else { proof.clone() },
+                                ));
                             }
                         }
                         for terminal in function.terminals.iter().filter(|end| end.node == output) {
@@ -2280,8 +2321,13 @@ impl MatchedTransport {
                             if !relations.contains_key(&relation)
                                 && first_in_round(&mut pushed, &relation, scan)
                             {
-                                let mut proof = proof.clone();
-                                proof.extend(terminal.suffix.iter().cloned());
+                                let proof = if probe() {
+                                    Vec::new()
+                                } else {
+                                    let mut proof = proof.clone();
+                                    proof.extend(terminal.suffix.iter().cloned());
+                                    proof
+                                };
                                 added.push((relation, proof));
                             }
                         }
@@ -2292,6 +2338,10 @@ impl MatchedTransport {
                 round_sizes(round, &relations, &added)
             });
             if added.is_empty() {
+                // Relay main/385: the fixpoint's end, where the key-closure probe is stopped.
+                crate::phase_log::sub("matched:fixpoint", "end", || {
+                    format!("rounds={round} relations={}", relations.len())
+                });
                 return Self {
                     functions,
                     relations,
@@ -2417,11 +2467,15 @@ impl MatchedTransport {
                                     lineage: terminal.lineage.through(key),
                                 },
                                 guards,
-                                suffix: vec![Step::EndApply {
-                                    call: key.clone(),
-                                    relation: relation.clone(),
-                                    input: input.clone(),
-                                }],
+                                suffix: if probe() {
+                                    Vec::new()
+                                } else {
+                                    vec![Step::EndApply {
+                                        call: key.clone(),
+                                        relation: relation.clone(),
+                                        input: input.clone(),
+                                    }]
+                                },
                             });
                         }
                     }
