@@ -15,7 +15,7 @@ use super::{
     fold_laws::{self, Plan},
     fold_member_output::ZeroOutput,
     fold_subtree::Membership,
-    matched::{MatchedTransport, MemberReturn, SourceInstance, TerminalTarget},
+    matched::{MatchedTransport, Meet, MemberReturn, SourceInstance, TerminalTarget},
     transport::Node,
 };
 
@@ -31,6 +31,15 @@ pub(crate) struct Route {
 pub(crate) struct MemberPlan {
     pub(crate) laws: Plan,
     pub(crate) routes: Vec<Route>,
+}
+
+/// Relay main/385 (R1335-1): the one free a source endpoint's route ends at -- `[meet] = frees`,
+/// else competing responsibility.
+pub(crate) fn single_free(frees: &[Meet]) -> Result<&Meet, Hold> {
+    let [meet] = frees else {
+        return Err(Hold::CompetingResponsibility);
+    };
+    Ok(meet)
 }
 
 #[cfg(test)]
@@ -108,9 +117,7 @@ pub(crate) fn audit_metadata(
             .into_iter()
             .filter(|meet| matches!(meet.terminal.target, TerminalTarget::Free(_)))
             .collect();
-        let [meet] = frees.as_slice() else {
-            return Err(Hold::CompetingResponsibility);
-        };
+        let meet = single_free(&frees)?;
         let TerminalTarget::Free(free) = meet.terminal.target else {
             return Err(Hold::OriginAt(line!()));
         };

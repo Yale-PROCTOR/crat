@@ -341,3 +341,100 @@ fn r385_a_a_lineage_deeper_than_k_becomes_the_scope_call_marker() {
         "one call deeper than LINEAGE_DEPTH"
     );
 }
+
+/// Relay main/385 (2): the meets to a free target from the fixture's one source (its `malloc`),
+/// as `fold_member_laws` takes them (`meets_for` of the endpoint, Free targets only).
+fn frees_from_the_source(facts: &Facts, transport: &FrozenTransport) -> Vec<super::matched::Meet> {
+    let sources = super::transport::CandidateGraph::build(facts).sources;
+    let [source] = sources.as_slice() else {
+        panic!("one source: {sources:?}");
+    };
+    transport
+        .matched
+        .meets_for(source.node)
+        .into_iter()
+        .filter(|meet| {
+            matches!(
+                meet.terminal.target,
+                super::matched::TerminalTarget::Free(_)
+            )
+        })
+        .collect()
+}
+
+/// Two recursive paths (through `g` and `h`) to one free in `sink`, through one outermost call
+/// `caller -> f`: the repeated call keys make `Recursive` markers, but the shortest path never
+/// repeats a call, so an `Exact` meet is always among the frees.
+const RECURSIVE_FREE_FIXTURE: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
+pub unsafe fn sink(p: *mut i32) { free(p); }
+pub unsafe fn f(p: *mut i32, n: usize) {
+    if n == 0 { sink(p); return; }
+    if n % 2 == 0 { g(p, n - 1) } else { h(p, n - 1) }
+}
+pub unsafe fn g(p: *mut i32, n: usize) { f(p, n) }
+pub unsafe fn h(p: *mut i32, n: usize) { f(p, n) }
+pub unsafe fn caller(n: usize) { let q = malloc(4); f(q, n); }
+"#;
+
+/// Two paths (through `left` and `right`) of eight calls each to one free in `sink`, through one
+/// outermost call `caller -> top`: both lineages pass LINEAGE_DEPTH and collapse into one marker.
+const DEEP_FREE_FIXTURE: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut i32; fn free(p: *mut i32); }
+pub unsafe fn sink(p: *mut i32) { free(p); }
+pub unsafe fn d7(p: *mut i32) { sink(p) }
+pub unsafe fn d6(p: *mut i32) { d7(p) }
+pub unsafe fn d5(p: *mut i32) { d6(p) }
+pub unsafe fn d4(p: *mut i32) { d5(p) }
+pub unsafe fn d3(p: *mut i32) { d4(p) }
+pub unsafe fn left(p: *mut i32) { d3(p) }
+pub unsafe fn right(p: *mut i32) { d3(p) }
+pub unsafe fn top(p: *mut i32, c: bool) { if c { left(p) } else { right(p) } }
+pub unsafe fn caller(c: bool) { let q = malloc(4); top(q, c); }
+"#;
+
+/// Relay main/385 (2), R1264-1 on today's code: two recursive paths to one free through one
+/// outermost call do NOT reach `fold_member_laws.rs:111` as a lone marker -- the shortest path's
+/// `Exact` meet is among the frees, so `[meet] = frees` already holds it as competing.
+#[test]
+fn r385_b_a_recursive_free_never_comes_alone() {
+    use super::matched::SourceLineage;
+    with_freeze_of(RECURSIVE_FREE_FIXTURE, |facts, transport| {
+        let frees = frees_from_the_source(facts, transport);
+        assert!(
+            frees
+                .iter()
+                .any(|meet| matches!(meet.terminal.lineage, SourceLineage::Exact(_))),
+            "{frees:?}"
+        );
+        assert!(
+            frees
+                .iter()
+                .any(|meet| matches!(meet.terminal.lineage, SourceLineage::Recursive { .. })),
+            "the recursive paths are markers: {frees:?}"
+        );
+        assert!(super::fold_member_laws::single_free(&frees).is_err());
+    });
+}
+
+/// Relay main/385 (2): with 3b', two deep paths to one free through one outermost call collapse
+/// into ONE marker meet, which `[meet] = frees` alone would take for a single free; the guard
+/// takes a free only with an `Exact` lineage.
+#[test]
+fn r385_c_a_collapsed_deep_free_is_not_a_single_free() {
+    use super::matched::SourceLineage;
+    with_freeze_of(DEEP_FREE_FIXTURE, |facts, transport| {
+        let frees = frees_from_the_source(facts, transport);
+        assert!(
+            matches!(
+                frees.as_slice(),
+                [meet] if matches!(meet.terminal.lineage, SourceLineage::Recursive { .. })
+            ),
+            "one marker meet: {frees:?}"
+        );
+        assert!(
+            super::fold_member_laws::single_free(&frees).is_err(),
+            "a marker stands for several frees"
+        );
+    });
+}
