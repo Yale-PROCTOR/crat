@@ -246,9 +246,9 @@ fn e5c_w269_b_a_callee_storing_into_a_global_keeps_the_subject_raw() {
     );
     let solved = solve(&code);
     assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
-    // The `out` copy is admitted (`mix` keeps `out`), so the call has its
-    // row; the `inp` copy is not, and drags the subject Raw: the row is per
-    // admission, and its obligation moot while the subject is Raw.
+    // The `out` copy is admitted (`mix` never retains `out`), so the call has
+    // its row; the `inp` copy is not, and drags the subject Raw: the row is
+    // per admission, and its obligation moot while the subject is Raw.
     assert_eq!(multi_views(&solved, "work").len(), 1);
 }
 
@@ -394,5 +394,173 @@ unsafe extern "C" fn driver(out: *mut f64, n: i32) {
         rows[0]["arguments"],
         serde_json::json!([0, 1, 2, 3]),
         "{rows:#?}"
+    );
+}
+
+/// (i) The review's blocker: the copy's own storage handed to `memcpy` as
+/// its source (`memcpy(&saved, &x, sizeof x)`) carries the copy's value into
+/// a global. The subject stays Raw.
+#[test]
+fn e5c_w269_i_memcpy_out_of_the_copys_own_storage_keeps_the_subject_raw() {
+    let code = r#"
+unsafe extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+}
+static mut SAVED: *mut u8 = 0 as *mut u8;
+unsafe extern "C" fn f(y: *mut u8) {
+    let x: *mut u8 = y;
+    *y = 1;
+    memcpy(
+        &raw mut SAVED as *mut core::ffi::c_void,
+        &raw const x as *const core::ffi::c_void,
+        8,
+    );
+    *y = 2;
+    *SAVED = 3;
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> u8 {
+    let mut b: [u8; 8] = [0; 8];
+    f(b.as_mut_ptr());
+    return b[0];
+}
+"#;
+    let solved = solve(code);
+    assert_eq!(kind(&solved, "f::y"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (j) A callee that returns its formal retains it: Raw.
+#[test]
+fn e5c_w269_j_a_callee_returning_its_formal_keeps_the_subject_raw() {
+    let code = program(
+        "static mut LAST: *const u8 = 0 as *const u8;\n\
+         unsafe extern \"C\" fn pass(q: *const u8) -> *const u8 { return q; }",
+        "LAST = pass(inp);",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (k) A callee that keeps its formal's address as an integer: Raw.
+#[test]
+fn e5c_w269_k_a_callee_casting_its_formal_to_an_integer_keeps_the_subject_raw() {
+    let code = program(
+        "static mut ADDR: usize = 0;",
+        "ADDR = inp as usize;",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (l) A callee that writes its formal: no summary (fail closed), Raw.
+#[test]
+fn e5c_w269_l_a_callee_writing_its_formal_keeps_the_subject_raw() {
+    let code = program("", "inp = inp.offset(0);", IN_PLACE)
+        .replace("inp: *const u8, n: i32", "mut inp: *const u8, n: i32");
+    assert!(code.contains("mut inp"));
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (m) A callee in a recursive SCC of two: Raw.
+#[test]
+fn e5c_w269_m_a_callee_in_a_two_function_cycle_keeps_the_subject_raw() {
+    let code = program(
+        "unsafe extern \"C\" fn again(n: i32, addr: *mut u32) {\n    \
+         let mut t: [u8; 64] = [0; 64];\n    mix(t.as_mut_ptr(), t.as_ptr(), n, addr);\n}",
+        "if n > 1 { again(n - 1, addr); }",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (n) E1's holder: the formal stored into a local struct handed to a
+/// retaining callee is retained (Raw); read back and dropped with the call,
+/// it is not (Ref).
+#[test]
+fn e5c_w269_n_a_holder_handed_to_a_retaining_callee_keeps_the_subject_raw() {
+    let holder = "#[repr(C)] pub struct Hd { pub p: *const u8, pub n: i32 }\n\
+                  static mut KEEPH: *const u8 = 0 as *const u8;\n\
+                  unsafe extern \"C\" fn take(h: *mut Hd) { KEEPH = (*h).p; }";
+    let code = program(
+        holder,
+        "let mut h: Hd = Hd { p: 0 as *const u8, n: 0 }; h.p = inp; take(&mut h);",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+    let code = program(
+        holder,
+        "let mut h: Hd = Hd { p: 0 as *const u8, n: 0 }; h.p = inp; *out = *h.p;",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "ref", "{:#?}", solved.kinds);
+}
+
+/// (o) `multi-view` counts views of the subject's bytes only: a pointer
+/// loaded through a view (`(*x).next`) and the address of the subject's own
+/// storage (`&mut y`) are not views, so neither call has a row.
+#[test]
+fn e5c_w269_o_a_loaded_pointer_or_an_address_of_the_subject_is_no_view() {
+    let code = r#"
+#[repr(C)] pub struct nd { pub v: u8, pub next: *mut nd }
+unsafe extern "C" fn g(a: *mut nd, b: *mut nd, addr: *mut u32) { (*a).v = (*b).v ^ *addr as u8; }
+unsafe extern "C" fn h2(pp: *mut *mut nd, b: *mut nd, addr: *mut u32) { (*b).v = (**pp).v ^ *addr as u8; }
+unsafe extern "C" fn walk(x: *mut nd) {
+    let mut addr: [u32; 8] = [0; 8];
+    (*x).v = 1;
+    g(x, (*x).next, addr.as_mut_ptr());
+    (*x).v = 2;
+}
+unsafe extern "C" fn twice(mut y: *mut nd) {
+    let mut addr: [u32; 8] = [0; 8];
+    (*y).v = 1;
+    h2(&mut y, y, addr.as_mut_ptr());
+    (*y).v = 2;
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> u8 {
+    let mut b = nd { v: 0, next: 0 as *mut nd };
+    let mut a = nd { v: 0, next: &mut b };
+    walk(&mut a);
+    twice(&mut a);
+    return a.v;
+}
+"#;
+    let solved = solve(code);
+    assert!(
+        multi_views(&solved, "walk").is_empty(),
+        "{:#?}",
+        solved.multi_view
+    );
+    assert!(
+        multi_views(&solved, "twice").is_empty(),
+        "{:#?}",
+        solved.multi_view
+    );
+}
+
+/// (p) A reborrow of the subject live across the call, used after it: the
+/// callee's write through the admitted view meets it, so the two are never
+/// both Ref.
+#[test]
+fn e5c_w269_p_a_reborrow_live_across_the_call_is_not_ref_beside_the_subject() {
+    let code = WORK.replace(
+        "    *out = 1;\n    __CALL__;\n    *out = 2;",
+        "    let r: *mut u8 = out;\n    *r = 1;\n    __CALL__;\n    *r = 2;",
+    );
+    assert!(code.contains("*r = 2"));
+    let code = format!(
+        "{}\n{}",
+        MIX.replace("__BODY__", ""),
+        code.replace("__CALL__", IN_PLACE)
+    );
+    let solved = solve(&code);
+    assert!(
+        kind(&solved, "work::out") != "ref" || kind(&solved, "work::r") != "ref",
+        "{:#?}",
+        solved.kinds
     );
 }
