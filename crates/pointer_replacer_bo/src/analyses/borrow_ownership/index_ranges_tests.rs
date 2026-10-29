@@ -745,6 +745,259 @@ fn e5c_w267_s2_struct_fields_meet() {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 2 (relay era-5c/267 §3): the field path (E1) and the equality exit
+// (E2), β's shape (005's `SPX_merkle_sign` / `SPX_wots_treehashx1` /
+// `SPX_wots_gen_leafx1`).
+// ---------------------------------------------------------------------------
+
+/// The equality-exit loop: `tree` copies 16 bytes to `auth[h·16 ..]` for every
+/// `h` before `h == tree_height` (`wrapping_mul`, `wrapping_add`, as C2Rust
+/// writes them); `first` writes `p[3]`.
+const B2: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_upper_case_globals)]
+pub const SPX_N: core::ffi::c_int = 16 as core::ffi::c_int;
+pub const SPX_TREE_HEIGHT: core::ffi::c_int = 66 as core::ffi::c_int / 22 as core::ffi::c_int;
+unsafe extern "C" {
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: core::ffi::c_ulong,
+    ) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn tree(mut auth: *mut u8, mut leaf: *const u8, tree_height: u32) {
+    let mut h: u32 = 0;
+    h = 0 as u32;
+    loop {
+        if h == tree_height {
+            return;
+        }
+        memcpy(
+            &mut *auth.offset(h.wrapping_mul(SPX_N as u32) as isize) as *mut u8
+                as *mut core::ffi::c_void,
+            leaf as *const core::ffi::c_void,
+            SPX_N as core::ffi::c_ulong,
+        );
+        h = h.wrapping_add(1);
+    }
+}
+unsafe extern "C" fn first(mut p: *mut u8) {
+    *p.offset(3) = 1 as u8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn sign(mut sig: *mut u8, mut leaf: *const u8) {
+    let mut auth: *mut u8 = sig.offset(560 as isize);
+    first(sig);
+    tree(auth, leaf, SPX_TREE_HEIGHT as u32);
+}
+"#;
+
+/// B2 (E2): `h ≤ tree_height` is inductive once the `h ≠ tree_height` edge
+/// reads `h ≤ tree_height − 1`, so `Ext(tree, auth)` is `[0, 16·tree_height)`
+/// and the call's is `[560, 608)` against `first`'s `[3, 4)`: the edge is gone.
+#[test]
+fn e5c_w267_b2_equality_exit_counter() {
+    assert_eq!(edges(B2, "sign"), 0, "the disjoint pair leaves no edge");
+    let (accepted, receipts) = accepts(B2, "sign");
+    assert!(accepted, "`sign`'s pointers are Ref");
+    assert!(
+        has_receipt(&receipts, (560, 608), (3, 4)),
+        "the receipt: the loan's [560, 608), the access's [3, 4): {receipts:?}"
+    );
+}
+
+/// B2's control: a step of 2 can pass `tree_height` without meeting it, so
+/// `h ≤ tree_height` is not inductive and `h` is unbounded: the edge stays.
+#[test]
+fn e5c_w267_b2b_a_step_that_skips_the_exit_is_unknown() {
+    let code = B2.replace("h = h.wrapping_add(1);", "h = h.wrapping_add(2);");
+    assert!(code.contains("h.wrapping_add(2)"));
+    control(&code, "sign");
+}
+
+/// `Ext(tree, auth)` is `[0, 16·tree_height)` written: the exit's counter and
+/// the product's range in the formal (`wrapping_mul` by 16 of `h ≤ n − 1`).
+#[test]
+fn e5c_w267_d5_the_exit_counter_bounds_the_extent_by_the_formal() {
+    with_program(B2, |program| {
+        let table = IndexRanges::build(program);
+        let tree = function(program, "tree");
+        assert_eq!(
+            bytes(&table.ext(tree, 0)),
+            Some((
+                Bound::constant(0),
+                Bound {
+                    formal: Some(2),
+                    coef: 16,
+                    add: 0
+                },
+                true
+            ))
+        );
+    });
+}
+
+/// β: `sign` stores `sig` into `info.sig` and hands `&mut info` to `tree`,
+/// which hands it on to `gen_leaf`; `gen_leaf` copies 16 bytes to
+/// `(*info).sig[i·16 ..]` for `i < 35`, reads `(*info).steps[i]` and writes
+/// `(*info).addr` through `set_addr`; `tree` copies to `auth[h·16 ..]` for
+/// `h < tree_height`.
+const B1: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments, non_upper_case_globals)]
+pub const SPX_N: core::ffi::c_int = 16 as core::ffi::c_int;
+pub const SPX_WOTS_LEN: core::ffi::c_int = 35 as core::ffi::c_int;
+pub const SPX_WOTS_BYTES: core::ffi::c_int = SPX_WOTS_LEN * SPX_N;
+pub const SPX_TREE_HEIGHT: core::ffi::c_int = 66 as core::ffi::c_int / 22 as core::ffi::c_int;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info {
+    pub sig: *mut u8,
+    pub leaf: u32,
+    pub steps: *mut u32,
+    pub addr: [u32; 8],
+}
+unsafe extern "C" {
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: core::ffi::c_ulong,
+    ) -> *mut core::ffi::c_void;
+}
+unsafe extern "C" fn set_addr(mut addr: *mut u32, mut v: u32) {
+    *addr.offset(3) = v;
+}
+unsafe extern "C" fn gen_leaf(mut dest: *mut u8, mut v_info: *mut core::ffi::c_void) {
+    let mut info: *mut Info = v_info as *mut Info;
+    let mut buf: [u8; 16] = [0; 16];
+    let mut i: u32 = 0;
+    let mut s: u32 = 0;
+    i = 0 as u32;
+    while i < SPX_WOTS_LEN as u32 {
+        s = s.wrapping_add(*((*info).steps).offset(i as isize));
+        set_addr(((*info).addr).as_mut_ptr(), i);
+        memcpy(
+            ((*info).sig).offset(i.wrapping_mul(SPX_N as u32) as isize) as *mut core::ffi::c_void,
+            buf.as_mut_ptr() as *const core::ffi::c_void,
+            SPX_N as core::ffi::c_ulong,
+        );
+        i = i.wrapping_add(1);
+    }
+}
+unsafe extern "C" fn tree(mut auth: *mut u8, tree_height: u32, mut info: *mut Info) {
+    let mut leaf: [u8; 16] = [0; 16];
+    gen_leaf(leaf.as_mut_ptr(), info as *mut core::ffi::c_void);
+    let mut h: u32 = 0;
+    h = 0 as u32;
+    loop {
+        if h == tree_height {
+            return;
+        }
+        memcpy(
+            &mut *auth.offset(h.wrapping_mul(SPX_N as u32) as isize) as *mut u8
+                as *mut core::ffi::c_void,
+            leaf.as_mut_ptr() as *const core::ffi::c_void,
+            SPX_N as core::ffi::c_ulong,
+        );
+        h = h.wrapping_add(1);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn sign(mut sig: *mut u8) {
+    let mut auth: *mut u8 = sig.offset(SPX_WOTS_BYTES as isize);
+    let mut init: Info = Info {
+        sig: 0 as *mut u8,
+        leaf: 0 as u32,
+        steps: 0 as *mut u32,
+        addr: [0; 8],
+    };
+    let mut info: Info = init;
+    let mut steps: [u32; 35] = [0; 35];
+    info.sig = sig as *mut u8;
+    info.steps = steps.as_mut_ptr();
+    set_addr((info.addr).as_mut_ptr(), 1 as u32);
+    info.leaf = 7 as u32;
+    tree(auth, SPX_TREE_HEIGHT as u32, &mut info);
+}
+"#;
+
+/// B1 (E1 + E2): `info.sig`'s path reaches `sig + [0, 560)` (written, in
+/// `gen_leaf`) and `auth` reaches `sig + [560, 608)` (in `tree`): the edge is
+/// gone, `sign`'s pointers are `Ref`, and the receipt names both ranges.
+#[test]
+fn e5c_w267_b1_field_path_extent() {
+    assert_eq!(edges(B1, "sign"), 0, "the disjoint pair leaves no edge");
+    let (accepted, receipts) = accepts(B1, "sign");
+    assert!(accepted, "`sign`'s pointers are Ref");
+    assert!(
+        has_receipt(&receipts, (560, 608), (0, 560)),
+        "the receipt: the loan's [560, 608), the access's [0, 560): {receipts:?}"
+    );
+}
+
+/// B1's control (the relay's condition): `gen_leaf` stores to `(*info).sig`:
+/// the field path is Unknown, the edge stays.
+#[test]
+fn e5c_w267_b1b_a_callee_storing_to_the_field_is_unknown() {
+    let code = B1.replace(
+        "        i = i.wrapping_add(1);\n    }\n}",
+        "        i = i.wrapping_add(1);\n    }\n    (*info).sig = dest;\n}",
+    );
+    assert!(code.contains("(*info).sig = dest;"));
+    control(&code, "sign");
+}
+
+/// B1's control: `gen_leaf` keeps the loaded field in a global: the loaded
+/// value escapes, the edge stays.
+#[test]
+fn e5c_w267_b1c_a_loaded_field_that_escapes_is_unknown() {
+    let code = B1.replace(
+        "        i = i.wrapping_add(1);\n    }\n}",
+        "        i = i.wrapping_add(1);\n    }\n    G = (*info).sig;\n}\npub static mut G: *mut u8 = 0 as *mut u8;",
+    );
+    assert!(code.contains("G = (*info).sig;"));
+    control(&code, "sign");
+}
+
+/// B1's control: `sign` copies the whole holder (the pointer with it) before
+/// the call: Unknown, the edge stays.
+#[test]
+fn e5c_w267_b1d_a_holder_copied_whole_is_unknown() {
+    let code = B1.replace(
+        "    tree(auth, SPX_TREE_HEIGHT as u32, &mut info);",
+        "    let mut other: Info = info;\n    tree(auth, SPX_TREE_HEIGHT as u32, &mut other);",
+    );
+    assert!(code.contains("let mut other: Info = info;"));
+    control(&code, "sign");
+}
+
+/// B1's control: `info.steps` points into `sig` too, at 600: `gen_leaf`'s reads
+/// of `steps[i]` reach `sig + [600, 740)` (the second field's own path), which
+/// meets `auth`'s `[560, 608)`: that pair keeps its edge and `sign` is not
+/// accepted. (Its pairs with `info.sig`'s `[0, 560)` are disjoint and
+/// discharged, so not `control`.)
+#[test]
+fn e5c_w267_b1e_a_second_field_into_the_base_meets() {
+    let code = B1.replace(
+        "    info.steps = steps.as_mut_ptr();",
+        "    info.steps = sig.offset(600 as isize) as *mut u32;",
+    );
+    assert!(code.contains("info.steps = sig.offset(600"));
+    assert!(edges(&code, "sign") > 0, "the meeting pair's edge is there");
+    let (accepted, receipts) = accepts(&code, "sign");
+    assert!(!accepted, "`sign` is not accepted");
+    assert!(
+        has_receipt(&receipts, (600, 740), (0, 560)),
+        "the second field's path is measured: {receipts:?}"
+    );
+    assert!(
+        !receipts.iter().any(|receipt| matches!(
+            (receipt.loan_bytes, receipt.access_bytes),
+            (Some((600, 740)), Some((560, 608))) | (Some((560, 608)), Some((600, 740)))
+        )),
+        "the meeting pair is never discharged: {receipts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The domain.
 // ---------------------------------------------------------------------------
 
