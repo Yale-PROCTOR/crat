@@ -109,13 +109,20 @@ impl ValueEscapes {
             }
             let terminator = data.terminator();
             match &terminator.kind {
-                // Form 1: a call argument, and the callee operand itself.
+                // Form 1: a call argument, and the callee operand itself -- except an argument a
+                // libc contract row says the callee writes and never keeps (relay main/388 (a)).
                 TerminatorKind::Call { func, args, .. }
                 | TerminatorKind::TailCall { func, args, .. } => {
-                    for operand in args.iter().map(|argument| &argument.node).chain([func]) {
+                    for (index, operand) in args.iter().map(|argument| &argument.node).enumerate() {
+                        if non_retaining_out_parameter(tcx, func, index) {
+                            continue;
+                        }
                         if let Some(place) = operand.place() {
                             escaping.insert(place.local);
                         }
+                    }
+                    if let Some(place) = func.place() {
+                        escaping.insert(place.local);
                     }
                 }
                 // Drop glue is a call the frame does not write: the dropped place
@@ -132,6 +139,36 @@ impl ValueEscapes {
     /// True when this local's value leaves the frame anywhere in it.
     pub(crate) fn escapes(&self, local: Local) -> bool {
         self.escaping.contains(&local)
+    }
+}
+
+/// Relay main/388 (R1347-1) (a): the libc out-parameters the callee writes and never keeps -- the
+/// string conversions' `endptr` (C11 7.22.1.3 / 7.22.1.4: the function stores a pointer into
+/// `*endptr` and retains nothing). The address given there does not leave the frame: its loan ends
+/// at the call's return. A row is (callee, 0-based argument position).
+const NON_RETAINING_OUT_PARAMETERS: &[(&str, usize)] = &[
+    ("strtol", 1),
+    ("strtoul", 1),
+    ("strtoll", 1),
+    ("strtoull", 1),
+    ("strtod", 1),
+    ("strtof", 1),
+    ("strtold", 1),
+];
+
+/// True only for a direct call of a foreign item in the table at that position. Fail closed: a
+/// local callee of the same name, a callee outside the table and a fn-pointer call all escape.
+pub(crate) fn non_retaining_out_parameter<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &Operand<'tcx>,
+    index: usize,
+) -> bool {
+    let Some((callee, _)) = func.const_fn_def() else { return false };
+    tcx.is_foreign_item(callee) && {
+        let name = tcx.item_name(callee);
+        NON_RETAINING_OUT_PARAMETERS
+            .iter()
+            .any(|&(row, position)| position == index && name.as_str() == row)
     }
 }
 
