@@ -58,12 +58,15 @@ impl FrozenTransport {
         step("freeze:no_ref_carriers")?;
         let no_ref_carriers = value_origins.no_ref_carriers(facts);
         step("freeze:field_support")?;
-        let mut field_support = super::field_support::audit(
-            facts,
-            &facts.field_support_inputs,
-            &matched,
-            &value_origins,
-        );
+        // Relay main/388 (R1352-2): `field_support:<sub>` marks inside this audit only.
+        let mut field_support = crate::phase_log::with_sub_marks(|| {
+            super::field_support::audit(
+                facts,
+                &facts.field_support_inputs,
+                &matched,
+                &value_origins,
+            )
+        });
         step("freeze:first_permissions")?;
         let first_permissions =
             super::first_permission::plan(facts, &mut field_support, matched.guard_aliases());

@@ -1117,6 +1117,25 @@ pub(crate) fn audit(
                 .ok()
         })
         .collect();
+    // Relay main/388 (R1352-2): the audit's sizes, then a mark per pass and a tick per
+    // `STORE_TICK` stores (log only, inside the freeze's `with_sub_marks`).
+    crate::phase_log::sub("field_support:audit", "start", || {
+        format!(
+            "stores={} constructions={} equations={} consumes={} loads={} occurrences={} fields={} certificates={}",
+            inputs.stores.len(),
+            facts.constructions,
+            facts.equations.len(),
+            facts.consumes.len(),
+            inputs.loads.len(),
+            facts
+                .source_occurrences
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            inputs.fields.len(),
+            certificates.len()
+        )
+    });
     let mut fields: BTreeMap<_, _> = inputs
         .fields
         .iter()
@@ -1222,6 +1241,7 @@ pub(crate) fn audit(
             }
         }
     }
+    crate::phase_log::sub("field_support:occurrences", "end", String::new);
     for load in &inputs.loads {
         let Some(proof) = fields.get_mut(&load.site.field_key) else { continue };
         let reader = facts
@@ -1250,7 +1270,29 @@ pub(crate) fn audit(
             });
         }
     }
+    crate::phase_log::sub("field_support:loads", "end", String::new);
+    const STORE_TICK: usize = 25;
+    let (mut done, mut meets_calls, mut input_store_calls) = (0usize, 0usize, 0usize);
     for store in &inputs.stores {
+        done += 1;
+        if done % STORE_TICK == 0 {
+            crate::phase_log::sub("field_support:stores", "tick", || {
+                format!(
+                    "done={done} of={} meets_for={meets_calls} input_store={input_store_calls} holds={}",
+                    inputs.stores.len(),
+                    fields
+                        .values()
+                        .map(|proof| proof.holds.len())
+                        .sum::<usize>()
+                )
+            });
+        }
+        let started = std::time::Instant::now();
+        let _slow = SlowStore {
+            started,
+            done,
+            function: &store.site.function,
+        };
         let Some(proof) = fields.get_mut(&store.site.field_key) else { continue };
         let mut hold = |construction, reason| {
             proof.holds.push(Hold {
@@ -1336,6 +1378,7 @@ pub(crate) fn audit(
                     construction,
                     ordinal: equation.ordinal,
                 };
+                input_store_calls += 1;
                 let (input, reasons) =
                     input_store(facts, matched, origins, &store.site, id, transfer, &atoms);
                 for reason in reasons {
@@ -1362,6 +1405,7 @@ pub(crate) fn audit(
                 hold(Some(construction), Pending::OwnedInputOrOriginC);
                 continue;
             }
+            meets_calls += 1;
             let meets = matched.meets_for(node(transfer.destination_def));
             let field_certificates: Vec<_> = certificates
                 .iter()
@@ -1402,6 +1446,7 @@ pub(crate) fn audit(
                 continue;
             }
             let mut competing = false;
+            meets_calls += seeds.len();
             for other in seeds.into_iter().flat_map(|seed| matched.meets_for(seed)) {
                 if other.source != meet.source {
                     competing = true;
@@ -1456,6 +1501,9 @@ pub(crate) fn audit(
             });
         }
     }
+    crate::phase_log::sub("field_support:stores", "end", || {
+        format!("done={done} meets_for={meets_calls} input_store={input_store_calls}")
+    });
     for proof in fields.values_mut() {
         if proof.stores.is_empty() && proof.input_stores.is_empty() {
             proof.holds.push(Hold {
@@ -1519,7 +1567,30 @@ pub(crate) fn audit(
             }
         }
     }
+    crate::phase_log::sub("field_support:classify", "end", String::new);
     fields.into_values().collect()
+}
+
+/// Relay main/388 (R1352-2): a `slow` mark for one store whose audit took at least 10 s, written
+/// when the store's iteration ends (log only).
+struct SlowStore<'a> {
+    started: std::time::Instant,
+    done: usize,
+    function: &'a str,
+}
+
+impl Drop for SlowStore<'_> {
+    fn drop(&mut self) {
+        let wall = self.started.elapsed().as_secs_f64();
+        if wall >= 10.0 {
+            crate::phase_log::sub("field_support:store", "slow", || {
+                format!(
+                    "index={} function={} wall={wall:.1}s",
+                    self.done, self.function
+                )
+            });
+        }
+    }
 }
 
 /// The moved-input rule: whether a store's transfer hands the whole token to the field --
