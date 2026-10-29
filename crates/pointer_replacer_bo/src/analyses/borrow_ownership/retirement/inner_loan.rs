@@ -543,11 +543,13 @@ pub(crate) fn analyze(
                 .or_insert_with(|| ValueEscapes::of_body(program.tcx, &body));
             members.iter().any(|&local| direct.escapes(local))
         };
+        // The copy closure crosses frames through field slots, so a member index can name another
+        // frame's local; only this frame's locals are asked, as the liveness does.
         let typing_env = body.typing_env(program.tcx);
         let droppable = members.iter().any(|&local| {
-            body.local_decls[local]
-                .ty
-                .needs_drop(program.tcx, typing_env)
+            body.local_decls
+                .get(local)
+                .is_some_and(|decl| decl.ty.needs_drop(program.tcx, typing_env))
         });
         unwind_exits.entry(loan.key.function).or_insert_with(|| {
             body.basic_blocks
