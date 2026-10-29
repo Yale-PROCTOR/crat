@@ -38,6 +38,8 @@ mod copy_lend_guard_tests;
 mod copy_lend_mut_tests;
 pub(crate) mod copy_relax;
 #[cfg(test)]
+mod copy_relax_call_tests;
+#[cfg(test)]
 mod copy_relax_tests;
 pub(crate) mod field_moves;
 pub(crate) mod guarded_repair;
