@@ -22,13 +22,34 @@
 //!   *source* is Unknown (the bytes copied out may be a pointer to the base,
 //!   used after through the copy);
 //! - a comparison or `is_null`: nothing;
-//! - anything else is Unknown: a store into memory, a return, an aggregate, a
-//!   cast to an integer, a foreign callee without a row, a local with two
-//!   definitions, the address of the pointer local. A pointer *loaded* from
-//!   memory is never a derivation (rider R2): its base is Unknown. A read of a
-//!   pointer stored in the base ends the footprint too (Unknown): what is
-//!   reached through it is not the base's bytes, and two such pointers may
-//!   meet outside them.
+//! - a store into a pointer field of a local struct, `s.f = v` (stage 2, E1,
+//!   below): the field's path;
+//! - anything else is Unknown: any other store into memory, a return, an
+//!   aggregate, a cast to an integer, a foreign callee without a row, a local
+//!   with two definitions, the address of the pointer local. A pointer
+//!   *loaded* from memory is never a derivation (rider R2): it is no base,
+//!   only the root of its own footprint (E1's loads). A read of a pointer
+//!   stored in the base ends the footprint too (Unknown): what is reached
+//!   through it is not the base's bytes, and two such pointers may meet
+//!   outside them.
+//!
+//! **E1, the one-level field path** (stage 2, relay 267 §3). A *holder* is a
+//! local struct (never a formal, never a union) a pointer is stored into one
+//! field deep. The path of its field `[off, off + size)` is everything reached
+//! through the pointer stored there, relative to that pointer: the families
+//! of the locals the field is loaded into, in the body, and, through the
+//! holder's address, in each local callee it is handed to: `Ext(g, k.f)`, the
+//! loads of `(*k).f` in `g` and its callees (`Path`, per formal, bottom-up
+//! like `Ext`). The path is Unknown when `g` or a callee stores to `(*k).f`
+//! or reads its bytes other than as that pointer (a copy out of them, a
+//! whole-struct read), when the holder is read whole in the body, or when its
+//! address goes where the walk cannot follow (stored, returned, a foreign or
+//! recursive callee). A store to the holder in the body only replaces what
+//! the field holds, and every value stored into it carries the whole path in
+//! its own footprint. The escape walk keeps such a store (by a local of the
+//! base's family, onto a bounded path) from counting as the base's escape.
+//! Neither a loaded value nor a holder is ever a base: the discharge takes
+//! only a pointer formal.
 //!
 //! **A base that escapes discharges nothing.** A taint walk follows the
 //! base's value through every local it reaches, bounded or not; when any of
@@ -63,7 +84,14 @@
 //! integer locals that feed an index, a step or a guard, with branch and assert
 //! conditions applied on their edges and widening at loop heads. A local whose
 //! address is taken is never tracked; a local with one constant definition is a
-//! constant.
+//! constant. Stage 2 adds E2, the equality exit: on the edge where `h ≠ n`,
+//! a bound `h ≤ n` already known becomes `h ≤ n − 1` (so a counter stepping by
+//! one from below `n` and leaving at `h == n` stays below `n`); and the range
+//! of a product `y · c` by a constant `c > 0` at its one definition, which
+//! difference bounds cannot hold when `y`'s bound is a formal (`IntFacts::defs`:
+//! an unsigned product, or core's unsigned `wrapping_mul`, lies in
+//! `[0, c·hi(y)]` wrapped or not; a signed one is exact under
+//! `§28:index-step-no-wrap`), carried through copies and value-keeping casts.
 //!
 //! **The discharge** (`borrow_engine/invalidates.rs`, `check_access_for_conflict`,
 //! in the direct and the routed check): an invalidation `(access, loan)` that
@@ -374,21 +402,158 @@ impl Footprint {
         let Footprint::Bytes(mut bytes) = self else {
             return self;
         };
-        let bound = |b: Bound| -> Option<Bound> {
-            match b.formal {
-                None => Some(b),
-                Some(formal) => {
-                    let value = actual(formal)?;
-                    value.scale(b.coef)?.plus(Bound::constant(b.add))
-                }
-            }
-        };
+        let bound = |b: Bound| instantiate_bound(b, actual);
         let (Some(lo), Some(hi)) = (bound(bytes.lo), bound(bytes.hi)) else {
             return Footprint::Unknown("non-constant-actual");
         };
         bytes.lo = lo;
         bytes.hi = hi;
         Footprint::Bytes(bytes).normal()
+    }
+}
+
+/// A bound of `g`'s with its formal replaced by the actual.
+fn instantiate_bound(b: Bound, actual: &dyn Fn(u32) -> Option<Bound>) -> Option<Bound> {
+    match b.formal {
+        None => Some(b),
+        Some(formal) => {
+            let value = actual(formal)?;
+            value.scale(b.coef)?.plus(Bound::constant(b.add))
+        }
+    }
+}
+
+/// The most byte ranges a path keeps apart; past it they are merged, and then
+/// one hull.
+const MAX_TOUCHED: usize = 64;
+
+/// E1, what a pointer's object gives out of the pointers stored in it, one
+/// field deep: the bytes of the object (relative to the pointer) that are
+/// written, or read other than as a pointer load at a constant offset; and
+/// each such load, with the footprint of the loaded value (relative to that
+/// value). A pointer stored in the object is reached only through those
+/// loads, so the path of the field at `[off, off + size)` is the join of the
+/// loads at exactly `off`. It is Unknown when a touched range meets the field
+/// (a store to it, a copy of its bytes) or the object is reached where the
+/// walk cannot follow.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Path {
+    opaque: Option<&'static str>,
+    /// `None`: a range with no bound.
+    touched: Vec<Option<(Bound, Bound)>>,
+    /// `(offset, size, footprint of the loaded value)`.
+    loads: Vec<(i64, i64, Footprint)>,
+}
+
+impl Path {
+    fn opaque(why: &'static str) -> Path {
+        Path {
+            opaque: Some(why),
+            ..Path::default()
+        }
+    }
+
+    fn stop(&mut self, why: &'static str) {
+        self.opaque.get_or_insert(why);
+    }
+
+    fn touch(&mut self, range: Option<(Bound, Bound)>) {
+        self.touched.push(range);
+        if self.touched.len() <= MAX_TOUCHED {
+            return;
+        }
+        let mut constant: Vec<(i64, i64)> = Vec::new();
+        let mut rest = Vec::new();
+        for range in self.touched.drain(..) {
+            match range.and_then(|(lo, hi)| Some((lo.as_constant()?, hi.as_constant()?))) {
+                Some(range) => constant.push(range),
+                None => rest.push(range),
+            }
+        }
+        constant.sort();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (lo, hi) in constant {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        rest.dedup();
+        if merged.len() + rest.len() > MAX_TOUCHED {
+            if !rest.is_empty() {
+                self.stop("touched");
+            }
+            if let (Some(first), Some(last)) = (merged.first(), merged.last()) {
+                merged = vec![(first.0, last.1)];
+            }
+        }
+        self.touched = merged
+            .into_iter()
+            .map(|(lo, hi)| Some((Bound::constant(lo), Bound::constant(hi))))
+            .chain(rest)
+            .collect();
+    }
+
+    /// The path of the pointer stored at `[off, off + size)`.
+    fn at(&self, off: i64, size: i64) -> Footprint {
+        if let Some(why) = self.opaque {
+            return Footprint::Unknown(why);
+        }
+        let meets = |lo: i64, hi: i64| lo < off + size && off < hi;
+        for range in &self.touched {
+            match range.and_then(|(lo, hi)| Some((lo.as_constant()?, hi.as_constant()?))) {
+                Some((lo, hi)) if !meets(lo, hi) => {}
+                _ => return Footprint::Unknown("field-touched"),
+            }
+        }
+        let mut fp = Footprint::Empty;
+        for (o, s, loaded) in &self.loads {
+            if (*o, *s) == (off, size) {
+                fp = fp.join(loaded.clone());
+            } else if meets(*o, o + s) {
+                return Footprint::Unknown("field-misread");
+            }
+        }
+        fp
+    }
+
+    /// A callee's path for an argument at `[deriv.lo, deriv.hi]` from this
+    /// path's root, its bounds instantiated by the actuals.
+    fn absorb(
+        &mut self,
+        callee: &Path,
+        deriv: &Deriv,
+        actual: &dyn Fn(u32) -> Option<Bound>,
+        summary: (LocalDefId, u32),
+    ) {
+        if let Some(why) = callee.opaque {
+            self.stop(why);
+            return;
+        }
+        let shift = |lo: Bound, hi: Bound| -> Option<(Bound, Bound)> {
+            Some((
+                deriv.lo.plus(instantiate_bound(lo, actual)?)?,
+                deriv.hi.plus(instantiate_bound(hi, actual)?)?,
+            ))
+        };
+        for range in &callee.touched {
+            self.touch(range.and_then(|(lo, hi)| shift(lo, hi)));
+        }
+        for (o, s, loaded) in &callee.loads {
+            let loaded = match loaded.clone().instantiate(actual) {
+                Footprint::Bytes(mut bytes) => {
+                    bytes.summaries.insert(summary);
+                    Footprint::Bytes(bytes)
+                }
+                other => other,
+            };
+            match deriv.lo.as_constant() {
+                Some(d) if deriv.lo == deriv.hi => self.loads.push((o + d, *s, loaded)),
+                // A load at an offset not known exactly: its bytes are
+                // touched.
+                _ => self.touch(shift(Bound::constant(*o), Bound::constant(o + s))),
+            }
+        }
     }
 }
 
@@ -533,6 +698,9 @@ pub(crate) struct IndexRanges {
     /// The `(g, k)` whose formal escapes `g`: stored, returned, handed where
     /// the walk cannot follow, or read out as a pointer.
     escapes: FxHashSet<(LocalDefId, u32)>,
+    /// E1: `(g, k)`'s path, what `g` and its callees give out of the pointers
+    /// stored in `*k`.
+    paths: FxHashMap<(LocalDefId, u32), Path>,
     scc: FxHashMap<LocalDefId, usize>,
 }
 
@@ -540,9 +708,17 @@ pub(crate) struct IndexRanges {
 struct FnFacts {
     shape: Shape,
     ints: IntFacts,
+    /// E1's holders: the local structs a pointer is stored into.
+    holders: FxHashSet<Local>,
     derivs: FxHashMap<Local, Deriv>,
     /// Complete once built: every local of `derivs` has its family.
     families: RefCell<FxHashMap<Local, Footprint>>,
+    /// Complete once built: the path of every holder field a pointer is
+    /// stored into, by `(holder, offset)`.
+    holder_paths: RefCell<FxHashMap<(Local, i64), Footprint>>,
+    /// The paths of the pointer formals, by argument index (moved into the
+    /// table).
+    paths: FxHashMap<u32, Path>,
     /// The bases some use of which escapes the body: stored, returned,
     /// handed where the walk cannot follow, or a pointer read out of it. A
     /// copy so retained may reach the base behind every footprint's back, so
@@ -578,6 +754,7 @@ impl IndexRanges {
             functions: FxHashMap::default(),
             summaries: FxHashMap::default(),
             escapes: FxHashSet::default(),
+            paths: FxHashMap::default(),
             scc: FxHashMap::default(),
         };
         for (index, component) in petgraph::algo::tarjan_scc(&graph).into_iter().enumerate() {
@@ -587,12 +764,17 @@ impl IndexRanges {
             for &member in &component {
                 let f = graph[member];
                 let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
-                let facts = FnFacts::build(tcx, &body, f, &table);
+                let mut facts = FnFacts::build(tcx, &body, f, &table);
                 for k in 0..body.arg_count {
                     let formal = Local::from_usize(k + 1);
                     if pointee(body.local_decls[formal].ty).is_none() {
                         continue;
                     }
+                    let path = facts
+                        .paths
+                        .remove(&(k as u32))
+                        .unwrap_or_else(|| Path::opaque("formal-written"));
+                    table.paths.insert((f, k as u32), path);
                     let extent = match facts.derivs.get(&formal) {
                         Some(_) => facts
                             .families
@@ -650,8 +832,10 @@ impl IndexRanges {
         if facts.shape.only_def(issuer) != Some(loan.location) {
             return None;
         }
+        // The base is a pointer formal: a loaded value (R2) and a holder's
+        // address (E1) are roots of their own paths, never bases.
         let loan_root = facts.derivs.get(&issuer)?.root;
-        if facts.escaped.contains(&loan_root) {
+        if !facts.shape.fixed_formal(loan_root) || facts.escaped.contains(&loan_root) {
             return None;
         }
         let loan_fp = facts.families.borrow().get(&issuer)?.clone();
@@ -1086,11 +1270,21 @@ impl IState {
     }
 }
 
-/// The integer facts one function's derivations read: the constants, and the
-/// interval of each indexing or argument local where it is used.
+/// The integer facts one function's derivations read: the constants, the
+/// interval of each indexing or argument local where it is used, and the
+/// interval of each product (and of what keeps its value) at its one
+/// definition.
 struct IntFacts {
     consts: FxHashMap<Local, i64>,
     ranges: FxHashMap<(Location, Local), IntRange>,
+    /// A local with one definition, never addressed: its interval at every
+    /// use. Products `y · c` by a constant `c > 0` (an unsigned one, or
+    /// core's unsigned `wrapping_mul`, is in `[0, c·hi(y)]` whether it wraps
+    /// or not: a wrapped product is below 2^bits, which is at most `c·y`; a
+    /// signed one is exact under `§28:index-step-no-wrap`), and the copies
+    /// and value-keeping casts of those. The difference bounds cannot hold
+    /// `c·n`; this can.
+    defs: FxHashMap<Local, IntRange>,
 }
 
 impl IntFacts {
@@ -1098,8 +1292,30 @@ impl IntFacts {
         if let Some(k) = self.consts.get(&local) {
             return Some(IntRange::exact(*k));
         }
-        self.ranges.get(&(location, local)).cloned()
+        combine(self.ranges.get(&(location, local)), self.defs.get(&local))
     }
+}
+
+/// The interval at a point, each side the point's when it has one and the
+/// definition's otherwise.
+fn combine(at: Option<&IntRange>, def: Option<&IntRange>) -> Option<IntRange> {
+    let (at, def) = match (at, def) {
+        (None, None) => return None,
+        (Some(only), None) | (None, Some(only)) => return Some(only.clone()),
+        (Some(at), Some(def)) => (at, def),
+    };
+    let mut premises = BTreeSet::new();
+    let mut side = |mine: Option<Bound>, theirs: Option<Bound>, from: &IntRange| match mine {
+        Some(bound) => Some(bound),
+        None => {
+            premises.extend(from.premises.iter().copied());
+            theirs
+        }
+    };
+    let lo = side(at.lo, def.lo, def);
+    let hi = side(at.hi, def.hi, def);
+    premises.extend(at.premises.iter().copied());
+    Some(IntRange { lo, hi, premises })
 }
 
 struct Ints<'a, 'tcx> {
@@ -1144,9 +1360,132 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             formals,
         };
         let ranges = ints.run();
+        let mut defs = FxHashMap::default();
+        for local in ints.var_locals.clone() {
+            ints.def_range(shape, &ranges, &mut defs, local);
+        }
         IntFacts {
             consts: ints.consts,
             ranges,
+            defs: defs
+                .into_iter()
+                .filter_map(|(local, range)| range.map(|range| (local, range)))
+                .collect(),
+        }
+    }
+
+    /// The interval of a product, or of a copy or a value-keeping cast of
+    /// one, at its one definition (`IntFacts::defs`).
+    fn def_range(
+        &self,
+        shape: &Shape,
+        ranges: &FxHashMap<(Location, Local), IntRange>,
+        defs: &mut FxHashMap<Local, Option<IntRange>>,
+        x: Local,
+    ) -> Option<IntRange> {
+        if let Some(known) = defs.get(&x) {
+            return known.clone();
+        }
+        // A cycle has no range: mark it before the definition is read.
+        defs.insert(x, None);
+        let found = self.def_range_once(shape, ranges, defs, x);
+        defs.insert(x, found.clone());
+        found
+    }
+
+    fn def_range_once(
+        &self,
+        shape: &Shape,
+        ranges: &FxHashMap<(Location, Local), IntRange>,
+        defs: &mut FxHashMap<Local, Option<IntRange>>,
+        x: Local,
+    ) -> Option<IntRange> {
+        let location = shape.only_def(x)?;
+        let (bits, signed) = int_shape(self.body.local_decls[x].ty)?;
+        let range_of = |y: Local, defs: &mut FxHashMap<Local, Option<IntRange>>| {
+            if let Some(k) = self.consts.get(&y) {
+                return Some(IntRange::exact(*k));
+            }
+            let def = self.def_range(shape, ranges, defs, y);
+            combine(ranges.get(&(location, y)), def.as_ref())
+        };
+        // `y · c`, `c > 0` a constant, from the operands.
+        let product = |left: &Operand<'tcx>, right: &Operand<'tcx>| -> Option<(Local, i64)> {
+            let constant = |operand: &Operand<'tcx>| match operand {
+                Operand::Constant(_) => constant_value(self.tcx, operand),
+                _ => operand_local(operand).and_then(|l| self.consts.get(&l).copied()),
+            };
+            let (y, c) = match (operand_local(left), constant(right)) {
+                (Some(y), Some(c)) if !self.consts.contains_key(&y) => (y, c),
+                _ => (operand_local(right)?, constant(left)?),
+            };
+            (c > 0).then_some((y, c))
+        };
+        let scaled = |range: IntRange, c: i64, signed: bool| -> Option<IntRange> {
+            if signed {
+                let mut premises = range.premises.clone();
+                premises.insert(Premise::IndexStepNoWrap);
+                Some(IntRange {
+                    lo: Some(range.lo?.scale(c)?),
+                    hi: Some(range.hi?.scale(c)?),
+                    premises,
+                })
+            } else {
+                Some(IntRange {
+                    lo: Some(Bound::constant(0)),
+                    hi: Some(range.hi?.scale(c)?),
+                    premises: range.premises,
+                })
+            }
+        };
+        match at(self.body, location) {
+            At::Statement(statement) => {
+                let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+                    return None;
+                };
+                match rvalue {
+                    Rvalue::BinaryOp(BinOp::Mul | BinOp::MulUnchecked, box (left, right)) => {
+                        let (y, c) = product(left, right)?;
+                        scaled(range_of(y, defs)?, c, signed)
+                    }
+                    Rvalue::Use(operand) => {
+                        self.def_range(shape, ranges, defs, operand_local(operand)?)
+                    }
+                    Rvalue::Cast(CastKind::IntToInt, operand, _) => {
+                        let y = operand_local(operand)?;
+                        let from = int_shape(self.body.local_decls[y].ty)?;
+                        let range = self.def_range(shape, ranges, defs, y)?;
+                        let constant = |b: Option<Bound>| b.and_then(Bound::as_constant);
+                        let premise = cast_keeps(
+                            from,
+                            (bits, signed),
+                            constant(range.lo),
+                            constant(range.hi),
+                            self.offset_only.contains(&x),
+                        )?;
+                        let mut range = range;
+                        range.premises.extend(premise);
+                        Some(range)
+                    }
+                    _ => None,
+                }
+            }
+            At::Terminator(terminator) => {
+                let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+                    return None;
+                };
+                let def = func.const_fn_def()?.0;
+                let core_integer = self.tcx.crate_name(def.krate).as_str() == "core"
+                    && self.tcx.def_path_str(def).contains("num::<impl");
+                if signed || !core_integer || self.tcx.item_name(def).as_str() != "wrapping_mul" {
+                    return None;
+                }
+                let [left, right] = &args[..] else {
+                    return None;
+                };
+                let (y, c) = product(&left.node, &right.node)?;
+                scaled(range_of(y, defs)?, c, false)
+            }
         }
     }
 
@@ -1297,10 +1636,18 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                     self.record_place(state, location, place, recorded);
                 }
             }
-            Rvalue::BinaryOp(_, box (left, right)) => {
+            Rvalue::BinaryOp(op, box (left, right)) => {
                 for operand in [left, right] {
                     if let Operand::Copy(place) | Operand::Move(place) = operand {
                         self.record_place(state, location, place, recorded);
+                    }
+                    // A product's operand, for its range at the definition.
+                    if matches!(op, BinOp::Mul | BinOp::MulUnchecked)
+                        && let Some(local) = operand_local(operand)
+                        && let Some(var) = self.var(local)
+                        && let Some(recorded) = recorded.as_deref_mut()
+                    {
+                        recorded.insert((location, local), self.range(state, Term::Var(var)));
                     }
                 }
             }
@@ -1492,6 +1839,17 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             (BinOp::Gt, true) | (BinOp::Le, false) => ((b, a, -d - 1), None),
             (BinOp::Ge, true) | (BinOp::Lt, false) => ((b, a, -d), None),
             (BinOp::Eq, true) | (BinOp::Ne, false) => ((a, b, d), Some((b, a, -d))),
+            // E2, the equality exit: unequal, and already at most (at
+            // least) the other side, so strictly below (above) it.
+            (BinOp::Eq, false) | (BinOp::Ne, true) => {
+                if state.dbm.get(a, b) <= d {
+                    state.dbm.constrain(a, b, d - 1);
+                }
+                if state.dbm.get(b, a) <= -d {
+                    state.dbm.constrain(b, a, -d - 1);
+                }
+                return;
+            }
             _ => return,
         };
         state.dbm.constrain(first.0, first.1, first.2);
@@ -1567,20 +1925,12 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                 (state.dbm.get(v, 0) < INF).then(|| state.dbm.get(v, 0)),
             ),
         };
-        let fits = |bits: u64, signed: bool| {
-            let (min, max) = type_range(bits, signed);
-            lo.is_some_and(|lo| lo as i128 >= min) && hi.is_some_and(|hi| hi as i128 <= max)
-        };
-        match (from.1, to.1) {
-            (false, false) | (true, true) if to.0 >= from.0 => true,
-            (false, true) if to.0 > from.0 => true,
-            (true, false) if to.0 >= from.0 && lo.is_some_and(|lo| lo >= 0) => true,
-            _ if fits(to.0, to.1) => true,
-            (false, true) if to.0 == from.0 && to.0 == 64 && self.offset_only.contains(&x) => {
-                state.premises.insert(Premise::UsizeAsIsize);
+        match cast_keeps(from, to, lo, hi, self.offset_only.contains(&x)) {
+            Some(premise) => {
+                state.premises.extend(premise);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -1830,6 +2180,32 @@ fn offset_only_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<L
         .filter(|(local, n)| uses.0.get(local) == Some(n))
         .map(|(local, _)| local)
         .collect()
+}
+
+/// Does a cast from `from` to `to` keep a value in `[lo, hi]` (the bounds
+/// when constant)? `Some` with the §28 use it rests on, if any
+/// (`Ints::value_preserving`).
+fn cast_keeps(
+    from: (u64, bool),
+    to: (u64, bool),
+    lo: Option<i64>,
+    hi: Option<i64>,
+    offset_only: bool,
+) -> Option<Option<Premise>> {
+    let fits = |bits: u64, signed: bool| {
+        let (min, max) = type_range(bits, signed);
+        lo.is_some_and(|lo| lo as i128 >= min) && hi.is_some_and(|hi| hi as i128 <= max)
+    };
+    match (from.1, to.1) {
+        (false, false) | (true, true) if to.0 >= from.0 => Some(None),
+        (false, true) if to.0 > from.0 => Some(None),
+        (true, false) if to.0 >= from.0 && lo.is_some_and(|lo| lo >= 0) => Some(None),
+        _ if fits(to.0, to.1) => Some(None),
+        (false, true) if to.0 == from.0 && to.0 == 64 && offset_only => {
+            Some(Some(Premise::UsizeAsIsize))
+        }
+        _ => None,
+    }
 }
 
 /// The values an integer type holds, `[min, max]` (128-bit types clipped to
@@ -2300,10 +2676,14 @@ struct Ctx<'a, 'tcx> {
     env: ty::TypingEnv<'tcx>,
     shape: &'a Shape,
     ints: &'a IntFacts,
+    holders: &'a FxHashSet<Local>,
     derivs: &'a FxHashMap<Local, Deriv>,
     families: &'a RefCell<FxHashMap<Local, Footprint>>,
+    holder_paths: &'a RefCell<FxHashMap<(Local, i64), Footprint>>,
     /// Families being computed (a cycle is Unknown).
     open: RefCell<FxHashSet<Local>>,
+    /// The paths of roots already walked (E1).
+    paths: RefCell<FxHashMap<Local, Path>>,
     /// Every use of a pointer local, by local (the families' input).
     uses: Option<&'a FxHashMap<Local, Vec<(Location, Occ<'tcx>)>>>,
     table: &'a IndexRanges,
@@ -2318,7 +2698,8 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         facts: &'a FnFacts,
         table: &'a IndexRanges,
     ) -> Ctx<'a, 'tcx> {
-        // The families are complete: the cell is only read.
+        // The families and the holders' paths are complete: the cells are
+        // only read.
         Ctx {
             tcx,
             body,
@@ -2326,9 +2707,12 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             env: ty::TypingEnv::post_analysis(tcx, function),
             shape: &facts.shape,
             ints: &facts.ints,
+            holders: &facts.holders,
             derivs: &facts.derivs,
             families: &facts.families,
+            holder_paths: &facts.holder_paths,
             open: RefCell::new(FxHashSet::default()),
+            paths: RefCell::new(FxHashMap::default()),
             uses: None,
             table,
         }
@@ -2378,15 +2762,26 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         place: &Place<'tcx>,
         location: Location,
     ) -> Option<(Bound, Bound, Option<i64>, bool, BTreeSet<Premise>)> {
+        self.place_offset_from(place, 1, location)
+    }
+
+    /// The same, from the object the first `start` projections reach: 1 for
+    /// `*p.proj`, 0 for a holder's own `s.proj` (E1).
+    fn place_offset_from(
+        &self,
+        place: &Place<'tcx>,
+        start: usize,
+        location: Location,
+    ) -> Option<(Bound, Bound, Option<i64>, bool, BTreeSet<Premise>)> {
         let mut ty = PlaceRef {
             local: place.local,
-            projection: &place.projection[..1],
+            projection: &place.projection[..start],
         }
         .ty(self.body, self.tcx)
         .ty;
         let (mut lo, mut hi) = (Bound::constant(0), Bound::constant(0));
         let mut premises = BTreeSet::new();
-        for elem in place.projection[1..].iter().copied() {
+        for elem in place.projection[start..].iter().copied() {
             match elem {
                 PlaceElem::Deref => {
                     return Some((lo, hi, self.size_of(ty), true, premises));
@@ -2496,6 +2891,40 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                             premises: base.premises.union(&premises).copied().collect(),
                         })
                     }
+                    // A pointer loaded from memory is the root of its own
+                    // family (E1's loads; R2: never a base).
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                    | Rvalue::CopyForDeref(p)
+                    | Rvalue::Cast(
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion(
+                            PointerCoercion::Unsize
+                            | PointerCoercion::MutToConstPointer
+                            | PointerCoercion::ArrayToPointer,
+                            _,
+                        ),
+                        Operand::Copy(p) | Operand::Move(p),
+                        _,
+                    ) if pointee(p.ty(self.body, self.tcx).ty).is_some() => Some(Deriv {
+                        root: local,
+                        lo: Bound::constant(0),
+                        hi: Bound::constant(0),
+                        premises: BTreeSet::new(),
+                    }),
+                    // A holder's address (E1): the holder is the root.
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                        if self.holders.contains(&place.local)
+                            && !place.projection.contains(&PlaceElem::Deref) =>
+                    {
+                        let (lo, hi, _, _, premises) =
+                            self.place_offset_from(place, 0, location)?;
+                        Some(Deriv {
+                            root: place.local,
+                            lo,
+                            hi,
+                            premises,
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -2577,7 +3006,8 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         }
     }
 
-    /// A value landing in `dest`: that local's family, when it is the same base.
+    /// A value landing in `dest`: that local's family, when it is the same
+    /// base; a holder's field's path (E1), shifted by the value's offset.
     fn flow(&self, deriv: &Deriv, dest: &Place<'tcx>) -> Footprint {
         match dest.as_local() {
             Some(RETURN_PLACE) => Footprint::Unknown("returned"),
@@ -2585,7 +3015,332 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                 Some(next) if next.root == deriv.root => self.family(dest),
                 _ => Footprint::Unknown("flows-into-untracked"),
             },
-            None => Footprint::Unknown("stored"),
+            None => match self.holder_field(dest) {
+                Some((holder, off, size)) => {
+                    self.holder_path(holder, off, size)
+                        .shift(deriv.lo, deriv.hi, &deriv.premises)
+                }
+                None => Footprint::Unknown("stored"),
+            },
+        }
+    }
+
+    /// `(holder, offset, size)` of a store's destination `s.f`: a pointer
+    /// field one level into a holder (E1).
+    fn holder_field(&self, dest: &Place<'tcx>) -> Option<(Local, i64, i64)> {
+        if !self.holders.contains(&dest.local) {
+            return None;
+        }
+        let [PlaceElem::Field(field, field_ty)] = dest.projection[..] else {
+            return None;
+        };
+        if !matches!(field_ty.kind(), TyKind::RawPtr(..)) {
+            return None;
+        }
+        let ty = self.body.local_decls[dest.local].ty;
+        let layout = self.tcx.layout_of(self.env.as_query_input(ty)).ok()?;
+        let off = i64::try_from(layout.fields.offset(field.index()).bytes()).ok()?;
+        Some((dest.local, off, self.size_of(field_ty)?))
+    }
+
+    /// E1: everything reached through the pointer stored in `holder`'s field
+    /// at `[off, off + size)`, relative to that pointer: the loads of the field
+    /// in the body and, through the holder's address, in the callees it is
+    /// handed to (their paths). Unknown when the holder is read whole, its
+    /// field's bytes are read other than as a pointer, a callee stores to
+    /// the field, or its address goes where the walk cannot follow. A store
+    /// to the holder in the body only replaces what the field holds: every
+    /// stored value carries the path in its own footprint.
+    fn holder_path(&self, holder: Local, off: i64, size: i64) -> Footprint {
+        if let Some(known) = self.holder_paths.borrow().get(&(holder, off)) {
+            return known.clone();
+        }
+        if self.uses.is_none() {
+            return Footprint::Unknown("no-path");
+        }
+        // A cycle is Unknown: marked before the walk.
+        self.holder_paths
+            .borrow_mut()
+            .insert((holder, off), Footprint::Unknown("cycle"));
+        let fp = self
+            .path(holder)
+            .at(off, size)
+            .join(self.holder_mentions(holder, off, size));
+        self.holder_paths
+            .borrow_mut()
+            .insert((holder, off), fp.clone());
+        fp
+    }
+
+    /// The holder's own mentions in the body: loads of the field, reads of
+    /// other bytes, writes, and its address taken into a local of its path.
+    fn holder_mentions(&self, holder: Local, off: i64, size: i64) -> Footprint {
+        use rustc_middle::mir::visit::{
+            MutatingUseContext as M, NonMutatingUseContext as N, PlaceContext, Visitor,
+        };
+        struct Mentions<'tcx>(Local, Vec<(Location, Place<'tcx>, PlaceContext)>);
+        impl<'tcx> Visitor<'tcx> for Mentions<'tcx> {
+            fn visit_place(
+                &mut self,
+                place: &Place<'tcx>,
+                context: PlaceContext,
+                location: Location,
+            ) {
+                if place.local == self.0 {
+                    self.1.push((location, *place, context));
+                }
+                self.super_place(place, context, location);
+            }
+        }
+        let mut mentions = Mentions(holder, Vec::new());
+        mentions.visit_body(self.body);
+        let meets = |place: &Place<'tcx>, location: Location| -> bool {
+            match self.place_offset_from(place, 0, location) {
+                Some((lo, hi, Some(bytes), _, _)) => match (lo.as_constant(), hi.as_constant()) {
+                    (Some(lo), Some(hi)) => lo < off + size && off < hi + bytes,
+                    _ => true,
+                },
+                _ => true,
+            }
+        };
+        let mut fp = Footprint::Empty;
+        for (location, place, context) in mentions.1 {
+            // Through a pointer stored in the holder: a read of that pointer.
+            if place.projection.contains(&PlaceElem::Deref) {
+                if meets(&place, location) {
+                    return Footprint::Unknown("holder-field-used");
+                }
+                continue;
+            }
+            match context {
+                PlaceContext::NonUse(_)
+                | PlaceContext::NonMutatingUse(N::Inspect | N::PlaceMention)
+                | PlaceContext::MutatingUse(
+                    M::Store | M::Call | M::AsmOutput | M::SetDiscriminant | M::Deinit | M::Retag,
+                ) => {}
+                PlaceContext::MutatingUse(M::Borrow | M::RawBorrow)
+                | PlaceContext::NonMutatingUse(N::SharedBorrow | N::FakeBorrow | N::RawBorrow) => {
+                    // The address lands in a local of the holder's path.
+                    let taken = match at(self.body, location) {
+                        At::Statement(statement) => match &statement.kind {
+                            StatementKind::Assign(box (lhs, _)) => lhs.as_local(),
+                            _ => None,
+                        },
+                        At::Terminator(_) => None,
+                    };
+                    if !taken
+                        .and_then(|local| self.derivs.get(&local))
+                        .is_some_and(|deriv| deriv.root == holder)
+                    {
+                        return Footprint::Unknown("holder-address");
+                    }
+                }
+                PlaceContext::NonMutatingUse(N::Copy | N::Move) => {
+                    let field = matches!(
+                        self.place_offset_from(&place, 0, location),
+                        Some((lo, hi, Some(bytes), false, _))
+                            if lo == hi && lo.as_constant() == Some(off) && bytes == size
+                    );
+                    match field.then(|| self.exact_load(&place, location)).flatten() {
+                        Some(loaded) => fp = fp.join(loaded),
+                        None if meets(&place, location) => {
+                            return Footprint::Unknown("holder-read");
+                        }
+                        None => {}
+                    }
+                }
+                _ => return Footprint::Unknown("holder-use"),
+            }
+            if matches!(fp, Footprint::Unknown(_)) {
+                return fp;
+            }
+        }
+        fp
+    }
+
+    /// The statement at `location` loads the pointer at `place` into a local of
+    /// its own family, and nothing else: that family.
+    fn exact_load(&self, place: &Place<'tcx>, location: Location) -> Option<Footprint> {
+        let At::Statement(statement) = at(self.body, location) else {
+            return None;
+        };
+        let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+            return None;
+        };
+        let (Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+        | Rvalue::CopyForDeref(p)
+        | Rvalue::Cast(
+            CastKind::PtrToPtr
+            | CastKind::PointerCoercion(
+                PointerCoercion::Unsize
+                | PointerCoercion::MutToConstPointer
+                | PointerCoercion::ArrayToPointer,
+                _,
+            ),
+            Operand::Copy(p) | Operand::Move(p),
+            _,
+        )) = rvalue
+        else {
+            return None;
+        };
+        let dest = lhs.as_local()?;
+        if p != place
+            || self
+                .derivs
+                .get(&dest)
+                .is_none_or(|deriv| deriv.root != dest)
+        {
+            return None;
+        }
+        Some(self.family(dest))
+    }
+
+    /// The path of `root` (a pointer formal, or a holder through its
+    /// address): every use of every local of its family.
+    fn path(&self, root: Local) -> Path {
+        if let Some(known) = self.paths.borrow().get(&root) {
+            return known.clone();
+        }
+        let Some(uses) = self.uses else {
+            return Path::opaque("no-path");
+        };
+        let mut members: Vec<(Local, &Deriv)> = self
+            .derivs
+            .iter()
+            .filter(|(_, deriv)| deriv.root == root)
+            .map(|(local, deriv)| (*local, deriv))
+            .collect();
+        members.sort_by_key(|(local, _)| *local);
+        let mut path = Path::default();
+        // The bytes `[deriv.lo + lo, deriv.hi + hi + size)`, `None` unbounded.
+        let span = |deriv: &Deriv, lo: Bound, hi: Bound, size: i64| -> Option<(Bound, Bound)> {
+            Some((
+                deriv.lo.plus(lo)?,
+                deriv.hi.plus(hi)?.plus(Bound::constant(size))?,
+            ))
+        };
+        for (local, deriv) in members {
+            for (location, occ) in uses.get(&local).into_iter().flatten() {
+                match &occ.what {
+                    Use::Inert => {}
+                    Use::Escape(why) => path.stop(why),
+                    Use::Flow { dest } => match dest.as_local() {
+                        Some(RETURN_PLACE) => path.stop("returned"),
+                        Some(dest)
+                            if self.derivs.get(&dest).is_some_and(|next| next.root == root) => {}
+                        Some(_) => path.stop("flows-into-untracked"),
+                        None => path.stop("stored"),
+                    },
+                    Use::Bytes { place, write } => {
+                        let Some((lo, hi, Some(size), through, _)) =
+                            self.place_offset(place, *location)
+                        else {
+                            path.touch(None);
+                            continue;
+                        };
+                        let range = span(deriv, lo, hi, size);
+                        // A pointer loaded at one constant offset of the root.
+                        let load = match range {
+                            Some((from, _))
+                                if !*write && !through && deriv.lo == deriv.hi && lo == hi =>
+                            {
+                                from.as_constant().zip(self.exact_load(place, *location))
+                            }
+                            _ => None,
+                        };
+                        match load {
+                            Some((at, loaded)) => path.loads.push((at, size, loaded)),
+                            None => path.touch(range),
+                        }
+                    }
+                    Use::Arg { k } => self.path_argument(&mut path, deriv, *k, *location),
+                }
+                if path.opaque.is_some() {
+                    break;
+                }
+            }
+        }
+        self.paths.borrow_mut().insert(root, path.clone());
+        path
+    }
+
+    /// A member of a path as argument `k` of the call at `location`.
+    fn path_argument(&self, path: &mut Path, deriv: &Deriv, k: usize, location: Location) {
+        let terminator = self.body.basic_blocks[location.block].terminator();
+        let (
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            },
+            Some(call),
+        ) = (&terminator.kind, terminator.as_call(self.tcx))
+        else {
+            path.stop("not-a-call");
+            return;
+        };
+        let actual = |j: u32| self.actual(args, j, location);
+        let lands_in_path = |dest: &Place<'tcx>| {
+            dest.as_local()
+                .and_then(|dest| self.derivs.get(&dest))
+                .is_some_and(|next| next.root == deriv.root)
+        };
+        if k == 0
+            && (core_pointer_step(self.tcx, &call.func).is_some()
+                || core_slice_buffer(self.tcx, self.body, func))
+        {
+            if !lands_in_path(destination) {
+                path.stop("flows-into-untracked");
+            }
+            return;
+        }
+        if k == 0 && core_is_null(self.tcx, &call.func) {
+            return;
+        }
+        if let Some((written, read, length)) = libc_row(&call.func) {
+            if k != written && Some(k) != read {
+                path.stop("libc-argument");
+                return;
+            }
+            let n = actual(length as u32).and_then(Bound::as_constant);
+            path.touch(n.and_then(|n| Some((deriv.lo, deriv.hi.plus(Bound::constant(n))?))));
+            if k == written && !lands_in_path(destination) {
+                // `memcpy` / `memmove` / `memset` return their destination.
+                path.stop("flows-into-untracked");
+            }
+            return;
+        }
+        let callee = func
+            .const_fn_def()
+            .and_then(|(def, _)| def.as_local())
+            .filter(|callee| self.table.scc.contains_key(callee));
+        let Some(callee) = callee else {
+            path.stop("foreign-callee");
+            return;
+        };
+        if self.table.scc.get(&callee) == self.table.scc.get(&self.function) {
+            path.stop("recursion");
+            return;
+        }
+        match self.table.paths.get(&(callee, k as u32)) {
+            Some(callee_path) => path.absorb(callee_path, deriv, &actual, (callee, k as u32)),
+            None => path.stop("no-path"),
+        }
+    }
+
+    /// The actual of formal `j` at a call: a constant, or a range pinned to
+    /// one value (the caller's formal keeps it affine).
+    fn actual(
+        &self,
+        args: &[rustc_span::source_map::Spanned<Operand<'tcx>>],
+        j: u32,
+        location: Location,
+    ) -> Option<Bound> {
+        let operand = &args.get(j as usize)?.node;
+        match operand {
+            Operand::Constant(_) => constant_value(self.tcx, operand).map(Bound::constant),
+            _ => self.ints.range(location, operand_local(operand)?)?.actual(),
         }
     }
 
@@ -2604,13 +3359,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         let Some(call) = terminator.as_call(self.tcx) else {
             return Footprint::Unknown("not-a-call");
         };
-        let actual = |j: u32| -> Option<Bound> {
-            let operand = &args.get(j as usize)?.node;
-            match operand {
-                Operand::Constant(_) => constant_value(self.tcx, operand).map(Bound::constant),
-                _ => self.ints.range(location, operand_local(operand)?)?.actual(),
-            }
-        };
+        let actual = |j: u32| self.actual(args, j, location);
         if k == 0
             && (core_pointer_step(self.tcx, &call.func).is_some()
                 || core_slice_buffer(self.tcx, self.body, func))
@@ -2710,6 +3459,17 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                 match &occ.what {
                     Use::Inert => {}
                     Use::Escape(_) => escaped.extend(roots.iter().copied()),
+                    // E1: a value of the family stored into a holder's field
+                    // whose path is bounded is retained only where that path
+                    // reaches, and its footprint carries the path.
+                    Use::Flow { dest }
+                        if self.derivs.contains_key(&local)
+                            && self.holder_field(dest).is_some_and(|(holder, off, size)| {
+                                !matches!(
+                                    self.holder_path(holder, off, size),
+                                    Footprint::Unknown(_)
+                                )
+                            }) => {}
                     Use::Flow { dest } => into(dest, &mut work, &mut escaped),
                     Use::Bytes { place, write } => {
                         let through = place.projection[1..].contains(&PlaceElem::Deref);
@@ -2796,8 +3556,11 @@ impl FnFacts {
     ) -> FnFacts {
         let shape = Shape::new(body);
         let ints = Ints::compute(tcx, body, &shape);
+        let holders = holders(body, &shape);
         let families = RefCell::new(FxHashMap::default());
+        let holder_paths = RefCell::new(FxHashMap::default());
         let escaped: FxHashSet<Local>;
+        let mut paths = FxHashMap::default();
         let none = FxHashMap::default();
         let derivs: FxHashMap<Local, Deriv> = {
             let ctx = Ctx {
@@ -2807,9 +3570,12 @@ impl FnFacts {
                 env: ty::TypingEnv::post_analysis(tcx, function),
                 shape: &shape,
                 ints: &ints,
+                holders: &holders,
                 derivs: &none,
                 families: &families,
+                holder_paths: &holder_paths,
                 open: RefCell::new(FxHashSet::default()),
+                paths: RefCell::new(FxHashMap::default()),
                 uses: None,
                 table,
             };
@@ -2843,9 +3609,12 @@ impl FnFacts {
                 env: ty::TypingEnv::post_analysis(tcx, function),
                 shape: &shape,
                 ints: &ints,
+                holders: &holders,
                 derivs: &derivs,
                 families: &families,
+                holder_paths: &holder_paths,
                 open: RefCell::new(FxHashSet::default()),
+                paths: RefCell::new(FxHashMap::default()),
                 uses: Some(&uses),
                 table,
             };
@@ -2854,14 +3623,56 @@ impl FnFacts {
             for local in &locals {
                 ctx.family(*local);
             }
+            // Every holder field a pointer is stored into has its path (the
+            // read-back context only reads them).
+            for data in body.basic_blocks.iter() {
+                for statement in &data.statements {
+                    if let StatementKind::Assign(box (place, _)) = &statement.kind
+                        && let Some((holder, off, size)) = ctx.holder_field(place)
+                    {
+                        ctx.holder_path(holder, off, size);
+                    }
+                }
+            }
             escaped = ctx.escaped_roots();
+            for k in 0..body.arg_count {
+                let formal = Local::from_usize(k + 1);
+                if derivs
+                    .get(&formal)
+                    .is_some_and(|deriv| deriv.root == formal)
+                {
+                    paths.insert(k as u32, ctx.path(formal));
+                }
+            }
         }
         FnFacts {
             shape,
             ints,
+            holders,
             derivs,
             families,
+            holder_paths,
+            paths,
             escaped,
         }
     }
+}
+
+/// E1's holders: the local structs (never a formal, never a union) a pointer is
+/// stored into one field deep, `s.f = p`.
+fn holders(body: &Body<'_>, shape: &Shape) -> FxHashSet<Local> {
+    let mut out = FxHashSet::default();
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            if let StatementKind::Assign(box (place, _)) = &statement.kind
+                && let [PlaceElem::Field(_, field_ty)] = place.projection[..]
+                && matches!(field_ty.kind(), TyKind::RawPtr(..))
+                && !shape.is_formal(place.local)
+                && matches!(body.local_decls[place.local].ty.kind(), TyKind::Adt(def, _) if def.is_struct())
+            {
+                out.insert(place.local);
+            }
+        }
+    }
+    out
 }
